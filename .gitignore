@@ -1,0 +1,12 @@
+target/
+node_modules/
+dist/
+dist-electron/
+.vite/
+.env
+.env.local
+*.log
+*.db
+*.db-shm
+*.db-wal
+out/
