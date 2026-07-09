@@ -30,6 +30,8 @@ export function App() {
   const [events, setEvents] = useState<AgentEvent[]>([])
   const [composer, setComposer] = useState("")
   const [isSending, setIsSending] = useState(false)
+  const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -121,9 +123,24 @@ export function App() {
     }
   }
 
+  async function decideApproval(approvalId: string, approved: boolean) {
+    if (!client || !activeThread || decidingApprovalId) return
+    setDecidingApprovalId(approvalId)
+    try {
+      await client.decideApproval(activeThread.id, approvalId, approved)
+    } finally {
+      setDecidingApprovalId(null)
+    }
+  }
+
   return (
     <div className="app-shell">
-      <TopBar platform={platform} status={serverStatus} activeThread={activeThread} />
+      <TopBar
+        platform={platform}
+        status={serverStatus}
+        activeThread={activeThread}
+        onSettings={() => setSettingsOpen(true)}
+      />
       <main className="workspace">
         <Sidebar
           threads={threads}
@@ -149,8 +166,14 @@ export function App() {
             <EmptyState onNew={createThread} />
           )}
         </section>
-        <RightPanel thread={activeThread} events={events} />
+        <RightPanel
+          thread={activeThread}
+          events={events}
+          decidingApprovalId={decidingApprovalId}
+          onDecideApproval={decideApproval}
+        />
       </main>
+      {settingsOpen && <SettingsPanel platform={platform} onClose={() => setSettingsOpen(false)} />}
     </div>
   )
 }
@@ -159,10 +182,12 @@ function TopBar({
   platform,
   status,
   activeThread,
+  onSettings,
 }: {
   platform: PlatformInfo | null
   status: ServerStatus
   activeThread: Thread | null
+  onSettings(): void
 }) {
   return (
     <header className="topbar">
@@ -177,11 +202,44 @@ function TopBar({
         <StatusPill status={status} />
         <span>{platform?.os ?? "web"}</span>
         <span>{activeThread?.workspaceRoot ?? "No workspace"}</span>
-        <button className="icon-button" aria-label="Settings">
+        <button className="icon-button" aria-label="Settings" onClick={onSettings}>
           <Settings size={17} />
         </button>
       </div>
     </header>
+  )
+}
+
+function SettingsPanel({ platform, onClose }: { platform: PlatformInfo | null; onClose(): void }) {
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <section className="settings-panel" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <h2>Settings</h2>
+          <button className="secondary-button" onClick={onClose}>
+            Close
+          </button>
+        </header>
+        <div className="settings-grid">
+          <label>
+            Backend URL
+            <code>{platform?.backendUrl ?? "http://127.0.0.1:8787"}</code>
+          </label>
+          <label>
+            Platform
+            <code>{platform?.os ?? "browser"}</code>
+          </label>
+          <label>
+            Provider
+            <span>Uses `OPENAI_API_KEY` / `OPENTOPIA_API_KEY` when present; otherwise mock provider.</span>
+          </label>
+          <label>
+            Permission
+            <span>Default `auto`; approvals are required for dangerous commands and can be allowed once.</span>
+          </label>
+        </div>
+      </section>
+    </div>
   )
 }
 
@@ -322,9 +380,21 @@ function Composer({
   )
 }
 
-function RightPanel({ thread, events }: { thread: Thread | null; events: AgentEvent[] }) {
+function RightPanel({
+  thread,
+  events,
+  decidingApprovalId,
+  onDecideApproval,
+}: {
+  thread: Thread | null
+  events: AgentEvent[]
+  decidingApprovalId: string | null
+  onDecideApproval(approvalId: string, approved: boolean): void
+}) {
   const latestToolResult = [...events].reverse().find((event) => event.payload.type === "tool_call_finished")
   const latestApproval = [...events].reverse().find((event) => event.payload.type === "approval_requested")
+  const latestApprovalPayload =
+    latestApproval?.payload.type === "approval_requested" ? latestApproval.payload : null
   return (
     <aside className="right-panel">
       <div className="panel-card">
@@ -347,14 +417,30 @@ function RightPanel({ thread, events }: { thread: Thread | null; events: AgentEv
           )}
         </div>
       </div>
-      {latestApproval?.payload.type === "approval_requested" && (
+      {latestApprovalPayload && (
         <div className="panel-card approval-card">
           <div className="panel-title">
             <ShieldAlert size={16} />
             Approval Needed
           </div>
-          <p>{latestApproval.payload.reason}</p>
-          <code>{latestApproval.payload.action}</code>
+          <p>{latestApprovalPayload.reason}</p>
+          <code>{latestApprovalPayload.action}</code>
+          <div className="approval-actions">
+            <button
+              className="secondary-button"
+              disabled={decidingApprovalId === latestApprovalPayload.approval_id}
+              onClick={() => onDecideApproval(latestApprovalPayload.approval_id, false)}
+            >
+              Deny
+            </button>
+            <button
+              className="primary-button"
+              disabled={decidingApprovalId === latestApprovalPayload.approval_id}
+              onClick={() => onDecideApproval(latestApprovalPayload.approval_id, true)}
+            >
+              Allow Once
+            </button>
+          </div>
         </div>
       )}
       <div className="panel-card">

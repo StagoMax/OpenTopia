@@ -58,7 +58,7 @@ export type AgentEventPayload =
   | { type: "tool_call_finished"; result: ToolResult }
   | { type: "assistant_message"; message: Message }
   | { type: "file_changed"; path: string; summary: string }
-  | { type: "approval_requested"; reason: string; action: string }
+  | { type: "approval_requested"; approval_id: string; reason: string; action: string }
   | { type: "turn_finished"; summary: string }
   | { type: "error"; message: string }
 

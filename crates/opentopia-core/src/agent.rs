@@ -100,7 +100,7 @@ impl AgentCore {
             .await?;
 
         let text = format!(
-            "{}\n\nI inspected the workspace root and found:\n\n```text\n{}\n```\n\nThis is the MVP agent loop. Next slices should replace the mock provider with a real LLM provider and add edit/apply_patch/shell tools behind PolicyEngine.",
+            "{}\n\nI inspected the workspace root and found:\n\n```text\n{}\n```\n\nYou can also use deterministic local tools such as `/read`, `/write`, `/run`, `/diff`, and `/patch`.",
             response.text, listed_files
         );
         let assistant_message = Message::text(input.thread_id, MessageRole::Assistant, text);

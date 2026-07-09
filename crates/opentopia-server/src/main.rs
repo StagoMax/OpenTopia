@@ -53,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         agent: Arc::new(AgentCore::from_env()),
         events: EventBus::default(),
         permission_mode: args.permission,
+        approvals: PendingApprovals::default(),
     };
 
     let app = build_router(state);
@@ -67,9 +68,13 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/threads", get(list_threads).post(create_thread))
-        .route("/api/threads/{thread_id}/messages", get(list_messages).post(send_message))
-        .route("/api/threads/{thread_id}/events", get(list_events))
-        .route("/api/threads/{thread_id}/events/stream", get(stream_events))
+        .route("/api/threads/:thread_id/messages", get(list_messages).post(send_message))
+        .route("/api/threads/:thread_id/events", get(list_events))
+        .route("/api/threads/:thread_id/events/stream", get(stream_events))
+        .route(
+            "/api/threads/:thread_id/approvals/:approval_id/decision",
+            post(decide_approval),
+        )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -81,6 +86,34 @@ struct AppState {
     agent: Arc<AgentCore>,
     events: EventBus,
     permission_mode: PermissionMode,
+    approvals: PendingApprovals,
+}
+
+#[derive(Clone, Default)]
+struct PendingApprovals {
+    items: Arc<RwLock<HashMap<Uuid, PendingApproval>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    thread_id: Uuid,
+    action: String,
+}
+
+impl PendingApprovals {
+    fn insert(&self, approval_id: Uuid, approval: PendingApproval) {
+        self.items
+            .write()
+            .expect("approval store poisoned")
+            .insert(approval_id, approval);
+    }
+
+    fn remove(&self, approval_id: Uuid) -> Option<PendingApproval> {
+        self.items
+            .write()
+            .expect("approval store poisoned")
+            .remove(&approval_id)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -182,6 +215,20 @@ async fn send_message(
                             error!(?err, "failed to persist assistant message");
                         }
                     }
+                    if let AgentEventPayload::ApprovalRequested {
+                        approval_id,
+                        action,
+                        ..
+                    } = &payload
+                    {
+                        run_state.approvals.insert(
+                            *approval_id,
+                            PendingApproval {
+                                thread_id,
+                                action: action.clone(),
+                            },
+                        );
+                    }
                     publish_payload(&run_state, thread_id, Some(turn_id), payload);
                 }
             }
@@ -199,6 +246,77 @@ async fn send_message(
     });
 
     Ok(Json(user_message))
+}
+
+async fn decide_approval(
+    State(state): State<AppState>,
+    Path((thread_id, approval_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ApprovalDecisionRequest>,
+) -> Result<Json<ApprovalDecisionResponse>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let pending = state
+        .approvals
+        .remove(approval_id)
+        .ok_or_else(|| ApiError::not_found(format!("approval not found: {approval_id}")))?;
+    if pending.thread_id != thread_id {
+        return Err(ApiError::bad_request("approval does not belong to this thread"));
+    }
+
+    if !request.approved {
+        let message = state.store.append_message(Message::text(
+            thread_id,
+            MessageRole::Assistant,
+            "Approval denied. The requested action was not executed.",
+        ))?;
+        publish_payload(
+            &state,
+            thread_id,
+            Some(Uuid::new_v4()),
+            AgentEventPayload::AssistantMessage { message },
+        );
+        return Ok(Json(ApprovalDecisionResponse {
+            accepted: true,
+            executed: false,
+        }));
+    }
+
+    let thread = ensure_thread(&state, thread_id)?;
+    let run_state = state.clone();
+    tokio::spawn(async move {
+        let turn_id = Uuid::new_v4();
+        let input = AgentTurnInput {
+            thread_id,
+            user_message_id: approval_id,
+            workspace_root: thread.workspace_root,
+            content: pending.action,
+            permission_mode: PermissionMode::FullAccess,
+        };
+        match run_state.agent.run_turn(input).await {
+            Ok(payloads) => {
+                for payload in payloads {
+                    if let AgentEventPayload::AssistantMessage { message } = &payload {
+                        if let Err(err) = run_state.store.append_message(message.clone()) {
+                            error!(?err, "failed to persist approved assistant message");
+                        }
+                    }
+                    publish_payload(&run_state, thread_id, Some(turn_id), payload);
+                }
+            }
+            Err(err) => publish_payload(
+                &run_state,
+                thread_id,
+                Some(turn_id),
+                AgentEventPayload::Error {
+                    message: err.to_string(),
+                },
+            ),
+        }
+    });
+
+    Ok(Json(ApprovalDecisionResponse {
+        accepted: true,
+        executed: true,
+    }))
 }
 
 async fn list_events(
@@ -278,6 +396,19 @@ struct CreateThreadRequest {
 #[serde(rename_all = "camelCase")]
 struct SendMessageRequest {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalDecisionRequest {
+    approved: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalDecisionResponse {
+    accepted: bool,
+    executed: bool,
 }
 
 #[derive(Debug, Deserialize)]

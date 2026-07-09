@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +56,9 @@ impl BasicPolicyEngine {
     }
 
     fn inside_workspace(&self, path: &Path) -> bool {
+        if path.components().any(|component| matches!(component, Component::ParentDir)) {
+            return false;
+        }
         let workspace_root = self
             .workspace_root
             .canonicalize()
@@ -111,6 +114,9 @@ impl PolicyEngine for BasicPolicyEngine {
             .iter()
             .any(|marker| lowered.contains(marker))
         {
+            if self.mode == PermissionMode::FullAccess {
+                return PolicyDecision::Allow;
+            }
             return PolicyDecision::Ask {
                 reason: format!("Potentially destructive command: {command}"),
             };

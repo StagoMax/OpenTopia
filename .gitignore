@@ -10,3 +10,6 @@ dist-electron/
 *.db-shm
 *.db-wal
 out/
+apps/desktop/release/
+apps/desktop/resources/opentopia-server*
+!apps/desktop/resources/.gitkeep

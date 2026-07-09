@@ -2,6 +2,8 @@
 
 This MVP is the first executable slice of the architecture described in `docs/ai-coding-work-agent-architecture.md`.
 
+The concrete source borrowing map is maintained in `docs/source-adaptation-map.md`.
+
 ## What Exists
 
 ### Rust Core
@@ -14,9 +16,9 @@ Implemented:
 - SQLite session store.
 - Basic permission policy.
 - Built-in tool abstraction.
-- Built-in `list_files`, `read_file`, `write_file`, `shell`, and `git_diff` tools.
+- Built-in `list_files`, `read_file`, `write_file`, `shell`, `git_diff`, and `apply_patch` tools.
 - OpenAI-compatible provider with mock fallback.
-- Deterministic command parser for `/list`, `/read`, `/write`, `/run`, `/diff`.
+- Deterministic command parser for `/list`, `/read`, `/write`, `/run`, `/diff`, `/patch`.
 
 The agent loop currently:
 
@@ -69,11 +71,17 @@ Implemented:
 - Workspace inspector.
 - Tool output inspector.
 - Approval-needed notification card.
+- Allow-once and deny approval actions.
 - Offline state when the local server is unavailable.
+- Electron development shell can auto-start the local Rust server.
 
 ## Run
 
-Install Rust stable and Node 22+ first.
+Install Rust stable and Node 22+ first. On Windows, initialize the verified GNU Rust + WinLibs environment:
+
+```powershell
+.\scripts\dev-env.ps1
+```
 
 Start server:
 
@@ -99,12 +107,10 @@ pnpm dev:desktop
 
 The current MVP intentionally does not yet include:
 
-- `apply_patch`.
 - MCP extension host.
-- Approval decision/resume API.
 - Sandbox execution.
 - Secret storage.
-- Auto-updater packaging.
+- Auto-updater pipeline.
 
 Those are next slices; the interfaces are already shaped so they can be added without replacing the full skeleton.
 
@@ -112,24 +118,23 @@ Those are next slices; the interfaces are already shaped so they can be added wi
 
 Recommended order:
 
-1. Add `apply_patch` tool.
-2. Add approval decision/resume API.
-3. Add MCP extension host.
-4. Add Electron-side server bootstrap.
-5. Add packaging and update pipeline.
-6. Add Docker/remote sandbox.
+1. Persist approvals in SQLite instead of memory.
+2. Add MCP extension host.
+3. Add provider/settings persistence.
+4. Add packaging signing and update pipeline.
+5. Add Docker/remote sandbox.
+6. Add richer file tree/diff review/editor panels.
 
 ## Verification
 
 When Rust is installed:
 
 ```powershell
-cargo check --workspace
+.\scripts\check.ps1
 ```
 
-When Node dependencies are installed:
+Runtime smoke test:
 
 ```powershell
-pnpm.cmd --filter @opentopia/desktop typecheck
-pnpm.cmd --filter @opentopia/desktop build
+.\scripts\verify-server.cmd
 ```

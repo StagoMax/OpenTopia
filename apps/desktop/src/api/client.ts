@@ -28,6 +28,10 @@ export class ApiClient {
     return this.get(`/api/threads/${threadId}/events${query}`)
   }
 
+  async decideApproval(threadId: string, approvalId: string, approved: boolean): Promise<{ accepted: boolean; executed: boolean }> {
+    return this.post(`/api/threads/${threadId}/approvals/${approvalId}/decision`, { approved })
+  }
+
   openEventStream(threadId: string, since: number | undefined, onEvent: (event: AgentEvent) => void): EventSource {
     const query = since ? `?since=${since}` : ""
     const source = new EventSource(`${this.baseUrl}/api/threads/${threadId}/events/stream${query}`)
