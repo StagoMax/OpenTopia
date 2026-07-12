@@ -2,6 +2,7 @@
   "name": "@opentopia/desktop",
   "version": "0.1.0",
   "private": true,
+  "author": "OpenTopia Contributors",
   "description": "OpenTopia desktop workbench.",
   "type": "module",
   "main": "electron/main.cjs",
@@ -29,16 +30,35 @@
     "extraResources": [
       {
         "from": "resources",
-        "to": "."
+        "to": ".",
+        "filter": ["opentopia-server", "opentopia-server.exe"]
+      },
+      {
+        "from": "resources/codex-sandbox",
+        "to": "codex-sandbox",
+        "filter": ["codex.exe", "codex-command-runner.exe", "codex-windows-sandbox-setup.exe", "LICENSE"]
       }
     ],
+    "publish": {
+      "provider": "github",
+      "owner": "opentopia",
+      "repo": "opentopia",
+      "releaseType": "draft"
+    },
     "win": {
       "target": ["nsis"],
       "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
     "mac": {
       "target": ["dmg"],
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "notarize": false
     },
     "linux": {
       "target": ["AppImage", "deb"],
@@ -46,21 +66,26 @@
     }
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.1.4",
-    "concurrently": "^9.2.1",
-    "electron": "^41.0.0",
-    "electron-builder": "^26.0.12",
+    "@monaco-editor/react": "^4.7.0",
+    "electron-updater": "^6.6.0",
     "lucide-react": "^0.575.0",
+    "monaco-editor": "^0.52.2",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
-    "vite": "^7.3.1",
-    "wait-on": "^9.0.3"
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.4",
     "@types/node": "^25.5.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
+    "concurrently": "^9.2.1",
+    "electron": "^41.0.0",
+    "electron-builder": "^26.0.12",
     "prettier": "^3.8.1",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "wait-on": "^9.0.3"
   }
 }

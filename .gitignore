@@ -5,11 +5,14 @@ dist-electron/
 .vite/
 .env
 .env.local
+.opentopia/
 *.log
 *.db
 *.db-shm
 *.db-wal
 out/
 apps/desktop/release/
+apps/desktop/release-*/
 apps/desktop/resources/opentopia-server*
+apps/desktop/resources/codex-sandbox/
 !apps/desktop/resources/.gitkeep

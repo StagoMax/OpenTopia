@@ -4,6 +4,7 @@ use opentopia_core::{
     SqliteSessionStore,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -36,7 +37,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let store = SqliteSessionStore::open(args.db)?;
+    let store = Arc::new(SqliteSessionStore::open(args.db)?);
 
     match args.command {
         Command::Threads => {
@@ -65,7 +66,12 @@ async fn main() -> anyhow::Result<()> {
                     user_message_id: user_message.id,
                     workspace_root: thread.workspace_root,
                     content,
+                    context_summary: None,
+                    conversation: Vec::new(),
                     permission_mode: args.permission,
+                    context_budget: None,
+                    store: Some(store.clone() as Arc<dyn SessionStore>),
+                    cancellation: None,
                 })
                 .await?;
 
