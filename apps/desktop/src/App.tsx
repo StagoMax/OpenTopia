@@ -1,24 +1,33 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
+  Archive,
   ArrowLeft,
   ArrowRight,
   Bot,
+  Box,
   Check,
   ChevronDown,
   CircleHelp,
+  Cloud,
   Clock3,
   ExternalLink,
   FileCode2,
   FileText,
   Folder,
+  FolderOpen,
   GitBranch,
   Github,
   GitPullRequest,
+  GitFork,
+  Globe2,
   Loader2,
   Menu,
   MoreHorizontal,
   PanelRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Pencil,
   Plug,
   Plus,
   Search,
@@ -34,7 +43,7 @@ import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
 import { LogViewer } from "./components/LogViewer";
 import { detectLanguage, MonacoEditor } from "./components/MonacoEditor";
-import { WorkbenchPanel } from "./components/WorkbenchPanel";
+import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
 import {
   deleteSecret,
   getRecentWorkspaces,
@@ -76,10 +85,42 @@ import type {
 
 type ServerStatus = "checking" | "online" | "offline";
 
+type ToolTabKind = WorkbenchTab | "browser";
+
+type ToolTab = {
+  id: string;
+  kind: ToolTabKind;
+  title: string;
+};
+
 type ArtifactPreviewState =
   | { status: "loading"; artifactId: string }
   | { status: "ready"; artifactId: string; content: ArtifactContent }
   | { status: "error"; artifactId: string; message: string };
+
+function useDismissiblePopover(open: boolean, onClose: () => void) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) onClose();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose, open]);
+
+  return containerRef;
+}
 
 export function App() {
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
@@ -149,6 +190,10 @@ export function App() {
   const [hunkActionKey, setHunkActionKey] = useState<string | null>(null);
   const [artifactPreview, setArtifactPreview] =
     useState<ArtifactPreviewState | null>(null);
+  const [toolTabs, setToolTabs] = useState<ToolTab[]>([]);
+  const [activeToolTabId, setActiveToolTabId] = useState<string | null>(null);
+  const [conversationCollapsed, setConversationCollapsed] = useState(false);
+  const [draftProjectName, setDraftProjectName] = useState<string | null>(null);
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -156,6 +201,10 @@ export function App() {
   );
   const currentWorkspaceRoot =
     selectedWorkspaceRoot ?? activeThread?.workspaceRoot ?? null;
+  const activeToolTab = useMemo(
+    () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
+    [activeToolTabId, toolTabs],
+  );
 
   const ingestEvent = useCallback((event: AgentEvent) => {
     setEvents((current) => {
@@ -434,7 +483,66 @@ export function App() {
   function selectThread(threadId: string) {
     const thread = threads.find((item) => item.id === threadId);
     setActiveThreadId(threadId);
+    setDraftProjectName(null);
     if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
+  }
+
+  function beginNewThread() {
+    setActiveThreadId(null);
+    setMessages([]);
+    setEvents([]);
+    setComposer("");
+    setActiveTurnId(null);
+    setPendingApprovalIds([]);
+    setToolTabs([]);
+    setActiveToolTabId(null);
+    setConversationCollapsed(false);
+    setDraftProjectName(
+      currentWorkspaceRoot ? workspaceName(currentWorkspaceRoot) : null,
+    );
+  }
+
+  function beginProjectDraft(projectName: string) {
+    beginNewThread();
+    setSelectedWorkspaceRoot(null);
+    setDraftProjectName(projectName);
+  }
+
+  function handleNewThreadForProject(
+    workspaceRoot: string | null,
+    projectName: string,
+  ) {
+    if (workspaceRoot) {
+      void selectRecentWorkspace(workspaceRoot);
+      beginNewThread();
+    } else {
+      beginProjectDraft(projectName);
+    }
+  }
+
+  function openToolTab(kind: ToolTabKind) {
+    const id = `tool-${kind}`;
+    setToolTabs((current) =>
+      current.some((tab) => tab.id === id)
+        ? current
+        : [...current, { id, kind, title: toolTabTitle(kind) }],
+    );
+    setActiveToolTabId(id);
+    setConversationCollapsed(false);
+  }
+
+  function closeToolTab(tabId: string) {
+    setToolTabs((current) => {
+      const closingIndex = current.findIndex((tab) => tab.id === tabId);
+      const next = current.filter((tab) => tab.id !== tabId);
+      if (activeToolTabId === tabId) {
+        const replacement =
+          next[Math.min(Math.max(closingIndex, 0), next.length - 1)] ?? null;
+        setActiveToolTabId(replacement?.id ?? null);
+        if (!replacement) setConversationCollapsed(false);
+      }
+      return next;
+    });
   }
 
   async function chooseWorkspace(): Promise<string | null> {
@@ -447,6 +555,9 @@ export function App() {
       if (result.canceled) return null;
 
       setSelectedWorkspaceRoot(result.workspaceRoot);
+      if (!activeThread) {
+        setDraftProjectName((current) => current ?? result.workspace.name);
+      }
       setRecentWorkspaces(result.recentWorkspaces);
       return result.workspaceRoot;
     } catch (error) {
@@ -460,6 +571,7 @@ export function App() {
   async function selectRecentWorkspace(workspaceRoot: string) {
     setWorkspaceError(null);
     setSelectedWorkspaceRoot(workspaceRoot);
+    setDraftProjectName(workspaceName(workspaceRoot));
     try {
       setRecentWorkspaces(await saveRecentWorkspace(workspaceRoot));
     } catch (error) {
@@ -554,19 +666,32 @@ export function App() {
     }
   }
 
-  async function createThread() {
-    if (!client) return;
+  async function createThread(initialPrompt?: string): Promise<Thread | null> {
+    if (!client) return null;
     const workspaceRoot = currentWorkspaceRoot ?? (await chooseWorkspace());
-    if (!workspaceRoot) return;
+    if (!workspaceRoot) return null;
 
+    setIsSending(Boolean(initialPrompt?.trim()));
     try {
       const thread = await client.createThread({
-        title: workspaceName(workspaceRoot),
+        title: initialPrompt?.trim()
+          ? threadTitleFromPrompt(initialPrompt)
+          : workspaceName(workspaceRoot),
         workspaceRoot,
       });
       setThreads((current) => [thread, ...current]);
       setActiveThreadId(thread.id);
       setSelectedWorkspaceRoot(thread.workspaceRoot);
+      setToolTabs([]);
+      setActiveToolTabId(null);
+      if (initialPrompt?.trim()) {
+        const message = await client.sendMessage(
+          thread.id,
+          initialPrompt.trim(),
+        );
+        setMessages([message]);
+        setComposer("");
+      }
       try {
         setRecentWorkspaces(await saveRecentWorkspace(thread.workspaceRoot));
       } catch (error) {
@@ -574,8 +699,12 @@ export function App() {
           error instanceof Error ? error.message : String(error),
         );
       }
+      return thread;
     } catch (error) {
       setServerError(error instanceof Error ? error.message : String(error));
+      return null;
+    } finally {
+      setIsSending(false);
     }
   }
 
@@ -848,22 +977,30 @@ export function App() {
   return (
     <div className="app-shell">
       <TopBar />
-      <main className="workspace">
+      <main
+        className={`workspace ${activeToolTab ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""}`}
+      >
         <Sidebar
           threads={threads}
           activeThreadId={activeThreadId}
           selectedWorkspaceRoot={currentWorkspaceRoot}
+          selectedDraftProjectName={draftProjectName}
           recentWorkspaces={recentWorkspaces}
           workspaceError={workspaceError}
           isPickingWorkspace={isPickingWorkspace}
           onSelect={selectThread}
-          onNew={createThread}
+          onNew={beginNewThread}
           onPickWorkspace={() => void chooseWorkspace()}
           onSelectWorkspace={(workspaceRoot) =>
             void selectRecentWorkspace(workspaceRoot)
           }
           onForgetWorkspace={(workspaceRoot) =>
             void forgetRecentWorkspace(workspaceRoot)
+          }
+          onSelectDraftProject={beginProjectDraft}
+          onNewThreadForProject={handleNewThreadForProject}
+          onOpenThreadWorkspace={(workspaceRoot) =>
+            void openWorkspaceRoot(workspaceRoot)
           }
           onSettings={() => setSettingsOpen(true)}
         />
@@ -873,6 +1010,7 @@ export function App() {
             onOpenLocation={() =>
               activeThread && void openWorkspaceRoot(activeThread.workspaceRoot)
             }
+            onOpenTool={openToolTab}
           />
           {serverStatus === "offline" ? (
             <OfflineState
@@ -901,16 +1039,53 @@ export function App() {
                   )?.model ?? "Model"
                 }
                 permissionMode={settings?.permissionMode ?? "auto"}
+                workspaceRoot={null}
+                projectName={null}
+                recentWorkspaces={recentWorkspaces}
+                canOpenThreadTools
                 onChange={setComposer}
                 onSubmit={submitMessage}
                 onCancel={() => void cancelTurn()}
+                onOpenTool={openToolTab}
+                onPickWorkspace={() => void chooseWorkspace()}
+                onSelectWorkspace={(workspaceRoot) =>
+                  void selectRecentWorkspace(workspaceRoot)
+                }
+                onChangePermissionMode={(permissionMode) =>
+                  void saveSettings({ permissionMode })
+                }
               />
             </>
           ) : (
-            <EmptyState onNew={createThread} />
+            <NewTaskState
+              value={composer}
+              workspaceRoot={currentWorkspaceRoot}
+              projectName={draftProjectName}
+              recentWorkspaces={recentWorkspaces}
+              model={
+                settings?.providers.find(
+                  (provider) => provider.id === settings.activeProviderId,
+                )?.model ?? "Model"
+              }
+              permissionMode={settings?.permissionMode ?? "auto"}
+              isSending={isSending}
+              onChange={setComposer}
+              onPickWorkspace={() => void chooseWorkspace()}
+              onSelectWorkspace={(workspaceRoot) =>
+                void selectRecentWorkspace(workspaceRoot)
+              }
+              onOpenTool={openToolTab}
+              onChangePermissionMode={(permissionMode) =>
+                void saveSettings({ permissionMode })
+              }
+              onSubmit={() => void createThread(composer)}
+            />
           )}
         </section>
         <RightPanel
+          toolTabs={toolTabs}
+          activeToolTab={activeToolTab}
+          conversationCollapsed={conversationCollapsed}
           thread={activeThread}
           workspaceRoot={currentWorkspaceRoot}
           events={events.filter(
@@ -962,6 +1137,12 @@ export function App() {
           onApplyDiffHunk={(hunk, action) => void applyDiffHunk(hunk, action)}
           onGetArtifact={(threadId, artifactId) =>
             getArtifact(threadId, artifactId)
+          }
+          onOpenToolTab={openToolTab}
+          onActivateToolTab={setActiveToolTabId}
+          onCloseToolTab={closeToolTab}
+          onToggleConversation={() =>
+            setConversationCollapsed((current) => !current)
           }
         />
       </main>
@@ -1461,6 +1642,7 @@ function Sidebar({
   threads,
   activeThreadId,
   selectedWorkspaceRoot,
+  selectedDraftProjectName,
   recentWorkspaces,
   workspaceError,
   isPickingWorkspace,
@@ -1469,11 +1651,15 @@ function Sidebar({
   onPickWorkspace,
   onSelectWorkspace,
   onForgetWorkspace,
+  onSelectDraftProject,
+  onOpenThreadWorkspace,
+  onNewThreadForProject,
   onSettings,
 }: {
   threads: Thread[];
   activeThreadId: string | null;
   selectedWorkspaceRoot: string | null;
+  selectedDraftProjectName: string | null;
   recentWorkspaces: RecentWorkspace[];
   workspaceError: string | null;
   isPickingWorkspace: boolean;
@@ -1482,8 +1668,51 @@ function Sidebar({
   onPickWorkspace(): void;
   onSelectWorkspace(workspaceRoot: string): void;
   onForgetWorkspace(workspaceRoot: string): void;
+  onSelectDraftProject(projectName: string): void;
+  onOpenThreadWorkspace(workspaceRoot: string): void;
+  onNewThreadForProject?(workspaceRoot: string | null, projectName: string): void;
   onSettings(): void;
 }) {
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const [newProjectName, setNewProjectName] = useState("New project");
+  const [localProjects, setLocalProjects] = useState<LocalProject[]>(() =>
+    readLocalProjects(),
+  );
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [moreMenuProjectId, setMoreMenuProjectId] = useState<string | null>(
+    null,
+  );
+  const moreMenuRef = useDismissiblePopover(moreMenuProjectId !== null, () =>
+    setMoreMenuProjectId(null),
+  );
+  const projectMenuRef = useDismissiblePopover(projectMenuOpen, () =>
+    setProjectMenuOpen(false),
+  );
+
+  function toggleExpandedProject(projectId: string) {
+    setExpandedProjects((prev) => {
+      const next = new Set(prev);
+      if (next.has(projectId)) {
+        next.delete(projectId);
+      } else {
+        next.add(projectId);
+      }
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    if (!newProjectOpen) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setNewProjectOpen(false);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [newProjectOpen]);
+
   const projects = useMemo(() => {
     const roots = new Map<string, { name: string; workspaceRoot: string }>();
     for (const workspace of recentWorkspaces) {
@@ -1497,161 +1726,497 @@ function Sidebar({
         });
       }
     }
-    return [...roots.values()];
-  }, [recentWorkspaces, threads]);
+    return [
+      ...localProjects.map((project) => ({
+        id: project.id,
+        name: project.name,
+        workspaceRoot: null,
+      })),
+      ...[...roots.values()].map((project) => ({
+        id: project.workspaceRoot,
+        ...project,
+      })),
+    ];
+  }, [localProjects, recentWorkspaces, threads]);
+
+  function createLocalProject() {
+    const name = newProjectName.trim();
+    if (!name) return;
+    const project = { id: crypto.randomUUID(), name };
+    setLocalProjects((current) => {
+      const next = [project, ...current];
+      writeLocalProjects(next);
+      return next;
+    });
+    setNewProjectOpen(false);
+    setProjectMenuOpen(false);
+    setNewProjectName("New project");
+    onSelectDraftProject(name);
+  }
+
+  function removeLocalProject(projectId: string) {
+    setLocalProjects((current) => {
+      const next = current.filter((project) => project.id !== projectId);
+      writeLocalProjects(next);
+      return next;
+    });
+  }
 
   return (
-    <aside className="sidebar">
-      <div className="sidebar-brand-row">
-        <strong>
-          OpenTopia <span>Codex</span>
-        </strong>
-        <button
-          className="sidebar-icon-button"
-          disabled
-          title="搜索 · 未实现"
-          aria-label="搜索"
-        >
-          <Search size={15} />
-        </button>
-      </div>
-      <nav className="primary-nav" aria-label="主要导航">
-        <button onClick={onNew}>
-          <FileText size={15} />
-          <span>新建任务</span>
-        </button>
-        <button disabled title="已安排 · 未实现">
-          <Clock3 size={15} />
-          <span>已安排</span>
-          <small>未实现</small>
-        </button>
-        <button disabled title="MCP 插件已实现，请在右侧扩展标签管理">
-          <Plug size={15} />
-          <span>插件</span>
-          <small>MCP</small>
-        </button>
-        <button disabled title="拉取请求 · 未实现">
-          <GitPullRequest size={15} />
-          <span>拉取请求</span>
-          <small>未实现</small>
-        </button>
-      </nav>
+    <>
+      <aside className="sidebar">
+        <div className="sidebar-brand-row">
+          <strong>
+            <span className="brand-open">Open</span><span>Topia</span>
+          </strong>
+          <button
+            className="sidebar-icon-button"
+            disabled
+            title="搜索 · 未实现"
+            aria-label="搜索"
+          >
+            <Search size={15} />
+          </button>
+        </div>
+        <nav className="primary-nav" aria-label="主要导航">
+          <button onClick={onNew}>
+            <FileText size={15} />
+            <span>新建任务</span>
+          </button>
+          <button disabled title="已安排 · 未实现">
+            <Clock3 size={15} />
+            <span>已安排</span>
+            <small>未实现</small>
+          </button>
+          <button disabled title="MCP 插件已实现，请在右侧扩展标签管理">
+            <Plug size={15} />
+            <span>插件</span>
+            <small>MCP</small>
+          </button>
+          <button disabled title="拉取请求 · 未实现">
+            <GitPullRequest size={15} />
+            <span>拉取请求</span>
+            <small>未实现</small>
+          </button>
+        </nav>
 
-      <div className="project-heading">
-        <span>项目</span>
-        <button
-          className="sidebar-icon-button"
-          disabled={isPickingWorkspace}
-          onClick={onPickWorkspace}
-          title="打开工作区"
-          aria-label="打开工作区"
-        >
-          {isPickingWorkspace ? (
-            <Loader2 size={14} className="spin" />
-          ) : (
-            <Plus size={14} />
-          )}
-        </button>
-      </div>
-      <div className="project-tree">
-        {projects.map((project) => {
-          const projectThreads = threads.filter(
-            (thread) => thread.workspaceRoot === project.workspaceRoot,
-          );
-          const isActive = project.workspaceRoot === selectedWorkspaceRoot;
-          return (
-            <section
-              className={`project-node ${isActive ? "active" : ""}`}
-              key={project.workspaceRoot}
+        <div className="project-heading">
+          <span>项目</span>
+          <div className="sidebar-project-menu-wrap" ref={projectMenuRef}>
+            <button
+              className="sidebar-icon-button"
+              disabled={isPickingWorkspace}
+              onClick={() => setProjectMenuOpen((current) => !current)}
+              title="添加项目"
+              aria-label="添加项目"
+              aria-expanded={projectMenuOpen}
             >
-              <div className="project-row">
+              {isPickingWorkspace ? (
+                <Loader2 size={14} className="spin" />
+              ) : (
+                <Plus size={14} />
+              )}
+            </button>
+            {projectMenuOpen && (
+              <div className="tool-popover sidebar-project-popover" role="menu">
                 <button
-                  className="project-select"
-                  title={project.workspaceRoot}
-                  onClick={() => onSelectWorkspace(project.workspaceRoot)}
+                  role="menuitem"
+                  onClick={() => {
+                    setNewProjectOpen(true);
+                    setProjectMenuOpen(false);
+                  }}
                 >
-                  <ChevronDown size={13} />
-                  <Folder size={14} />
-                  <span>{project.name}</span>
+                  <Plus size={14} />
+                  <span>新建空白项目</span>
                 </button>
                 <button
-                  className="project-forget"
-                  aria-label={`移除 ${project.name}`}
-                  title="从最近项目移除"
-                  onClick={() => onForgetWorkspace(project.workspaceRoot)}
+                  role="menuitem"
+                  onClick={() => {
+                    onPickWorkspace();
+                    setProjectMenuOpen(false);
+                  }}
                 >
-                  <X size={12} />
+                  <FolderOpen size={14} />
+                  <span>使用现有文件夹</span>
                 </button>
               </div>
-              <div className="project-tasks">
-                {projectThreads.map((thread) => (
+            )}
+          </div>
+        </div>
+        <div className="project-tree">
+          {projects.map((project) => {
+            const projectThreads = project.workspaceRoot
+              ? threads.filter(
+                  (thread) => thread.workspaceRoot === project.workspaceRoot,
+                )
+              : [];
+            const isActive = project.workspaceRoot
+              ? project.workspaceRoot === selectedWorkspaceRoot
+              : !activeThreadId && project.name === selectedDraftProjectName;
+            const isExpanded = expandedProjects.has(project.id);
+            const isMoreMenuOpen = moreMenuProjectId === project.id;
+            return (
+              <section
+                className={`project-node ${isActive ? "active" : ""}`}
+                key={project.id}
+              >
+                <div className="project-row">
                   <button
-                    className={`thread-row ${thread.id === activeThreadId ? "active" : ""}`}
-                    key={thread.id}
-                    onClick={() => onSelect(thread.id)}
-                    title={thread.title}
+                    className="project-select"
+                    title={project.workspaceRoot ?? project.name}
+                    onClick={() => {
+                      toggleExpandedProject(project.id);
+                      project.workspaceRoot
+                        ? onSelectWorkspace(project.workspaceRoot)
+                        : onSelectDraftProject(project.name);
+                    }}
                   >
-                    <span>{thread.title}</span>
+                    {isExpanded ? <FolderOpen size={14} /> : <Folder size={14} />}
+                    <span>{project.name}</span>
                   </button>
-                ))}
-                {projectThreads.length === 0 && (
-                  <span className="project-empty">无任务</span>
+                  <div className="project-row-actions">
+                    <button
+                      className="project-new-thread"
+                      title="新建对话"
+                      onClick={() => {
+                        onNewThreadForProject?.(
+                          project.workspaceRoot,
+                          project.name,
+                        );
+                      }}
+                    >
+                      <Plus size={13} />
+                    </button>
+                    <div
+                      className="project-menu-wrap"
+                      ref={isMoreMenuOpen ? moreMenuRef : undefined}
+                    >
+                      <button
+                        className="project-more"
+                        aria-label={`菜单 ${project.name}`}
+                        aria-expanded={isMoreMenuOpen}
+                        onClick={() =>
+                          setMoreMenuProjectId(
+                            isMoreMenuOpen ? null : project.id,
+                          )
+                        }
+                      >
+                        <MoreHorizontal size={13} />
+                      </button>
+                      {isMoreMenuOpen && (
+                        <div className="tool-popover project-row-popover" role="menu">
+                          <button
+                            role="menuitem"
+                            onClick={() => {
+                              project.workspaceRoot
+                                ? onForgetWorkspace(project.workspaceRoot)
+                                : removeLocalProject(project.id);
+                              setMoreMenuProjectId(null);
+                            }}
+                          >
+                            <X size={14} />
+                            <span>从最近项目移除</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                {isExpanded && (
+                  <div className="project-tasks">
+                    {projectThreads.map((thread) => (
+                      <SidebarThreadRow
+                        active={thread.id === activeThreadId}
+                        key={thread.id}
+                        thread={thread}
+                        onSelect={() => onSelect(thread.id)}
+                        onOpenWorkspace={() =>
+                          onOpenThreadWorkspace(thread.workspaceRoot)
+                        }
+                      />
+                    ))}
+                    {projectThreads.length === 0 && (
+                      <span className="project-empty">无任务</span>
+                    )}
+                  </div>
                 )}
-              </div>
-            </section>
-          );
-        })}
-        {projects.length === 0 && (
-          <p className="workspace-empty">尚未打开项目</p>
-        )}
-        {workspaceError && <p className="workspace-error">{workspaceError}</p>}
-      </div>
+              </section>
+            );
+          })}
+          {projects.length === 0 && (
+            <p className="workspace-empty">尚未打开项目</p>
+          )}
+          {workspaceError && (
+            <p className="workspace-error">{workspaceError}</p>
+          )}
+        </div>
 
-      <div className="sidebar-footer">
-        <button onClick={onSettings}>
-          <Settings size={15} />
-          <span>设置</span>
+        <div className="sidebar-footer">
+          <button onClick={onSettings}>
+            <Settings size={15} />
+            <span>设置</span>
+          </button>
+          <button disabled title="帮助 · 未实现" aria-label="帮助">
+            <CircleHelp size={15} />
+          </button>
+        </div>
+      </aside>
+      {newProjectOpen && (
+        <div
+          className="modal-backdrop project-modal-backdrop"
+          role="presentation"
+          onClick={() => setNewProjectOpen(false)}
+        >
+          <form
+            className="project-name-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="project-name-title"
+            onClick={(event) => event.stopPropagation()}
+            onSubmit={(event) => {
+              event.preventDefault();
+              createLocalProject();
+            }}
+          >
+            <header>
+              <div>
+                <h2 id="project-name-title">为项目命名</h2>
+                <p>项目可以稍后再选择工作区。</p>
+              </div>
+              <button
+                className="icon-button small"
+                type="button"
+                aria-label="关闭项目弹窗"
+                onClick={() => setNewProjectOpen(false)}
+              >
+                <X size={14} />
+              </button>
+            </header>
+            <input
+              autoFocus
+              aria-label="项目名称"
+              value={newProjectName}
+              onChange={(event) => setNewProjectName(event.target.value)}
+            />
+            <footer>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setNewProjectOpen(false)}
+              >
+                取消
+              </button>
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={!newProjectName.trim()}
+              >
+                保存
+              </button>
+            </footer>
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
+function SidebarThreadRow({
+  thread,
+  active,
+  onSelect,
+  onOpenWorkspace,
+}: {
+  thread: Thread;
+  active: boolean;
+  onSelect(): void;
+  onOpenWorkspace(): void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
+
+  return (
+    <div className={`thread-row-wrap ${menuOpen ? "menu-open" : ""}`}>
+      <button
+        className={`thread-row ${active ? "active" : ""}`}
+        onClick={onSelect}
+        title={thread.title}
+      >
+        <span>{thread.title}</span>
+      </button>
+      <div className="thread-row-menu-wrap" ref={menuRef}>
+        <button
+          className="thread-row-more"
+          type="button"
+          aria-label={`任务菜单 ${thread.title}`}
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((current) => !current)}
+        >
+          <MoreHorizontal size={13} />
         </button>
-        <button disabled title="帮助 · 未实现" aria-label="帮助">
-          <CircleHelp size={15} />
-        </button>
+        {menuOpen && (
+          <div className="tool-popover thread-row-popover" role="menu">
+            <button
+              role="menuitem"
+              onClick={() => {
+                onOpenWorkspace();
+                setMenuOpen(false);
+              }}
+            >
+              <FolderOpen size={14} />
+              <span>在文件管理器中打开</span>
+            </button>
+            <button disabled title="线程重命名 API 尚未实现">
+              <Pencil size={14} />
+              <span>重命名</span>
+              <small>未实现</small>
+            </button>
+            <button disabled title="Git 工作树管理尚未实现">
+              <GitFork size={14} />
+              <span>创建工作树</span>
+              <small>未实现</small>
+            </button>
+            <button disabled title="任务归档 API 尚未实现">
+              <Archive size={14} />
+              <span>归档</span>
+              <small>未实现</small>
+            </button>
+          </div>
+        )}
       </div>
-    </aside>
+    </div>
   );
 }
 
 function ThreadHeader({
   thread,
   onOpenLocation,
+  onOpenTool,
 }: {
   thread: Thread | null;
   onOpenLocation(): void;
+  onOpenTool(kind: ToolTabKind): void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [taskMenuOpen, setTaskMenuOpen] = useState(false);
+  const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
+  const taskMenuRef = useDismissiblePopover(taskMenuOpen, () =>
+    setTaskMenuOpen(false),
+  );
+
+  function selectTool(kind: ToolTabKind) {
+    onOpenTool(kind);
+    setMenuOpen(false);
+  }
+
   return (
     <div className="thread-header">
       <div className="thread-heading">
         <Folder size={15} />
-        <h1>{thread?.title ?? "OpenTopia Workbench"}</h1>
-        <button
-          className="thread-more"
-          disabled
-          title="任务菜单 · 未实现"
-          aria-label="任务菜单"
-        >
-          <MoreHorizontal size={15} />
-        </button>
+        <h1>{thread?.title ?? "新任务"}</h1>
+        <div className="thread-heading-menu-wrap" ref={taskMenuRef}>
+          <button
+            className="thread-more"
+            disabled={!thread}
+            aria-label="任务菜单"
+            aria-expanded={taskMenuOpen}
+            onClick={() => {
+              setTaskMenuOpen((current) => !current);
+              setMenuOpen(false);
+            }}
+          >
+            <MoreHorizontal size={15} />
+          </button>
+          {taskMenuOpen && thread && (
+            <div className="tool-popover thread-heading-popover" role="menu">
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onOpenLocation();
+                  setTaskMenuOpen(false);
+                }}
+              >
+                <FolderOpen size={14} />
+                <span>在文件管理器中打开</span>
+              </button>
+              <button disabled title="线程重命名 API 尚未实现">
+                <Pencil size={14} />
+                <span>重命名任务</span>
+                <small>未实现</small>
+              </button>
+              <button disabled title="Git 工作树管理尚未实现">
+                <GitFork size={14} />
+                <span>创建工作树</span>
+                <small>未实现</small>
+              </button>
+              <button disabled title="任务归档 API 尚未实现">
+                <Archive size={14} />
+                <span>归档任务</span>
+                <small>未实现</small>
+              </button>
+            </div>
+          )}
+        </div>
       </div>
       <div className="thread-actions">
-        <button
-          className="thread-tool-button"
-          disabled={!thread}
-          title="打开工作区位置；下拉菜单尚未实现"
-          onClick={onOpenLocation}
-        >
-          <PanelRight size={14} />
-          <span>打开位置</span>
-          <ChevronDown size={12} />
-        </button>
+        <div className="thread-tool-menu-wrap" ref={menuRef}>
+          <button
+            className="thread-tool-button"
+            disabled={!thread}
+            aria-expanded={menuOpen}
+            aria-haspopup="menu"
+            onClick={() => {
+              setMenuOpen((current) => !current);
+              setTaskMenuOpen(false);
+            }}
+          >
+            <PanelRight size={14} />
+            <span>打开位置</span>
+            <ChevronDown size={12} />
+          </button>
+          {menuOpen && thread && (
+            <div className="tool-popover thread-tool-popover" role="menu">
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onOpenLocation();
+                  setMenuOpen(false);
+                }}
+              >
+                <FolderOpen size={14} />
+                <span>文件管理器</span>
+              </button>
+              <button role="menuitem" onClick={() => selectTool("terminal")}>
+                <TerminalSquare size={14} />
+                <span>终端</span>
+              </button>
+              <button disabled title="VS Code 启动集成尚未实现">
+                <FileCode2 size={14} />
+                <span>VS Code</span>
+                <small>未实现</small>
+              </button>
+              <button disabled title="Git Bash 启动集成尚未实现">
+                <GitBranch size={14} />
+                <span>Git Bash</span>
+                <small>未实现</small>
+              </button>
+              <button disabled title="WSL 启动集成尚未实现">
+                <Cloud size={14} />
+                <span>WSL</span>
+                <small>未实现</small>
+              </button>
+              <div className="tool-popover-separator" />
+              <button role="menuitem" onClick={() => selectTool("files")}>
+                <Folder size={14} />
+                <span>文件工具</span>
+              </button>
+              <button role="menuitem" onClick={() => selectTool("diff")}>
+                <GitBranch size={14} />
+                <span>审查变更</span>
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1684,16 +2249,20 @@ function MessageList({
         )
         .join("")
     : "";
+  const completedToolSteps = activeTurnId
+    ? events.filter(
+        (event) =>
+          event.turnId === activeTurnId &&
+          event.payload.type === "tool_call_finished",
+      ).length
+    : 0;
   return (
     <div className="message-list">
       {messages.length === 0 ? (
         <div className="empty-thread">
           <Bot size={42} />
-          <h2>Ready for a coding task</h2>
-          <p>
-            The MVP agent can create turns, inspect the workspace root, emit
-            tool events, and persist history.
-          </p>
+          <h2>等待第一个任务指令</h2>
+          <p>当前任务尚未产生消息。</p>
         </div>
       ) : (
         messages.map((message) => (
@@ -1708,20 +2277,18 @@ function MessageList({
       )}
       {streamingText && (
         <article className="message assistant streaming-message">
-          <div className="message-avatar">A</div>
           <div className="message-body">
-            <div className="message-meta">
-              <strong>OpenTopia</strong>
-              <Loader2 size={13} className="spin" />
-            </div>
             <p className="message-text">{streamingText}</p>
           </div>
         </article>
       )}
       {activeTurnId && (
-        <div className="event-strip">
-          <Activity size={14} />
-          <span>Agent is working</span>
+        <div className="agent-progress" role="status">
+          <Loader2 size={14} className="spin" />
+          <span>{streamingText ? "正在生成回复" : "正在思考"}</span>
+          {completedToolSteps > 0 && (
+            <small>已完成 {completedToolSteps} 个工具步骤</small>
+          )}
         </div>
       )}
     </div>
@@ -1741,14 +2308,7 @@ function MessageBubble({
 }) {
   return (
     <article className={`message ${message.role}`}>
-      <div className="message-avatar">
-        {message.role === "user" ? "U" : "A"}
-      </div>
       <div className="message-body">
-        <div className="message-meta">
-          <strong>{message.role === "user" ? "You" : "OpenTopia"}</strong>
-          <span>{formatTime(message.createdAt)}</span>
-        </div>
         {message.parts.map((part, index) => (
           <MessagePartView
             key={index}
@@ -1854,21 +2414,153 @@ function Composer({
   isRunning,
   model,
   permissionMode,
+  workspaceRoot,
+  projectName,
+  recentWorkspaces,
+  canOpenThreadTools = false,
   onChange,
   onSubmit,
   onCancel,
+  onOpenTool,
+  onPickWorkspace,
+  onSelectWorkspace,
+  onChangePermissionMode,
 }: {
   value: string;
   isSending: boolean;
   isRunning: boolean;
   model: string;
   permissionMode: AppSettings["permissionMode"];
+  workspaceRoot: string | null;
+  projectName: string | null;
+  recentWorkspaces: RecentWorkspace[];
+  canOpenThreadTools?: boolean;
   onChange(value: string): void;
   onSubmit(): void;
   onCancel(): void;
+  onOpenTool(kind: ToolTabKind): void;
+  onPickWorkspace(): void;
+  onSelectWorkspace(workspaceRoot: string): void;
+  onChangePermissionMode(mode: AppSettings["permissionMode"]): void;
 }) {
+  const [openMenu, setOpenMenu] = useState<
+    "actions" | "permission" | "model" | "workspace" | "environment" | null
+  >(null);
+  const popoverRef = useDismissiblePopover(Boolean(openMenu), () =>
+    setOpenMenu(null),
+  );
+
   return (
-    <div className="composer">
+    <div
+      className={`composer ${workspaceRoot || projectName ? "has-context" : ""}`}
+      ref={popoverRef}
+    >
+      {(workspaceRoot || projectName) && (
+        <div className="composer-context">
+          <div className="composer-menu-wrap">
+            <button
+              className="composer-context-button"
+              type="button"
+              title={workspaceRoot ?? projectName ?? "项目"}
+              aria-expanded={openMenu === "workspace"}
+              onClick={() =>
+                setOpenMenu((current) =>
+                  current === "workspace" ? null : "workspace",
+                )
+              }
+            >
+              <Folder size={12} />
+              <span>{projectName ?? workspaceName(workspaceRoot ?? "")}</span>
+              <ChevronDown size={11} />
+            </button>
+            {openMenu === "workspace" && (
+              <div className="tool-popover workspace-popover" role="menu">
+                <div className="tool-popover-note">
+                  <strong>选择工作区</strong>
+                  <span>当前任务将使用所选文件夹</span>
+                </div>
+                {recentWorkspaces.map((workspace) => (
+                  <button
+                    key={workspace.workspaceRoot}
+                    role="menuitemradio"
+                    aria-checked={workspace.workspaceRoot === workspaceRoot}
+                    onClick={() => {
+                      onSelectWorkspace(workspace.workspaceRoot);
+                      setOpenMenu(null);
+                    }}
+                  >
+                    {workspace.workspaceRoot === workspaceRoot ? (
+                      <Check size={13} />
+                    ) : (
+                      <Folder size={13} />
+                    )}
+                    <span>{workspace.name}</span>
+                  </button>
+                ))}
+                <div className="tool-popover-separator" />
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onPickWorkspace();
+                    setOpenMenu(null);
+                  }}
+                >
+                  <FolderOpen size={14} />
+                  <span>选择其他文件夹</span>
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="composer-menu-wrap">
+            <button
+              className="composer-context-button"
+              type="button"
+              aria-expanded={openMenu === "environment"}
+              onClick={() =>
+                setOpenMenu((current) =>
+                  current === "environment" ? null : "environment",
+                )
+              }
+            >
+              <TerminalSquare size={12} />
+              <span>本地</span>
+              <ChevronDown size={11} />
+            </button>
+            {openMenu === "environment" && (
+              <div className="tool-popover environment-popover" role="menu">
+                <button
+                  className="active"
+                  role="menuitemradio"
+                  aria-checked
+                  onClick={() => setOpenMenu(null)}
+                >
+                  <Check size={13} />
+                  <span>在本地处理</span>
+                </button>
+                <button disabled title="Git 工作树创建尚未实现">
+                  <GitFork size={14} />
+                  <span>新工作树</span>
+                  <small>未实现</small>
+                </button>
+                <button disabled title="远程执行环境尚未实现">
+                  <Cloud size={14} />
+                  <span>云环境</span>
+                  <small>未实现</small>
+                </button>
+              </div>
+            )}
+          </div>
+          <button
+            className="composer-context-button"
+            type="button"
+            disabled
+            title="分支读取尚未实现"
+          >
+            <GitBranch size={12} />
+            <span>分支未接入</span>
+          </button>
+        </div>
+      )}
       <textarea
         value={value}
         aria-label="消息"
@@ -1882,21 +2574,148 @@ function Composer({
         }}
       />
       <div className="composer-toolbar">
-        <button
-          className="composer-icon-button"
-          disabled
-          title="添加上下文 · 未实现"
-          aria-label="添加上下文"
-        >
-          <Plus size={16} />
-        </button>
-        <span className="composer-mode">
-          {permissionModeLabel(permissionMode)}
-        </span>
-        <div className="composer-meta">
-          <span title={model}>{model}</span>
-          <span>较高</span>
-          <ChevronDown size={12} />
+        <div className="composer-menu-wrap">
+          <button
+            className="composer-icon-button"
+            type="button"
+            title="添加上下文或打开工具"
+            aria-label="添加上下文或打开工具"
+            aria-expanded={openMenu === "actions"}
+            onClick={() =>
+              setOpenMenu((current) =>
+                current === "actions" ? null : "actions",
+              )
+            }
+          >
+            <Plus size={16} />
+          </button>
+          {openMenu === "actions" && (
+            <div className="tool-popover composer-actions-popover" role="menu">
+              <button
+                role="menuitem"
+                disabled={!canOpenThreadTools}
+                title={canOpenThreadTools ? undefined : "创建任务后可浏览文件"}
+                onClick={() => {
+                  onPickWorkspace();
+                  setOpenMenu(null);
+                }}
+              >
+                <Folder size={14} />
+                <span>选择工作区</span>
+              </button>
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onOpenTool("files");
+                  setOpenMenu(null);
+                }}
+              >
+                <FileText size={14} />
+                <span>文件和文件夹</span>
+                {!canOpenThreadTools && <small>创建任务后</small>}
+              </button>
+              <button
+                role="menuitem"
+                disabled={!canOpenThreadTools}
+                title={canOpenThreadTools ? undefined : "创建任务后可打开终端"}
+                onClick={() => {
+                  onOpenTool("terminal");
+                  setOpenMenu(null);
+                }}
+              >
+                <TerminalSquare size={14} />
+                <span>终端</span>
+                {!canOpenThreadTools && <small>创建任务后</small>}
+              </button>
+              <button
+                role="menuitem"
+                disabled={!canOpenThreadTools}
+                title={canOpenThreadTools ? undefined : "创建任务后可审查变更"}
+                onClick={() => {
+                  onOpenTool("diff");
+                  setOpenMenu(null);
+                }}
+              >
+                <GitBranch size={14} />
+                <span>审查变更</span>
+                {!canOpenThreadTools && <small>创建任务后</small>}
+              </button>
+              <button disabled title="图片附件协议尚未实现">
+                <Plus size={14} />
+                <span>添加图片</span>
+                <small>未实现</small>
+              </button>
+              <button disabled title="Skill 选择协议尚未实现">
+                <Plug size={14} />
+                <span>Skills</span>
+                <small>未实现</small>
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="composer-menu-wrap">
+          <button
+            className="composer-mode"
+            type="button"
+            aria-expanded={openMenu === "permission"}
+            onClick={() =>
+              setOpenMenu((current) =>
+                current === "permission" ? null : "permission",
+              )
+            }
+          >
+            {permissionModeLabel(permissionMode)}
+          </button>
+          {openMenu === "permission" && (
+            <div className="tool-popover permission-popover" role="menu">
+              {permissionModeOptions.map((option) => (
+                <button
+                  className={permissionMode === option.value ? "active" : ""}
+                  key={option.value}
+                  role="menuitemradio"
+                  aria-checked={permissionMode === option.value}
+                  onClick={() => {
+                    onChangePermissionMode(option.value);
+                    setOpenMenu(null);
+                  }}
+                >
+                  {permissionMode === option.value ? (
+                    <Check size={13} />
+                  ) : (
+                    <span className="menu-icon-spacer" />
+                  )}
+                  <span>{option.label}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="composer-menu-wrap composer-meta-wrap">
+          <button
+            className="composer-meta"
+            type="button"
+            aria-expanded={openMenu === "model"}
+            onClick={() =>
+              setOpenMenu((current) => (current === "model" ? null : "model"))
+            }
+          >
+            <span title={model}>{model}</span>
+            <span>默认推理</span>
+            <ChevronDown size={12} />
+          </button>
+          {openMenu === "model" && (
+            <div className="tool-popover model-popover" role="menu">
+              <div className="tool-popover-note">
+                <strong>{model}</strong>
+                <span>当前 Provider 模型</span>
+              </div>
+              <button disabled title="单任务模型与推理强度尚未实现">
+                <Activity size={14} />
+                <span>模型与推理强度</span>
+                <small>使用全局配置</small>
+              </button>
+            </div>
+          )}
         </div>
       </div>
       <button
@@ -1917,6 +2736,17 @@ function Composer({
   );
 }
 
+const permissionModeOptions: Array<{
+  value: AppSettings["permissionMode"];
+  label: string;
+}> = [
+  { value: "chat", label: "仅聊天" },
+  { value: "read_only", label: "只读" },
+  { value: "auto", label: "自动" },
+  { value: "approve", label: "需要审批" },
+  { value: "full_access", label: "完全访问" },
+];
+
 function permissionModeLabel(mode: AppSettings["permissionMode"]): string {
   switch (mode) {
     case "full_access":
@@ -1933,6 +2763,9 @@ function permissionModeLabel(mode: AppSettings["permissionMode"]): string {
 }
 
 function RightPanel({
+  toolTabs,
+  activeToolTab,
+  conversationCollapsed,
   thread,
   workspaceRoot,
   events,
@@ -1967,7 +2800,14 @@ function RightPanel({
   onRevertDiffFile,
   onApplyDiffHunk,
   onGetArtifact,
+  onOpenToolTab,
+  onActivateToolTab,
+  onCloseToolTab,
+  onToggleConversation,
 }: {
+  toolTabs: ToolTab[];
+  activeToolTab: ToolTab | null;
+  conversationCollapsed: boolean;
   thread: Thread | null;
   workspaceRoot: string | null;
   events: AgentEvent[];
@@ -2014,11 +2854,86 @@ function RightPanel({
     action: WorkspaceDiffHunkAction,
   ): void;
   onGetArtifact(threadId: string, artifactId: string): Promise<ArtifactContent>;
+  onOpenToolTab(kind: ToolTabKind): void;
+  onActivateToolTab(tabId: string): void;
+  onCloseToolTab(tabId: string): void;
+  onToggleConversation(): void;
 }) {
   const changedFiles = workspaceDiff?.files.length ?? 0;
   const enabledMcpServers = threadMcpServers.filter(
     (server) => server.enabled,
   ).length;
+
+  const renderWorkbench = (
+    mode: "panel" | "stage",
+    activeTab?: WorkbenchTab,
+  ) => (
+    <WorkbenchPanel
+      mode={mode}
+      activeTab={activeTab}
+      thread={thread}
+      workspaceRoot={workspaceRoot}
+      events={events}
+      terminalEvents={terminalEvents}
+      terminalSession={terminalSession}
+      workspaceTree={workspaceTree}
+      filePreview={filePreview}
+      workspaceDiff={workspaceDiff}
+      sandbox={sandbox}
+      mcpServers={mcpServers}
+      threadMcpServers={threadMcpServers}
+      workbenchError={workbenchError}
+      isRefreshingWorkbench={isRefreshingWorkbench}
+      decidingApprovalId={decidingApprovalId}
+      artifacts={artifacts}
+      contextStatus={contextStatus}
+      isCompactingContext={isCompactingContext}
+      revertingDiffPath={revertingDiffPath}
+      hunkActionKey={hunkActionKey}
+      onDecideApproval={onDecideApproval}
+      onRefreshWorkbench={onRefreshWorkbench}
+      onOpenWorkspacePath={onOpenWorkspacePath}
+      onOpenWorkspaceEntry={onOpenWorkspaceEntry}
+      onToggleThreadMcp={onToggleThreadMcp}
+      onOpenPath={onOpenWorkspace}
+      onEnsureTerminalSession={onEnsureTerminalSession}
+      onWriteTerminalSession={onWriteTerminalSession}
+      onResizeTerminalSession={onResizeTerminalSession}
+      onCloseTerminalSession={onCloseTerminalSession}
+      onCompactContext={onCompactContext}
+      onOpenArtifact={onOpenArtifact}
+      onRevertDiffFile={onRevertDiffFile}
+      onApplyDiffHunk={onApplyDiffHunk}
+      onGetArtifact={onGetArtifact}
+    />
+  );
+
+  if (activeToolTab) {
+    return (
+      <aside className="right-panel tool-stage">
+        <ToolTabStrip
+          tabs={toolTabs}
+          activeTabId={activeToolTab.id}
+          onActivate={onActivateToolTab}
+          onClose={onCloseToolTab}
+          onOpen={onOpenToolTab}
+          conversationCollapsed={conversationCollapsed}
+          onToggleConversation={onToggleConversation}
+        />
+        <div className="tool-stage-body">
+          {activeToolTab.kind === "browser" ? (
+            <UnavailableToolState
+              icon={Globe2}
+              title="内置浏览器尚未实现"
+              description="录屏中的网页标签需要独立的 Electron BrowserView 安全边界、导航策略和会话隔离。入口已经保留，当前不会伪造网页执行结果。"
+            />
+          ) : (
+            renderWorkbench("stage", activeToolTab.kind)
+          )}
+        </div>
+      </aside>
+    );
+  }
 
   return (
     <aside className="right-panel">
@@ -2030,30 +2945,30 @@ function RightPanel({
           </button>
         </header>
         <div className="environment-facts">
-          <div>
+          <button type="button" onClick={() => onOpenToolTab("diff")}>
             <FileCode2 size={14} />
             <span>变更</span>
             <strong>{changedFiles}</strong>
-          </div>
-          <div>
+          </button>
+          <button type="button" onClick={() => onOpenToolTab("terminal")}>
             <TerminalSquare size={14} />
             <span>本地</span>
             <strong>{terminalSession ? "已连接" : "待连接"}</strong>
-          </div>
-          <div>
+          </button>
+          <button type="button" onClick={() => onOpenToolTab("extensions")}>
             <Plug size={14} />
             <span>MCP</span>
             <strong>
               {enabledMcpServers}/{mcpServers.length}
             </strong>
-          </div>
-          <div>
+          </button>
+          <button type="button" onClick={() => onOpenToolTab("files")}>
             <GitBranch size={14} />
             <span>工作区</span>
             <strong title={workspaceRoot ?? ""}>
               {workspaceRoot ? workspaceName(workspaceRoot) : "未选择"}
             </strong>
-          </div>
+          </button>
         </div>
         <div className="environment-disabled-actions">
           <button disabled title="提交或推送 · 未实现">
@@ -2078,60 +2993,235 @@ function RightPanel({
           </button>
         </div>
       </section>
-      <WorkbenchPanel
-        thread={thread}
-        workspaceRoot={workspaceRoot}
-        events={events}
-        terminalEvents={terminalEvents}
-        terminalSession={terminalSession}
-        workspaceTree={workspaceTree}
-        filePreview={filePreview}
-        workspaceDiff={workspaceDiff}
-        sandbox={sandbox}
-        mcpServers={mcpServers}
-        threadMcpServers={threadMcpServers}
-        workbenchError={workbenchError}
-        isRefreshingWorkbench={isRefreshingWorkbench}
-        decidingApprovalId={decidingApprovalId}
-        artifacts={artifacts}
-        contextStatus={contextStatus}
-        isCompactingContext={isCompactingContext}
-        revertingDiffPath={revertingDiffPath}
-        hunkActionKey={hunkActionKey}
-        onDecideApproval={onDecideApproval}
-        onRefreshWorkbench={onRefreshWorkbench}
-        onOpenWorkspacePath={onOpenWorkspacePath}
-        onOpenWorkspaceEntry={onOpenWorkspaceEntry}
-        onToggleThreadMcp={onToggleThreadMcp}
-        onOpenPath={onOpenWorkspace}
-        onEnsureTerminalSession={onEnsureTerminalSession}
-        onWriteTerminalSession={onWriteTerminalSession}
-        onResizeTerminalSession={onResizeTerminalSession}
-        onCloseTerminalSession={onCloseTerminalSession}
-        onCompactContext={onCompactContext}
-        onOpenArtifact={onOpenArtifact}
-        onRevertDiffFile={onRevertDiffFile}
-        onApplyDiffHunk={onApplyDiffHunk}
-        onGetArtifact={onGetArtifact}
-      />
+      {renderWorkbench("panel")}
     </aside>
   );
 }
 
-function EmptyState({ onNew }: { onNew(): void }) {
+function ToolTabStrip({
+  tabs,
+  activeTabId,
+  onActivate,
+  onClose,
+  onOpen,
+  conversationCollapsed,
+  onToggleConversation,
+}: {
+  tabs: ToolTab[];
+  activeTabId: string;
+  onActivate(tabId: string): void;
+  onClose(tabId: string): void;
+  onOpen(kind: ToolTabKind): void;
+  conversationCollapsed: boolean;
+  onToggleConversation(): void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
+
+  function open(kind: ToolTabKind) {
+    onOpen(kind);
+    setMenuOpen(false);
+  }
+
   return (
-    <div className="empty-state">
-      <Bot size={48} />
-      <h2>Create your first thread</h2>
-      <p>
-        OpenTopia will store every message, tool call, and event for replay and
-        audit.
-      </p>
-      <button className="new-thread large" onClick={onNew}>
-        <Plus size={16} />
-        New Thread
+    <div className="tool-tab-strip">
+      <div className="tool-tab-list" role="tablist" aria-label="工作工具">
+        {tabs.map((tab) => {
+          const Icon = toolTabIcon(tab.kind);
+          return (
+            <div
+              className={`tool-stage-tab ${tab.id === activeTabId ? "active" : ""}`}
+              key={tab.id}
+              role="tab"
+              aria-selected={tab.id === activeTabId}
+            >
+              <button
+                className="tool-tab-main"
+                type="button"
+                onClick={() => onActivate(tab.id)}
+              >
+                <Icon size={13} />
+                <span>{tab.title}</span>
+              </button>
+              <button
+                className="tool-tab-close"
+                type="button"
+                aria-label={`关闭 ${tab.title}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onClose(tab.id);
+                }}
+              >
+                <X size={12} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      <button
+        className="tool-tab-layout-toggle"
+        type="button"
+        title={conversationCollapsed ? "显示对话" : "隐藏对话"}
+        aria-label={conversationCollapsed ? "显示对话" : "隐藏对话"}
+        onClick={onToggleConversation}
+      >
+        {conversationCollapsed ? (
+          <PanelLeftOpen size={14} />
+        ) : (
+          <PanelLeftClose size={14} />
+        )}
       </button>
+      <div className="tool-tab-add-wrap" ref={menuRef}>
+        <button
+          className="tool-tab-add"
+          type="button"
+          title="打开工具"
+          aria-label="打开工具"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((current) => !current)}
+        >
+          <Plus size={14} />
+        </button>
+        {menuOpen && (
+          <div className="tool-popover tool-tab-add-popover" role="menu">
+            {toolTabKinds.map((kind) => {
+              const Icon = toolTabIcon(kind);
+              return (
+                <button key={kind} role="menuitem" onClick={() => open(kind)}>
+                  <Icon size={14} />
+                  <span>{toolTabTitle(kind)}</span>
+                  {kind === "browser" && <small>未实现</small>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
+  );
+}
+
+function UnavailableToolState({
+  icon: Icon,
+  title,
+  description,
+}: {
+  icon: typeof Folder;
+  title: string;
+  description: string;
+}) {
+  return (
+    <div className="unavailable-tool-state">
+      <Icon size={34} />
+      <h2>{title}</h2>
+      <p>{description}</p>
+      <span>未实现</span>
+    </div>
+  );
+}
+
+function NewTaskState({
+  value,
+  workspaceRoot,
+  projectName,
+  recentWorkspaces,
+  model,
+  permissionMode,
+  isSending,
+  onChange,
+  onPickWorkspace,
+  onSelectWorkspace,
+  onOpenTool,
+  onChangePermissionMode,
+  onSubmit,
+}: {
+  value: string;
+  workspaceRoot: string | null;
+  projectName: string | null;
+  recentWorkspaces: RecentWorkspace[];
+  model: string;
+  permissionMode: AppSettings["permissionMode"];
+  isSending: boolean;
+  onChange(value: string): void;
+  onPickWorkspace(): void;
+  onSelectWorkspace(workspaceRoot: string): void;
+  onOpenTool(kind: ToolTabKind): void;
+  onChangePermissionMode(mode: AppSettings["permissionMode"]): void;
+  onSubmit(): void;
+}) {
+  const suggestions = [
+    {
+      icon: Search,
+      label: "探索并理解代码",
+      prompt: "分析这个项目的架构和核心模块",
+    },
+    {
+      icon: FileCode2,
+      label: "构建新功能",
+      prompt: "为这个项目实现一个新功能",
+    },
+    {
+      icon: Check,
+      label: "审查代码更改",
+      prompt: "审查当前工作区中的代码更改",
+    },
+    { icon: Activity, label: "修复问题", prompt: "检查并修复当前项目中的问题" },
+  ];
+
+  return (
+    <>
+      <div className="new-task-state">
+        <Bot size={34} />
+        <h2>
+          我们应该在{" "}
+          <u>
+            {projectName ??
+              (workspaceRoot ? workspaceName(workspaceRoot) : "项目")}
+          </u>{" "}
+          中构建什么？
+        </h2>
+        <div className="task-suggestions">
+          {suggestions.map((suggestion) => {
+            const Icon = suggestion.icon;
+            return (
+              <button
+                key={suggestion.label}
+                type="button"
+                onClick={() => onChange(suggestion.prompt)}
+              >
+                <Icon size={15} />
+                <span>{suggestion.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        {!workspaceRoot && (
+          <button className="workspace-picker-button" onClick={onPickWorkspace}>
+            <Folder size={15} />
+            选择项目文件夹
+          </button>
+        )}
+      </div>
+      <Composer
+        value={value}
+        isSending={isSending}
+        isRunning={false}
+        model={model}
+        permissionMode={permissionMode}
+        workspaceRoot={workspaceRoot}
+        projectName={
+          projectName ?? (workspaceRoot ? workspaceName(workspaceRoot) : null)
+        }
+        recentWorkspaces={recentWorkspaces}
+        onChange={onChange}
+        onSubmit={onSubmit}
+        onCancel={() => undefined}
+        onOpenTool={onOpenTool}
+        onPickWorkspace={onPickWorkspace}
+        onSelectWorkspace={onSelectWorkspace}
+        onChangePermissionMode={onChangePermissionMode}
+      />
+    </>
   );
 }
 
@@ -2227,6 +3317,38 @@ type ArtifactReference = {
   kind?: string;
   bytes?: number;
 };
+
+type LocalProject = {
+  id: string;
+  name: string;
+};
+
+const localProjectsStorageKey = "opentopia.localProjects";
+
+function readLocalProjects(): LocalProject[] {
+  try {
+    const parsed = JSON.parse(
+      window.localStorage.getItem(localProjectsStorageKey) ?? "[]",
+    );
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((project): project is LocalProject =>
+      Boolean(
+        project &&
+        typeof project.id === "string" &&
+        typeof project.name === "string",
+      ),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalProjects(projects: LocalProject[]) {
+  window.localStorage.setItem(
+    localProjectsStorageKey,
+    JSON.stringify(projects),
+  );
+}
 
 function collectArtifactReferences(
   metadata: unknown,
@@ -2334,16 +3456,56 @@ function formatBytes(value: number): string {
   return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
+const toolTabKinds: ToolTabKind[] = [
+  "files",
+  "terminal",
+  "diff",
+  "extensions",
+  "sandbox",
+  "browser",
+];
+
+function toolTabTitle(kind: ToolTabKind): string {
+  switch (kind) {
+    case "files":
+      return "文件";
+    case "terminal":
+      return "终端";
+    case "diff":
+      return "审查";
+    case "extensions":
+      return "MCP";
+    case "sandbox":
+      return "沙箱";
+    case "browser":
+      return "浏览器";
+  }
+}
+
+function toolTabIcon(kind: ToolTabKind): typeof Folder {
+  switch (kind) {
+    case "files":
+      return Folder;
+    case "terminal":
+      return TerminalSquare;
+    case "diff":
+      return GitBranch;
+    case "extensions":
+      return Plug;
+    case "sandbox":
+      return Box;
+    case "browser":
+      return Globe2;
+  }
+}
+
+function threadTitleFromPrompt(prompt: string): string {
+  const title = prompt.replace(/\s+/g, " ").trim();
+  return title.length > 32 ? `${title.slice(0, 31)}…` : title;
+}
+
 function workspaceName(workspaceRoot: string): string {
   const trimmed = workspaceRoot.replace(/[\\\/]+$/, "");
   const parts = trimmed.split(/[\\\/]/).filter(Boolean);
   return parts.at(-1) || workspaceRoot;
-}
-
-function formatTime(value: string): string {
-  return new Date(value).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
 }

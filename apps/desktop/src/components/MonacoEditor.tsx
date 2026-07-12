@@ -1,11 +1,17 @@
-import { Editor } from "@monaco-editor/react";
+import { lazy, Suspense } from "react";
 
-type MonacoEditorProps = {
+export type MonacoEditorProps = {
   value: string;
   onChange?: (value: string) => void;
   language?: string;
   readOnly?: boolean;
 };
+
+const MonacoEditorImpl = lazy(() =>
+  import("./MonacoEditorImpl").then((module) => ({
+    default: module.MonacoEditorImpl,
+  })),
+);
 
 const languageMap: Record<string, string> = {
   ts: "typescript",
@@ -35,33 +41,12 @@ export function detectLanguage(filePath: string): string | undefined {
   return ext ? languageMap[ext] : undefined;
 }
 
-export function MonacoEditor({
-  value,
-  onChange,
-  language,
-  readOnly = false,
-}: MonacoEditorProps) {
+export function MonacoEditor(props: MonacoEditorProps) {
   return (
     <div className="monaco-editor-wrapper">
-      <Editor
-        value={value}
-        onChange={(v) => onChange?.(v ?? "")}
-        language={language}
-        theme="vs-dark"
-        options={{
-          readOnly,
-          minimap: { enabled: false },
-          fontSize: 13,
-          lineNumbers: "on",
-          scrollBeyondLastLine: false,
-          wordWrap: "off",
-          automaticLayout: true,
-          tabSize: 2,
-          renderWhitespace: "selection",
-          padding: { top: 8, bottom: 8 },
-        }}
-        loading={<span className="muted">Loading editor...</span>}
-      />
+      <Suspense fallback={<span className="muted">Loading editor...</span>}>
+        <MonacoEditorImpl {...props} />
+      </Suspense>
     </div>
   );
 }

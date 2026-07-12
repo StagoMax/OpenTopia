@@ -43,9 +43,12 @@ import { detectLanguage, MonacoEditor } from "./MonacoEditor";
 import type { XtermTerminalHandle } from "./XtermTerminal";
 import { XtermTerminal } from "./XtermTerminal";
 
-type WorkbenchTab = "files" | "diff" | "terminal" | "extensions" | "sandbox";
+export type WorkbenchTab =
+  "files" | "diff" | "terminal" | "extensions" | "sandbox";
 
 type WorkbenchPanelProps = {
+  mode?: "panel" | "stage";
+  activeTab?: WorkbenchTab;
   thread: Thread | null;
   workspaceRoot: string | null;
   events: AgentEvent[];
@@ -107,6 +110,8 @@ const tabs: Array<{
 ];
 
 export function WorkbenchPanel({
+  mode = "panel",
+  activeTab: controlledActiveTab,
   thread,
   workspaceRoot,
   events,
@@ -142,7 +147,9 @@ export function WorkbenchPanel({
   onApplyDiffHunk,
   onGetArtifact,
 }: WorkbenchPanelProps) {
-  const [activeTab, setActiveTab] = useState<WorkbenchTab>("files");
+  const [internalActiveTab, setInternalActiveTab] =
+    useState<WorkbenchTab>("files");
+  const activeTab = controlledActiveTab ?? internalActiveTab;
   const shownWorkspaceRoot = workspaceRoot ?? thread?.workspaceRoot ?? null;
   const latestApproval = [...events]
     .reverse()
@@ -151,6 +158,62 @@ export function WorkbenchPanel({
     latestApproval?.payload.type === "approval_requested"
       ? latestApproval.payload
       : null;
+
+  const tabContent = (
+    <>
+      {activeTab === "files" && (
+        <FilesView
+          workspaceRoot={shownWorkspaceRoot}
+          workspaceTree={workspaceTree}
+          filePreview={filePreview}
+          isRefreshing={isRefreshingWorkbench}
+          onRefresh={onRefreshWorkbench}
+          onOpenWorkspacePath={onOpenWorkspacePath}
+          onOpenWorkspaceEntry={onOpenWorkspaceEntry}
+          onOpenPath={onOpenPath}
+        />
+      )}
+      {activeTab === "diff" && (
+        <DiffView
+          workspaceDiff={workspaceDiff}
+          revertingDiffPath={revertingDiffPath}
+          hunkActionKey={hunkActionKey}
+          onRevertDiffFile={onRevertDiffFile}
+          onApplyDiffHunk={onApplyDiffHunk}
+        />
+      )}
+      {activeTab === "terminal" && (
+        <TerminalView
+          thread={thread}
+          events={events}
+          terminalEvents={terminalEvents}
+          terminalSession={terminalSession}
+          onEnsureSession={onEnsureTerminalSession}
+          onWriteSession={onWriteTerminalSession}
+          onResizeSession={onResizeTerminalSession}
+          onCloseSession={onCloseTerminalSession}
+          onOpenArtifact={onOpenArtifact}
+        />
+      )}
+      {activeTab === "extensions" && (
+        <ExtensionsView
+          mcpServers={mcpServers}
+          threadMcpServers={threadMcpServers}
+          onToggleThreadMcp={onToggleThreadMcp}
+        />
+      )}
+      {activeTab === "sandbox" && <SandboxView sandbox={sandbox} />}
+    </>
+  );
+
+  if (mode === "stage") {
+    return (
+      <section className="workbench-stage-panel">
+        {workbenchError && <p className="workspace-error">{workbenchError}</p>}
+        <div className="workbench-tab-panel stage">{tabContent}</div>
+      </section>
+    );
+  }
 
   return (
     <>
@@ -206,7 +269,7 @@ export function WorkbenchPanel({
                 role="tab"
                 aria-selected={activeTab === tab.id}
                 title={tab.label}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => setInternalActiveTab(tab.id)}
               >
                 <Icon size={14} />
                 <span>{tab.label}</span>
@@ -215,50 +278,7 @@ export function WorkbenchPanel({
           })}
         </div>
 
-        <div className="workbench-tab-panel">
-          {activeTab === "files" && (
-            <FilesView
-              workspaceRoot={shownWorkspaceRoot}
-              workspaceTree={workspaceTree}
-              filePreview={filePreview}
-              isRefreshing={isRefreshingWorkbench}
-              onRefresh={onRefreshWorkbench}
-              onOpenWorkspacePath={onOpenWorkspacePath}
-              onOpenWorkspaceEntry={onOpenWorkspaceEntry}
-              onOpenPath={onOpenPath}
-            />
-          )}
-          {activeTab === "diff" && (
-            <DiffView
-              workspaceDiff={workspaceDiff}
-              revertingDiffPath={revertingDiffPath}
-              hunkActionKey={hunkActionKey}
-              onRevertDiffFile={onRevertDiffFile}
-              onApplyDiffHunk={onApplyDiffHunk}
-            />
-          )}
-          {activeTab === "terminal" && (
-            <TerminalView
-              thread={thread}
-              events={events}
-              terminalEvents={terminalEvents}
-              terminalSession={terminalSession}
-              onEnsureSession={onEnsureTerminalSession}
-              onWriteSession={onWriteTerminalSession}
-              onResizeSession={onResizeTerminalSession}
-              onCloseSession={onCloseTerminalSession}
-              onOpenArtifact={onOpenArtifact}
-            />
-          )}
-          {activeTab === "extensions" && (
-            <ExtensionsView
-              mcpServers={mcpServers}
-              threadMcpServers={threadMcpServers}
-              onToggleThreadMcp={onToggleThreadMcp}
-            />
-          )}
-          {activeTab === "sandbox" && <SandboxView sandbox={sandbox} />}
-        </div>
+        <div className="workbench-tab-panel">{tabContent}</div>
       </section>
 
       <ArtifactGallery
@@ -1230,7 +1250,11 @@ function SandboxView({ sandbox }: { sandbox: SandboxDescriptor | null }) {
         <span>{sandbox.kind}</span>
         <span>{sandbox.lifecycle}</span>
         <span>{sandbox.enforced ? "enforced" : sandbox.mode}</span>
-        <span>{sandbox.network === "deny" ? "network denied" : `network ${sandbox.network}`}</span>
+        <span>
+          {sandbox.network === "deny"
+            ? "network denied"
+            : `network ${sandbox.network}`}
+        </span>
       </div>
       <dl className="sandbox-details">
         <div>

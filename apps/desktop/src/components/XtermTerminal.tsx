@@ -115,9 +115,15 @@ export const XtermTerminal = forwardRef<
       resizeObserver.disconnect();
       dataDisposable.dispose();
       resizeDisposable.dispose();
-      terminal.dispose();
       terminalRef.current = null;
       fitAddonRef.current = null;
+
+      // Xterm schedules viewport refreshes internally. Let those finish while
+      // its render service is still alive when a tool tab closes quickly.
+      window.setTimeout(() => {
+        fitAddon.dispose();
+        terminal.dispose();
+      }, 100);
     };
   }, [fitTerminal]);
 
