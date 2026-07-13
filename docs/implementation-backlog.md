@@ -267,15 +267,23 @@ Tasks:
 - ~~Implement local environment wrapper.~~ (Done)
 - ~~Move shell/file operations behind the trait.~~ (Done)
 - ~~Add OS-level local sandbox wrapping.~~ Built-in execution and stdio spawn use platform-native wrappers:
-  - Linux: bubblewrap + seccomp (mount namespace + network namespace isolation)
+  - Linux: bubblewrap (mount/process/network namespaces; seccomp/Landlock still pending)
   - macOS: sandbox-exec + Seatbelt profile (path allowlists + port restrictions)
   - Windows: restricted token + integrity level + ACL
 - Implemented now:
-  - `LocalSandboxConfig`, `OsSandboxMode`, `NetworkPolicy`, platform status, and sandbox command plan types.
+  - `SandboxMode` (`read-only` / `workspace-write` / `danger-full-access`) is
+    independent from `OsSandboxMode` (`disabled` / `best-effort` / `enforce`),
+    which now describes only backend fallback behavior.
+  - `writable_roots` extends the workspace boundary without disabling the sandbox;
+    built-in file writes and spawned commands share the same profile.
+  - `.git`, `.agents`, and `.codex` remain protected under writable roots.
+  - Approved sandbox escalation is one-shot: only the suspended call receives an
+    unrestricted execution environment; later calls return to the thread sandbox.
   - Linux/macOS command builders for `bwrap` and `sandbox-exec`.
   - Windows reuses the Apache-2.0 Codex restricted-token/ACL/job-object sandbox
     helpers through `codex sandbox`; the helper binaries and license are staged in
-    Windows installers.
+    Windows installers. `unelevated` is the tested default; `elevated` can be
+    selected but its administrator setup lifecycle still needs release validation.
   - Strict mode fails closed when the backend is unavailable. Status reports
     `ready`, `stopped`, or `error` separately from backend availability.
   - Workspace path canonicalization rejects `..` and symlink/ancestor escapes for
@@ -283,10 +291,16 @@ Tasks:
   - A Windows execution test proves a strict sandbox command cannot write to a
     non-temporary path outside its workspace.
 - Remaining hardening:
+  - Persist sandbox mode/network/writable roots in `AppSettings` and expose a
+    separate composer/settings selector. The current desktop displays effective
+    sandbox state, while changes are configured through environment variables.
   - Run Linux bubblewrap and macOS Seatbelt integration suites on native release
     runners; current cross-platform builders are unit tested but only Windows has
     an end-to-end confinement test in this workspace.
   - Add optional Linux seccomp/Landlock defense in depth.
+  - Linux bwrap remounts existing `.git`/`.agents`/`.codex` paths read-only, but
+    preventing first creation of a missing metadata directory by arbitrary shell
+    commands requires the pending Landlock layer. Built-in file tools already deny it.
 - Add resource limits (CPU/memory/disk quotas).
 - ~~Add stdio session streaming for command observability.~~ (Done at terminal API level)
 - ~~Add cancel/interrupt support for running commands.~~ (Done)
@@ -294,7 +308,8 @@ Tasks:
 Acceptance:
 
 - Shell commands are confined to the workspace by default; network access is blocked or proxied.
-- OS-level sandbox adds < 10ms overhead per command.
+- Measure and publish per-platform startup overhead; do not use a single `<10ms`
+  target for bwrap, Seatbelt, and Windows native sandbox backends.
 - Docker implementation can be added without rewriting tool APIs.
 
 ### Docker/Remote Sandbox (Optional Backend)

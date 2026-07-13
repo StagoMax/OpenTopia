@@ -578,13 +578,17 @@ function createBackendEnv(repoRoot, options = {}) {
     if (sandbox.exists) {
       env.OPENTOPIA_CODEX_SANDBOX_BIN = sandbox.path;
     }
-    env.OPENTOPIA_SANDBOX_MODE =
-      process.env.OPENTOPIA_SANDBOX_MODE || (isDev ? "best_effort" : "enforce");
-    env.OPENTOPIA_SANDBOX_NETWORK =
-      process.env.OPENTOPIA_SANDBOX_NETWORK || "deny";
-    env.OPENTOPIA_SANDBOX_HOME =
-      process.env.OPENTOPIA_SANDBOX_HOME ||
-      path.join(app.getPath("userData"), "sandbox");
+    env.OPENTOPIA_SANDBOX_MODE ||= "workspace-write";
+    env.OPENTOPIA_SANDBOX_ENFORCEMENT ||=
+      process.env.OPENTOPIA_SANDBOX_ENFORCEMENT ||
+      (isDev ? "best-effort" : "enforce");
+    env.OPENTOPIA_SANDBOX_NETWORK ||= "deny";
+    env.OPENTOPIA_WINDOWS_SANDBOX ||=
+      process.env.OPENTOPIA_WINDOWS_SANDBOX || "unelevated";
+    env.OPENTOPIA_SANDBOX_HOME ||= path.join(
+      app.getPath("userData"),
+      "sandbox",
+    );
   }
 
   if (process.platform === "win32") {

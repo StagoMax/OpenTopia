@@ -1249,7 +1249,8 @@ function SandboxView({ sandbox }: { sandbox: SandboxDescriptor | null }) {
       <div className="sandbox-status">
         <span>{sandbox.kind}</span>
         <span>{sandbox.lifecycle}</span>
-        <span>{sandbox.enforced ? "enforced" : sandbox.mode}</span>
+        <span>{sandbox.sandboxMode}</span>
+        <span>{sandbox.enforced ? sandbox.mode : "not enforced"}</span>
         <span>
           {sandbox.network === "deny"
             ? "network denied"
@@ -1268,6 +1269,32 @@ function SandboxView({ sandbox }: { sandbox: SandboxDescriptor | null }) {
         <div>
           <dt>Backend</dt>
           <dd>{sandbox.backend ?? `${sandbox.platform} unavailable`}</dd>
+        </div>
+        <div>
+          <dt>Readable roots</dt>
+          <dd title={sandbox.readableRoots.join("\n")}>
+            {sandbox.readableRoots.length
+              ? sandbox.readableRoots.join(", ")
+              : sandbox.sandboxMode === "danger-full-access"
+                ? "unrestricted"
+                : "none"}
+          </dd>
+        </div>
+        <div>
+          <dt>Writable roots</dt>
+          <dd title={sandbox.writableRoots.join("\n")}>
+            {sandbox.writableRoots.length
+              ? sandbox.writableRoots.join(", ")
+              : "none"}
+          </dd>
+        </div>
+        <div>
+          <dt>Protected metadata</dt>
+          <dd title={sandbox.protectedPaths.join("\n")}>
+            {sandbox.protectedPaths.length
+              ? sandbox.protectedPaths.join(", ")
+              : "none"}
+          </dd>
         </div>
         <div>
           <dt>Capabilities</dt>

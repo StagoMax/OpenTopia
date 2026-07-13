@@ -47,6 +47,20 @@ impl Default for NetworkPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl Default for SandboxMode {
+    fn default() -> Self {
+        Self::WorkspaceWrite
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalSandboxConfig {
@@ -60,6 +74,12 @@ pub struct LocalSandboxConfig {
     pub read_paths: Vec<PathBuf>,
     #[serde(default)]
     pub write_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub sandbox_mode: SandboxMode,
+    #[serde(default)]
+    pub writable_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub sandbox_home: Option<PathBuf>,
 }
 
 impl Default for LocalSandboxConfig {
@@ -70,6 +90,9 @@ impl Default for LocalSandboxConfig {
             network: NetworkPolicy::Deny,
             read_paths: Vec::new(),
             write_paths: Vec::new(),
+            sandbox_mode: SandboxMode::WorkspaceWrite,
+            writable_roots: Vec::new(),
+            sandbox_home: None,
         }
     }
 }
@@ -83,6 +106,7 @@ impl LocalSandboxConfig {
         Self {
             enabled: true,
             mode: OsSandboxMode::BestEffort,
+            sandbox_mode: SandboxMode::WorkspaceWrite,
             ..Self::default()
         }
     }
@@ -91,8 +115,32 @@ impl LocalSandboxConfig {
         Self {
             enabled: true,
             mode: OsSandboxMode::Enforce,
+            sandbox_mode: SandboxMode::WorkspaceWrite,
             ..Self::default()
         }
+    }
+
+    pub fn danger_full_access() -> Self {
+        Self {
+            enabled: false,
+            mode: OsSandboxMode::Disabled,
+            network: NetworkPolicy::Allow,
+            sandbox_mode: SandboxMode::DangerFullAccess,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_sandbox_mode(mut self, sandbox_mode: SandboxMode) -> Self {
+        self.sandbox_mode = sandbox_mode;
+        if sandbox_mode == SandboxMode::DangerFullAccess {
+            self.enabled = false;
+            self.mode = OsSandboxMode::Disabled;
+            self.network = NetworkPolicy::Allow;
+        } else if self.mode == OsSandboxMode::Disabled {
+            self.enabled = true;
+            self.mode = OsSandboxMode::Enforce;
+        }
+        self
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -104,17 +152,38 @@ impl LocalSandboxConfig {
     }
 
     pub fn from_env() -> Self {
-        let mode = match std::env::var("OPENTOPIA_SANDBOX_MODE")
-            .unwrap_or_else(|_| "disabled".to_string())
+        let mode_value = std::env::var("OPENTOPIA_SANDBOX_MODE")
+            .unwrap_or_else(|_| "workspace-write".to_string())
             .to_ascii_lowercase()
-            .as_str()
-        {
-            "enforce" | "strict" => OsSandboxMode::Enforce,
-            "best_effort" | "best-effort" => OsSandboxMode::BestEffort,
-            _ => OsSandboxMode::Disabled,
+            .replace('_', "-");
+        let (legacy_enforcement, sandbox_mode) = match mode_value.as_str() {
+            "enforce" | "strict" => (Some(OsSandboxMode::Enforce), SandboxMode::WorkspaceWrite),
+            "best-effort" => (Some(OsSandboxMode::BestEffort), SandboxMode::WorkspaceWrite),
+            "disabled" => (Some(OsSandboxMode::Disabled), SandboxMode::DangerFullAccess),
+            "read-only" => (None, SandboxMode::ReadOnly),
+            "workspace-write" => (None, SandboxMode::WorkspaceWrite),
+            "danger-full-access" => (None, SandboxMode::DangerFullAccess),
+            _ => (Some(OsSandboxMode::Enforce), SandboxMode::ReadOnly),
         };
-        let network = match std::env::var("OPENTOPIA_SANDBOX_NETWORK")
-            .unwrap_or_else(|_| "deny".to_string())
+        let mode = std::env::var("OPENTOPIA_SANDBOX_ENFORCEMENT")
+            .ok()
+            .and_then(|value| parse_enforcement_mode(&value))
+            .or(legacy_enforcement)
+            .unwrap_or_else(|| {
+                if sandbox_mode == SandboxMode::DangerFullAccess {
+                    OsSandboxMode::Disabled
+                } else {
+                    OsSandboxMode::Enforce
+                }
+            });
+        let configured_network = match std::env::var("OPENTOPIA_SANDBOX_NETWORK")
+            .unwrap_or_else(|_| {
+                if sandbox_mode == SandboxMode::DangerFullAccess {
+                    "allow".to_string()
+                } else {
+                    "deny".to_string()
+                }
+            })
             .to_ascii_lowercase()
             .as_str()
         {
@@ -122,13 +191,55 @@ impl LocalSandboxConfig {
             "inherit" => NetworkPolicy::Inherit,
             _ => NetworkPolicy::Deny,
         };
+        let network = if sandbox_mode == SandboxMode::DangerFullAccess {
+            NetworkPolicy::Allow
+        } else {
+            configured_network
+        };
         Self {
-            enabled: mode != OsSandboxMode::Disabled,
+            enabled: mode != OsSandboxMode::Disabled
+                && sandbox_mode != SandboxMode::DangerFullAccess,
             mode,
             network,
             read_paths: env_path_list("OPENTOPIA_SANDBOX_READ_PATHS"),
             write_paths: env_path_list("OPENTOPIA_SANDBOX_WRITE_PATHS"),
+            sandbox_mode,
+            writable_roots: env_path_list("OPENTOPIA_SANDBOX_WRITABLE_ROOTS"),
+            sandbox_home: std::env::var("OPENTOPIA_SANDBOX_HOME")
+                .ok()
+                .map(PathBuf::from),
         }
+    }
+
+    pub fn effective_writable_roots(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        if self.sandbox_mode != SandboxMode::WorkspaceWrite {
+            return Vec::new();
+        }
+        dedup_paths(
+            std::iter::once(workspace_root.to_path_buf())
+                .chain(self.write_paths.iter().cloned())
+                .chain(self.writable_roots.iter().cloned()),
+        )
+    }
+
+    pub fn effective_readable_roots(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        if self.sandbox_mode == SandboxMode::DangerFullAccess {
+            return Vec::new();
+        }
+        dedup_paths(
+            std::iter::once(workspace_root.to_path_buf())
+                .chain(self.read_paths.iter().cloned())
+                .chain(self.effective_writable_roots(workspace_root)),
+        )
+    }
+}
+
+fn parse_enforcement_mode(value: &str) -> Option<OsSandboxMode> {
+    match value.to_ascii_lowercase().replace('_', "-").as_str() {
+        "disabled" => Some(OsSandboxMode::Disabled),
+        "best-effort" => Some(OsSandboxMode::BestEffort),
+        "enforce" | "strict" => Some(OsSandboxMode::Enforce),
+        _ => None,
     }
 }
 
@@ -168,6 +279,7 @@ impl OsSandboxPlatform {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SandboxCommandStatus {
     Disabled,
+    Unrestricted,
     Wrapped {
         platform: OsSandboxPlatform,
         backend: String,
@@ -196,6 +308,15 @@ impl SandboxCommandPlan {
             status: SandboxCommandStatus::Disabled,
         }
     }
+
+    fn unrestricted(program: &str, args: &[String]) -> Self {
+        Self {
+            program: program.to_string(),
+            args: args.to_vec(),
+            env: Vec::new(),
+            status: SandboxCommandStatus::Unrestricted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +332,10 @@ pub struct SandboxDescriptor {
     pub platform: OsSandboxPlatform,
     pub mode: OsSandboxMode,
     pub network: NetworkPolicy,
+    pub sandbox_mode: SandboxMode,
+    pub readable_roots: Vec<PathBuf>,
+    pub writable_roots: Vec<PathBuf>,
+    pub protected_paths: Vec<PathBuf>,
     pub backend: Option<String>,
     pub enforced: bool,
     pub available: bool,
@@ -237,12 +362,25 @@ impl SandboxDescriptor {
                 true,
                 true,
                 Some(backend.clone()),
-                format!("OS sandbox is ready using {backend}."),
+                format!(
+                    "OS sandbox command wrapping is configured using {backend}; restricted calls fail closed at execution time."
+                ),
             ),
             Ok(SandboxCommandPlan {
                 status: SandboxCommandStatus::BestEffortPassthrough { reason, .. },
                 ..
             }) => (SandboxLifecycle::Ready, false, false, None, reason),
+            Ok(SandboxCommandPlan {
+                status: SandboxCommandStatus::Unrestricted,
+                ..
+            }) => (
+                SandboxLifecycle::Ready,
+                true,
+                false,
+                None,
+                "Sandbox restrictions are disabled; commands have full filesystem and network access."
+                    .to_string(),
+            ),
             Ok(_) => (
                 SandboxLifecycle::Stopped,
                 false,
@@ -252,26 +390,24 @@ impl SandboxDescriptor {
             ),
             Err(err) => (SandboxLifecycle::Error, false, false, None, err.to_string()),
         };
+        let readable_roots = config.effective_readable_roots(&workspace_root);
+        let writable_roots = config.effective_writable_roots(&workspace_root);
+        let protected_paths = protected_paths(&workspace_root, config);
         Self {
             id: format!("local-{thread_id}"),
             thread_id,
             kind: ExecutionEnvironmentKind::Local,
             lifecycle,
             workspace_root,
-            capabilities: vec![
-                "read_file".to_string(),
-                "write_file".to_string(),
-                "search".to_string(),
-                "shell".to_string(),
-                "git_diff".to_string(),
-                "apply_patch".to_string(),
-                "spawn_stdio".to_string(),
-                "os_sandbox_preflight".to_string(),
-            ],
+            capabilities: sandbox_capabilities(config.sandbox_mode),
             message,
             platform,
             mode: config.mode,
             network: config.network,
+            sandbox_mode: config.sandbox_mode,
+            readable_roots,
+            writable_roots,
+            protected_paths,
             backend,
             enforced,
             available,
@@ -314,6 +450,9 @@ pub fn build_local_sandbox_command_for_platform(
     workspace_root: &Path,
     config: &LocalSandboxConfig,
 ) -> anyhow::Result<SandboxCommandPlan> {
+    if config.sandbox_mode == SandboxMode::DangerFullAccess {
+        return Ok(SandboxCommandPlan::unrestricted(program, args));
+    }
     if !config.is_enabled() {
         return Ok(SandboxCommandPlan::disabled(program, args));
     }
@@ -380,16 +519,26 @@ fn build_bubblewrap_command(
         args.push(path.to_string());
     }
 
-    for path in effective_read_paths(config, &workspace_root) {
+    for path in config.effective_readable_roots(&workspace_root) {
         let path = absolute_path(&path);
         args.push("--ro-bind".to_string());
         args.push(path_to_string(&path));
         args.push(path_to_string(&path));
     }
 
-    for path in effective_write_paths(config, &workspace_root) {
+    for path in config.effective_writable_roots(&workspace_root) {
         let path = absolute_path(&path);
         args.push("--bind".to_string());
+        args.push(path_to_string(&path));
+        args.push(path_to_string(&path));
+    }
+
+    for path in protected_paths(&workspace_root, config)
+        .into_iter()
+        .filter(|path| path.exists())
+    {
+        let path = absolute_path(path);
+        args.push("--ro-bind".to_string());
         args.push(path_to_string(&path));
         args.push(path_to_string(&path));
     }
@@ -449,11 +598,6 @@ fn build_windows_sandbox_command(
     workspace_root: &Path,
     config: &LocalSandboxConfig,
 ) -> anyhow::Result<SandboxCommandPlan> {
-    if !config.read_paths.is_empty() || !config.write_paths.is_empty() {
-        anyhow::bail!(
-            "custom read/write path grants are not supported by the Windows Codex sandbox adapter"
-        );
-    }
     let Some(codex) = resolve_codex_sandbox_binary() else {
         return unavailable_backend(
             OsSandboxPlatform::Windows,
@@ -463,11 +607,12 @@ fn build_windows_sandbox_command(
             config,
         );
     };
-    let codex_home = prepare_codex_sandbox_home(config)?;
+    let permission_profile = windows_permission_profile(config);
+    let codex_home = prepare_codex_sandbox_home(workspace_root, config)?;
     let mut sandbox_args = vec![
         "sandbox".to_string(),
         "--permission-profile".to_string(),
-        "opentopia".to_string(),
+        permission_profile.to_string(),
         "--cd".to_string(),
         path_to_string(&absolute_path(cwd)),
     ];
@@ -487,7 +632,10 @@ fn build_windows_sandbox_command(
         ],
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Windows,
-            backend: "codex-restricted-token".to_string(),
+            backend: format!(
+                "codex-windows-{}",
+                windows_sandbox_implementation().replace('_', "-")
+            ),
         },
     })
 }
@@ -553,31 +701,116 @@ fn resolve_codex_sandbox_binary() -> Option<PathBuf> {
     None
 }
 
-fn prepare_codex_sandbox_home(config: &LocalSandboxConfig) -> anyhow::Result<PathBuf> {
-    let home = std::env::var("OPENTOPIA_SANDBOX_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| {
+fn prepare_codex_sandbox_home(
+    workspace_root: &Path,
+    config: &LocalSandboxConfig,
+) -> anyhow::Result<PathBuf> {
+    let sandbox_root = config
+        .sandbox_home
+        .clone()
+        .or_else(|| {
+            std::env::var("OPENTOPIA_SANDBOX_HOME")
+                .ok()
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
             std::env::var("LOCALAPPDATA")
                 .map(|root| PathBuf::from(root).join("OpenTopia").join("sandbox"))
+                .ok()
         })
-        .unwrap_or_else(|_| std::env::temp_dir().join("opentopia-sandbox"));
+        .unwrap_or_else(|| std::env::temp_dir().join("opentopia-sandbox"));
+    let home = sandbox_root.join("codex-home");
     std::fs::create_dir_all(&home)?;
-    let network = if matches!(
+
+    let implementation = windows_sandbox_implementation();
+    let mut config_lines = vec![
+        "[windows]".to_string(),
+        format!("sandbox = \"{implementation}\""),
+        "sandbox_private_desktop = true".to_string(),
+    ];
+
+    let needs_custom_profile = windows_permission_profile(config) == "opentopia";
+    if needs_custom_profile {
+        let base = match config.sandbox_mode {
+            SandboxMode::ReadOnly => ":read-only",
+            SandboxMode::WorkspaceWrite => ":workspace",
+            SandboxMode::DangerFullAccess => ":danger-full-access",
+        };
+        config_lines.extend([
+            String::new(),
+            "[permissions.opentopia]".to_string(),
+            format!("extends = \"{base}\""),
+        ]);
+
+        let mut filesystem_entries = Vec::new();
+        for path in &config.read_paths {
+            filesystem_entries.push((absolute_path(path), "read"));
+        }
+        for path in config
+            .effective_writable_roots(workspace_root)
+            .into_iter()
+            .filter(|path| absolute_path(path) != absolute_path(workspace_root))
+        {
+            filesystem_entries.push((absolute_path(path), "write"));
+        }
+        if !filesystem_entries.is_empty() {
+            config_lines.push(String::new());
+            config_lines.push("[permissions.opentopia.filesystem]".to_string());
+            for (path, access) in filesystem_entries {
+                config_lines.push(format!(
+                    "{} = \"{access}\"",
+                    toml_basic_string(&path_to_string(&path))
+                ));
+            }
+        }
+    }
+
+    if matches!(
         config.network,
         NetworkPolicy::Allow | NetworkPolicy::Inherit
     ) {
-        "\n[permissions.opentopia.network]\nenabled = true\nmode = \"full\"\n"
-    } else {
-        ""
-    };
-    let contents = format!(
-        "default_permissions = \"opentopia\"\n\n[permissions.opentopia]\nextends = \":workspace\"\n{network}"
-    );
+        config_lines.push(String::new());
+        config_lines.push("[permissions.opentopia.network]".to_string());
+        config_lines.push("enabled = true".to_string());
+        config_lines.push("mode = \"full\"".to_string());
+    }
+
+    let contents = config_lines.join("\n");
     let path = home.join("config.toml");
     if std::fs::read_to_string(&path).ok().as_deref() != Some(contents.as_str()) {
         std::fs::write(&path, contents)?;
     }
     Ok(home)
+}
+
+fn windows_permission_profile(config: &LocalSandboxConfig) -> &'static str {
+    let has_extra_roots = !config.read_paths.is_empty()
+        || !config.write_paths.is_empty()
+        || !config.writable_roots.is_empty();
+    let network_enabled = matches!(
+        config.network,
+        NetworkPolicy::Allow | NetworkPolicy::Inherit
+    );
+    if has_extra_roots || network_enabled {
+        "opentopia"
+    } else {
+        match config.sandbox_mode {
+            SandboxMode::ReadOnly => ":read-only",
+            SandboxMode::WorkspaceWrite => ":workspace",
+            SandboxMode::DangerFullAccess => ":danger-full-access",
+        }
+    }
+}
+
+fn windows_sandbox_implementation() -> &'static str {
+    match std::env::var("OPENTOPIA_WINDOWS_SANDBOX")
+        .unwrap_or_else(|_| "unelevated".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "elevated" => "elevated",
+        _ => "unelevated",
+    }
 }
 
 fn first_existing_executable(candidates: &[PathBuf]) -> Option<PathBuf> {
@@ -588,25 +821,6 @@ fn env_path_list(name: &str) -> Vec<PathBuf> {
     std::env::var_os(name)
         .map(|value| std::env::split_paths(&value).collect())
         .unwrap_or_default()
-}
-
-fn effective_read_paths(config: &LocalSandboxConfig, workspace_root: &Path) -> Vec<PathBuf> {
-    if config.read_paths.is_empty() {
-        Vec::new()
-    } else {
-        config.read_paths.clone()
-    }
-    .into_iter()
-    .filter(|path| absolute_path(path) != absolute_path(workspace_root))
-    .collect()
-}
-
-fn effective_write_paths(config: &LocalSandboxConfig, workspace_root: &Path) -> Vec<PathBuf> {
-    if config.write_paths.is_empty() {
-        vec![workspace_root.to_path_buf()]
-    } else {
-        config.write_paths.clone()
-    }
 }
 
 fn default_system_read_paths() -> Vec<&'static str> {
@@ -642,16 +856,25 @@ fn seatbelt_profile(workspace_root: &Path, config: &LocalSandboxConfig) -> Strin
     }
     profile.push(")".to_string());
 
-    profile.push("(allow file-write*".to_string());
-    for path in effective_write_paths(config, &workspace_root) {
-        profile.push(format!(
-            "  (subpath \"{}\")",
-            seatbelt_escape(&absolute_path(&path))
-        ));
+    if config.sandbox_mode == SandboxMode::WorkspaceWrite {
+        profile.push("(allow file-write*".to_string());
+        for path in config.effective_writable_roots(&workspace_root) {
+            profile.push(format!(
+                "  (subpath \"{}\")",
+                seatbelt_escape(&absolute_path(&path))
+            ));
+        }
+        profile.push("  (subpath \"/tmp\")".to_string());
+        profile.push("  (subpath \"/private/tmp\")".to_string());
+        profile.push(")".to_string());
+
+        for path in protected_paths(&workspace_root, config) {
+            profile.push(format!(
+                "(deny file-write* (subpath \"{}\"))",
+                seatbelt_escape(&absolute_path(path))
+            ));
+        }
     }
-    profile.push("  (subpath \"/tmp\")".to_string());
-    profile.push("  (subpath \"/private/tmp\")".to_string());
-    profile.push(")".to_string());
 
     if matches!(
         config.network,
@@ -684,6 +907,76 @@ fn seatbelt_escape(path: &Path) -> String {
         .replace('"', "\\\"")
 }
 
+fn sandbox_capabilities(mode: SandboxMode) -> Vec<String> {
+    let mut capabilities = vec![
+        "read_file".to_string(),
+        "search".to_string(),
+        "shell".to_string(),
+        "git_diff".to_string(),
+        "spawn_stdio".to_string(),
+        "os_sandbox_preflight".to_string(),
+    ];
+    if mode != SandboxMode::ReadOnly {
+        capabilities.push("write_file".to_string());
+        capabilities.push("apply_patch".to_string());
+    }
+    capabilities
+}
+
+const PROTECTED_METADATA_NAMES: [&str; 3] = [".git", ".agents", ".codex"];
+
+pub fn is_protected_metadata_path(path: &Path, writable_root: &Path) -> bool {
+    let candidate = absolute_path(path);
+    let root = absolute_path(writable_root);
+    let Ok(relative) = candidate.strip_prefix(root) else {
+        return false;
+    };
+    relative.components().next().is_some_and(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        PROTECTED_METADATA_NAMES
+            .iter()
+            .any(|protected| name.eq_ignore_ascii_case(protected))
+    })
+}
+
+fn protected_paths(workspace_root: &Path, config: &LocalSandboxConfig) -> Vec<PathBuf> {
+    if config.sandbox_mode != SandboxMode::WorkspaceWrite {
+        return Vec::new();
+    }
+    dedup_paths(
+        config
+            .effective_writable_roots(workspace_root)
+            .into_iter()
+            .flat_map(|root| {
+                PROTECTED_METADATA_NAMES
+                    .into_iter()
+                    .map(move |name| root.join(name))
+            }),
+    )
+}
+
+fn dedup_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    for path in paths {
+        let path = absolute_path(path);
+        if !result.iter().any(|existing| existing == &path) {
+            result.push(path);
+        }
+    }
+    result
+}
+
+fn toml_basic_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +991,7 @@ mod tests {
         assert!(!config.is_enabled());
         assert_eq!(config.mode, OsSandboxMode::Disabled);
         assert_eq!(config.network, NetworkPolicy::Deny);
+        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
     }
 
     #[test]
@@ -718,6 +1012,7 @@ mod tests {
         assert_eq!(config.network, NetworkPolicy::Allow);
         assert_eq!(config.read_paths, vec![PathBuf::from("C:/readonly")]);
         assert_eq!(config.write_paths, vec![PathBuf::from("C:/workspace")]);
+        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
     }
 
     #[test]
@@ -736,6 +1031,25 @@ mod tests {
         assert_eq!(plan.program, "sh");
         assert_eq!(plan.args, args);
         assert_eq!(plan.status, SandboxCommandStatus::Disabled);
+    }
+
+    #[test]
+    fn danger_full_access_plan_is_explicitly_unrestricted() {
+        let args = sample_args();
+        let config = LocalSandboxConfig::enforce().with_sandbox_mode(SandboxMode::DangerFullAccess);
+        let plan = build_local_sandbox_command_for_platform(
+            OsSandboxPlatform::Linux,
+            "sh",
+            &args,
+            Path::new("/workspace"),
+            Path::new("/workspace"),
+            &config,
+        )
+        .expect("build unrestricted plan");
+
+        assert_eq!(plan.program, "sh");
+        assert_eq!(plan.args, args);
+        assert_eq!(plan.status, SandboxCommandStatus::Unrestricted);
     }
 
     #[test]
@@ -765,6 +1079,47 @@ mod tests {
     }
 
     #[test]
+    fn linux_read_only_uses_only_read_only_workspace_bind() {
+        let config = LocalSandboxConfig::enforce().with_sandbox_mode(SandboxMode::ReadOnly);
+        let plan = build_local_sandbox_command_for_platform(
+            OsSandboxPlatform::Linux,
+            "sh",
+            &sample_args(),
+            Path::new("/workspace"),
+            Path::new("/workspace"),
+            &config,
+        )
+        .expect("build read-only plan");
+
+        let workspace = path_to_string(&absolute_path("/workspace"));
+        assert!(!plan.args.iter().any(|arg| arg == "--bind"));
+        assert!(plan.args.windows(3).any(|args| {
+            args[0] == "--ro-bind" && args[1] == workspace && args[2] == workspace
+        }));
+    }
+
+    #[test]
+    fn linux_workspace_write_includes_additional_writable_roots() {
+        let mut config = LocalSandboxConfig::enforce();
+        config.writable_roots = vec![PathBuf::from("/shared")];
+        let plan = build_local_sandbox_command_for_platform(
+            OsSandboxPlatform::Linux,
+            "sh",
+            &sample_args(),
+            Path::new("/workspace"),
+            Path::new("/workspace"),
+            &config,
+        )
+        .expect("build workspace-write plan");
+
+        let shared = path_to_string(&absolute_path("/shared"));
+        assert!(plan
+            .args
+            .windows(3)
+            .any(|args| { args[0] == "--bind" && args[1] == shared && args[2] == shared }));
+    }
+
+    #[test]
     fn macos_sandbox_plan_wraps_with_sandbox_exec() {
         let args = sample_args();
         let plan = build_local_sandbox_command_for_platform(
@@ -782,6 +1137,36 @@ mod tests {
         assert!(plan.args[1].contains("(deny default)"));
         assert!(plan.args[1].contains("workspace"));
         assert!(!plan.args[1].contains("(allow network*)"));
+    }
+
+    #[test]
+    fn macos_read_only_profile_has_no_write_grants() {
+        let config = LocalSandboxConfig::enforce().with_sandbox_mode(SandboxMode::ReadOnly);
+        let plan = build_local_sandbox_command_for_platform(
+            OsSandboxPlatform::Macos,
+            "sh",
+            &sample_args(),
+            Path::new("/workspace"),
+            Path::new("/workspace"),
+            &config,
+        )
+        .expect("build read-only profile");
+
+        assert!(!plan.args[1].contains("allow file-write"));
+    }
+
+    #[test]
+    fn macos_workspace_profile_protects_agent_metadata() {
+        let profile = seatbelt_profile(Path::new("/workspace"), &LocalSandboxConfig::enforce());
+        let workspace = absolute_path("/workspace");
+        assert!(profile.contains(&format!(
+            "(deny file-write* (subpath \"{}\"))",
+            seatbelt_escape(&workspace.join(".git"))
+        )));
+        assert!(profile.contains(&format!(
+            "(deny file-write* (subpath \"{}\"))",
+            seatbelt_escape(&workspace.join(".codex"))
+        )));
     }
 
     #[test]
@@ -845,9 +1230,14 @@ mod tests {
     }
 
     #[test]
-    fn windows_adapter_rejects_unsupported_custom_path_grants() {
+    fn windows_adapter_writes_custom_path_grants_to_codex_profile() {
+        let sandbox_home = std::env::temp_dir().join(format!(
+            "opentopia-sandbox-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
         let mut config = LocalSandboxConfig::enforce();
-        config.write_paths = vec![PathBuf::from("C:/other")];
+        config.sandbox_home = Some(sandbox_home.clone());
+        config.writable_roots = vec![PathBuf::from("C:/other")];
         let result = build_local_sandbox_command_for_platform(
             OsSandboxPlatform::Windows,
             "powershell.exe",
@@ -857,10 +1247,19 @@ mod tests {
             &config,
         );
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("custom read/write path grants"));
+        if resolve_codex_sandbox_binary().is_some() {
+            let plan = result.expect("custom roots should use a generated Codex profile");
+            assert!(plan
+                .args
+                .windows(2)
+                .any(|args| { args == ["--permission-profile", "opentopia"] }));
+            let contents = std::fs::read_to_string(sandbox_home.join("codex-home/config.toml"))
+                .expect("read generated profile");
+            assert!(contents.contains("[permissions.opentopia.filesystem]"));
+            assert!(contents.contains("C:/other"));
+        } else {
+            assert!(result.is_err());
+        }
+        let _ = std::fs::remove_dir_all(sandbox_home);
     }
 }

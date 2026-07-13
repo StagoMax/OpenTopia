@@ -31,9 +31,17 @@ pub struct ToolContext {
 
 impl ToolContext {
     pub fn local(workspace_root: PathBuf, policy: Arc<dyn PolicyEngine>) -> Self {
+        Self::local_with_sandbox_config(workspace_root, policy, LocalSandboxConfig::from_env())
+    }
+
+    pub fn local_with_sandbox_config(
+        workspace_root: PathBuf,
+        policy: Arc<dyn PolicyEngine>,
+        sandbox_config: LocalSandboxConfig,
+    ) -> Self {
         let environment = Arc::new(LocalExecutionEnvironment::with_sandbox_config(
             workspace_root.clone(),
-            LocalSandboxConfig::from_env(),
+            sandbox_config,
         ));
         Self {
             workspace_root,
@@ -498,6 +506,12 @@ impl Tool for ShellTool {
             .await?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.success && looks_like_sandbox_denial(&stderr) {
+            anyhow::bail!(
+                "approval required: command was blocked by the sandbox: {}",
+                truncate(&stderr, 2_000)
+            );
+        }
         let full_combined = format!(
             "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
             command, stdout, stderr
@@ -647,6 +661,12 @@ impl Tool for ApplyPatchTool {
         let output = result.exec;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.success && looks_like_sandbox_denial(&stderr) {
+            anyhow::bail!(
+                "approval required: patch was blocked by the sandbox: {}",
+                truncate(&stderr, 2_000)
+            );
+        }
         if !output.success {
             anyhow::bail!(
                 "git apply failed ({:?})\n{}",
@@ -677,6 +697,26 @@ fn normalize_workspace_path(workspace_root: &Path, path: &str) -> PathBuf {
     } else {
         workspace_root.join(candidate)
     }
+}
+
+fn looks_like_sandbox_denial(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    [
+        "access is denied",
+        "access denied",
+        "access to the path",
+        "permissiondenied",
+        "permission denied",
+        "operation not permitted",
+        "read-only file system",
+        "unauthorized",
+        "unauthorizedaccessexception",
+        "network is unreachable",
+        "network access is denied",
+        "blocked by sandbox",
+    ]
+    .iter()
+    .any(|pattern| stderr.contains(pattern))
 }
 
 struct SearchRun {
@@ -1040,5 +1080,23 @@ impl Tool for McpToolWrapper {
                 "serverId": result.server_id,
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_sandbox_denial;
+
+    #[test]
+    fn detects_common_cross_platform_sandbox_denials() {
+        assert!(looks_like_sandbox_denial("Access is denied."));
+        assert!(looks_like_sandbox_denial(
+            "Access to the path 'C:\\\\outside.txt' is denied."
+        ));
+        assert!(looks_like_sandbox_denial("CategoryInfo: PermissionDenied"));
+        assert!(looks_like_sandbox_denial("bash: Permission denied"));
+        assert!(looks_like_sandbox_denial("Operation not permitted"));
+        assert!(looks_like_sandbox_denial("Network is unreachable"));
+        assert!(!looks_like_sandbox_denial("cargo test failed"));
     }
 }

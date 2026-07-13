@@ -503,10 +503,19 @@ flowchart LR
 采用 **OS 级本地沙箱**作为执行环境的安全底座，Docker/Remote 沙箱作为后续可扩展方向：
 
 **默认路径（前期专注）：OS 级本地沙箱**
-- **Linux**：bubblewrap + seccomp + Landlock（文件系统 mount namespace、网络 namespace 隔离）
+- **Linux**：bubblewrap（文件系统/process/network namespace；seccomp + Landlock 为后续纵深）
 - **macOS**：sandbox-exec + Seatbelt profile（读/写路径 allowlist + 端口限制）
-- **Windows**：restricted token + integrity level + ACL
-- 直接在用户工作区内执行，无需 Docker 开销；启动延迟 < 10ms，适合高频 tool call 场景。
+- **Windows**：复用 Codex native sandbox；默认验证 `unelevated` restricted token + ACL，`elevated` 需管理员设置并独立验收
+- 直接在用户工作区内执行，无需 Docker；延迟由平台后端决定，不承诺统一 `<10ms`。
+
+**Codex 对齐的权限模型**
+
+- `sandbox_mode`：`read-only` / `workspace-write` / `danger-full-access`，定义技术边界。
+- backend enforcement：`disabled` / `best-effort` / `enforce`，只定义 helper 缺失时的行为。
+- approval policy：独立决定何时暂停询问；`never` 不等于关闭沙箱。
+- `workspace-write` 默认网络受限，通过 writable roots 增加额外写目录。
+- 内置 read/write/apply_patch 与 spawned command 必须遵守相同边界。
+- writable root 下 `.git`、`.agents`、`.codex` 默认只读，避免 hooks/config 扩权。
 
 **后续方向：Docker/Remote 沙箱**（优先级后移）
 - 用于固定 CI 环境、多租户部署、或需要完整容器隔离的场景

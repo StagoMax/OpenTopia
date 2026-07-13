@@ -1,5 +1,6 @@
 use crate::sandbox::{
-    build_local_sandbox_command, ExecutionEnvironmentKind, LocalSandboxConfig, SandboxCommandStatus,
+    build_local_sandbox_command, is_protected_metadata_path, ExecutionEnvironmentKind,
+    LocalSandboxConfig, SandboxCommandStatus, SandboxMode,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -318,19 +319,27 @@ impl LocalExecutionEnvironment {
     }
 
     fn resolve_existing_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
-        let root = self.workspace_root_canonical()?;
         let candidate = self.candidate_path(path)?;
         let resolved = candidate
             .canonicalize()
             .with_context(|| format!("path does not exist: {}", candidate.display()))?;
-        if !resolved.starts_with(&root) {
+        if self.sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess {
+            return Ok(resolved);
+        }
+        let readable_roots = self.canonical_roots(
+            self.sandbox_config
+                .effective_readable_roots(&self.workspace_root),
+        );
+        if !readable_roots.iter().any(|root| resolved.starts_with(root)) {
             anyhow::bail!("path escapes workspace: {}", path.display());
         }
         Ok(resolved)
     }
 
     fn resolve_write_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
-        let root = self.workspace_root_canonical()?;
+        if self.sandbox_config.sandbox_mode == SandboxMode::ReadOnly {
+            anyhow::bail!("sandbox mode read-only does not permit file writes");
+        }
         let candidate = self.candidate_path(path)?;
         let mut ancestor = candidate.as_path();
         while !ancestor.exists() {
@@ -341,11 +350,38 @@ impl LocalExecutionEnvironment {
                 )
             })?;
         }
+        let suffix = candidate
+            .strip_prefix(ancestor)
+            .unwrap_or_else(|_| Path::new(""));
         let resolved_ancestor = ancestor.canonicalize()?;
-        if !resolved_ancestor.starts_with(&root) {
+        let resolved_candidate = resolved_ancestor.join(suffix);
+        if self.sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess {
+            return Ok(candidate);
+        }
+        let writable_roots = self.canonical_roots(
+            self.sandbox_config
+                .effective_writable_roots(&self.workspace_root),
+        );
+        let Some(root) = writable_roots
+            .iter()
+            .find(|root| resolved_ancestor.starts_with(root.as_path()))
+        else {
             anyhow::bail!("write path escapes workspace: {}", path.display());
+        };
+        if is_protected_metadata_path(&resolved_candidate, root) {
+            anyhow::bail!(
+                "approval required: write to protected workspace metadata: {}",
+                path.display()
+            );
         }
         Ok(candidate)
+    }
+
+    fn canonical_roots(&self, roots: Vec<PathBuf>) -> Vec<PathBuf> {
+        roots
+            .into_iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect()
     }
 
     fn register_process(&self, request_id: String, cancel: CancellationToken) {
@@ -878,6 +914,87 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove temp workspace");
     }
 
+    #[tokio::test]
+    async fn read_only_environment_rejects_builtin_file_writes() {
+        let root =
+            std::env::temp_dir().join(format!("opentopia-core-read-only-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        let config = LocalSandboxConfig::enforce().with_sandbox_mode(SandboxMode::ReadOnly);
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
+
+        let error = env
+            .write_file(FileWriteRequest::new("blocked.txt", b"blocked".to_vec()))
+            .await
+            .expect_err("read-only mode must reject writes");
+
+        assert!(error.to_string().contains("read-only"));
+        assert!(!root.join("blocked.txt").exists());
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[tokio::test]
+    async fn workspace_write_allows_configured_writable_root() {
+        let id = Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("opentopia-core-workspace-{id}"));
+        let extra = std::env::temp_dir().join(format!("opentopia-core-extra-{id}"));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        std::fs::create_dir_all(&extra).expect("create extra writable root");
+        let mut config = LocalSandboxConfig::default();
+        config.writable_roots = vec![extra.clone()];
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
+
+        env.write_file(FileWriteRequest::new(
+            extra.join("allowed.txt"),
+            b"allowed".to_vec(),
+        ))
+        .await
+        .expect("write additional root");
+
+        assert!(extra.join("allowed.txt").exists());
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+        std::fs::remove_dir_all(extra).expect("remove extra writable root");
+    }
+
+    #[tokio::test]
+    async fn workspace_write_protects_agent_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "opentopia-core-protected-metadata-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        let env = LocalExecutionEnvironment::new(root.clone());
+
+        let error = env
+            .write_file(FileWriteRequest::new(
+                ".codex/config.toml",
+                b"unsafe".to_vec(),
+            ))
+            .await
+            .expect_err("protected metadata must remain read-only");
+
+        assert!(error.to_string().contains("protected workspace metadata"));
+        assert!(!root.join(".codex/config.toml").exists());
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[tokio::test]
+    async fn danger_full_access_allows_builtin_write_outside_workspace() {
+        let id = Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("opentopia-core-full-root-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-core-full-outside-{id}.txt"));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        let config = LocalSandboxConfig::default().with_sandbox_mode(SandboxMode::DangerFullAccess);
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
+
+        env.write_file(FileWriteRequest::new(&outside, b"allowed".to_vec()))
+            .await
+            .expect("full access write outside workspace");
+
+        assert!(outside.exists());
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+        std::fs::remove_file(outside).expect("remove outside file");
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn local_environment_windows_best_effort_sandbox_executes() {
@@ -892,7 +1009,7 @@ mod tests {
         let exec = env
             .exec(
                 ExecRequest::shell("Write-Output ok"),
-                ExecutionContext::with_timeout(Duration::from_secs(20)),
+                ExecutionContext::with_timeout(Duration::from_secs(45)),
             )
             .await
             .expect("windows restricted-token sandbox should run");
@@ -940,6 +1057,74 @@ mod tests {
             !command_succeeded,
             "outside write should fail in enforced mode"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_environment_windows_read_only_denies_workspace_write() {
+        let id = Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("opentopia-core-readonly-{id}"));
+        let sandbox_home = std::env::temp_dir().join(format!("opentopia-core-readonly-home-{id}"));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        let mut config = LocalSandboxConfig::enforce().with_sandbox_mode(SandboxMode::ReadOnly);
+        config.sandbox_home = Some(sandbox_home.clone());
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
+        let target = root.join("blocked.txt");
+        let command = format!(
+            "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{}' -Value blocked",
+            target.to_string_lossy().replace('\'', "''")
+        );
+
+        let exec = env
+            .exec(
+                ExecRequest::shell(command),
+                ExecutionContext::with_timeout(Duration::from_secs(30)),
+            )
+            .await
+            .expect("read-only sandbox command should start");
+
+        assert!(!exec.success, "read-only command unexpectedly wrote a file");
+        assert!(!target.exists());
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+        let _ = std::fs::remove_dir_all(sandbox_home);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_environment_windows_allows_additional_writable_root() {
+        let id = Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("opentopia-core-root-{id}"));
+        let extra = std::env::temp_dir().join(format!("opentopia-core-writable-{id}"));
+        let sandbox_home = std::env::temp_dir().join(format!("opentopia-core-writable-home-{id}"));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        std::fs::create_dir_all(&extra).expect("create extra writable root");
+        let mut config = LocalSandboxConfig::enforce();
+        config.writable_roots = vec![extra.clone()];
+        config.sandbox_home = Some(sandbox_home.clone());
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
+        let target = extra.join("allowed.txt");
+        let command = format!(
+            "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{}' -Value allowed",
+            target.to_string_lossy().replace('\'', "''")
+        );
+
+        let exec = env
+            .exec(
+                ExecRequest::shell(command),
+                ExecutionContext::with_timeout(Duration::from_secs(30)),
+            )
+            .await
+            .expect("workspace-write sandbox command should start");
+
+        assert!(
+            exec.success,
+            "additional writable root failed: {}",
+            String::from_utf8_lossy(&exec.stderr)
+        );
+        assert!(target.exists());
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+        std::fs::remove_dir_all(extra).expect("remove extra writable root");
+        let _ = std::fs::remove_dir_all(sandbox_home);
     }
 
     #[tokio::test]

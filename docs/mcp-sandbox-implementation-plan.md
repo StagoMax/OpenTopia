@@ -7,7 +7,7 @@ This plan turns the architecture notes into concrete implementation issues. It i
 OpenTopia should keep high-trust coding tools built in, and use MCP for ecosystem/work tools. Sandbox support should be introduced as an execution abstraction first.
 
 The execution environment follows a **local-first model**:
-- **Primary: OS-level sandbox** — wrap tool execution with OS-native security mechanisms (bwrap+seccomp on Linux, Seatbelt on macOS, restricted tokens on Windows), following Codex and Claude Code's approach. This keeps the agent working directly in the user's workspace without Docker overhead.
+- **Primary: OS-level sandbox** — wrap tool execution with OS-native security mechanisms (bwrap now, seccomp/Landlock later on Linux; Seatbelt on macOS; Codex native sandbox on Windows). This keeps the agent working directly in the user's workspace without Docker overhead.
 - **Future: Docker/remote sandbox** — for fixed CI environments, multi-tenant deployments, or scenarios requiring full container isolation. Deferred priority; same `ExecutionEnvironment` trait.
 
 ## New Rust Modules
@@ -140,8 +140,16 @@ pub trait ExecutionEnvironment: Send + Sync {
    `opentopia-core`; `LocalExecutionEnvironment.exec()` and `spawn_stdio()` route
    through the wrapper boundary. Packaged Windows builds default to strict mode;
    development defaults to explicit best-effort mode.
+   Codex-compatible `SandboxMode` (`read-only` / `workspace-write` /
+   `danger-full-access`) is implemented independently from `OsSandboxMode`, which
+   only controls fail-closed versus explicit fallback behavior. The parser accepts
+   old `OPENTOPIA_SANDBOX_MODE=best_effort|enforce|disabled` values for migration;
+   new configurations use `OPENTOPIA_SANDBOX_ENFORCEMENT` for that axis.
+   Bubblewrap, Seatbelt, Windows Codex profiles, and built-in file writes all
+   consume the same readable/writable-root policy. Approval remains in the policy
+   engine and SQLite continuation flow, not in the sandbox configuration.
    Wrap `LocalExecutionEnvironment.exec()` with platform-native sandbox:
-   - Linux: bubblewrap + seccomp (file system mount namespace + network namespace isolation)
+   - Linux: bubblewrap (file system/process/network namespaces; seccomp/Landlock deferred)
    - macOS: sandbox-exec with Seatbelt profile (read/write path allowlists + network restrictions)
    - Windows: restricted token / integrity level isolation
    Current implementation:

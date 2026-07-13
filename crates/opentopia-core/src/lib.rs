@@ -42,7 +42,7 @@ pub use provider::{
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,
     ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy, OsSandboxMode, OsSandboxPlatform,
-    SandboxCommandPlan, SandboxCommandStatus, SandboxDescriptor, SandboxLifecycle,
+    SandboxCommandPlan, SandboxCommandStatus, SandboxDescriptor, SandboxLifecycle, SandboxMode,
 };
 pub use settings::{
     AppSettings, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,

@@ -74,6 +74,22 @@ $env:OPENTOPIA_OPENAI_BASE_URL="https://api.openai.com/v1"
 cargo run -p opentopia-server -- --permission auto
 ```
 
+Sandbox and approval are configured independently. The desktop defaults to a
+network-restricted, workspace-write sandbox; development may explicitly fall
+back when the platform helper is unavailable, while packaged builds fail closed:
+
+```powershell
+$env:OPENTOPIA_SANDBOX_MODE="workspace-write" # read-only | workspace-write | danger-full-access
+$env:OPENTOPIA_SANDBOX_ENFORCEMENT="enforce"  # disabled | best-effort | enforce
+$env:OPENTOPIA_SANDBOX_NETWORK="deny"
+$env:OPENTOPIA_SANDBOX_WRITABLE_ROOTS="D:\shared"
+```
+
+The existing `--permission`/desktop permission control remains the approval and
+tool-policy layer. Selecting a non-interactive approval mode does not disable the
+sandbox; unrestricted execution requires the explicit `danger-full-access`
+sandbox mode.
+
 OpenTopia can also reuse the existing env file from the sibling credit-review project:
 
 ```powershell

@@ -286,6 +286,10 @@ export type SandboxDescriptor = {
   platform: "linux" | "macos" | "windows" | "unsupported";
   mode: "disabled" | "best_effort" | "enforce";
   network: "inherit" | "allow" | "deny";
+  sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
+  readableRoots: string[];
+  writableRoots: string[];
+  protectedPaths: string[];
   backend?: string | null;
   enforced: boolean;
   available: boolean;

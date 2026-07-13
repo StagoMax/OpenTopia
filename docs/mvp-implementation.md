@@ -211,9 +211,34 @@ Those are next slices; the interfaces are already shaped so they can be added wi
 
 OpenTopia uses **OS-level local sandbox** as the execution environment security base:
 
-- Linux: bubblewrap + seccomp (filesystem mount namespace, network namespace isolation)
+- Linux: bubblewrap (filesystem/process/network namespaces; seccomp/Landlock is deferred)
 - macOS: sandbox-exec with Seatbelt profiles
-- Windows: restricted token + integrity level + ACL
+- Windows: Codex native sandbox helper; tested default is restricted-token/ACL
+  `unelevated`, with `elevated` available for separately validated deployments
+
+Requirements implemented for the local runtime:
+
+- Sandbox and approval are independent controls. `read-only`, `workspace-write`,
+  and `danger-full-access` define the technical boundary; the existing policy
+  engine and durable approval continuation decide when execution pauses.
+- `workspace-write` is the desktop default, blocks direct network access by
+  default, and supports additional `writable_roots` without broad full access.
+- Built-in file writes and spawned commands consume the same boundary.
+- `.git`, `.agents`, and `.codex` remain protected beneath writable roots.
+- `best-effort` versus `enforce` describes backend fallback only. Packaged
+  execution must use `enforce`; development may use visible `best-effort` fallback.
+- `danger-full-access` is explicit and never inferred from a non-interactive
+  approval setting.
+- An approved boundary escalation applies only to the suspended tool call. The
+  continuation executes that call once with an unrestricted environment, then
+  subsequent calls return to the configured sandbox.
+
+The sandbox workbench reports the effective profile and roots. Changing these
+values from the composer/settings UI is a remaining product slice; the current
+runtime uses `OPENTOPIA_SANDBOX_*` configuration. On Linux, protected metadata is
+fully checked for built-in file tools and existing metadata mounts; first creation
+of a missing metadata directory by a spawned command remains part of the planned
+Landlock hardening.
 
 Docker/remote sandbox is intentionally deferred for now, sharing the same `ExecutionEnvironment` trait later if resumed.
 

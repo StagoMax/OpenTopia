@@ -459,7 +459,11 @@ impl AgentCore {
                     continuation.workspace_root.clone(),
                     PermissionMode::FullAccess,
                 ));
-                let mut ctx = ToolContext::local(continuation.workspace_root, policy);
+                let mut ctx = ToolContext::local_with_sandbox_config(
+                    continuation.workspace_root,
+                    policy,
+                    crate::sandbox::LocalSandboxConfig::danger_full_access(),
+                );
                 ctx.store = store;
                 ctx.thread_id = Some(continuation.thread_id);
                 ctx.cancel = cancellation;
@@ -493,7 +497,11 @@ impl AgentCore {
                         continuation.workspace_root.clone(),
                         PermissionMode::FullAccess,
                     ));
-                    let mut ctx = ToolContext::local(continuation.workspace_root.clone(), policy);
+                    let mut ctx = ToolContext::local_with_sandbox_config(
+                        continuation.workspace_root.clone(),
+                        policy,
+                        crate::sandbox::LocalSandboxConfig::danger_full_access(),
+                    );
                     ctx.store = store.clone();
                     ctx.thread_id = Some(continuation.thread_id);
                     ctx.cancel = cancellation.clone();
@@ -1449,6 +1457,100 @@ mod tests {
             fs::read_to_string(workspace.join("approved.txt")).unwrap(),
             "approved once"
         );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn approved_protected_metadata_write_uses_one_shot_sandbox_escalation() {
+        let workspace = test_workspace("approved-sandbox-escalation");
+        let agent = AgentCore::default();
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "/write .codex/config.toml\napproved metadata".to_string(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::Auto,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("protected metadata write suspends");
+        assert!(!workspace.join(".codex/config.toml").exists());
+        let continuation = match result.outcome {
+            AgentTurnOutcome::Suspended { continuation, .. } => continuation,
+            AgentTurnOutcome::Completed => panic!("protected write should wait for approval"),
+        };
+
+        let resumed = agent
+            .resume_turn_streaming(continuation, true, None, None, None)
+            .await
+            .expect("approved sandbox escalation resumes");
+
+        assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
+        assert_eq!(
+            fs::read_to_string(workspace.join(".codex/config.toml")).unwrap(),
+            "approved metadata"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn sandbox_blocked_shell_write_resumes_with_one_shot_approval() {
+        let workspace = test_workspace("approved-shell-sandbox-escalation");
+        let outside = std::env::current_dir()
+            .expect("current directory")
+            .parent()
+            .expect("workspace parent")
+            .join(format!("opentopia-approved-outside-{}.txt", Uuid::new_v4()));
+        let escaped_outside = outside.to_string_lossy().replace('\'', "''");
+        let command = format!(
+            "/run $ErrorActionPreference='Stop'; Set-Content -LiteralPath '{escaped_outside}' -Value approved-shell"
+        );
+        let agent = AgentCore::default();
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: command,
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::Auto,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("sandbox denial suspends the turn");
+        assert!(!outside.exists());
+        let continuation = match result.outcome {
+            AgentTurnOutcome::Suspended { continuation, .. } => continuation,
+            AgentTurnOutcome::Completed => panic!("sandbox denial should wait for approval"),
+        };
+
+        let resumed = agent
+            .resume_turn_streaming(continuation, true, None, None, None)
+            .await
+            .expect("approved sandbox escalation resumes");
+
+        assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap().trim(),
+            "approved-shell"
+        );
+        let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(workspace);
     }
 
