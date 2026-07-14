@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Activity,
   Archive,
@@ -17,32 +18,34 @@ import {
   Folder,
   FolderOpen,
   GitBranch,
-  Github,
   GitPullRequest,
   GitFork,
   Globe2,
   Loader2,
   Menu,
+  MessageCircle,
   MoreHorizontal,
   PanelRight,
   PanelLeftClose,
   PanelLeftOpen,
   Pencil,
+  Pin,
   Plug,
   Plus,
   Search,
   Send,
   Settings,
   Square,
+  SquarePen,
   TerminalSquare,
   Trash2,
-  Users,
   X,
 } from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
 import { LogViewer } from "./components/LogViewer";
 import { detectLanguage, MonacoEditor } from "./components/MonacoEditor";
+import { RightContextRail } from "./components/RightContextRail";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
 import {
   deleteSecret,
@@ -194,6 +197,13 @@ export function App() {
   const [activeToolTabId, setActiveToolTabId] = useState<string | null>(null);
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
   const [draftProjectName, setDraftProjectName] = useState<string | null>(null);
+  const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
+  const [localProjects, setLocalProjects] = useState<LocalProject[]>(() =>
+    readLocalProjects(),
+  );
+  const [hiddenWorkspaceRootKeys, setHiddenWorkspaceRootKeys] = useState<
+    string[]
+  >(() => readHiddenWorkspaceRootKeys());
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -291,6 +301,7 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const hiddenRootKeys = new Set(readHiddenWorkspaceRootKeys());
     void loadPlatformInfo().then(async (info) => {
       if (cancelled) return;
       const nextClient = new ApiClient(info.backendUrl);
@@ -313,8 +324,12 @@ export function App() {
         loadedRecent = await getRecentWorkspaces();
         if (cancelled) return;
         setRecentWorkspaces(loadedRecent);
+        const firstVisibleRecent = loadedRecent.find(
+          (workspace) =>
+            !hiddenRootKeys.has(workspaceRootKey(workspace.workspaceRoot)),
+        );
         setSelectedWorkspaceRoot(
-          (current) => current ?? loadedRecent[0]?.workspaceRoot ?? null,
+          (current) => current ?? firstVisibleRecent?.workspaceRoot ?? null,
         );
       } catch (error) {
         if (cancelled) return;
@@ -337,12 +352,22 @@ export function App() {
         setSettings(loadedSettings);
         setProviderHealth(loadedHealth);
         setMcpServers(loadedMcp);
-        setActiveThreadId((current) => current ?? loadedThreads[0]?.id ?? null);
+        const firstVisibleThread = loadedThreads.find(
+          (thread) =>
+            !hiddenRootKeys.has(workspaceRootKey(thread.workspaceRoot)),
+        );
+        const firstVisibleRecent = loadedRecent.find(
+          (workspace) =>
+            !hiddenRootKeys.has(workspaceRootKey(workspace.workspaceRoot)),
+        );
+        setActiveThreadId(
+          (current) => current ?? firstVisibleThread?.id ?? null,
+        );
         setSelectedWorkspaceRoot(
           (current) =>
             current ??
-            loadedThreads[0]?.workspaceRoot ??
-            loadedRecent[0]?.workspaceRoot ??
+            firstVisibleThread?.workspaceRoot ??
+            firstVisibleRecent?.workspaceRoot ??
             null,
         );
         setServerStatus("online");
@@ -484,10 +509,15 @@ export function App() {
     const thread = threads.find((item) => item.id === threadId);
     setActiveThreadId(threadId);
     setDraftProjectName(null);
+    setDraftProjectId(null);
     if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
   }
 
-  function beginNewThread() {
+  function prepareNewThread(
+    workspaceRoot: string | null,
+    projectName: string | null,
+    projectId: string | null = null,
+  ) {
     setActiveThreadId(null);
     setMessages([]);
     setEvents([]);
@@ -497,26 +527,78 @@ export function App() {
     setToolTabs([]);
     setActiveToolTabId(null);
     setConversationCollapsed(false);
-    setDraftProjectName(
+    setSelectedWorkspaceRoot(workspaceRoot);
+    setDraftProjectName(projectName);
+    setDraftProjectId(projectId);
+  }
+
+  function beginNewThread() {
+    prepareNewThread(
+      currentWorkspaceRoot,
       currentWorkspaceRoot ? workspaceName(currentWorkspaceRoot) : null,
     );
   }
 
-  function beginProjectDraft(projectName: string) {
-    beginNewThread();
-    setSelectedWorkspaceRoot(null);
-    setDraftProjectName(projectName);
+  function beginProjectDraft(projectId: string, projectName: string) {
+    prepareNewThread(null, projectName, projectId);
   }
 
   function handleNewThreadForProject(
     workspaceRoot: string | null,
     projectName: string,
+    projectId: string,
   ) {
     if (workspaceRoot) {
-      void selectRecentWorkspace(workspaceRoot);
-      beginNewThread();
+      prepareNewThread(workspaceRoot, projectName);
+      showWorkspaceRoot(workspaceRoot);
+      void saveWorkspaceToRecent(workspaceRoot);
     } else {
-      beginProjectDraft(projectName);
+      beginProjectDraft(projectId, projectName);
+    }
+  }
+
+  function addLocalProject(project: LocalProject) {
+    setLocalProjects((current) => {
+      const next = [project, ...current];
+      writeLocalProjects(next);
+      return next;
+    });
+  }
+
+  function removeLocalProject(projectId: string) {
+    setLocalProjects((current) => {
+      const next = current.filter((project) => project.id !== projectId);
+      writeLocalProjects(next);
+      return next;
+    });
+    if (draftProjectId === projectId) prepareNewThread(null, null);
+  }
+
+  function showWorkspaceRoot(workspaceRoot: string) {
+    const key = workspaceRootKey(workspaceRoot);
+    setHiddenWorkspaceRootKeys((current) => {
+      if (!current.includes(key)) return current;
+      const next = current.filter((hiddenKey) => hiddenKey !== key);
+      writeHiddenWorkspaceRootKeys(next);
+      return next;
+    });
+  }
+
+  function hideWorkspaceRoot(workspaceRoot: string) {
+    const key = workspaceRootKey(workspaceRoot);
+    setHiddenWorkspaceRootKeys((current) => {
+      if (current.includes(key)) return current;
+      const next = [...current, key];
+      writeHiddenWorkspaceRootKeys(next);
+      return next;
+    });
+  }
+
+  async function saveWorkspaceToRecent(workspaceRoot: string) {
+    try {
+      setRecentWorkspaces(await saveRecentWorkspace(workspaceRoot));
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -545,7 +627,10 @@ export function App() {
     });
   }
 
-  async function chooseWorkspace(): Promise<string | null> {
+  async function chooseWorkspace(
+    bindDraftProject = false,
+  ): Promise<string | null> {
+    const projectIdToBind = bindDraftProject ? draftProjectId : null;
     setIsPickingWorkspace(true);
     setWorkspaceError(null);
     try {
@@ -556,8 +641,11 @@ export function App() {
 
       setSelectedWorkspaceRoot(result.workspaceRoot);
       if (!activeThread) {
-        setDraftProjectName((current) => current ?? result.workspace.name);
+        setDraftProjectName(result.workspace.name);
       }
+      setDraftProjectId(null);
+      if (projectIdToBind) removeLocalProject(projectIdToBind);
+      showWorkspaceRoot(result.workspaceRoot);
       setRecentWorkspaces(result.recentWorkspaces);
       return result.workspaceRoot;
     } catch (error) {
@@ -568,27 +656,42 @@ export function App() {
     }
   }
 
-  async function selectRecentWorkspace(workspaceRoot: string) {
+  async function selectRecentWorkspace(
+    workspaceRoot: string,
+    bindDraftProject = false,
+  ) {
+    const projectIdToBind = bindDraftProject ? draftProjectId : null;
     setWorkspaceError(null);
     setSelectedWorkspaceRoot(workspaceRoot);
     setDraftProjectName(workspaceName(workspaceRoot));
-    try {
-      setRecentWorkspaces(await saveRecentWorkspace(workspaceRoot));
-    } catch (error) {
-      setWorkspaceError(error instanceof Error ? error.message : String(error));
-    }
+    setDraftProjectId(null);
+    if (projectIdToBind) removeLocalProject(projectIdToBind);
+    showWorkspaceRoot(workspaceRoot);
+    await saveWorkspaceToRecent(workspaceRoot);
   }
 
   async function forgetRecentWorkspace(workspaceRoot: string) {
     setWorkspaceError(null);
+    const removedKey = workspaceRootKey(workspaceRoot);
+    hideWorkspaceRoot(workspaceRoot);
     try {
       const nextRecentWorkspaces = await removeRecentWorkspace(workspaceRoot);
       setRecentWorkspaces(nextRecentWorkspaces);
-      if (selectedWorkspaceRoot === workspaceRoot) {
-        setSelectedWorkspaceRoot(
-          nextRecentWorkspaces[0]?.workspaceRoot ??
-            activeThread?.workspaceRoot ??
-            null,
+      const removesSelectedWorkspace =
+        selectedWorkspaceRoot &&
+        workspaceRootKey(selectedWorkspaceRoot) === removedKey;
+      const removesActiveThread =
+        activeThread &&
+        workspaceRootKey(activeThread.workspaceRoot) === removedKey;
+      if (removesSelectedWorkspace || removesActiveThread) {
+        const hiddenKeys = new Set([...hiddenWorkspaceRootKeys, removedKey]);
+        const nextWorkspace = nextRecentWorkspaces.find(
+          (workspace) =>
+            !hiddenKeys.has(workspaceRootKey(workspace.workspaceRoot)),
+        );
+        prepareNewThread(
+          nextWorkspace?.workspaceRoot ?? null,
+          nextWorkspace?.name ?? null,
         );
       }
     } catch (error) {
@@ -668,7 +771,7 @@ export function App() {
 
   async function createThread(initialPrompt?: string): Promise<Thread | null> {
     if (!client) return null;
-    const workspaceRoot = currentWorkspaceRoot ?? (await chooseWorkspace());
+    const workspaceRoot = currentWorkspaceRoot ?? (await chooseWorkspace(true));
     if (!workspaceRoot) return null;
 
     setIsSending(Boolean(initialPrompt?.trim()));
@@ -682,6 +785,9 @@ export function App() {
       setThreads((current) => [thread, ...current]);
       setActiveThreadId(thread.id);
       setSelectedWorkspaceRoot(thread.workspaceRoot);
+      setDraftProjectId(null);
+      setDraftProjectName(null);
+      showWorkspaceRoot(thread.workspaceRoot);
       setToolTabs([]);
       setActiveToolTabId(null);
       if (initialPrompt?.trim()) {
@@ -692,13 +798,7 @@ export function App() {
         setMessages([message]);
         setComposer("");
       }
-      try {
-        setRecentWorkspaces(await saveRecentWorkspace(thread.workspaceRoot));
-      } catch (error) {
-        setWorkspaceError(
-          error instanceof Error ? error.message : String(error),
-        );
-      }
+      await saveWorkspaceToRecent(thread.workspaceRoot);
       return thread;
     } catch (error) {
       setServerError(error instanceof Error ? error.message : String(error));
@@ -984,8 +1084,11 @@ export function App() {
           threads={threads}
           activeThreadId={activeThreadId}
           selectedWorkspaceRoot={currentWorkspaceRoot}
-          selectedDraftProjectName={draftProjectName}
+          selectedDraftProjectId={draftProjectId}
           recentWorkspaces={recentWorkspaces}
+          localProjects={localProjects}
+          hiddenWorkspaceRootKeys={hiddenWorkspaceRootKeys}
+          activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
           workspaceError={workspaceError}
           isPickingWorkspace={isPickingWorkspace}
           onSelect={selectThread}
@@ -997,6 +1100,8 @@ export function App() {
           onForgetWorkspace={(workspaceRoot) =>
             void forgetRecentWorkspace(workspaceRoot)
           }
+          onCreateLocalProject={addLocalProject}
+          onRemoveLocalProject={removeLocalProject}
           onSelectDraftProject={beginProjectDraft}
           onNewThreadForProject={handleNewThreadForProject}
           onOpenThreadWorkspace={(workspaceRoot) =>
@@ -1070,9 +1175,9 @@ export function App() {
               permissionMode={settings?.permissionMode ?? "auto"}
               isSending={isSending}
               onChange={setComposer}
-              onPickWorkspace={() => void chooseWorkspace()}
+              onPickWorkspace={() => void chooseWorkspace(true)}
               onSelectWorkspace={(workspaceRoot) =>
-                void selectRecentWorkspace(workspaceRoot)
+                void selectRecentWorkspace(workspaceRoot, true)
               }
               onOpenTool={openToolTab}
               onChangePermissionMode={(permissionMode) =>
@@ -1642,8 +1747,11 @@ function Sidebar({
   threads,
   activeThreadId,
   selectedWorkspaceRoot,
-  selectedDraftProjectName,
+  selectedDraftProjectId,
   recentWorkspaces,
+  localProjects,
+  hiddenWorkspaceRootKeys,
+  activeWorkspaceRemoteUrl,
   workspaceError,
   isPickingWorkspace,
   onSelect,
@@ -1651,6 +1759,8 @@ function Sidebar({
   onPickWorkspace,
   onSelectWorkspace,
   onForgetWorkspace,
+  onCreateLocalProject,
+  onRemoveLocalProject,
   onSelectDraftProject,
   onOpenThreadWorkspace,
   onNewThreadForProject,
@@ -1659,8 +1769,11 @@ function Sidebar({
   threads: Thread[];
   activeThreadId: string | null;
   selectedWorkspaceRoot: string | null;
-  selectedDraftProjectName: string | null;
+  selectedDraftProjectId: string | null;
   recentWorkspaces: RecentWorkspace[];
+  localProjects: LocalProject[];
+  hiddenWorkspaceRootKeys: string[];
+  activeWorkspaceRemoteUrl: string | null;
   workspaceError: string | null;
   isPickingWorkspace: boolean;
   onSelect(id: string): void;
@@ -1668,23 +1781,28 @@ function Sidebar({
   onPickWorkspace(): void;
   onSelectWorkspace(workspaceRoot: string): void;
   onForgetWorkspace(workspaceRoot: string): void;
-  onSelectDraftProject(projectName: string): void;
+  onCreateLocalProject(project: LocalProject): void;
+  onRemoveLocalProject(projectId: string): void;
+  onSelectDraftProject(projectId: string, projectName: string): void;
   onOpenThreadWorkspace(workspaceRoot: string): void;
-  onNewThreadForProject?(workspaceRoot: string | null, projectName: string): void;
+  onNewThreadForProject?(
+    workspaceRoot: string | null,
+    projectName: string,
+    projectId: string,
+  ): void;
   onSettings(): void;
 }) {
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("New project");
-  const [localProjects, setLocalProjects] = useState<LocalProject[]>(() =>
-    readLocalProjects(),
-  );
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
     () => new Set(),
   );
   const [moreMenuProjectId, setMoreMenuProjectId] = useState<string | null>(
     null,
   );
+  const [hoveredProject, setHoveredProject] =
+    useState<ProjectHoverState | null>(null);
   const moreMenuRef = useDismissiblePopover(moreMenuProjectId !== null, () =>
     setMoreMenuProjectId(null),
   );
@@ -1715,12 +1833,17 @@ function Sidebar({
 
   const projects = useMemo(() => {
     const roots = new Map<string, { name: string; workspaceRoot: string }>();
+    const hiddenKeys = new Set(hiddenWorkspaceRootKeys);
     for (const workspace of recentWorkspaces) {
-      roots.set(workspace.workspaceRoot, workspace);
+      const key = workspaceRootKey(workspace.workspaceRoot);
+      if (!hiddenKeys.has(key) && !roots.has(key)) {
+        roots.set(key, workspace);
+      }
     }
     for (const thread of threads) {
-      if (!roots.has(thread.workspaceRoot)) {
-        roots.set(thread.workspaceRoot, {
+      const key = workspaceRootKey(thread.workspaceRoot);
+      if (!hiddenKeys.has(key) && !roots.has(key)) {
+        roots.set(key, {
           name: workspaceName(thread.workspaceRoot),
           workspaceRoot: thread.workspaceRoot,
         });
@@ -1732,34 +1855,32 @@ function Sidebar({
         name: project.name,
         workspaceRoot: null,
       })),
-      ...[...roots.values()].map((project) => ({
-        id: project.workspaceRoot,
+      ...[...roots.entries()].map(([key, project]) => ({
+        id: `workspace:${key}`,
         ...project,
       })),
     ];
-  }, [localProjects, recentWorkspaces, threads]);
+  }, [hiddenWorkspaceRootKeys, localProjects, recentWorkspaces, threads]);
 
   function createLocalProject() {
     const name = newProjectName.trim();
     if (!name) return;
+    const existingProject = localProjects.find(
+      (project) =>
+        project.name.trim().toLocaleLowerCase() === name.toLocaleLowerCase(),
+    );
+    if (existingProject) {
+      setNewProjectOpen(false);
+      setProjectMenuOpen(false);
+      onSelectDraftProject(existingProject.id, existingProject.name);
+      return;
+    }
     const project = { id: crypto.randomUUID(), name };
-    setLocalProjects((current) => {
-      const next = [project, ...current];
-      writeLocalProjects(next);
-      return next;
-    });
+    onCreateLocalProject(project);
     setNewProjectOpen(false);
     setProjectMenuOpen(false);
     setNewProjectName("New project");
-    onSelectDraftProject(name);
-  }
-
-  function removeLocalProject(projectId: string) {
-    setLocalProjects((current) => {
-      const next = current.filter((project) => project.id !== projectId);
-      writeLocalProjects(next);
-      return next;
-    });
+    onSelectDraftProject(project.id, name);
   }
 
   return (
@@ -1767,7 +1888,8 @@ function Sidebar({
       <aside className="sidebar">
         <div className="sidebar-brand-row">
           <strong>
-            <span className="brand-open">Open</span><span>Topia</span>
+            <span className="brand-open">Open</span>
+            <span>Topia</span>
           </strong>
           <button
             className="sidebar-icon-button"
@@ -1814,7 +1936,7 @@ function Sidebar({
               {isPickingWorkspace ? (
                 <Loader2 size={14} className="spin" />
               ) : (
-                <Plus size={14} />
+                <SquarePen size={14} />
               )}
             </button>
             {projectMenuOpen && (
@@ -1844,49 +1966,78 @@ function Sidebar({
           </div>
         </div>
         <div className="project-tree">
-          {projects.map((project) => {
+          {projects.map((project, projectIndex) => {
             const projectThreads = project.workspaceRoot
               ? threads.filter(
-                  (thread) => thread.workspaceRoot === project.workspaceRoot,
+                  (thread) =>
+                    workspaceRootKey(thread.workspaceRoot) ===
+                    workspaceRootKey(project.workspaceRoot ?? ""),
                 )
               : [];
             const isActive = project.workspaceRoot
-              ? project.workspaceRoot === selectedWorkspaceRoot
-              : !activeThreadId && project.name === selectedDraftProjectName;
+              ? Boolean(
+                  selectedWorkspaceRoot &&
+                  workspaceRootKey(project.workspaceRoot) ===
+                    workspaceRootKey(selectedWorkspaceRoot),
+                )
+              : !activeThreadId && project.id === selectedDraftProjectId;
             const isExpanded = expandedProjects.has(project.id);
             const isMoreMenuOpen = moreMenuProjectId === project.id;
+            const projectInfoId = `project-hover-card-${projectIndex}`;
             return (
               <section
                 className={`project-node ${isActive ? "active" : ""}`}
                 key={project.id}
+                onMouseEnter={(event) => {
+                  const bounds = event.currentTarget.getBoundingClientRect();
+                  const cardWidth = 320;
+                  const left = Math.min(
+                    bounds.right + 8,
+                    window.innerWidth - cardWidth - 8,
+                  );
+                  const remoteUrl =
+                    project.workspaceRoot &&
+                    selectedWorkspaceRoot &&
+                    workspaceRootKey(project.workspaceRoot) ===
+                      workspaceRootKey(selectedWorkspaceRoot)
+                      ? activeWorkspaceRemoteUrl
+                      : null;
+                  setHoveredProject({
+                    id: projectInfoId,
+                    name: project.name,
+                    threadCount: projectThreads.length,
+                    workspaceRoot: project.workspaceRoot,
+                    remoteUrl,
+                    left: Math.max(8, left),
+                    top: Math.max(
+                      36,
+                      Math.min(bounds.top, window.innerHeight - 174),
+                    ),
+                  });
+                }}
+                onMouseLeave={() => setHoveredProject(null)}
               >
                 <div className="project-row">
                   <button
                     className="project-select"
                     title={project.workspaceRoot ?? project.name}
+                    aria-label={`项目 ${project.name}`}
+                    aria-describedby={projectInfoId}
                     onClick={() => {
                       toggleExpandedProject(project.id);
                       project.workspaceRoot
                         ? onSelectWorkspace(project.workspaceRoot)
-                        : onSelectDraftProject(project.name);
+                        : onSelectDraftProject(project.id, project.name);
                     }}
                   >
-                    {isExpanded ? <FolderOpen size={14} /> : <Folder size={14} />}
+                    {isExpanded ? (
+                      <FolderOpen size={14} />
+                    ) : (
+                      <Folder size={14} />
+                    )}
                     <span>{project.name}</span>
                   </button>
                   <div className="project-row-actions">
-                    <button
-                      className="project-new-thread"
-                      title="新建对话"
-                      onClick={() => {
-                        onNewThreadForProject?.(
-                          project.workspaceRoot,
-                          project.name,
-                        );
-                      }}
-                    >
-                      <Plus size={13} />
-                    </button>
                     <div
                       className="project-menu-wrap"
                       ref={isMoreMenuOpen ? moreMenuRef : undefined}
@@ -1904,13 +2055,16 @@ function Sidebar({
                         <MoreHorizontal size={13} />
                       </button>
                       {isMoreMenuOpen && (
-                        <div className="tool-popover project-row-popover" role="menu">
+                        <div
+                          className="tool-popover project-row-popover"
+                          role="menu"
+                        >
                           <button
                             role="menuitem"
                             onClick={() => {
                               project.workspaceRoot
                                 ? onForgetWorkspace(project.workspaceRoot)
-                                : removeLocalProject(project.id);
+                                : onRemoveLocalProject(project.id);
                               setMoreMenuProjectId(null);
                             }}
                           >
@@ -1920,6 +2074,20 @@ function Sidebar({
                         </div>
                       )}
                     </div>
+                    <button
+                      className="project-new-thread"
+                      title="新建对话"
+                      aria-label={`在 ${project.name} 中新建对话`}
+                      onClick={() => {
+                        onNewThreadForProject?.(
+                          project.workspaceRoot,
+                          project.name,
+                          project.id,
+                        );
+                      }}
+                    >
+                      <SquarePen size={13} />
+                    </button>
                   </div>
                 </div>
                 {isExpanded && (
@@ -1961,6 +2129,45 @@ function Sidebar({
           </button>
         </div>
       </aside>
+      {hoveredProject &&
+        createPortal(
+          <div
+            className="project-hover-card"
+            id={hoveredProject.id}
+            role="tooltip"
+            style={{ left: hoveredProject.left, top: hoveredProject.top }}
+          >
+            <header>
+              <span>
+                <Folder size={17} aria-hidden="true" />
+                <strong>{hoveredProject.name}</strong>
+              </span>
+              <button disabled title="固定项目 · 未实现" aria-label="固定项目">
+                <Pin size={14} aria-hidden="true" />
+              </button>
+            </header>
+            <div className="project-hover-card__row">
+              <MessageCircle size={15} aria-hidden="true" />
+              <span>{hoveredProject.threadCount} 个对话串</span>
+            </div>
+            <div className="project-hover-card__divider" />
+            <div className="project-hover-card__row">
+              <GitFork size={15} aria-hidden="true" />
+              <span title={hoveredProject.remoteUrl ?? undefined}>
+                {hoveredProject.remoteUrl
+                  ? compactRemoteLabel(hoveredProject.remoteUrl)
+                  : "远程仓库信息未加载"}
+              </span>
+            </div>
+            <div className="project-hover-card__row">
+              <Folder size={15} aria-hidden="true" />
+              <span title={hoveredProject.workspaceRoot ?? undefined}>
+                {hoveredProject.workspaceRoot ?? "尚未选择工作区"}
+              </span>
+            </div>
+          </div>,
+          document.body,
+        )}
       {newProjectOpen && (
         <div
           className="modal-backdrop project-modal-backdrop"
@@ -2859,11 +3066,6 @@ function RightPanel({
   onCloseToolTab(tabId: string): void;
   onToggleConversation(): void;
 }) {
-  const changedFiles = workspaceDiff?.files.length ?? 0;
-  const enabledMcpServers = threadMcpServers.filter(
-    (server) => server.enabled,
-  ).length;
-
   const renderWorkbench = (
     mode: "panel" | "stage",
     activeTab?: WorkbenchTab,
@@ -2936,64 +3138,19 @@ function RightPanel({
   }
 
   return (
-    <aside className="right-panel">
-      <section className="environment-panel" aria-label="环境信息">
-        <header>
-          <span>环境信息</span>
-          <button disabled title="添加环境 · 未实现" aria-label="添加环境">
-            <Plus size={14} />
-          </button>
-        </header>
-        <div className="environment-facts">
-          <button type="button" onClick={() => onOpenToolTab("diff")}>
-            <FileCode2 size={14} />
-            <span>变更</span>
-            <strong>{changedFiles}</strong>
-          </button>
-          <button type="button" onClick={() => onOpenToolTab("terminal")}>
-            <TerminalSquare size={14} />
-            <span>本地</span>
-            <strong>{terminalSession ? "已连接" : "待连接"}</strong>
-          </button>
-          <button type="button" onClick={() => onOpenToolTab("extensions")}>
-            <Plug size={14} />
-            <span>MCP</span>
-            <strong>
-              {enabledMcpServers}/{mcpServers.length}
-            </strong>
-          </button>
-          <button type="button" onClick={() => onOpenToolTab("files")}>
-            <GitBranch size={14} />
-            <span>工作区</span>
-            <strong title={workspaceRoot ?? ""}>
-              {workspaceRoot ? workspaceName(workspaceRoot) : "未选择"}
-            </strong>
-          </button>
-        </div>
-        <div className="environment-disabled-actions">
-          <button disabled title="提交或推送 · 未实现">
-            <GitBranch size={14} />
-            <span>提交或推送</span>
-            <small>未实现</small>
-          </button>
-          <button disabled title="GitHub CLI · 未实现">
-            <Github size={14} />
-            <span>GitHub CLI</span>
-            <small>未实现</small>
-          </button>
-          <button disabled title="比较分支 · 未实现">
-            <GitPullRequest size={14} />
-            <span>比较分支</span>
-            <small>未实现</small>
-          </button>
-          <button disabled title="子智能体 · 未实现">
-            <Users size={14} />
-            <span>子智能体</span>
-            <small>未实现</small>
-          </button>
-        </div>
-      </section>
-      {renderWorkbench("panel")}
+    <aside className="right-panel context-rail-shell">
+      <RightContextRail
+        workspaceRoot={workspaceRoot}
+        workspaceDiff={workspaceDiff}
+        terminalEvents={terminalEvents}
+        terminalSession={terminalSession}
+        agentEvents={events}
+        artifacts={artifacts}
+        onOpenDiff={() => onOpenToolTab("diff")}
+        onOpenTerminal={() => onOpenToolTab("terminal")}
+        onOpenFiles={() => onOpenToolTab("files")}
+        onOpenExtensions={() => onOpenToolTab("extensions")}
+      />
     </aside>
   );
 }
@@ -3323,7 +3480,18 @@ type LocalProject = {
   name: string;
 };
 
+type ProjectHoverState = {
+  id: string;
+  name: string;
+  threadCount: number;
+  workspaceRoot: string | null;
+  remoteUrl: string | null;
+  left: number;
+  top: number;
+};
+
 const localProjectsStorageKey = "opentopia.localProjects";
+const hiddenWorkspaceRootsStorageKey = "opentopia.hiddenWorkspaceRoots";
 
 function readLocalProjects(): LocalProject[] {
   try {
@@ -3347,6 +3515,31 @@ function writeLocalProjects(projects: LocalProject[]) {
   window.localStorage.setItem(
     localProjectsStorageKey,
     JSON.stringify(projects),
+  );
+}
+
+function readHiddenWorkspaceRootKeys(): string[] {
+  try {
+    const parsed = JSON.parse(
+      window.localStorage.getItem(hiddenWorkspaceRootsStorageKey) ?? "[]",
+    );
+    if (!Array.isArray(parsed)) return [];
+    return [
+      ...new Set(
+        parsed
+          .filter((key): key is string => typeof key === "string")
+          .map(workspaceRootKey),
+      ),
+    ];
+  } catch {
+    return [];
+  }
+}
+
+function writeHiddenWorkspaceRootKeys(keys: string[]) {
+  window.localStorage.setItem(
+    hiddenWorkspaceRootsStorageKey,
+    JSON.stringify(keys),
   );
 }
 
@@ -3508,4 +3701,39 @@ function workspaceName(workspaceRoot: string): string {
   const trimmed = workspaceRoot.replace(/[\\\/]+$/, "");
   const parts = trimmed.split(/[\\\/]/).filter(Boolean);
   return parts.at(-1) || workspaceRoot;
+}
+
+function workspaceRootKey(workspaceRoot: string): string {
+  let unified = workspaceRoot.trim().replace(/\\/g, "/");
+  if (/^\/\/\?\/unc\//i.test(unified)) {
+    unified = `//${unified.slice(8)}`;
+  } else if (/^\/\/\?\//.test(unified)) {
+    unified = unified.slice(4);
+  }
+  const prefix = unified.startsWith("//")
+    ? "//"
+    : unified.startsWith("/")
+      ? "/"
+      : "";
+  const remainder = unified.slice(prefix.length).replace(/^\/+/, "");
+  const normalized = `${prefix}${remainder.replace(/\/+/g, "/")}`;
+  const withoutTrailingSeparators =
+    normalized.length > prefix.length
+      ? normalized.replace(/\/+$/, "")
+      : normalized;
+  return withoutTrailingSeparators.toLowerCase();
+}
+
+function compactRemoteLabel(remoteUrl: string): string {
+  const scpRemote = remoteUrl.match(/^[^@]+@([^:]+):(.+)$/);
+  if (scpRemote) {
+    return `${scpRemote[1]}/${scpRemote[2].replace(/\.git$/, "")}`;
+  }
+  try {
+    const parsed = new URL(remoteUrl);
+    const pathname = parsed.pathname.replace(/^\//, "").replace(/\.git$/, "");
+    return pathname ? `${parsed.host}/${pathname}` : parsed.host;
+  } catch {
+    return remoteUrl;
+  }
 }

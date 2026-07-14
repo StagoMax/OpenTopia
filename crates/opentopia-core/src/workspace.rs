@@ -77,6 +77,8 @@ pub struct WorkspaceDiffHunk {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceDiff {
     pub command: String,
+    pub branch: Option<String>,
+    pub remote_url: Option<String>,
     pub files: Vec<ChangedFile>,
     pub diff: String,
     pub staged_diff: String,

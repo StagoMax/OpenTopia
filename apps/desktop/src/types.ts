@@ -174,6 +174,8 @@ export type WorkspaceDiffHunkAction = "stage" | "unstage" | "discard";
 
 export type WorkspaceDiff = {
   command: string;
+  branch?: string | null;
+  remoteUrl?: string | null;
   files: ChangedFile[];
   diff: string;
   stagedDiff?: string;

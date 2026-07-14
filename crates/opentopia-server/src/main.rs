@@ -1028,6 +1028,16 @@ async fn apply_workspace_diff_hunk(
 }
 
 async fn get_workspace_diff_inner(workspace_root: &FsPath) -> anyhow::Result<WorkspaceDiff> {
+    let branch = run_git(workspace_root, ["symbolic-ref", "--short", "HEAD"])
+        .await
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let remote_url = run_git(workspace_root, ["remote", "get-url", "origin"])
+        .await
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let status_output = run_git(workspace_root, ["status", "--porcelain=v1"])
         .await
         .unwrap_or_else(|_| String::new());
@@ -1048,6 +1058,8 @@ async fn get_workspace_diff_inner(workspace_root: &FsPath) -> anyhow::Result<Wor
     let diff = combine_workspace_diffs(&staged_diff, &unstaged_diff);
     Ok(WorkspaceDiff {
         command: "git diff --cached -- && git diff --".to_string(),
+        branch,
+        remote_url,
         files,
         diff,
         staged_diff,
