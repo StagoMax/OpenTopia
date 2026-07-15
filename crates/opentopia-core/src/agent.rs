@@ -1,6 +1,9 @@
+use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
 use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
-use crate::model::{AgentEventPayload, ContextSummary, Message, MessageRole, ToolCall, ToolResult};
+use crate::model::{
+    AgentEventPayload, Message, MessageRole, ModelContentPart, ToolCall, ToolResult,
+};
 use crate::policy::{BasicPolicyEngine, PermissionMode};
 use crate::provider::{
     MockProvider, ModelConversationMessage, ModelProvider, ModelRequest, ModelResponse,
@@ -11,16 +14,21 @@ use crate::sandbox::LocalSandboxConfig;
 use crate::settings::{AppSettings, ProviderKind};
 use crate::store::SessionStore;
 use crate::subagents::SubagentScheduler;
-use crate::tools::{McpToolWrapper, ToolContext, ToolRegistry};
+use crate::tools::{
+    browser_domain_approval_action, browser_domain_from_url, McpToolWrapper, ToolContext,
+    ToolRegistry,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const MAX_PROVIDER_TOOL_ROUNDS: usize = 8;
+const DEFAULT_MAX_PROVIDER_TOOL_ROUNDS: usize = 8;
+const DEFAULT_MAX_TURN_ELAPSED_MS: u64 = 15 * 60 * 1_000;
 
 pub type AgentEventSender = mpsc::UnboundedSender<AgentEventPayload>;
 
@@ -41,6 +49,86 @@ pub enum AgentTurnOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentExecutionBudget {
+    pub max_tool_rounds: usize,
+    pub max_elapsed_ms: u64,
+}
+
+impl Default for AgentExecutionBudget {
+    fn default() -> Self {
+        Self {
+            max_tool_rounds: DEFAULT_MAX_PROVIDER_TOOL_ROUNDS,
+            max_elapsed_ms: DEFAULT_MAX_TURN_ELAPSED_MS,
+        }
+    }
+}
+
+impl AgentExecutionBudget {
+    fn normalized(mut self) -> Self {
+        self.max_tool_rounds = self.max_tool_rounds.max(1);
+        self.max_elapsed_ms = self.max_elapsed_ms.max(1);
+        self
+    }
+
+    fn status(
+        &self,
+        used_tool_rounds: usize,
+        started_at: Instant,
+        context_budget: Option<&ContextBudget>,
+    ) -> AgentBudgetStatus {
+        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let context_used_tokens = context_budget.map(|budget| budget.used_tokens);
+        let context_max_tokens = context_budget.map(|budget| budget.max_tokens);
+        AgentBudgetStatus {
+            max_tool_rounds: self.max_tool_rounds,
+            used_tool_rounds,
+            remaining_tool_rounds: self.max_tool_rounds.saturating_sub(used_tool_rounds),
+            max_elapsed_ms: self.max_elapsed_ms,
+            elapsed_ms,
+            remaining_time_ms: self.max_elapsed_ms.saturating_sub(elapsed_ms),
+            context_max_tokens,
+            context_used_tokens,
+            context_remaining_tokens: context_max_tokens
+                .zip(context_used_tokens)
+                .map(|(max, used)| max.saturating_sub(used)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBudgetStatus {
+    pub max_tool_rounds: usize,
+    pub used_tool_rounds: usize,
+    pub remaining_tool_rounds: usize,
+    pub max_elapsed_ms: u64,
+    pub elapsed_ms: u64,
+    pub remaining_time_ms: u64,
+    pub context_max_tokens: Option<usize>,
+    pub context_used_tokens: Option<usize>,
+    pub context_remaining_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBudgetCheckpointReason {
+    ToolRounds,
+    ElapsedTime,
+    ContextWindow,
+}
+
+impl AgentBudgetCheckpointReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ToolRounds => "The tool-decision budget for this execution slice was reached.",
+            Self::ElapsedTime => "The execution time budget for this slice was reached.",
+            Self::ContextWindow => "The context budget for this execution slice was reached.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentContinuation {
     pub thread_id: Uuid,
     pub user_message_id: Uuid,
@@ -49,18 +137,28 @@ pub struct AgentContinuation {
     pub conversation: Vec<ModelConversationMessage>,
     pub permission_mode: PermissionMode,
     pub context_budget: Option<ContextBudget>,
+    #[serde(default)]
+    pub execution_budget: AgentExecutionBudget,
+    #[serde(default)]
+    pub continuation_kind: AgentContinuationKind,
     pub state: AgentContinuationState,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentContinuationKind {
+    #[default]
+    Approval,
+    BudgetCheckpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentContinuationState {
-    DirectCommand {
-        content: String,
-    },
     Provider {
         model_user_message: String,
-        listed_files: String,
+        #[serde(default)]
+        model_user_content: Vec<ModelContentPart>,
         tool_candidates: Vec<ProviderToolCandidate>,
         provider_tool_calls: Vec<ProviderToolCall>,
         provider_tool_results: Vec<ProviderToolResult>,
@@ -151,6 +249,7 @@ pub struct AgentCore {
     tools: ToolRegistry,
     pub mcp_host: Option<McpExtensionHost>,
     sandbox_config: LocalSandboxConfig,
+    browser: Arc<dyn BrowserRuntime>,
     subagents: Option<SubagentScheduler>,
     subagent_depth: u8,
     subagent_parent_turn_id: Option<Uuid>,
@@ -163,6 +262,7 @@ impl Default for AgentCore {
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
             sandbox_config: LocalSandboxConfig::from_env(),
+            browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             subagents: None,
             subagent_depth: 0,
             subagent_parent_turn_id: None,
@@ -180,6 +280,7 @@ impl AgentCore {
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
             sandbox_config: LocalSandboxConfig::from_env(),
+            browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             subagents: None,
             subagent_depth: 0,
             subagent_parent_turn_id: None,
@@ -200,6 +301,7 @@ impl AgentCore {
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
             sandbox_config: settings.sandbox.to_local_sandbox_config(),
+            browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             subagents: None,
             subagent_depth: 0,
             subagent_parent_turn_id: None,
@@ -212,6 +314,7 @@ impl AgentCore {
             tools,
             mcp_host: None,
             sandbox_config: LocalSandboxConfig::from_env(),
+            browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             subagents: None,
             subagent_depth: 0,
             subagent_parent_turn_id: None,
@@ -227,6 +330,10 @@ impl AgentCore {
         self.sandbox_config = sandbox_config;
     }
 
+    pub fn set_browser_runtime(&mut self, browser: Arc<dyn BrowserRuntime>) {
+        self.browser = browser;
+    }
+
     pub fn set_subagent_scheduler(&mut self, scheduler: SubagentScheduler) {
         self.subagents = Some(scheduler);
     }
@@ -240,6 +347,7 @@ impl AgentCore {
         context.subagents = self.subagents.clone();
         context.parent_turn_id = Some(self.subagent_parent_turn_id.unwrap_or(fallback_turn_id));
         context.subagent_depth = self.subagent_depth;
+        context.browser = Some(self.browser.clone());
     }
 
     pub fn with_mcp_host(mut self, host: McpExtensionHost) -> Self {
@@ -317,143 +425,32 @@ impl AgentCore {
     ) -> anyhow::Result<AgentTurnResult> {
         let mut events = TurnEvents::new(sender);
         let mut budget = input.context_budget;
+        let execution_budget = AgentExecutionBudget::default().normalized();
+        let started_at = Instant::now();
 
         events.push(AgentEventPayload::TurnStarted {
             user_message_id: input.user_message_id,
         });
-
-        let policy = Arc::new(BasicPolicyEngine::new(
-            input.workspace_root.clone(),
-            input.permission_mode,
-        ));
 
         if let Some(ref mut budget) = budget {
             let input_tokens = ContextBudget::estimate_tokens(&input.content);
             budget.record_tokens(input_tokens);
         }
 
-        if let Some(task) = ParsedTask::parse(&input.content) {
-            let mut tool_ctx = ToolContext::local_with_sandbox_config(
-                input.workspace_root.clone(),
-                policy,
-                self.sandbox_config.clone(),
-            );
-            tool_ctx.store = input.store.clone();
-            tool_ctx.thread_id = Some(input.thread_id);
-            tool_ctx.cancel = input.cancellation.clone();
-            self.apply_subagent_context(&mut tool_ctx, input.user_message_id);
-
-            let result = match self.execute_parsed_task(task, tool_ctx, &mut events).await {
-                Ok(result) => {
-                    if let Some(ref mut budget) = budget {
-                        let output_tokens = ContextBudget::estimate_tokens(&result);
-                        budget.record_tokens(output_tokens);
-                        if budget.is_exceeded() {
-                            events.push(AgentEventPayload::ContextCompacted {
-                                summary: ContextSummary::new(
-                                    input.thread_id,
-                                    0,
-                                    1,
-                                    format!(
-                                        "Context budget exceeded ({} / {} tokens). Consider summarizing earlier turns.",
-                                        budget.used_tokens, budget.max_tokens
-                                    ),
-                                ),
-                            });
-                        } else {
-                            for warning in &budget.warnings {
-                                events.push(AgentEventPayload::ModelDelta {
-                                    text: format!("**Context budget warning:** {}\n", warning),
-                                });
-                            }
-                        }
-                    }
-                    result
-                }
-                Err(err) if err.to_string().contains("approval required") => {
-                    let reason = err.to_string();
-                    let approval_id = Uuid::new_v4();
-                    events.push(AgentEventPayload::ApprovalRequested {
-                        approval_id,
-                        reason: reason.clone(),
-                        action: input.content.clone(),
-                    });
-                    events.push(AgentEventPayload::TurnSuspended {
-                        approval_id,
-                        reason,
-                    });
-                    return Ok(AgentTurnResult {
-                        events: events.into_vec(),
-                        outcome: AgentTurnOutcome::Suspended {
-                            approval_id,
-                            continuation: AgentContinuation {
-                                thread_id: input.thread_id,
-                                user_message_id: input.user_message_id,
-                                workspace_root: input.workspace_root,
-                                context_summary: input.context_summary,
-                                conversation: input.conversation,
-                                permission_mode: input.permission_mode,
-                                context_budget: budget,
-                                state: AgentContinuationState::DirectCommand {
-                                    content: input.content,
-                                },
-                            },
-                        },
-                    });
-                }
-                Err(err) => return Err(err),
-            };
-            let assistant_message = Message::text(input.thread_id, MessageRole::Assistant, result);
-            events.push(AgentEventPayload::AssistantMessage {
-                message: assistant_message,
-            });
-            events.push(AgentEventPayload::TurnFinished {
-                summary: "Command task completed.".to_string(),
-            });
-            return Ok(AgentTurnResult {
-                events: events.into_vec(),
-                outcome: AgentTurnOutcome::Completed,
-            });
-        }
-
-        let listed_files = self
-            .execute_tool(
-                "list_files",
-                json!({ "path": "." }),
-                {
-                    let mut ctx = ToolContext::local_with_sandbox_config(
-                        input.workspace_root.clone(),
-                        policy.clone(),
-                        self.sandbox_config.clone(),
-                    );
-                    ctx.store = input.store.clone();
-                    ctx.thread_id = Some(input.thread_id);
-                    ctx.cancel = input.cancellation.clone();
-                    self.apply_subagent_context(&mut ctx, input.user_message_id);
-                    ctx
-                },
-                &mut events,
-            )
-            .await?
-            .output;
-
-        if let Some(ref mut budget) = budget {
-            let list_tokens = ContextBudget::estimate_tokens(&listed_files);
-            budget.record_tokens(list_tokens);
-        }
-
-        let model_user_message = provider_user_message(
-            &input.content,
-            &listed_files,
-            input.context_summary.as_deref(),
-        );
+        let model_user_message =
+            provider_user_message(&input.content, input.context_summary.as_deref());
         let tool_candidates = self.provider_tool_candidates();
         let response = self
             .complete_model(
                 ModelRequest {
-                    system_prompt: provider_system_prompt(),
+                    system_prompt: provider_system_prompt(&execution_budget.status(
+                        0,
+                        started_at,
+                        budget.as_ref(),
+                    )),
                     conversation: input.conversation.clone(),
                     user_message: model_user_message.clone(),
+                    user_content: input.user_content.clone(),
                     tool_candidates: tool_candidates.clone(),
                     previous_tool_calls: Vec::new(),
                     tool_results: Vec::new(),
@@ -461,10 +458,12 @@ impl AgentCore {
                 &mut events,
             )
             .await?;
+        if let Some(ref mut budget) = budget {
+            budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
+        }
         if response.tool_calls.is_empty() {
             return Ok(finalize_provider_turn(
                 input.thread_id,
-                listed_files,
                 response,
                 Vec::new(),
                 budget,
@@ -481,15 +480,17 @@ impl AgentCore {
             input.conversation,
             input.permission_mode,
             budget,
+            execution_budget,
+            started_at,
             input.store,
             input.cancellation,
             model_user_message,
-            listed_files,
+            input.user_content,
             tool_candidates,
             provider_tool_calls,
             Vec::new(),
             response.tool_calls,
-            0,
+            1,
             &mut events,
         )
         .await
@@ -508,59 +509,57 @@ impl AgentCore {
             user_message_id: continuation.user_message_id,
         });
 
-        match continuation.state {
-            AgentContinuationState::DirectCommand { content } => {
-                if !approved {
-                    let message = Message::text(
-                        continuation.thread_id,
-                        MessageRole::Assistant,
-                        "Approval was denied, so the requested action was not executed.",
-                    );
-                    events.push(AgentEventPayload::AssistantMessage { message });
-                    events.push(AgentEventPayload::TurnFinished {
-                        summary: "Approval denied; command skipped.".to_string(),
-                    });
-                    return Ok(AgentTurnResult {
-                        events: events.into_vec(),
-                        outcome: AgentTurnOutcome::Completed,
-                    });
-                }
+        let is_budget_checkpoint =
+            continuation.continuation_kind == AgentContinuationKind::BudgetCheckpoint;
+        let execution_budget = continuation.execution_budget.clone().normalized();
+        let started_at = Instant::now();
 
-                let task = ParsedTask::parse(&content)
-                    .ok_or_else(|| anyhow::anyhow!("approved command is no longer parseable"))?;
-                let policy = Arc::new(BasicPolicyEngine::new(
-                    continuation.workspace_root.clone(),
-                    PermissionMode::FullAccess,
-                ));
-                let mut ctx = ToolContext::local_with_sandbox_config(
-                    continuation.workspace_root,
-                    policy,
-                    crate::sandbox::LocalSandboxConfig::danger_full_access(),
-                );
-                ctx.store = store;
-                ctx.thread_id = Some(continuation.thread_id);
-                ctx.cancel = cancellation;
-                self.apply_subagent_context(&mut ctx, continuation.user_message_id);
-                let result = self.execute_parsed_task(task, ctx, &mut events).await?;
-                let message = Message::text(continuation.thread_id, MessageRole::Assistant, result);
-                events.push(AgentEventPayload::AssistantMessage { message });
-                events.push(AgentEventPayload::TurnFinished {
-                    summary: "Approved command completed.".to_string(),
-                });
-                Ok(AgentTurnResult {
-                    events: events.into_vec(),
-                    outcome: AgentTurnOutcome::Completed,
-                })
-            }
+        match continuation.state {
             AgentContinuationState::Provider {
                 model_user_message,
-                listed_files,
+                model_user_content,
                 tool_candidates,
                 provider_tool_calls,
                 mut provider_tool_results,
                 mut pending_tool_calls,
                 current_round,
             } => {
+                if is_budget_checkpoint {
+                    if !approved {
+                        events.push(AgentEventPayload::TurnFinished {
+                            summary: "Budget checkpoint left paused by the user.".to_string(),
+                        });
+                        return Ok(AgentTurnResult {
+                            events: events.into_vec(),
+                            outcome: AgentTurnOutcome::Completed,
+                        });
+                    }
+
+                    return self
+                        .continue_provider_turn(
+                            continuation.thread_id,
+                            continuation.user_message_id,
+                            continuation.workspace_root,
+                            continuation.context_summary,
+                            continuation.conversation,
+                            continuation.permission_mode,
+                            continuation.context_budget,
+                            execution_budget,
+                            started_at,
+                            store,
+                            cancellation,
+                            model_user_message,
+                            model_user_content,
+                            tool_candidates,
+                            provider_tool_calls,
+                            provider_tool_results,
+                            pending_tool_calls,
+                            current_round,
+                            &mut events,
+                        )
+                        .await;
+                }
+
                 let pending = pending_tool_calls
                     .first()
                     .cloned()
@@ -579,6 +578,7 @@ impl AgentCore {
                     ctx.store = store.clone();
                     ctx.thread_id = Some(continuation.thread_id);
                     ctx.cancel = cancellation.clone();
+                    ctx.approval_granted = true;
                     self.apply_subagent_context(&mut ctx, continuation.user_message_id);
                     provider_tool_results.push(
                         self.execute_provider_tool_call(&pending, ctx, &mut events)
@@ -589,9 +589,17 @@ impl AgentCore {
                         call_id: pending.id.clone(),
                         name: pending.name.clone(),
                         output: "The user denied this tool call.".to_string(),
+                        content: vec![ModelContentPart::text("The user denied this tool call.")],
                         is_error: true,
                         metadata: json!({ "approvalDenied": true }),
                     });
+                }
+
+                let mut context_budget = continuation.context_budget;
+                if let Some(ref mut budget) = context_budget {
+                    if let Some(result) = provider_tool_results.last() {
+                        budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
+                    }
                 }
 
                 self.continue_provider_turn(
@@ -601,11 +609,13 @@ impl AgentCore {
                     continuation.context_summary,
                     continuation.conversation,
                     continuation.permission_mode,
-                    continuation.context_budget,
+                    context_budget,
+                    execution_budget,
+                    started_at,
                     store,
                     cancellation,
                     model_user_message,
-                    listed_files,
+                    model_user_content,
                     tool_candidates,
                     provider_tool_calls,
                     provider_tool_results,
@@ -628,10 +638,12 @@ impl AgentCore {
         conversation: Vec<ModelConversationMessage>,
         permission_mode: PermissionMode,
         mut budget: Option<ContextBudget>,
+        execution_budget: AgentExecutionBudget,
+        started_at: Instant,
         store: Option<Arc<dyn SessionStore>>,
         cancellation: Option<CancellationToken>,
         model_user_message: String,
-        listed_files: String,
+        model_user_content: Vec<ModelContentPart>,
         tool_candidates: Vec<ProviderToolCandidate>,
         mut provider_tool_calls: Vec<ProviderToolCall>,
         mut provider_tool_results: Vec<ProviderToolResult>,
@@ -640,6 +652,34 @@ impl AgentCore {
         events: &mut TurnEvents,
     ) -> anyhow::Result<AgentTurnResult> {
         loop {
+            if let Some(reason) = budget_checkpoint_reason(
+                &execution_budget,
+                current_round,
+                started_at,
+                budget.as_ref(),
+            ) {
+                return Ok(suspend_for_budget_checkpoint(
+                    thread_id,
+                    user_message_id,
+                    workspace_root,
+                    context_summary,
+                    conversation,
+                    permission_mode,
+                    budget,
+                    execution_budget,
+                    started_at,
+                    reason,
+                    model_user_message,
+                    model_user_content,
+                    tool_candidates,
+                    provider_tool_calls,
+                    provider_tool_results,
+                    pending_tool_calls,
+                    current_round,
+                    std::mem::replace(events, TurnEvents::new(None)),
+                ));
+            }
+
             while let Some(provider_call) = pending_tool_calls.first().cloned() {
                 let policy = Arc::new(BasicPolicyEngine::new(
                     workspace_root.clone(),
@@ -659,6 +699,9 @@ impl AgentCore {
                     .await
                 {
                     Ok(result) => {
+                        if let Some(ref mut budget) = budget {
+                            budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
+                        }
                         provider_tool_results.push(result);
                         pending_tool_calls.remove(0);
                     }
@@ -686,9 +729,11 @@ impl AgentCore {
                                     conversation,
                                     permission_mode,
                                     context_budget: budget,
+                                    execution_budget: execution_budget.clone(),
+                                    continuation_kind: AgentContinuationKind::Approval,
                                     state: AgentContinuationState::Provider {
                                         model_user_message,
-                                        listed_files,
+                                        model_user_content,
                                         tool_candidates,
                                         provider_tool_calls,
                                         provider_tool_results,
@@ -703,13 +748,18 @@ impl AgentCore {
                 }
             }
 
-            let mut response = self
+            let response = self
                 .complete_model(
                     ModelRequest {
-                        system_prompt: provider_system_prompt(),
+                        system_prompt: provider_system_prompt(&execution_budget.status(
+                            current_round,
+                            started_at,
+                            budget.as_ref(),
+                        )),
                         conversation: conversation.clone(),
                         user_message: model_user_message.clone(),
-                        tool_candidates: if current_round + 1 < MAX_PROVIDER_TOOL_ROUNDS {
+                        user_content: model_user_content.clone(),
+                        tool_candidates: if current_round < execution_budget.max_tool_rounds {
                             tool_candidates.clone()
                         } else {
                             Vec::new()
@@ -720,11 +770,13 @@ impl AgentCore {
                     events,
                 )
                 .await?;
+            if let Some(ref mut budget) = budget {
+                budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
+            }
 
             if response.tool_calls.is_empty() {
                 return Ok(finalize_provider_turn(
                     thread_id,
-                    listed_files,
                     response,
                     provider_tool_results,
                     budget,
@@ -733,27 +785,6 @@ impl AgentCore {
             }
 
             current_round += 1;
-            if current_round >= MAX_PROVIDER_TOOL_ROUNDS {
-                events.push(AgentEventPayload::ModelDelta {
-                    text: format!(
-                        "Provider reached the autonomous tool limit of {} rounds.\n",
-                        MAX_PROVIDER_TOOL_ROUNDS
-                    ),
-                });
-                if response.text.trim().is_empty() {
-                    response =
-                        ModelResponse::text(local_provider_tool_summary(&provider_tool_results));
-                }
-                return Ok(finalize_provider_turn(
-                    thread_id,
-                    listed_files,
-                    response,
-                    provider_tool_results,
-                    budget,
-                    std::mem::replace(events, TurnEvents::new(None)),
-                ));
-            }
-
             pending_tool_calls = response.tool_calls;
             provider_tool_calls.extend(pending_tool_calls.clone());
             if let Some(ref mut budget) = budget {
@@ -819,19 +850,23 @@ impl AgentCore {
         match result {
             Ok(result) => {
                 let is_error = tool_result_is_error(&result);
+                let content = result.content_or_legacy_text();
                 Ok(ProviderToolResult {
                     call_id: provider_call.id.clone(),
                     name: provider_call.name.clone(),
                     output: result.output,
+                    content,
                     is_error,
                     metadata: result.metadata,
                 })
             }
             Err(err) if err.to_string().contains("approval required") => Err(err),
+            Err(err) if err.to_string().contains("cancelled") => Err(err),
             Err(err) => Ok(ProviderToolResult {
                 call_id: provider_call.id.clone(),
                 name: provider_call.name.clone(),
                 output: err.to_string(),
+                content: vec![ModelContentPart::text(err.to_string())],
                 is_error: true,
                 metadata: json!({
                     "toolName": &provider_call.name,
@@ -841,101 +876,6 @@ impl AgentCore {
                 }),
             }),
         }
-    }
-
-    async fn execute_parsed_task(
-        &self,
-        task: ParsedTask,
-        ctx: ToolContext,
-        events: &mut TurnEvents,
-    ) -> anyhow::Result<String> {
-        let result = match task {
-            ParsedTask::List { path } => {
-                self.execute_tool("list_files", json!({ "path": path }), ctx, events)
-                    .await?
-            }
-            ParsedTask::Read { path } => {
-                self.execute_tool("read_file", json!({ "path": path }), ctx, events)
-                    .await?
-            }
-            ParsedTask::Search { path, query } => {
-                self.execute_tool(
-                    "search",
-                    json!({ "path": path, "query": query }),
-                    ctx,
-                    events,
-                )
-                .await?
-            }
-            ParsedTask::Write { path, content } => {
-                let result = self
-                    .execute_tool(
-                        "write_file",
-                        json!({ "path": path, "content": content }),
-                        ctx,
-                        events,
-                    )
-                    .await?;
-                if let Some(changed_path) = result
-                    .metadata
-                    .get("changedPath")
-                    .and_then(|value| value.as_str())
-                {
-                    events.push(AgentEventPayload::FileChanged {
-                        path: changed_path.into(),
-                        summary: "File written by write_file tool.".to_string(),
-                    });
-                }
-                result
-            }
-            ParsedTask::Run { command } => {
-                self.execute_tool("shell", json!({ "command": command }), ctx, events)
-                    .await?
-            }
-            ParsedTask::Diff => {
-                self.execute_tool("git_diff", json!({}), ctx, events)
-                    .await?
-            }
-            ParsedTask::Patch { patch } => {
-                let result = self
-                    .execute_tool("apply_patch", json!({ "patch": patch }), ctx, events)
-                    .await?;
-                events.push(AgentEventPayload::FileChanged {
-                    path: input_placeholder_path(),
-                    summary: "Patch applied by apply_patch tool.".to_string(),
-                });
-                result
-            }
-            ParsedTask::Mcp {
-                public_name,
-                arguments,
-            } => {
-                self.execute_tool(&public_name, arguments, ctx, events)
-                    .await?
-            }
-            ParsedTask::Invalid { reason } => anyhow::bail!("{reason}"),
-        };
-
-        Ok(format!(
-            "Completed `{}`.\n\n```text\n{}\n```",
-            result
-                .metadata
-                .get("toolName")
-                .and_then(|value| value.as_str())
-                .unwrap_or("tool"),
-            result.output
-        ))
-    }
-
-    async fn execute_tool(
-        &self,
-        name: &str,
-        input: Value,
-        ctx: ToolContext,
-        events: &mut TurnEvents,
-    ) -> anyhow::Result<crate::model::ToolResult> {
-        let call = ToolCall::new(name, input);
-        self.execute_tool_call(call, ctx, events, None).await
     }
 
     async fn execute_tool_call(
@@ -961,6 +901,7 @@ impl AgentCore {
                     result: ToolResult {
                         call_id: call.id,
                         output: err.to_string(),
+                        content: vec![ModelContentPart::text(err.to_string())],
                         metadata,
                     },
                 });
@@ -980,6 +921,7 @@ impl AgentCore {
                     result: ToolResult {
                         call_id: call.id,
                         output: err.to_string(),
+                        content: vec![ModelContentPart::text(err.to_string())],
                         metadata,
                     },
                 });
@@ -999,17 +941,12 @@ impl AgentCore {
 
 fn finalize_provider_turn(
     thread_id: Uuid,
-    _listed_files: String,
     response: ModelResponse,
     provider_tool_results: Vec<ProviderToolResult>,
     mut budget: Option<ContextBudget>,
     mut events: TurnEvents,
 ) -> AgentTurnResult {
     if let Some(ref mut budget) = budget {
-        for result in &provider_tool_results {
-            budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
-        }
-        budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
         for warning in &budget.warnings {
             events.push(AgentEventPayload::ModelDelta {
                 text: format!("**Context budget warning:** {}\n", warning),
@@ -1039,22 +976,114 @@ fn finalize_provider_turn(
     }
 }
 
-fn provider_system_prompt() -> String {
-    "You are OpenTopia, a local-first coding agent. Use the provided tools when you need workspace context or need to perform a permitted local action. After tool results are provided, write a concise assistant summary for the user.".to_string()
+fn budget_checkpoint_reason(
+    execution_budget: &AgentExecutionBudget,
+    used_tool_rounds: usize,
+    started_at: Instant,
+    context_budget: Option<&ContextBudget>,
+) -> Option<AgentBudgetCheckpointReason> {
+    if used_tool_rounds >= execution_budget.max_tool_rounds {
+        return Some(AgentBudgetCheckpointReason::ToolRounds);
+    }
+    if started_at.elapsed().as_millis() >= u128::from(execution_budget.max_elapsed_ms) {
+        return Some(AgentBudgetCheckpointReason::ElapsedTime);
+    }
+    context_budget
+        .filter(|budget| budget.is_exceeded())
+        .map(|_| AgentBudgetCheckpointReason::ContextWindow)
 }
 
-fn provider_user_message(
-    user_content: &str,
-    listed_files: &str,
-    context_summary: Option<&str>,
-) -> String {
+#[allow(clippy::too_many_arguments)]
+fn suspend_for_budget_checkpoint(
+    thread_id: Uuid,
+    user_message_id: Uuid,
+    workspace_root: PathBuf,
+    context_summary: Option<String>,
+    conversation: Vec<ModelConversationMessage>,
+    permission_mode: PermissionMode,
+    context_budget: Option<ContextBudget>,
+    execution_budget: AgentExecutionBudget,
+    started_at: Instant,
+    checkpoint_reason: AgentBudgetCheckpointReason,
+    model_user_message: String,
+    model_user_content: Vec<ModelContentPart>,
+    tool_candidates: Vec<ProviderToolCandidate>,
+    provider_tool_calls: Vec<ProviderToolCall>,
+    provider_tool_results: Vec<ProviderToolResult>,
+    pending_tool_calls: Vec<ProviderToolCall>,
+    used_tool_rounds: usize,
+    mut events: TurnEvents,
+) -> AgentTurnResult {
+    let approval_id = Uuid::new_v4();
+    let status = execution_budget.status(used_tool_rounds, started_at, context_budget.as_ref());
+    let reason = format!(
+        "{} Continue to grant another execution slice (tool rounds remaining: {}, time remaining: {} ms, context remaining: {}).",
+        checkpoint_reason.message(),
+        status.remaining_tool_rounds,
+        status.remaining_time_ms,
+        status
+            .context_remaining_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "not tracked".to_string()),
+    );
+    events.push(AgentEventPayload::ApprovalRequested {
+        approval_id,
+        action: "Continue agent execution".to_string(),
+        reason: reason.clone(),
+    });
+    events.push(AgentEventPayload::TurnSuspended {
+        approval_id,
+        reason,
+    });
+    AgentTurnResult {
+        events: events.into_vec(),
+        outcome: AgentTurnOutcome::Suspended {
+            approval_id,
+            continuation: AgentContinuation {
+                thread_id,
+                user_message_id,
+                workspace_root,
+                context_summary,
+                conversation,
+                permission_mode,
+                context_budget,
+                execution_budget,
+                continuation_kind: AgentContinuationKind::BudgetCheckpoint,
+                state: AgentContinuationState::Provider {
+                    model_user_message,
+                    model_user_content,
+                    tool_candidates,
+                    provider_tool_calls,
+                    provider_tool_results,
+                    pending_tool_calls,
+                    // A resumed slice receives a fresh execution budget. Prior tool calls remain
+                    // in the provider history, but they do not consume the new slice's allowance.
+                    current_round: 0,
+                },
+            },
+        },
+    }
+}
+
+fn provider_system_prompt(status: &AgentBudgetStatus) -> String {
+    format!(
+        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help.\n\nExecution budget for this slice: {}/{} tool-decision rounds used ({} remaining); {} ms remaining of {} ms. Context budget: {} used of {} tokens ({} remaining). When a budget reaches zero, execution pauses and the user may explicitly continue from this checkpoint. Do not claim work is complete merely because a budget is low.",
+        status.used_tool_rounds,
+        status.max_tool_rounds,
+        status.remaining_tool_rounds,
+        status.remaining_time_ms,
+        status.max_elapsed_ms,
+        status.context_used_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
+        status.context_max_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
+        status.context_remaining_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
+    )
+}
+
+fn provider_user_message(user_content: &str, context_summary: Option<&str>) -> String {
     let durable_context = context_summary
         .map(|summary| format!("Durable context from earlier turns:\n{summary}\n\n"))
         .unwrap_or_default();
-    format!(
-        "{durable_context}User request:\n{}\n\nWorkspace root listing:\n{}",
-        user_content, listed_files
-    )
+    format!("{durable_context}User request:\n{user_content}")
 }
 
 fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
@@ -1114,6 +1143,13 @@ fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("")
         ),
+        "browser" => call
+            .arguments
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|url| browser_domain_from_url(url).ok())
+            .map(|host| browser_domain_approval_action(&host))
+            .unwrap_or_else(|| format!("browser {}", call.arguments)),
         _ => format!("/mcp {} {}", call.name, call.arguments),
     }
 }
@@ -1164,7 +1200,7 @@ fn local_provider_tool_summary(results: &[ProviderToolResult]) -> String {
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
-        "The provider requested another tool round, so OpenTopia stopped after the first autonomous round. Results from the completed tool call(s):\n\n{}",
+        "The tool-call budget ended before the provider returned a final response. Completed tool results:\n\n{}",
         rendered
     )
 }
@@ -1185,189 +1221,13 @@ pub struct AgentTurnInput {
     pub user_message_id: Uuid,
     pub workspace_root: PathBuf,
     pub content: String,
+    pub user_content: Vec<ModelContentPart>,
     pub context_summary: Option<String>,
     pub conversation: Vec<ModelConversationMessage>,
     pub permission_mode: PermissionMode,
     pub context_budget: Option<ContextBudget>,
     pub store: Option<Arc<dyn SessionStore>>,
     pub cancellation: Option<CancellationToken>,
-}
-
-#[derive(Debug, Clone)]
-enum ParsedTask {
-    List {
-        path: String,
-    },
-    Read {
-        path: String,
-    },
-    Search {
-        path: String,
-        query: String,
-    },
-    Write {
-        path: String,
-        content: String,
-    },
-    Run {
-        command: String,
-    },
-    Diff,
-    Patch {
-        patch: String,
-    },
-    Mcp {
-        public_name: String,
-        arguments: Value,
-    },
-    Invalid {
-        reason: String,
-    },
-}
-
-impl ParsedTask {
-    fn parse(input: &str) -> Option<Self> {
-        let trimmed = input.trim();
-        if trimmed.eq_ignore_ascii_case("/diff") || trimmed.eq_ignore_ascii_case("diff") {
-            return Some(Self::Diff);
-        }
-        if let Some(path) =
-            strip_command(trimmed, "/list").or_else(|| strip_command(trimmed, "list"))
-        {
-            return Some(Self::List {
-                path: default_path(path),
-            });
-        }
-        if let Some(path) =
-            strip_command(trimmed, "/read").or_else(|| strip_command(trimmed, "read"))
-        {
-            return Some(Self::Read {
-                path: path.trim().to_string(),
-            });
-        }
-        if let Some(rest) =
-            strip_command(trimmed, "/search").or_else(|| strip_command(trimmed, "search"))
-        {
-            if let Some((path, query)) = parse_search_args(rest) {
-                return Some(Self::Search { path, query });
-            }
-        }
-        if let Some(command) = strip_command(trimmed, "/run")
-            .or_else(|| strip_command(trimmed, "run"))
-            .or_else(|| strip_command(trimmed, "shell:"))
-        {
-            return Some(Self::Run {
-                command: command.trim().to_string(),
-            });
-        }
-        if let Some(rest) =
-            strip_command(trimmed, "/write").or_else(|| strip_command(trimmed, "write"))
-        {
-            let mut lines = rest.lines();
-            let path = lines.next()?.trim().to_string();
-            let content = lines.collect::<Vec<_>>().join("\n");
-            if !path.is_empty() {
-                return Some(Self::Write { path, content });
-            }
-        }
-        if let Some(patch) =
-            strip_command(trimmed, "/patch").or_else(|| strip_command(trimmed, "patch"))
-        {
-            if !patch.trim().is_empty() {
-                return Some(Self::Patch {
-                    patch: patch.to_string(),
-                });
-            }
-        }
-        if let Some(rest) = strip_command(trimmed, "/mcp").or_else(|| strip_command(trimmed, "mcp"))
-        {
-            return Some(match parse_mcp_args(rest) {
-                Ok((public_name, arguments)) => Self::Mcp {
-                    public_name,
-                    arguments,
-                },
-                Err(reason) => Self::Invalid { reason },
-            });
-        }
-        None
-    }
-}
-
-fn input_placeholder_path() -> PathBuf {
-    PathBuf::from(".")
-}
-
-fn strip_command<'a>(input: &'a str, command: &str) -> Option<&'a str> {
-    if command.ends_with(':') {
-        return input
-            .strip_prefix(command)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-    }
-
-    if input == command {
-        return Some("");
-    }
-
-    input.strip_prefix(command).and_then(|rest| {
-        if rest.chars().next().is_some_and(char::is_whitespace) {
-            Some(rest.trim())
-        } else {
-            None
-        }
-    })
-}
-
-fn default_path(path: &str) -> String {
-    if path.trim().is_empty() {
-        ".".to_string()
-    } else {
-        path.trim().to_string()
-    }
-}
-
-fn parse_search_args(input: &str) -> Option<(String, String)> {
-    let input = input.trim();
-    if input.is_empty() {
-        return None;
-    }
-
-    if let Some((path, query)) = input.split_once(" -- ") {
-        let query = query.trim();
-        if query.is_empty() {
-            return None;
-        }
-        return Some((default_path(path), query.to_string()));
-    }
-
-    Some((".".to_string(), input.to_string()))
-}
-
-fn parse_mcp_args(input: &str) -> Result<(String, Value), String> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err("Usage: /mcp server__tool {\"arg\":\"value\"}".to_string());
-    }
-
-    let split_at = input.find(char::is_whitespace).unwrap_or(input.len());
-    let (public_name, rest) = input.split_at(split_at);
-    let public_name = public_name.trim();
-    if public_name.is_empty() {
-        return Err("MCP tool name cannot be empty.".to_string());
-    }
-
-    let arguments = rest.trim();
-    if arguments.is_empty() {
-        return Ok((public_name.to_string(), json!({})));
-    }
-
-    let value = serde_json::from_str::<Value>(arguments)
-        .map_err(|err| format!("Invalid /mcp JSON arguments: {err}"))?;
-    if !value.is_object() {
-        return Err("/mcp arguments must be a JSON object.".to_string());
-    }
-
-    Ok((public_name.to_string(), value))
 }
 
 #[cfg(test)]
@@ -1377,7 +1237,6 @@ mod tests {
     use crate::settings::ProviderHealthCheck;
     use std::collections::VecDeque;
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     struct ScriptedProvider {
@@ -1419,27 +1278,6 @@ mod tests {
         }
     }
 
-    struct CountingProvider {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl ModelProvider for CountingProvider {
-        async fn complete(&self, _request: ModelRequest) -> anyhow::Result<ModelResponse> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(ModelResponse::text("provider should not be needed"))
-        }
-
-        async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
-            Ok(ProviderHealthCheck {
-                reachable: true,
-                latency_ms: None,
-                model_available: true,
-                error: None,
-            })
-        }
-    }
-
     #[tokio::test]
     async fn provider_tool_loop_executes_tool_and_requests_summary() {
         let workspace = test_workspace("provider-tool-loop");
@@ -1464,6 +1302,7 @@ mod tests {
                 user_message_id: Uuid::new_v4(),
                 workspace_root: workspace.clone(),
                 content: "What is in sample.txt?".to_string(),
+                user_content: Vec::new(),
                 context_summary: None,
                 conversation: Vec::new(),
                 permission_mode: PermissionMode::FullAccess,
@@ -1501,16 +1340,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_direct_command_resumes_exact_suspended_action() {
+    async fn approved_provider_write_resumes_suspended_action() {
         let workspace = test_workspace("approved-direct-continuation");
-        let agent = AgentCore::default();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "approved.txt", "content": "approved once" }),
+                }],
+                usage: None,
+            },
+            ModelResponse::text("Approved file written."),
+        ]));
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
         let result = agent
             .run_turn_detailed_streaming(
                 AgentTurnInput {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "/write approved.txt\napproved once".to_string(),
+                    content: "Create approved.txt with the requested content.".to_string(),
+                    user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
                     permission_mode: PermissionMode::Approve,
@@ -1543,14 +1395,30 @@ mod tests {
     #[tokio::test]
     async fn approved_protected_metadata_write_uses_one_shot_sandbox_escalation() {
         let workspace = test_workspace("approved-sandbox-escalation");
-        let agent = AgentCore::default();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_write_metadata".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": ".codex/config.toml",
+                        "content": "approved metadata"
+                    }),
+                }],
+                usage: None,
+            },
+            ModelResponse::text("Approved metadata written."),
+        ]));
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
         let result = agent
             .run_turn_detailed_streaming(
                 AgentTurnInput {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "/write .codex/config.toml\napproved metadata".to_string(),
+                    content: "Update the protected metadata configuration.".to_string(),
+                    user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
                     permission_mode: PermissionMode::Auto,
@@ -1592,9 +1460,21 @@ mod tests {
             .join(format!("opentopia-approved-outside-{}.txt", Uuid::new_v4()));
         let escaped_outside = outside.to_string_lossy().replace('\'', "''");
         let command = format!(
-            "/run $ErrorActionPreference='Stop'; Set-Content -LiteralPath '{escaped_outside}' -Value approved-shell"
+            "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{escaped_outside}' -Value approved-shell"
         );
-        let agent = AgentCore::default();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_shell".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({ "command": command }),
+                }],
+                usage: None,
+            },
+            ModelResponse::text("Approved shell command completed."),
+        ]));
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
 
         let result = agent
             .run_turn_detailed_streaming(
@@ -1602,7 +1482,8 @@ mod tests {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: command,
+                    content: "Run the requested external write command.".to_string(),
+                    user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
                     permission_mode: PermissionMode::Auto,
@@ -1635,16 +1516,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_direct_command_completes_without_execution() {
+    async fn denied_provider_write_completes_without_execution() {
         let workspace = test_workspace("denied-direct-continuation");
-        let agent = AgentCore::default();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_denied_write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "denied.txt", "content": "never written" }),
+                }],
+                usage: None,
+            },
+            ModelResponse::text("The file was not written because approval was denied."),
+        ]));
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
         let result = agent
             .run_turn_detailed_streaming(
                 AgentTurnInput {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "/write denied.txt\nnever written".to_string(),
+                    content: "Create denied.txt with the requested content.".to_string(),
+                    user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
                     permission_mode: PermissionMode::Approve,
@@ -1696,6 +1590,7 @@ mod tests {
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
                     content: "Create denied-provider.txt".to_string(),
+                    user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
                     permission_mode: PermissionMode::Approve,
@@ -1737,11 +1632,20 @@ mod tests {
         let workspace = test_workspace("turn-shell-cancellation");
         let cancellation = CancellationToken::new();
         let command = if cfg!(windows) {
-            "/run powershell -NoProfile -Command \"Start-Sleep -Seconds 30\""
+            "powershell -NoProfile -Command \"Start-Sleep -Seconds 30\""
         } else {
-            "/run sh -c 'sleep 30'"
+            "sh -c 'sleep 30'"
         };
-        let agent = AgentCore::default();
+        let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ProviderToolCall {
+                id: "call_sleep".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({ "command": command }),
+            }],
+            usage: None,
+        }]));
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
         let workspace_for_turn = workspace.clone();
         let cancellation_for_turn = cancellation.clone();
         let task = tokio::spawn(async move {
@@ -1750,7 +1654,8 @@ mod tests {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace_for_turn,
-                    content: command.to_string(),
+                    content: "Run a long-running command.".to_string(),
+                    user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
                     permission_mode: PermissionMode::FullAccess,
@@ -1807,6 +1712,7 @@ mod tests {
                 user_message_id: Uuid::new_v4(),
                 workspace_root: workspace.clone(),
                 content: "Inspect both files.".to_string(),
+                user_content: Vec::new(),
                 context_summary: None,
                 conversation: Vec::new(),
                 permission_mode: PermissionMode::FullAccess,
@@ -1833,6 +1739,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_budget_suspends_without_a_harness_summary_and_resumes() {
+        let workspace = test_workspace("tool-budget-checkpoint");
+        fs::write(workspace.join("sample.txt"), "checkpoint content").unwrap();
+        let tool_responses = (0..8)
+            .map(|index| ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: format!("call_{index}"),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "sample.txt" }),
+                }],
+                usage: None,
+            })
+            .collect::<Vec<_>>();
+        let provider = Arc::new(ScriptedProvider::new(
+            tool_responses
+                .into_iter()
+                .chain(std::iter::once(ModelResponse::text(
+                    "Completed after the user continued the checkpoint.",
+                )))
+                .collect(),
+        ));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Inspect sample.txt until the work is complete.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("turn checkpoints at the tool budget");
+
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEventPayload::AssistantMessage { .. })));
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ModelDelta { text }
+                if text.contains("tool-call budget ended")
+        )));
+        let continuation = match result.outcome {
+            AgentTurnOutcome::Suspended { continuation, .. } => continuation,
+            AgentTurnOutcome::Completed => panic!("turn should pause at the budget"),
+        };
+        assert_eq!(
+            continuation.continuation_kind,
+            AgentContinuationKind::BudgetCheckpoint
+        );
+        match &continuation.state {
+            AgentContinuationState::Provider {
+                pending_tool_calls,
+                current_round,
+                ..
+            } => {
+                assert_eq!(pending_tool_calls.len(), 1);
+                assert_eq!(pending_tool_calls[0].id, "call_7");
+                assert_eq!(*current_round, 0);
+            }
+        }
+        assert!(provider.requests()[0]
+            .system_prompt
+            .contains("Execution budget for this slice: 0/8"));
+
+        let resumed = agent
+            .resume_turn_streaming(continuation, true, None, None, None)
+            .await
+            .expect("budget checkpoint resumes");
+        assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
+        assert!(assistant_text(&resumed.events).contains("Completed after the user continued"));
+        assert_eq!(provider.requests().len(), 9);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn provider_request_includes_durable_context_summary() {
         let workspace = test_workspace("provider-durable-context");
         let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
@@ -1846,6 +1840,7 @@ mod tests {
                 user_message_id: Uuid::new_v4(),
                 workspace_root: workspace.clone(),
                 content: "Continue the implementation.".to_string(),
+                user_content: Vec::new(),
                 context_summary: Some("Decision: keep the Rust sidecar API stable.".to_string()),
                 conversation: Vec::new(),
                 permission_mode: PermissionMode::FullAccess,
@@ -1869,12 +1864,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slash_command_does_not_call_provider() {
-        let workspace = test_workspace("slash-command");
-        fs::write(workspace.join("sample.txt"), "slash command content").unwrap();
-        let provider = Arc::new(CountingProvider {
-            calls: AtomicUsize::new(0),
-        });
+    async fn provider_request_does_not_prefetch_workspace_listing() {
+        let workspace = test_workspace("no-workspace-preflight");
+        fs::write(workspace.join("private.txt"), "workspace marker").unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
+            "No workspace inspection was required.",
+        )]));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
 
         let events = agent
@@ -1882,7 +1877,8 @@ mod tests {
                 thread_id: Uuid::new_v4(),
                 user_message_id: Uuid::new_v4(),
                 workspace_root: workspace.clone(),
-                content: "/read sample.txt".to_string(),
+                content: "Explain the available tools.".to_string(),
+                user_content: Vec::new(),
                 context_summary: None,
                 conversation: Vec::new(),
                 permission_mode: PermissionMode::FullAccess,
@@ -1893,8 +1889,22 @@ mod tests {
             .await
             .expect("turn succeeds");
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        assert!(assistant_text(&events).contains("slash command content"));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallStarted { call } if call.name == "list_files"
+        )));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].user_message,
+            "User request:\nExplain the available tools."
+        );
+        assert!(!requests[0].user_message.contains("Workspace root listing"));
+        assert!(!requests[0].user_message.contains("workspace marker"));
+        assert!(requests[0]
+            .tool_candidates
+            .iter()
+            .any(|candidate| candidate.name == "list_files"));
 
         let _ = fs::remove_dir_all(workspace);
     }

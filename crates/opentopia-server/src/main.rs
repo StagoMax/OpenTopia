@@ -11,21 +11,25 @@ use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    build_local_sandbox_command, discover_skills, execute_git_workflow, load_context_sources,
-    load_selected_skills, AgentContextBudget, AgentContinuation, AgentCore, AgentEvent,
+    browser_domain_approval_action, browser_domain_from_approval_action, browser_domain_from_url,
+    browser_domain_is_approved, build_local_sandbox_command, discover_skills, execute_git_workflow,
+    load_context_sources, AgentContextBudget, AgentContinuation, AgentCore, AgentEvent,
     AgentEventPayload, AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus,
-    Artifact, ArtifactMetadata, BasicPolicyEngine, ChangedFile, ContextSourcePolicy,
+    Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserDownloadRequest, BrowserNavigateRequest,
+    BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId,
+    BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, ChangedFile, ContextSourcePolicy,
     ContextSourceRef, ContextSummary, ExecRequest, ExecutionContext, GitWorkflowAction,
-    GitWorkflowRequest, LocalExecutionEnvironment, McpCallResult, McpServerConfig, McpServerStatus,
-    McpToolDescriptor, Message, MessagePart, MessageRole, ModelConversationMessage,
-    ModelConversationRole, ModelProvider, ModelRequest, OpenAiCompatibleProvider, PermissionMode,
-    PolicyDecision, PolicyEngine, ProviderHealth, ProviderHealthCheck, ProviderKind,
-    ProviderSettings, ResourceLimit, SandboxDescriptor, SandboxSettings, SessionStore,
-    SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
-    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
-    TerminalCommandHistory, TerminalCommandStatus, ThreadMcpServer, ToolCall,
-    ToolPermissionDescriptor, ToolResult, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
+    GitWorkflowRequest, LocalBrowserRuntime, LocalExecutionEnvironment, McpCallResult,
+    McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole,
+    ModelContentPart, ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
+    OpenAiCompatibleProvider, PermissionMode, PolicyDecision, PolicyEngine, ProviderHealth,
+    ProviderHealthCheck, ProviderKind, ProviderSettings, ResourceLimit, SandboxDescriptor,
+    SandboxSettings, SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest,
+    SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver, SubagentRun,
+    SubagentScheduler, SubagentSchedulerConfig, TerminalCommandHistory, TerminalCommandStatus,
+    ThreadMcpServer, ToolCall, ToolPermissionDescriptor, ToolResult, WorkspaceDiff,
+    WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
+    WorkspaceFilePreview, WorkspaceTree,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -102,7 +106,10 @@ async fn main() -> anyhow::Result<()> {
             sandbox_config,
         ))
     });
-    let agent = Arc::new(RwLock::new(AgentCore::from_settings(&loaded_settings)));
+    let browser = Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default()));
+    let mut initial_agent = AgentCore::from_settings(&loaded_settings);
+    initial_agent.set_browser_runtime(browser.clone());
+    let agent = Arc::new(RwLock::new(initial_agent));
     let subagents = SubagentScheduler::new(
         SubagentSchedulerConfig::default(),
         Arc::new(ServerSubagentExecutor {
@@ -126,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         events: EventBus::default(),
         terminals: TerminalBus::default(),
         ptys: PtyManager::default(),
+        browser,
         mcp_host,
         auth,
         turns: TurnManager::default(),
@@ -252,6 +260,7 @@ fn build_router(state: AppState) -> Router {
             post(apply_workspace_diff_hunk),
         )
         .route("/api/threads/:thread_id/sandbox", get(get_sandbox))
+        .route("/api/threads/:thread_id/browser", post(run_browser_command))
         .route("/api/threads/:thread_id/git", post(run_git_workflow))
         .route("/api/threads/:thread_id/context", get(get_context_status))
         .route(
@@ -305,6 +314,7 @@ struct AppState {
     events: EventBus,
     terminals: TerminalBus,
     ptys: PtyManager,
+    browser: Arc<LocalBrowserRuntime>,
     mcp_host: McpExtensionHost,
     auth: ApiAuth,
     turns: TurnManager,
@@ -365,6 +375,7 @@ impl SubagentExecutor for ServerSubagentExecutor {
                         user_message_id: Uuid::new_v4(),
                         workspace_root: thread.workspace_root.clone(),
                         content: prompt.clone(),
+                        user_content: Vec::new(),
                         context_summary: None,
                         conversation: conversation.clone(),
                         permission_mode: settings.permission_mode,
@@ -384,10 +395,12 @@ impl SubagentExecutor for ServerSubagentExecutor {
             conversation.push(ModelConversationMessage {
                 role: ModelConversationRole::User,
                 content: prompt,
+                content_parts: Vec::new(),
             });
             conversation.push(ModelConversationMessage {
                 role: ModelConversationRole::Assistant,
                 content: last_result.clone(),
+                content_parts: Vec::new(),
             });
 
             let follow_up = match timeout(Duration::from_millis(25), input.recv()).await {
@@ -845,6 +858,7 @@ async fn update_settings(
     {
         let mut agent_guard = state.agent.write().expect("agent lock poisoned");
         let mut agent = AgentCore::from_settings(&settings);
+        agent.set_browser_runtime(state.browser.clone());
         agent.set_subagent_scheduler(state.subagents.clone());
         *agent_guard = agent;
     }
@@ -1059,6 +1073,11 @@ async fn send_message(
     Json(request): Json<SendMessageRequest>,
 ) -> Result<Json<Message>, ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
+    if let Some(command) = legacy_direct_tool_command(&request.content) {
+        return Err(ApiError::bad_request(format!(
+            "{command} is a direct tool command. Use the terminal or file workspace API instead of sending it to the agent."
+        )));
+    }
     if request.content.trim().is_empty()
         && request.source_paths.is_empty()
         && request.skill_ids.is_empty()
@@ -1068,8 +1087,29 @@ async fn send_message(
 
     let sources = load_context_sources(&request.source_paths, &ContextSourcePolicy::default())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let skills = load_selected_skills(Some(&thread.workspace_root), &request.skill_ids)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    // Skills are pinned user context, not an instruction pipeline. The model can inspect the
+    // catalog and read a Skill through tools when it decides that the task calls for one.
+    let skill_catalog = discover_skills(Some(&thread.workspace_root))
+        .into_iter()
+        .map(|skill| (skill.id.clone(), skill))
+        .collect::<HashMap<_, _>>();
+    let mut pinned_skills = Vec::new();
+    let mut seen_skill_ids = HashSet::new();
+    for skill_id in &request.skill_ids {
+        if !seen_skill_ids.insert(skill_id) {
+            continue;
+        }
+        let skill = skill_catalog.get(skill_id).ok_or_else(|| {
+            ApiError::bad_request(format!("unknown or unavailable skill: {skill_id}"))
+        })?;
+        pinned_skills.push(SkillRef {
+            id: skill.id.clone(),
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            path: skill.path.clone(),
+            truncated: false,
+        });
+    }
     let prompt = if request.content.trim().is_empty() {
         "Review the attached sources.".to_string()
     } else {
@@ -1092,11 +1132,11 @@ async fn send_message(
         .extend(sources.iter().map(|source| MessagePart::SourceRef {
             source: ContextSourceRef::from(source),
         }));
-    pending_message
-        .parts
-        .extend(skills.iter().map(|skill| MessagePart::SkillRef {
-            skill: SkillRef::from(skill),
-        }));
+    pending_message.parts.extend(
+        pinned_skills
+            .into_iter()
+            .map(|skill| MessagePart::SkillRef { skill }),
+    );
     let turn = state
         .turns
         .begin(thread_id, pending_message.id)
@@ -1113,21 +1153,32 @@ async fn send_message(
 
     let run_state = state.clone();
     let run_message = user_message.clone();
-    let context_sections = sources
+    let model_content = prompt;
+    let model_user_content = sources
         .iter()
-        .map(|source| source.render_for_model())
-        .chain(skills.iter().map(|skill| skill.render_for_model()))
+        .flat_map(|source| source.content_or_legacy_text())
         .collect::<Vec<_>>();
-    let model_content = if context_sections.is_empty() {
-        prompt
-    } else {
-        format!("{}\n\n{}", prompt, context_sections.join("\n\n"))
-    };
     tokio::spawn(async move {
-        run_new_agent_turn(run_state, thread, run_message, model_content, turn).await;
+        run_new_agent_turn(
+            run_state,
+            thread,
+            run_message,
+            model_content,
+            model_user_content,
+            turn,
+        )
+        .await;
     });
 
     Ok(Json(user_message))
+}
+
+fn legacy_direct_tool_command(content: &str) -> Option<&'static str> {
+    match content.trim().split_whitespace().next()? {
+        command if command.eq_ignore_ascii_case("/run") => Some("/run"),
+        command if command.eq_ignore_ascii_case("/read") => Some("/read"),
+        _ => None,
+    }
 }
 
 async fn decide_approval(
@@ -1149,6 +1200,24 @@ async fn decide_approval(
         return Err(ApiError::conflict(format!(
             "approval already decided: {approval_id}"
         )));
+    }
+
+    if browser_domain_from_approval_action(&pending.action).is_some() {
+        let status = if request.approved {
+            ApprovalStatus::Approved
+        } else {
+            ApprovalStatus::Denied
+        };
+        state
+            .store
+            .update_approval_status(approval_id, status)?
+            .ok_or_else(|| ApiError::not_found(format!("approval not found: {approval_id}")))?;
+        return Ok(Json(ApprovalDecisionResponse {
+            accepted: true,
+            // Browser-panel commands are intentionally not replayed implicitly. The approved
+            // domain grant lets the user or model make the next explicit navigation.
+            executed: false,
+        }));
     }
 
     let continuation_value = state
@@ -1626,6 +1695,203 @@ async fn get_sandbox(
         thread.workspace_root,
         &current_settings(&state).sandbox.to_local_sandbox_config(),
     )))
+}
+
+async fn run_browser_command(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(request): Json<BrowserCommandRequest>,
+) -> Result<Json<BrowserOutput>, ApiError> {
+    let thread = ensure_thread(&state, thread_id)?;
+    let policy = BasicPolicyEngine::new(
+        thread.workspace_root,
+        current_settings(&state).permission_mode,
+    );
+    let session = BrowserSessionId::from_thread(thread_id);
+    let timeout = request
+        .timeout_ms
+        .map(|milliseconds| Duration::from_millis(milliseconds.clamp(1, 120_000)));
+    let result = match request.action.as_str() {
+        "navigate" => {
+            let url = browser_required(&request.url, "url")?;
+            inspect_browser_url_policy(&state, thread_id, &policy, url)?;
+            let mut command = BrowserNavigateRequest::new(url);
+            if let Some(timeout) = timeout {
+                command.wait = Some(BrowserWaitRequest {
+                    condition: BrowserWaitCondition::DocumentComplete,
+                    timeout: Some(timeout),
+                    poll_interval: Duration::from_millis(100),
+                });
+            }
+            state.browser.navigate(session, command).await
+        }
+        "snapshot" => state.browser.snapshot(session).await,
+        "screenshot" => state.browser.screenshot(session).await,
+        "click" => {
+            inspect_browser_interaction_policy(&policy)?;
+            state
+                .browser
+                .click(
+                    session,
+                    BrowserSelector::new(browser_required(&request.selector, "selector")?)
+                        .map_err(|error| ApiError::bad_request(error.to_string()))?,
+                )
+                .await
+        }
+        "type" => {
+            inspect_browser_interaction_policy(&policy)?;
+            state
+                .browser
+                .type_text(
+                    session,
+                    BrowserTypeRequest {
+                        selector: BrowserSelector::new(browser_required(
+                            &request.selector,
+                            "selector",
+                        )?)
+                        .map_err(|error| ApiError::bad_request(error.to_string()))?,
+                        text: browser_required(&request.text, "text")?.to_string(),
+                        clear_first: request.clear_first.unwrap_or(true),
+                    },
+                )
+                .await
+        }
+        "wait" => {
+            let condition = match request.condition.as_deref().unwrap_or("document_complete") {
+                "document_complete" => BrowserWaitCondition::DocumentComplete,
+                "selector" => BrowserWaitCondition::Selector(
+                    BrowserSelector::new(browser_required(&request.selector, "selector")?)
+                        .map_err(|error| ApiError::bad_request(error.to_string()))?,
+                ),
+                "text" => {
+                    BrowserWaitCondition::Text(browser_required(&request.text, "text")?.to_string())
+                }
+                other => {
+                    return Err(ApiError::bad_request(format!(
+                        "unsupported browser wait condition: {other}"
+                    )))
+                }
+            };
+            state
+                .browser
+                .wait(
+                    session,
+                    BrowserWaitRequest {
+                        condition,
+                        timeout,
+                        poll_interval: Duration::from_millis(100),
+                    },
+                )
+                .await
+        }
+        "download" => {
+            let url = browser_required(&request.url, "url")?;
+            inspect_browser_url_policy(&state, thread_id, &policy, url)?;
+            state
+                .browser
+                .download(
+                    session,
+                    BrowserDownloadRequest {
+                        url: url.to_string(),
+                        expected_filename: request.expected_filename,
+                        timeout,
+                    },
+                )
+                .await
+        }
+        "close" => {
+            state
+                .browser
+                .close_session(session)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            return Ok(Json(BrowserOutput {
+                url: None,
+                contents: Vec::new(),
+                metadata: json!({ "action": "close" }),
+            }));
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unsupported browser action: {other}"
+            )))
+        }
+    }
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(Json(result))
+}
+
+fn browser_required<'a>(value: &'a Option<String>, field: &str) -> Result<&'a str, ApiError> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request(format!("browser {field} is required")))
+}
+
+fn inspect_browser_url_policy(
+    state: &AppState,
+    thread_id: Uuid,
+    policy: &BasicPolicyEngine,
+    raw_url: &str,
+) -> Result<(), ApiError> {
+    let host = browser_domain_from_url(raw_url)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    match policy.inspect_network(&host) {
+        PolicyDecision::Deny { reason } => return Err(ApiError::bad_request(reason)),
+        // An explicit network approval policy and a first-visit domain policy both lead to the
+        // same persisted, thread-scoped domain grant below.
+        PolicyDecision::Allow | PolicyDecision::Ask { .. } => {}
+    }
+
+    if browser_domain_is_approved(state.store.as_ref(), thread_id, &host)? {
+        return Ok(());
+    }
+
+    let action = browser_domain_approval_action(&host);
+    let has_pending = state
+        .store
+        .list_approvals(thread_id, Some(ApprovalStatus::Pending))?
+        .into_iter()
+        .any(|approval| approval.action == action);
+    if !has_pending {
+        let approval_id = Uuid::new_v4();
+        let reason =
+            format!("Browser access to the new domain `{host}` requires approval for this thread.");
+        state.store.insert_approval(Approval::pending(
+            approval_id,
+            thread_id,
+            action.clone(),
+            reason.clone(),
+        ))?;
+        publish_payload(
+            state,
+            thread_id,
+            None,
+            AgentEventPayload::ApprovalRequested {
+                approval_id,
+                action,
+                reason,
+            },
+        );
+    }
+
+    Err(ApiError::conflict(format!(
+        "approval required: Browser access to the new domain `{host}` is waiting for approval"
+    )))
+}
+
+fn inspect_browser_interaction_policy(policy: &BasicPolicyEngine) -> Result<(), ApiError> {
+    inspect_browser_policy_decision(policy.inspect_network("browser-interaction"))
+}
+
+fn inspect_browser_policy_decision(decision: PolicyDecision) -> Result<(), ApiError> {
+    match decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::Deny { reason } | PolicyDecision::Ask { reason } => {
+            Err(ApiError::bad_request(reason))
+        }
+    }
 }
 
 async fn run_git_workflow(
@@ -2837,6 +3103,7 @@ async fn call_mcp_tool(
             let tool_result = ToolResult {
                 call_id: call.id,
                 output: err.to_string(),
+                content: vec![ModelContentPart::text(err.to_string())],
                 metadata: json!({
                     "success": false,
                     "error": err.to_string(),
@@ -2860,6 +3127,12 @@ async fn call_mcp_tool(
     let tool_result = ToolResult {
         call_id: call.id,
         output: result.output.clone(),
+        content: result
+            .structured_content
+            .clone()
+            .map(ModelContentPart::json)
+            .into_iter()
+            .collect(),
         metadata: json!({
             "isError": result.is_error,
             "publicName": descriptor.public_name,
@@ -2982,6 +3255,7 @@ async fn run_new_agent_turn(
     thread: opentopia_core::Thread,
     user_message: Message,
     content: String,
+    user_content: Vec<ModelContentPart>,
     turn: TurnHandle,
 ) {
     let thread_id = thread.id;
@@ -3022,6 +3296,7 @@ async fn run_new_agent_turn(
         user_message_id: user_message.id,
         workspace_root: thread.workspace_root,
         content,
+        user_content,
         context_summary: prepared.summary,
         conversation: prepared.conversation,
         permission_mode: settings.permission_mode,
@@ -3393,7 +3668,28 @@ fn model_conversation_message(message: &Message) -> Option<ModelConversationMess
         })
         .collect::<Vec<_>>()
         .join("\n");
-    (!content.trim().is_empty()).then_some(ModelConversationMessage { role, content })
+    let content_parts = message
+        .parts
+        .iter()
+        .flat_map(message_model_content_parts)
+        .collect::<Vec<_>>();
+    (!content.trim().is_empty() || !content_parts.is_empty()).then_some(ModelConversationMessage {
+        role,
+        content,
+        content_parts,
+    })
+}
+
+fn message_model_content_parts(part: &MessagePart) -> Vec<ModelContentPart> {
+    match part {
+        MessagePart::ToolResult { result } => result.content_or_legacy_text(),
+        MessagePart::SourceRef { source } => vec![ModelContentPart::resource(
+            source.path.to_string_lossy(),
+            Some(source.content_type.clone()),
+            Some(source.name.clone()),
+        )],
+        _ => Vec::new(),
+    }
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -3485,6 +3781,7 @@ async fn generate_context_summary(
             system_prompt: context_summary_system_prompt().to_string(),
             conversation: Vec::new(),
             user_message: snapshot,
+            user_content: Vec::new(),
             tool_candidates: Vec::new(),
             previous_tool_calls: Vec::new(),
             tool_results: Vec::new(),
@@ -4161,6 +4458,19 @@ struct SendMessageRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BrowserCommandRequest {
+    action: String,
+    url: Option<String>,
+    selector: Option<String>,
+    text: Option<String>,
+    clear_first: Option<bool>,
+    condition: Option<String>,
+    timeout_ms: Option<u64>,
+    expected_filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CancelAgentTurnRequest {
     turn_id: Option<Uuid>,
 }
@@ -4706,5 +5016,17 @@ mod tests {
 
         let empty = ApiError::from(anyhow::Error::new(StoreError::EmptyProjectName));
         assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn legacy_direct_tool_commands_are_not_agent_messages() {
+        assert_eq!(legacy_direct_tool_command("/run cargo test"), Some("/run"));
+        assert_eq!(
+            legacy_direct_tool_command("  /READ src/lib.rs"),
+            Some("/read")
+        );
+        assert_eq!(legacy_direct_tool_command("/run"), Some("/run"));
+        assert_eq!(legacy_direct_tool_command("/runner status"), None);
+        assert_eq!(legacy_direct_tool_command("Please /run the tests"), None);
     }
 }

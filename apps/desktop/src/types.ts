@@ -44,6 +44,23 @@ export type ContextSourcePickResult =
   | { canceled: true; files: [] }
   | { canceled: false; files: ContextSourceFile[] };
 
+export type BrowserContent =
+  | { type: "text"; text: string; truncated: boolean }
+  | { type: "json"; value: unknown }
+  | { type: "image"; mime_type: string; bytes: number[] }
+  | {
+      type: "file";
+      path: string;
+      mime_type?: string | null;
+      bytes: number;
+    };
+
+export type BrowserOutput = {
+  url?: string | null;
+  contents: BrowserContent[];
+  metadata: unknown;
+};
+
 export type Thread = {
   id: string;
   title: string;
@@ -498,8 +515,20 @@ export type ToolCall = {
 export type ToolResult = {
   callId: string;
   output: string;
+  content?: ModelContentPart[];
   metadata: unknown;
 };
+
+export type ModelContentPart =
+  | { type: "text"; text: string }
+  | { type: "json"; value: unknown }
+  | { type: "image"; content_type: string; data: number[] }
+  | {
+      type: "resource";
+      uri: string;
+      content_type?: string | null;
+      name?: string | null;
+    };
 
 export type AgentEvent = {
   id: string;

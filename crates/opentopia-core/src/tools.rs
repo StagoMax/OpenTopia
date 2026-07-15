@@ -1,12 +1,18 @@
+use crate::browser::{
+    BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest, BrowserRuntime,
+    BrowserSelector, BrowserSessionId, BrowserTypeRequest, BrowserWaitCondition,
+    BrowserWaitRequest,
+};
 use crate::execution::{
     ExecRequest, ExecutionContext, ExecutionEnvironment, FileReadRequest, FileWriteRequest,
     LocalExecutionEnvironment,
 };
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
-use crate::model::{ToolCall, ToolResult};
+use crate::model::{ApprovalStatus, ModelContentPart, ToolCall, ToolResult};
 use crate::policy::{PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
 use crate::sandbox::LocalSandboxConfig;
+use crate::skills::{discover_skills, load_selected_skills};
 use crate::store::SessionStore;
 use crate::subagents::{SpawnSubagentRequest, SubagentScheduler, SubagentScope};
 use anyhow::Context;
@@ -31,6 +37,11 @@ pub struct ToolContext {
     pub subagents: Option<SubagentScheduler>,
     pub parent_turn_id: Option<Uuid>,
     pub subagent_depth: u8,
+    pub browser: Option<Arc<dyn BrowserRuntime>>,
+    /// Set only while replaying a tool call that the user explicitly approved.
+    /// Browser navigation uses this as a one-time fallback when a caller does not have a
+    /// persistent session store from which it can read the approved domain.
+    pub approval_granted: bool,
 }
 
 impl ToolContext {
@@ -57,6 +68,8 @@ impl ToolContext {
             subagents: None,
             parent_turn_id: None,
             subagent_depth: 0,
+            browser: None,
+            approval_granted: false,
         }
     }
 
@@ -75,6 +88,8 @@ impl ToolContext {
             subagents: None,
             parent_turn_id: None,
             subagent_depth: 0,
+            browser: None,
+            approval_granted: false,
         }
     }
 
@@ -114,6 +129,9 @@ impl ToolRegistry {
         tools.insert("send_input".to_string(), Arc::new(SendAgentInputTool));
         tools.insert("cancel_agent".to_string(), Arc::new(CancelAgentTool));
         tools.insert("wait_agent".to_string(), Arc::new(WaitAgentTool));
+        tools.insert("list_skills".to_string(), Arc::new(ListSkillsTool));
+        tools.insert("read_skill".to_string(), Arc::new(ReadSkillTool));
+        tools.insert("browser".to_string(), Arc::new(BrowserTool));
         Self {
             tools: Arc::new(tools),
         }
@@ -130,6 +148,361 @@ impl ToolRegistry {
 
     pub fn list(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
+    }
+}
+
+pub struct ListSkillsTool;
+
+#[async_trait]
+impl Tool for ListSkillsTool {
+    fn name(&self) -> &str {
+        "list_skills"
+    }
+
+    fn description(&self) -> &str {
+        "List available capability instructions (Skills) without loading their instructions."
+    }
+
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let skills = discover_skills(Some(&ctx.workspace_root));
+        let value = serde_json::to_value(&skills)?;
+        Ok(ToolResult {
+            call_id: call.id,
+            output: serde_json::to_string_pretty(&value)?,
+            content: vec![ModelContentPart::json(value)],
+            metadata: json!({ "count": skills.len() }),
+        })
+    }
+}
+
+pub struct ReadSkillTool;
+
+#[async_trait]
+impl Tool for ReadSkillTool {
+    fn name(&self) -> &str {
+        "read_skill"
+    }
+
+    fn description(&self) -> &str {
+        "Read one Skill's instructions after deciding it is relevant to the current task."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "id": { "type": "string", "description": "Skill ID returned by list_skills." } },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let id = required_string(&call.input, "id")?;
+        let descriptor = discover_skills(Some(&ctx.workspace_root))
+            .into_iter()
+            .find(|skill| skill.id == id)
+            .context("Skill is unavailable")?;
+        match ctx.policy.inspect_read(&descriptor.path) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
+            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+        }
+        let loaded = load_selected_skills(Some(&ctx.workspace_root), &[id])?
+            .into_iter()
+            .next()
+            .context("Skill is unavailable")?;
+        let output = loaded.render_for_model();
+        Ok(ToolResult {
+            call_id: call.id,
+            output: output.clone(),
+            content: vec![ModelContentPart::text(output)],
+            metadata: json!({
+                "id": loaded.descriptor.id,
+                "name": loaded.descriptor.name,
+                "path": loaded.descriptor.path,
+                "truncated": loaded.truncated
+            }),
+        })
+    }
+}
+
+pub struct BrowserTool;
+
+#[async_trait]
+impl Tool for BrowserTool {
+    fn name(&self) -> &str {
+        "browser"
+    }
+
+    fn description(&self) -> &str {
+        "Use an isolated local browser to navigate, inspect pages, take screenshots, click, type, wait, download, or close the current thread's browser session. The first visit to each domain requires user approval."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["navigate", "snapshot", "screenshot", "click", "type", "wait", "download", "close"],
+                    "description": "Browser action to perform."
+                },
+                "url": { "type": "string", "description": "URL for navigate or download." },
+                "selector": { "type": "string", "description": "CSS selector for click, type, or wait." },
+                "text": { "type": "string", "description": "Text for type or a wait text condition." },
+                "clearFirst": { "type": "boolean", "description": "Clear an input before typing; defaults to true." },
+                "condition": {
+                    "type": "string",
+                    "enum": ["document_complete", "selector", "text"],
+                    "description": "Wait condition; defaults to document_complete."
+                },
+                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 120000 },
+                "expectedFilename": { "type": "string", "description": "Optional expected filename for a download." }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let runtime = ctx
+            .browser
+            .as_ref()
+            .context("browser runtime is unavailable")?
+            .clone();
+        let thread_id = ctx.thread_id.context("browser requires a thread context")?;
+        let session = BrowserSessionId::from_thread(thread_id);
+        let action = required_string(&call.input, "action")?;
+        let timeout = browser_timeout(&call.input);
+        let output = match action.as_str() {
+            "navigate" => {
+                let url = required_string(&call.input, "url")?;
+                inspect_browser_url(&ctx, &url)?;
+                runtime
+                    .navigate(session, BrowserNavigateRequest::new(url))
+                    .await?
+            }
+            "snapshot" => runtime.snapshot(session).await?,
+            "screenshot" => runtime.screenshot(session).await?,
+            "click" => {
+                inspect_browser_interaction(&ctx)?;
+                runtime
+                    .click(
+                        session,
+                        BrowserSelector::new(required_string(&call.input, "selector")?)?,
+                    )
+                    .await?
+            }
+            "type" => {
+                inspect_browser_interaction(&ctx)?;
+                runtime
+                    .type_text(
+                        session,
+                        BrowserTypeRequest {
+                            selector: BrowserSelector::new(required_string(
+                                &call.input,
+                                "selector",
+                            )?)?,
+                            text: required_string(&call.input, "text")?,
+                            clear_first: call
+                                .input
+                                .get("clearFirst")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true),
+                        },
+                    )
+                    .await?
+            }
+            "wait" => {
+                let condition = match call
+                    .input
+                    .get("condition")
+                    .and_then(Value::as_str)
+                    .unwrap_or("document_complete")
+                {
+                    "document_complete" => BrowserWaitCondition::DocumentComplete,
+                    "selector" => BrowserWaitCondition::Selector(BrowserSelector::new(
+                        required_string(&call.input, "selector")?,
+                    )?),
+                    "text" => BrowserWaitCondition::Text(required_string(&call.input, "text")?),
+                    other => anyhow::bail!("unsupported browser wait condition: {other}"),
+                };
+                runtime
+                    .wait(
+                        session,
+                        BrowserWaitRequest {
+                            condition,
+                            timeout,
+                            poll_interval: Duration::from_millis(100),
+                        },
+                    )
+                    .await?
+            }
+            "download" => {
+                let url = required_string(&call.input, "url")?;
+                inspect_browser_url(&ctx, &url)?;
+                runtime
+                    .download(
+                        session,
+                        BrowserDownloadRequest {
+                            url,
+                            expected_filename: call
+                                .input
+                                .get("expectedFilename")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            timeout,
+                        },
+                    )
+                    .await?
+            }
+            "close" => {
+                inspect_browser_interaction(&ctx)?;
+                runtime.close_session(session).await?;
+                return Ok(ToolResult::text(
+                    call.id,
+                    "Closed the isolated browser session for this thread.",
+                    json!({ "sessionId": session.to_string(), "action": action }),
+                ));
+            }
+            other => anyhow::bail!("unsupported browser action: {other}"),
+        };
+        Ok(browser_output_to_tool_result(call.id, action, output))
+    }
+}
+
+fn browser_timeout(input: &Value) -> Option<Duration> {
+    input
+        .get("timeoutMs")
+        .and_then(Value::as_u64)
+        .map(|milliseconds| Duration::from_millis(milliseconds.clamp(1, 120_000)))
+}
+
+const BROWSER_DOMAIN_APPROVAL_PREFIX: &str = "browser:domain:";
+
+/// Parse a browser URL into the normalized host used for policy checks and persisted approvals.
+pub fn browser_domain_from_url(raw_url: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(raw_url).context("browser URL is invalid")?;
+    let host = url.host_str().context("browser URL must include a host")?;
+    Ok(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// Keep domain grants in the existing approval history so they survive runtime restarts and are
+/// scoped by the approval's thread ID.
+pub fn browser_domain_approval_action(host: &str) -> String {
+    format!(
+        "{BROWSER_DOMAIN_APPROVAL_PREFIX}{}",
+        host.trim_end_matches('.').to_ascii_lowercase()
+    )
+}
+
+pub fn browser_domain_from_approval_action(action: &str) -> Option<String> {
+    action
+        .strip_prefix(BROWSER_DOMAIN_APPROVAL_PREFIX)
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+pub fn browser_domain_is_approved(
+    store: &dyn SessionStore,
+    thread_id: Uuid,
+    host: &str,
+) -> anyhow::Result<bool> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    Ok(store
+        .list_approvals(thread_id, Some(ApprovalStatus::Approved))?
+        .into_iter()
+        .filter_map(|approval| browser_domain_from_approval_action(&approval.action))
+        .any(|approved_host| approved_host == host))
+}
+
+fn inspect_browser_url(ctx: &ToolContext, raw_url: &str) -> anyhow::Result<()> {
+    let host = browser_domain_from_url(raw_url)?;
+    match ctx.policy.inspect_network(&host) {
+        PolicyDecision::Allow => {}
+        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
+        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+    }
+
+    if ctx.approval_granted
+        || ctx
+            .store
+            .as_deref()
+            .map(|store| {
+                browser_domain_is_approved(store, ctx.thread_id.unwrap_or_default(), &host)
+            })
+            .transpose()?
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    anyhow::bail!("approval required: Browser access to the new domain `{host}` requires approval.")
+}
+
+fn inspect_browser_interaction(ctx: &ToolContext) -> anyhow::Result<()> {
+    match ctx.policy.inspect_network("browser-interaction") {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
+        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+    }
+}
+
+fn browser_output_to_tool_result(
+    call_id: Uuid,
+    action: String,
+    output: crate::browser::BrowserOutput,
+) -> ToolResult {
+    let mut rendered = Vec::new();
+    let mut content = Vec::new();
+    for item in output.contents {
+        match item {
+            BrowserContent::Text { text, truncated } => {
+                if truncated {
+                    rendered.push(format!("{text}\n\n[Browser text truncated]"));
+                } else {
+                    rendered.push(text.clone());
+                }
+                content.push(ModelContentPart::text(text));
+            }
+            BrowserContent::Json { value } => {
+                rendered.push(value.to_string());
+                content.push(ModelContentPart::json(value));
+            }
+            BrowserContent::Image { mime_type, bytes } => {
+                rendered.push(format!("[Browser screenshot: {} bytes]", bytes.len()));
+                content.push(ModelContentPart::image(mime_type, bytes));
+            }
+            BrowserContent::File {
+                path,
+                mime_type,
+                bytes,
+            } => {
+                rendered.push(format!(
+                    "[Browser download: {} ({} bytes)]",
+                    path.display(),
+                    bytes
+                ));
+                content.push(ModelContentPart::resource(
+                    path.to_string_lossy(),
+                    mime_type,
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string),
+                ));
+            }
+        }
+    }
+    ToolResult {
+        call_id,
+        output: rendered.join("\n\n"),
+        content,
+        metadata: json!({ "action": action, "url": output.url, "browser": output.metadata }),
     }
 }
 
@@ -180,6 +553,7 @@ impl Tool for SpawnAgentTool {
         Ok(ToolResult {
             call_id: call.id,
             output: serde_json::to_string(&run)?,
+            content: Vec::new(),
             metadata: json!({
                 "toolName": self.name(),
                 "runId": run.id,
@@ -228,6 +602,7 @@ impl Tool for SendAgentInputTool {
         Ok(ToolResult {
             call_id: call.id,
             output: format!("Input delivered to subagent {run_id}."),
+            content: Vec::new(),
             metadata: json!({ "toolName": self.name(), "runId": run_id, "success": true }),
         })
     }
@@ -264,6 +639,7 @@ impl Tool for CancelAgentTool {
         Ok(ToolResult {
             call_id: call.id,
             output: format!("Cancellation requested for subagent {run_id}."),
+            content: Vec::new(),
             metadata: json!({ "toolName": self.name(), "runId": run_id, "success": true }),
         })
     }
@@ -315,6 +691,7 @@ impl Tool for WaitAgentTool {
         Ok(ToolResult {
             call_id: call.id,
             output: serde_json::to_string(&run)?,
+            content: Vec::new(),
             metadata: json!({
                 "toolName": self.name(),
                 "runId": run_id,
@@ -393,6 +770,7 @@ impl Tool for ListFilesTool {
         Ok(ToolResult {
             call_id: call.id,
             output: entries.join("\n"),
+            content: Vec::new(),
             metadata: json!({ "count": entries.len() }),
         })
     }
@@ -454,6 +832,7 @@ impl Tool for ReadFileTool {
                     let tool_result = ToolResult {
                         call_id: call.id,
                         output: contents,
+                        content: Vec::new(),
                         metadata: metadata.clone(),
                     };
                     if let Ok(Some(artifact)) = store.insert_large_tool_output_artifact(
@@ -482,6 +861,7 @@ impl Tool for ReadFileTool {
         Ok(ToolResult {
             call_id: call.id,
             output,
+            content: Vec::new(),
             metadata,
         })
     }
@@ -539,6 +919,7 @@ impl Tool for WriteFileTool {
                 written.bytes_written,
                 written.path.display()
             ),
+            content: Vec::new(),
             metadata: json!({
                 "changedPath": written.path.display().to_string(),
                 "bytes": written.bytes_written
@@ -641,6 +1022,7 @@ impl Tool for SearchTool {
         let mut tool_result = ToolResult {
             call_id: call.id,
             output: result.output,
+            content: Vec::new(),
             metadata,
         };
 
@@ -759,6 +1141,7 @@ impl Tool for ShellTool {
         let mut result = ToolResult {
             call_id: call.id,
             output: combined,
+            content: Vec::new(),
             metadata: json!({
                 "exitCode": output.exit_code,
                 "success": output.success
@@ -771,6 +1154,7 @@ impl Tool for ShellTool {
                     let artifact_result = ToolResult {
                         call_id: result.call_id,
                         output: full_combined,
+                        content: Vec::new(),
                         metadata: result.metadata.clone(),
                     };
                     if let Ok(Some(artifact)) = store.insert_large_tool_output_artifact(
@@ -840,6 +1224,7 @@ impl Tool for GitDiffTool {
         Ok(ToolResult {
             call_id: call.id,
             output: text,
+            content: Vec::new(),
             metadata: json!({
                 "exitCode": output.exit_code,
                 "success": output.success
@@ -915,6 +1300,7 @@ impl Tool for ApplyPatchTool {
                 truncate(&stdout, 8_000),
                 truncate(&stderr, 8_000)
             ),
+            content: Vec::new(),
             metadata: json!({
                 "success": true,
                 "bytes": result.bytes
@@ -1287,24 +1673,135 @@ impl Tool for McpToolWrapper {
             .host
             .call_tool(&self.descriptor.public_name, call.input)
             .await?;
+        let content = mcp_content_parts(&result.content, result.structured_content.as_ref());
 
         Ok(ToolResult {
             call_id: call.id,
             output: result.output,
+            content,
             metadata: json!({
                 "isError": result.is_error,
                 "publicName": result.public_name,
                 "toolName": result.tool_name,
                 "serverId": result.server_id,
+                "raw": result.raw,
             }),
         })
     }
 }
 
+fn mcp_content_parts(
+    content: &[Value],
+    structured_content: Option<&Value>,
+) -> Vec<ModelContentPart> {
+    let mut parts = Vec::new();
+    for item in content {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    parts.push(ModelContentPart::text(text));
+                } else {
+                    parts.push(ModelContentPart::json(item.clone()));
+                }
+            }
+            Some("image") => {
+                let content_type = item
+                    .get("mimeType")
+                    .or_else(|| item.get("mime_type"))
+                    .and_then(Value::as_str);
+                let data = item.get("data").and_then(Value::as_str);
+                match (content_type, data.and_then(decode_mcp_base64)) {
+                    (Some(content_type), Some(data)) => {
+                        parts.push(ModelContentPart::image(content_type, data));
+                    }
+                    _ => parts.push(ModelContentPart::json(item.clone())),
+                }
+            }
+            Some("resource") => {
+                let resource = item.get("resource").unwrap_or(item);
+                let uri = resource.get("uri").and_then(Value::as_str);
+                if let Some(uri) = uri {
+                    parts.push(ModelContentPart::resource(
+                        uri,
+                        resource
+                            .get("mimeType")
+                            .or_else(|| resource.get("mime_type"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        resource
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    ));
+                    if let Some(text) = resource.get("text").and_then(Value::as_str) {
+                        parts.push(ModelContentPart::text(text));
+                    }
+                } else {
+                    parts.push(ModelContentPart::json(item.clone()));
+                }
+            }
+            _ => parts.push(ModelContentPart::json(item.clone())),
+        }
+    }
+    if let Some(value) = structured_content {
+        parts.push(ModelContentPart::json(value.clone()));
+    }
+    parts
+}
+
+fn decode_mcp_base64(value: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks_exact(4) {
+        let first = sextet(chunk[0])?;
+        let second = sextet(chunk[1])?;
+        let third = if chunk[2] == b'=' {
+            None
+        } else {
+            Some(sextet(chunk[2])?)
+        };
+        let fourth = if chunk[3] == b'=' {
+            None
+        } else {
+            Some(sextet(chunk[3])?)
+        };
+        if third.is_none() && fourth.is_some() {
+            return None;
+        }
+        decoded.push(first << 2 | second >> 4);
+        if let Some(third) = third {
+            decoded.push((second & 0b0000_1111) << 4 | third >> 2);
+            if let Some(fourth) = fourth {
+                decoded.push((third & 0b0000_0011) << 6 | fourth);
+            }
+        }
+    }
+    Some(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Approval;
     use crate::policy::{BasicPolicyEngine, PermissionMode};
+    use crate::store::SqliteSessionStore;
     use crate::subagents::{
         NoopSubagentObserver, SubagentExecutor, SubagentRun, SubagentSchedulerConfig,
     };
@@ -1365,6 +1862,96 @@ mod tests {
         assert!(looks_like_sandbox_denial("Operation not permitted"));
         assert!(looks_like_sandbox_denial("Network is unreachable"));
         assert!(!looks_like_sandbox_denial("cargo test failed"));
+    }
+
+    #[test]
+    fn browser_domain_grants_are_thread_scoped_and_normalized() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let first_thread = store
+            .create_thread(Some("first".to_string()), PathBuf::from("."))
+            .expect("create first thread");
+        let second_thread = store
+            .create_thread(Some("second".to_string()), PathBuf::from("."))
+            .expect("create second thread");
+        let host =
+            browser_domain_from_url("https://Example.COM:8443/path").expect("parse browser URL");
+        assert_eq!(host, "example.com");
+
+        let approval = Approval::pending(
+            Uuid::new_v4(),
+            first_thread.id,
+            browser_domain_approval_action(&host),
+            "test domain approval",
+        );
+        let approval_id = approval.approval_id;
+        store.insert_approval(approval).expect("persist approval");
+        store
+            .update_approval_status(approval_id, ApprovalStatus::Approved)
+            .expect("approve domain");
+
+        assert!(
+            browser_domain_is_approved(&store, first_thread.id, "EXAMPLE.COM.")
+                .expect("read grant")
+        );
+        assert!(!browser_domain_is_approved(&store, second_thread.id, &host)
+            .expect("grants do not cross threads"));
+    }
+
+    #[test]
+    fn preserves_typed_mcp_content_and_structured_content() {
+        let parts = mcp_content_parts(
+            &[
+                json!({ "type": "text", "text": "observed" }),
+                json!({
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": "iVBORw=="
+                }),
+                json!({
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///workspace/report.pdf",
+                        "mimeType": "application/pdf",
+                        "name": "report.pdf",
+                        "text": "First page"
+                    }
+                }),
+            ],
+            Some(&json!({ "count": 1 })),
+        );
+
+        assert_eq!(parts[0], ModelContentPart::text("observed"));
+        assert_eq!(
+            parts[1],
+            ModelContentPart::image("image/png", vec![0x89, b'P', b'N', b'G'])
+        );
+        assert_eq!(
+            parts[2],
+            ModelContentPart::resource(
+                "file:///workspace/report.pdf",
+                Some("application/pdf".to_string()),
+                Some("report.pdf".to_string()),
+            )
+        );
+        assert_eq!(parts[3], ModelContentPart::text("First page"));
+        assert_eq!(parts[4], ModelContentPart::json(json!({ "count": 1 })));
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_base64_without_losing_the_original_json() {
+        assert_eq!(decode_mcp_base64("not-base64"), None);
+        let parts = mcp_content_parts(
+            &[json!({ "type": "image", "mimeType": "image/png", "data": "bad" })],
+            None,
+        );
+        assert_eq!(
+            parts,
+            vec![ModelContentPart::json(json!({
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "bad"
+            }))]
+        );
     }
 
     #[tokio::test]

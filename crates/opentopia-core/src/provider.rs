@@ -1,3 +1,4 @@
+use crate::model::ModelContentPart;
 use crate::settings::{ProviderHealthCheck, ProviderKind, ProviderSettings};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -15,11 +16,21 @@ pub enum ModelConversationRole {
     Assistant,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Typed input content shared by user/history messages and tool results.
+///
+/// This alias leaves the model-layer representation as the single source of
+/// truth while making the provider-facing API discoverable.
+pub type ModelInputContent = ModelContentPart;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConversationMessage {
     pub role: ModelConversationRole,
+    /// Legacy text content. Non-empty `content_parts` are appended and sent as
+    /// native content parts where the selected provider supports them.
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_parts: Vec<ModelInputContent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +40,10 @@ pub struct ModelRequest {
     #[serde(default)]
     pub conversation: Vec<ModelConversationMessage>,
     pub user_message: String,
+    /// Native user input carried alongside `user_message`. Keep the string for
+    /// older callers and providers; adapters combine both fields in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_content: Vec<ModelInputContent>,
     #[serde(default)]
     pub tool_candidates: Vec<ProviderToolCandidate>,
     #[serde(default)]
@@ -109,9 +124,23 @@ pub struct ProviderToolCall {
 pub struct ProviderToolResult {
     pub call_id: String,
     pub name: String,
+    /// Legacy text output. `content` preserves structured and multimodal tool
+    /// output for provider adapters and persisted events.
     pub output: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ModelInputContent>,
     pub is_error: bool,
     pub metadata: Value,
+}
+
+impl ProviderToolResult {
+    pub fn content_or_legacy_text(&self) -> Vec<ModelInputContent> {
+        if self.content.is_empty() {
+            vec![ModelInputContent::text(self.output.clone())]
+        } else {
+            self.content.clone()
+        }
+    }
 }
 
 #[async_trait]
@@ -566,10 +595,13 @@ fn openai_messages(request: &ModelRequest) -> Vec<Value> {
     messages.extend(request.conversation.iter().map(|message| {
         json!({
             "role": openai_conversation_role(message.role),
-            "content": &message.content
+            "content": openai_message_content(&message.content, &message.content_parts)
         })
     }));
-    messages.push(json!({ "role": "user", "content": &request.user_message }));
+    messages.push(json!({
+        "role": "user",
+        "content": openai_message_content(&request.user_message, &request.user_content)
+    }));
 
     if !request.previous_tool_calls.is_empty() {
         messages.push(json!({
@@ -626,12 +658,119 @@ fn openai_tool_call_message(call: &ProviderToolCall) -> Value {
 }
 
 fn provider_tool_result_content(result: &ProviderToolResult) -> String {
-    json!({
+    let mut payload = json!({
         "output": &result.output,
         "isError": result.is_error,
         "metadata": &result.metadata
-    })
-    .to_string()
+    });
+    if !result.content.is_empty() {
+        payload["content"] = json!(result
+            .content
+            .iter()
+            .map(openai_tool_result_part)
+            .collect::<Vec<_>>());
+    }
+    payload.to_string()
+}
+
+/// Chat Completions accepts native image content on user/assistant messages.
+/// Resources and JSON have no portable Chat Completions content-part analogue,
+/// so they remain explicit text/JSON representations instead of being dropped.
+fn openai_message_content(legacy_text: &str, parts: &[ModelInputContent]) -> Value {
+    if parts.is_empty() {
+        return Value::String(legacy_text.to_string());
+    }
+
+    let mut content = Vec::new();
+    if !legacy_text.is_empty() {
+        content.push(json!({ "type": "text", "text": legacy_text }));
+    }
+    content.extend(parts.iter().map(openai_input_part));
+    Value::Array(content)
+}
+
+fn openai_input_part(part: &ModelInputContent) -> Value {
+    match part {
+        ModelInputContent::Text { text } => json!({ "type": "text", "text": text }),
+        ModelInputContent::Json { value } => json!({
+            "type": "text",
+            "text": value.to_string()
+        }),
+        ModelInputContent::Image { content_type, data } => json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{content_type};base64,{}", encode_base64(data))
+            }
+        }),
+        ModelInputContent::Resource {
+            uri,
+            content_type,
+            name,
+        } => json!({
+            "type": "text",
+            "text": resource_fallback_text(uri, content_type.as_deref(), name.as_deref())
+        }),
+    }
+}
+
+// A Chat Completions tool message is text-only across OpenAI-compatible APIs.
+// Preserve richer output inside its JSON envelope, including an image data URL,
+// so another runtime can recover it even when this provider cannot pass it as a
+// native image part after a function call.
+fn openai_tool_result_part(part: &ModelInputContent) -> Value {
+    match part {
+        ModelInputContent::Text { text } => json!({ "type": "text", "text": text }),
+        ModelInputContent::Json { value } => json!({ "type": "json", "value": value }),
+        ModelInputContent::Image { content_type, data } => json!({
+            "type": "image",
+            "contentType": content_type,
+            "dataUrl": format!("data:{content_type};base64,{}", encode_base64(data))
+        }),
+        ModelInputContent::Resource {
+            uri,
+            content_type,
+            name,
+        } => json!({
+            "type": "resource",
+            "uri": uri,
+            "contentType": content_type,
+            "name": name
+        }),
+    }
+}
+
+fn resource_fallback_text(uri: &str, content_type: Option<&str>, name: Option<&str>) -> String {
+    let mut fields = vec![format!("uri={uri}")];
+    if let Some(name) = name {
+        fields.push(format!("name={name}"));
+    }
+    if let Some(content_type) = content_type {
+        fields.push(format!("contentType={content_type}"));
+    }
+    format!("[Attached resource: {}]", fields.join(", "))
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        encoded.push(TABLE[(first >> 2) as usize] as char);
+        encoded.push(TABLE[((first & 0b0000_0011) << 4 | second >> 4) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            TABLE[((second & 0b0000_1111) << 2 | third >> 6) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            TABLE[(third & 0b0011_1111) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -942,6 +1081,7 @@ mod tests {
             system_prompt: "system".to_string(),
             conversation: Vec::new(),
             user_message: "current".to_string(),
+            user_content: Vec::new(),
             tool_candidates: Vec::new(),
             previous_tool_calls: Vec::new(),
             tool_results: Vec::new(),
@@ -1027,10 +1167,12 @@ mod tests {
             ModelConversationMessage {
                 role: ModelConversationRole::User,
                 content: "earlier user".to_string(),
+                content_parts: Vec::new(),
             },
             ModelConversationMessage {
                 role: ModelConversationRole::Assistant,
                 content: "earlier assistant".to_string(),
+                content_parts: Vec::new(),
             },
         ];
         request.previous_tool_calls = vec![ProviderToolCall {
@@ -1042,6 +1184,7 @@ mod tests {
             call_id: "call_1".to_string(),
             name: "read_file".to_string(),
             output: "workspace".to_string(),
+            content: Vec::new(),
             is_error: false,
             metadata: json!({}),
         }];
@@ -1066,6 +1209,67 @@ mod tests {
         assert_eq!(messages[4]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[5]["role"], "tool");
         assert_eq!(messages[5]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn serializes_native_user_images_and_structured_tool_content() {
+        let mut request = model_request();
+        request.user_content = vec![
+            ModelInputContent::image("image/png", vec![0x89, b'P', b'N', b'G']),
+            ModelInputContent::json(json!({ "selection": 4 })),
+            ModelInputContent::resource(
+                "file:///workspace/spec.pdf",
+                Some("application/pdf".to_string()),
+                Some("spec.pdf".to_string()),
+            ),
+        ];
+        request.previous_tool_calls = vec![ProviderToolCall {
+            id: "call_1".to_string(),
+            name: "inspect".to_string(),
+            arguments: json!({}),
+        }];
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "call_1".to_string(),
+            name: "inspect".to_string(),
+            output: "legacy".to_string(),
+            content: vec![ModelInputContent::json(json!({ "ready": true }))],
+            is_error: false,
+            metadata: json!({}),
+        }];
+
+        let messages = openai_messages(&request);
+        let user = &messages[1];
+        assert_eq!(user["role"], "user");
+        assert_eq!(
+            user["content"][0],
+            json!({ "type": "text", "text": "current" })
+        );
+        assert_eq!(user["content"][1]["type"], "image_url");
+        assert_eq!(
+            user["content"][1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw=="
+        );
+        assert_eq!(user["content"][2]["text"], "{\"selection\":4}");
+        assert!(user["content"][3]["text"]
+            .as_str()
+            .unwrap()
+            .contains("file:///workspace/spec.pdf"));
+
+        let tool_content: Value =
+            serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(tool_content["content"][0]["type"], "json");
+        assert_eq!(
+            tool_content["content"][0]["value"],
+            json!({ "ready": true })
+        );
+    }
+
+    #[test]
+    fn base64_encoding_handles_all_padding_cases() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
     }
 
     #[test]
@@ -1246,6 +1450,7 @@ mod tests {
         request.conversation.push(ModelConversationMessage {
             role: ModelConversationRole::Assistant,
             content: "history".to_string(),
+            content_parts: Vec::new(),
         });
         let mut deltas = Vec::new();
 

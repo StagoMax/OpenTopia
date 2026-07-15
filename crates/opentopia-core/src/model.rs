@@ -201,14 +201,96 @@ impl ToolCall {
     }
 }
 
+/// A typed unit of model input or tool output.
+///
+/// Text remains the compatibility path for existing providers and tools, while
+/// the other variants retain information that would otherwise be flattened into
+/// a prompt string. `Image` stores the original bytes so provider adapters can
+/// choose their native multimodal representation at the last possible point.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelContentPart {
+    Text {
+        text: String,
+    },
+    Json {
+        value: Value,
+    },
+    Image {
+        content_type: String,
+        data: Vec<u8>,
+    },
+    Resource {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+}
+
+impl ModelContentPart {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    pub fn json(value: Value) -> Self {
+        Self::Json { value }
+    }
+
+    pub fn image(content_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self::Image {
+            content_type: content_type.into(),
+            data,
+        }
+    }
+
+    pub fn resource(
+        uri: impl Into<String>,
+        content_type: Option<String>,
+        name: Option<String>,
+    ) -> Self {
+        Self::Resource {
+            uri: uri.into(),
+            content_type,
+            name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResult {
     pub call_id: Uuid,
+    /// Legacy text output. New tools should populate `content`; consumers can
+    /// use `content_or_legacy_text` while callers migrate.
     pub output: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ModelContentPart>,
     /// Tool-specific metadata is also the forward-compatible place for context
     /// and artifact hints, such as truncated/originalBytes/maxResults.
     pub metadata: Value,
+}
+
+impl ToolResult {
+    pub fn text(call_id: Uuid, output: impl Into<String>, metadata: Value) -> Self {
+        let output = output.into();
+        Self {
+            call_id,
+            content: vec![ModelContentPart::text(output.clone())],
+            output,
+            metadata,
+        }
+    }
+
+    /// Returns typed content for both new and persisted legacy results.
+    pub fn content_or_legacy_text(&self) -> Vec<ModelContentPart> {
+        if self.content.is_empty() {
+            vec![ModelContentPart::text(self.output.clone())]
+        } else {
+            self.content.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -568,5 +650,42 @@ impl AgentEventPayload {
             Self::TurnCancelled { .. } => "turn_cancelled",
             Self::Error { .. } => "error",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_tool_output_remains_typed_text_content() {
+        let result = ToolResult {
+            call_id: Uuid::nil(),
+            output: "legacy output".to_string(),
+            content: Vec::new(),
+            metadata: json!({}),
+        };
+
+        assert_eq!(
+            result.content_or_legacy_text(),
+            vec![ModelContentPart::text("legacy output")]
+        );
+    }
+
+    #[test]
+    fn typed_content_round_trips_through_json() {
+        let content = vec![
+            ModelContentPart::image("image/png", vec![1, 2, 3]),
+            ModelContentPart::resource(
+                "file:///workspace/spec.pdf",
+                Some("application/pdf".to_string()),
+                Some("spec.pdf".to_string()),
+            ),
+            ModelContentPart::json(json!({ "rows": 4 })),
+        ];
+        let serialized = serde_json::to_string(&content).unwrap();
+        let restored: Vec<ModelContentPart> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored, content);
     }
 }

@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
                     user_message_id: user_message.id,
                     workspace_root: thread.workspace_root,
                     content,
+                    user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
                     permission_mode: args.permission,

@@ -140,6 +140,123 @@ button {
   border-radius: 7px;
 }
 
+.icon-button.danger {
+  color: #f29a9a;
+}
+
+.browser-panel {
+  display: grid;
+  grid-template-rows: auto auto auto auto auto minmax(0, 1fr) auto;
+  gap: var(--spacing-sm);
+  height: 100%;
+  min-height: 0;
+  padding: var(--spacing-md);
+  background: #11141b;
+}
+
+.browser-address-row,
+.browser-selector-row,
+.browser-toolbar,
+.browser-downloads {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.browser-address-row input,
+.browser-selector-row input {
+  min-width: 0;
+  height: 34px;
+  flex: 1;
+  border: 1px solid #303646;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #171b24;
+  color: #eef1f7;
+}
+
+.browser-address-row input:focus,
+.browser-selector-row input:focus {
+  border-color: #62b6e7;
+  outline: 2px solid rgb(98 182 231 / 28%);
+  outline-offset: 1px;
+}
+
+.browser-toolbar {
+  min-height: 32px;
+}
+
+.browser-screenshot {
+  width: 100%;
+  max-height: 42%;
+  border: 1px solid #303646;
+  border-radius: 6px;
+  object-fit: contain;
+  background: #0b0d12;
+}
+
+.browser-snapshot {
+  min-height: 0;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #252b37;
+  border-radius: 6px;
+  padding: 10px;
+  background: #0d1016;
+  color: #d7deea;
+  font:
+    12px/1.55 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+  white-space: pre-wrap;
+}
+
+.browser-downloads {
+  flex-wrap: wrap;
+}
+
+.browser-downloads span {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  border: 1px solid #303646;
+  border-radius: 5px;
+  padding: 4px 7px;
+  color: #c8d4e6;
+  font-size: var(--font-size-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-error {
+  margin: 0;
+  color: #f29a9a;
+  font-size: var(--font-size-sm);
+}
+
+.browser-approval {
+  display: grid;
+  gap: var(--spacing-sm);
+  border-top: 1px solid #303646;
+  padding-top: var(--spacing-sm);
+}
+
+.browser-approval p {
+  margin: 0;
+  color: #d7deea;
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+}
+
+.browser-approval div {
+  display: flex;
+  gap: var(--spacing-sm);
+}
+
 .workspace {
   display: grid;
   grid-template-columns: 302px minmax(520px, 1fr) 360px;

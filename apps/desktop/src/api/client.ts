@@ -3,6 +3,7 @@ import type {
   AppSettings,
   ArtifactContent,
   ArtifactDescriptor,
+  BrowserOutput,
   ContextStatus,
   ContextSummary,
   DiffFileActionResult,
@@ -177,6 +178,30 @@ export class ApiClient {
       sourcePaths,
       skillIds,
     });
+  }
+
+  async runBrowserCommand(
+    threadId: string,
+    input: {
+      action:
+        | "navigate"
+        | "snapshot"
+        | "screenshot"
+        | "click"
+        | "type"
+        | "wait"
+        | "download"
+        | "close";
+      url?: string;
+      selector?: string;
+      text?: string;
+      clearFirst?: boolean;
+      condition?: "document_complete" | "selector" | "text";
+      timeoutMs?: number;
+      expectedFilename?: string;
+    },
+  ): Promise<BrowserOutput> {
+    return this.post(`/api/threads/${threadId}/browser`, input);
   }
 
   async getTurnStatus(threadId: string): Promise<TurnStatus | null> {

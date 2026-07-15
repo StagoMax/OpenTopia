@@ -1,3 +1,4 @@
+use crate::model::ModelContentPart;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
@@ -45,11 +46,26 @@ pub struct LoadedContextSource {
     pub kind: ContextSourceKind,
     pub content_type: String,
     pub bytes: u64,
+    /// Typed source content for model adapters. `text` remains for callers that
+    /// only understand the original text-or-reference representation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ModelContentPart>,
     pub text: Option<String>,
     pub truncated: bool,
 }
 
 impl LoadedContextSource {
+    pub fn content_or_legacy_text(&self) -> Vec<ModelContentPart> {
+        if self.content.is_empty() {
+            self.text
+                .as_ref()
+                .map(|text| vec![ModelContentPart::text(text.clone())])
+                .unwrap_or_default()
+        } else {
+            self.content.clone()
+        }
+    }
+
     pub fn render_for_model(&self) -> String {
         let header = format!(
             "Source: {}\nPath: {}\nType: {}\nBytes: {}",
@@ -64,7 +80,8 @@ impl LoadedContextSource {
                 self.truncated
             ),
             None => format!(
-                "<source>\n{header}\nContent: binary content is referenced but not embedded\n</source>"
+                "<source>\n{header}\nContent representation: {}\n</source>",
+                source_representation(&self.content)
             ),
         }
     }
@@ -150,13 +167,32 @@ pub fn load_context_sources(
             .and_then(|name| name.to_str())
             .unwrap_or("source")
             .to_string();
-        let (text, truncated) = if kind == ContextSourceKind::Text {
+        let (text, content, truncated) = if kind == ContextSourceKind::Text {
             let limit = policy.max_text_bytes.min(remaining_text_bytes);
             let (text, truncated) = read_text_limited(&canonical, limit, metadata.len())?;
             remaining_text_bytes = remaining_text_bytes.saturating_sub(text.len());
-            (Some(text), truncated)
+            (
+                Some(text.clone()),
+                vec![ModelContentPart::text(text)],
+                truncated,
+            )
+        } else if kind == ContextSourceKind::Image {
+            let data = read_binary(&canonical)?;
+            (
+                None,
+                vec![ModelContentPart::image(content_type, data)],
+                false,
+            )
         } else {
-            (None, false)
+            (
+                None,
+                vec![ModelContentPart::resource(
+                    file_uri(&canonical),
+                    Some(content_type.to_string()),
+                    Some(name.clone()),
+                )],
+                false,
+            )
         };
         sources.push(LoadedContextSource {
             path: canonical,
@@ -164,11 +200,53 @@ pub fn load_context_sources(
             kind,
             content_type: content_type.to_string(),
             bytes: metadata.len(),
+            content,
             text,
             truncated,
         });
     }
     Ok(sources)
+}
+
+fn read_binary(path: &Path) -> Result<Vec<u8>, ContextSourceError> {
+    std::fs::read(path).map_err(|_| ContextSourceError::Read {
+        path: path.display().to_string(),
+    })
+}
+
+fn source_representation(content: &[ModelContentPart]) -> String {
+    content
+        .iter()
+        .map(|part| match part {
+            ModelContentPart::Image { content_type, .. } => {
+                format!("native image ({content_type})")
+            }
+            ModelContentPart::Resource {
+                uri, content_type, ..
+            } => format!(
+                "resource {} ({})",
+                uri,
+                content_type.as_deref().unwrap_or("unknown type")
+            ),
+            ModelContentPart::Json { .. } => "structured JSON".to_string(),
+            ModelContentPart::Text { .. } => "text".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn file_uri(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::new();
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'.' | b'-' | b'_') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    format!("file:///{encoded}")
 }
 
 fn read_text_limited(
@@ -312,6 +390,10 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].kind, ContextSourceKind::Text);
         assert_eq!(sources[0].text.as_deref(), Some("fn main() {}\n"));
+        assert_eq!(
+            sources[0].content,
+            vec![ModelContentPart::text("fn main() {}\n")]
+        );
         assert!(!sources[0].truncated);
     }
 
@@ -332,15 +414,32 @@ mod tests {
     }
 
     #[test]
-    fn image_and_document_content_are_not_embedded() {
+    fn image_and_document_sources_keep_typed_content() {
         let dir = TestDir::new();
-        let image = dir.write("screen.png", b"not-a-real-image");
+        let image_bytes = b"not-a-real-image";
+        let image = dir.write("screen.png", image_bytes);
         let document = dir.write("spec.pdf", b"not-a-real-pdf");
         let sources =
             load_context_sources(&[image, document], &ContextSourcePolicy::default()).unwrap();
         assert_eq!(sources[0].kind, ContextSourceKind::Image);
         assert_eq!(sources[1].kind, ContextSourceKind::Document);
         assert!(sources.iter().all(|source| source.text.is_none()));
+        assert_eq!(
+            sources[0].content,
+            vec![ModelContentPart::image("image/png", image_bytes.to_vec())]
+        );
+        assert!(matches!(
+            &sources[1].content[..],
+            [ModelContentPart::Resource {
+                uri,
+                content_type: Some(content_type),
+                name: Some(name),
+            }] if uri.starts_with("file:///")
+                && content_type == "application/pdf"
+                && name == "spec.pdf"
+        ));
+        assert!(sources[0].render_for_model().contains("native image"));
+        assert!(sources[1].render_for_model().contains("resource file:///"));
     }
 
     #[test]

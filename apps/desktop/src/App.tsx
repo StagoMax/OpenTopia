@@ -45,6 +45,7 @@ import {
 } from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
+import { BrowserPanel } from "./components/BrowserPanel";
 import { LogViewer } from "./components/LogViewer";
 import { detectLanguage, MonacoEditor } from "./components/MonacoEditor";
 import { RightContextRail } from "./components/RightContextRail";
@@ -100,6 +101,10 @@ type ToolTab = {
   kind: ToolTabKind;
   title: string;
 };
+
+type DirectToolCommand =
+  | { kind: "run"; command: string }
+  | { kind: "read"; path: string };
 
 type ArtifactPreviewState =
   | { status: "loading"; artifactId: string }
@@ -952,8 +957,36 @@ export function App() {
     }
   }
 
+  async function runDirectToolCommand(
+    threadId: string,
+    command: DirectToolCommand,
+  ) {
+    if (!client) return;
+    setWorkbenchError(null);
+    if (command.kind === "run") {
+      openToolTab("terminal");
+      await client.startTerminalCommand(threadId, command.command);
+      return;
+    }
+
+    openToolTab("files");
+    setFilePreview(await client.readWorkspaceFile(threadId, command.path));
+  }
+
   async function createThread(initialPrompt?: string): Promise<Thread | null> {
     if (!client) return null;
+    const directCommand = parseDirectToolCommand(initialPrompt ?? "");
+    if (!directCommand && isLegacyDirectToolCommand(initialPrompt ?? "")) {
+      setActionError("/run and /read require an argument.");
+      return null;
+    }
+    if (
+      directCommand &&
+      (contextSources.length > 0 || selectedSkillIds.length > 0)
+    ) {
+      setActionError("Direct tool commands cannot include agent context.");
+      return null;
+    }
     let project =
       activeProject ??
       projects.find(
@@ -987,7 +1020,10 @@ export function App() {
       setDraftProjectId(null);
       setToolTabs([]);
       setActiveToolTabId(null);
-      if (
+      if (directCommand) {
+        await runDirectToolCommand(thread.id, directCommand);
+        setComposer("");
+      } else if (
         initialPrompt?.trim() ||
         contextSources.length > 0 ||
         selectedSkillIds.length > 0
@@ -1089,8 +1125,25 @@ export function App() {
       activeTurnId
     )
       return;
+    const directCommand = parseDirectToolCommand(composer);
+    if (!directCommand && isLegacyDirectToolCommand(composer)) {
+      setActionError("/run and /read require an argument.");
+      return;
+    }
+    if (
+      directCommand &&
+      (contextSources.length > 0 || selectedSkillIds.length > 0)
+    ) {
+      setActionError("Direct tool commands cannot include agent context.");
+      return;
+    }
     setIsSending(true);
     try {
+      if (directCommand) {
+        await runDirectToolCommand(activeThread.id, directCommand);
+        setComposer("");
+        return;
+      }
       const message = await client.sendMessage(
         activeThread.id,
         composer.trim(),
@@ -1101,6 +1154,8 @@ export function App() {
       setComposer("");
       setContextSources([]);
       setSelectedSkillIds([]);
+    } catch (error) {
+      setActionError(`Could not send message: ${errorMessage(error)}`);
     } finally {
       setIsSending(false);
     }
@@ -1529,6 +1584,7 @@ export function App() {
           threadMcpServers={threadMcpServers}
           workbenchError={workbenchError}
           isRefreshingWorkbench={isRefreshingWorkbench}
+          pendingApprovalIds={pendingApprovalIds}
           decidingApprovalId={decidingApprovalId}
           artifacts={artifacts}
           contextStatus={contextStatus}
@@ -3563,6 +3619,21 @@ function Composer({
                 <span>审查变更</span>
                 {!canOpenThreadTools && <small>创建任务后</small>}
               </button>
+              <button
+                role="menuitem"
+                disabled={!canOpenThreadTools}
+                title={
+                  canOpenThreadTools ? undefined : "创建任务后可打开浏览器"
+                }
+                onClick={() => {
+                  onOpenTool("browser");
+                  setOpenMenu(null);
+                }}
+              >
+                <Globe2 size={14} />
+                <span>Browser</span>
+                {!canOpenThreadTools && <small>创建任务后</small>}
+              </button>
               <button role="menuitem" onClick={() => setOpenMenu("skills")}>
                 <Plug size={14} />
                 <span>Skills</span>
@@ -3765,6 +3836,7 @@ function RightPanel({
   threadMcpServers,
   workbenchError,
   isRefreshingWorkbench,
+  pendingApprovalIds,
   decidingApprovalId,
   artifacts,
   contextStatus,
@@ -3813,6 +3885,7 @@ function RightPanel({
   threadMcpServers: ThreadMcpServerView[];
   workbenchError: string | null;
   isRefreshingWorkbench: boolean;
+  pendingApprovalIds: string[];
   decidingApprovalId: string | null;
   artifacts: ArtifactDescriptor[];
   contextStatus: ContextStatus | null;
@@ -3912,10 +3985,13 @@ function RightPanel({
         />
         <div className="tool-stage-body">
           {activeToolTab.kind === "browser" ? (
-            <UnavailableToolState
-              icon={Globe2}
-              title="内置浏览器尚未实现"
-              description="录屏中的网页标签需要独立的 Electron BrowserView 安全边界、导航策略和会话隔离。入口已经保留，当前不会伪造网页执行结果。"
+            <BrowserPanel
+              client={client}
+              threadId={thread?.id ?? null}
+              events={events}
+              pendingApprovalIds={pendingApprovalIds}
+              decidingApprovalId={decidingApprovalId}
+              onDecideApproval={onDecideApproval}
             />
           ) : (
             renderWorkbench("stage", activeToolTab.kind)
@@ -4050,25 +4126,6 @@ function ToolTabStrip({
           </div>
         )}
       </div>
-    </div>
-  );
-}
-
-function UnavailableToolState({
-  icon: Icon,
-  title,
-  description,
-}: {
-  icon: typeof Folder;
-  title: string;
-  description: string;
-}) {
-  return (
-    <div className="unavailable-tool-state">
-      <Icon size={34} />
-      <h2>{title}</h2>
-      <p>{description}</p>
-      <span>未实现</span>
     </div>
   );
 }
@@ -4479,6 +4536,22 @@ function sortProjects(projects: Project[]): Project[] {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function parseDirectToolCommand(value: string): DirectToolCommand | null {
+  const trimmed = value.trim();
+  const match = /^\/(run|read)(?:\s+([\s\S]*))?$/i.exec(trimmed);
+  if (!match) return null;
+
+  const argument = match[2]?.trim();
+  if (!argument) return null;
+  return match[1].toLowerCase() === "run"
+    ? { kind: "run", command: argument }
+    : { kind: "read", path: argument };
+}
+
+function isLegacyDirectToolCommand(value: string): boolean {
+  return /^\/(?:run|read)(?:\s|$)/i.test(value.trim());
 }
 
 function parsePathList(value: string): string[] {
