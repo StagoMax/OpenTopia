@@ -1,4 +1,5 @@
 import type {
+  ContextSourcePickResult,
   LogFileInfo,
   PlatformInfo,
   RecentWorkspace,
@@ -45,6 +46,13 @@ export async function selectWorkspace(options?: {
 }): Promise<WorkspacePickResult> {
   if (window.opentopia) return window.opentopia.selectWorkspace(options);
   return { canceled: true };
+}
+
+export async function selectContextFiles(options?: {
+  defaultPath?: string;
+}): Promise<ContextSourcePickResult> {
+  if (window.opentopia) return window.opentopia.selectContextFiles(options);
+  return { canceled: true, files: [] };
 }
 
 export async function openPath(targetPath: string): Promise<void> {

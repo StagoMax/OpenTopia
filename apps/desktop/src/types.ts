@@ -32,10 +32,34 @@ export type WorkspacePickResult =
       recentWorkspaces: RecentWorkspace[];
     };
 
+export type ContextSourceFile = {
+  path: string;
+  name: string;
+  extension: string;
+  kind: "text" | "image" | "document";
+  bytes: number;
+};
+
+export type ContextSourcePickResult =
+  | { canceled: true; files: [] }
+  | { canceled: false; files: ContextSourceFile[] };
+
 export type Thread = {
   id: string;
   title: string;
   workspaceRoot: string;
+  projectId: string | null;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type Project = {
+  id: string;
+  name: string;
+  workspaceRoot: string | null;
+  pinned: boolean;
+  sortOrder: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -50,7 +74,16 @@ export type AppSettings = {
   activeProviderId: string;
   permissionMode: PermissionMode;
   defaultWorkspaceRoot?: string | null;
+  sandbox: SandboxSettings;
   updatedAt: string;
+};
+
+export type SandboxSettings = {
+  sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
+  enforcement: "disabled" | "best-effort" | "enforce";
+  network: "inherit" | "allow" | "deny";
+  writableRoots: string[];
+  readPaths: string[];
 };
 
 export type ProviderSettings = {
@@ -184,6 +217,69 @@ export type WorkspaceDiff = {
   truncated: boolean;
   stagedTruncated?: boolean;
   unstagedTruncated?: boolean;
+};
+
+export type GitWorkflowActionKind =
+  | "status"
+  | "list_branches"
+  | "create_branch"
+  | "switch_branch"
+  | "commit"
+  | "push"
+  | "compare"
+  | "create_worktree";
+
+export type GitWorkflowAction =
+  | { type: "status"; request: { includeUntracked: boolean } }
+  | { type: "list_branches"; request: { includeRemote: boolean } }
+  | {
+      type: "create_branch";
+      request: { branch: string; startPoint: string | null };
+    }
+  | { type: "switch_branch"; request: { branch: string } }
+  | { type: "commit"; request: { message: string; allTracked: boolean } }
+  | {
+      type: "push";
+      request: { remote: string; branch: string; setUpstream: boolean };
+    }
+  | {
+      type: "compare";
+      request: {
+        base: string;
+        head: string;
+        mode: "direct" | "merge_base";
+      };
+    };
+
+export type GitWorkflowResponse = {
+  action: GitWorkflowActionKind;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  success: boolean;
+  truncated: boolean;
+};
+
+export type GitStatusSummary = {
+  branch: string | null;
+  upstream: string | null;
+  detached: boolean;
+  ahead: number;
+  behind: number;
+  changed: number;
+  staged: number;
+  unstaged: number;
+  untracked: number;
+  raw: string;
+};
+
+export type GitBranchInfo = {
+  fullRef: string;
+  name: string;
+  current: boolean;
+  remote: boolean;
+  upstream: string | null;
+  symbolicTarget: string | null;
 };
 
 export type TerminalEventType =
@@ -363,7 +459,35 @@ export type MessagePart =
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; result: ToolResult }
   | { type: "file_ref"; path: string }
+  | { type: "source_ref"; source: ContextSourceRef }
+  | { type: "skill_ref"; skill: SkillRef }
   | { type: "error"; message: string };
+
+export type ContextSourceRef = {
+  id: string;
+  path: string;
+  name: string;
+  kind: "text" | "image" | "document";
+  contentType: string;
+  bytes: number;
+  truncated: boolean;
+};
+
+export type SkillDescriptor = {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  scope: "workspace" | "user";
+};
+
+export type SkillRef = {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  truncated: boolean;
+};
 
 export type ToolCall = {
   id: string;
@@ -393,6 +517,7 @@ export type AgentEventPayload =
   | { type: "tool_call_finished"; result: ToolResult }
   | { type: "assistant_message"; message: Message }
   | { type: "file_changed"; path: string; summary: string }
+  | { type: "subagent_updated"; run: SubagentRun }
   | {
       type: "approval_requested";
       approval_id: string;
@@ -410,6 +535,24 @@ export type AgentEventPayload =
   | { type: "turn_suspended"; approval_id: string; reason: string }
   | { type: "turn_cancelled"; reason: string }
   | { type: "error"; message: string };
+
+export type SubagentRunStatus =
+  "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
+
+export type SubagentRun = {
+  id: string;
+  parentThreadId: string;
+  parentTurnId: string;
+  name: string;
+  input: string;
+  depth: number;
+  status: SubagentRunStatus;
+  result?: string | null;
+  error?: string | null;
+  createdAt: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
+};
 
 export type TurnStatus = {
   turnId: string;
@@ -434,6 +577,9 @@ declare global {
       selectWorkspace(options?: {
         defaultPath?: string;
       }): Promise<WorkspacePickResult>;
+      selectContextFiles(options?: {
+        defaultPath?: string;
+      }): Promise<ContextSourcePickResult>;
       getRecentWorkspaces(): Promise<RecentWorkspace[]>;
       saveRecentWorkspace(workspaceRoot: string): Promise<RecentWorkspace[]>;
       removeRecentWorkspace(workspaceRoot: string): Promise<RecentWorkspace[]>;

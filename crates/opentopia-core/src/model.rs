@@ -1,3 +1,6 @@
+use crate::context_sources::{ContextSourceKind, LoadedContextSource};
+use crate::skills::LoadedSkill;
+use crate::subagents::SubagentRun;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -6,10 +9,39 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Project {
+    pub id: Uuid,
+    pub name: String,
+    pub workspace_root: Option<PathBuf>,
+    pub pinned: bool,
+    pub sort_order: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Project {
+    pub fn new(name: impl Into<String>, workspace_root: Option<PathBuf>) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            workspace_root,
+            pinned: false,
+            sort_order: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: Uuid,
     pub title: String,
     pub workspace_root: PathBuf,
+    pub project_id: Option<Uuid>,
+    pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -21,9 +53,21 @@ impl Thread {
             id: Uuid::new_v4(),
             title: title.into(),
             workspace_root,
+            project_id: None,
+            archived_at: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    pub fn new_in_project(
+        title: impl Into<String>,
+        workspace_root: PathBuf,
+        project_id: Uuid,
+    ) -> Self {
+        let mut thread = Self::new(title, workspace_root);
+        thread.project_id = Some(project_id);
+        thread
     }
 }
 
@@ -86,7 +130,57 @@ pub enum MessagePart {
     ToolCall { call: ToolCall },
     ToolResult { result: ToolResult },
     FileRef { path: PathBuf },
+    SourceRef { source: ContextSourceRef },
+    SkillRef { skill: SkillRef },
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSourceRef {
+    pub id: Uuid,
+    pub path: PathBuf,
+    pub name: String,
+    pub kind: ContextSourceKind,
+    pub content_type: String,
+    pub bytes: u64,
+    pub truncated: bool,
+}
+
+impl From<&LoadedContextSource> for ContextSourceRef {
+    fn from(source: &LoadedContextSource) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            path: source.path.clone(),
+            name: source.name.clone(),
+            kind: source.kind,
+            content_type: source.content_type.clone(),
+            bytes: source.bytes,
+            truncated: source.truncated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRef {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+    pub truncated: bool,
+}
+
+impl From<&LoadedSkill> for SkillRef {
+    fn from(skill: &LoadedSkill) -> Self {
+        Self {
+            id: skill.descriptor.id.clone(),
+            name: skill.descriptor.name.clone(),
+            description: skill.descriptor.description.clone(),
+            path: skill.descriptor.path.clone(),
+            truncated: skill.truncated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +532,9 @@ pub enum AgentEventPayload {
         output_tokens: usize,
         total_tokens: usize,
     },
+    SubagentUpdated {
+        run: SubagentRun,
+    },
     TurnFinished {
         summary: String,
     },
@@ -465,6 +562,7 @@ impl AgentEventPayload {
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::ContextCompacted { .. } => "context_compacted",
             Self::TokenUsage { .. } => "token_usage",
+            Self::SubagentUpdated { .. } => "subagent_updated",
             Self::TurnFinished { .. } => "turn_finished",
             Self::TurnSuspended { .. } => "turn_suspended",
             Self::TurnCancelled { .. } => "turn_cancelled",

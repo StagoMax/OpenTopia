@@ -644,7 +644,8 @@ code {
 }
 
 .settings-grid input,
-.settings-grid select {
+.settings-grid select,
+.settings-grid textarea {
   min-height: 36px;
   border: 1px solid #303949;
   border-radius: 8px;
@@ -654,8 +655,20 @@ code {
   padding: 0 10px;
 }
 
+.settings-grid textarea {
+  min-height: 72px;
+  resize: vertical;
+  padding-block: 8px;
+  font:
+    12px/1.5 "Cascadia Code",
+    "SFMono-Regular",
+    Consolas,
+    monospace;
+}
+
 .settings-grid input:focus,
-.settings-grid select:focus {
+.settings-grid select:focus,
+.settings-grid textarea:focus {
   border-color: #2f7d6d;
 }
 
@@ -665,11 +678,27 @@ code {
 }
 
 .settings-providers-section,
+.settings-sandbox-section,
 .settings-provider-form,
 .settings-secret-section {
   display: grid;
   gap: 10px;
   min-width: 0;
+}
+
+.settings-sandbox-section {
+  border-block: 1px solid #252d3a;
+  padding-block: 14px;
+}
+
+.settings-sandbox-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.settings-sandbox-grid label:nth-last-child(-n + 2) {
+  grid-column: span 3;
 }
 
 .settings-providers-header,
@@ -2848,10 +2877,37 @@ button:disabled {
 }
 
 .artifact-reference-button,
+.message-source-reference,
 .artifact-file-link {
   border-color: #cbd9e9;
   background: #f4f8fc;
   color: var(--accent);
+}
+
+.message-source-reference {
+  display: inline-grid;
+  grid-template-columns: 14px minmax(0, auto) auto;
+  max-width: 100%;
+  min-height: 28px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #cbd9e9;
+  border-radius: 6px;
+  background: #f4f8fc;
+  color: var(--accent);
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.message-source-reference span {
+  overflow: hidden;
+  max-width: 240px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-source-reference small {
+  color: var(--text-muted);
 }
 
 .terminal-screen,
@@ -3047,6 +3103,45 @@ button:disabled {
   display: grid;
   place-items: center;
   padding: 24px;
+}
+
+.action-error {
+  position: fixed;
+  z-index: 180;
+  top: 62px;
+  right: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 26px;
+  align-items: center;
+  gap: 10px;
+  width: min(440px, calc(100vw - 28px));
+  border: 1px solid #d9a3a3;
+  border-radius: 7px;
+  background: #fff7f7;
+  box-shadow: 0 12px 30px rgb(64 31 31 / 16%);
+  color: #8b3030;
+  padding: 10px 10px 10px 12px;
+  font-size: 12px;
+}
+
+.action-error span {
+  overflow-wrap: anywhere;
+}
+
+.action-error button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.action-error button:hover {
+  background: rgb(139 48 48 / 8%);
 }
 
 .project-name-dialog {
@@ -3255,6 +3350,14 @@ button:disabled {
   grid-template-rows: 28px minmax(54px, auto) 34px;
 }
 
+.composer.has-sources {
+  grid-template-rows: auto minmax(54px, auto) 34px;
+}
+
+.composer.has-context.has-sources {
+  grid-template-rows: 28px auto minmax(54px, auto) 34px;
+}
+
 .composer.has-context textarea {
   grid-row: 2;
 }
@@ -3262,6 +3365,24 @@ button:disabled {
 .composer.has-context .composer-toolbar,
 .composer.has-context .send-button {
   grid-row: 3;
+}
+
+.composer.has-sources textarea {
+  grid-row: 2;
+}
+
+.composer.has-sources .composer-toolbar,
+.composer.has-sources .send-button {
+  grid-row: 3;
+}
+
+.composer.has-context.has-sources textarea {
+  grid-row: 3;
+}
+
+.composer.has-context.has-sources .composer-toolbar,
+.composer.has-context.has-sources .send-button {
+  grid-row: 4;
 }
 
 .composer-context {
@@ -3275,6 +3396,64 @@ button:disabled {
   color: #697069;
   padding: 0 2px 5px;
   font-size: 10px;
+}
+
+.composer-sources {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 2px 2px 6px;
+}
+
+.composer.has-context .composer-sources {
+  grid-row: 2;
+  padding-top: 6px;
+}
+
+.composer-source {
+  display: inline-grid;
+  grid-template-columns: 14px minmax(0, auto) auto 20px;
+  max-width: min(100%, 310px);
+  min-height: 26px;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #dfe3de;
+  border-radius: 5px;
+  background: #f7f8f6;
+  color: #555c55;
+  padding: 1px 2px 1px 7px;
+  font-size: 10px;
+}
+
+.composer-source > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-source small {
+  color: #8b918b;
+  white-space: nowrap;
+}
+
+.composer-source button {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #7a817a;
+  padding: 0;
+}
+
+.composer-source button:hover {
+  background: #e8ebe7;
+  color: #343a34;
 }
 
 .composer-context-button {

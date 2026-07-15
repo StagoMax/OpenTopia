@@ -1,5 +1,7 @@
 pub mod agent;
+pub mod context_sources;
 pub mod execution;
+pub mod git_workflow;
 pub mod mcp;
 pub mod mcp_host;
 pub mod model;
@@ -7,7 +9,9 @@ pub mod policy;
 pub mod provider;
 pub mod sandbox;
 pub mod settings;
+pub mod skills;
 pub mod store;
+pub mod subagents;
 pub mod tools;
 pub mod workspace;
 
@@ -15,10 +19,20 @@ pub use agent::{
     AgentContinuation, AgentCore, AgentEventSender, AgentTurnInput, AgentTurnOutcome,
     AgentTurnResult, ContextBudget as AgentContextBudget,
 };
+pub use context_sources::{
+    load_context_sources, ContextSourceError, ContextSourceKind, ContextSourcePolicy,
+    LoadedContextSource,
+};
 pub use execution::{
     ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
     FileReadResult, FileWriteRequest, LocalExecutionEnvironment, PatchResult, ResourceLimit,
     StdioSession, WriteResult,
+};
+pub use git_workflow::{
+    execute_git_workflow, AheadBehind, CommitRequest, CompareMode, CompareRequest,
+    CreateBranchRequest, CreateWorktreeRequest, GitBranchInfo, GitStatusRequest, GitWorkflowAction,
+    GitWorkflowActionKind, GitWorkflowError, GitWorkflowRequest, GitWorkflowResult,
+    ListBranchesRequest, PushRequest, SwitchBranchRequest, WorktreeTarget,
 };
 pub use mcp::{
     McpCallResult, McpLifecycleStatus, McpServerConfig, McpServerStatus, McpToolDescriptor,
@@ -27,8 +41,9 @@ pub use mcp::{
 pub use mcp_host::{McpExtensionHost, McpHostError, McpToolRoute};
 pub use model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    ArtifactStorage, ArtifactStorageMetadata, ContextSummary, Message, MessagePart, MessageRole,
-    TerminalCommandHistory, TerminalCommandStatus, Thread, ToolCall, ToolResult,
+    ArtifactStorage, ArtifactStorageMetadata, ContextSourceRef, ContextSummary, Message,
+    MessagePart, MessageRole, Project, SkillRef, TerminalCommandHistory, TerminalCommandStatus,
+    Thread, ToolCall, ToolResult,
 };
 pub use policy::{
     BasicPolicyEngine, CommandPolicyRule, CommandRuleMatch, NetworkPolicyConfig, PermissionMode,
@@ -46,8 +61,18 @@ pub use sandbox::{
 };
 pub use settings::{
     AppSettings, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
+    SandboxEnforcement, SandboxSettings,
 };
-pub use store::{ContextBudget, SessionStore, SqliteSessionStore};
+pub use skills::{
+    discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,
+};
+pub use store::{
+    normalize_workspace_key, ContextBudget, SessionStore, SqliteSessionStore, StoreError,
+};
+pub use subagents::{
+    NoopSubagentObserver, SpawnSubagentRequest, SubagentError, SubagentEvent, SubagentExecutor,
+    SubagentObserver, SubagentRun, SubagentRunStatus, SubagentScheduler, SubagentSchedulerConfig,
+};
 pub use tools::{
     ApplyPatchTool, GitDiffTool, ListFilesTool, McpToolWrapper, ReadFileTool, ShellTool, Tool,
     ToolContext, ToolRegistry, WriteFileTool,

@@ -2,6 +2,12 @@
 
 这份文档回答一个很具体的问题：OpenTopia 这个 MVP 到底借鉴了哪些开源项目的哪些模块，以及这些设计落到了本仓库的哪些代码里。
 
+产品优先级与交付顺序以 GitHub [Roadmap #4](https://github.com/StagoMax/OpenTopia/issues/4)
+为准；[#3 Project/Thread 一等模型](https://github.com/StagoMax/OpenTopia/issues/3)、
+[#1 附件、来源与 Skills 上下文](https://github.com/StagoMax/OpenTopia/issues/1)、
+[#2 子智能体运行时与持久化](https://github.com/StagoMax/OpenTopia/issues/2)
+已经有本地 MVP，Issue 继续跟踪多模态、审批和资源预算等深化项。
+
 大多数模块按架构模式重写，没有复制其他项目的 UI 像素或大段实现代码。
 一个明确例外是 Windows 沙箱：OpenTopia 直接分发并调用 Codex 的
 restricted-token helper binaries，并随安装包附带其 Apache-2.0 `LICENSE`。
@@ -15,14 +21,18 @@ restricted-token helper binaries，并随安装包附带其 Apache-2.0 `LICENSE`
 | Codex | `J:\Project\codex cli\codex\codex-rs\protocol\src\approvals.rs` | shell/apply_patch/network/MCP 等审批事件建模 | `ApprovalRequested` 事件、`/api/threads/{thread_id}/approvals/{approval_id}/decision` |
 | Codex | `J:\Project\codex cli\codex\codex-rs\core\src\exec_policy.rs` | 命令风险判定、approval policy、exec policy amendment | `crates/opentopia-core/src/policy.rs` 的 `PermissionMode`、`PolicyDecision`、危险命令 ask |
 | Codex | `J:\Project\codex cli\codex\codex-rs\core\src\apply_patch.rs` | 把 patch 当成一等工具，并进入权限链路 | `crates/opentopia-core/src/tools.rs` 的 `apply_patch` 工具与 `/patch` 命令 |
+| Codex | `J:\Project\codex cli\codex\codex-rs\core-skills\src\loader.rs` | `SKILL.md`、YAML front matter、分层 roots、扫描深度/字段上限 | `skills.rs` 的 workspace/user roots、YAML 元数据、扫描与注入上限；是协议级重写，未复制 loader 实现 |
+| Codex | `J:\Project\codex cli\codex\codex-rs\core\src\tools\handlers\multi_agents\spawn.rs` | spawn tool、父子关系、深度限制、继承运行环境、typed lifecycle event | `subagents.rs`、`tools.rs` 的 spawn/send/cancel/wait、父 Turn 队列、递归取消与事件；按 OpenTopia 架构重写 |
+| Codex | `J:\Project\codex cli\codex\codex-rs\git-utils\src` | Git 子进程参数化、repository/ref/branch 操作边界 | `git_workflow.rs` 的 argv-only Git action、严格 ref/remote 校验和 `ExecutionEnvironment` 执行 |
 | Codex | `J:\Project\codex cli\codex\codex-rs\sandboxing/`、本机 Codex appserver helpers | OS 级沙箱：Linux bwrap、macOS Seatbelt、Windows restricted token/ACL/job object | `sandbox.rs` 三平台 adapter；Windows 直接调用并打包 `codex.exe`、command runner、sandbox setup helper 与 Apache-2.0 license |
 | Goose | `J:\Project\Goose\ui\desktop\src\main.ts` | Electron 主进程、后端服务启动、窗口生命周期、设置/菜单/更新的主进程承载 | `apps/desktop/electron/main.cjs` 的 Electron shell 和 Rust server auto-start |
 | Goose | `J:\Project\Goose\crates\goose\src\agents\agent.rs` | agent loop、provider/tool/session 组合、frontend tool 分类 | `crates/opentopia-core/src/agent.rs` 的 AgentCore、provider、deterministic tools |
 | Goose | `J:\Project\Goose\crates\goose\src\permission\permission_inspector.rs` | 工具调用前的 inspector/permission 分层，read-only/approval/deny 三态 | `crates/opentopia-core/src/policy.rs` 和 desktop approval card |
 | Goose | `J:\Project\Goose\crates\goose\src\agents\extension_manager.rs` | extension/MCP 管理器作为 agent 能力扩展层 | `McpExtensionHost`、`McpStdioClient`、线程级启停和 agent tool schema 注册 |
+| Goose | `J:\Project\Goose\crates\goose\src\agents\subagent_handler.rs`、`subagent_execution_tool` | 子任务作为工具、继承 agent 配置、状态通知 | `ServerSubagentExecutor` 复用 AgentCore/provider/policy/sandbox，状态通过 SQLite + SSE 投影 |
 | opencode | `J:\Project\opencode\source\packages\desktop\src-tauri\src\server.rs` | desktop sidecar server spawn、health check、localhost no-proxy、WSL 配置 | `apps/desktop/electron/main.cjs` 的 `startBackendIfNeeded()`，后续加入 WSL path adapter |
 | opencode | `J:\Project\opencode\source\packages\desktop\src-tauri\src\lib.rs` | sidecar 状态、初始化阶段事件、kill sidecar、平台命令桥 | `apps/desktop/electron/preload.cjs` 和 `window.opentopia` 平台桥 |
-| opencode | `J:\Project\opencode\source\packages\desktop\src\index.tsx` | `PlatformProvider` 风格的桌面能力抽象：open path、dialog、storage、notification、OS 信息 | MVP 已实现 platform info/open external，后续扩展 dialog/storage/notification |
+| opencode | `J:\Project\opencode\source\packages\desktop\src\index.tsx` | `PlatformProvider` 风格的桌面能力抽象：open path、dialog、storage、notification、OS 信息 | MVP 已实现 platform info/open external、目录选择、recent workspace 与 safeStorage；notification、完整 deep link 和 WSL adapter 仍待实现 |
 | opencode | `J:\Project\opencode\source\packages\ui\src\theme` | 可换主题、token 化 UI、工作台布局风格 | `apps/desktop/src/styles/app.css` 的 restrained workbench 视觉基底 |
 | OpenHands | `J:\Project\openhand\openhands\app_server\event\event_service.py` | event service 抽象、event search/count/batch get | `SqliteSessionStore` 的 events 持久化与 `GET /api/threads/{thread_id}/events` |
 | OpenHands | `J:\Project\openhand\openhands\app_server\event\event_router.py` | event router 与分页查询 API | MVP 先实现 since-based event listing，后续改 page cursor |
@@ -48,31 +58,36 @@ OpenTopia 当前采用的是"Electron 桌面壳 + Rust 本地 agent server + SQL
 | OpenTopia 模块 | 代码路径 | 来源模式 | 当前状态 |
 | --- | --- | --- | --- |
 | Desktop shell | `apps/desktop/electron/main.cjs` | Goose Electron main + opencode sidecar health check | 可启动窗口，可自动拉起 Rust server |
-| Desktop platform bridge | `apps/desktop/electron/preload.cjs` | opencode PlatformProvider | platform info、目录选择、recent workspace、open path、safeStorage metadata/set/delete、logs |
-| Workbench UI | `apps/desktop/src/App.tsx` | Codex/Trae/opencode 三栏工作台 | thread、chat、timeline、Monaco、xterm、artifact、staged/unstaged hunk review |
+| Desktop platform bridge | `apps/desktop/electron/preload.cjs` | opencode PlatformProvider | platform info、目录/来源文件选择、recent workspace、open path、safeStorage metadata/set/delete、logs |
+| Workbench UI | `apps/desktop/src/App.tsx`、`components/RightContextRail.tsx` | Codex/Trae/opencode 三栏工作台 | first-class Project/Thread、chat、Monaco、xterm、artifact、hunk review、附件/Skills、真实子智能体状态与控制 |
 | Agent protocol | `crates/opentopia-core/src/model.rs` | Codex SQ/EQ typed events + OpenHands events | Thread、Message、ToolCall、AgentEvent |
 | Local server | `crates/opentopia-server/src/main.rs` | OpenHands REST event service + Codex event stream | REST + SSE + approval decision |
-| Session store | `crates/opentopia-core/src/store.rs` | OpenHands event persistence | SQLite thread/message/event/approval/artifact/settings/MCP/terminal history |
+| Session store | `crates/opentopia-core/src/store.rs` | OpenHands event persistence | SQLite project/thread/message/event/approval/artifact/settings/MCP/terminal/subagent history |
 | Policy engine | `crates/opentopia-core/src/policy.rs` | Codex exec_policy + Goose permission inspector | chat/read_only/auto/approve/full_access |
-| Tools | `crates/opentopia-core/src/tools.rs` | Codex apply_patch/shell/read/write tool surface | list/read/write/shell/diff/apply_patch |
-| Provider | `crates/opentopia-core/src/provider.rs` | Goose provider abstraction | OpenAI-compatible provider、tool_calls 解析、多轮工具结果回传、mock fallback |
+| Tools | `crates/opentopia-core/src/tools.rs` | Codex apply_patch/shell/read/write/search/multi-agent tool surface | list/read/write/search/shell/diff/apply_patch/spawn/send/cancel/wait；全部进入现有工具循环 |
+| Sources and Skills | `context_sources.rs`、`skills.rs` | Codex Skills roots/limits + OpenHands skill loader 的任务上下文模式 | canonical source 验证、敏感/类型/大小限制、消息引用、bounded text、Turn-scoped Skill 选择 |
+| Subagent runtime | `subagents.rs`、server `ServerSubagentExecutor` | Codex multi-agent lifecycle + Goose subagent tool | 每父 Turn 并发/队列/深度/超时、真实 AgentCore、SQLite/SSE、重启恢复和递归取消 |
+| Git workflow | `git_workflow.rs`、`POST /api/threads/:id/git`、`RightContextRail.tsx` | Codex git-utils 的参数化 subprocess boundary | status/list/create/switch/commit/push/compare/worktree 安全核心与沙箱 API；桌面已完成 status/branch/create/switch/commit/push/compare，worktree/PR 仍待完成 |
+| Provider | `crates/opentopia-core/src/provider.rs`、`agent.rs` | Goose provider abstraction | OpenAI-compatible provider、tool_calls 解析、多轮工具结果回传、streaming token usage 解析；AgentEvent 流将 usage 持久化为 `token_usage` 事件；mock fallback |
 | CLI | `crates/opentopia-cli/src/main.rs` | Codex CLI split package | new/list/send |
 | Execution environment | `crates/opentopia-core/src/execution.rs` | Codex exec/sandbox boundary | 路径收敛、超时/取消/输出限制、sandbox command plan、stdio session |
 | OS sandbox | `crates/opentopia-core/src/sandbox.rs` | Codex 三平台隔离模型；Windows helper binary 直接复用 | read-only/workspace-write/danger-full-access、writable roots、受保护元数据、独立 backend enforcement、network policy；Windows unelevated 已做真实越界写拒绝测试 |
-| Persistent terminal | `crates/opentopia-server/src/main.rs`、`XtermTerminal.tsx` | Codex terminal/exec 生命周期模式 + `portable-pty`/xterm.js | 每 thread 长驻 PTY、raw input、resize、SSE、SQLite 回放、Windows process-tree close |
-| Context compaction | `crates/opentopia-server/src/main.rs`、`agent.rs` | coding-agent durable summary 模式 | 真实 provider 摘要、metadata、latest-summary 恢复及后续 turn 注入 |
-| MCP host | `mcp_host.rs`、`mcp.rs` | Goose extension manager + MCP JSON-RPC | initialize/list_tools/call_tool、schema cache、policy、bounded agent loop |
+| Persistent terminal | `crates/opentopia-server/src/main.rs`、`XtermTerminal.tsx` | Codex terminal/exec 生命周期模式 + `portable-pty`/xterm.js | 每 thread 长驻 PTY、raw input、resize、SSE、SQLite 回放、Windows process-tree close，并复用当前 OS sandbox command plan |
+| Context compaction | `crates/opentopia-server/src/main.rs`、`agent.rs` | coding-agent durable summary 模式 | 真实 provider 摘要、metadata、latest-summary 恢复及后续 turn 注入；按估算上下文窗口的可配置阈值自动压缩，并对最近历史做预算裁剪 |
+| MCP host | `mcp_host.rs`、`mcp.rs` | Goose extension manager + MCP JSON-RPC | initialize/list_tools/call_tool、list_changed cache refresh、显式 envKeys、OS 沙箱 spawn、Thread enablement/policy、bounded agent loop |
 
 ## 还应该继续借鉴但暂未实现的模块
 
-下一阶段优先级：
+下一阶段优先级以 [Roadmap #4](https://github.com/StagoMax/OpenTopia/issues/4) 为准：
 
-1. Linux/macOS 沙箱：在对应原生发布机跑 bubblewrap/Seatbelt confinement 集成测试，并增加 seccomp/Landlock 与资源配额。
-2. Goose extension ecosystem：在现有 MCP host 上增加 schema cache 持久化和产品化 GitHub/Linear/Jira/browser/document 连接器。
-3. opencode desktop platform：继续补 notification、完整 deep link 路由、WSL path adapter。
-4. OpenHands trajectory：补 tool output 的更完整序列化和 replay tooling。
-5. Provider context：接入 provider-reported token usage 和自动压缩阈值。
-6. **Docker/Remote 沙箱（明确延期）**：仅保留 `ExecutionEnvironment` 扩展点，当前不实现运行时。
+1. P0 深化：provider-native 图片/文档内容、来源缺失状态、子智能体审批 continuation 与 token/resource budget。
+2. Git/UI 与内置浏览器：安全 Git core/API 及桌面分支/commit/push/compare 已完成；worktree 控件、PR/GitHub CLI 和 Browser runtime 尚未完成。
+3. Linux/macOS 沙箱：在对应原生发布机跑 bubblewrap/Seatbelt confinement 集成测试，并增加 seccomp/Landlock 与资源配额。
+4. Goose extension ecosystem：在现有 MCP host 上增加 schema cache 持久化和产品化 GitHub/Linear/Jira/browser/document 连接器。
+5. opencode desktop platform：继续补 notification、完整 deep link 路由、WSL path adapter。
+6. OpenHands trajectory：补 tool output 的更完整序列化和 replay tooling。
+7. **Docker/Remote 沙箱（明确延期）**：仅保留 `ExecutionEnvironment` 扩展点，当前不实现运行时。
+8. **签名发布（明确延期）**：Windows/macOS 签名、公证和正式发布流水线待分发阶段再配置。
 
 ## 不建议直接复制的部分
 

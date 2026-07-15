@@ -5,6 +5,7 @@ use crate::sandbox::{
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -12,6 +13,14 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+
+const SENSITIVE_CHILD_ENV_KEYS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENTOPIA_API_KEY",
+    "OPENTOPIA_API_TOKEN",
+    "CREDIT_REVIEW_LLM_API_KEY",
+];
 
 #[derive(Debug, Clone)]
 pub struct ResourceLimit {
@@ -73,6 +82,8 @@ pub struct ExecRequest {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub stdin: Option<Vec<u8>>,
+    pub clear_env: bool,
+    pub env: HashMap<OsString, OsString>,
 }
 
 impl ExecRequest {
@@ -82,6 +93,8 @@ impl ExecRequest {
             args: Vec::new(),
             cwd: None,
             stdin: None,
+            clear_env: false,
+            env: HashMap::new(),
         }
     }
 
@@ -116,6 +129,29 @@ impl ExecRequest {
 
     pub fn stdin(mut self, stdin: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(stdin.into());
+        self
+    }
+
+    pub fn env_clear(mut self) -> Self {
+        self.clear_env = true;
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn envs<K, V>(mut self, variables: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.env.extend(
+            variables
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
         self
     }
 }
@@ -438,8 +474,16 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         }
 
         let mut process = Command::new(&command_plan.program);
+        if request.clear_env {
+            process.env_clear();
+        } else {
+            for key in SENSITIVE_CHILD_ENV_KEYS {
+                process.env_remove(key);
+            }
+        }
         process
             .args(&command_plan.args)
+            .envs(&request.env)
             .envs(command_plan.env.iter().cloned())
             .current_dir(&cwd)
             .stdout(Stdio::piped())
@@ -607,8 +651,16 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             &self.sandbox_config,
         )?;
         let mut process = Command::new(&command_plan.program);
+        if request.clear_env {
+            process.env_clear();
+        } else {
+            for key in SENSITIVE_CHILD_ENV_KEYS {
+                process.env_remove(key);
+            }
+        }
         process
             .args(&command_plan.args)
+            .envs(&request.env)
             .envs(command_plan.env.iter().cloned())
             .current_dir(&cwd)
             .stdin(Stdio::piped())

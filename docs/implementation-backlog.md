@@ -2,6 +2,13 @@
 
 This backlog translates `docs/ai-coding-work-agent-architecture.md` into implementation slices that can be assigned, reviewed, and verified independently.
 
+Product priority and delivery order are tracked in GitHub
+[Roadmap #4](https://github.com/StagoMax/OpenTopia/issues/4). The local-MVP implementations
+for [#3 Project/Thread](https://github.com/StagoMax/OpenTopia/issues/3),
+[#1 attachments/sources/Skills](https://github.com/StagoMax/OpenTopia/issues/1), and
+[#2 subagents](https://github.com/StagoMax/OpenTopia/issues/2) now exist; the issues retain
+their explicit hardening and multimodal follow-up work.
+
 ## Current Baseline
 
 Implemented:
@@ -15,15 +22,16 @@ Implemented:
 - Incremental model/tool/event streaming with persisted token-usage events.
 - OpenAI-compatible provider with env reuse from the credit review project and
   an eight-round bounded autonomous built-in/MCP tool loop.
-- Built-in tools: `list_files`, `read_file`, `write_file`, `shell`, `git_diff`, `apply_patch`.
+- Built-in tools: `list_files`, `read_file`, `write_file`, `search`, `shell`, `git_diff`,
+  `apply_patch`, `spawn_agent`, `send_input`, `cancel_agent`, and `wait_agent`.
 - Permission modes plus persistent, resumable allow-once approvals. Approval
   restores the exact provider/tool-loop state instead of starting a full-access turn.
 - Dev/build scripts for Windows GNU Rust + WinLibs.
 - Settings persistence, provider connectivity test, and Electron safeStorage key management.
 - Workspace file tree, file preview, git diff, sandbox status, trajectory export,
   and MCP configuration skeleton APIs.
-- Artifact model, SQLite artifact index, artifact read APIs, and context
-  compaction event/API skeleton.
+- Artifact model, SQLite artifact index, artifact read APIs, and provider-backed
+  manual/automatic context compaction.
 - `ExecutionEnvironment` trait and `LocalExecutionEnvironment` implementation.
 - `McpExtensionHost` and `McpStdioClient` with full JSON-RPC initialize/list_tools/call_tool lifecycle.
 - Per-thread terminal streaming, SQLite history, cancellation/process-tree cleanup,
@@ -32,6 +40,18 @@ Implemented:
 - Windows NSIS packaging with the Rust server bundled as an Electron resource.
 - Structured recent conversation history, automatic threshold-based LLM compaction,
   and token-window trimming for every provider turn.
+- SQLite-backed first-class Projects with normalized workspace-root uniqueness,
+  pinned/sort metadata, project-owned Threads, reassignment/archive/delete APIs,
+  recoverable unassigned/archived desktop sections, and legacy desktop migration.
+- Explicit Electron attachment selection, server-side source validation/limits,
+  message-persisted source and Skill references, bounded text injection, and right-rail recovery.
+- Persistent subagent runs with real AgentCore execution, bounded per-parent concurrency,
+  queueing, recursion limits, input/wait/cancel tools, recursive cancellation, SQLite recovery,
+  SSE updates, and right-rail controls.
+- Persisted sandbox mode/enforcement/network/read/write roots with Settings and Composer controls.
+- Validated Git workflow core and sandboxed Thread API for status, branch, commit, push,
+  compare, and worktree actions, with desktop status/branch/create/switch/commit/push/compare
+  controls. Worktree UI and PR/GitHub CLI remain open.
 
 ## P0: Make The MVP Product-Shaped
 
@@ -39,13 +59,20 @@ Implemented:
 
 Goal: users can open a real workspace from the desktop UI without starting from a terminal.
 
-Tasks:
+Status: complete for the local MVP. Electron owns directory selection and recent
+workspace persistence; the renderer uses the context-isolated preload bridge.
+
+Implemented:
 
 - Add Electron dialog bridge for selecting directories.
 - Store recent workspaces locally.
 - Let new threads use the selected `workspaceRoot`.
 - Add open-path action for files/directories.
-- Normalize Windows paths and leave a WSL adapter seam.
+- Normalize Windows paths.
+
+Future refinement:
+
+- Add the WSL path adapter tracked in Roadmap #4.
 
 Acceptance:
 
@@ -83,13 +110,19 @@ Acceptance:
 
 Goal: approvals are auditable and recoverable.
 
-Tasks:
+Status: complete for the local MVP. Approval records and exact suspended-turn
+continuations are stored in SQLite and resumed through the decision route.
+
+Implemented:
 
 - Add `approvals` persistence.
 - Store pending/approved/denied status.
 - Record action, reason, timestamps, and decision.
 - Add query route for pending approvals.
-- Expand policy types for future exec prefix rules and network policy.
+
+Future refinement:
+
+- Add richer exec-prefix amendments and product controls for network policy.
 
 Acceptance:
 
@@ -101,7 +134,10 @@ Acceptance:
 
 Goal: repo search is a first-class built-in tool.
 
-Tasks:
+Status: complete for the local MVP built-in tool and deterministic command. The
+disabled app-wide sidebar search is a separate desktop feature tracked in Roadmap #4.
+
+Implemented:
 
 - Add `search` tool backed by `rg`.
 - Add deterministic `/search` command.
@@ -112,6 +148,37 @@ Acceptance:
 
 - `/search AgentCore` returns matching files/lines.
 - Searching outside workspace is denied or asks approval.
+
+### Project, Sources, Skills, And Subagents
+
+Status: local MVP complete for Roadmap #3/#1/#2.
+
+Implemented:
+
+- First-class Project CRUD, canonical workspace deduplication, Thread ownership/archive,
+  desktop migration, rename/pin/remove, and project-scoped new tasks.
+- Message parts for source and Skill references. Source contents are not copied to SQLite;
+  selected canonical paths and metadata persist with the message.
+- Electron context-isolated multi-file picker plus independent server validation: 20 files,
+  25 MiB each, sensitive-file denial, type allowlist, canonical dedupe, 256 KiB text/file,
+  and 512 KiB aggregate text injection limits.
+- Codex-compatible `SKILL.md` discovery under workspace/user skill roots, YAML metadata,
+  allowlisted IDs, five Skills per Turn, and 128 KiB aggregate instruction limit.
+- Subagent scheduler and real AgentCore executor with inherited workspace/provider/policy/sandbox,
+  four concurrent children per parent, depth two, 15-minute timeout, typed events, SQLite
+  persistence/restart recovery, model-callable tools, HTTP controls, and desktop status/actions.
+
+Future refinement:
+
+- Add provider-native image parts and document extraction. Images/PDF/Office files currently
+  contribute verified metadata only; binary bytes are never coerced into text prompts.
+- Text source content is bounded and injected into the Turn where it is selected. Historical
+  messages retain the source reference/metadata, but do not silently re-read a changed file
+  into every later Turn.
+- Add explicit missing/deleted source status refresh and richer source detail/gallery views.
+- Add a child-approval UI/continuation protocol. Child approval currently fails closed and tells
+  the parent to perform the action directly, so it cannot bypass the parent policy.
+- Add per-subagent token accounting/budgets and configurable scheduler limits in Settings.
 
 ## P1: Coding Workbench Depth
 
@@ -148,6 +215,7 @@ Status: complete for the local MVP. Per-command streaming and a persistent,
 per-thread PTY are both available. The desktop xterm.js instance is connected
 bidirectionally to a `portable-pty` session, including resize, ANSI/ConPTY
 handshake traffic, process-tree close, SSE replay, and SQLite aggregate history.
+Both terminal paths use the current OS sandbox plan and cap persisted/streamed output.
 
 Implemented:
 
@@ -223,6 +291,9 @@ Implemented:
 - Wire `restart`, `tools`, and `call-tool` routes into the server.
 - Route MCP calls through descriptor/annotation-aware policy checks.
 - Register cached MCP descriptors into `AgentCore` and expose `/mcp server__tool {json}`.
+- Start MCP stdio through the current OS sandbox, clear inherited environment secrets,
+  allow only explicit `envKeys`, refresh `tools/list_changed`, and filter schemas by
+  per-Thread enablement. Direct API calls require the owning Thread.
 - Parse OpenAI-compatible tool calls and run up to eight provider tool rounds,
   including enabled MCP tools, with a hard loop limit and local-summary fallback.
 
@@ -245,7 +316,6 @@ Tasks:
 - Browser automation bridge.
 - Docs/Sheets/PDF MCP servers.
 - Scheduler/reminder tool.
-- Artifact gallery.
 
 Acceptance:
 
@@ -290,10 +360,12 @@ Tasks:
     file reads and writes before OS sandboxing is considered.
   - A Windows execution test proves a strict sandbox command cannot write to a
     non-temporary path outside its workspace.
+  - Sandbox mode, enforcement, network, writable roots, and read paths persist in
+    `AppSettings`; Settings and Composer update the AgentCore profile immediately.
+  - One-shot terminal commands, long-lived PTY sessions, Git workflow actions, and
+    MCP stdio processes consume the same sandbox command builder. Git responses are
+    capped at 8 MiB and terminal aggregate output at 4 MiB.
 - Remaining hardening:
-  - Persist sandbox mode/network/writable roots in `AppSettings` and expose a
-    separate composer/settings selector. The current desktop displays effective
-    sandbox state, while changes are configured through environment variables.
   - Run Linux bubblewrap and macOS Seatbelt integration suites on native release
     runners; current cross-platform builders are unit tested but only Windows has
     an end-to-end confinement test in this workspace.
@@ -301,7 +373,7 @@ Tasks:
   - Linux bwrap remounts existing `.git`/`.agents`/`.codex` paths read-only, but
     preventing first creation of a missing metadata directory by arbitrary shell
     commands requires the pending Landlock layer. Built-in file tools already deny it.
-- Add resource limits (CPU/memory/disk quotas).
+- Add native CPU/memory/disk quotas. Output and timeout limits are already enforced.
 - ~~Add stdio session streaming for command observability.~~ (Done at terminal API level)
 - ~~Add cancel/interrupt support for running commands.~~ (Done)
 

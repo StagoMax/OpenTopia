@@ -7,8 +7,10 @@ use crate::provider::{
     ModelStreamDelta, OpenAiCompatibleProvider, ProviderToolCall, ProviderToolCandidate,
     ProviderToolResult,
 };
+use crate::sandbox::LocalSandboxConfig;
 use crate::settings::{AppSettings, ProviderKind};
 use crate::store::SessionStore;
+use crate::subagents::SubagentScheduler;
 use crate::tools::{McpToolWrapper, ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -148,6 +150,10 @@ pub struct AgentCore {
     provider: Arc<dyn ModelProvider>,
     tools: ToolRegistry,
     pub mcp_host: Option<McpExtensionHost>,
+    sandbox_config: LocalSandboxConfig,
+    subagents: Option<SubagentScheduler>,
+    subagent_depth: u8,
+    subagent_parent_turn_id: Option<Uuid>,
 }
 
 impl Default for AgentCore {
@@ -156,6 +162,10 @@ impl Default for AgentCore {
             provider: Arc::new(MockProvider),
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
+            sandbox_config: LocalSandboxConfig::from_env(),
+            subagents: None,
+            subagent_depth: 0,
+            subagent_parent_turn_id: None,
         }
     }
 }
@@ -169,6 +179,10 @@ impl AgentCore {
             provider,
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
+            sandbox_config: LocalSandboxConfig::from_env(),
+            subagents: None,
+            subagent_depth: 0,
+            subagent_parent_turn_id: None,
         }
     }
 
@@ -185,6 +199,10 @@ impl AgentCore {
             provider,
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
+            sandbox_config: settings.sandbox.to_local_sandbox_config(),
+            subagents: None,
+            subagent_depth: 0,
+            subagent_parent_turn_id: None,
         }
     }
 
@@ -193,7 +211,35 @@ impl AgentCore {
             provider,
             tools,
             mcp_host: None,
+            sandbox_config: LocalSandboxConfig::from_env(),
+            subagents: None,
+            subagent_depth: 0,
+            subagent_parent_turn_id: None,
         }
+    }
+
+    pub fn with_sandbox_config(mut self, sandbox_config: LocalSandboxConfig) -> Self {
+        self.sandbox_config = sandbox_config;
+        self
+    }
+
+    pub fn set_sandbox_config(&mut self, sandbox_config: LocalSandboxConfig) {
+        self.sandbox_config = sandbox_config;
+    }
+
+    pub fn set_subagent_scheduler(&mut self, scheduler: SubagentScheduler) {
+        self.subagents = Some(scheduler);
+    }
+
+    pub fn set_subagent_context(&mut self, parent_turn_id: Uuid, depth: u8) {
+        self.subagent_parent_turn_id = Some(parent_turn_id);
+        self.subagent_depth = depth;
+    }
+
+    fn apply_subagent_context(&self, context: &mut ToolContext, fallback_turn_id: Uuid) {
+        context.subagents = self.subagents.clone();
+        context.parent_turn_id = Some(self.subagent_parent_turn_id.unwrap_or(fallback_turn_id));
+        context.subagent_depth = self.subagent_depth;
     }
 
     pub fn with_mcp_host(mut self, host: McpExtensionHost) -> Self {
@@ -228,6 +274,23 @@ impl AgentCore {
             let name = wrapper.descriptor().public_name.clone();
             registered.push(name.clone());
             self.tools.insert(name, Arc::new(wrapper));
+        }
+        registered
+    }
+
+    pub async fn sync_mcp_tools_for_servers(&mut self, server_ids: &[Uuid]) -> Vec<String> {
+        let host = match self.mcp_host.as_ref() {
+            Some(host) => host.clone(),
+            None => return Vec::new(),
+        };
+        let mut registered = Vec::new();
+        for server_id in server_ids {
+            for desc in host.cached_tools(*server_id).await {
+                let wrapper = McpToolWrapper::new(host.clone(), desc);
+                let name = wrapper.descriptor().public_name.clone();
+                registered.push(name.clone());
+                self.tools.insert(name, Arc::new(wrapper));
+            }
         }
         registered
     }
@@ -270,10 +333,15 @@ impl AgentCore {
         }
 
         if let Some(task) = ParsedTask::parse(&input.content) {
-            let mut tool_ctx = ToolContext::local(input.workspace_root.clone(), policy);
+            let mut tool_ctx = ToolContext::local_with_sandbox_config(
+                input.workspace_root.clone(),
+                policy,
+                self.sandbox_config.clone(),
+            );
             tool_ctx.store = input.store.clone();
             tool_ctx.thread_id = Some(input.thread_id);
             tool_ctx.cancel = input.cancellation.clone();
+            self.apply_subagent_context(&mut tool_ctx, input.user_message_id);
 
             let result = match self.execute_parsed_task(task, tool_ctx, &mut events).await {
                 Ok(result) => {
@@ -353,10 +421,15 @@ impl AgentCore {
                 "list_files",
                 json!({ "path": "." }),
                 {
-                    let mut ctx = ToolContext::local(input.workspace_root.clone(), policy.clone());
+                    let mut ctx = ToolContext::local_with_sandbox_config(
+                        input.workspace_root.clone(),
+                        policy.clone(),
+                        self.sandbox_config.clone(),
+                    );
                     ctx.store = input.store.clone();
                     ctx.thread_id = Some(input.thread_id);
                     ctx.cancel = input.cancellation.clone();
+                    self.apply_subagent_context(&mut ctx, input.user_message_id);
                     ctx
                 },
                 &mut events,
@@ -467,6 +540,7 @@ impl AgentCore {
                 ctx.store = store;
                 ctx.thread_id = Some(continuation.thread_id);
                 ctx.cancel = cancellation;
+                self.apply_subagent_context(&mut ctx, continuation.user_message_id);
                 let result = self.execute_parsed_task(task, ctx, &mut events).await?;
                 let message = Message::text(continuation.thread_id, MessageRole::Assistant, result);
                 events.push(AgentEventPayload::AssistantMessage { message });
@@ -505,6 +579,7 @@ impl AgentCore {
                     ctx.store = store.clone();
                     ctx.thread_id = Some(continuation.thread_id);
                     ctx.cancel = cancellation.clone();
+                    self.apply_subagent_context(&mut ctx, continuation.user_message_id);
                     provider_tool_results.push(
                         self.execute_provider_tool_call(&pending, ctx, &mut events)
                             .await?,
@@ -570,10 +645,15 @@ impl AgentCore {
                     workspace_root.clone(),
                     permission_mode,
                 ));
-                let mut ctx = ToolContext::local(workspace_root.clone(), policy);
+                let mut ctx = ToolContext::local_with_sandbox_config(
+                    workspace_root.clone(),
+                    policy,
+                    self.sandbox_config.clone(),
+                );
                 ctx.store = store.clone();
                 ctx.thread_id = Some(thread_id);
                 ctx.cancel = cancellation.clone();
+                self.apply_subagent_context(&mut ctx, user_message_id);
                 match self
                     .execute_provider_tool_call(&provider_call, ctx, events)
                     .await

@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld("opentopia", {
   openPath: (targetPath) =>
     ipcRenderer.invoke("platform:open-path", targetPath),
   selectWorkspace: (options) => ipcRenderer.invoke("workspace:select", options),
+  selectContextFiles: (options) =>
+    ipcRenderer.invoke("context:select-files", options),
   getRecentWorkspaces: () => ipcRenderer.invoke("workspace:get-recent"),
   saveRecentWorkspace: (workspaceRoot) =>
     ipcRenderer.invoke("workspace:save-recent", workspaceRoot),

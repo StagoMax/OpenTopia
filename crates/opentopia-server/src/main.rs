@@ -1,4 +1,5 @@
 use anyhow::Context;
+use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -10,21 +11,26 @@ use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    AgentContextBudget, AgentContinuation, AgentCore, AgentEvent, AgentEventPayload,
-    AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus, Artifact,
-    ArtifactMetadata, BasicPolicyEngine, ChangedFile, ContextSummary, ExecRequest, McpCallResult,
-    McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole,
-    ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
-    OpenAiCompatibleProvider, PermissionMode, PolicyDecision, PolicyEngine, ProviderHealth,
-    ProviderHealthCheck, ProviderKind, ProviderSettings, SandboxDescriptor, SessionStore,
-    SqliteSessionStore, TerminalCommandHistory, TerminalCommandStatus, ThreadMcpServer, ToolCall,
+    build_local_sandbox_command, discover_skills, execute_git_workflow, load_context_sources,
+    load_selected_skills, AgentContextBudget, AgentContinuation, AgentCore, AgentEvent,
+    AgentEventPayload, AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus,
+    Artifact, ArtifactMetadata, BasicPolicyEngine, ChangedFile, ContextSourcePolicy,
+    ContextSourceRef, ContextSummary, ExecRequest, ExecutionContext, GitWorkflowAction,
+    GitWorkflowRequest, LocalExecutionEnvironment, McpCallResult, McpServerConfig, McpServerStatus,
+    McpToolDescriptor, Message, MessagePart, MessageRole, ModelConversationMessage,
+    ModelConversationRole, ModelProvider, ModelRequest, OpenAiCompatibleProvider, PermissionMode,
+    PolicyDecision, PolicyEngine, ProviderHealth, ProviderHealthCheck, ProviderKind,
+    ProviderSettings, ResourceLimit, SandboxDescriptor, SandboxSettings, SessionStore,
+    SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
+    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
+    TerminalCommandHistory, TerminalCommandStatus, ThreadMcpServer, ToolCall,
     ToolPermissionDescriptor, ToolResult, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope,
     WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -74,19 +80,70 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let auth = ApiAuth::from_env()?;
     let store = Arc::new(SqliteSessionStore::open(&args.db)?);
-    let settings = store.load_settings(args.permission)?;
-    let mcp_host = McpExtensionHost::new();
+    let interrupted_subagents = store.fail_interrupted_subagent_runs()?;
+    if interrupted_subagents > 0 {
+        info!(interrupted_subagents, "recovered interrupted subagent runs");
+    }
+    let loaded_settings = store.load_settings(args.permission)?;
+    let settings = Arc::new(RwLock::new(loaded_settings.clone()));
+    let mcp_settings = settings.clone();
+    let mcp_host = McpExtensionHost::with_execution_environment_factory(move |config| {
+        let workspace_root = config
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let sandbox_config = mcp_settings
+            .read()
+            .expect("settings lock poisoned")
+            .sandbox
+            .to_local_sandbox_config();
+        Arc::new(LocalExecutionEnvironment::with_sandbox_config(
+            workspace_root,
+            sandbox_config,
+        ))
+    });
+    let agent = Arc::new(RwLock::new(AgentCore::from_settings(&loaded_settings)));
+    let subagents = SubagentScheduler::new(
+        SubagentSchedulerConfig::default(),
+        Arc::new(ServerSubagentExecutor {
+            store: store.clone(),
+            agent: agent.clone(),
+            settings: settings.clone(),
+            mcp_host: mcp_host.clone(),
+        }),
+        Arc::new(StoreSubagentObserver {
+            store: store.clone(),
+        }),
+    );
+    agent
+        .write()
+        .expect("agent lock poisoned")
+        .set_subagent_scheduler(subagents.clone());
     let state = AppState {
         store,
-        agent: Arc::new(RwLock::new(AgentCore::from_settings(&settings))),
-        settings: Arc::new(RwLock::new(settings)),
+        agent,
+        settings,
         events: EventBus::default(),
         terminals: TerminalBus::default(),
         ptys: PtyManager::default(),
         mcp_host,
         auth,
         turns: TurnManager::default(),
+        subagents,
     };
+
+    let event_state = state.clone();
+    let mut subagent_events = state.subagents.subscribe();
+    tokio::spawn(async move {
+        while let Ok(event) = subagent_events.recv().await {
+            publish_payload(
+                &event_state,
+                event.run.parent_thread_id,
+                Some(event.run.parent_turn_id),
+                AgentEventPayload::SubagentUpdated { run: event.run },
+            );
+        }
+    });
 
     let app = build_router(state);
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
@@ -102,9 +159,19 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/settings", get(get_settings).patch(update_settings))
+        .route("/api/skills", get(list_skills))
         .route("/api/provider/health", get(provider_health))
         .route("/api/provider/test", post(test_provider_connection))
         .route("/api/threads", get(list_threads).post(create_thread))
+        .route(
+            "/api/threads/:thread_id",
+            patch(update_thread).delete(delete_thread),
+        )
+        .route("/api/projects", get(list_projects).post(create_project))
+        .route(
+            "/api/projects/:project_id",
+            patch(update_project).delete(delete_project),
+        )
         .route(
             "/api/threads/:thread_id/messages",
             get(list_messages).post(send_message),
@@ -112,6 +179,22 @@ fn build_router(state: AppState) -> Router {
         .route("/api/threads/:thread_id/events", get(list_events))
         .route("/api/threads/:thread_id/events/stream", get(stream_events))
         .route("/api/threads/:thread_id/turn", get(get_turn_status))
+        .route(
+            "/api/threads/:thread_id/subagents",
+            get(list_subagent_runs).post(spawn_subagent_run),
+        )
+        .route(
+            "/api/threads/:thread_id/subagents/:run_id/input",
+            post(send_subagent_input),
+        )
+        .route(
+            "/api/threads/:thread_id/subagents/:run_id/cancel",
+            post(cancel_subagent_run),
+        )
+        .route(
+            "/api/threads/:thread_id/subagents/:run_id/wait",
+            post(wait_subagent_run),
+        )
         .route(
             "/api/threads/:thread_id/turn/cancel",
             post(cancel_agent_turn),
@@ -169,6 +252,7 @@ fn build_router(state: AppState) -> Router {
             post(apply_workspace_diff_hunk),
         )
         .route("/api/threads/:thread_id/sandbox", get(get_sandbox))
+        .route("/api/threads/:thread_id/git", post(run_git_workflow))
         .route("/api/threads/:thread_id/context", get(get_context_status))
         .route(
             "/api/threads/:thread_id/context/compact",
@@ -224,6 +308,122 @@ struct AppState {
     mcp_host: McpExtensionHost,
     auth: ApiAuth,
     turns: TurnManager,
+    subagents: SubagentScheduler,
+}
+
+struct StoreSubagentObserver {
+    store: Arc<SqliteSessionStore>,
+}
+
+impl SubagentObserver for StoreSubagentObserver {
+    fn on_update(&self, run: &SubagentRun) {
+        if let Err(error) = self.store.upsert_subagent_run(run) {
+            error!(?error, run_id = %run.id, "failed to persist subagent run");
+        }
+    }
+}
+
+struct ServerSubagentExecutor {
+    store: Arc<SqliteSessionStore>,
+    agent: Arc<RwLock<AgentCore>>,
+    settings: Arc<RwLock<AppSettings>>,
+    mcp_host: McpExtensionHost,
+}
+
+#[async_trait]
+impl SubagentExecutor for ServerSubagentExecutor {
+    async fn execute(
+        &self,
+        run: SubagentRun,
+        mut input: mpsc::UnboundedReceiver<String>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<String> {
+        let thread = self
+            .store
+            .get_thread(run.parent_thread_id)?
+            .ok_or_else(|| anyhow::anyhow!("parent thread no longer exists"))?;
+        let mut conversation = Vec::new();
+        let mut prompt = run.input.clone();
+        loop {
+            while let Ok(extra) = input.try_recv() {
+                prompt.push_str("\n\nAdditional parent input:\n");
+                prompt.push_str(&extra);
+            }
+            let settings = self
+                .settings
+                .read()
+                .expect("settings lock poisoned")
+                .clone();
+            let mut agent = self.agent.read().expect("agent lock poisoned").clone();
+            agent.set_mcp_host(self.mcp_host.clone());
+            agent.set_subagent_context(run.id, run.depth);
+            sync_thread_mcp_tools(&self.store, run.parent_thread_id, &mut agent).await;
+            let result = agent
+                .run_turn_detailed_streaming(
+                    AgentTurnInput {
+                        thread_id: run.parent_thread_id,
+                        user_message_id: Uuid::new_v4(),
+                        workspace_root: thread.workspace_root.clone(),
+                        content: prompt.clone(),
+                        context_summary: None,
+                        conversation: conversation.clone(),
+                        permission_mode: settings.permission_mode,
+                        context_budget: None,
+                        store: Some(self.store.clone()),
+                        cancellation: Some(cancellation.clone()),
+                    },
+                    None,
+                )
+                .await?;
+            if matches!(result.outcome, AgentTurnOutcome::Suspended { .. }) {
+                anyhow::bail!(
+                    "subagent requires approval; the parent must perform this action directly"
+                );
+            }
+            let last_result = subagent_result_text(&result.events);
+            conversation.push(ModelConversationMessage {
+                role: ModelConversationRole::User,
+                content: prompt,
+            });
+            conversation.push(ModelConversationMessage {
+                role: ModelConversationRole::Assistant,
+                content: last_result.clone(),
+            });
+
+            let follow_up = match timeout(Duration::from_millis(25), input.recv()).await {
+                Ok(Some(follow_up)) => follow_up,
+                _ => return Ok(last_result),
+            };
+            prompt = follow_up;
+        }
+    }
+}
+
+fn subagent_result_text(events: &[AgentEventPayload]) -> String {
+    let messages = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEventPayload::AssistantMessage { message } => Some(message),
+            _ => None,
+        })
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            MessagePart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                AgentEventPayload::TurnFinished { summary } => Some(summary.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "Subagent completed without a text result.".to_string())
+    } else {
+        messages.join("\n\n")
+    }
 }
 
 #[derive(Clone, Default)]
@@ -260,6 +460,15 @@ impl EventBus {
 
 const TERMINAL_HISTORY_LIMIT: usize = 2_000;
 const DEFAULT_TERMINAL_TIMEOUT_MS: u64 = 300_000;
+const TERMINAL_OUTPUT_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+const GIT_OUTPUT_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+const SENSITIVE_CHILD_ENV_KEYS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENTOPIA_API_KEY",
+    "OPENTOPIA_API_TOKEN",
+    "CREDIT_REVIEW_LLM_API_KEY",
+];
 const MAX_TERMINAL_TIMEOUT_MS: u64 = 3_600_000;
 
 #[derive(Clone, Default)]
@@ -624,6 +833,9 @@ async fn update_settings(
     } else if let Some(default_workspace_root) = request.default_workspace_root {
         settings.default_workspace_root = Some(default_workspace_root);
     }
+    if let Some(sandbox) = request.sandbox {
+        settings.sandbox = sandbox;
+    }
 
     let settings = state.store.save_settings(settings)?;
     {
@@ -632,7 +844,9 @@ async fn update_settings(
     }
     {
         let mut agent_guard = state.agent.write().expect("agent lock poisoned");
-        *agent_guard = AgentCore::from_settings(&settings);
+        let mut agent = AgentCore::from_settings(&settings);
+        agent.set_subagent_scheduler(state.subagents.clone());
+        *agent_guard = agent;
     }
     Ok(Json(settings))
 }
@@ -646,6 +860,28 @@ async fn provider_health(State(state): State<AppState>) -> Json<Vec<ProviderHeal
             .map(ProviderHealth::from_settings)
             .collect(),
     )
+}
+
+async fn list_skills(
+    State(state): State<AppState>,
+    Query(query): Query<SkillsQuery>,
+) -> Result<Json<Vec<SkillDescriptor>>, ApiError> {
+    let workspace_root = match query.workspace_root {
+        Some(workspace_root) => {
+            if state
+                .store
+                .find_project_by_workspace(&workspace_root)?
+                .is_none()
+            {
+                return Err(ApiError::bad_request(
+                    "workspace is not registered as a project",
+                ));
+            }
+            Some(workspace_root)
+        }
+        None => None,
+    };
+    Ok(Json(discover_skills(workspace_root.as_deref())))
 }
 
 async fn test_provider_connection(
@@ -670,20 +906,143 @@ async fn test_provider_connection(
 
 async fn list_threads(
     State(state): State<AppState>,
+    Query(query): Query<ThreadListQuery>,
 ) -> Result<Json<Vec<opentopia_core::Thread>>, ApiError> {
-    Ok(Json(state.store.list_threads()?))
+    Ok(Json(
+        state
+            .store
+            .list_threads_including_archived(query.include_archived)?,
+    ))
 }
 
 async fn create_thread(
     State(state): State<AppState>,
     Json(request): Json<CreateThreadRequest>,
 ) -> Result<Json<opentopia_core::Thread>, ApiError> {
-    let workspace_root = request
-        .workspace_root
-        .unwrap_or(std::env::current_dir().map_err(anyhow::Error::from)?);
-    let workspace_root = workspace_root.canonicalize().unwrap_or(workspace_root);
-    let thread = state.store.create_thread(request.title, workspace_root)?;
+    let thread = if let Some(project_id) = request.project_id {
+        state
+            .store
+            .create_thread_in_project(request.title, project_id)?
+    } else if let Some(workspace_root) = request.workspace_root {
+        let workspace_root = canonicalize_workspace_root(workspace_root);
+        let project = state
+            .store
+            .find_or_create_project(project_name_for_workspace(&workspace_root), workspace_root)?;
+        state
+            .store
+            .create_thread_in_project(request.title, project.id)?
+    } else {
+        let workspace_root = std::env::current_dir().map_err(anyhow::Error::from)?;
+        state.store.create_thread(request.title, workspace_root)?
+    };
     Ok(Json(thread))
+}
+
+async fn update_thread(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(request): Json<UpdateThreadRequest>,
+) -> Result<Json<opentopia_core::Thread>, ApiError> {
+    let archived = request.archived.or_else(|| match request.archived_at {
+        PatchValue::Missing => None,
+        PatchValue::Null => Some(false),
+        PatchValue::Value(_) => Some(true),
+    });
+    let project_id = match request.project_id {
+        PatchValue::Missing => None,
+        PatchValue::Null => Some(None),
+        PatchValue::Value(project_id) => Some(Some(project_id)),
+    };
+    let thread = state
+        .store
+        .update_thread(thread_id, request.title, project_id, archived)?
+        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
+    Ok(Json(thread))
+}
+
+async fn delete_thread(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let deleted = state.store.delete_thread(thread_id)?;
+    if !deleted {
+        return Err(ApiError::not_found(format!(
+            "thread not found: {thread_id}"
+        )));
+    }
+    Ok(Json(DeleteResponse { deleted }))
+}
+
+async fn list_projects(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<opentopia_core::Project>>, ApiError> {
+    Ok(Json(state.store.list_projects()?))
+}
+
+async fn create_project(
+    State(state): State<AppState>,
+    Json(request): Json<CreateProjectRequest>,
+) -> Result<Json<opentopia_core::Project>, ApiError> {
+    let workspace_root = request.workspace_root.map(canonicalize_workspace_root);
+    let project = state.store.create_project(
+        request.name,
+        workspace_root,
+        request.pinned.unwrap_or(false),
+        request.sort_order.unwrap_or(0),
+    )?;
+    Ok(Json(project))
+}
+
+async fn update_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<Uuid>,
+    Json(request): Json<UpdateProjectRequest>,
+) -> Result<Json<opentopia_core::Project>, ApiError> {
+    let workspace_root = match request.workspace_root {
+        PatchValue::Missing => None,
+        PatchValue::Null => Some(None),
+        PatchValue::Value(path) => Some(Some(canonicalize_workspace_root(path))),
+    };
+    let project = state
+        .store
+        .update_project(
+            project_id,
+            request.name,
+            workspace_root,
+            request.pinned,
+            request.sort_order,
+        )?
+        .ok_or_else(|| ApiError::not_found(format!("project not found: {project_id}")))?;
+    Ok(Json(project))
+}
+
+async fn delete_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let deleted = state.store.delete_project(project_id)?;
+    if !deleted {
+        return Err(ApiError::not_found(format!(
+            "project not found: {project_id}"
+        )));
+    }
+    Ok(Json(DeleteResponse { deleted }))
+}
+
+fn canonicalize_workspace_root(workspace_root: PathBuf) -> PathBuf {
+    workspace_root.canonicalize().unwrap_or(workspace_root)
+}
+
+fn project_name_for_workspace(workspace_root: &FsPath) -> String {
+    workspace_root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .filter(|part| *part != ".")
+        .unwrap_or("Workspace")
+        .to_string()
 }
 
 async fn list_messages(
@@ -700,9 +1059,22 @@ async fn send_message(
     Json(request): Json<SendMessageRequest>,
 ) -> Result<Json<Message>, ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
-    if request.content.trim().is_empty() {
+    if request.content.trim().is_empty()
+        && request.source_paths.is_empty()
+        && request.skill_ids.is_empty()
+    {
         return Err(ApiError::bad_request("message content cannot be empty"));
     }
+
+    let sources = load_context_sources(&request.source_paths, &ContextSourcePolicy::default())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let skills = load_selected_skills(Some(&thread.workspace_root), &request.skill_ids)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let prompt = if request.content.trim().is_empty() {
+        "Review the attached sources.".to_string()
+    } else {
+        request.content.clone()
+    };
 
     if !state
         .store
@@ -714,7 +1086,17 @@ async fn send_message(
         ));
     }
 
-    let pending_message = Message::text(thread_id, MessageRole::User, request.content.clone());
+    let mut pending_message = Message::text(thread_id, MessageRole::User, prompt.clone());
+    pending_message
+        .parts
+        .extend(sources.iter().map(|source| MessagePart::SourceRef {
+            source: ContextSourceRef::from(source),
+        }));
+    pending_message
+        .parts
+        .extend(skills.iter().map(|skill| MessagePart::SkillRef {
+            skill: SkillRef::from(skill),
+        }));
     let turn = state
         .turns
         .begin(thread_id, pending_message.id)
@@ -731,8 +1113,18 @@ async fn send_message(
 
     let run_state = state.clone();
     let run_message = user_message.clone();
+    let context_sections = sources
+        .iter()
+        .map(|source| source.render_for_model())
+        .chain(skills.iter().map(|skill| skill.render_for_model()))
+        .collect::<Vec<_>>();
+    let model_content = if context_sections.is_empty() {
+        prompt
+    } else {
+        format!("{}\n\n{}", prompt, context_sections.join("\n\n"))
+    };
     tokio::spawn(async move {
-        run_new_agent_turn(run_state, thread, run_message, request.content, turn).await;
+        run_new_agent_turn(run_state, thread, run_message, model_content, turn).await;
     });
 
     Ok(Json(user_message))
@@ -799,13 +1191,119 @@ async fn get_turn_status(
     Ok(Json(state.turns.status(thread_id)))
 }
 
+async fn list_subagent_runs(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+) -> Result<Json<Vec<SubagentRun>>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    Ok(Json(state.store.list_subagent_runs(thread_id)?))
+}
+
+async fn spawn_subagent_run(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(request): Json<SpawnSubagentRunRequest>,
+) -> Result<Json<SubagentRun>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let parent_turn_id = request
+        .parent_turn_id
+        .or_else(|| state.turns.status(thread_id).map(|turn| turn.turn_id))
+        .unwrap_or_else(Uuid::new_v4);
+    let run = state
+        .subagents
+        .spawn(SpawnSubagentRequest {
+            parent_thread_id: thread_id,
+            parent_turn_id,
+            name: request.name,
+            input: request.input,
+            depth: request.depth.unwrap_or(1),
+        })
+        .map_err(subagent_api_error)?;
+    Ok(Json(run))
+}
+
+async fn send_subagent_input(
+    State(state): State<AppState>,
+    Path((thread_id, run_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<SubagentInputRequest>,
+) -> Result<StatusCode, ApiError> {
+    ensure_live_subagent(&state, thread_id, run_id)?;
+    state
+        .subagents
+        .send_input(run_id, request.input)
+        .map_err(subagent_api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn cancel_subagent_run(
+    State(state): State<AppState>,
+    Path((thread_id, run_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    ensure_live_subagent(&state, thread_id, run_id)?;
+    state.subagents.cancel(run_id).map_err(subagent_api_error)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn wait_subagent_run(
+    State(state): State<AppState>,
+    Path((thread_id, run_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<WaitSubagentRunRequest>,
+) -> Result<Json<SubagentRun>, ApiError> {
+    ensure_live_subagent(&state, thread_id, run_id)?;
+    let wait_timeout =
+        Duration::from_millis(request.timeout_ms.unwrap_or(30_000).clamp(1, 120_000));
+    Ok(Json(
+        state
+            .subagents
+            .wait(run_id, wait_timeout)
+            .await
+            .map_err(subagent_api_error)?,
+    ))
+}
+
+fn ensure_live_subagent(
+    state: &AppState,
+    thread_id: Uuid,
+    run_id: Uuid,
+) -> Result<SubagentRun, ApiError> {
+    ensure_thread(state, thread_id)?;
+    let run = state
+        .subagents
+        .get(run_id)
+        .ok_or_else(|| ApiError::not_found(format!("active subagent run not found: {run_id}")))?;
+    if run.parent_thread_id != thread_id {
+        return Err(ApiError::bad_request(
+            "subagent run does not belong to this thread",
+        ));
+    }
+    Ok(run)
+}
+
+fn subagent_api_error(error: opentopia_core::SubagentError) -> ApiError {
+    match error {
+        opentopia_core::SubagentError::NotFound(_) => ApiError::not_found(error.to_string()),
+        opentopia_core::SubagentError::AlreadyTerminal(_)
+        | opentopia_core::SubagentError::InputClosed(_) => ApiError::conflict(error.to_string()),
+        _ => ApiError::bad_request(error.to_string()),
+    }
+}
+
 async fn cancel_agent_turn(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
     Json(request): Json<CancelAgentTurnRequest>,
 ) -> Result<Json<TurnCancelResult>, ApiError> {
     ensure_thread(&state, thread_id)?;
-    Ok(Json(state.turns.cancel(thread_id, request.turn_id)))
+    let parent_turn_id = request
+        .turn_id
+        .or_else(|| state.turns.status(thread_id).map(|turn| turn.turn_id));
+    let result = state.turns.cancel(thread_id, request.turn_id);
+    if result.cancelled {
+        if let Some(parent_turn_id) = parent_turn_id {
+            state.subagents.cancel_parent(parent_turn_id);
+        }
+    }
+    Ok(Json(result))
 }
 
 async fn list_approvals(
@@ -1126,8 +1624,49 @@ async fn get_sandbox(
     Ok(Json(SandboxDescriptor::local(
         thread_id,
         thread.workspace_root,
-        &opentopia_core::LocalSandboxConfig::from_env(),
+        &current_settings(&state).sandbox.to_local_sandbox_config(),
     )))
+}
+
+async fn run_git_workflow(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(action): Json<GitWorkflowAction>,
+) -> Result<Json<GitWorkflowResponse>, ApiError> {
+    let thread = ensure_thread(&state, thread_id)?;
+    let config = current_settings(&state).sandbox.to_local_sandbox_config();
+    let environment =
+        LocalExecutionEnvironment::with_sandbox_config(thread.workspace_root.clone(), config);
+    let request = GitWorkflowRequest {
+        repository: thread.workspace_root,
+        action,
+    };
+    let result = execute_git_workflow(
+        &environment,
+        &request,
+        ExecutionContext::with_timeout(Duration::from_secs(120)).with_resource_limits(
+            ResourceLimit {
+                max_output_bytes: Some(GIT_OUTPUT_BYTES_LIMIT),
+                ..ResourceLimit::default()
+            },
+        ),
+    )
+    .await
+    .map_err(|error| {
+        let detail = error
+            .failed_result()
+            .map(|result| String::from_utf8_lossy(&result.stderr).trim().to_string())
+            .filter(|detail| !detail.is_empty());
+        ApiError::bad_request(detail.unwrap_or_else(|| error.to_string()))
+    })?;
+    Ok(Json(GitWorkflowResponse {
+        action: result.action,
+        stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+        exit_code: result.exit_code,
+        success: result.success,
+        truncated: result.truncated,
+    }))
 }
 
 async fn export_trajectory(
@@ -1216,7 +1755,14 @@ async fn ensure_terminal_session(
     let cols = request.cols.unwrap_or(100).clamp(20, 500);
     let rows = request.rows.unwrap_or(30).clamp(5, 200);
     let cwd = resolve_terminal_cwd(&thread.workspace_root, request.cwd.as_deref())?;
-    let session = spawn_pty_session(state.clone(), thread_id, cwd, cols, rows)?;
+    let session = spawn_pty_session(
+        state.clone(),
+        thread_id,
+        thread.workspace_root,
+        cwd,
+        cols,
+        rows,
+    )?;
     state.ptys.insert(session.clone());
     Ok(Json(session.view()))
 }
@@ -1278,6 +1824,7 @@ fn require_pty_session(
 fn spawn_pty_session(
     state: AppState,
     thread_id: Uuid,
+    workspace_root: PathBuf,
     cwd: PathBuf,
     cols: u16,
     rows: u16,
@@ -1290,11 +1837,20 @@ fn spawn_pty_session(
         pixel_height: 0,
     })?;
     let (shell, shell_args) = interactive_shell();
-    let mut command = CommandBuilder::new(&shell);
+    let sandbox_config = current_settings(&state).sandbox.to_local_sandbox_config();
+    let command_plan =
+        build_local_sandbox_command(&shell, &shell_args, &cwd, &workspace_root, &sandbox_config)?;
+    let mut command = CommandBuilder::new(&command_plan.program);
     command.cwd(shell_native_path(&cwd));
+    for key in SENSITIVE_CHILD_ENV_KEYS {
+        command.env_remove(key);
+    }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
-    for arg in &shell_args {
+    for (key, value) in &command_plan.env {
+        command.env(key, value);
+    }
+    for arg in &command_plan.args {
         command.arg(arg);
     }
 
@@ -1516,9 +2072,21 @@ async fn start_terminal_command(
         .register_running(thread_id, command_id, cancel_tx)?;
 
     let exec_request = ExecRequest::shell(command.clone()).cwd(cwd.clone());
-    let mut process = Command::new(&exec_request.program);
+    let sandbox_config = current_settings(&state).sandbox.to_local_sandbox_config();
+    let command_plan = build_local_sandbox_command(
+        &exec_request.program,
+        &exec_request.args,
+        &cwd,
+        &thread.workspace_root,
+        &sandbox_config,
+    )?;
+    let mut process = Command::new(&command_plan.program);
+    for key in SENSITIVE_CHILD_ENV_KEYS {
+        process.env_remove(key);
+    }
     process
-        .args(&exec_request.args)
+        .args(&command_plan.args)
+        .envs(command_plan.env)
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2047,21 +2615,53 @@ where
 {
     let mut buffer = [0u8; 8192];
     let mut output = String::new();
+    let mut truncation_reported = false;
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(n) => {
-                let chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
-                output.push_str(&chunk);
-                terminals.publish_event(
-                    thread_id,
-                    command_id,
-                    kind,
-                    TerminalEventFields {
-                        data: Some(chunk),
-                        ..Default::default()
-                    },
-                );
+                if output.len() < TERMINAL_OUTPUT_BYTES_LIMIT {
+                    let remaining = TERMINAL_OUTPUT_BYTES_LIMIT - output.len();
+                    let accepted = n.min(remaining);
+                    let chunk = String::from_utf8_lossy(&buffer[..accepted]).to_string();
+                    output.push_str(&chunk);
+                    terminals.publish_event(
+                        thread_id,
+                        command_id,
+                        kind,
+                        TerminalEventFields {
+                            data: Some(chunk),
+                            ..Default::default()
+                        },
+                    );
+                    if accepted < n && !truncation_reported {
+                        truncation_reported = true;
+                        let marker = "\n[terminal output truncated at 4 MiB]\n";
+                        output.push_str(marker);
+                        terminals.publish_event(
+                            thread_id,
+                            command_id,
+                            kind,
+                            TerminalEventFields {
+                                data: Some(marker.to_string()),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                } else if !truncation_reported {
+                    truncation_reported = true;
+                    let marker = "\n[terminal output truncated at 4 MiB]\n";
+                    output.push_str(marker);
+                    terminals.publish_event(
+                        thread_id,
+                        command_id,
+                        kind,
+                        TerminalEventFields {
+                            data: Some(marker.to_string()),
+                            ..Default::default()
+                        },
+                    );
+                }
             }
             Err(err) => {
                 let stream = if kind == TerminalEventKind::Stdout {
@@ -2176,10 +2776,25 @@ async fn call_mcp_tool(
     Path(server_id): Path<Uuid>,
     Json(request): Json<McpToolCallRequest>,
 ) -> Result<Json<McpCallResult>, ApiError> {
-    state
+    let server = state
         .store
         .get_mcp_server(server_id)?
         .ok_or_else(|| ApiError::not_found(format!("MCP server not found: {server_id}")))?;
+    let thread_id = request.thread_id;
+    let thread = state
+        .store
+        .get_thread(thread_id)?
+        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
+    let enabled_for_thread = state
+        .store
+        .list_thread_mcp_servers(thread_id)?
+        .into_iter()
+        .any(|binding| binding.server_id == server_id && binding.enabled);
+    if !server.enabled || !enabled_for_thread {
+        return Err(ApiError::bad_request(
+            "MCP server is not enabled for this thread",
+        ));
+    }
 
     let tools = state.mcp_host.cached_tools(server_id).await;
     let descriptor = tools
@@ -2193,32 +2808,24 @@ async fn call_mcp_tool(
         })?;
 
     let settings = current_settings(&state);
-    if let Some(thread_id) = request.thread_id {
-        let thread = state
-            .store
-            .get_thread(thread_id)?
-            .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
-        let policy = Arc::new(BasicPolicyEngine::new(
-            thread.workspace_root,
-            settings.permission_mode,
-        ));
-        let permission = ToolPermissionDescriptor::from(descriptor);
-        match policy.inspect_mcp_tool_call(&permission) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => return Err(ApiError::bad_request(reason)),
-            PolicyDecision::Ask { reason } => return Err(ApiError::bad_request(reason)),
-        }
+    let policy = Arc::new(BasicPolicyEngine::new(
+        thread.workspace_root,
+        settings.permission_mode,
+    ));
+    let permission = ToolPermissionDescriptor::from(descriptor);
+    match policy.inspect_mcp_tool_call(&permission) {
+        PolicyDecision::Allow => {}
+        PolicyDecision::Deny { reason } => return Err(ApiError::bad_request(reason)),
+        PolicyDecision::Ask { reason } => return Err(ApiError::bad_request(reason)),
     }
 
     let call = ToolCall::new(&descriptor.public_name, request.arguments.clone());
-    if let Some(thread_id) = request.thread_id {
-        publish_payload(
-            &state,
-            thread_id,
-            None,
-            AgentEventPayload::ToolCallStarted { call: call.clone() },
-        );
-    }
+    publish_payload(
+        &state,
+        thread_id,
+        None,
+        AgentEventPayload::ToolCallStarted { call: call.clone() },
+    );
 
     let result = match state
         .mcp_host
@@ -2227,51 +2834,47 @@ async fn call_mcp_tool(
     {
         Ok(result) => result,
         Err(err) => {
-            if let Some(thread_id) = request.thread_id {
-                let tool_result = ToolResult {
-                    call_id: call.id,
-                    output: err.to_string(),
-                    metadata: json!({
-                        "success": false,
-                        "error": err.to_string(),
-                        "publicName": descriptor.public_name,
-                        "toolName": descriptor.tool_name,
-                        "serverId": descriptor.server_id,
-                    }),
-                };
-                publish_payload(
-                    &state,
-                    thread_id,
-                    None,
-                    AgentEventPayload::ToolCallFinished {
-                        result: tool_result,
-                    },
-                );
-            }
+            let tool_result = ToolResult {
+                call_id: call.id,
+                output: err.to_string(),
+                metadata: json!({
+                    "success": false,
+                    "error": err.to_string(),
+                    "publicName": descriptor.public_name,
+                    "toolName": descriptor.tool_name,
+                    "serverId": descriptor.server_id,
+                }),
+            };
+            publish_payload(
+                &state,
+                thread_id,
+                None,
+                AgentEventPayload::ToolCallFinished {
+                    result: tool_result,
+                },
+            );
             return Err(ApiError::from(err));
         }
     };
 
-    if let Some(thread_id) = request.thread_id {
-        let tool_result = ToolResult {
-            call_id: call.id,
-            output: result.output.clone(),
-            metadata: json!({
-                "isError": result.is_error,
-                "publicName": descriptor.public_name,
-                "toolName": descriptor.tool_name,
-                "serverId": descriptor.server_id,
-            }),
-        };
-        publish_payload(
-            &state,
-            thread_id,
-            None,
-            AgentEventPayload::ToolCallFinished {
-                result: tool_result,
-            },
-        );
-    }
+    let tool_result = ToolResult {
+        call_id: call.id,
+        output: result.output.clone(),
+        metadata: json!({
+            "isError": result.is_error,
+            "publicName": descriptor.public_name,
+            "toolName": descriptor.tool_name,
+            "serverId": descriptor.server_id,
+        }),
+    };
+    publish_payload(
+        &state,
+        thread_id,
+        None,
+        AgentEventPayload::ToolCallFinished {
+            result: tool_result,
+        },
+    );
 
     Ok(Json(result))
 }
@@ -2333,6 +2936,32 @@ fn ensure_thread(state: &AppState, thread_id: Uuid) -> Result<opentopia_core::Th
         .store
         .get_thread(thread_id)?
         .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))
+}
+
+async fn sync_thread_mcp_tools(store: &SqliteSessionStore, thread_id: Uuid, agent: &mut AgentCore) {
+    let enabled_servers = match store.list_mcp_servers() {
+        Ok(servers) => servers
+            .into_iter()
+            .filter(|server| server.enabled)
+            .map(|server| server.server_id)
+            .collect::<HashSet<_>>(),
+        Err(err) => {
+            error!(?err, %thread_id, "failed to load MCP server configuration");
+            return;
+        }
+    };
+    let server_ids = match store.list_thread_mcp_servers(thread_id) {
+        Ok(bindings) => bindings
+            .into_iter()
+            .filter(|binding| binding.enabled && enabled_servers.contains(&binding.server_id))
+            .map(|binding| binding.server_id)
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            error!(?err, %thread_id, "failed to load thread MCP bindings");
+            return;
+        }
+    };
+    agent.sync_mcp_tools_for_servers(&server_ids).await;
 }
 
 fn publish_payload(
@@ -2403,7 +3032,8 @@ async fn run_new_agent_turn(
 
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
     agent.set_mcp_host(state.mcp_host.clone());
-    agent.sync_mcp_tools().await;
+    agent.set_subagent_context(turn_id, 0);
+    sync_thread_mcp_tools(&state.store, thread_id, &mut agent).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let future = agent.run_turn_detailed_streaming(input, Some(sender));
     tokio::pin!(future);
@@ -2467,7 +3097,8 @@ async fn run_resumed_agent_turn(
     let turn_id = turn.turn_id;
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
     agent.set_mcp_host(state.mcp_host.clone());
-    agent.sync_mcp_tools().await;
+    agent.set_subagent_context(turn_id, 0);
+    sync_thread_mcp_tools(&state.store, thread_id, &mut agent).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let future = agent.resume_turn_streaming(
         continuation,
@@ -2636,12 +3267,7 @@ fn persist_deferred_approval_records(
         else {
             continue;
         };
-        let approval = Approval::pending(
-            *approval_id,
-            thread_id,
-            action.clone(),
-            reason.clone(),
-        );
+        let approval = Approval::pending(*approval_id, thread_id, action.clone(), reason.clone());
         if let Err(err) = state.store.insert_approval(approval) {
             error!(?err, %approval_id, "failed to persist approval request");
         }
@@ -2951,6 +3577,19 @@ fn render_message_for_summary(message: &Message) -> String {
                 truncate_chars(&result.output, 12_000)
             ),
             MessagePart::FileRef { path } => format!("file_ref {}", path.display()),
+            MessagePart::SourceRef { source } => format!(
+                "source_ref {} {} {} bytes{}",
+                source.name,
+                source.path.display(),
+                source.bytes,
+                if source.truncated { " truncated" } else { "" }
+            ),
+            MessagePart::SkillRef { skill } => format!(
+                "skill_ref {} {}{}",
+                skill.name,
+                skill.path.display(),
+                if skill.truncated { " truncated" } else { "" }
+            ),
             MessagePart::Error { message } => format!("error {}", truncate_chars(message, 4_000)),
         })
         .collect::<Vec<_>>()
@@ -3399,6 +4038,17 @@ struct HealthResponse {
     api_version: u32,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorkflowResponse {
+    action: opentopia_core::GitWorkflowActionKind,
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    success: bool,
+    truncated: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsPatchRequest {
@@ -3411,6 +4061,7 @@ struct SettingsPatchRequest {
     permission_mode: Option<PermissionMode>,
     default_workspace_root: Option<PathBuf>,
     clear_default_workspace_root: Option<bool>,
+    sandbox: Option<SandboxSettings>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3419,17 +4070,93 @@ struct ProviderTestRequest {
     provider_id: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsQuery {
+    workspace_root: Option<PathBuf>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateThreadRequest {
     title: Option<String>,
     workspace_root: Option<PathBuf>,
+    project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadListQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateThreadRequest {
+    title: Option<String>,
+    #[serde(default)]
+    project_id: PatchValue<Uuid>,
+    archived: Option<bool>,
+    #[serde(default)]
+    archived_at: PatchValue<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateProjectRequest {
+    name: String,
+    workspace_root: Option<PathBuf>,
+    pinned: Option<bool>,
+    sort_order: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProjectRequest {
+    name: Option<String>,
+    #[serde(default)]
+    workspace_root: PatchValue<PathBuf>,
+    pinned: Option<bool>,
+    sort_order: Option<i64>,
+}
+
+#[derive(Debug)]
+enum PatchValue<T> {
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> Default for PatchValue<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<'de, T> Deserialize<'de> for PatchValue<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendMessageRequest {
     content: String,
+    #[serde(default)]
+    source_paths: Vec<PathBuf>,
+    #[serde(default)]
+    skill_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3440,11 +4167,31 @@ struct CancelAgentTurnRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SpawnSubagentRunRequest {
+    name: String,
+    input: String,
+    parent_turn_id: Option<Uuid>,
+    depth: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentInputRequest {
+    input: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WaitSubagentRunRequest {
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct McpToolCallRequest {
     tool_name: String,
     arguments: Value,
-    #[serde(default)]
-    thread_id: Option<Uuid>,
+    thread_id: Uuid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3825,8 +4572,20 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
+        let status = value
+            .downcast_ref::<StoreError>()
+            .map(|error| match error {
+                StoreError::DuplicateWorkspace(_) => StatusCode::CONFLICT,
+                StoreError::ProjectNotFound(_) => StatusCode::NOT_FOUND,
+                StoreError::EmptyProjectName
+                | StoreError::EmptyThreadTitle
+                | StoreError::EmptyWorkspaceRoot
+                | StoreError::ProjectHasNoWorkspace(_)
+                | StoreError::ProjectWorkspaceInUse(_) => StatusCode::BAD_REQUEST,
+            })
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             message: value.to_string(),
         }
     }
@@ -3861,5 +4620,91 @@ impl IntoResponse for ApiError {
             "error": self.message,
         }));
         (self.status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_patch_distinguishes_missing_null_and_value_workspace() {
+        let missing: UpdateProjectRequest =
+            serde_json::from_value(json!({})).expect("deserialize missing workspace");
+        assert!(matches!(missing.workspace_root, PatchValue::Missing));
+
+        let null: UpdateProjectRequest = serde_json::from_value(json!({
+            "workspaceRoot": null,
+        }))
+        .expect("deserialize null workspace");
+        assert!(matches!(null.workspace_root, PatchValue::Null));
+
+        let value: UpdateProjectRequest = serde_json::from_value(json!({
+            "workspaceRoot": "J:\\Project\\OpenTopia",
+            "sortOrder": 3,
+        }))
+        .expect("deserialize workspace value");
+        assert!(matches!(
+            value.workspace_root,
+            PatchValue::Value(path) if path == PathBuf::from(r"J:\Project\OpenTopia")
+        ));
+        assert_eq!(value.sort_order, Some(3));
+    }
+
+    #[test]
+    fn thread_requests_use_camel_case_project_and_archive_fields() {
+        let project_id = Uuid::new_v4();
+        let create: CreateThreadRequest = serde_json::from_value(json!({
+            "projectId": project_id,
+        }))
+        .expect("deserialize create thread");
+        assert_eq!(create.project_id, Some(project_id));
+
+        let missing_project: UpdateThreadRequest =
+            serde_json::from_value(json!({})).expect("deserialize missing project patch");
+        assert!(matches!(missing_project.project_id, PatchValue::Missing));
+
+        let assign: UpdateThreadRequest = serde_json::from_value(json!({
+            "projectId": project_id,
+        }))
+        .expect("deserialize project assignment");
+        assert!(matches!(
+            assign.project_id,
+            PatchValue::Value(value) if value == project_id
+        ));
+
+        let detach: UpdateThreadRequest = serde_json::from_value(json!({
+            "projectId": null,
+        }))
+        .expect("deserialize project detachment");
+        assert!(matches!(detach.project_id, PatchValue::Null));
+
+        let archive: UpdateThreadRequest = serde_json::from_value(json!({
+            "archivedAt": Utc::now().to_rfc3339(),
+        }))
+        .expect("deserialize archive thread");
+        assert!(matches!(archive.archived_at, PatchValue::Value(_)));
+
+        let restore: UpdateThreadRequest = serde_json::from_value(json!({
+            "archivedAt": null,
+        }))
+        .expect("deserialize restore thread");
+        assert!(matches!(restore.archived_at, PatchValue::Null));
+    }
+
+    #[test]
+    fn store_errors_map_to_client_http_statuses() {
+        let duplicate = ApiError::from(anyhow::Error::new(StoreError::DuplicateWorkspace(
+            "j:/project/opentopia".to_string(),
+        )));
+        assert_eq!(duplicate.status, StatusCode::CONFLICT);
+
+        let missing = ApiError::from(anyhow::Error::new(StoreError::ProjectNotFound(
+            Uuid::new_v4(),
+        )));
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+        let empty = ApiError::from(anyhow::Error::new(StoreError::EmptyProjectName));
+        assert_eq!(empty.status, StatusCode::BAD_REQUEST);
     }
 }

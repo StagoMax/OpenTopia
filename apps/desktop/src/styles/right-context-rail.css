@@ -173,15 +173,14 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__status {
-  display: inline-flex;
+  display: block;
   max-inline-size: 105px;
-  align-items: center;
-  justify-content: flex-end;
   overflow: hidden;
   color: #596059;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   font-weight: 550;
+  text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -192,6 +191,9 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__status.is-active {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
   color: var(--rail-success);
 }
 
@@ -257,9 +259,481 @@ button.right-context-rail__row:disabled {
   opacity: 1;
 }
 
+.right-context-rail__dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(20 24 20 / 28%);
+  z-index: 60;
+}
+
+.right-context-rail__dialog {
+  display: grid;
+  width: min(440px, calc(100vw - 32px));
+  gap: 12px;
+  border: 1px solid #d9ddd8;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 18px 60px rgb(31 38 31 / 20%);
+  color: #343a34;
+  padding: 16px;
+  font:
+    12px/1.5 Inter,
+    ui-sans-serif,
+    system-ui,
+    sans-serif;
+}
+
+.right-context-rail__dialog header,
+.right-context-rail__dialog label {
+  display: grid;
+  gap: 4px;
+}
+
+.right-context-rail__dialog header strong {
+  font-size: 14px;
+}
+
+.right-context-rail__dialog header span,
+.right-context-rail__dialog p {
+  margin: 0;
+  color: #747b74;
+}
+
+.right-context-rail__dialog input,
+.right-context-rail__dialog textarea {
+  width: 100%;
+  border: 1px solid #d9ddd8;
+  border-radius: 6px;
+  outline: 0;
+  background: #fbfcfa;
+  color: #343a34;
+  padding: 7px 8px;
+  font: inherit;
+  resize: vertical;
+}
+
+.right-context-rail__dialog input:focus,
+.right-context-rail__dialog textarea:focus {
+  border-color: var(--rail-focus);
+}
+
+.right-context-rail__dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.right-context-rail__dialog footer button {
+  min-height: 30px;
+  border: 1px solid #d9ddd8;
+  border-radius: 6px;
+  background: #f5f7f4;
+  color: #4b514b;
+  padding: 0 12px;
+}
+
+.right-context-rail__dialog footer button[type="submit"] {
+  border-color: #337764;
+  background: #337764;
+  color: #fff;
+}
+
+.right-context-rail__dialog footer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.right-context-rail__git-error {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) 12px;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 4px;
+  background: #fff4f3;
+  color: var(--rail-danger);
+  padding: 5px 4px;
+  text-align: left;
+}
+
+.right-context-rail__git-error span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.right-context-rail__git-dialog {
+  --rail-focus: #448b78;
+  width: min(680px, calc(100vw - 32px));
+  max-height: min(760px, calc(100vh - 32px));
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  overflow: hidden;
+  padding: 0;
+}
+
+.right-context-rail__dialog .right-context-rail__git-dialog-header {
+  display: flex;
+  min-height: 60px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px 8px;
+}
+
+.right-context-rail__git-dialog-header > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.right-context-rail__git-dialog-header small {
+  overflow: hidden;
+  color: #7b827b;
+  font-size: 10px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.right-context-rail__git-dialog-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.right-context-rail__icon-button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #6d746d;
+  padding: 0;
+}
+
+.right-context-rail__icon-button:hover:not(:disabled) {
+  background: #f1f4f0;
+}
+
+.right-context-rail__icon-button:disabled {
+  opacity: 0.45;
+}
+
+.right-context-rail__git-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px;
+  border-bottom: 1px solid #e7eae6;
+  padding: 0 14px;
+}
+
+.right-context-rail__git-tabs button {
+  min-height: 34px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: #727972;
+  padding: 0 8px;
+}
+
+.right-context-rail__git-tabs button:hover:not(:disabled) {
+  color: #343a34;
+}
+
+.right-context-rail__git-tabs button.is-active {
+  border-bottom-color: #337764;
+  color: #285f50;
+  font-weight: 600;
+}
+
+.right-context-rail__git-message {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  border-radius: 5px;
+  margin: 0 14px;
+  padding: 8px 9px;
+}
+
+.right-context-rail__git-message.is-error {
+  background: #fff2f1;
+  color: #a53f45;
+}
+
+.right-context-rail__git-message.is-success {
+  background: #eef8f1;
+  color: #26734f;
+}
+
+.right-context-rail__git-pane {
+  min-height: 0;
+  overflow: auto;
+  padding: 2px 14px 14px;
+}
+
+.right-context-rail__branch-list {
+  display: grid;
+  max-height: 300px;
+  gap: 2px;
+  overflow: auto;
+  border-bottom: 1px solid #e7eae6;
+  padding: 2px 0 10px;
+}
+
+.right-context-rail__branch-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  min-height: 42px;
+  align-items: center;
+  gap: 7px;
+  border-radius: 5px;
+  color: #4b514b;
+  padding: 4px 6px;
+}
+
+.right-context-rail__branch-item:hover,
+.right-context-rail__branch-item.is-current {
+  background: #f5f7f4;
+}
+
+.right-context-rail__branch-item > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.right-context-rail__branch-item strong,
+.right-context-rail__branch-item small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.right-context-rail__branch-item small {
+  color: #858c85;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.right-context-rail__branch-item button,
+.right-context-rail__branch-current {
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid #d9ddd8;
+  border-radius: 5px;
+  background: #fff;
+  color: #596059;
+  padding: 0 8px;
+}
+
+.right-context-rail__branch-current {
+  border-color: transparent;
+  background: transparent;
+  color: #26734f;
+}
+
+.right-context-rail__remote-branches {
+  color: #747b74;
+  padding: 5px 6px 0 25px;
+}
+
+.right-context-rail__remote-branches summary {
+  cursor: pointer;
+  font-weight: 550;
+}
+
+.right-context-rail__remote-branches div {
+  overflow: hidden;
+  padding: 4px 0 0 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.right-context-rail__git-form {
+  display: grid;
+  gap: 12px;
+}
+
+.right-context-rail__git-form.is-inline {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  padding-top: 12px;
+}
+
+.right-context-rail__git-form label {
+  color: #555c55;
+  font-weight: 550;
+}
+
+.right-context-rail__git-form input,
+.right-context-rail__git-form textarea {
+  font-weight: 400;
+}
+
+.right-context-rail__primary-button,
+.right-context-rail__git-form > footer button[type="submit"] {
+  min-height: 32px;
+  border: 1px solid #337764;
+  border-radius: 6px;
+  background: #337764;
+  color: #fff;
+  padding: 0 12px;
+}
+
+.right-context-rail__primary-button:disabled,
+.right-context-rail__git-form button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.right-context-rail__git-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.right-context-rail__git-summary span {
+  border: 1px solid #e1e5e0;
+  border-radius: 4px;
+  background: #f7f9f6;
+  color: #676e67;
+  padding: 3px 7px;
+}
+
+.right-context-rail__dialog label.right-context-rail__checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-weight: 400;
+}
+
+.right-context-rail__checkbox-row input {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  margin: 2px 0 0;
+  padding: 0;
+  accent-color: #337764;
+}
+
+.right-context-rail__checkbox-row span {
+  display: grid;
+  gap: 2px;
+}
+
+.right-context-rail__checkbox-row small,
+.right-context-rail__git-hero-icon small {
+  color: #858c85;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.right-context-rail__git-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.right-context-rail__git-hero-icon {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border-radius: 6px;
+  background: #f5f8f5;
+  color: #3e6f60;
+  padding: 10px;
+}
+
+.right-context-rail__git-hero-icon > span {
+  display: grid;
+  gap: 2px;
+}
+
+.right-context-rail__segmented {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  border: 1px solid #d9ddd8;
+  border-radius: 6px;
+  background: #f5f7f4;
+  padding: 2px;
+}
+
+.right-context-rail__segmented button {
+  min-height: 29px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #747b74;
+}
+
+.right-context-rail__segmented button.is-active {
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(31 38 31 / 10%);
+  color: #3f664f;
+  font-weight: 550;
+}
+
+.right-context-rail__compare-result {
+  display: grid;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid #dfe3de;
+  border-radius: 6px;
+  background: #fbfcfa;
+}
+
+.right-context-rail__dialog .right-context-rail__compare-result header {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #e7eae6;
+  padding: 0 9px;
+}
+
+.right-context-rail__compare-result header span {
+  color: #858c85;
+  font-size: 10px;
+}
+
+.right-context-rail__compare-result pre {
+  max-height: 300px;
+  overflow: auto;
+  margin: 0;
+  color: #3f463f;
+  padding: 9px;
+  font: 10px/1.45 "SFMono-Regular", Consolas, monospace;
+  white-space: pre;
+}
+
+.right-context-rail__git-empty {
+  margin: 0;
+  color: #858c85;
+  padding: 12px 6px;
+}
+
 @media (max-width: 520px) {
   .right-context-rail {
     inline-size: min(244px, calc(100vw - 16px));
+  }
+
+  .right-context-rail__git-dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+  }
+
+  .right-context-rail__git-form.is-inline,
+  .right-context-rail__git-field-grid {
+    grid-template-columns: 1fr;
   }
 }
 

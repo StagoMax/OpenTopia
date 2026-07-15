@@ -28,10 +28,12 @@ import {
   PanelRight,
   PanelLeftClose,
   PanelLeftOpen,
+  Paperclip,
   Pencil,
   Pin,
   Plug,
   Plus,
+  RotateCcw,
   Search,
   Send,
   Settings,
@@ -53,8 +55,7 @@ import {
   listSecretSources,
   loadPlatformInfo,
   openPath,
-  removeRecentWorkspace,
-  saveRecentWorkspace,
+  selectContextFiles,
   selectWorkspace,
   setSecret,
 } from "./platform";
@@ -64,16 +65,20 @@ import type {
   ArtifactContent,
   ArtifactDescriptor,
   ContextStatus,
+  ContextSourceFile,
   McpServerView,
   Message,
   MessagePart,
   PlatformInfo,
+  Project,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
   RecentWorkspace,
   SandboxDescriptor,
   SecretSources,
+  SkillDescriptor,
+  SubagentRun,
   TerminalEvent,
   TerminalSession,
   Thread,
@@ -130,22 +135,25 @@ export function App() {
   const [client, setClient] = useState<ApiClient | null>(null);
   const [serverStatus, setServerStatus] = useState<ServerStatus>("checking");
   const [serverError, setServerError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [selectedWorkspaceRoot, setSelectedWorkspaceRoot] = useState<
     string | null
   >(null);
-  const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>(
-    [],
-  );
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
+  const [subagentRuns, setSubagentRuns] = useState<SubagentRun[]>([]);
   const [terminalEvents, setTerminalEvents] = useState<TerminalEvent[]>([]);
   const [terminalSession, setTerminalSession] =
     useState<TerminalSession | null>(null);
   const [composer, setComposer] = useState("");
+  const [contextSources, setContextSources] = useState<ContextSourceFile[]>([]);
+  const [skills, setSkills] = useState<SkillDescriptor[]>([]);
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [isSending, setIsSending] = useState(false);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const [pendingApprovalIds, setPendingApprovalIds] = useState<string[]>([]);
@@ -196,25 +204,49 @@ export function App() {
   const [toolTabs, setToolTabs] = useState<ToolTab[]>([]);
   const [activeToolTabId, setActiveToolTabId] = useState<string | null>(null);
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
-  const [draftProjectName, setDraftProjectName] = useState<string | null>(null);
   const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
-  const [localProjects, setLocalProjects] = useState<LocalProject[]>(() =>
-    readLocalProjects(),
-  );
-  const [hiddenWorkspaceRootKeys, setHiddenWorkspaceRootKeys] = useState<
-    string[]
-  >(() => readHiddenWorkspaceRootKeys());
+  const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
     [threads, activeThreadId],
   );
+  const draftProject = useMemo(
+    () => projects.find((project) => project.id === draftProjectId) ?? null,
+    [draftProjectId, projects],
+  );
+  const activeProject = useMemo(() => {
+    const projectId = activeThread?.projectId ?? draftProjectId;
+    return projects.find((project) => project.id === projectId) ?? null;
+  }, [activeThread?.projectId, draftProjectId, projects]);
   const currentWorkspaceRoot =
-    selectedWorkspaceRoot ?? activeThread?.workspaceRoot ?? null;
+    selectedWorkspaceRoot ??
+    activeThread?.workspaceRoot ??
+    draftProject?.workspaceRoot ??
+    null;
   const activeToolTab = useMemo(
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
   );
+
+  useEffect(() => {
+    if (!client) return;
+    let cancelled = false;
+    void client
+      .listSkills(currentWorkspaceRoot)
+      .then((available) => {
+        if (cancelled) return;
+        setSkills(available);
+        const ids = new Set(available.map((skill) => skill.id));
+        setSelectedSkillIds((current) => current.filter((id) => ids.has(id)));
+      })
+      .catch(() => {
+        if (!cancelled) setSkills([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, currentWorkspaceRoot]);
 
   const ingestEvent = useCallback((event: AgentEvent) => {
     setEvents((current) => {
@@ -275,6 +307,15 @@ export function App() {
         latestSummary,
       }));
     }
+
+    if (event.payload.type === "subagent_updated") {
+      const run = event.payload.run;
+      setSubagentRuns((current) =>
+        [run, ...current.filter((item) => item.id !== run.id)].sort(
+          (left, right) => right.createdAt.localeCompare(left.createdAt),
+        ),
+      );
+    }
   }, []);
 
   const ingestTerminalEvent = useCallback((event: TerminalEvent) => {
@@ -301,7 +342,6 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false;
-    const hiddenRootKeys = new Set(readHiddenWorkspaceRootKeys());
     void loadPlatformInfo().then(async (info) => {
       if (cancelled) return;
       const nextClient = new ApiClient(info.backendUrl);
@@ -319,55 +359,63 @@ export function App() {
         }
       }
 
-      let loadedRecent: RecentWorkspace[] = [];
-      try {
-        loadedRecent = await getRecentWorkspaces();
-        if (cancelled) return;
-        setRecentWorkspaces(loadedRecent);
-        const firstVisibleRecent = loadedRecent.find(
-          (workspace) =>
-            !hiddenRootKeys.has(workspaceRootKey(workspace.workspaceRoot)),
-        );
-        setSelectedWorkspaceRoot(
-          (current) => current ?? firstVisibleRecent?.workspaceRoot ?? null,
-        );
-      } catch (error) {
-        if (cancelled) return;
-        setWorkspaceError(
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-
       try {
         await nextClient.health();
-        const [loadedThreads, loadedSettings, loadedHealth, loadedMcp] =
-          await Promise.all([
-            nextClient.listThreads(),
-            nextClient.getSettings(),
-            nextClient.getProviderHealth(),
-            nextClient.listMcpServers(),
-          ]);
+        let [
+          loadedProjects,
+          loadedThreads,
+          loadedSettings,
+          loadedHealth,
+          loadedMcp,
+        ] = await Promise.all([
+          nextClient.listProjects(),
+          nextClient.listThreads(),
+          nextClient.getSettings(),
+          nextClient.getProviderHealth(),
+          nextClient.listMcpServers(),
+        ]);
+
+        try {
+          const migrated = await migrateLegacyProjectData(
+            nextClient,
+            loadedProjects,
+            loadedThreads,
+          );
+          loadedProjects = migrated.projects;
+          loadedThreads = migrated.threads;
+        } catch (error) {
+          if (!cancelled) {
+            setActionError(`旧项目数据迁移失败：${errorMessage(error)}`);
+          }
+        }
+
+        loadedThreads = await nextClient.listThreads(true);
+
         if (cancelled) return;
+        setProjects(sortProjects(loadedProjects));
         setThreads(loadedThreads);
         setSettings(loadedSettings);
         setProviderHealth(loadedHealth);
         setMcpServers(loadedMcp);
+        const projectIds = new Set(loadedProjects.map((project) => project.id));
         const firstVisibleThread = loadedThreads.find(
           (thread) =>
-            !hiddenRootKeys.has(workspaceRootKey(thread.workspaceRoot)),
+            !thread.archivedAt &&
+            thread.projectId &&
+            projectIds.has(thread.projectId),
         );
-        const firstVisibleRecent = loadedRecent.find(
-          (workspace) =>
-            !hiddenRootKeys.has(workspaceRootKey(workspace.workspaceRoot)),
-        );
+        const firstProject = sortProjects(loadedProjects)[0] ?? null;
         setActiveThreadId(
           (current) => current ?? firstVisibleThread?.id ?? null,
         );
+        if (!firstVisibleThread) {
+          setDraftProjectId((current) => current ?? firstProject?.id ?? null);
+        }
         setSelectedWorkspaceRoot(
           (current) =>
             current ??
             firstVisibleThread?.workspaceRoot ??
-            firstVisibleRecent?.workspaceRoot ??
+            firstProject?.workspaceRoot ??
             null,
         );
         setServerStatus("online");
@@ -389,13 +437,19 @@ export function App() {
     let source: StreamHandle | null = null;
 
     void (async () => {
-      const [loadedMessages, loadedEvents, turnStatus, pendingApprovals] =
-        await Promise.all([
-          client.listMessages(activeThreadId),
-          client.listEvents(activeThreadId),
-          client.getTurnStatus(activeThreadId),
-          client.listPendingApprovals(activeThreadId),
-        ]);
+      const [
+        loadedMessages,
+        loadedEvents,
+        turnStatus,
+        pendingApprovals,
+        loadedSubagents,
+      ] = await Promise.all([
+        client.listMessages(activeThreadId),
+        client.listEvents(activeThreadId),
+        client.getTurnStatus(activeThreadId),
+        client.listPendingApprovals(activeThreadId),
+        client.listSubagents(activeThreadId),
+      ]);
       if (cancelled) return;
       setMessages(loadedMessages);
       setEvents(loadedEvents);
@@ -403,6 +457,7 @@ export function App() {
       setPendingApprovalIds(
         pendingApprovals.map((approval) => approval.approvalId),
       );
+      setSubagentRuns(loadedSubagents);
       const since = loadedEvents.at(-1)?.seq;
       source = client.openEventStream(activeThreadId, since, ingestEvent);
     })().catch((error) => {
@@ -508,97 +563,146 @@ export function App() {
   function selectThread(threadId: string) {
     const thread = threads.find((item) => item.id === threadId);
     setActiveThreadId(threadId);
-    setDraftProjectName(null);
     setDraftProjectId(null);
+    setContextSources([]);
+    setSelectedSkillIds([]);
     if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
   }
 
   function prepareNewThread(
     workspaceRoot: string | null,
-    projectName: string | null,
     projectId: string | null = null,
   ) {
     setActiveThreadId(null);
     setMessages([]);
     setEvents([]);
     setComposer("");
+    setContextSources([]);
+    setSelectedSkillIds([]);
     setActiveTurnId(null);
     setPendingApprovalIds([]);
     setToolTabs([]);
     setActiveToolTabId(null);
     setConversationCollapsed(false);
     setSelectedWorkspaceRoot(workspaceRoot);
-    setDraftProjectName(projectName);
     setDraftProjectId(projectId);
   }
 
   function beginNewThread() {
-    prepareNewThread(
-      currentWorkspaceRoot,
-      currentWorkspaceRoot ? workspaceName(currentWorkspaceRoot) : null,
-    );
+    const project =
+      activeProject ??
+      projects.find(
+        (item) =>
+          item.workspaceRoot &&
+          currentWorkspaceRoot &&
+          workspaceRootKey(item.workspaceRoot) ===
+            workspaceRootKey(currentWorkspaceRoot),
+      ) ??
+      null;
+    prepareNewThread(project?.workspaceRoot ?? null, project?.id ?? null);
   }
 
-  function beginProjectDraft(projectId: string, projectName: string) {
-    prepareNewThread(null, projectName, projectId);
+  function beginProjectDraft(project: Project) {
+    prepareNewThread(project.workspaceRoot, project.id);
   }
 
-  function handleNewThreadForProject(
-    workspaceRoot: string | null,
-    projectName: string,
-    projectId: string,
-  ) {
-    if (workspaceRoot) {
-      prepareNewThread(workspaceRoot, projectName);
-      showWorkspaceRoot(workspaceRoot);
-      void saveWorkspaceToRecent(workspaceRoot);
-    } else {
-      beginProjectDraft(projectId, projectName);
+  function handleNewThreadForProject(project: Project) {
+    beginProjectDraft(project);
+  }
+
+  async function createBlankProject(name: string): Promise<Project | null> {
+    if (!client) return null;
+    setActionError(null);
+    try {
+      const project = await client.createProject({ name });
+      setProjects((current) => sortProjects([project, ...current]));
+      return project;
+    } catch (error) {
+      setActionError(`创建项目失败：${errorMessage(error)}`);
+      return null;
     }
   }
 
-  function addLocalProject(project: LocalProject) {
-    setLocalProjects((current) => {
-      const next = [project, ...current];
-      writeLocalProjects(next);
-      return next;
-    });
-  }
-
-  function removeLocalProject(projectId: string) {
-    setLocalProjects((current) => {
-      const next = current.filter((project) => project.id !== projectId);
-      writeLocalProjects(next);
-      return next;
-    });
-    if (draftProjectId === projectId) prepareNewThread(null, null);
-  }
-
-  function showWorkspaceRoot(workspaceRoot: string) {
-    const key = workspaceRootKey(workspaceRoot);
-    setHiddenWorkspaceRootKeys((current) => {
-      if (!current.includes(key)) return current;
-      const next = current.filter((hiddenKey) => hiddenKey !== key);
-      writeHiddenWorkspaceRootKeys(next);
-      return next;
-    });
-  }
-
-  function hideWorkspaceRoot(workspaceRoot: string) {
-    const key = workspaceRootKey(workspaceRoot);
-    setHiddenWorkspaceRootKeys((current) => {
-      if (current.includes(key)) return current;
-      const next = [...current, key];
-      writeHiddenWorkspaceRootKeys(next);
-      return next;
-    });
-  }
-
-  async function saveWorkspaceToRecent(workspaceRoot: string) {
+  async function toggleProjectPinned(project: Project) {
+    if (!client) return;
+    setActionError(null);
     try {
-      setRecentWorkspaces(await saveRecentWorkspace(workspaceRoot));
+      const updated = await client.updateProject(project.id, {
+        pinned: !project.pinned,
+      });
+      setProjects((current) =>
+        sortProjects(
+          current.map((item) => (item.id === updated.id ? updated : item)),
+        ),
+      );
     } catch (error) {
-      setWorkspaceError(error instanceof Error ? error.message : String(error));
+      setActionError(`更新项目失败：${errorMessage(error)}`);
+    }
+  }
+
+  async function removeProject(project: Project) {
+    if (!client) return;
+    const confirmed = window.confirm(
+      `移除项目“${project.name}”？所属任务会归档，可在“已归档”中恢复。`,
+    );
+    if (!confirmed) return;
+
+    setActionError(null);
+    try {
+      await client.deleteProject(project.id);
+      const [nextProjects, nextThreads] = await Promise.all([
+        client.listProjects(),
+        client.listThreads(true),
+      ]);
+      const sortedProjects = sortProjects(nextProjects);
+      setProjects(sortedProjects);
+      setThreads(nextThreads);
+      if (
+        draftProjectId === project.id ||
+        activeThread?.projectId === project.id
+      ) {
+        const nextProject = sortedProjects[0] ?? null;
+        prepareNewThread(nextProject?.workspaceRoot ?? null, nextProject?.id);
+      }
+    } catch (error) {
+      setActionError(`移除项目失败：${errorMessage(error)}`);
+    }
+  }
+
+  async function restoreThread(thread: Thread) {
+    if (!client) return;
+    setActionError(null);
+    try {
+      let targetProject = thread.projectId
+        ? projects.find((project) => project.id === thread.projectId) ?? null
+        : null;
+      targetProject ??=
+        projects.find(
+          (project) =>
+            project.workspaceRoot &&
+            workspaceRootKey(project.workspaceRoot) ===
+              workspaceRootKey(thread.workspaceRoot),
+        ) ?? null;
+      if (!targetProject) {
+        targetProject = await client.createProject({
+          name: workspaceName(thread.workspaceRoot),
+          workspaceRoot: thread.workspaceRoot,
+        });
+        setProjects((current) =>
+          sortProjects([targetProject!, ...current]),
+        );
+      }
+
+      const restored = await client.updateThread(thread.id, {
+        projectId: targetProject.id,
+        archivedAt: null,
+      });
+      setThreads((current) =>
+        current.map((item) => (item.id === restored.id ? restored : item)),
+      );
+      selectThread(restored.id);
+    } catch (error) {
+      setActionError(`恢复任务失败：${errorMessage(error)}`);
     }
   }
 
@@ -629,74 +733,71 @@ export function App() {
 
   async function chooseWorkspace(
     bindDraftProject = false,
-  ): Promise<string | null> {
-    const projectIdToBind = bindDraftProject ? draftProjectId : null;
+  ): Promise<Project | null> {
+    if (!client) return null;
+    const projectToBind = bindDraftProject ? draftProject : null;
     setIsPickingWorkspace(true);
     setWorkspaceError(null);
+    setActionError(null);
     try {
       const result = await selectWorkspace({
         defaultPath: currentWorkspaceRoot ?? undefined,
       });
       if (result.canceled) return null;
 
-      setSelectedWorkspaceRoot(result.workspaceRoot);
-      if (!activeThread) {
-        setDraftProjectName(result.workspace.name);
+      const existingProject = projects.find(
+        (project) =>
+          project.workspaceRoot &&
+          workspaceRootKey(project.workspaceRoot) ===
+            workspaceRootKey(result.workspaceRoot),
+      );
+      if (existingProject) {
+        if (projectToBind && existingProject.id !== projectToBind.id) {
+          setActionError(
+            `该工作区已绑定到项目“${existingProject.name}”，请先选择其他文件夹。`,
+          );
+          return null;
+        }
+        beginProjectDraft(existingProject);
+        return existingProject;
       }
-      setDraftProjectId(null);
-      if (projectIdToBind) removeLocalProject(projectIdToBind);
-      showWorkspaceRoot(result.workspaceRoot);
-      setRecentWorkspaces(result.recentWorkspaces);
-      return result.workspaceRoot;
+
+      const project = projectToBind
+        ? await client.updateProject(projectToBind.id, {
+            workspaceRoot: result.workspaceRoot,
+          })
+        : await client.createProject({
+            name: result.workspace.name,
+            workspaceRoot: result.workspaceRoot,
+          });
+      setProjects((current) =>
+        sortProjects([
+          project,
+          ...current.filter((item) => item.id !== project.id),
+        ]),
+      );
+      if (project.workspaceRoot) {
+        setThreads((current) =>
+          current.map((thread) =>
+            thread.projectId === project.id
+              ? { ...thread, workspaceRoot: project.workspaceRoot! }
+              : thread,
+          ),
+        );
+      }
+      beginProjectDraft(project);
+      return project;
     } catch (error) {
-      setWorkspaceError(error instanceof Error ? error.message : String(error));
+      setActionError(`选择工作区失败：${errorMessage(error)}`);
       return null;
     } finally {
       setIsPickingWorkspace(false);
     }
   }
 
-  async function selectRecentWorkspace(
-    workspaceRoot: string,
-    bindDraftProject = false,
-  ) {
-    const projectIdToBind = bindDraftProject ? draftProjectId : null;
-    setWorkspaceError(null);
-    setSelectedWorkspaceRoot(workspaceRoot);
-    setDraftProjectName(workspaceName(workspaceRoot));
-    setDraftProjectId(null);
-    if (projectIdToBind) removeLocalProject(projectIdToBind);
-    showWorkspaceRoot(workspaceRoot);
-    await saveWorkspaceToRecent(workspaceRoot);
-  }
-
-  async function forgetRecentWorkspace(workspaceRoot: string) {
-    setWorkspaceError(null);
-    const removedKey = workspaceRootKey(workspaceRoot);
-    hideWorkspaceRoot(workspaceRoot);
-    try {
-      const nextRecentWorkspaces = await removeRecentWorkspace(workspaceRoot);
-      setRecentWorkspaces(nextRecentWorkspaces);
-      const removesSelectedWorkspace =
-        selectedWorkspaceRoot &&
-        workspaceRootKey(selectedWorkspaceRoot) === removedKey;
-      const removesActiveThread =
-        activeThread &&
-        workspaceRootKey(activeThread.workspaceRoot) === removedKey;
-      if (removesSelectedWorkspace || removesActiveThread) {
-        const hiddenKeys = new Set([...hiddenWorkspaceRootKeys, removedKey]);
-        const nextWorkspace = nextRecentWorkspaces.find(
-          (workspace) =>
-            !hiddenKeys.has(workspaceRootKey(workspace.workspaceRoot)),
-        );
-        prepareNewThread(
-          nextWorkspace?.workspaceRoot ?? null,
-          nextWorkspace?.name ?? null,
-        );
-      }
-    } catch (error) {
-      setWorkspaceError(error instanceof Error ? error.message : String(error));
-    }
+  function selectProject(projectId: string) {
+    const project = projects.find((item) => item.id === projectId);
+    if (project) beginProjectDraft(project);
   }
 
   async function openWorkspaceRoot(workspaceRoot: string) {
@@ -756,7 +857,8 @@ export function App() {
     baseUrl?: string;
     model?: string;
     apiKeySource?: string;
-    permissionMode: "chat" | "read_only" | "auto" | "approve" | "full_access";
+    permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
+    sandbox?: AppSettings["sandbox"];
   }) {
     if (!client) return;
     setIsSavingSettings(true);
@@ -764,47 +866,215 @@ export function App() {
       const updated = await client.updateSettings(input);
       setSettings(updated);
       setProviderHealth(await client.getProviderHealth());
+      if (activeThread) setSandbox(await client.getSandbox(activeThread.id));
     } finally {
       setIsSavingSettings(false);
     }
   }
 
+  function changeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]) {
+    if (!settings) return;
+    const danger = mode === "danger-full-access";
+    void saveSettings({
+      sandbox: {
+        ...settings.sandbox,
+        sandboxMode: mode,
+        enforcement: danger
+          ? "disabled"
+          : settings.sandbox.enforcement === "disabled"
+            ? "enforce"
+            : settings.sandbox.enforcement,
+        network: danger ? "allow" : settings.sandbox.network,
+      },
+    });
+  }
+
+  async function addContextSources() {
+    setActionError(null);
+    try {
+      const result = await selectContextFiles({
+        defaultPath: currentWorkspaceRoot ?? undefined,
+      });
+      if (result.canceled) return;
+      setContextSources((current) => {
+        const byPath = new Map(
+          current.map((source) => [workspaceRootKey(source.path), source]),
+        );
+        for (const source of result.files) {
+          byPath.set(workspaceRootKey(source.path), source);
+        }
+        return [...byPath.values()].slice(0, 20);
+      });
+    } catch (error) {
+      setActionError(`添加来源失败：${errorMessage(error)}`);
+    }
+  }
+
+  function removeContextSource(path: string) {
+    const key = workspaceRootKey(path);
+    setContextSources((current) =>
+      current.filter((source) => workspaceRootKey(source.path) !== key),
+    );
+  }
+
+  function toggleSkill(skillId: string) {
+    setSelectedSkillIds((current) => {
+      if (current.includes(skillId)) {
+        return current.filter((id) => id !== skillId);
+      }
+      return current.length >= 5 ? current : [...current, skillId];
+    });
+  }
+
+  async function spawnSubagent(name: string, input: string) {
+    if (!client || !activeThread) return;
+    setActionError(null);
+    try {
+      await client.spawnSubagent(activeThread.id, {
+        name,
+        input,
+        parentTurnId: activeTurnId ?? undefined,
+        depth: 1,
+      });
+    } catch (error) {
+      setActionError(`启动子智能体失败：${errorMessage(error)}`);
+      throw error;
+    }
+  }
+
+  async function cancelSubagent(runId: string) {
+    if (!client || !activeThread) return;
+    setActionError(null);
+    try {
+      await client.cancelSubagent(activeThread.id, runId);
+    } catch (error) {
+      setActionError(`取消子智能体失败：${errorMessage(error)}`);
+    }
+  }
+
   async function createThread(initialPrompt?: string): Promise<Thread | null> {
     if (!client) return null;
-    const workspaceRoot = currentWorkspaceRoot ?? (await chooseWorkspace(true));
-    if (!workspaceRoot) return null;
+    let project =
+      activeProject ??
+      projects.find(
+        (item) =>
+          item.workspaceRoot &&
+          currentWorkspaceRoot &&
+          workspaceRootKey(item.workspaceRoot) ===
+            workspaceRootKey(currentWorkspaceRoot),
+      ) ??
+      null;
+    if (!project?.workspaceRoot) project = await chooseWorkspace(true);
+    if (!project?.workspaceRoot) return null;
 
-    setIsSending(Boolean(initialPrompt?.trim()));
+    setIsSending(
+      Boolean(initialPrompt?.trim()) ||
+        contextSources.length > 0 ||
+        selectedSkillIds.length > 0,
+    );
+    setActionError(null);
     try {
       const thread = await client.createThread({
         title: initialPrompt?.trim()
           ? threadTitleFromPrompt(initialPrompt)
-          : workspaceName(workspaceRoot),
-        workspaceRoot,
+          : project.name,
+        workspaceRoot: project.workspaceRoot,
+        projectId: project.id,
       });
       setThreads((current) => [thread, ...current]);
       setActiveThreadId(thread.id);
       setSelectedWorkspaceRoot(thread.workspaceRoot);
       setDraftProjectId(null);
-      setDraftProjectName(null);
-      showWorkspaceRoot(thread.workspaceRoot);
       setToolTabs([]);
       setActiveToolTabId(null);
-      if (initialPrompt?.trim()) {
+      if (
+        initialPrompt?.trim() ||
+        contextSources.length > 0 ||
+        selectedSkillIds.length > 0
+      ) {
         const message = await client.sendMessage(
           thread.id,
-          initialPrompt.trim(),
+          initialPrompt?.trim() ?? "",
+          contextSources.map((source) => source.path),
+          selectedSkillIds,
         );
         setMessages([message]);
         setComposer("");
+        setContextSources([]);
+        setSelectedSkillIds([]);
       }
-      await saveWorkspaceToRecent(thread.workspaceRoot);
       return thread;
     } catch (error) {
-      setServerError(error instanceof Error ? error.message : String(error));
+      setActionError(`创建任务失败：${errorMessage(error)}`);
       return null;
     } finally {
       setIsSending(false);
+    }
+  }
+
+  async function submitRename(name: string): Promise<boolean> {
+    if (!client || !renameTarget) return false;
+    const trimmedName = name.trim();
+    if (!trimmedName) return false;
+
+    setActionError(null);
+    try {
+      if (renameTarget.kind === "project") {
+        const updated = await client.updateProject(renameTarget.id, {
+          name: trimmedName,
+        });
+        setProjects((current) =>
+          sortProjects(
+            current.map((project) =>
+              project.id === updated.id ? updated : project,
+            ),
+          ),
+        );
+      } else {
+        const updated = await client.updateThread(renameTarget.id, {
+          title: trimmedName,
+        });
+        setThreads((current) =>
+          current.map((thread) =>
+            thread.id === updated.id ? updated : thread,
+          ),
+        );
+      }
+      setRenameTarget(null);
+      return true;
+    } catch (error) {
+      setActionError(`重命名失败：${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function archiveThread(thread: Thread) {
+    if (!client) return;
+    setActionError(null);
+    try {
+      const archived = await client.updateThread(thread.id, {
+        archivedAt: new Date().toISOString(),
+      });
+      const nextThreads = threads.map((item) =>
+        item.id === archived.id ? archived : item,
+      );
+      setThreads(nextThreads);
+      if (activeThreadId === thread.id) {
+        const nextThread =
+          nextThreads.find(
+            (item) =>
+              !item.archivedAt && item.projectId === thread.projectId,
+          ) ?? null;
+        if (nextThread) {
+          selectThread(nextThread.id);
+        } else {
+          const project =
+            projects.find((item) => item.id === thread.projectId) ?? null;
+          prepareNewThread(project?.workspaceRoot ?? null, project?.id ?? null);
+        }
+      }
+    } catch (error) {
+      setActionError(`归档任务失败：${errorMessage(error)}`);
     }
   }
 
@@ -812,7 +1082,9 @@ export function App() {
     if (
       !client ||
       !activeThread ||
-      !composer.trim() ||
+      (!composer.trim() &&
+        contextSources.length === 0 &&
+        selectedSkillIds.length === 0) ||
       isSending ||
       activeTurnId
     )
@@ -822,9 +1094,13 @@ export function App() {
       const message = await client.sendMessage(
         activeThread.id,
         composer.trim(),
+        contextSources.map((source) => source.path),
+        selectedSkillIds,
       );
       setMessages((current) => [...current, message]);
       setComposer("");
+      setContextSources([]);
+      setSelectedSkillIds([]);
     } finally {
       setIsSending(false);
     }
@@ -1077,33 +1353,54 @@ export function App() {
   return (
     <div className="app-shell">
       <TopBar />
+      {actionError && (
+        <div className="action-error" role="alert">
+          <span>{actionError}</span>
+          <button
+            type="button"
+            title="关闭"
+            aria-label="关闭错误提示"
+            onClick={() => setActionError(null)}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
       <main
         className={`workspace ${activeToolTab ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""}`}
       >
         <Sidebar
+          projects={projects}
           threads={threads}
           activeThreadId={activeThreadId}
-          selectedWorkspaceRoot={currentWorkspaceRoot}
-          selectedDraftProjectId={draftProjectId}
-          recentWorkspaces={recentWorkspaces}
-          localProjects={localProjects}
-          hiddenWorkspaceRootKeys={hiddenWorkspaceRootKeys}
+          activeProjectId={activeThread?.projectId ?? draftProjectId}
           activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
           workspaceError={workspaceError}
           isPickingWorkspace={isPickingWorkspace}
           onSelect={selectThread}
           onNew={beginNewThread}
           onPickWorkspace={() => void chooseWorkspace()}
-          onSelectWorkspace={(workspaceRoot) =>
-            void selectRecentWorkspace(workspaceRoot)
+          onCreateProject={createBlankProject}
+          onRemoveProject={(project) => void removeProject(project)}
+          onRenameProject={(project) =>
+            setRenameTarget({
+              kind: "project",
+              id: project.id,
+              name: project.name,
+            })
           }
-          onForgetWorkspace={(workspaceRoot) =>
-            void forgetRecentWorkspace(workspaceRoot)
-          }
-          onCreateLocalProject={addLocalProject}
-          onRemoveLocalProject={removeLocalProject}
-          onSelectDraftProject={beginProjectDraft}
+          onToggleProjectPinned={(project) => void toggleProjectPinned(project)}
+          onSelectProject={beginProjectDraft}
           onNewThreadForProject={handleNewThreadForProject}
+          onRenameThread={(thread) =>
+            setRenameTarget({
+              kind: "thread",
+              id: thread.id,
+              name: thread.title,
+            })
+          }
+          onArchiveThread={(thread) => void archiveThread(thread)}
+          onRestoreThread={(thread) => void restoreThread(thread)}
           onOpenThreadWorkspace={(workspaceRoot) =>
             void openWorkspaceRoot(workspaceRoot)
           }
@@ -1116,6 +1413,15 @@ export function App() {
               activeThread && void openWorkspaceRoot(activeThread.workspaceRoot)
             }
             onOpenTool={openToolTab}
+            onRename={() =>
+              activeThread &&
+              setRenameTarget({
+                kind: "thread",
+                id: activeThread.id,
+                name: activeThread.title,
+              })
+            }
+            onArchive={() => activeThread && void archiveThread(activeThread)}
           />
           {serverStatus === "offline" ? (
             <OfflineState
@@ -1144,60 +1450,75 @@ export function App() {
                   )?.model ?? "Model"
                 }
                 permissionMode={settings?.permissionMode ?? "auto"}
+                sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
+                contextSources={contextSources}
+                skills={skills}
+                selectedSkillIds={selectedSkillIds}
                 workspaceRoot={null}
                 projectName={null}
-                recentWorkspaces={recentWorkspaces}
+                projects={projects}
                 canOpenThreadTools
                 onChange={setComposer}
                 onSubmit={submitMessage}
                 onCancel={() => void cancelTurn()}
                 onOpenTool={openToolTab}
                 onPickWorkspace={() => void chooseWorkspace()}
-                onSelectWorkspace={(workspaceRoot) =>
-                  void selectRecentWorkspace(workspaceRoot)
-                }
+                onSelectProject={selectProject}
                 onChangePermissionMode={(permissionMode) =>
                   void saveSettings({ permissionMode })
                 }
+                onChangeSandboxMode={changeSandboxMode}
+                onAddContextSources={() => void addContextSources()}
+                onRemoveContextSource={removeContextSource}
+                onToggleSkill={toggleSkill}
               />
             </>
           ) : (
             <NewTaskState
               value={composer}
               workspaceRoot={currentWorkspaceRoot}
-              projectName={draftProjectName}
-              recentWorkspaces={recentWorkspaces}
+              projectName={draftProject?.name ?? null}
+              projects={projects}
               model={
                 settings?.providers.find(
                   (provider) => provider.id === settings.activeProviderId,
                 )?.model ?? "Model"
               }
               permissionMode={settings?.permissionMode ?? "auto"}
+              sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
+              contextSources={contextSources}
+              skills={skills}
+              selectedSkillIds={selectedSkillIds}
               isSending={isSending}
               onChange={setComposer}
               onPickWorkspace={() => void chooseWorkspace(true)}
-              onSelectWorkspace={(workspaceRoot) =>
-                void selectRecentWorkspace(workspaceRoot, true)
-              }
+              onSelectProject={selectProject}
               onOpenTool={openToolTab}
               onChangePermissionMode={(permissionMode) =>
                 void saveSettings({ permissionMode })
               }
+              onChangeSandboxMode={changeSandboxMode}
+              onAddContextSources={() => void addContextSources()}
+              onRemoveContextSource={removeContextSource}
+              onToggleSkill={toggleSkill}
               onSubmit={() => void createThread(composer)}
             />
           )}
         </section>
         <RightPanel
+          client={client}
           toolTabs={toolTabs}
           activeToolTab={activeToolTab}
           conversationCollapsed={conversationCollapsed}
           thread={activeThread}
           workspaceRoot={currentWorkspaceRoot}
+          messages={messages}
           events={events.filter(
             (event) =>
               event.payload.type !== "approval_requested" ||
               pendingApprovalIds.includes(event.payload.approval_id),
           )}
+          subagentRuns={subagentRuns}
           terminalEvents={terminalEvents}
           terminalSession={terminalSession}
           workspaceTree={workspaceTree}
@@ -1249,6 +1570,9 @@ export function App() {
           onToggleConversation={() =>
             setConversationCollapsed((current) => !current)
           }
+          onAddContextSources={() => void addContextSources()}
+          onSpawnSubagent={spawnSubagent}
+          onCancelSubagent={(runId) => void cancelSubagent(runId)}
         />
       </main>
       {settingsOpen && (
@@ -1281,6 +1605,83 @@ export function App() {
           onClose={() => setArtifactPreview(null)}
         />
       )}
+      {renameTarget && (
+        <RenameDialog
+          target={renameTarget}
+          onSubmit={submitRename}
+          onClose={() => setRenameTarget(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function RenameDialog({
+  target,
+  onSubmit,
+  onClose,
+}: {
+  target: RenameTarget;
+  onSubmit(name: string): Promise<boolean>;
+  onClose(): void;
+}) {
+  const [name, setName] = useState(target.name);
+  const [isSaving, setIsSaving] = useState(false);
+  const label = target.kind === "project" ? "项目" : "任务";
+
+  return (
+    <div
+      className="modal-backdrop project-modal-backdrop"
+      role="presentation"
+      onClick={onClose}
+    >
+      <form
+        className="project-name-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rename-dialog-title"
+        onClick={(event) => event.stopPropagation()}
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!name.trim() || isSaving) return;
+          setIsSaving(true);
+          void onSubmit(name).finally(() => setIsSaving(false));
+        }}
+      >
+        <header>
+          <div>
+            <h2 id="rename-dialog-title">重命名{label}</h2>
+            <p>名称将在所有项目视图中同步更新。</p>
+          </div>
+          <button
+            className="icon-button small"
+            type="button"
+            aria-label="关闭重命名弹窗"
+            onClick={onClose}
+          >
+            <X size={14} />
+          </button>
+        </header>
+        <input
+          autoFocus
+          aria-label={`${label}名称`}
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          onFocus={(event) => event.currentTarget.select()}
+        />
+        <footer>
+          <button className="secondary-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="primary-button"
+            type="submit"
+            disabled={!name.trim() || isSaving}
+          >
+            {isSaving ? "保存中..." : "保存"}
+          </button>
+        </footer>
+      </form>
     </div>
   );
 }
@@ -1374,7 +1775,8 @@ function SettingsPanel({
     baseUrl?: string;
     model?: string;
     apiKeySource?: string;
-    permissionMode: "chat" | "read_only" | "auto" | "approve" | "full_access";
+    permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
+    sandbox?: AppSettings["sandbox"];
   }): void;
   onTestProvider(providerId: string): void;
   onStoreProviderApiKey(value: string): void;
@@ -1402,6 +1804,17 @@ function SettingsPanel({
   const [permissionMode, setPermissionMode] = useState<
     "chat" | "read_only" | "auto" | "approve" | "full_access"
   >(settings?.permissionMode ?? "auto");
+  const [sandboxSettings, setSandboxSettings] = useState<
+    AppSettings["sandbox"]
+  >(
+    settings?.sandbox ?? {
+      sandboxMode: "workspace-write",
+      enforcement: "enforce",
+      network: "deny",
+      writableRoots: [],
+      readPaths: [],
+    },
+  );
   const [providerApiKey, setProviderApiKey] = useState("");
 
   const editingProvider =
@@ -1412,6 +1825,7 @@ function SettingsPanel({
       setProviders(settings.providers);
       setActiveProviderId(settings.activeProviderId);
       setPermissionMode(settings.permissionMode);
+      setSandboxSettings(settings.sandbox);
     }
   }, [settings]);
 
@@ -1477,6 +1891,7 @@ function SettingsPanel({
               providers,
               activeProviderId,
               permissionMode,
+              sandbox: sandboxSettings,
             });
           }}
         >
@@ -1506,6 +1921,108 @@ function SettingsPanel({
               <option value="full_access">Full Access</option>
             </select>
           </label>
+
+          <div className="settings-sandbox-section">
+            <div className="settings-providers-header">
+              <h3>Sandbox</h3>
+              <span>Applies to new tool calls immediately</span>
+            </div>
+            <div className="settings-sandbox-grid">
+              <label>
+                Access mode
+                <select
+                  value={sandboxSettings.sandboxMode}
+                  onChange={(event) => {
+                    const sandboxMode = event.target
+                      .value as AppSettings["sandbox"]["sandboxMode"];
+                    const danger = sandboxMode === "danger-full-access";
+                    setSandboxSettings((current) => ({
+                      ...current,
+                      sandboxMode,
+                      enforcement: danger
+                        ? "disabled"
+                        : current.enforcement === "disabled"
+                          ? "enforce"
+                          : current.enforcement,
+                      network: danger ? "allow" : current.network,
+                    }));
+                  }}
+                >
+                  <option value="read-only">Read only</option>
+                  <option value="workspace-write">Workspace write</option>
+                  <option value="danger-full-access">Full system access</option>
+                </select>
+              </label>
+              <label>
+                OS enforcement
+                <select
+                  value={sandboxSettings.enforcement}
+                  disabled={
+                    sandboxSettings.sandboxMode === "danger-full-access"
+                  }
+                  onChange={(event) =>
+                    setSandboxSettings((current) => ({
+                      ...current,
+                      enforcement: event.target
+                        .value as AppSettings["sandbox"]["enforcement"],
+                    }))
+                  }
+                >
+                  <option value="enforce">Enforce</option>
+                  <option value="best-effort">Best effort</option>
+                  <option value="disabled">Disabled</option>
+                </select>
+              </label>
+              <label>
+                Network
+                <select
+                  value={sandboxSettings.network}
+                  disabled={
+                    sandboxSettings.sandboxMode === "danger-full-access"
+                  }
+                  onChange={(event) =>
+                    setSandboxSettings((current) => ({
+                      ...current,
+                      network: event.target
+                        .value as AppSettings["sandbox"]["network"],
+                    }))
+                  }
+                >
+                  <option value="deny">Deny</option>
+                  <option value="inherit">Inherit</option>
+                  <option value="allow">Allow</option>
+                </select>
+              </label>
+              <label>
+                Extra writable roots
+                <textarea
+                  rows={3}
+                  placeholder="One absolute path per line"
+                  value={sandboxSettings.writableRoots.join("\n")}
+                  onChange={(event) =>
+                    setSandboxSettings((current) => ({
+                      ...current,
+                      writableRoots: parsePathList(event.target.value),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                Extra readable paths
+                <textarea
+                  rows={3}
+                  placeholder="One absolute path per line"
+                  value={sandboxSettings.readPaths.join("\n")}
+                  onChange={(event) =>
+                    setSandboxSettings((current) => ({
+                      ...current,
+                      readPaths: parsePathList(event.target.value),
+                    }))
+                  }
+                />
+              </label>
+            </div>
+          </div>
 
           <div className="settings-providers-section">
             <div className="settings-providers-header">
@@ -1744,63 +2261,62 @@ function SettingsPanel({
 }
 
 function Sidebar({
+  projects,
   threads,
   activeThreadId,
-  selectedWorkspaceRoot,
-  selectedDraftProjectId,
-  recentWorkspaces,
-  localProjects,
-  hiddenWorkspaceRootKeys,
+  activeProjectId,
   activeWorkspaceRemoteUrl,
   workspaceError,
   isPickingWorkspace,
   onSelect,
   onNew,
   onPickWorkspace,
-  onSelectWorkspace,
-  onForgetWorkspace,
-  onCreateLocalProject,
-  onRemoveLocalProject,
-  onSelectDraftProject,
+  onCreateProject,
+  onRemoveProject,
+  onRenameProject,
+  onToggleProjectPinned,
+  onSelectProject,
   onOpenThreadWorkspace,
   onNewThreadForProject,
+  onRenameThread,
+  onArchiveThread,
+  onRestoreThread,
   onSettings,
 }: {
+  projects: Project[];
   threads: Thread[];
   activeThreadId: string | null;
-  selectedWorkspaceRoot: string | null;
-  selectedDraftProjectId: string | null;
-  recentWorkspaces: RecentWorkspace[];
-  localProjects: LocalProject[];
-  hiddenWorkspaceRootKeys: string[];
+  activeProjectId: string | null;
   activeWorkspaceRemoteUrl: string | null;
   workspaceError: string | null;
   isPickingWorkspace: boolean;
   onSelect(id: string): void;
   onNew(): void;
   onPickWorkspace(): void;
-  onSelectWorkspace(workspaceRoot: string): void;
-  onForgetWorkspace(workspaceRoot: string): void;
-  onCreateLocalProject(project: LocalProject): void;
-  onRemoveLocalProject(projectId: string): void;
-  onSelectDraftProject(projectId: string, projectName: string): void;
+  onCreateProject(name: string): Promise<Project | null>;
+  onRemoveProject(project: Project): void;
+  onRenameProject(project: Project): void;
+  onToggleProjectPinned(project: Project): void;
+  onSelectProject(project: Project): void;
   onOpenThreadWorkspace(workspaceRoot: string): void;
-  onNewThreadForProject?(
-    workspaceRoot: string | null,
-    projectName: string,
-    projectId: string,
-  ): void;
+  onNewThreadForProject?(project: Project): void;
+  onRenameThread(thread: Thread): void;
+  onArchiveThread(thread: Thread): void;
+  onRestoreThread(thread: Thread): void;
   onSettings(): void;
 }) {
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("New project");
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
     () => new Set(),
   );
   const [moreMenuProjectId, setMoreMenuProjectId] = useState<string | null>(
     null,
   );
+  const [unassignedExpanded, setUnassignedExpanded] = useState(false);
+  const [archivedExpanded, setArchivedExpanded] = useState(false);
   const [hoveredProject, setHoveredProject] =
     useState<ProjectHoverState | null>(null);
   const moreMenuRef = useDismissiblePopover(moreMenuProjectId !== null, () =>
@@ -1809,6 +2325,10 @@ function Sidebar({
   const projectMenuRef = useDismissiblePopover(projectMenuOpen, () =>
     setProjectMenuOpen(false),
   );
+  const unassignedThreads = threads.filter(
+    (thread) => !thread.projectId && !thread.archivedAt,
+  );
+  const archivedThreads = threads.filter((thread) => thread.archivedAt);
 
   function toggleExpandedProject(projectId: string) {
     setExpandedProjects((prev) => {
@@ -1831,56 +2351,17 @@ function Sidebar({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [newProjectOpen]);
 
-  const projects = useMemo(() => {
-    const roots = new Map<string, { name: string; workspaceRoot: string }>();
-    const hiddenKeys = new Set(hiddenWorkspaceRootKeys);
-    for (const workspace of recentWorkspaces) {
-      const key = workspaceRootKey(workspace.workspaceRoot);
-      if (!hiddenKeys.has(key) && !roots.has(key)) {
-        roots.set(key, workspace);
-      }
-    }
-    for (const thread of threads) {
-      const key = workspaceRootKey(thread.workspaceRoot);
-      if (!hiddenKeys.has(key) && !roots.has(key)) {
-        roots.set(key, {
-          name: workspaceName(thread.workspaceRoot),
-          workspaceRoot: thread.workspaceRoot,
-        });
-      }
-    }
-    return [
-      ...localProjects.map((project) => ({
-        id: project.id,
-        name: project.name,
-        workspaceRoot: null,
-      })),
-      ...[...roots.entries()].map(([key, project]) => ({
-        id: `workspace:${key}`,
-        ...project,
-      })),
-    ];
-  }, [hiddenWorkspaceRootKeys, localProjects, recentWorkspaces, threads]);
-
-  function createLocalProject() {
+  async function createProject() {
     const name = newProjectName.trim();
-    if (!name) return;
-    const existingProject = localProjects.find(
-      (project) =>
-        project.name.trim().toLocaleLowerCase() === name.toLocaleLowerCase(),
-    );
-    if (existingProject) {
-      setNewProjectOpen(false);
-      setProjectMenuOpen(false);
-      onSelectDraftProject(existingProject.id, existingProject.name);
-      return;
-    }
-    const project = { id: crypto.randomUUID(), name };
-    onCreateLocalProject(project);
+    if (!name || isCreatingProject) return;
+    setIsCreatingProject(true);
+    const project = await onCreateProject(name);
+    setIsCreatingProject(false);
+    if (!project) return;
     setNewProjectOpen(false);
     setProjectMenuOpen(false);
     setNewProjectName("New project");
-    onSelectDraftProject(project.id, name);
+    onSelectProject(project);
   }
 
   return (
@@ -1967,20 +2448,11 @@ function Sidebar({
         </div>
         <div className="project-tree">
           {projects.map((project, projectIndex) => {
-            const projectThreads = project.workspaceRoot
-              ? threads.filter(
-                  (thread) =>
-                    workspaceRootKey(thread.workspaceRoot) ===
-                    workspaceRootKey(project.workspaceRoot ?? ""),
-                )
-              : [];
-            const isActive = project.workspaceRoot
-              ? Boolean(
-                  selectedWorkspaceRoot &&
-                  workspaceRootKey(project.workspaceRoot) ===
-                    workspaceRootKey(selectedWorkspaceRoot),
-                )
-              : !activeThreadId && project.id === selectedDraftProjectId;
+            const projectThreads = threads.filter(
+              (thread) =>
+                thread.projectId === project.id && !thread.archivedAt,
+            );
+            const isActive = project.id === activeProjectId;
             const isExpanded = expandedProjects.has(project.id);
             const isMoreMenuOpen = moreMenuProjectId === project.id;
             const projectInfoId = `project-hover-card-${projectIndex}`;
@@ -1996,10 +2468,7 @@ function Sidebar({
                     window.innerWidth - cardWidth - 8,
                   );
                   const remoteUrl =
-                    project.workspaceRoot &&
-                    selectedWorkspaceRoot &&
-                    workspaceRootKey(project.workspaceRoot) ===
-                      workspaceRootKey(selectedWorkspaceRoot)
+                    project.id === activeProjectId
                       ? activeWorkspaceRemoteUrl
                       : null;
                   setHoveredProject({
@@ -2007,6 +2476,7 @@ function Sidebar({
                     name: project.name,
                     threadCount: projectThreads.length,
                     workspaceRoot: project.workspaceRoot,
+                    pinned: project.pinned,
                     remoteUrl,
                     left: Math.max(8, left),
                     top: Math.max(
@@ -2025,9 +2495,7 @@ function Sidebar({
                     aria-describedby={projectInfoId}
                     onClick={() => {
                       toggleExpandedProject(project.id);
-                      project.workspaceRoot
-                        ? onSelectWorkspace(project.workspaceRoot)
-                        : onSelectDraftProject(project.id, project.name);
+                      onSelectProject(project);
                     }}
                   >
                     {isExpanded ? (
@@ -2062,9 +2530,30 @@ function Sidebar({
                           <button
                             role="menuitem"
                             onClick={() => {
-                              project.workspaceRoot
-                                ? onForgetWorkspace(project.workspaceRoot)
-                                : onRemoveLocalProject(project.id);
+                              onRenameProject(project);
+                              setMoreMenuProjectId(null);
+                            }}
+                          >
+                            <Pencil size={14} />
+                            <span>重命名项目</span>
+                          </button>
+                          <button
+                            role="menuitem"
+                            onClick={() => {
+                              onToggleProjectPinned(project);
+                              setMoreMenuProjectId(null);
+                            }}
+                          >
+                            <Pin size={14} />
+                            <span>
+                              {project.pinned ? "取消固定" : "固定项目"}
+                            </span>
+                          </button>
+                          <div className="tool-popover-separator" />
+                          <button
+                            role="menuitem"
+                            onClick={() => {
+                              onRemoveProject(project);
                               setMoreMenuProjectId(null);
                             }}
                           >
@@ -2079,11 +2568,7 @@ function Sidebar({
                       title="新建对话"
                       aria-label={`在 ${project.name} 中新建对话`}
                       onClick={() => {
-                        onNewThreadForProject?.(
-                          project.workspaceRoot,
-                          project.name,
-                          project.id,
-                        );
+                        onNewThreadForProject?.(project);
                       }}
                     >
                       <SquarePen size={13} />
@@ -2101,6 +2586,8 @@ function Sidebar({
                         onOpenWorkspace={() =>
                           onOpenThreadWorkspace(thread.workspaceRoot)
                         }
+                        onRename={() => onRenameThread(thread)}
+                        onArchive={() => onArchiveThread(thread)}
                       />
                     ))}
                     {projectThreads.length === 0 && (
@@ -2111,6 +2598,74 @@ function Sidebar({
               </section>
             );
           })}
+          {unassignedThreads.length > 0 && (
+            <section className="project-node">
+              <div className="project-row">
+                <button
+                  className="project-select"
+                  title="尚未归属到项目的任务"
+                  onClick={() => setUnassignedExpanded((current) => !current)}
+                >
+                  {unassignedExpanded ? (
+                    <FolderOpen size={14} />
+                  ) : (
+                    <Folder size={14} />
+                  )}
+                  <span>未归属任务 ({unassignedThreads.length})</span>
+                </button>
+              </div>
+              {unassignedExpanded && (
+                <div className="project-tasks">
+                  {unassignedThreads.map((thread) => (
+                    <SidebarThreadRow
+                      active={thread.id === activeThreadId}
+                      key={thread.id}
+                      thread={thread}
+                      onSelect={() => onSelect(thread.id)}
+                      onOpenWorkspace={() =>
+                        onOpenThreadWorkspace(thread.workspaceRoot)
+                      }
+                      onRename={() => onRenameThread(thread)}
+                      onArchive={() => onArchiveThread(thread)}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
+          {archivedThreads.length > 0 && (
+            <section className="project-node">
+              <div className="project-row">
+                <button
+                  className="project-select"
+                  title="查看可恢复的归档任务"
+                  onClick={() => setArchivedExpanded((current) => !current)}
+                >
+                  <Archive size={14} />
+                  <span>已归档 ({archivedThreads.length})</span>
+                </button>
+              </div>
+              {archivedExpanded && (
+                <div className="project-tasks">
+                  {archivedThreads.map((thread) => (
+                    <SidebarThreadRow
+                      archived
+                      active={false}
+                      key={thread.id}
+                      thread={thread}
+                      onSelect={() => onRestoreThread(thread)}
+                      onOpenWorkspace={() =>
+                        onOpenThreadWorkspace(thread.workspaceRoot)
+                      }
+                      onRename={() => onRenameThread(thread)}
+                      onArchive={() => undefined}
+                      onRestore={() => onRestoreThread(thread)}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
           {projects.length === 0 && (
             <p className="workspace-empty">尚未打开项目</p>
           )}
@@ -2142,8 +2697,17 @@ function Sidebar({
                 <Folder size={17} aria-hidden="true" />
                 <strong>{hoveredProject.name}</strong>
               </span>
-              <button disabled title="固定项目 · 未实现" aria-label="固定项目">
-                <Pin size={14} aria-hidden="true" />
+              <button
+                disabled
+                className={hoveredProject.pinned ? "active" : undefined}
+                title={hoveredProject.pinned ? "已固定" : "未固定"}
+                aria-label={hoveredProject.pinned ? "已固定" : "未固定"}
+              >
+                <Pin
+                  size={14}
+                  fill={hoveredProject.pinned ? "currentColor" : "none"}
+                  aria-hidden="true"
+                />
               </button>
             </header>
             <div className="project-hover-card__row">
@@ -2182,7 +2746,7 @@ function Sidebar({
             onClick={(event) => event.stopPropagation()}
             onSubmit={(event) => {
               event.preventDefault();
-              createLocalProject();
+              void createProject();
             }}
           >
             <header>
@@ -2216,9 +2780,9 @@ function Sidebar({
               <button
                 className="primary-button"
                 type="submit"
-                disabled={!newProjectName.trim()}
+                disabled={!newProjectName.trim() || isCreatingProject}
               >
-                保存
+                {isCreatingProject ? "保存中..." : "保存"}
               </button>
             </footer>
           </form>
@@ -2231,13 +2795,21 @@ function Sidebar({
 function SidebarThreadRow({
   thread,
   active,
+  archived = false,
   onSelect,
   onOpenWorkspace,
+  onRename,
+  onArchive,
+  onRestore,
 }: {
   thread: Thread;
   active: boolean;
+  archived?: boolean;
   onSelect(): void;
   onOpenWorkspace(): void;
+  onRename(): void;
+  onArchive(): void;
+  onRestore?(): void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
@@ -2273,21 +2845,44 @@ function SidebarThreadRow({
               <FolderOpen size={14} />
               <span>在文件管理器中打开</span>
             </button>
-            <button disabled title="线程重命名 API 尚未实现">
+            <button
+              role="menuitem"
+              onClick={() => {
+                onRename();
+                setMenuOpen(false);
+              }}
+            >
               <Pencil size={14} />
               <span>重命名</span>
-              <small>未实现</small>
             </button>
             <button disabled title="Git 工作树管理尚未实现">
               <GitFork size={14} />
               <span>创建工作树</span>
               <small>未实现</small>
             </button>
-            <button disabled title="任务归档 API 尚未实现">
-              <Archive size={14} />
-              <span>归档</span>
-              <small>未实现</small>
-            </button>
+            {archived ? (
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onRestore?.();
+                  setMenuOpen(false);
+                }}
+              >
+                <RotateCcw size={14} />
+                <span>恢复到项目</span>
+              </button>
+            ) : (
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onArchive();
+                  setMenuOpen(false);
+                }}
+              >
+                <Archive size={14} />
+                <span>归档</span>
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -2299,10 +2894,14 @@ function ThreadHeader({
   thread,
   onOpenLocation,
   onOpenTool,
+  onRename,
+  onArchive,
 }: {
   thread: Thread | null;
   onOpenLocation(): void;
   onOpenTool(kind: ToolTabKind): void;
+  onRename(): void;
+  onArchive(): void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [taskMenuOpen, setTaskMenuOpen] = useState(false);
@@ -2346,20 +2945,30 @@ function ThreadHeader({
                 <FolderOpen size={14} />
                 <span>在文件管理器中打开</span>
               </button>
-              <button disabled title="线程重命名 API 尚未实现">
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onRename();
+                  setTaskMenuOpen(false);
+                }}
+              >
                 <Pencil size={14} />
                 <span>重命名任务</span>
-                <small>未实现</small>
               </button>
               <button disabled title="Git 工作树管理尚未实现">
                 <GitFork size={14} />
                 <span>创建工作树</span>
                 <small>未实现</small>
               </button>
-              <button disabled title="任务归档 API 尚未实现">
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onArchive();
+                  setTaskMenuOpen(false);
+                }}
+              >
                 <Archive size={14} />
                 <span>归档任务</span>
-                <small>未实现</small>
               </button>
             </div>
           )}
@@ -2558,6 +3167,34 @@ function MessagePartView({
   if (part.type === "error")
     return <p className="message-error">{part.message}</p>;
   if (part.type === "file_ref") return <code>{part.path}</code>;
+  if (part.type === "source_ref") {
+    return (
+      <button
+        className="message-source-reference"
+        type="button"
+        title={part.source.path}
+        onClick={() => void openPath(part.source.path)}
+      >
+        <Paperclip size={12} />
+        <span>{part.source.name}</span>
+        <small>{formatBytes(part.source.bytes)}</small>
+      </button>
+    );
+  }
+  if (part.type === "skill_ref") {
+    return (
+      <button
+        className="message-source-reference is-skill"
+        type="button"
+        title={part.skill.description || part.skill.path}
+        onClick={() => void openPath(part.skill.path)}
+      >
+        <Plug size={12} />
+        <span>{part.skill.name}</span>
+        <small>Skill</small>
+      </button>
+    );
+  }
   if (part.type === "tool_call")
     return <pre>{JSON.stringify(part.call, null, 2)}</pre>;
   return (
@@ -2621,37 +3258,59 @@ function Composer({
   isRunning,
   model,
   permissionMode,
+  sandboxMode,
+  contextSources,
+  skills,
+  selectedSkillIds,
   workspaceRoot,
   projectName,
-  recentWorkspaces,
+  projects,
   canOpenThreadTools = false,
   onChange,
   onSubmit,
   onCancel,
   onOpenTool,
   onPickWorkspace,
-  onSelectWorkspace,
+  onSelectProject,
   onChangePermissionMode,
+  onChangeSandboxMode,
+  onAddContextSources,
+  onRemoveContextSource,
+  onToggleSkill,
 }: {
   value: string;
   isSending: boolean;
   isRunning: boolean;
   model: string;
   permissionMode: AppSettings["permissionMode"];
+  sandboxMode: AppSettings["sandbox"]["sandboxMode"];
+  contextSources: ContextSourceFile[];
+  skills: SkillDescriptor[];
+  selectedSkillIds: string[];
   workspaceRoot: string | null;
   projectName: string | null;
-  recentWorkspaces: RecentWorkspace[];
+  projects: Project[];
   canOpenThreadTools?: boolean;
   onChange(value: string): void;
   onSubmit(): void;
   onCancel(): void;
   onOpenTool(kind: ToolTabKind): void;
   onPickWorkspace(): void;
-  onSelectWorkspace(workspaceRoot: string): void;
+  onSelectProject(projectId: string): void;
   onChangePermissionMode(mode: AppSettings["permissionMode"]): void;
+  onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
+  onAddContextSources(): void;
+  onRemoveContextSource(path: string): void;
+  onToggleSkill(skillId: string): void;
 }) {
   const [openMenu, setOpenMenu] = useState<
-    "actions" | "permission" | "model" | "workspace" | "environment" | null
+    | "actions"
+    | "skills"
+    | "permission"
+    | "model"
+    | "workspace"
+    | "environment"
+    | null
   >(null);
   const popoverRef = useDismissiblePopover(Boolean(openMenu), () =>
     setOpenMenu(null),
@@ -2659,7 +3318,7 @@ function Composer({
 
   return (
     <div
-      className={`composer ${workspaceRoot || projectName ? "has-context" : ""}`}
+      className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""}`}
       ref={popoverRef}
     >
       {(workspaceRoot || projectName) && (
@@ -2686,24 +3345,26 @@ function Composer({
                   <strong>选择工作区</strong>
                   <span>当前任务将使用所选文件夹</span>
                 </div>
-                {recentWorkspaces.map((workspace) => (
-                  <button
-                    key={workspace.workspaceRoot}
-                    role="menuitemradio"
-                    aria-checked={workspace.workspaceRoot === workspaceRoot}
-                    onClick={() => {
-                      onSelectWorkspace(workspace.workspaceRoot);
-                      setOpenMenu(null);
-                    }}
-                  >
-                    {workspace.workspaceRoot === workspaceRoot ? (
-                      <Check size={13} />
-                    ) : (
-                      <Folder size={13} />
-                    )}
-                    <span>{workspace.name}</span>
-                  </button>
-                ))}
+                {projects
+                  .filter((project) => project.workspaceRoot)
+                  .map((project) => (
+                    <button
+                      key={project.id}
+                      role="menuitemradio"
+                      aria-checked={project.workspaceRoot === workspaceRoot}
+                      onClick={() => {
+                        onSelectProject(project.id);
+                        setOpenMenu(null);
+                      }}
+                    >
+                      {project.workspaceRoot === workspaceRoot ? (
+                        <Check size={13} />
+                      ) : (
+                        <Folder size={13} />
+                      )}
+                      <span>{project.name}</span>
+                    </button>
+                  ))}
                 <div className="tool-popover-separator" />
                 <button
                   role="menuitem"
@@ -2730,20 +3391,32 @@ function Composer({
               }
             >
               <TerminalSquare size={12} />
-              <span>本地</span>
+              <span>{sandboxModeLabel(sandboxMode)}</span>
               <ChevronDown size={11} />
             </button>
             {openMenu === "environment" && (
               <div className="tool-popover environment-popover" role="menu">
-                <button
-                  className="active"
-                  role="menuitemradio"
-                  aria-checked
-                  onClick={() => setOpenMenu(null)}
-                >
-                  <Check size={13} />
-                  <span>在本地处理</span>
-                </button>
+                {sandboxModeOptions.map((option) => (
+                  <button
+                    className={sandboxMode === option.value ? "active" : ""}
+                    key={option.value}
+                    role="menuitemradio"
+                    aria-checked={sandboxMode === option.value}
+                    onClick={() => {
+                      onChangeSandboxMode(option.value);
+                      setOpenMenu(null);
+                    }}
+                  >
+                    {sandboxMode === option.value ? (
+                      <Check size={13} />
+                    ) : (
+                      <span className="menu-icon-spacer" />
+                    )}
+                    <span>{option.label}</span>
+                    <small>{option.detail}</small>
+                  </button>
+                ))}
+                <div className="tool-popover-separator" />
                 <button disabled title="Git 工作树创建尚未实现">
                   <GitFork size={14} />
                   <span>新工作树</span>
@@ -2766,6 +3439,50 @@ function Composer({
             <GitBranch size={12} />
             <span>分支未接入</span>
           </button>
+        </div>
+      )}
+      {(contextSources.length > 0 || selectedSkillIds.length > 0) && (
+        <div className="composer-sources" aria-label="已添加来源">
+          {contextSources.map((source) => (
+            <span
+              className="composer-source"
+              key={source.path}
+              title={source.path}
+            >
+              <Paperclip size={12} />
+              <span>{source.name}</span>
+              <small>{formatBytes(source.bytes)}</small>
+              <button
+                type="button"
+                title={`移除 ${source.name}`}
+                aria-label={`移除 ${source.name}`}
+                onClick={() => onRemoveContextSource(source.path)}
+              >
+                <X size={12} />
+              </button>
+            </span>
+          ))}
+          {skills
+            .filter((skill) => selectedSkillIds.includes(skill.id))
+            .map((skill) => (
+              <span
+                className="composer-source is-skill"
+                key={skill.id}
+                title={skill.description || skill.path}
+              >
+                <Plug size={12} />
+                <span>{skill.name}</span>
+                <small>Skill</small>
+                <button
+                  type="button"
+                  title={`移除 ${skill.name}`}
+                  aria-label={`移除 ${skill.name}`}
+                  onClick={() => onToggleSkill(skill.id)}
+                >
+                  <X size={12} />
+                </button>
+              </span>
+            ))}
         </div>
       )}
       <textarea
@@ -2813,13 +3530,12 @@ function Composer({
               <button
                 role="menuitem"
                 onClick={() => {
-                  onOpenTool("files");
+                  onAddContextSources();
                   setOpenMenu(null);
                 }}
               >
-                <FileText size={14} />
-                <span>文件和文件夹</span>
-                {!canOpenThreadTools && <small>创建任务后</small>}
+                <Paperclip size={14} />
+                <span>添加文件或图片</span>
               </button>
               <button
                 role="menuitem"
@@ -2847,15 +3563,53 @@ function Composer({
                 <span>审查变更</span>
                 {!canOpenThreadTools && <small>创建任务后</small>}
               </button>
-              <button disabled title="图片附件协议尚未实现">
-                <Plus size={14} />
-                <span>添加图片</span>
-                <small>未实现</small>
-              </button>
-              <button disabled title="Skill 选择协议尚未实现">
+              <button role="menuitem" onClick={() => setOpenMenu("skills")}>
                 <Plug size={14} />
                 <span>Skills</span>
-                <small>未实现</small>
+                <small>{selectedSkillIds.length || skills.length}</small>
+              </button>
+            </div>
+          )}
+          {openMenu === "skills" && (
+            <div
+              className="tool-popover composer-actions-popover skills-popover"
+              role="menu"
+            >
+              <div className="tool-popover-note">
+                <strong>Skills</strong>
+                <span>最多为当前 Turn 选择 5 个</span>
+              </div>
+              {skills.length ? (
+                skills.map((skill) => {
+                  const selected = selectedSkillIds.includes(skill.id);
+                  return (
+                    <button
+                      className={selected ? "active" : ""}
+                      key={skill.id}
+                      role="menuitemcheckbox"
+                      aria-checked={selected}
+                      disabled={!selected && selectedSkillIds.length >= 5}
+                      title={skill.description || skill.path}
+                      onClick={() => onToggleSkill(skill.id)}
+                    >
+                      {selected ? <Check size={13} /> : <Plug size={13} />}
+                      <span>{skill.name}</span>
+                      <small>
+                        {skill.scope === "workspace" ? "项目" : "用户"}
+                      </small>
+                    </button>
+                  );
+                })
+              ) : (
+                <button disabled>
+                  <Plug size={13} />
+                  <span>未发现 Skills</span>
+                </button>
+              )}
+              <div className="tool-popover-separator" />
+              <button onClick={() => setOpenMenu("actions")}>
+                <ArrowLeft size={13} />
+                <span>返回</span>
               </button>
             </div>
           )}
@@ -2927,7 +3681,13 @@ function Composer({
       </div>
       <button
         className="send-button"
-        disabled={!isRunning && (isSending || !value.trim())}
+        disabled={
+          !isRunning &&
+          (isSending ||
+            (!value.trim() &&
+              contextSources.length === 0 &&
+              selectedSkillIds.length === 0))
+        }
         onClick={isRunning ? onCancel : onSubmit}
         title={isRunning ? "Stop turn" : "Send message"}
       >
@@ -2954,6 +3714,22 @@ const permissionModeOptions: Array<{
   { value: "full_access", label: "完全访问" },
 ];
 
+const sandboxModeOptions: Array<{
+  value: AppSettings["sandbox"]["sandboxMode"];
+  label: string;
+  detail: string;
+}> = [
+  { value: "read-only", label: "只读沙箱", detail: "禁止写入" },
+  { value: "workspace-write", label: "工作区写入", detail: "默认" },
+  { value: "danger-full-access", label: "完全访问", detail: "无 OS 沙箱" },
+];
+
+function sandboxModeLabel(mode: AppSettings["sandbox"]["sandboxMode"]): string {
+  return (
+    sandboxModeOptions.find((option) => option.value === mode)?.label ?? mode
+  );
+}
+
 function permissionModeLabel(mode: AppSettings["permissionMode"]): string {
   switch (mode) {
     case "full_access":
@@ -2970,11 +3746,14 @@ function permissionModeLabel(mode: AppSettings["permissionMode"]): string {
 }
 
 function RightPanel({
+  client,
   toolTabs,
   activeToolTab,
   conversationCollapsed,
   thread,
   workspaceRoot,
+  subagentRuns,
+  messages,
   events,
   terminalEvents,
   terminalSession,
@@ -3011,12 +3790,18 @@ function RightPanel({
   onActivateToolTab,
   onCloseToolTab,
   onToggleConversation,
+  onAddContextSources,
+  onSpawnSubagent,
+  onCancelSubagent,
 }: {
+  client: ApiClient | null;
   toolTabs: ToolTab[];
   activeToolTab: ToolTab | null;
   conversationCollapsed: boolean;
   thread: Thread | null;
   workspaceRoot: string | null;
+  messages: Message[];
+  subagentRuns: SubagentRun[];
   events: AgentEvent[];
   terminalEvents: TerminalEvent[];
   terminalSession: TerminalSession | null;
@@ -3065,6 +3850,9 @@ function RightPanel({
   onActivateToolTab(tabId: string): void;
   onCloseToolTab(tabId: string): void;
   onToggleConversation(): void;
+  onAddContextSources(): void;
+  onSpawnSubagent(name: string, input: string): Promise<void>;
+  onCancelSubagent(runId: string): void;
 }) {
   const renderWorkbench = (
     mode: "panel" | "stage",
@@ -3140,16 +3928,24 @@ function RightPanel({
   return (
     <aside className="right-panel context-rail-shell">
       <RightContextRail
+        client={client}
+        threadId={thread?.id ?? null}
         workspaceRoot={workspaceRoot}
         workspaceDiff={workspaceDiff}
         terminalEvents={terminalEvents}
         terminalSession={terminalSession}
         agentEvents={events}
+        subagentRuns={subagentRuns}
         artifacts={artifacts}
+        messages={messages}
         onOpenDiff={() => onOpenToolTab("diff")}
         onOpenTerminal={() => onOpenToolTab("terminal")}
         onOpenFiles={() => onOpenToolTab("files")}
         onOpenExtensions={() => onOpenToolTab("extensions")}
+        onAddSource={onAddContextSources}
+        onSpawnSubagent={onSpawnSubagent}
+        onCancelSubagent={onCancelSubagent}
+        onGitChanged={onRefreshWorkbench}
       />
     </aside>
   );
@@ -3281,29 +4077,45 @@ function NewTaskState({
   value,
   workspaceRoot,
   projectName,
-  recentWorkspaces,
+  projects,
   model,
   permissionMode,
+  sandboxMode,
+  contextSources,
+  skills,
+  selectedSkillIds,
   isSending,
   onChange,
   onPickWorkspace,
-  onSelectWorkspace,
+  onSelectProject,
   onOpenTool,
   onChangePermissionMode,
+  onChangeSandboxMode,
+  onAddContextSources,
+  onRemoveContextSource,
+  onToggleSkill,
   onSubmit,
 }: {
   value: string;
   workspaceRoot: string | null;
   projectName: string | null;
-  recentWorkspaces: RecentWorkspace[];
+  projects: Project[];
   model: string;
   permissionMode: AppSettings["permissionMode"];
+  sandboxMode: AppSettings["sandbox"]["sandboxMode"];
+  contextSources: ContextSourceFile[];
+  skills: SkillDescriptor[];
+  selectedSkillIds: string[];
   isSending: boolean;
   onChange(value: string): void;
   onPickWorkspace(): void;
-  onSelectWorkspace(workspaceRoot: string): void;
+  onSelectProject(projectId: string): void;
   onOpenTool(kind: ToolTabKind): void;
   onChangePermissionMode(mode: AppSettings["permissionMode"]): void;
+  onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
+  onAddContextSources(): void;
+  onRemoveContextSource(path: string): void;
+  onToggleSkill(skillId: string): void;
   onSubmit(): void;
 }) {
   const suggestions = [
@@ -3365,18 +4177,26 @@ function NewTaskState({
         isRunning={false}
         model={model}
         permissionMode={permissionMode}
+        sandboxMode={sandboxMode}
+        contextSources={contextSources}
+        skills={skills}
+        selectedSkillIds={selectedSkillIds}
         workspaceRoot={workspaceRoot}
         projectName={
           projectName ?? (workspaceRoot ? workspaceName(workspaceRoot) : null)
         }
-        recentWorkspaces={recentWorkspaces}
+        projects={projects}
         onChange={onChange}
         onSubmit={onSubmit}
         onCancel={() => undefined}
         onOpenTool={onOpenTool}
         onPickWorkspace={onPickWorkspace}
-        onSelectWorkspace={onSelectWorkspace}
+        onSelectProject={onSelectProject}
         onChangePermissionMode={onChangePermissionMode}
+        onChangeSandboxMode={onChangeSandboxMode}
+        onAddContextSources={onAddContextSources}
+        onRemoveContextSource={onRemoveContextSource}
+        onToggleSkill={onToggleSkill}
       />
     </>
   );
@@ -3475,7 +4295,13 @@ type ArtifactReference = {
   bytes?: number;
 };
 
-type LocalProject = {
+type LegacyLocalProject = {
+  id: string;
+  name: string;
+};
+
+type RenameTarget = {
+  kind: "project" | "thread";
   id: string;
   name: string;
 };
@@ -3485,6 +4311,7 @@ type ProjectHoverState = {
   name: string;
   threadCount: number;
   workspaceRoot: string | null;
+  pinned: boolean;
   remoteUrl: string | null;
   left: number;
   top: number;
@@ -3492,14 +4319,15 @@ type ProjectHoverState = {
 
 const localProjectsStorageKey = "opentopia.localProjects";
 const hiddenWorkspaceRootsStorageKey = "opentopia.hiddenWorkspaceRoots";
+const projectApiMigrationStorageKey = "opentopia.projectApiMigration.v1";
 
-function readLocalProjects(): LocalProject[] {
+function readLegacyLocalProjects(): LegacyLocalProject[] {
   try {
     const parsed = JSON.parse(
       window.localStorage.getItem(localProjectsStorageKey) ?? "[]",
     );
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((project): project is LocalProject =>
+    return parsed.filter((project): project is LegacyLocalProject =>
       Boolean(
         project &&
         typeof project.id === "string" &&
@@ -3511,14 +4339,7 @@ function readLocalProjects(): LocalProject[] {
   }
 }
 
-function writeLocalProjects(projects: LocalProject[]) {
-  window.localStorage.setItem(
-    localProjectsStorageKey,
-    JSON.stringify(projects),
-  );
-}
-
-function readHiddenWorkspaceRootKeys(): string[] {
+function readLegacyHiddenWorkspaceRootKeys(): string[] {
   try {
     const parsed = JSON.parse(
       window.localStorage.getItem(hiddenWorkspaceRootsStorageKey) ?? "[]",
@@ -3536,11 +4357,139 @@ function readHiddenWorkspaceRootKeys(): string[] {
   }
 }
 
-function writeHiddenWorkspaceRootKeys(keys: string[]) {
-  window.localStorage.setItem(
-    hiddenWorkspaceRootsStorageKey,
-    JSON.stringify(keys),
+function projectApiMigrationComplete(): boolean {
+  try {
+    return window.localStorage.getItem(projectApiMigrationStorageKey) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markProjectApiMigrationComplete() {
+  try {
+    window.localStorage.removeItem(localProjectsStorageKey);
+    window.localStorage.removeItem(hiddenWorkspaceRootsStorageKey);
+    window.localStorage.setItem(projectApiMigrationStorageKey, "1");
+  } catch {
+    // The API data remains authoritative when browser storage is unavailable.
+  }
+}
+
+async function migrateLegacyProjectData(
+  client: ApiClient,
+  existingProjects: Project[],
+  existingThreads: Thread[],
+): Promise<{ projects: Project[]; threads: Thread[] }> {
+  if (projectApiMigrationComplete()) {
+    return { projects: existingProjects, threads: existingThreads };
+  }
+
+  const [recentWorkspaces, localProjects] = await Promise.all([
+    getRecentWorkspaces(),
+    Promise.resolve(readLegacyLocalProjects()),
+  ]);
+  const hiddenRoots = new Set(readLegacyHiddenWorkspaceRootKeys());
+  const projects = [...existingProjects];
+  const workspaceCandidates = new Map<
+    string,
+    Pick<RecentWorkspace, "name" | "workspaceRoot">
+  >();
+
+  for (const workspace of recentWorkspaces) {
+    const key = workspaceRootKey(workspace.workspaceRoot);
+    if (!hiddenRoots.has(key) && !workspaceCandidates.has(key)) {
+      workspaceCandidates.set(key, workspace);
+    }
+  }
+  for (const thread of existingThreads) {
+    const key = workspaceRootKey(thread.workspaceRoot);
+    if (!hiddenRoots.has(key) && !workspaceCandidates.has(key)) {
+      workspaceCandidates.set(key, {
+        name: workspaceName(thread.workspaceRoot),
+        workspaceRoot: thread.workspaceRoot,
+      });
+    }
+  }
+
+  for (const candidate of workspaceCandidates.values()) {
+    const key = workspaceRootKey(candidate.workspaceRoot);
+    if (
+      projects.some(
+        (project) =>
+          project.workspaceRoot &&
+          workspaceRootKey(project.workspaceRoot) === key,
+      )
+    ) {
+      continue;
+    }
+    projects.push(
+      await client.createProject({
+        name: candidate.name,
+        workspaceRoot: candidate.workspaceRoot,
+      }),
+    );
+  }
+
+  for (const localProject of localProjects) {
+    const duplicate = projects.some(
+      (project) =>
+        project.workspaceRoot === null &&
+        project.name.trim().toLocaleLowerCase() ===
+          localProject.name.trim().toLocaleLowerCase(),
+    );
+    if (!duplicate) {
+      projects.push(await client.createProject({ name: localProject.name }));
+    }
+  }
+
+  for (const thread of existingThreads) {
+    if (thread.projectId) continue;
+    const project = projects.find(
+      (item) =>
+        item.workspaceRoot &&
+        workspaceRootKey(item.workspaceRoot) ===
+          workspaceRootKey(thread.workspaceRoot),
+    );
+    if (project) {
+      await client.updateThread(thread.id, { projectId: project.id });
+    }
+  }
+
+  const [migratedProjects, migratedThreads] = await Promise.all([
+    client.listProjects(),
+    client.listThreads(),
+  ]);
+  try {
+    await window.opentopia?.clearRecentWorkspaces();
+  } catch (error) {
+    console.warn("OpenTopia could not clear migrated recent workspaces", error);
+  }
+  markProjectApiMigrationComplete();
+  return { projects: migratedProjects, threads: migratedThreads };
+}
+
+function sortProjects(projects: Project[]): Project[] {
+  return [...projects].sort(
+    (left, right) =>
+      Number(right.pinned) - Number(left.pinned) ||
+      left.sortOrder - right.sortOrder ||
+      left.createdAt.localeCompare(right.createdAt),
   );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function parsePathList(value: string): string[] {
+  return [
+    ...new Set(
+      value
+        .split(/\r?\n/)
+        .map((path) => path.trim())
+        .filter(Boolean),
+    ),
+  ];
 }
 
 function collectArtifactReferences(

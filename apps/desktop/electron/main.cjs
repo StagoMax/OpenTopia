@@ -35,6 +35,8 @@ const keyringProviderApiKeySourceId = `keyring:${providerSecretStorageKey}`;
 const keyringProviderApiKeyEnvName = "OPENTOPIA_API_KEY";
 
 const maxRecentWorkspaces = 12;
+const maxContextSourceFiles = 20;
+const maxContextSourceBytes = 25 * 1024 * 1024;
 const recentWorkspacesFile = "recent-workspaces.json";
 const openRequestHistoryLimit = 50;
 const openRequestHistory = [];
@@ -650,6 +652,36 @@ function normalizeWorkspaceRoot(rawPath) {
     throw new Error(`Workspace must be a directory: ${workspaceRoot}`);
   }
   return workspaceRoot;
+}
+
+function contextSourceKind(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  if ([".png", ".jpg", ".jpeg", ".gif", ".webp"].includes(extension)) {
+    return "image";
+  }
+  if ([".pdf", ".docx", ".xlsx", ".pptx"].includes(extension)) {
+    return "document";
+  }
+  return "text";
+}
+
+function contextSourceMetadata(rawPath) {
+  const filePath = normalizeExistingPath(rawPath);
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile())
+    throw new Error(`Context source must be a file: ${filePath}`);
+  if (stat.size > maxContextSourceBytes) {
+    throw new Error(
+      `Context source exceeds ${maxContextSourceBytes} bytes: ${filePath}`,
+    );
+  }
+  return {
+    path: filePath,
+    name: path.basename(filePath),
+    extension: path.extname(filePath).toLowerCase(),
+    kind: contextSourceKind(filePath),
+    bytes: stat.size,
+  };
 }
 
 function resolvePathArgument(rawPath, cwd) {
@@ -1412,6 +1444,94 @@ function registerIpc() {
       workspaceRoot,
       workspace: recentWorkspaces[0],
       recentWorkspaces,
+    };
+  });
+
+  ipcMain.handle("context:select-files", async (event, options = {}) => {
+    let defaultPath;
+    if (typeof options?.defaultPath === "string" && options.defaultPath) {
+      try {
+        defaultPath = normalizeComparablePath(options.defaultPath);
+      } catch {
+        defaultPath = undefined;
+      }
+    }
+
+    const owner = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+    const dialogOptions = {
+      title: "Add context files",
+      defaultPath,
+      properties: ["openFile", "multiSelections"],
+      filters: [
+        {
+          name: "Supported context files",
+          extensions: [
+            "txt",
+            "md",
+            "json",
+            "jsonc",
+            "jsonl",
+            "csv",
+            "tsv",
+            "yaml",
+            "yml",
+            "toml",
+            "xml",
+            "html",
+            "css",
+            "scss",
+            "less",
+            "js",
+            "jsx",
+            "ts",
+            "tsx",
+            "rs",
+            "py",
+            "go",
+            "java",
+            "kt",
+            "swift",
+            "rb",
+            "php",
+            "sql",
+            "graphql",
+            "gql",
+            "proto",
+            "diff",
+            "patch",
+            "c",
+            "h",
+            "cpp",
+            "hpp",
+            "png",
+            "jpg",
+            "jpeg",
+            "gif",
+            "webp",
+            "bmp",
+            "pdf",
+            "docx",
+            "xlsx",
+            "pptx",
+          ],
+        },
+      ],
+    };
+    const result = owner
+      ? await dialog.showOpenDialog(owner, dialogOptions)
+      : await dialog.showOpenDialog(dialogOptions);
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return { canceled: true, files: [] };
+    }
+    if (result.filePaths.length > maxContextSourceFiles) {
+      throw new Error(
+        `Select at most ${maxContextSourceFiles} context files at once.`,
+      );
+    }
+    return {
+      canceled: false,
+      files: result.filePaths.map(contextSourceMetadata),
     };
   });
 

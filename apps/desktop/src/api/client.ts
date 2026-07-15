@@ -6,15 +6,22 @@ import type {
   ContextStatus,
   ContextSummary,
   DiffFileActionResult,
+  GitBranchInfo,
+  GitStatusSummary,
+  GitWorkflowAction,
+  GitWorkflowResponse,
   McpCallResult,
   McpServerStatus,
   McpServerView,
   Message,
   PermissionMode,
+  Project,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
   SandboxDescriptor,
+  SkillDescriptor,
+  SubagentRun,
   TerminalCancelResponse,
   TerminalEvent,
   TerminalStartResponse,
@@ -74,6 +81,7 @@ export class ApiClient {
     permissionMode?: PermissionMode;
     defaultWorkspaceRoot?: string;
     clearDefaultWorkspaceRoot?: boolean;
+    sandbox?: AppSettings["sandbox"];
   }): Promise<AppSettings> {
     return this.patch("/api/settings", input);
   }
@@ -82,33 +90,127 @@ export class ApiClient {
     return this.get("/api/provider/health");
   }
 
+  async listSkills(workspaceRoot?: string | null): Promise<SkillDescriptor[]> {
+    return this.get(
+      `/api/skills${queryString({ workspaceRoot: workspaceRoot ?? undefined })}`,
+    );
+  }
+
   async testProviderConnection(
     providerId?: string,
   ): Promise<ProviderHealthCheckResult> {
     return this.post("/api/provider/test", { providerId });
   }
 
-  async listThreads(): Promise<Thread[]> {
-    return this.get("/api/threads");
+  async listProjects(): Promise<Project[]> {
+    return this.get("/api/projects");
+  }
+
+  async createProject(input: {
+    name: string;
+    workspaceRoot?: string | null;
+    pinned?: boolean;
+    sortOrder?: number;
+  }): Promise<Project> {
+    return this.post("/api/projects", input);
+  }
+
+  async updateProject(
+    projectId: string,
+    input: {
+      name?: string;
+      workspaceRoot?: string | null;
+      pinned?: boolean;
+      sortOrder?: number;
+    },
+  ): Promise<Project> {
+    return this.patch(`/api/projects/${projectId}`, input);
+  }
+
+  async deleteProject(projectId: string): Promise<void> {
+    return this.delete(`/api/projects/${projectId}`);
+  }
+
+  async listThreads(includeArchived = false): Promise<Thread[]> {
+    return this.get(
+      `/api/threads${queryString({
+        includeArchived: includeArchived ? "true" : undefined,
+      })}`,
+    );
   }
 
   async createThread(input: {
     title?: string;
     workspaceRoot?: string;
+    projectId?: string;
   }): Promise<Thread> {
     return this.post("/api/threads", input);
+  }
+
+  async updateThread(
+    threadId: string,
+    input: {
+      title?: string;
+      projectId?: string | null;
+      archivedAt?: string | null;
+    },
+  ): Promise<Thread> {
+    return this.patch(`/api/threads/${threadId}`, input);
+  }
+
+  async deleteThread(threadId: string): Promise<void> {
+    return this.delete(`/api/threads/${threadId}`);
   }
 
   async listMessages(threadId: string): Promise<Message[]> {
     return this.get(`/api/threads/${threadId}/messages`);
   }
 
-  async sendMessage(threadId: string, content: string): Promise<Message> {
-    return this.post(`/api/threads/${threadId}/messages`, { content });
+  async sendMessage(
+    threadId: string,
+    content: string,
+    sourcePaths: string[] = [],
+    skillIds: string[] = [],
+  ): Promise<Message> {
+    return this.post(`/api/threads/${threadId}/messages`, {
+      content,
+      sourcePaths,
+      skillIds,
+    });
   }
 
   async getTurnStatus(threadId: string): Promise<TurnStatus | null> {
     return this.get(`/api/threads/${threadId}/turn`);
+  }
+
+  async listSubagents(threadId: string): Promise<SubagentRun[]> {
+    return this.get(`/api/threads/${threadId}/subagents`);
+  }
+
+  async spawnSubagent(
+    threadId: string,
+    input: {
+      name: string;
+      input: string;
+      parentTurnId?: string;
+      depth?: number;
+    },
+  ): Promise<SubagentRun> {
+    return this.post(`/api/threads/${threadId}/subagents`, input);
+  }
+
+  async sendSubagentInput(
+    threadId: string,
+    runId: string,
+    input: string,
+  ): Promise<void> {
+    return this.post(`/api/threads/${threadId}/subagents/${runId}/input`, {
+      input,
+    });
+  }
+
+  async cancelSubagent(threadId: string, runId: string): Promise<void> {
+    return this.post(`/api/threads/${threadId}/subagents/${runId}/cancel`, {});
   }
 
   async cancelTurn(
@@ -239,6 +341,34 @@ export class ApiClient {
     return this.get(`/api/threads/${threadId}/workspace/diff`);
   }
 
+  async runGitWorkflow(
+    threadId: string,
+    action: GitWorkflowAction,
+  ): Promise<GitWorkflowResponse> {
+    const result = await this.post<GitWorkflowResponse>(
+      `/api/threads/${threadId}/git`,
+      action,
+    );
+    if (!result.success) throw new Error(gitFailureMessage(result));
+    return result;
+  }
+
+  async getGitStatus(threadId: string): Promise<GitStatusSummary> {
+    const result = await this.runGitWorkflow(threadId, {
+      type: "status",
+      request: { includeUntracked: true },
+    });
+    return parseGitStatus(result.stdout);
+  }
+
+  async listGitBranches(threadId: string): Promise<GitBranchInfo[]> {
+    const result = await this.runGitWorkflow(threadId, {
+      type: "list_branches",
+      request: { includeRemote: true },
+    });
+    return parseGitBranches(result.stdout);
+  }
+
   async revertWorkspaceFile(
     threadId: string,
     path: string,
@@ -340,7 +470,7 @@ export class ApiClient {
     serverId: string,
     toolName: string,
     args: unknown,
-    threadId?: string,
+    threadId: string,
   ): Promise<McpCallResult> {
     return this.post(`/api/mcp/servers/${serverId}/call-tool`, {
       toolName,
@@ -407,6 +537,14 @@ export class ApiClient {
       method: "PUT",
       headers: this.authHeaders(true),
       body: JSON.stringify(body),
+    });
+    return parseResponse<T>(response);
+  }
+
+  private async delete<T>(path: string): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: "DELETE",
+      headers: this.authHeaders(),
     });
     return parseResponse<T>(response);
   }
@@ -542,7 +680,9 @@ async function parseResponse<T>(response: Response): Promise<T> {
     const text = await response.text();
     throw new Error(text || `${response.status} ${response.statusText}`);
   }
-  return response.json() as Promise<T>;
+  if (response.status === 204) return undefined as T;
+  const text = await response.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 function queryString(
@@ -554,4 +694,91 @@ function queryString(
   }
   const query = params.toString();
   return query ? `?${query}` : "";
+}
+
+export function parseGitStatus(output: string): GitStatusSummary {
+  let branch: string | null = null;
+  let upstream: string | null = null;
+  let detached = false;
+  let ahead = 0;
+  let behind = 0;
+  let changed = 0;
+  let staged = 0;
+  let unstaged = 0;
+  let untracked = 0;
+
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("# branch.head ")) {
+      const value = line.slice("# branch.head ".length).trim();
+      detached = value === "(detached)" || value === "(unknown)";
+      branch = detached || !value ? null : value;
+      continue;
+    }
+    if (line.startsWith("# branch.upstream ")) {
+      upstream = line.slice("# branch.upstream ".length).trim() || null;
+      continue;
+    }
+    if (line.startsWith("# branch.ab ")) {
+      const match = line.match(/^# branch\.ab \+(\d+) -(\d+)$/);
+      if (match) {
+        ahead = Number(match[1]);
+        behind = Number(match[2]);
+      }
+      continue;
+    }
+    if (line.startsWith("? ")) {
+      changed += 1;
+      untracked += 1;
+      continue;
+    }
+    if (!/^[12u] /.test(line)) continue;
+    const xy = line.slice(2, 4);
+    if (xy.length !== 2) continue;
+    changed += 1;
+    if (xy[0] !== ".") staged += 1;
+    if (xy[1] !== ".") unstaged += 1;
+  }
+
+  return {
+    branch,
+    upstream,
+    detached,
+    ahead,
+    behind,
+    changed,
+    staged,
+    unstaged,
+    untracked,
+    raw: output,
+  };
+}
+
+export function parseGitBranches(output: string): GitBranchInfo[] {
+  const branches: GitBranchInfo[] = [];
+  for (const [index, rawLine] of output.split(/\r?\n/).entries()) {
+    if (!rawLine) continue;
+    const fields = rawLine.split("\0");
+    if (fields.length !== 5 || !fields[0] || !fields[1]) {
+      throw new Error(`无法解析第 ${index + 1} 条 Git 分支记录`);
+    }
+    branches.push({
+      fullRef: fields[0],
+      name: fields[1],
+      current: fields[2] === "*",
+      remote: fields[0].startsWith("refs/remotes/"),
+      upstream: fields[3] || null,
+      symbolicTarget: fields[4] || null,
+    });
+  }
+  return branches.sort((left, right) => {
+    if (left.current !== right.current) return left.current ? -1 : 1;
+    if (left.remote !== right.remote) return left.remote ? 1 : -1;
+    return left.name.localeCompare(right.name);
+  });
+}
+
+function gitFailureMessage(result: GitWorkflowResponse): string {
+  const detail = result.stderr.trim() || result.stdout.trim();
+  const exit = result.exitCode === null ? "未知退出码" : `退出码 ${result.exitCode}`;
+  return detail || `Git ${result.action} 执行失败（${exit}）`;
 }

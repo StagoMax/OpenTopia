@@ -4,6 +4,12 @@ This MVP is the first executable slice of the architecture described in `docs/ai
 
 The concrete source borrowing map is maintained in `docs/source-adaptation-map.md`.
 The remaining implementation slices are tracked in `docs/implementation-backlog.md`.
+Product delivery order is tracked in GitHub
+[Roadmap #4](https://github.com/StagoMax/OpenTopia/issues/4). The local MVP for
+[#3 Project/Thread model](https://github.com/StagoMax/OpenTopia/issues/3) is complete;
+[#1 attachments/sources/Skills context](https://github.com/StagoMax/OpenTopia/issues/1),
+and [#2 subagent runtime](https://github.com/StagoMax/OpenTopia/issues/2) retain
+their multimodal, approval, and resource-budget follow-up work.
 
 ## What Exists
 
@@ -21,7 +27,8 @@ Implemented:
 - Built-in `list_files`, `read_file`, `write_file`, `search`, `shell`, `git_diff`, and `apply_patch` tools.
 - OpenAI-compatible provider with mock fallback.
 - Settings, MCP, sandbox, and workspace workbench shared types.
-- Context summary and compaction event shared type for future budget management.
+- Context summary, compaction, and provider-reported token-usage event types used by
+  the active context-budget runtime.
 - Deterministic command parser for `/list`, `/read`, `/search`, `/write`, `/run`, `/diff`, `/patch`.
 - Explicit MCP command parser for `/mcp server__tool {json}` after MCP tools are synced into the agent registry.
 - `ExecutionEnvironment` trait and `LocalExecutionEnvironment` with file read/write/exec/apply_patch.
@@ -52,10 +59,24 @@ Implemented:
 - `POST /api/provider/test`
 - `GET /api/threads`
 - `POST /api/threads`
+- `PATCH /api/threads/{thread_id}`
+- `DELETE /api/threads/{thread_id}`
+- `GET /api/projects`
+- `POST /api/projects`
+- `PATCH /api/projects/{project_id}`
+- `DELETE /api/projects/{project_id}`
+- `GET /api/skills?workspaceRoot=...`
 - `GET /api/threads/{thread_id}/messages`
 - `POST /api/threads/{thread_id}/messages`
 - `GET /api/threads/{thread_id}/events`
 - `GET /api/threads/{thread_id}/events/stream`
+- `GET /api/threads/{thread_id}/turn`
+- `POST /api/threads/{thread_id}/turn/cancel`
+- `GET /api/threads/{thread_id}/subagents`
+- `POST /api/threads/{thread_id}/subagents`
+- `POST /api/threads/{thread_id}/subagents/{run_id}/input`
+- `POST /api/threads/{thread_id}/subagents/{run_id}/cancel`
+- `POST /api/threads/{thread_id}/subagents/{run_id}/wait`
 - `GET /api/threads/{thread_id}/workspace/tree`
 - `GET /api/threads/{thread_id}/workspace/file`
 - `GET /api/threads/{thread_id}/workspace/diff`
@@ -67,10 +88,15 @@ Implemented:
 - `GET /api/threads/{thread_id}/artifacts/{artifact_id}`
 - `GET /api/threads/{thread_id}/context`
 - `POST /api/threads/{thread_id}/context/compact`
+- `POST /api/threads/{thread_id}/git`
 - `POST /api/threads/{thread_id}/terminal/commands`
 - `POST /api/threads/{thread_id}/terminal/cancel`
 - `GET /api/threads/{thread_id}/terminal/history`
 - `GET /api/threads/{thread_id}/terminal/stream`
+- `GET|POST /api/threads/{thread_id}/terminal/session`
+- `POST /api/threads/{thread_id}/terminal/session/input`
+- `POST /api/threads/{thread_id}/terminal/session/resize`
+- `POST /api/threads/{thread_id}/terminal/session/close`
 - `GET /api/threads/{thread_id}/approvals?status=pending`
 - `POST /api/threads/{thread_id}/approvals/{approval_id}/decision`
 - `GET /api/mcp/servers`
@@ -85,12 +111,17 @@ Implemented:
 
 Events are persisted in SQLite and also broadcast through SSE.
 Approval requests are stored in SQLite with `pending`, `approved`, or `denied` status so unresolved requests can be recovered after a server restart.
-Settings and MCP server configurations are persisted in SQLite. MCP stdio servers can be restarted from the API, tools can be listed from the host cache, and MCP tools can be called through the server route.
+Settings and MCP server configurations are persisted in SQLite. MCP stdio servers
+run through the configured OS sandbox, receive only a minimal environment plus
+explicit `envKeys`, refresh `tools/list_changed`, and expose tools only to Threads
+where the server is enabled. Direct calls require a Thread and use its policy/timeline.
 Artifacts are indexed in SQLite and trajectory export includes artifact metadata.
 Large read/search/shell outputs can surface artifact metadata for UI retrieval.
 Context compaction calls the active OpenAI-compatible provider, records durable
 summary metadata, and injects the latest summary into later model turns. An
-explicit manual summary remains supported.
+explicit manual summary remains supported. Provider streaming usage is parsed into
+persisted `token_usage` events; automatic compaction separately uses the configured
+context-window estimate and threshold before bounded-history trimming.
 
 ### Rust CLI
 
@@ -129,6 +160,16 @@ Implemented:
 - SQLite-backed terminal history and cancellation/timeout process-tree cleanup.
 - Artifact gallery, quick artifact preview, context status, explicit-confirm file revert,
   and staged/unstaged hunk stage/unstage/discard.
+- First-class SQLite Project/Thread ownership, normalized workspace uniqueness,
+  archive/delete/rename/pin flows, and migration from the former renderer-only projection.
+- Explicit file/image/document source selection through Electron, server-side canonicalization,
+  sensitive/type/size limits, message-persisted references, bounded text context, and right-rail recovery.
+- Turn-scoped Codex-compatible Skills discovery/selection and bounded `SKILL.md` injection.
+- Real persistent subagents with AgentCore execution, concurrency/depth/timeout limits,
+  recursive cancellation, model-callable lifecycle tools, HTTP controls, SSE, and right-rail UI.
+- Sandboxed Git workflow API for branch/status/commit/push/compare/worktree actions,
+  plus desktop status/branch/create/switch/commit/push/compare controls. Worktree UI,
+  PR creation, and GitHub CLI remain follow-up work.
 - Electron `safeStorage` provider API-key storage: renderer can set/delete the
   provider key and list metadata only; the secret value stays in the main
   process and is injected into the spawned Rust server as `OPENTOPIA_API_KEY`
@@ -204,6 +245,13 @@ The current MVP intentionally does not yet include:
 - Production release signing, notarization, and update publication credentials.
 - Multiple named PTY sessions and shell selection; one long-lived PTY per thread is implemented.
 - Product-specific GitHub/Linear/Jira/browser/document connectors beyond the MCP host.
+- Provider-native image input and PDF/Office extraction; verified binary sources currently
+  contribute metadata only and are never coerced into text.
+- Automatic re-reading of historical attachment contents. Source references remain visible
+  and durable, while bounded text content applies to the Turn where the source was selected.
+- Child-agent approval continuation UI and per-child token budgets. Child approval currently
+  fails closed and returns control to the parent.
+- Worktree desktop controls, PR/GitHub CLI, and an embedded browser.
 
 Those are next slices; the interfaces are already shaped so they can be added without replacing the full skeleton.
 
@@ -224,6 +272,9 @@ Requirements implemented for the local runtime:
 - `workspace-write` is the desktop default, blocks direct network access by
   default, and supports additional `writable_roots` without broad full access.
 - Built-in file writes and spawned commands consume the same boundary.
+- One-shot terminal commands, long-lived PTY sessions, Git actions, and MCP stdio
+  processes use that same OS sandbox command plan. App/model API keys are scrubbed
+  from ordinary child processes; MCP secrets require explicit `envKeys`.
 - `.git`, `.agents`, and `.codex` remain protected beneath writable roots.
 - `best-effort` versus `enforce` describes backend fallback only. Packaged
   execution must use `enforce`; development may use visible `best-effort` fallback.
@@ -233,9 +284,10 @@ Requirements implemented for the local runtime:
   continuation executes that call once with an unrestricted environment, then
   subsequent calls return to the configured sandbox.
 
-The sandbox workbench reports the effective profile and roots. Changing these
-values from the composer/settings UI is a remaining product slice; the current
-runtime uses `OPENTOPIA_SANDBOX_*` configuration. On Linux, protected metadata is
+The sandbox workbench reports the effective profile and roots. Sandbox mode,
+enforcement, network, readable paths, and writable roots persist in `AppSettings` and
+can be changed from Composer or Settings; environment values seed first-run defaults.
+On Linux, protected metadata is
 fully checked for built-in file tools and existing metadata mounts; first creation
 of a missing metadata directory by a spawned command remains part of the planned
 Landlock hardening.
@@ -246,9 +298,12 @@ Docker/remote sandbox is intentionally deferred for now, sharing the same `Execu
 
 Recommended order:
 
-1. Run native Linux/macOS sandbox integration suites and add resource quotas.
-2. Add product-specific work-tool connectors through MCP.
-3. Add production signing, notarization, and update publication CI when distribution begins.
+1. Finish provider-native image/document context and child-agent approval/token hardening.
+2. Add worktree controls and PR/GitHub CLI on top of the completed desktop Git workflow.
+3. Add PR/GitHub CLI, embedded browser, and first product-specific connectors tracked in Roadmap #4.
+4. Run native Linux/macOS sandbox integration suites and add resource quotas.
+
+Docker/Remote execution and production signing/notarization/release publication remain deferred.
 
 ## Verification
 

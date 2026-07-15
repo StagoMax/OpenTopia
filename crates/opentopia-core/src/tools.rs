@@ -8,6 +8,7 @@ use crate::model::{ToolCall, ToolResult};
 use crate::policy::{PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
 use crate::sandbox::LocalSandboxConfig;
 use crate::store::SessionStore;
+use crate::subagents::{SpawnSubagentRequest, SubagentScheduler, SubagentScope};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -27,6 +28,9 @@ pub struct ToolContext {
     pub store: Option<Arc<dyn SessionStore>>,
     pub thread_id: Option<Uuid>,
     pub cancel: Option<CancellationToken>,
+    pub subagents: Option<SubagentScheduler>,
+    pub parent_turn_id: Option<Uuid>,
+    pub subagent_depth: u8,
 }
 
 impl ToolContext {
@@ -50,6 +54,9 @@ impl ToolContext {
             store: None,
             thread_id: None,
             cancel: None,
+            subagents: None,
+            parent_turn_id: None,
+            subagent_depth: 0,
         }
     }
 
@@ -65,6 +72,9 @@ impl ToolContext {
             store: None,
             thread_id: None,
             cancel: None,
+            subagents: None,
+            parent_turn_id: None,
+            subagent_depth: 0,
         }
     }
 
@@ -79,8 +89,8 @@ impl ToolContext {
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
     fn schema(&self) -> Value;
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult>;
 }
@@ -100,6 +110,10 @@ impl ToolRegistry {
         tools.insert("shell".to_string(), Arc::new(ShellTool));
         tools.insert("git_diff".to_string(), Arc::new(GitDiffTool));
         tools.insert("apply_patch".to_string(), Arc::new(ApplyPatchTool));
+        tools.insert("spawn_agent".to_string(), Arc::new(SpawnAgentTool));
+        tools.insert("send_input".to_string(), Arc::new(SendAgentInputTool));
+        tools.insert("cancel_agent".to_string(), Arc::new(CancelAgentTool));
+        tools.insert("wait_agent".to_string(), Arc::new(WaitAgentTool));
         Self {
             tools: Arc::new(tools),
         }
@@ -119,15 +133,234 @@ impl ToolRegistry {
     }
 }
 
+pub struct SpawnAgentTool;
+
+#[async_trait]
+impl Tool for SpawnAgentTool {
+    fn name(&self) -> &str {
+        "spawn_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Start a bounded child agent that inherits the current workspace, provider, permissions, and sandbox."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Short worker name." },
+                "input": { "type": "string", "description": "Concrete task for the child agent." }
+            },
+            "required": ["name", "input"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = ctx
+            .subagents
+            .as_ref()
+            .context("subagent runtime is unavailable")?;
+        let thread_id = ctx
+            .thread_id
+            .context("subagent parent thread is unavailable")?;
+        let parent_turn_id = ctx
+            .parent_turn_id
+            .context("subagent parent turn is unavailable")?;
+        let name = required_string(&call.input, "name")?;
+        let input = required_string(&call.input, "input")?;
+        let run = scheduler.spawn(SpawnSubagentRequest {
+            parent_thread_id: thread_id,
+            parent_turn_id,
+            name,
+            input,
+            depth: ctx.subagent_depth.saturating_add(1),
+        })?;
+        Ok(ToolResult {
+            call_id: call.id,
+            output: serde_json::to_string(&run)?,
+            metadata: json!({
+                "toolName": self.name(),
+                "runId": run.id,
+                "status": run.status,
+                "success": true
+            }),
+        })
+    }
+}
+
+pub struct SendAgentInputTool;
+
+#[async_trait]
+impl Tool for SendAgentInputTool {
+    fn name(&self) -> &str {
+        "send_input"
+    }
+
+    fn description(&self) -> &str {
+        "Send additional input to an active child agent."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "runId": { "type": "string", "description": "Child run UUID." },
+                "input": { "type": "string", "description": "Additional instructions." }
+            },
+            "required": ["runId", "input"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = ctx
+            .subagents
+            .as_ref()
+            .context("subagent runtime is unavailable")?;
+        let run_id = required_uuid(&call.input, "runId")?;
+        scheduler.send_input_scoped(
+            subagent_scope(&ctx)?,
+            run_id,
+            required_string(&call.input, "input")?,
+        )?;
+        Ok(ToolResult {
+            call_id: call.id,
+            output: format!("Input delivered to subagent {run_id}."),
+            metadata: json!({ "toolName": self.name(), "runId": run_id, "success": true }),
+        })
+    }
+}
+
+pub struct CancelAgentTool;
+
+#[async_trait]
+impl Tool for CancelAgentTool {
+    fn name(&self) -> &str {
+        "cancel_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Cancel an active child agent."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "runId": { "type": "string", "description": "Child run UUID." } },
+            "required": ["runId"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = ctx
+            .subagents
+            .as_ref()
+            .context("subagent runtime is unavailable")?;
+        let run_id = required_uuid(&call.input, "runId")?;
+        scheduler.cancel_scoped(subagent_scope(&ctx)?, run_id)?;
+        Ok(ToolResult {
+            call_id: call.id,
+            output: format!("Cancellation requested for subagent {run_id}."),
+            metadata: json!({ "toolName": self.name(), "runId": run_id, "success": true }),
+        })
+    }
+}
+
+pub struct WaitAgentTool;
+
+#[async_trait]
+impl Tool for WaitAgentTool {
+    fn name(&self) -> &str {
+        "wait_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Wait for a child agent to finish and return its persisted status and result."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "runId": { "type": "string", "description": "Child run UUID." },
+                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 120000 }
+            },
+            "required": ["runId"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = ctx
+            .subagents
+            .as_ref()
+            .context("subagent runtime is unavailable")?;
+        let run_id = required_uuid(&call.input, "runId")?;
+        let timeout_ms = call
+            .input
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .clamp(1, 120_000);
+        let run = scheduler
+            .wait_scoped(
+                subagent_scope(&ctx)?,
+                run_id,
+                Duration::from_millis(timeout_ms),
+            )
+            .await?;
+        Ok(ToolResult {
+            call_id: call.id,
+            output: serde_json::to_string(&run)?,
+            metadata: json!({
+                "toolName": self.name(),
+                "runId": run_id,
+                "status": run.status,
+                "success": run.status.is_terminal()
+            }),
+        })
+    }
+}
+
+fn subagent_scope(ctx: &ToolContext) -> anyhow::Result<SubagentScope> {
+    Ok(SubagentScope {
+        thread_id: ctx
+            .thread_id
+            .context("subagent parent thread is unavailable")?,
+        parent_turn_id: ctx
+            .parent_turn_id
+            .context("subagent parent turn is unavailable")?,
+        depth: ctx.subagent_depth,
+    })
+}
+
+fn required_string(input: &Value, key: &str) -> anyhow::Result<String> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("{key} must be a non-empty string"))
+}
+
+fn required_uuid(input: &Value, key: &str) -> anyhow::Result<Uuid> {
+    let value = required_string(input, key)?;
+    Uuid::parse_str(&value).with_context(|| format!("{key} must be a UUID"))
+}
+
 pub struct ListFilesTool;
 
 #[async_trait]
 impl Tool for ListFilesTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "list_files"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "List direct children of a directory inside the workspace."
     }
 
@@ -171,11 +404,11 @@ const READ_FILE_ARTIFACT_THRESHOLD: usize = 64_000;
 
 #[async_trait]
 impl Tool for ReadFileTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "read_file"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read a UTF-8 text file inside the workspace."
     }
 
@@ -258,11 +491,11 @@ pub struct WriteFileTool;
 
 #[async_trait]
 impl Tool for WriteFileTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "write_file"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Write a UTF-8 text file inside the workspace."
     }
 
@@ -324,11 +557,11 @@ const FALLBACK_MAX_FILE_BYTES: u64 = 1_048_576;
 
 #[async_trait]
 impl Tool for SearchTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "search"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Search workspace text with ripgrep, falling back to a simple substring scan."
     }
 
@@ -459,11 +692,11 @@ const ARTIFACT_THRESHOLD: usize = 16_000;
 
 #[async_trait]
 impl Tool for ShellTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "shell"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Run a shell command in the workspace with timeout and output caps."
     }
 
@@ -573,11 +806,11 @@ pub struct GitDiffTool;
 
 #[async_trait]
 impl Tool for GitDiffTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "git_diff"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Show the current git diff for the workspace."
     }
 
@@ -619,11 +852,11 @@ pub struct ApplyPatchTool;
 
 #[async_trait]
 impl Tool for ApplyPatchTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "apply_patch"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Apply a unified diff patch to files in the workspace using git apply."
     }
 
@@ -1016,26 +1249,11 @@ fn truncate(value: &str, max_chars: usize) -> String {
 pub struct McpToolWrapper {
     host: McpExtensionHost,
     descriptor: McpToolDescriptor,
-    leaked_name: &'static str,
-    leaked_description: &'static str,
 }
 
 impl McpToolWrapper {
     pub fn new(host: McpExtensionHost, descriptor: McpToolDescriptor) -> Self {
-        let leaked_name = Box::leak(descriptor.public_name.clone().into_boxed_str());
-        let leaked_description = Box::leak(
-            descriptor
-                .description
-                .clone()
-                .unwrap_or_default()
-                .into_boxed_str(),
-        );
-        Self {
-            host,
-            descriptor,
-            leaked_name,
-            leaked_description,
-        }
+        Self { host, descriptor }
     }
 
     pub fn descriptor(&self) -> &McpToolDescriptor {
@@ -1045,12 +1263,12 @@ impl McpToolWrapper {
 
 #[async_trait]
 impl Tool for McpToolWrapper {
-    fn name(&self) -> &'static str {
-        self.leaked_name
+    fn name(&self) -> &str {
+        &self.descriptor.public_name
     }
 
-    fn description(&self) -> &'static str {
-        self.leaked_description
+    fn description(&self) -> &str {
+        self.descriptor.description.as_deref().unwrap_or_default()
     }
 
     fn schema(&self) -> Value {
@@ -1085,7 +1303,56 @@ impl Tool for McpToolWrapper {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_sandbox_denial;
+    use super::*;
+    use crate::policy::{BasicPolicyEngine, PermissionMode};
+    use crate::subagents::{
+        NoopSubagentObserver, SubagentExecutor, SubagentRun, SubagentSchedulerConfig,
+    };
+    use tokio::sync::mpsc;
+
+    struct PendingExecutor;
+
+    #[async_trait]
+    impl SubagentExecutor for PendingExecutor {
+        async fn execute(
+            &self,
+            _run: SubagentRun,
+            _input: mpsc::UnboundedReceiver<String>,
+            cancellation: CancellationToken,
+        ) -> anyhow::Result<String> {
+            cancellation.cancelled().await;
+            anyhow::bail!("cancelled")
+        }
+    }
+
+    fn test_scheduler() -> SubagentScheduler {
+        SubagentScheduler::new(
+            SubagentSchedulerConfig {
+                max_concurrency_per_parent: 1,
+                max_depth: 2,
+                timeout: Duration::from_secs(10),
+            },
+            Arc::new(PendingExecutor),
+            Arc::new(NoopSubagentObserver),
+        )
+    }
+
+    fn tool_context(
+        scheduler: SubagentScheduler,
+        thread_id: Uuid,
+        parent_turn_id: Uuid,
+    ) -> ToolContext {
+        let workspace_root = std::env::current_dir().unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut context = ToolContext::local(workspace_root, policy);
+        context.subagents = Some(scheduler);
+        context.thread_id = Some(thread_id);
+        context.parent_turn_id = Some(parent_turn_id);
+        context
+    }
 
     #[test]
     fn detects_common_cross_platform_sandbox_denials() {
@@ -1098,5 +1365,43 @@ mod tests {
         assert!(looks_like_sandbox_denial("Operation not permitted"));
         assert!(looks_like_sandbox_denial("Network is unreachable"));
         assert!(!looks_like_sandbox_denial("cargo test failed"));
+    }
+
+    #[tokio::test]
+    async fn model_subagent_tools_enforce_thread_and_parent_scope() {
+        let scheduler = test_scheduler();
+        let target_thread = Uuid::new_v4();
+        let target_parent = Uuid::new_v4();
+        let run = scheduler
+            .spawn(SpawnSubagentRequest {
+                parent_thread_id: target_thread,
+                parent_turn_id: target_parent,
+                name: "owned".to_string(),
+                input: "work".to_string(),
+                depth: 1,
+            })
+            .unwrap();
+
+        let cross_thread = tool_context(scheduler.clone(), Uuid::new_v4(), target_parent);
+        let error = SendAgentInputTool
+            .execute(
+                ToolCall::new("send_input", json!({ "runId": run.id, "input": "intrude" })),
+                cross_thread,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("subagent run not found"));
+
+        let wrong_parent = tool_context(scheduler.clone(), target_thread, Uuid::new_v4());
+        let error = WaitAgentTool
+            .execute(
+                ToolCall::new("wait_agent", json!({ "runId": run.id, "timeoutMs": 5 })),
+                wrong_parent,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("subagent run not found"));
+
+        scheduler.cancel(run.id).unwrap();
     }
 }

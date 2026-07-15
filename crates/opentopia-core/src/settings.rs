@@ -1,6 +1,7 @@
 use crate::policy::PermissionMode;
+use crate::sandbox::{LocalSandboxConfig, NetworkPolicy, OsSandboxMode, SandboxMode};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +79,188 @@ impl ProviderSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxEnforcement {
+    Disabled,
+    BestEffort,
+    Enforce,
+}
+
+impl Default for SandboxEnforcement {
+    fn default() -> Self {
+        Self::Enforce
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxSettings {
+    pub sandbox_mode: SandboxMode,
+    pub enforcement: SandboxEnforcement,
+    pub network: NetworkPolicy,
+    pub writable_roots: Vec<PathBuf>,
+    pub read_paths: Vec<PathBuf>,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            sandbox_mode: SandboxMode::WorkspaceWrite,
+            enforcement: SandboxEnforcement::Enforce,
+            network: NetworkPolicy::Deny,
+            writable_roots: Vec::new(),
+            read_paths: Vec::new(),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SandboxSettingsWire {
+    sandbox_mode: Option<String>,
+    enforcement: Option<String>,
+    network: Option<String>,
+    writable_roots: Vec<PathBuf>,
+    read_paths: Vec<PathBuf>,
+}
+
+impl<'de> Deserialize<'de> for SandboxSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SandboxSettingsWire::deserialize(deserializer)?;
+        let defaults = Self::default();
+        let sandbox_mode = wire
+            .sandbox_mode
+            .as_deref()
+            .map(parse_sandbox_mode)
+            .unwrap_or(Some(defaults.sandbox_mode));
+        let enforcement = wire
+            .enforcement
+            .as_deref()
+            .map(parse_sandbox_enforcement)
+            .unwrap_or(Some(defaults.enforcement));
+        let network = wire
+            .network
+            .as_deref()
+            .map(parse_sandbox_network)
+            .unwrap_or(Some(defaults.network));
+
+        match (sandbox_mode, enforcement, network) {
+            (Some(sandbox_mode), Some(enforcement), Some(network)) => Ok(Self {
+                sandbox_mode,
+                enforcement,
+                network,
+                writable_roots: wire.writable_roots,
+                read_paths: wire.read_paths,
+            }),
+            _ => Ok(Self::fail_safe(wire.writable_roots, wire.read_paths)),
+        }
+    }
+}
+
+impl SandboxSettings {
+    pub fn from_env() -> Self {
+        let writable_roots = env_path_list("OPENTOPIA_SANDBOX_WRITABLE_ROOTS");
+        let read_paths = env_path_list("OPENTOPIA_SANDBOX_READ_PATHS");
+        let mode_value = std::env::var("OPENTOPIA_SANDBOX_MODE")
+            .unwrap_or_else(|_| "workspace-write".to_string());
+        let normalized_mode = normalize_sandbox_value(&mode_value);
+        let (legacy_enforcement, sandbox_mode) = match normalized_mode.as_str() {
+            "enforce" | "strict" => (
+                Some(SandboxEnforcement::Enforce),
+                SandboxMode::WorkspaceWrite,
+            ),
+            "best-effort" => (
+                Some(SandboxEnforcement::BestEffort),
+                SandboxMode::WorkspaceWrite,
+            ),
+            "disabled" => (
+                Some(SandboxEnforcement::Disabled),
+                SandboxMode::DangerFullAccess,
+            ),
+            _ => match parse_sandbox_mode(&normalized_mode) {
+                Some(sandbox_mode) => (None, sandbox_mode),
+                None => return Self::fail_safe(writable_roots, read_paths),
+            },
+        };
+
+        let enforcement = match std::env::var("OPENTOPIA_SANDBOX_ENFORCEMENT") {
+            Ok(value) => match parse_sandbox_enforcement(&value) {
+                Some(enforcement) => enforcement,
+                None => return Self::fail_safe(writable_roots, read_paths),
+            },
+            Err(_) => legacy_enforcement.unwrap_or_else(|| {
+                if sandbox_mode == SandboxMode::DangerFullAccess {
+                    SandboxEnforcement::Disabled
+                } else {
+                    SandboxEnforcement::Enforce
+                }
+            }),
+        };
+        let network = match std::env::var("OPENTOPIA_SANDBOX_NETWORK") {
+            Ok(value) => match parse_sandbox_network(&value) {
+                Some(network) => network,
+                None => return Self::fail_safe(writable_roots, read_paths),
+            },
+            Err(_) if sandbox_mode == SandboxMode::DangerFullAccess => NetworkPolicy::Allow,
+            Err(_) => NetworkPolicy::Deny,
+        };
+
+        Self {
+            sandbox_mode,
+            enforcement,
+            network,
+            writable_roots,
+            read_paths,
+        }
+    }
+
+    pub fn to_local_sandbox_config(&self) -> LocalSandboxConfig {
+        if self.sandbox_mode == SandboxMode::DangerFullAccess {
+            return LocalSandboxConfig {
+                read_paths: self.read_paths.clone(),
+                writable_roots: self.writable_roots.clone(),
+                ..LocalSandboxConfig::danger_full_access()
+            };
+        }
+
+        let mode = match self.enforcement {
+            SandboxEnforcement::Disabled => OsSandboxMode::Disabled,
+            SandboxEnforcement::BestEffort => OsSandboxMode::BestEffort,
+            SandboxEnforcement::Enforce => OsSandboxMode::Enforce,
+        };
+        LocalSandboxConfig {
+            enabled: mode != OsSandboxMode::Disabled,
+            mode,
+            network: self.network,
+            read_paths: self.read_paths.clone(),
+            write_paths: Vec::new(),
+            sandbox_mode: self.sandbox_mode,
+            writable_roots: self.writable_roots.clone(),
+            sandbox_home: None,
+        }
+    }
+
+    fn fail_safe(writable_roots: Vec<PathBuf>, read_paths: Vec<PathBuf>) -> Self {
+        Self {
+            sandbox_mode: SandboxMode::ReadOnly,
+            enforcement: SandboxEnforcement::Enforce,
+            network: NetworkPolicy::Deny,
+            writable_roots,
+            read_paths,
+        }
+    }
+}
+
+impl From<&SandboxSettings> for LocalSandboxConfig {
+    fn from(settings: &SandboxSettings) -> Self {
+        settings.to_local_sandbox_config()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -88,6 +271,8 @@ pub struct AppSettings {
     pub permission_mode: PermissionMode,
     #[serde(default)]
     pub default_workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    pub sandbox: SandboxSettings,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -99,6 +284,7 @@ impl AppSettings {
             active_provider_id: provider.id.clone(),
             permission_mode,
             default_workspace_root: None,
+            sandbox: SandboxSettings::from_env(),
             updated_at: Utc::now(),
         }
     }
@@ -186,4 +372,182 @@ fn first_env_with_key<const N: usize>(keys: [&str; N]) -> Option<(String, String
             .filter(|value| !value.is_empty())
             .map(|value| (key.to_string(), value))
     })
+}
+
+fn normalize_sandbox_value(value: &str) -> String {
+    value.to_ascii_lowercase().replace('_', "-")
+}
+
+fn parse_sandbox_mode(value: &str) -> Option<SandboxMode> {
+    match normalize_sandbox_value(value).as_str() {
+        "read-only" => Some(SandboxMode::ReadOnly),
+        "workspace-write" => Some(SandboxMode::WorkspaceWrite),
+        "danger-full-access" => Some(SandboxMode::DangerFullAccess),
+        _ => None,
+    }
+}
+
+fn parse_sandbox_enforcement(value: &str) -> Option<SandboxEnforcement> {
+    match normalize_sandbox_value(value).as_str() {
+        "disabled" => Some(SandboxEnforcement::Disabled),
+        "best-effort" => Some(SandboxEnforcement::BestEffort),
+        "enforce" | "strict" => Some(SandboxEnforcement::Enforce),
+        _ => None,
+    }
+}
+
+fn parse_sandbox_network(value: &str) -> Option<NetworkPolicy> {
+    match normalize_sandbox_value(value).as_str() {
+        "inherit" => Some(NetworkPolicy::Inherit),
+        "allow" => Some(NetworkPolicy::Allow),
+        "deny" => Some(NetworkPolicy::Deny),
+        _ => None,
+    }
+}
+
+fn env_path_list(name: &str) -> Vec<PathBuf> {
+    std::env::var_os(name)
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+
+    const SANDBOX_ENV_KEYS: [&str; 5] = [
+        "OPENTOPIA_SANDBOX_MODE",
+        "OPENTOPIA_SANDBOX_ENFORCEMENT",
+        "OPENTOPIA_SANDBOX_NETWORK",
+        "OPENTOPIA_SANDBOX_WRITABLE_ROOTS",
+        "OPENTOPIA_SANDBOX_READ_PATHS",
+    ];
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn cleared(keys: &'static [&'static str]) -> Self {
+            let values = keys
+                .iter()
+                .map(|key| {
+                    let value = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (*key, value)
+                })
+                .collect();
+            Self(values)
+        }
+
+        fn set(&self, key: &str, value: impl AsRef<OsStr>) {
+            std::env::set_var(key, value);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn old_app_settings_json_uses_sandbox_defaults() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "providers": [],
+                "activeProviderId": "",
+                "permissionMode": "auto",
+                "defaultWorkspaceRoot": null,
+                "updatedAt": "2026-01-01T00:00:00Z"
+            }"#,
+        )
+        .expect("deserialize settings without sandbox");
+
+        assert_eq!(settings.sandbox, SandboxSettings::default());
+    }
+
+    #[test]
+    fn sandbox_settings_from_env_uses_defaults_and_legacy_mode() {
+        let env = EnvGuard::cleared(&SANDBOX_ENV_KEYS);
+        let settings = AppSettings::from_env(PermissionMode::Auto);
+        assert_eq!(settings.sandbox, SandboxSettings::default());
+
+        env.set("OPENTOPIA_SANDBOX_MODE", "best_effort");
+        env.set("OPENTOPIA_SANDBOX_NETWORK", "inherit");
+        let writable_roots = [PathBuf::from("C:/workspace"), PathBuf::from("D:/scratch")];
+        let read_paths = [PathBuf::from("C:/reference")];
+        env.set(
+            "OPENTOPIA_SANDBOX_WRITABLE_ROOTS",
+            std::env::join_paths(&writable_roots).expect("join writable roots"),
+        );
+        env.set(
+            "OPENTOPIA_SANDBOX_READ_PATHS",
+            std::env::join_paths(&read_paths).expect("join read paths"),
+        );
+
+        let settings = SandboxSettings::from_env();
+        assert_eq!(settings.sandbox_mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(settings.enforcement, SandboxEnforcement::BestEffort);
+        assert_eq!(settings.network, NetworkPolicy::Inherit);
+        assert_eq!(settings.writable_roots, writable_roots);
+        assert_eq!(settings.read_paths, read_paths);
+    }
+
+    #[test]
+    fn sandbox_settings_convert_to_local_config() {
+        let settings = SandboxSettings {
+            sandbox_mode: SandboxMode::WorkspaceWrite,
+            enforcement: SandboxEnforcement::BestEffort,
+            network: NetworkPolicy::Inherit,
+            writable_roots: vec![PathBuf::from("C:/workspace")],
+            read_paths: vec![PathBuf::from("C:/reference")],
+        };
+
+        let config = settings.to_local_sandbox_config();
+        assert!(config.enabled);
+        assert_eq!(config.mode, OsSandboxMode::BestEffort);
+        assert_eq!(config.network, NetworkPolicy::Inherit);
+        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(config.writable_roots, settings.writable_roots);
+        assert_eq!(config.read_paths, settings.read_paths);
+        assert!(config.write_paths.is_empty());
+        assert_eq!(config.sandbox_home, None);
+    }
+
+    #[test]
+    fn danger_full_access_forces_disabled_enforcement_and_network_allow() {
+        let settings = SandboxSettings {
+            sandbox_mode: SandboxMode::DangerFullAccess,
+            enforcement: SandboxEnforcement::Enforce,
+            network: NetworkPolicy::Deny,
+            ..SandboxSettings::default()
+        };
+
+        let config = settings.to_local_sandbox_config();
+        assert!(!config.enabled);
+        assert_eq!(config.mode, OsSandboxMode::Disabled);
+        assert_eq!(config.network, NetworkPolicy::Allow);
+        assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
+    }
+
+    #[test]
+    fn invalid_sandbox_settings_fail_safe() {
+        let settings: SandboxSettings = serde_json::from_str(
+            r#"{
+                "sandboxMode": "workspace-write",
+                "enforcement": "unexpected",
+                "network": "allow"
+            }"#,
+        )
+        .expect("invalid settings should deserialize to a safe configuration");
+
+        assert_eq!(settings.sandbox_mode, SandboxMode::ReadOnly);
+        assert_eq!(settings.enforcement, SandboxEnforcement::Enforce);
+        assert_eq!(settings.network, NetworkPolicy::Deny);
+    }
 }
