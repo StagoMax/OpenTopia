@@ -2,7 +2,8 @@ use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
 use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    AgentEventPayload, Message, MessageRole, ModelContentPart, TaskPlan, ToolCall, ToolResult,
+    AgentEventPayload, Message, MessageRole, ModelContentPart, TaskPlan, TaskPlanStepStatus,
+    ToolCall, ToolResult,
 };
 use crate::policy::{BasicPolicyEngine, PermissionMode};
 use crate::provider::{
@@ -20,6 +21,7 @@ use crate::tools::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,6 +30,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const DEFAULT_MAX_PROVIDER_TOOL_ROUNDS: usize = 8;
+const DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS: usize = 24;
+const DEFAULT_MAX_EQUIVALENT_TOOL_CALLS: usize = 3;
+const DEFAULT_MAX_OBSERVATION_TOOL_CALLS_WITHOUT_WORKSPACE_CHANGE: usize = 12;
+const MAX_COMPLETION_MODE_VIOLATIONS: usize = 2;
+const MAX_IMPLEMENTATION_MODE_VIOLATIONS: usize = 3;
 const DEFAULT_MAX_TURN_ELAPSED_MS: u64 = 15 * 60 * 1_000;
 
 pub type AgentEventSender = mpsc::UnboundedSender<AgentEventPayload>;
@@ -51,6 +58,12 @@ pub enum AgentTurnOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct AgentExecutionBudget {
     pub max_tool_rounds: usize,
+    #[serde(default = "default_max_total_tool_rounds")]
+    pub max_total_tool_rounds: usize,
+    #[serde(default = "default_max_equivalent_tool_calls")]
+    pub max_equivalent_tool_calls: usize,
+    #[serde(default = "default_max_observation_tool_calls_without_workspace_change")]
+    pub max_observation_tool_calls_without_workspace_change: usize,
     pub max_elapsed_ms: u64,
 }
 
@@ -58,6 +71,10 @@ impl Default for AgentExecutionBudget {
     fn default() -> Self {
         Self {
             max_tool_rounds: DEFAULT_MAX_PROVIDER_TOOL_ROUNDS,
+            max_total_tool_rounds: DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS,
+            max_equivalent_tool_calls: DEFAULT_MAX_EQUIVALENT_TOOL_CALLS,
+            max_observation_tool_calls_without_workspace_change:
+                DEFAULT_MAX_OBSERVATION_TOOL_CALLS_WITHOUT_WORKSPACE_CHANGE,
             max_elapsed_ms: DEFAULT_MAX_TURN_ELAPSED_MS,
         }
     }
@@ -66,6 +83,11 @@ impl Default for AgentExecutionBudget {
 impl AgentExecutionBudget {
     fn normalized(mut self) -> Self {
         self.max_tool_rounds = self.max_tool_rounds.max(1);
+        self.max_total_tool_rounds = self.max_total_tool_rounds.max(self.max_tool_rounds);
+        self.max_equivalent_tool_calls = self.max_equivalent_tool_calls.max(1);
+        self.max_observation_tool_calls_without_workspace_change = self
+            .max_observation_tool_calls_without_workspace_change
+            .max(1);
         self.max_elapsed_ms = self.max_elapsed_ms.max(1);
         self
     }
@@ -73,6 +95,7 @@ impl AgentExecutionBudget {
     fn status(
         &self,
         used_tool_rounds: usize,
+        total_tool_rounds: usize,
         started_at: Instant,
         context_budget: Option<&ContextBudget>,
     ) -> AgentBudgetStatus {
@@ -83,6 +106,14 @@ impl AgentExecutionBudget {
             max_tool_rounds: self.max_tool_rounds,
             used_tool_rounds,
             remaining_tool_rounds: self.max_tool_rounds.saturating_sub(used_tool_rounds),
+            max_total_tool_rounds: self.max_total_tool_rounds,
+            total_tool_rounds,
+            remaining_total_tool_rounds: self
+                .max_total_tool_rounds
+                .saturating_sub(total_tool_rounds),
+            max_equivalent_tool_calls: self.max_equivalent_tool_calls,
+            max_observation_tool_calls_without_workspace_change: self
+                .max_observation_tool_calls_without_workspace_change,
             max_elapsed_ms: self.max_elapsed_ms,
             elapsed_ms,
             remaining_time_ms: self.max_elapsed_ms.saturating_sub(elapsed_ms),
@@ -101,12 +132,56 @@ pub struct AgentBudgetStatus {
     pub max_tool_rounds: usize,
     pub used_tool_rounds: usize,
     pub remaining_tool_rounds: usize,
+    pub max_total_tool_rounds: usize,
+    pub total_tool_rounds: usize,
+    pub remaining_total_tool_rounds: usize,
+    pub max_equivalent_tool_calls: usize,
+    pub max_observation_tool_calls_without_workspace_change: usize,
     pub max_elapsed_ms: u64,
     pub elapsed_ms: u64,
     pub remaining_time_ms: u64,
     pub context_max_tokens: Option<usize>,
     pub context_used_tokens: Option<usize>,
     pub context_remaining_tokens: Option<usize>,
+}
+
+fn default_max_total_tool_rounds() -> usize {
+    DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS
+}
+
+fn default_max_equivalent_tool_calls() -> usize {
+    DEFAULT_MAX_EQUIVALENT_TOOL_CALLS
+}
+
+fn default_max_observation_tool_calls_without_workspace_change() -> usize {
+    DEFAULT_MAX_OBSERVATION_TOOL_CALLS_WITHOUT_WORKSPACE_CHANGE
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLoopGuardState {
+    pub total_tool_rounds: usize,
+    pub blocked_equivalent_calls: usize,
+    #[serde(default)]
+    equivalent_call_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    last_plan_fingerprint: Option<String>,
+    #[serde(default)]
+    last_successful_verification: Option<String>,
+    #[serde(default)]
+    latest_plan: Option<TaskPlan>,
+    #[serde(default)]
+    workspace_changed_since_verification: bool,
+    #[serde(default)]
+    completion_mode: bool,
+    #[serde(default)]
+    blocked_completion_mode_calls: usize,
+    #[serde(default)]
+    observation_tool_calls_since_workspace_change: usize,
+    #[serde(default)]
+    implementation_mode: bool,
+    #[serde(default)]
+    blocked_implementation_mode_calls: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -139,6 +214,8 @@ pub struct AgentContinuation {
     pub context_budget: Option<ContextBudget>,
     #[serde(default)]
     pub execution_budget: AgentExecutionBudget,
+    #[serde(default)]
+    pub loop_guard: AgentLoopGuardState,
     #[serde(default)]
     pub continuation_kind: AgentContinuationKind,
     pub state: AgentContinuationState,
@@ -443,11 +520,11 @@ impl AgentCore {
         let response = self
             .complete_model(
                 ModelRequest {
-                    system_prompt: provider_system_prompt(&execution_budget.status(
-                        0,
-                        started_at,
-                        budget.as_ref(),
-                    )),
+                    system_prompt: provider_system_prompt(
+                        &execution_budget.status(0, 0, started_at, budget.as_ref()),
+                        false,
+                        false,
+                    ),
                     conversation: input.conversation.clone(),
                     user_message: model_user_message.clone(),
                     user_content: input.user_content.clone(),
@@ -472,6 +549,10 @@ impl AgentCore {
         }
 
         let provider_tool_calls = response.tool_calls.clone();
+        let loop_guard = AgentLoopGuardState {
+            total_tool_rounds: 1,
+            ..AgentLoopGuardState::default()
+        };
         self.continue_provider_turn(
             input.thread_id,
             input.user_message_id,
@@ -481,6 +562,7 @@ impl AgentCore {
             input.permission_mode,
             budget,
             execution_budget,
+            loop_guard,
             started_at,
             input.store,
             input.cancellation,
@@ -512,6 +594,7 @@ impl AgentCore {
         let is_budget_checkpoint =
             continuation.continuation_kind == AgentContinuationKind::BudgetCheckpoint;
         let execution_budget = continuation.execution_budget.clone().normalized();
+        let mut loop_guard = continuation.loop_guard.clone();
         let started_at = Instant::now();
 
         match continuation.state {
@@ -545,6 +628,7 @@ impl AgentCore {
                             continuation.permission_mode,
                             continuation.context_budget,
                             execution_budget,
+                            loop_guard.clone(),
                             started_at,
                             store,
                             cancellation,
@@ -580,10 +664,15 @@ impl AgentCore {
                     ctx.cancel = cancellation.clone();
                     ctx.approval_granted = true;
                     self.apply_subagent_context(&mut ctx, continuation.user_message_id);
-                    provider_tool_results.push(
-                        self.execute_provider_tool_call(&pending, ctx, &mut events)
-                            .await?,
+                    let result = self
+                        .execute_provider_tool_call(&pending, ctx, &mut events)
+                        .await?;
+                    loop_guard.observe_tool_result(
+                        &pending,
+                        &result,
+                        execution_budget.max_observation_tool_calls_without_workspace_change,
                     );
+                    provider_tool_results.push(result);
                 } else {
                     provider_tool_results.push(ProviderToolResult {
                         call_id: pending.id.clone(),
@@ -611,6 +700,7 @@ impl AgentCore {
                     continuation.permission_mode,
                     context_budget,
                     execution_budget,
+                    loop_guard,
                     started_at,
                     store,
                     cancellation,
@@ -639,6 +729,7 @@ impl AgentCore {
         permission_mode: PermissionMode,
         mut budget: Option<ContextBudget>,
         execution_budget: AgentExecutionBudget,
+        mut loop_guard: AgentLoopGuardState,
         started_at: Instant,
         store: Option<Arc<dyn SessionStore>>,
         cancellation: Option<CancellationToken>,
@@ -658,29 +749,112 @@ impl AgentCore {
                 started_at,
                 budget.as_ref(),
             ) {
-                return Ok(suspend_for_budget_checkpoint(
-                    thread_id,
-                    user_message_id,
-                    workspace_root,
-                    context_summary,
-                    conversation,
-                    permission_mode,
-                    budget,
-                    execution_budget,
-                    started_at,
-                    reason,
-                    model_user_message,
-                    model_user_content,
-                    tool_candidates,
-                    provider_tool_calls,
-                    provider_tool_results,
-                    pending_tool_calls,
-                    current_round,
-                    std::mem::replace(events, TurnEvents::new(None)),
-                ));
+                let completion_is_pending = pending_tool_calls
+                    .first()
+                    .is_some_and(|call| call.name == "complete_task");
+                let total_budget_is_exhausted =
+                    loop_guard.total_tool_rounds >= execution_budget.max_total_tool_rounds;
+                let should_finish_without_checkpoint =
+                    matches!(reason, AgentBudgetCheckpointReason::ToolRounds)
+                        && (completion_is_pending || total_budget_is_exhausted);
+                if !should_finish_without_checkpoint {
+                    return Ok(suspend_for_budget_checkpoint(
+                        thread_id,
+                        user_message_id,
+                        workspace_root,
+                        context_summary,
+                        conversation,
+                        permission_mode,
+                        budget,
+                        execution_budget,
+                        loop_guard,
+                        started_at,
+                        reason,
+                        model_user_message,
+                        model_user_content,
+                        tool_candidates,
+                        provider_tool_calls,
+                        provider_tool_results,
+                        pending_tool_calls,
+                        current_round,
+                        std::mem::replace(events, TurnEvents::new(None)),
+                    ));
+                }
             }
 
             while let Some(provider_call) = pending_tool_calls.first().cloned() {
+                if loop_guard.completion_mode
+                    && !matches!(provider_call.name.as_str(), "update_plan" | "complete_task")
+                {
+                    loop_guard.blocked_completion_mode_calls += 1;
+                    let result = blocked_completion_mode_tool_result(&provider_call, events);
+                    if let Some(ref mut budget) = budget {
+                        budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
+                    }
+                    provider_tool_results.push(result);
+                    pending_tool_calls.remove(0);
+                    if loop_guard.blocked_completion_mode_calls >= MAX_COMPLETION_MODE_VIOLATIONS {
+                        let output = fallback_verified_completion_output(
+                            &mut loop_guard,
+                            &model_user_message,
+                            events,
+                        )
+                        .unwrap_or_else(|| {
+                                "Terminal verification succeeded, but the provider did not submit a final task state. The turn was stopped after repeated completion-mode violations; the durable plan remains unchanged."
+                                    .to_string()
+                            });
+                        return Ok(finalize_provider_turn(
+                            thread_id,
+                            ModelResponse::text(output),
+                            provider_tool_results,
+                            budget,
+                            std::mem::replace(events, TurnEvents::new(None)),
+                        ));
+                    }
+                    continue;
+                }
+                if loop_guard.implementation_mode
+                    && !tool_call_can_change_workspace(&provider_call)
+                    && provider_call.name != "complete_task"
+                {
+                    loop_guard.blocked_implementation_mode_calls += 1;
+                    let result = blocked_implementation_mode_tool_result(&provider_call, events);
+                    if let Some(ref mut budget) = budget {
+                        budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
+                    }
+                    provider_tool_results.push(result);
+                    pending_tool_calls.remove(0);
+                    if loop_guard.blocked_implementation_mode_calls
+                        >= MAX_IMPLEMENTATION_MODE_VIOLATIONS
+                    {
+                        let output = incomplete_stagnation_output(&loop_guard);
+                        return Ok(finalize_provider_turn(
+                            thread_id,
+                            ModelResponse::text(output),
+                            provider_tool_results,
+                            budget,
+                            std::mem::replace(events, TurnEvents::new(None)),
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(equivalent_call_count) = loop_guard
+                    .register_tool_call(&provider_call, execution_budget.max_equivalent_tool_calls)
+                {
+                    let result = blocked_equivalent_tool_result(
+                        &provider_call,
+                        equivalent_call_count,
+                        execution_budget.max_equivalent_tool_calls,
+                        events,
+                    );
+                    if let Some(ref mut budget) = budget {
+                        budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
+                    }
+                    provider_tool_results.push(result);
+                    pending_tool_calls.remove(0);
+                    continue;
+                }
+
                 let policy = Arc::new(BasicPolicyEngine::new(
                     workspace_root.clone(),
                     permission_mode,
@@ -699,11 +873,27 @@ impl AgentCore {
                     .await
                 {
                     Ok(result) => {
+                        loop_guard.observe_tool_result(
+                            &provider_call,
+                            &result,
+                            execution_budget.max_observation_tool_calls_without_workspace_change,
+                        );
+                        let completion_output = explicit_task_completion_output(&result)
+                            .or_else(|| verified_plan_completion_output(&result, &loop_guard));
                         if let Some(ref mut budget) = budget {
                             budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
                         }
                         provider_tool_results.push(result);
                         pending_tool_calls.remove(0);
+                        if let Some(output) = completion_output {
+                            return Ok(finalize_provider_turn(
+                                thread_id,
+                                ModelResponse::text(output),
+                                provider_tool_results,
+                                budget,
+                                std::mem::replace(events, TurnEvents::new(None)),
+                            ));
+                        }
                     }
                     Err(err) if err.to_string().contains("approval required") => {
                         let reason = err.to_string();
@@ -730,6 +920,7 @@ impl AgentCore {
                                     permission_mode,
                                     context_budget: budget,
                                     execution_budget: execution_budget.clone(),
+                                    loop_guard,
                                     continuation_kind: AgentContinuationKind::Approval,
                                     state: AgentContinuationState::Provider {
                                         model_user_message,
@@ -748,19 +939,55 @@ impl AgentCore {
                 }
             }
 
+            let total_budget_exhausted =
+                loop_guard.total_tool_rounds >= execution_budget.max_total_tool_rounds;
             let response = self
                 .complete_model(
                     ModelRequest {
-                        system_prompt: provider_system_prompt(&execution_budget.status(
-                            current_round,
-                            started_at,
-                            budget.as_ref(),
-                        )),
+                        system_prompt: provider_system_prompt(
+                            &execution_budget.status(
+                                current_round,
+                                loop_guard.total_tool_rounds,
+                                started_at,
+                                budget.as_ref(),
+                            ),
+                            loop_guard.completion_mode,
+                            loop_guard.implementation_mode,
+                        ),
                         conversation: conversation.clone(),
                         user_message: model_user_message.clone(),
                         user_content: model_user_content.clone(),
-                        tool_candidates: if current_round < execution_budget.max_tool_rounds {
-                            tool_candidates.clone()
+                        tool_candidates: if !total_budget_exhausted
+                            && current_round < execution_budget.max_tool_rounds
+                        {
+                            if loop_guard.completion_mode {
+                                tool_candidates
+                                    .iter()
+                                    .filter(|candidate| {
+                                        matches!(
+                                            candidate.name.as_str(),
+                                            "update_plan" | "complete_task"
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect()
+                            } else if loop_guard.implementation_mode {
+                                tool_candidates
+                                    .iter()
+                                    .filter(|candidate| {
+                                        matches!(
+                                            candidate.name.as_str(),
+                                            "write_file"
+                                                | "apply_patch"
+                                                | "spreadsheet"
+                                                | "complete_task"
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                tool_candidates.clone()
+                            }
                         } else {
                             Vec::new()
                         },
@@ -774,7 +1001,7 @@ impl AgentCore {
                 budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
             }
 
-            if response.tool_calls.is_empty() {
+            if response.tool_calls.is_empty() || total_budget_exhausted {
                 return Ok(finalize_provider_turn(
                     thread_id,
                     response,
@@ -785,6 +1012,7 @@ impl AgentCore {
             }
 
             current_round += 1;
+            loop_guard.total_tool_rounds += 1;
             pending_tool_calls = response.tool_calls;
             provider_tool_calls.extend(pending_tool_calls.clone());
             if let Some(ref mut budget) = budget {
@@ -985,6 +1213,458 @@ fn finalize_provider_turn(
     }
 }
 
+impl AgentLoopGuardState {
+    fn register_tool_call(
+        &mut self,
+        call: &ProviderToolCall,
+        max_equivalent_tool_calls: usize,
+    ) -> Option<usize> {
+        if call.name == "complete_task" {
+            return None;
+        }
+        let signature = provider_tool_call_signature(call);
+        let count = self.equivalent_call_counts.entry(signature).or_default();
+        *count += 1;
+        if *count > max_equivalent_tool_calls {
+            self.blocked_equivalent_calls += 1;
+            Some(*count)
+        } else {
+            None
+        }
+    }
+
+    fn observe_tool_result(
+        &mut self,
+        call: &ProviderToolCall,
+        result: &ProviderToolResult,
+        max_observation_tool_calls_without_workspace_change: usize,
+    ) {
+        let workspace_mutation_succeeded = !result.is_error && tool_call_can_change_workspace(call);
+        if workspace_mutation_succeeded {
+            self.observation_tool_calls_since_workspace_change = 0;
+            self.implementation_mode = false;
+            self.blocked_implementation_mode_calls = 0;
+        } else if call.name != "complete_task" {
+            self.observation_tool_calls_since_workspace_change += 1;
+        }
+
+        if result.is_error {
+            self.refresh_implementation_mode(max_observation_tool_calls_without_workspace_change);
+            return;
+        }
+
+        let verification_command = successful_verification_command(call);
+        if let Some(command) = verification_command.as_ref() {
+            self.last_successful_verification = Some(command.clone());
+        }
+
+        let changed_state = if call.name == "update_plan" {
+            self.latest_plan = result
+                .metadata
+                .get("taskPlan")
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+            let fingerprint = result.metadata.get("taskPlan").map(canonical_json_string);
+            let changed = fingerprint != self.last_plan_fingerprint;
+            self.last_plan_fingerprint = fingerprint;
+            changed
+        } else {
+            workspace_mutation_succeeded
+        };
+
+        if changed_state {
+            self.equivalent_call_counts.clear();
+            if call.name != "update_plan" {
+                self.last_successful_verification = None;
+                self.workspace_changed_since_verification = true;
+                self.completion_mode = false;
+            }
+        }
+        if verification_command.is_some()
+            && self.workspace_changed_since_verification
+            && self.latest_plan.as_ref().is_some_and(|plan| {
+                plan.steps
+                    .iter()
+                    .any(|step| step_looks_like_verification(&step.step))
+            })
+        {
+            self.completion_mode = true;
+            self.blocked_completion_mode_calls = 0;
+            self.implementation_mode = false;
+            self.workspace_changed_since_verification = false;
+        }
+        self.refresh_implementation_mode(max_observation_tool_calls_without_workspace_change);
+    }
+
+    fn refresh_implementation_mode(
+        &mut self,
+        max_observation_tool_calls_without_workspace_change: usize,
+    ) {
+        if !self.completion_mode
+            && self.observation_tool_calls_since_workspace_change
+                >= max_observation_tool_calls_without_workspace_change
+            && self
+                .latest_plan
+                .as_ref()
+                .is_some_and(plan_needs_workspace_change)
+        {
+            self.implementation_mode = true;
+        }
+    }
+}
+
+fn provider_tool_call_signature(call: &ProviderToolCall) -> String {
+    format!("{}:{}", call.name, canonical_json_string(&call.arguments))
+}
+
+fn canonical_json_string(value: &Value) -> String {
+    fn canonicalize(value: &Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
+            Value::Object(values) => {
+                let sorted = values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonicalize(value)))
+                    .collect::<BTreeMap<_, _>>();
+                serde_json::to_value(sorted).unwrap_or(Value::Null)
+            }
+            _ => value.clone(),
+        }
+    }
+
+    serde_json::to_string(&canonicalize(value)).unwrap_or_else(|_| "null".to_string())
+}
+
+fn explicit_task_completion_output(result: &ProviderToolResult) -> Option<String> {
+    (!result.is_error && result.metadata.get("taskCompletion").is_some())
+        .then(|| result.output.clone())
+}
+
+fn successful_verification_command(call: &ProviderToolCall) -> Option<String> {
+    if call.name != "shell" {
+        return None;
+    }
+    let command = call.arguments.get("command")?.as_str()?.trim();
+    let normalized = command.to_lowercase();
+    [
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "cargo test",
+        "pytest",
+        "node --test",
+        "node test/",
+        "node test\\",
+        "npm run build",
+        "npm run check",
+        "npm run lint",
+        "pnpm build",
+        "pnpm check",
+        "pnpm lint",
+        "cargo check",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    .then(|| command.to_string())
+}
+
+fn step_looks_like_verification(step: &str) -> bool {
+    let step = step.to_lowercase();
+    [
+        "test", "verify", "check", "lint", "build", "测试", "验证", "检查", "构建",
+    ]
+    .iter()
+    .any(|keyword| step.contains(keyword))
+}
+
+fn plan_needs_workspace_change(plan: &TaskPlan) -> bool {
+    plan.steps.iter().any(|step| {
+        step.status != TaskPlanStepStatus::Completed && step_looks_like_workspace_change(&step.step)
+    })
+}
+
+fn step_looks_like_workspace_change(step: &str) -> bool {
+    let step = step.to_lowercase();
+    [
+        "implement",
+        "fix",
+        "repair",
+        "create",
+        "write",
+        "modify",
+        "update",
+        "add",
+        "remove",
+        "migrate",
+        "refactor",
+        "cli",
+        "实现",
+        "修复",
+        "创建",
+        "写入",
+        "修改",
+        "更新",
+        "添加",
+        "删除",
+        "迁移",
+        "重构",
+    ]
+    .iter()
+    .any(|keyword| step.contains(keyword))
+}
+
+fn tool_call_can_change_workspace(call: &ProviderToolCall) -> bool {
+    match call.name.as_str() {
+        "write_file" | "apply_patch" => true,
+        "spreadsheet" => call.arguments.get("action").and_then(Value::as_str) == Some("write"),
+        _ => false,
+    }
+}
+
+fn verified_plan_completion_output(
+    result: &ProviderToolResult,
+    loop_guard: &AgentLoopGuardState,
+) -> Option<String> {
+    if result.name != "update_plan" || result.is_error {
+        return None;
+    }
+    let plan: TaskPlan = serde_json::from_value(result.metadata.get("taskPlan")?.clone()).ok()?;
+    let completed = plan
+        .steps
+        .iter()
+        .filter(|step| step.status == TaskPlanStepStatus::Completed)
+        .count();
+    let pending = plan
+        .steps
+        .iter()
+        .filter(|step| step.status == TaskPlanStepStatus::Pending)
+        .count();
+    let has_in_progress = plan
+        .steps
+        .iter()
+        .any(|step| step.status == TaskPlanStepStatus::InProgress);
+    let all_steps_complete = !plan.steps.is_empty() && completed == plan.steps.len();
+    let current_scope_complete = result
+        .metadata
+        .get("currentScopeComplete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let verification = loop_guard.last_successful_verification.as_deref()?;
+    if has_in_progress || completed == 0 || (!all_steps_complete && !current_scope_complete) {
+        return None;
+    }
+
+    let mut output = format!(
+        "Current requested scope completed with {completed}/{} plan steps completed.\n\nVerification:\n- {verification}",
+        plan.steps.len()
+    );
+    if pending > 0 {
+        output.push_str(&format!(
+            "\n\nRemaining work:\n- {pending} plan step(s) explicitly deferred to a later phase."
+        ));
+    }
+    Some(output)
+}
+
+fn blocked_equivalent_tool_result(
+    provider_call: &ProviderToolCall,
+    equivalent_call_count: usize,
+    max_equivalent_tool_calls: usize,
+    events: &mut TurnEvents,
+) -> ProviderToolResult {
+    let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
+    events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
+    let output = format!(
+        "Equivalent tool call blocked after {max_equivalent_tool_calls} executions without an intervening state change. Do not retry the same call. Make a state-changing step, use different evidence, or finish the task."
+    );
+    let metadata = json!({
+        "toolName": &provider_call.name,
+        "providerToolCallId": &provider_call.id,
+        "success": false,
+        "loopGuardBlocked": true,
+        "equivalentCallCount": equivalent_call_count,
+        "maxEquivalentToolCalls": max_equivalent_tool_calls
+    });
+    events.push(AgentEventPayload::ToolCallFinished {
+        result: ToolResult {
+            call_id: call.id,
+            output: output.clone(),
+            content: vec![ModelContentPart::text(output.clone())],
+            metadata: metadata.clone(),
+        },
+    });
+    ProviderToolResult {
+        call_id: provider_call.id.clone(),
+        name: provider_call.name.clone(),
+        output: output.clone(),
+        content: vec![ModelContentPart::text(output)],
+        is_error: true,
+        metadata,
+    }
+}
+
+fn blocked_completion_mode_tool_result(
+    provider_call: &ProviderToolCall,
+    events: &mut TurnEvents,
+) -> ProviderToolResult {
+    let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
+    events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
+    let output = "Tool call blocked because terminal verification already succeeded. Completion mode only permits update_plan or complete_task. Submit the truthful final state now.".to_string();
+    let metadata = json!({
+        "toolName": &provider_call.name,
+        "providerToolCallId": &provider_call.id,
+        "success": false,
+        "completionModeBlocked": true
+    });
+    events.push(AgentEventPayload::ToolCallFinished {
+        result: ToolResult {
+            call_id: call.id,
+            output: output.clone(),
+            metadata: metadata.clone(),
+            content: vec![ModelContentPart::text(output.clone())],
+        },
+    });
+    ProviderToolResult {
+        call_id: provider_call.id.clone(),
+        name: provider_call.name.clone(),
+        output: output.clone(),
+        content: vec![ModelContentPart::text(output)],
+        metadata,
+        is_error: true,
+    }
+}
+
+fn blocked_implementation_mode_tool_result(
+    provider_call: &ProviderToolCall,
+    events: &mut TurnEvents,
+) -> ProviderToolResult {
+    let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
+    events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
+    let output = "Tool call blocked because exploration has continued without a workspace change. Implementation mode only permits write_file, apply_patch, spreadsheet write, or complete_task. Make the planned concrete change now.".to_string();
+    let metadata = json!({
+        "toolName": &provider_call.name,
+        "providerToolCallId": &provider_call.id,
+        "success": false,
+        "implementationModeBlocked": true
+    });
+    events.push(AgentEventPayload::ToolCallFinished {
+        result: ToolResult {
+            call_id: call.id,
+            output: output.clone(),
+            metadata: metadata.clone(),
+            content: vec![ModelContentPart::text(output.clone())],
+        },
+    });
+    ProviderToolResult {
+        call_id: provider_call.id.clone(),
+        name: provider_call.name.clone(),
+        output: output.clone(),
+        content: vec![ModelContentPart::text(output)],
+        metadata,
+        is_error: true,
+    }
+}
+
+fn fallback_verified_completion_output(
+    loop_guard: &mut AgentLoopGuardState,
+    model_user_message: &str,
+    events: &mut TurnEvents,
+) -> Option<String> {
+    let verification = loop_guard.last_successful_verification.clone()?;
+    let mut plan = loop_guard.latest_plan.clone()?;
+    let resumes_deferred_work = request_resumes_deferred_work(model_user_message);
+    let mut completed = 0;
+    let mut deferred = 0;
+    for step in &mut plan.steps {
+        if step.status != TaskPlanStepStatus::Completed {
+            if !resumes_deferred_work && step_is_explicitly_deferred(&step.step) {
+                step.status = TaskPlanStepStatus::Pending;
+                deferred += 1;
+            } else {
+                step.status = TaskPlanStepStatus::Completed;
+            }
+        }
+        if step.status == TaskPlanStepStatus::Completed {
+            completed += 1;
+        }
+    }
+    plan.explanation = Some(
+        "Runtime fallback reconciled the durable plan after successful verification and repeated completion-mode violations."
+            .to_string(),
+    );
+    loop_guard.latest_plan = Some(plan.clone());
+    events.push(AgentEventPayload::PlanUpdated { plan: plan.clone() });
+
+    let mut output = format!(
+        "Current requested scope closed by the runtime fallback with {completed}/{} plan steps completed after the provider repeatedly violated completion mode.\n\nVerification:\n- {verification}",
+        plan.steps.len()
+    );
+    if deferred > 0 {
+        output.push_str(&format!(
+            "\n\nRemaining work:\n- {deferred} plan step(s) remain explicitly deferred."
+        ));
+    }
+    Some(output)
+}
+
+fn request_resumes_deferred_work(request: &str) -> bool {
+    let request = request.to_lowercase();
+    [
+        "continue",
+        "resume",
+        "recover",
+        "remaining work",
+        "phase 2",
+        "phase-2",
+        "session 2",
+        "session-2",
+        "继续",
+        "恢复",
+        "剩余",
+        "第二阶段",
+    ]
+    .iter()
+    .any(|keyword| request.contains(keyword))
+}
+
+fn step_is_explicitly_deferred(step: &str) -> bool {
+    let step = step.to_lowercase();
+    [
+        "session 2",
+        "session-2",
+        "phase 2",
+        "phase-2",
+        "later session",
+        "later phase",
+        "future work",
+        "deferred",
+        "out of scope",
+        "follow-up",
+        "第二阶段",
+        "稍后",
+        "后续",
+        "延期",
+        "暂缓",
+        "不在范围",
+    ]
+    .iter()
+    .any(|keyword| step.contains(keyword))
+}
+
+fn incomplete_stagnation_output(loop_guard: &AgentLoopGuardState) -> String {
+    let plan = loop_guard.latest_plan.as_ref();
+    let remaining = plan
+        .map(|plan| {
+            plan.steps
+                .iter()
+                .filter(|step| step.status != TaskPlanStepStatus::Completed)
+                .count()
+        })
+        .unwrap_or(0);
+    format!(
+        "Task remains incomplete. The turn was stopped after {MAX_IMPLEMENTATION_MODE_VIOLATIONS} implementation-mode violations without a workspace change. The durable plan retains {remaining} unfinished step(s) for a retry or user-directed continuation."
+    )
+}
+
 fn budget_checkpoint_reason(
     execution_budget: &AgentExecutionBudget,
     used_tool_rounds: usize,
@@ -1012,6 +1692,7 @@ fn suspend_for_budget_checkpoint(
     permission_mode: PermissionMode,
     context_budget: Option<ContextBudget>,
     execution_budget: AgentExecutionBudget,
+    loop_guard: AgentLoopGuardState,
     started_at: Instant,
     checkpoint_reason: AgentBudgetCheckpointReason,
     model_user_message: String,
@@ -1024,11 +1705,17 @@ fn suspend_for_budget_checkpoint(
     mut events: TurnEvents,
 ) -> AgentTurnResult {
     let approval_id = Uuid::new_v4();
-    let status = execution_budget.status(used_tool_rounds, started_at, context_budget.as_ref());
+    let status = execution_budget.status(
+        used_tool_rounds,
+        loop_guard.total_tool_rounds,
+        started_at,
+        context_budget.as_ref(),
+    );
     let reason = format!(
-        "{} Continue to grant another execution slice (tool rounds remaining: {}, time remaining: {} ms, context remaining: {}).",
+        "{} Continue to grant another execution slice (slice rounds remaining: {}, total rounds remaining: {}, time remaining: {} ms, context remaining: {}).",
         checkpoint_reason.message(),
         status.remaining_tool_rounds,
+        status.remaining_total_tool_rounds,
         status.remaining_time_ms,
         status
             .context_remaining_tokens
@@ -1057,6 +1744,7 @@ fn suspend_for_budget_checkpoint(
                 permission_mode,
                 context_budget,
                 execution_budget,
+                loop_guard,
                 continuation_kind: AgentContinuationKind::BudgetCheckpoint,
                 state: AgentContinuationState::Provider {
                     model_user_message,
@@ -1074,12 +1762,31 @@ fn suspend_for_budget_checkpoint(
     }
 }
 
-fn provider_system_prompt(status: &AgentBudgetStatus) -> String {
+fn provider_system_prompt(
+    status: &AgentBudgetStatus,
+    completion_mode: bool,
+    implementation_mode: bool,
+) -> String {
+    let completion_instruction = if completion_mode {
+        " A terminal verification command just succeeded. Completion mode is active: only update_plan and complete_task are available. Do not resume implementation or investigation. Submit the truthful final plan state now, or use complete_task if the requested scope is actually complete."
+    } else {
+        ""
+    };
+    let implementation_instruction = if implementation_mode {
+        " Exploration has exceeded the no-progress limit. Implementation mode is active: only write_file, apply_patch, spreadsheet write, and complete_task are available. Make the concrete workspace change required by the current plan now. Do not inspect more files, run tests, or revise the plan until a workspace change succeeds."
+    } else {
+        ""
+    };
     format!(
-        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help. For non-trivial multi-step work, use update_plan as durable task memory, keep it current, and complete every step before claiming completion. Delegate independent work with spawn_agent when useful, then use wait_agents to collect parallel results before synthesizing the final answer. Inspect every child status and error; a terminal child is not necessarily a successful child.\n\nExecution budget for this slice: {}/{} tool-decision rounds used ({} remaining); {} ms remaining of {} ms. Context budget: {} used of {} tokens ({} remaining). When a budget reaches zero, execution pauses and the user may explicitly continue from this checkpoint. Do not claim work is complete merely because a budget is low.",
+        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help. For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. After a successful test, build, lint, check, or verify command, finish with one final action: update_plan with all current steps completed (set current_scope_complete with verification when later-phase steps remain pending), or call complete_task with a concise summary, concrete verification evidence, and any deliberately deferred work. Do not perform more investigation after that final action. Delegate independent work with spawn_agent when useful, then use wait_agents to collect parallel results before synthesizing the final answer. Inspect every child status and error; a terminal child is not necessarily a successful child.{completion_instruction}{implementation_instruction}\n\nExecution budget for this slice: {}/{} tool-decision rounds used ({} remaining). Total tool-decision budget: {}/{} used ({} remaining). Equivalent tool calls without an intervening state change are limited to {}. Observation tool calls without a workspace change are limited to {} before implementation mode activates. Time budget: {} ms remaining of {} ms. Context budget: {} used of {} tokens ({} remaining). A slice budget checkpoint requires explicit continuation. When the total tool budget reaches zero, stop using tools and provide the best truthful final response. Do not claim work is complete merely because a budget is low.",
         status.used_tool_rounds,
         status.max_tool_rounds,
         status.remaining_tool_rounds,
+        status.total_tool_rounds,
+        status.max_total_tool_rounds,
+        status.remaining_total_tool_rounds,
+        status.max_equivalent_tool_calls,
+        status.max_observation_tool_calls_without_workspace_change,
         status.remaining_time_ms,
         status.max_elapsed_ms,
         status.context_used_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
@@ -1351,6 +2058,629 @@ mod tests {
         assert!(requests[1].tool_results[0]
             .output
             .contains("hello from provider loop"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn complete_task_finishes_without_an_extra_provider_round() {
+        let workspace = test_workspace("complete-task");
+        let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ProviderToolCall {
+                id: "call_complete".to_string(),
+                name: "complete_task".to_string(),
+                arguments: json!({
+                    "summary": "Implemented and verified the requested scope.",
+                    "verification": ["cargo test passed"],
+                    "remaining_work": []
+                }),
+            }],
+            usage: None,
+        }]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Complete the task and report verification.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("explicit completion succeeds");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert_eq!(provider.requests().len(), 1);
+        assert!(assistant_text(&result.events).contains("Implemented and verified"));
+        assert!(assistant_text(&result.events).contains("cargo test passed"));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallFinished { result }
+                if result.metadata.get("taskCompletion").is_some()
+        )));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn verified_final_plan_update_completes_the_current_scope() {
+        let workspace = test_workspace("verified-plan-completion");
+        fs::create_dir_all(workspace.join("test")).unwrap();
+        fs::write(
+            workspace.join("test").join("check.js"),
+            "console.log('passed');",
+        )
+        .unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_test".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({ "command": "node test/check.js" }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_plan".to_string(),
+                    name: "update_plan".to_string(),
+                    arguments: json!({
+                        "current_scope_complete": true,
+                        "verification": ["node test/check.js"],
+                        "plan": [
+                            { "step": "Implement current scope", "status": "completed" },
+                            { "step": "Later session work", "status": "pending" }
+                        ]
+                    }),
+                }],
+                usage: None,
+            },
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Complete this phase and leave the later session pending.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("verified plan completion succeeds");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert_eq!(provider.requests().len(), 2);
+        assert!(assistant_text(&result.events).contains("Current requested scope completed"));
+        assert!(assistant_text(&result.events).contains("explicitly deferred"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn successful_terminal_verification_enters_completion_mode() {
+        let workspace = test_workspace("completion-mode");
+        fs::create_dir_all(workspace.join("test")).unwrap();
+        fs::write(
+            workspace.join("test").join("check.js"),
+            "console.log('passed');",
+        )
+        .unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_plan".to_string(),
+                    name: "update_plan".to_string(),
+                    arguments: json!({
+                        "plan": [
+                            { "step": "Implement current scope", "status": "in_progress" },
+                            { "step": "Run tests and verify", "status": "pending" },
+                            { "step": "Session 2: implement CLI", "status": "pending" }
+                        ]
+                    }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "result.txt", "content": "done" }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_test".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({ "command": "node test/check.js" }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_disallowed_after_test".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({ "command": "type result.txt" }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_final_plan".to_string(),
+                    name: "update_plan".to_string(),
+                    arguments: json!({
+                        "explanation": "Implementation and verification completed.",
+                        "current_scope_complete": true,
+                        "verification": ["node test/check.js passed"],
+                        "plan": [
+                            { "step": "Implement current scope", "status": "completed" },
+                            { "step": "Run tests and verify", "status": "completed" },
+                            { "step": "Session 2: implement CLI", "status": "pending" }
+                        ]
+                    }),
+                }],
+                usage: None,
+            },
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Implement and verify this phase.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("verified completion mode succeeds");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
+        for request in &requests[3..] {
+            let mut final_tool_names = request
+                .tool_candidates
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>();
+            final_tool_names.sort_unstable();
+            assert_eq!(final_tool_names, vec!["complete_task", "update_plan"]);
+        }
+        assert!(requests[3]
+            .system_prompt
+            .contains("Completion mode is active"));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallFinished { result }
+                if result.metadata.get("completionModeBlocked") == Some(&Value::Bool(true))
+        )));
+        assert!(assistant_text(&result.events).contains("Current requested scope completed"));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::PlanUpdated { plan }
+                if plan.explanation.as_deref() == Some("Implementation and verification completed.")
+                    && plan.steps[0].status == TaskPlanStepStatus::Completed
+                    && plan.steps[2].status == TaskPlanStepStatus::Pending
+        )));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn stagnant_exploration_requires_a_workspace_change() {
+        let workspace = test_workspace("implementation-mode");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        for index in 0..11 {
+            fs::write(workspace.join(format!("context-{index}.txt")), "context").unwrap();
+        }
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_plan".to_string(),
+                    name: "update_plan".to_string(),
+                    arguments: json!({
+                        "plan": [
+                            { "step": "Implement CLI contract", "status": "in_progress" },
+                            { "step": "Run tests and verify", "status": "pending" }
+                        ]
+                    }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: (0..11)
+                    .map(|index| ProviderToolCall {
+                        id: format!("call_read_{index}"),
+                        name: "read_file".to_string(),
+                        arguments: json!({ "path": format!("context-{index}.txt") }),
+                    })
+                    .collect(),
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_stagnant_read".to_string(),
+                    name: "list_files".to_string(),
+                    arguments: json!({ "path": "." }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "src/cli.js", "content": "export {};\n" }),
+                }],
+                usage: None,
+            },
+            ModelResponse::text("The implementation is now in place."),
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Implement the CLI after inspecting the task context.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("implementation mode recovers after a workspace change");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
+        for request in &requests[2..4] {
+            let mut tool_names = request
+                .tool_candidates
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>();
+            tool_names.sort_unstable();
+            assert_eq!(
+                tool_names,
+                vec!["apply_patch", "complete_task", "spreadsheet", "write_file"]
+            );
+            assert!(request
+                .system_prompt
+                .contains("Implementation mode is active"));
+        }
+        assert!(requests[4]
+            .tool_candidates
+            .iter()
+            .any(|candidate| candidate.name == "read_file"));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallFinished { result }
+                if result.metadata.get("implementationModeBlocked") == Some(&Value::Bool(true))
+        )));
+        assert_eq!(
+            fs::read_to_string(workspace.join("src").join("cli.js")).unwrap(),
+            "export {};\n"
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn repeated_completion_mode_violations_use_verified_fallback() {
+        let workspace = test_workspace("completion-mode-fallback");
+        fs::create_dir_all(workspace.join("test")).unwrap();
+        fs::write(
+            workspace.join("test").join("check.js"),
+            "console.log('passed');",
+        )
+        .unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_plan".to_string(),
+                    name: "update_plan".to_string(),
+                    arguments: json!({
+                        "plan": [
+                            { "step": "Implement current scope", "status": "in_progress" },
+                            { "step": "Run tests and verify", "status": "pending" },
+                            { "step": "Session 2: implement CLI", "status": "pending" }
+                        ]
+                    }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "result.txt", "content": "done" }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_test".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({ "command": "node test/check.js" }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_violation_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "result.txt" }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_violation_2".to_string(),
+                    name: "git_diff".to_string(),
+                    arguments: json!({}),
+                }],
+                usage: None,
+            },
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Implement and verify this phase.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("verified fallback closes the turn");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert_eq!(provider.requests().len(), 5);
+        assert!(assistant_text(&result.events).contains("runtime fallback"));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::PlanUpdated { plan }
+                if plan.explanation.as_deref().is_some_and(|value| value.starts_with("Runtime fallback"))
+                    && plan.steps[0].status == TaskPlanStepStatus::Completed
+                    && plan.steps[1].status == TaskPlanStepStatus::Completed
+                    && plan.steps[2].status == TaskPlanStepStatus::Pending
+        )));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn verified_fallback_completes_resumed_phase_steps() {
+        let mut loop_guard = AgentLoopGuardState {
+            last_successful_verification: Some("npm test".to_string()),
+            latest_plan: Some(TaskPlan {
+                explanation: None,
+                steps: vec![
+                    crate::model::TaskPlanStep {
+                        step: "Phase 1: implement library".to_string(),
+                        status: TaskPlanStepStatus::Completed,
+                    },
+                    crate::model::TaskPlanStep {
+                        step: "Phase 2: implement CLI".to_string(),
+                        status: TaskPlanStepStatus::Pending,
+                    },
+                ],
+            }),
+            ..AgentLoopGuardState::default()
+        };
+        let mut events = TurnEvents::new(None);
+
+        let output = fallback_verified_completion_output(
+            &mut loop_guard,
+            "User request:\nContinue the remaining work after restart.",
+            &mut events,
+        )
+        .expect("fallback output");
+
+        assert!(!output.contains("Remaining work"));
+        assert!(loop_guard.latest_plan.as_ref().is_some_and(|plan| plan
+            .steps
+            .iter()
+            .all(|step| step.status == TaskPlanStepStatus::Completed)));
+    }
+
+    #[test]
+    fn chinese_plan_keywords_drive_loop_guards() {
+        assert!(step_looks_like_verification("运行测试并验证结果"));
+        assert!(step_looks_like_workspace_change("实现并修复命令行工具"));
+        assert!(request_resumes_deferred_work("继续完成第二阶段的剩余工作"));
+        assert!(step_is_explicitly_deferred("后续阶段暂缓实现"));
+    }
+
+    #[tokio::test]
+    async fn repeated_implementation_mode_violations_stop_as_incomplete() {
+        let workspace = test_workspace("implementation-mode-stop");
+        for index in 0..11 {
+            fs::write(workspace.join(format!("context-{index}.txt")), "context").unwrap();
+        }
+        let mut responses = vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_plan".to_string(),
+                    name: "update_plan".to_string(),
+                    arguments: json!({
+                        "plan": [
+                            { "step": "Implement CLI contract", "status": "in_progress" },
+                            { "step": "Run tests", "status": "pending" }
+                        ]
+                    }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: (0..11)
+                    .map(|index| ProviderToolCall {
+                        id: format!("call_read_{index}"),
+                        name: "read_file".to_string(),
+                        arguments: json!({ "path": format!("context-{index}.txt") }),
+                    })
+                    .collect(),
+                usage: None,
+            },
+        ];
+        responses.extend((1..=3).map(|index| ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ProviderToolCall {
+                id: format!("call_violation_{index}"),
+                name: "list_files".to_string(),
+                arguments: json!({ "path": "." }),
+            }],
+            usage: None,
+        }));
+        let provider = Arc::new(ScriptedProvider::new(responses));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Implement the CLI.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("stagnation stop closes the turn");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert_eq!(provider.requests().len(), 5);
+        assert!(assistant_text(&result.events).contains("Task remains incomplete"));
+        assert!(assistant_text(&result.events).contains("3 implementation-mode violations"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn equivalent_tool_calls_are_blocked_until_state_changes() {
+        let workspace = test_workspace("equivalent-tool-loop");
+        fs::write(workspace.join("sample.txt"), "stable content").unwrap();
+        let responses = (0..4)
+            .map(|index| ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: format!("call_read_{index}"),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "sample.txt" }),
+                }],
+                usage: None,
+            })
+            .chain(std::iter::once(ModelResponse::text(
+                "Stopped retrying the equivalent read.",
+            )))
+            .collect();
+        let provider = Arc::new(ScriptedProvider::new(responses));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let events = agent
+            .run_turn(AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Inspect sample.txt without looping.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                store: None,
+                cancellation: None,
+            })
+            .await
+            .expect("loop guard returns the blocked result to the provider");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallFinished { result }
+                if result.metadata.get("loopGuardBlocked").and_then(Value::as_bool) == Some(true)
+        )));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests[4].tool_results[3]
+                .metadata
+                .get("equivalentCallCount")
+                .and_then(Value::as_u64),
+            Some(4)
+        );
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -1838,6 +3168,75 @@ mod tests {
         assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
         assert!(assistant_text(&resumed.events).contains("Completed after the user continued"));
         assert_eq!(provider.requests().len(), 9);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn total_tool_budget_forces_a_final_response_across_continuations() {
+        let workspace = test_workspace("total-tool-budget");
+        fs::write(workspace.join("sample.txt"), "bounded content").unwrap();
+        let responses = (0..DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS)
+            .map(|index| ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: format!("call_{index}"),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "sample.txt" }),
+                }],
+                usage: None,
+            })
+            .chain(std::iter::once(ModelResponse::text(
+                "Stopped at the total tool budget.",
+            )))
+            .collect();
+        let provider = Arc::new(ScriptedProvider::new(responses));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+        let mut result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Exercise the total loop guard.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("initial slice runs");
+        let mut checkpoints = 0;
+
+        loop {
+            let continuation = match result.outcome {
+                AgentTurnOutcome::Completed => break,
+                AgentTurnOutcome::Suspended { continuation, .. } => continuation,
+            };
+            checkpoints += 1;
+            assert_eq!(
+                continuation.continuation_kind,
+                AgentContinuationKind::BudgetCheckpoint
+            );
+            result = agent
+                .resume_turn_streaming(continuation, true, None, None, None)
+                .await
+                .expect("budget continuation runs");
+        }
+
+        assert_eq!(checkpoints, 2);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS + 1);
+        let final_request = requests.last().expect("final provider request");
+        assert!(final_request.tool_candidates.is_empty());
+        assert!(final_request
+            .system_prompt
+            .contains("Total tool-decision budget: 24/24"));
 
         let _ = fs::remove_dir_all(workspace);
     }

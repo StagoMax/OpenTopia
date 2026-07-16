@@ -233,12 +233,23 @@ or run the deterministic two-phase long-horizon evaluation without printing the 
 .\scripts\evaluate-long-horizon.ps1 `
   -EnvFile "J:\Project\信贷审核助手\.env" `
   -Profile AUDIT_COPILOT_LLM `
-  -ExpectedModel glm-5.2
+  -ExpectedModel glm-5.2 `
+  -TaskManifest scripts\fixtures\long-horizon\task.json `
+  -TurnTimeoutSeconds 300
+
+.\scripts\evaluate-long-horizon-suite.ps1 `
+  -EnvFile "J:\Project\信贷审核助手\.env" `
+  -Profile AUDIT_COPILOT_LLM `
+  -ExpectedModel glm-5.2 `
+  -Repetitions 1 `
+  -TurnTimeoutSeconds 300
 ```
 
-The latest methodology and result are documented in
+The latest methodology, closure design, and three-task result are documented in
 `docs/evaluations/glm-5.2-long-horizon-2026-07-16.md`. This local harness follows
 SWE-bench/Terminal-Bench principles but is not an official leaderboard score.
+The long-term task taxonomy, metric definitions, release gates, artifact schema,
+and evaluation workflow are specified in `docs/evaluation-system.md`.
 
 The integration smoke test covers settings, workspace tree, search, approval
 persistence, staged/unstaged hunk stage/unstage/discard, one-shot terminal

@@ -141,6 +141,7 @@ impl ToolRegistry {
         tools.insert("wait_agent".to_string(), Arc::new(WaitAgentTool));
         tools.insert("wait_agents".to_string(), Arc::new(WaitAgentsTool));
         tools.insert("update_plan".to_string(), Arc::new(UpdatePlanTool));
+        tools.insert("complete_task".to_string(), Arc::new(CompleteTaskTool));
         tools.insert("list_skills".to_string(), Arc::new(ListSkillsTool));
         tools.insert("read_skill".to_string(), Arc::new(ReadSkillTool));
         tools.insert("browser".to_string(), Arc::new(BrowserTool));
@@ -553,6 +554,131 @@ impl Drop for SpreadsheetStaging {
     }
 }
 
+const MAX_TASK_COMPLETION_SUMMARY_CHARS: usize = 4_000;
+const MAX_TASK_COMPLETION_ITEMS: usize = 20;
+const MAX_TASK_COMPLETION_ITEM_CHARS: usize = 1_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompleteTaskInput {
+    summary: String,
+    #[serde(default)]
+    verification: Vec<String>,
+    #[serde(default)]
+    remaining_work: Vec<String>,
+}
+
+pub struct CompleteTaskTool;
+
+#[async_trait]
+impl Tool for CompleteTaskTool {
+    fn name(&self) -> &str {
+        "complete_task"
+    }
+
+    fn description(&self) -> &str {
+        "Finish the current user task after its requested scope has been verified. Provide a concise summary, concrete verification evidence, and any deliberately deferred work. This is the final tool call for the turn."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Concise description of the completed result."
+                },
+                "verification": {
+                    "type": "array",
+                    "maxItems": MAX_TASK_COMPLETION_ITEMS,
+                    "items": { "type": "string" },
+                    "description": "Commands, checks, or observed results that verify the completed scope."
+                },
+                "remaining_work": {
+                    "type": "array",
+                    "maxItems": MAX_TASK_COMPLETION_ITEMS,
+                    "items": { "type": "string" },
+                    "description": "Work intentionally left for a later phase. Empty means no known remaining work."
+                }
+            },
+            "required": ["summary", "verification", "remaining_work"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, _ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let input: CompleteTaskInput = serde_json::from_value(call.input.clone())
+            .context("complete_task received invalid arguments")?;
+        let summary =
+            validate_completion_text("summary", input.summary, MAX_TASK_COMPLETION_SUMMARY_CHARS)?;
+        let verification = validate_completion_items("verification", input.verification)?;
+        let remaining_work = validate_completion_items("remaining_work", input.remaining_work)?;
+
+        let mut output = summary.clone();
+        if !verification.is_empty() {
+            output.push_str("\n\nVerification:\n");
+            for item in &verification {
+                output.push_str("- ");
+                output.push_str(item);
+                output.push('\n');
+            }
+            output.pop();
+        }
+        if !remaining_work.is_empty() {
+            output.push_str("\n\nRemaining work:\n");
+            for item in &remaining_work {
+                output.push_str("- ");
+                output.push_str(item);
+                output.push('\n');
+            }
+            output.pop();
+        }
+
+        let completion = json!({
+            "summary": summary,
+            "verification": verification,
+            "remainingWork": remaining_work
+        });
+        Ok(ToolResult {
+            call_id: call.id,
+            output,
+            content: vec![ModelContentPart::json(completion.clone())],
+            metadata: json!({
+                "toolName": self.name(),
+                "taskCompletion": completion,
+                "success": true
+            }),
+        })
+    }
+}
+
+fn validate_completion_text(
+    field: &str,
+    value: String,
+    max_chars: usize,
+) -> anyhow::Result<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        anyhow::bail!("complete_task {field} cannot be empty");
+    }
+    if value.chars().count() > max_chars {
+        anyhow::bail!("complete_task {field} exceeds the {max_chars} character limit");
+    }
+    Ok(value)
+}
+
+fn validate_completion_items(field: &str, values: Vec<String>) -> anyhow::Result<Vec<String>> {
+    if values.len() > MAX_TASK_COMPLETION_ITEMS {
+        anyhow::bail!(
+            "complete_task {field} may contain at most {MAX_TASK_COMPLETION_ITEMS} items"
+        );
+    }
+    values
+        .into_iter()
+        .map(|value| validate_completion_text(field, value, MAX_TASK_COMPLETION_ITEM_CHARS))
+        .collect()
+}
+
 const MAX_TASK_PLAN_STEPS: usize = 20;
 const MAX_TASK_PLAN_STEP_CHARS: usize = 300;
 const MAX_TASK_PLAN_EXPLANATION_CHARS: usize = 2_000;
@@ -562,6 +688,10 @@ const MAX_TASK_PLAN_EXPLANATION_CHARS: usize = 2_000;
 struct UpdatePlanInput {
     #[serde(default)]
     explanation: Option<String>,
+    #[serde(default)]
+    current_scope_complete: bool,
+    #[serde(default)]
+    verification: Vec<String>,
     plan: Vec<TaskPlanStep>,
 }
 
@@ -574,7 +704,7 @@ impl Tool for UpdatePlanTool {
     }
 
     fn description(&self) -> &str {
-        "Replace the current task checklist with concise steps and their progress. Use it for multi-step work and keep it current until every step is completed."
+        "Replace the current task checklist with concise steps and their progress. Use it for multi-step work and keep it current. When the current requested scope is verified but later-phase steps deliberately remain pending, set current_scope_complete and include verification evidence."
     }
 
     fn schema(&self) -> Value {
@@ -584,6 +714,16 @@ impl Tool for UpdatePlanTool {
                 "explanation": {
                     "type": "string",
                     "description": "Optional reason for changing the plan."
+                },
+                "current_scope_complete": {
+                    "type": "boolean",
+                    "description": "True only when every step in the current user-requested scope is complete and verified; explicitly deferred later-phase steps may remain pending."
+                },
+                "verification": {
+                    "type": "array",
+                    "maxItems": MAX_TASK_COMPLETION_ITEMS,
+                    "items": { "type": "string" },
+                    "description": "Concrete checks supporting current_scope_complete, such as a successful test command."
                 },
                 "plan": {
                     "type": "array",
@@ -645,6 +785,9 @@ impl Tool for UpdatePlanTool {
         if in_progress > 1 {
             anyhow::bail!("task plan may contain at most one in_progress step");
         }
+        if input.current_scope_complete && in_progress > 0 {
+            anyhow::bail!("a completed current scope cannot contain an in_progress step");
+        }
 
         let explanation = input
             .explanation
@@ -665,6 +808,13 @@ impl Tool for UpdatePlanTool {
             .iter()
             .filter(|step| step.status == TaskPlanStepStatus::Completed)
             .count();
+        let verification = validate_completion_items("verification", input.verification)?;
+        if input.current_scope_complete && completed == 0 {
+            anyhow::bail!("a completed current scope must contain a completed plan step");
+        }
+        if input.current_scope_complete && verification.is_empty() {
+            anyhow::bail!("a completed current scope requires verification evidence");
+        }
         let value = serde_json::to_value(&plan)?;
         Ok(ToolResult {
             call_id: call.id,
@@ -678,6 +828,9 @@ impl Tool for UpdatePlanTool {
                 "taskPlan": value,
                 "completed": completed,
                 "total": plan.steps.len(),
+                "allStepsComplete": !plan.steps.is_empty() && completed == plan.steps.len(),
+                "currentScopeComplete": input.current_scope_complete,
+                "verification": verification,
                 "success": true
             }),
         })
@@ -2658,6 +2811,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_task_returns_a_structured_terminal_signal() {
+        let workspace_root = std::env::current_dir().unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let result = CompleteTaskTool
+            .execute(
+                ToolCall::new(
+                    "complete_task",
+                    json!({
+                        "summary": "Requested scope is complete.",
+                        "verification": ["Focused tests passed"],
+                        "remaining_work": ["A later phase remains pending"]
+                    }),
+                ),
+                ToolContext::local(workspace_root.clone(), policy.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.metadata["success"], true);
+        assert_eq!(
+            result.metadata["taskCompletion"]["summary"],
+            "Requested scope is complete."
+        );
+        assert!(result.output.contains("Focused tests passed"));
+        assert!(result.output.contains("A later phase remains pending"));
+
+        let invalid = CompleteTaskTool
+            .execute(
+                ToolCall::new(
+                    "complete_task",
+                    json!({
+                        "summary": "   ",
+                        "verification": [],
+                        "remaining_work": []
+                    }),
+                ),
+                ToolContext::local(workspace_root, policy),
+            )
+            .await
+            .unwrap_err();
+        assert!(invalid.to_string().contains("summary cannot be empty"));
+    }
+
+    #[tokio::test]
     async fn update_plan_validates_progress_and_parent_ownership() {
         let workspace_root = std::env::current_dir().unwrap();
         let policy = Arc::new(BasicPolicyEngine::new(
@@ -2684,6 +2883,30 @@ mod tests {
         let plan: TaskPlan = serde_json::from_value(result.metadata["taskPlan"].clone()).unwrap();
         assert_eq!(plan.steps.len(), 2);
         assert!(plan.is_active());
+
+        let completed_scope = UpdatePlanTool
+            .execute(
+                ToolCall::new(
+                    "update_plan",
+                    json!({
+                        "current_scope_complete": true,
+                        "verification": ["npm test passed"],
+                        "plan": [
+                            { "step": "Current phase", "status": "completed" },
+                            { "step": "Later phase", "status": "pending" }
+                        ]
+                    }),
+                ),
+                ToolContext::local(workspace_root.clone(), policy.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed_scope.metadata["currentScopeComplete"], true);
+        assert_eq!(completed_scope.metadata["allStepsComplete"], false);
+        assert_eq!(
+            completed_scope.metadata["verification"][0],
+            "npm test passed"
+        );
 
         let invalid = UpdatePlanTool
             .execute(

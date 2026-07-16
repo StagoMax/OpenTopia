@@ -1,0 +1,101 @@
+{
+    "schemaVersion":  1,
+    "suiteId":  "long-horizon-suite-20260716T115514Z",
+    "startedAt":  "2026-07-16T11:55:14.4270599Z",
+    "completedAt":  "2026-07-16T12:14:10.0182208Z",
+    "status":  "failed",
+    "provider":  {
+                     "profile":  "AUDIT_COPILOT_LLM",
+                     "expectedModel":  "glm-5.2",
+                     "credentials":  "redacted:set"
+                 },
+    "configuration":  {
+                          "repetitions":  1,
+                          "turnTimeoutSeconds":  240,
+                          "taskManifests":  [
+                                                "scripts\\fixtures\\long-horizon\\task.json",
+                                                "scripts\\fixtures\\long-horizon\\config-migration\\task.json",
+                                                "scripts\\fixtures\\long-horizon\\dependency-planner\\task.json"
+                                            ]
+                      },
+    "aggregate":  {
+                      "requestedRuns":  3,
+                      "validRuns":  3,
+                      "passedRuns":  1,
+                      "passRate":  0.33333333333333331
+                  },
+    "tasks":  [
+                  {
+                      "taskId":  "LONG-LEDGER-001",
+                      "validRuns":  1,
+                      "passedRuns":  1,
+                      "passRate":  1,
+                      "runs":  [
+                                   {
+                                       "repetition":  1,
+                                       "runId":  "glm-5-2-long-ledger-001-20260716T115515Z",
+                                       "status":  "passed",
+                                       "totalMs":  387145,
+                                       "totalTokens":  300951,
+                                       "completionToolCalls":  0,
+                                       "verifiedPlanCompletionCalls":  2,
+                                       "blockedEquivalentToolCalls":  1,
+                                       "blockedCompletionModeToolCalls":  2,
+                                       "blockedImplementationModeToolCalls":  0,
+                                       "recoveryPassed":  true,
+                                       "processContractPassed":  true,
+                                       "error":  null
+                                   }
+                               ]
+                  },
+                  {
+                      "taskId":  "LONG-CONFIG-001",
+                      "validRuns":  1,
+                      "passedRuns":  0,
+                      "passRate":  0,
+                      "runs":  [
+                                   {
+                                       "repetition":  1,
+                                       "runId":  "glm-5-2-long-config-001-20260716T120143Z",
+                                       "status":  "failed",
+                                       "totalMs":  340006,
+                                       "totalTokens":  204295,
+                                       "completionToolCalls":  0,
+                                       "verifiedPlanCompletionCalls":  1,
+                                       "blockedEquivalentToolCalls":  0,
+                                       "blockedCompletionModeToolCalls":  0,
+                                       "blockedImplementationModeToolCalls":  2,
+                                       "recoveryPassed":  true,
+                                       "processContractPassed":  false,
+                                       "error":  "Turn exceeded the configured hard timeout"
+                                   }
+                               ]
+                  },
+                  {
+                      "taskId":  "LONG-DEPS-001",
+                      "validRuns":  1,
+                      "passedRuns":  0,
+                      "passRate":  0,
+                      "runs":  [
+                                   {
+                                       "repetition":  1,
+                                       "runId":  "glm-5-2-long-deps-001-20260716T120724Z",
+                                       "status":  "failed",
+                                       "totalMs":  405114,
+                                       "totalTokens":  184279,
+                                       "completionToolCalls":  0,
+                                       "verifiedPlanCompletionCalls":  1,
+                                       "blockedEquivalentToolCalls":  0,
+                                       "blockedCompletionModeToolCalls":  2,
+                                       "blockedImplementationModeToolCalls":  2,
+                                       "recoveryPassed":  true,
+                                       "processContractPassed":  false,
+                                       "error":  "Turn exceeded the configured hard timeout"
+                                   }
+                               ]
+                  }
+              ],
+    "infrastructureFailures":  [
+
+                               ]
+}

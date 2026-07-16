@@ -5,6 +5,7 @@ param(
   [int]$Port = 8812,
   [int]$TurnTimeoutSeconds = 420,
   [string]$SummaryPath = "",
+  [string]$TaskManifest = "scripts\fixtures\long-horizon\task.json",
   [switch]$SkipBuild
 )
 
@@ -143,6 +144,7 @@ function Wait-EvalTurn {
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   $continuations = 0
+  $deniedApprovals = 0
   $lastTurn = $null
   while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
@@ -154,25 +156,31 @@ function Wait-EvalTurn {
       $pending = @(Expand-EvalItems (
         Invoke-EvalApi "Get" "/api/threads/$ThreadId/approvals?status=pending"
       ))
-      if ($pending.Count -ne 1 -or $pending[0].action -ne "Continue agent execution") {
-        throw "Turn reached a non-budget approval boundary"
+      if ($pending.Count -ne 1) {
+        throw "Turn reached an ambiguous approval boundary"
       }
       $approvalId = [string]$pending[0].approvalId
       if (-not $approvalId) {
         throw "Pending approval did not include approvalId"
       }
+      $isBudgetCheckpoint = $pending[0].action -eq "Continue agent execution"
       Invoke-EvalApi `
         -Method "Post" `
         -Path "/api/threads/$ThreadId/approvals/$approvalId/decision" `
-        -Body @{ approved = $true } `
+        -Body @{ approved = $isBudgetCheckpoint } `
         -TimeoutSeconds $TimeoutSeconds | Out-Null
-      $continuations += 1
+      if ($isBudgetCheckpoint) {
+        $continuations += 1
+      } else {
+        $deniedApprovals += 1
+      }
       continue
     }
     if ($lastTurn.status -in @("succeeded", "failed", "cancelled", "interrupted")) {
       return [PSCustomObject]@{
         Turn = $lastTurn
         BudgetContinuations = $continuations
+        DeniedApprovals = $deniedApprovals
       }
     }
   }
@@ -187,7 +195,7 @@ function Wait-EvalTurn {
 function Invoke-HiddenGrader {
   param(
     [Parameter(Mandatory = $true)][string]$Workspace,
-    [Parameter(Mandatory = $true)][ValidateSet("library", "full")][string]$Phase,
+    [Parameter(Mandatory = $true)][string]$Phase,
     [Parameter(Mandatory = $true)][string]$GraderPath
   )
 
@@ -236,6 +244,29 @@ function Get-TrajectoryMetrics {
     $_.payload.call.name -eq "shell" -and
     [string]$_.payload.call.input.command -match '(?i)(npm\s+test|node\s+--test)'
   }).Count
+  $completionToolCalls = @($toolStarts | Where-Object {
+    $_.payload.call.name -eq "complete_task"
+  }).Count
+  $blockedEquivalentToolCalls = @($toolFinishes | Where-Object {
+    $_.payload.result.metadata.loopGuardBlocked -eq $true
+  }).Count
+  $blockedCompletionModeToolCalls = @($toolFinishes | Where-Object {
+    $_.payload.result.metadata.completionModeBlocked -eq $true
+  }).Count
+  $blockedImplementationModeToolCalls = @($toolFinishes | Where-Object {
+    $_.payload.result.metadata.implementationModeBlocked -eq $true
+  }).Count
+  $verifiedPlanCompletionCalls = @($toolFinishes | Where-Object {
+    $_.payload.result.metadata.toolName -eq "update_plan" -and
+    $_.payload.result.metadata.success -eq $true -and
+    (
+      $_.payload.result.metadata.currentScopeComplete -eq $true -or
+      $_.payload.result.metadata.allStepsComplete -eq $true
+    )
+  }).Count
+  $fallbackVerifiedCompletions = @($planEvents | Where-Object {
+    [string]$_.payload.plan.explanation -like "Runtime fallback reconciled the durable plan*"
+  }).Count
   $latestPlan = if ($planEvents.Count -gt 0) {
     $planEvents[$planEvents.Count - 1].payload.plan
   } else {
@@ -271,6 +302,12 @@ function Get-TrajectoryMetrics {
     budgetCheckpoints = $budgetCheckpoints.Count
     latestPlan = $planStatus
     testToolCalls = $testToolCalls
+    completionToolCalls = $completionToolCalls
+    verifiedPlanCompletionCalls = $verifiedPlanCompletionCalls
+    fallbackVerifiedCompletions = $fallbackVerifiedCompletions
+    blockedEquivalentToolCalls = $blockedEquivalentToolCalls
+    blockedCompletionModeToolCalls = $blockedCompletionModeToolCalls
+    blockedImplementationModeToolCalls = $blockedImplementationModeToolCalls
     inputTokens = $inputTokens
     outputTokens = $outputTokens
     totalTokens = $totalTokens
@@ -309,6 +346,42 @@ function Test-FilesForSecret {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . "$PSScriptRoot\dev-env.ps1"
 
+$taskManifestPath = if ([IO.Path]::IsPathRooted($TaskManifest)) {
+  $TaskManifest
+} else {
+  Join-Path $repoRoot $TaskManifest
+}
+$taskManifestPath = (Resolve-Path -LiteralPath $taskManifestPath).Path
+$taskRoot = Split-Path -Parent $taskManifestPath
+$task = Get-Content -Raw -Encoding UTF8 -LiteralPath $taskManifestPath | ConvertFrom-Json
+foreach ($required in @(
+  "id",
+  "title",
+  "seedDirectory",
+  "graderPath",
+  "publicTestFile",
+  "phase1",
+  "phase2"
+)) {
+  if (-not $task.$required) {
+    throw "Task manifest is missing required field: $required"
+  }
+}
+if (-not $task.phase1.prompt -or -not $task.phase1.graderPhase) {
+  throw "Task manifest phase1 is incomplete"
+}
+if (-not $task.phase2.prompt -or -not $task.phase2.graderPhase) {
+  throw "Task manifest phase2 is incomplete"
+}
+$seed = Join-Path $taskRoot ([string]$task.seedDirectory)
+$graderPath = Join-Path $taskRoot ([string]$task.graderPath)
+if (-not (Test-Path -LiteralPath $seed -PathType Container)) {
+  throw "Task seed directory was not found: $seed"
+}
+if (-not (Test-Path -LiteralPath $graderPath -PathType Leaf)) {
+  throw "Task grader was not found: $graderPath"
+}
+
 $values = ConvertFrom-DotEnvFile $EnvFile
 $apiKey = [string]$values["${Profile}_API_KEY"]
 $baseUrl = ([string]$values["${Profile}_BASE_URL"]).TrimEnd("/")
@@ -340,7 +413,9 @@ foreach ($name in @(
 [Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_NETWORK", "deny", "Process")
 
 $script:ApiHeaders = @{ Authorization = "Bearer $env:OPENTOPIA_API_TOKEN" }
-$runId = "glm-5-2-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+$modelSlug = ($model.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+$taskSlug = (([string]$task.id).ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+$runId = "$modelSlug-$taskSlug-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
 $runRoot = Join-Path $repoRoot ".opentopia\evaluations\$runId"
 $workspace = Join-Path $runRoot "workspace"
 $database = Join-Path $runRoot "evaluation.db"
@@ -348,8 +423,6 @@ $probePath = Join-Path $runRoot "provider-probe.json"
 $trajectoryPhase1Path = Join-Path $runRoot "trajectory-phase1.json"
 $trajectoryFinalPath = Join-Path $runRoot "trajectory-final.json"
 $resultPath = Join-Path $runRoot "result.json"
-$seed = Join-Path $PSScriptRoot "fixtures\long-horizon\seed"
-$graderPath = Join-Path $PSScriptRoot "fixtures\long-horizon\grader.cjs"
 $server = $null
 $startedAt = Get-Date
 $phase1StartedAt = $null
@@ -363,6 +436,8 @@ $phase1Turn = $null
 $phase2Turn = $null
 $phase1Continuations = 0
 $phase2Continuations = 0
+$phase1DeniedApprovals = 0
+$phase2DeniedApprovals = 0
 $thread = $null
 $eventsPhase1 = @()
 $eventsFinal = @()
@@ -389,10 +464,16 @@ if ($LASTEXITCODE -ne 0) {
   throw "Failed to initialize the evaluation fixture"
 }
 
-$baselinePublicOutput = & node --test (Join-Path $workspace "test\contract.test.js") 2>&1
+$baselinePublicOutput = & node --test (Join-Path $workspace ([string]$task.publicTestFile)) 2>&1
 $baselinePublicExit = $LASTEXITCODE
-$baselineLibrary = Invoke-HiddenGrader $workspace "library" $graderPath
-$baselineFull = Invoke-HiddenGrader $workspace "full" $graderPath
+$baselineLibrary = Invoke-HiddenGrader `
+  $workspace `
+  ([string]$task.phase1.graderPhase) `
+  $graderPath
+$baselineFull = Invoke-HiddenGrader `
+  $workspace `
+  ([string]$task.phase2.graderPhase) `
+  $graderPath
 
 try {
   $probeText = & "$PSScriptRoot\probe-openai-compatible.ps1" `
@@ -448,17 +529,10 @@ try {
   }
 
   $thread = Invoke-EvalApi "Post" "/api/threads" @{
-    title = "GLM-5.2 deterministic long-horizon evaluation"
+    title = [string]$task.title
     workspaceRoot = $workspace
   }
-  $phase1Prompt = @'
-This is phase 1 of a controlled two-session coding evaluation. Read SPEC.md and
-the existing code. Use update_plan to create a durable plan with at least four
-concrete steps covering both sessions. In this phase, implement and verify the
-CSV parsing, reconciliation, and report library in src/ledger.js. Run npm test.
-Do not modify SPEC.md or any file under test/. Leave the CLI/session-2 work
-pending in the plan and finish with a runnable, tested workspace.
-'@
+  $phase1Prompt = [string]$task.phase1.prompt
   $phase1StartedAt = Get-Date
   $phase1Message = Invoke-EvalApi "Post" "/api/threads/$($thread.id)/messages" @{
     content = $phase1Prompt
@@ -467,6 +541,7 @@ pending in the plan and finish with a runnable, tested workspace.
   $phase1ElapsedMs = [int64]((Get-Date) - $phase1StartedAt).TotalMilliseconds
   $phase1Turn = $phase1Wait.Turn
   $phase1Continuations = $phase1Wait.BudgetContinuations
+  $phase1DeniedApprovals = $phase1Wait.DeniedApprovals
   $eventsPhase1 = @(Expand-EvalItems (
     Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
   ))
@@ -514,13 +589,7 @@ pending in the plan and finish with a runnable, tested workspace.
     }).Count -gt 0
   }
 
-  $phase2Prompt = @'
-Continue the same task after the server restart. Recover the current state from
-the durable plan, prior messages, workspace, and git diff. Complete the remaining
-CLI contract in src/cli.js, repair any incomplete library behavior, run the full
-npm test suite, and update the durable plan so every step is completed. Do not
-modify SPEC.md or any file under test/. Do not claim completion unless tests pass.
-'@
+  $phase2Prompt = [string]$task.phase2.prompt
   $phase2StartedAt = Get-Date
   $phase2Message = Invoke-EvalApi "Post" "/api/threads/$($thread.id)/messages" @{
     content = $phase2Prompt
@@ -529,6 +598,7 @@ modify SPEC.md or any file under test/. Do not claim completion unless tests pas
   $phase2ElapsedMs = [int64]((Get-Date) - $phase2StartedAt).TotalMilliseconds
   $phase2Turn = $phase2Wait.Turn
   $phase2Continuations = $phase2Wait.BudgetContinuations
+  $phase2DeniedApprovals = $phase2Wait.DeniedApprovals
   $eventsFinal = @(Expand-EvalItems (
     Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
   ))
@@ -570,17 +640,42 @@ modify SPEC.md or any file under test/. Do not claim completion unless tests pas
   }
 }
 
-$phase1Grade = Invoke-HiddenGrader $workspace "library" $graderPath
-$finalGrade = Invoke-HiddenGrader $workspace "full" $graderPath
+$phase1Grade = Invoke-HiddenGrader `
+  $workspace `
+  ([string]$task.phase1.graderPhase) `
+  $graderPath
+$finalGrade = Invoke-HiddenGrader `
+  $workspace `
+  ([string]$task.phase2.graderPhase) `
+  $graderPath
 if ($eventsFinal.Count -eq 0 -and $eventsPhase1.Count -gt 0) {
   $eventsFinal = $eventsPhase1
 }
+$phase1Metrics = Get-TrajectoryMetrics $eventsPhase1
 $metrics = Get-TrajectoryMetrics $eventsFinal
+$minPlanUpdates = if ($null -ne $task.process.minPlanUpdates) {
+  [int]$task.process.minPlanUpdates
+} else { 2 }
+$minTestToolCalls = if ($null -ne $task.process.minTestToolCalls) {
+  [int]$task.process.minTestToolCalls
+} else { 2 }
+$minCompletedPlanSteps = if ($null -ne $task.process.minCompletedPlanSteps) {
+  [int]$task.process.minCompletedPlanSteps
+} else { 4 }
+$requireExplicitCompletion = $task.process.requireExplicitCompletion -eq $true
+$phase1CompletionSignals =
+  $phase1Metrics.completionToolCalls +
+  $phase1Metrics.verifiedPlanCompletionCalls +
+  $phase1Metrics.fallbackVerifiedCompletions
+$completionSignals =
+  $metrics.completionToolCalls +
+  $metrics.verifiedPlanCompletionCalls +
+  $metrics.fallbackVerifiedCompletions
 $latestPlanComplete =
   $metrics.planUpdates -gt 0 -and
   $metrics.latestPlan.pending -eq 0 -and
   $metrics.latestPlan.inProgress -eq 0 -and
-  $metrics.latestPlan.completed -ge 4
+  $metrics.latestPlan.completed -ge $minCompletedPlanSteps
 $recoveryPassed =
   $recovery.serverRestarted -and
   $recovery.threadRecovered -and
@@ -590,9 +685,16 @@ $recoveryPassed =
   $recovery.durablePlanRecovered -and
   $recovery.activePlanRecovered
 $processContractPassed =
-  $metrics.planUpdates -ge 2 -and
-  $metrics.testToolCalls -ge 2 -and
-  $latestPlanComplete
+  $metrics.planUpdates -ge $minPlanUpdates -and
+  $metrics.testToolCalls -ge $minTestToolCalls -and
+  $latestPlanComplete -and
+  (
+    -not $requireExplicitCompletion -or
+    (
+      $phase1CompletionSignals -ge 1 -and
+      $completionSignals -ge 2
+    )
+  )
 $providerPassed = $null -ne $providerProbe -and $providerProbe.compatibleWithOpenTopia
 $turnsPassed =
   $null -ne $phase1Turn -and
@@ -617,6 +719,13 @@ $result = [ordered]@{
   completedAt = (Get-Date).ToUniversalTime().ToString("o")
   status = if ($overallPassed) { "passed" } else { "failed" }
   objectiveScoringOnly = $true
+  task = [ordered]@{
+    id = [string]$task.id
+    title = [string]$task.title
+    manifest = $taskManifestPath.Substring($repoRoot.Length).TrimStart('\', '/')
+    phase1Grader = [string]$task.phase1.graderPhase
+    phase2Grader = [string]$task.phase2.graderPhase
+  }
   provider = [ordered]@{
     profile = $Profile
     baseUrl = $baseUrl
@@ -655,17 +764,32 @@ $result = [ordered]@{
       status = if ($phase1Turn) { $phase1Turn.status } else { "not_completed" }
       elapsedMs = $phase1ElapsedMs
       budgetContinuations = $phase1Continuations
+      deniedApprovals = $phase1DeniedApprovals
     },
     [ordered]@{
       phase = 2
       status = if ($phase2Turn) { $phase2Turn.status } else { "not_completed" }
       elapsedMs = $phase2ElapsedMs
       budgetContinuations = $phase2Continuations
+      deniedApprovals = $phase2DeniedApprovals
     }
   )
   recovery = $recovery
   recoveryPassed = $recoveryPassed
   trajectoryMetrics = $metrics
+  processContract = [ordered]@{
+    passed = $processContractPassed
+    requireExplicitCompletion = $requireExplicitCompletion
+    phase1CompletionCalls = $phase1Metrics.completionToolCalls
+    totalCompletionCalls = $metrics.completionToolCalls
+    phase1VerifiedPlanCompletions = $phase1Metrics.verifiedPlanCompletionCalls
+    totalVerifiedPlanCompletions = $metrics.verifiedPlanCompletionCalls
+    phase1FallbackVerifiedCompletions = $phase1Metrics.fallbackVerifiedCompletions
+    totalFallbackVerifiedCompletions = $metrics.fallbackVerifiedCompletions
+    minPlanUpdates = $minPlanUpdates
+    minTestToolCalls = $minTestToolCalls
+    minCompletedPlanSteps = $minCompletedPlanSteps
+  }
   processContractPassed = $processContractPassed
   grading = [ordered]@{
     phase1Library = $phase1Grade

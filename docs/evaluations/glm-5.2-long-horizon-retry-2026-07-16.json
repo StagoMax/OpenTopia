@@ -1,0 +1,79 @@
+{
+    "schemaVersion":  1,
+    "suiteId":  "long-horizon-suite-20260716T123524Z",
+    "startedAt":  "2026-07-16T12:35:24.7590694Z",
+    "completedAt":  "2026-07-16T12:48:58.2554369Z",
+    "status":  "passed",
+    "provider":  {
+                     "profile":  "AUDIT_COPILOT_LLM",
+                     "expectedModel":  "glm-5.2",
+                     "credentials":  "redacted:set"
+                 },
+    "configuration":  {
+                          "repetitions":  1,
+                          "turnTimeoutSeconds":  300,
+                          "taskManifests":  [
+                                                "scripts\\fixtures\\long-horizon\\config-migration\\task.json",
+                                                "scripts\\fixtures\\long-horizon\\dependency-planner\\task.json"
+                                            ]
+                      },
+    "aggregate":  {
+                      "requestedRuns":  2,
+                      "validRuns":  2,
+                      "passedRuns":  2,
+                      "passRate":  1
+                  },
+    "tasks":  [
+                  {
+                      "taskId":  "LONG-CONFIG-001",
+                      "validRuns":  1,
+                      "passedRuns":  1,
+                      "passRate":  1,
+                      "runs":  [
+                                   {
+                                       "repetition":  1,
+                                       "runId":  "glm-5-2-long-config-001-20260716T123525Z",
+                                       "status":  "passed",
+                                       "totalMs":  389493,
+                                       "totalTokens":  178526,
+                                       "completionToolCalls":  0,
+                                       "verifiedPlanCompletionCalls":  2,
+                                       "fallbackVerifiedCompletions":  0,
+                                       "blockedEquivalentToolCalls":  0,
+                                       "blockedCompletionModeToolCalls":  1,
+                                       "blockedImplementationModeToolCalls":  3,
+                                       "recoveryPassed":  true,
+                                       "processContractPassed":  true,
+                                       "error":  null
+                                   }
+                               ]
+                  },
+                  {
+                      "taskId":  "LONG-DEPS-001",
+                      "validRuns":  1,
+                      "passedRuns":  1,
+                      "passRate":  1,
+                      "runs":  [
+                                   {
+                                       "repetition":  1,
+                                       "runId":  "glm-5-2-long-deps-001-20260716T124156Z",
+                                       "status":  "passed",
+                                       "totalMs":  421238,
+                                       "totalTokens":  191648,
+                                       "completionToolCalls":  0,
+                                       "verifiedPlanCompletionCalls":  2,
+                                       "fallbackVerifiedCompletions":  0,
+                                       "blockedEquivalentToolCalls":  0,
+                                       "blockedCompletionModeToolCalls":  0,
+                                       "blockedImplementationModeToolCalls":  1,
+                                       "recoveryPassed":  true,
+                                       "processContractPassed":  true,
+                                       "error":  null
+                                   }
+                               ]
+                  }
+              ],
+    "infrastructureFailures":  [
+
+                               ]
+}
