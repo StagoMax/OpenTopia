@@ -60,6 +60,14 @@ export async function openPath(targetPath: string): Promise<void> {
   await window.opentopia.openPath(targetPath);
 }
 
+export async function openExternal(url: string): Promise<void> {
+  if (window.opentopia) {
+    await window.opentopia.openExternal(url);
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
 export async function getRecentWorkspaces(): Promise<RecentWorkspace[]> {
   if (window.opentopia) return window.opentopia.getRecentWorkspaces();
   return readBrowserRecentWorkspaces();

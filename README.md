@@ -102,6 +102,9 @@ When `OPENTOPIA_ENV_FILE` is not set, the Windows dev scripts and Electron dev s
 - `CREDIT_REVIEW_LLM_API_KEY` -> `OPENTOPIA_API_KEY`
 - `CREDIT_REVIEW_LLM_BASE_URL` -> `OPENTOPIA_OPENAI_BASE_URL`
 - `CREDIT_REVIEW_LLM_MODEL` -> `OPENTOPIA_MODEL`
+- `AUDIT_COPILOT_LLM_API_KEY` -> `OPENTOPIA_API_KEY`
+- `AUDIT_COPILOT_LLM_BASE_URL` -> `OPENTOPIA_OPENAI_BASE_URL`
+- `AUDIT_COPILOT_LLM_MODEL` -> `OPENTOPIA_MODEL`
 
 Desktop builds can also store one provider API key through Electron
 `safeStorage`. The renderer process can list only metadata such as
@@ -212,6 +215,30 @@ Run the real-provider context compaction smoke test (this makes one model reques
 ```powershell
 .\scripts\verify-context-summary.cmd
 ```
+
+Configure the Electron development profile through `safeStorage`, probe a provider,
+or run the deterministic two-phase long-horizon evaluation without printing the key:
+
+```powershell
+.\scripts\configure-provider-safe-storage.ps1 `
+  -EnvFile "J:\Project\信贷审核助手\.env" `
+  -UserDataDir ".opentopia\preview-user-data" `
+  -Profile AUDIT_COPILOT_LLM
+
+.\scripts\probe-openai-compatible.ps1 `
+  -EnvFile "J:\Project\信贷审核助手\.env" `
+  -Profile AUDIT_COPILOT_LLM `
+  -ExpectedModel glm-5.2
+
+.\scripts\evaluate-long-horizon.ps1 `
+  -EnvFile "J:\Project\信贷审核助手\.env" `
+  -Profile AUDIT_COPILOT_LLM `
+  -ExpectedModel glm-5.2
+```
+
+The latest methodology and result are documented in
+`docs/evaluations/glm-5.2-long-horizon-2026-07-16.md`. This local harness follows
+SWE-bench/Terminal-Bench principles but is not an official leaderboard score.
 
 The integration smoke test covers settings, workspace tree, search, approval
 persistence, staged/unstaged hunk stage/unstage/discard, one-shot terminal

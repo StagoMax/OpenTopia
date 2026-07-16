@@ -168,11 +168,20 @@ pub struct ExecResult {
 #[derive(Debug, Clone)]
 pub struct FileReadRequest {
     pub path: PathBuf,
+    pub max_bytes: Option<u64>,
 }
 
 impl FileReadRequest {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            max_bytes: None,
+        }
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
     }
 }
 
@@ -712,9 +721,28 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
 
     async fn read_file(&self, request: FileReadRequest) -> anyhow::Result<FileReadResult> {
         let path = self.resolve_existing_path(&request.path)?;
+        if let Some(max_bytes) = request.max_bytes {
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            if metadata.len() > max_bytes {
+                anyhow::bail!(
+                    "file {} is {} bytes; read limit is {} bytes",
+                    path.display(),
+                    metadata.len(),
+                    max_bytes
+                );
+            }
+        }
         let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
+        if request
+            .max_bytes
+            .is_some_and(|max_bytes| bytes.len() as u64 > max_bytes)
+        {
+            anyhow::bail!("file {} exceeded the configured read limit", path.display());
+        }
         Ok(FileReadResult { path, bytes })
     }
 
@@ -947,6 +975,12 @@ mod tests {
             .await
             .expect("read file");
         assert_eq!(read.bytes, b"hello");
+
+        let limited = env
+            .read_file(FileReadRequest::new("nested/hello.txt").with_max_bytes(4))
+            .await
+            .expect_err("bounded read should reject an oversized file");
+        assert!(limited.to_string().contains("read limit"));
 
         let command = if cfg!(windows) {
             "Write-Output ok"

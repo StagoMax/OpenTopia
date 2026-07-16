@@ -64,11 +64,16 @@ OpenTopia 当前采用的是"Electron 桌面壳 + Rust 本地 agent server + SQL
 | Local server | `crates/opentopia-server/src/main.rs` | OpenHands REST event service + Codex event stream | REST + SSE + approval decision |
 | Session store | `crates/opentopia-core/src/store.rs` | OpenHands event persistence | SQLite project/thread/message/event/approval/artifact/settings/MCP/terminal/subagent history |
 | Policy engine | `crates/opentopia-core/src/policy.rs` | Codex exec_policy + Goose permission inspector | chat/read_only/auto/approve/full_access |
-| Tools | `crates/opentopia-core/src/tools.rs` | Codex apply_patch/shell/read/write/search/multi-agent tool surface | list/read/write/search/shell/diff/apply_patch/spawn/send/cancel/wait；全部进入现有工具循环 |
+| Tools | `crates/opentopia-core/src/tools.rs` | Codex apply_patch/shell/read/write/search/plan/multi-agent tool surface | list/read/write/search/shell/diff/apply_patch/update_plan/spreadsheet/browser/spawn/send/cancel/wait/wait_agents；全部进入现有工具循环 |
 | Sources and Skills | `context_sources.rs`、`skills.rs` | Codex Skills roots/limits + OpenHands skill loader 的任务上下文模式 | canonical source 验证、敏感/类型/大小限制、消息引用、bounded text、Turn-scoped Skill 选择 |
-| Subagent runtime | `subagents.rs`、server `ServerSubagentExecutor` | Codex multi-agent lifecycle + Goose subagent tool | 每父 Turn 并发/队列/深度/超时、真实 AgentCore、SQLite/SSE、重启恢复和递归取消 |
+| Subagent runtime | `subagents.rs`、server `ServerSubagentExecutor` | Codex multi-agent lifecycle + Goose subagent tool | 每父 Turn 并发/队列/深度/超时、真实 AgentCore、SQLite/SSE、重启恢复、递归取消和批量并发结果收集 |
+| Durable task plan | `model.rs`、`tools.rs`、`main.rs`、`App.tsx` | Codex `update_plan` typed event + opencode session todo + Goose MOIM todo | 父 Agent 更新结构化计划，事件持久化，未完成计划注入后续 Turn，桌面显示进度 |
+| Persistent Turn lifecycle | `model.rs`、`store.rs`、server `turns.rs` | OpenHands durable run state + Codex typed turn events | SQLite running/waiting/succeeded/failed/cancelled/interrupted 状态、启动恢复和 SSE 去竞态 |
+| Browser runtime | `browser.rs`、`desktop_browser.rs`、`tools.rs`、`electron/browser-host.cjs`、`WebPreviewSurface.tsx`、`BrowserPanel.tsx` | Playwright/Puppeteer 的页面自动化边界 + Electron `WebContentsView` + Codex 审批/typed tool result | Electron 下用户与 Agent 共享每 Thread 原生页面，随机 Token loopback broker 连接 Rust；导航/快照/交互/截图/下载和域名审批 continuation 完整，CDP/BrowserPanel 作为非 Electron fallback |
+| Preview runtime | `preview.rs`、server preview routes、`PreviewHost.tsx` | Codex/opencode 的 first-class workbench tab 模式 + Monaco/PDF.js/calamine 的成熟渲染与解析边界 | canonical workspace/Thread artifact 解析、认证 binary/ETag、Monaco 文本、Blob 图片、PDF.js、虚拟化 XLSX range、系统应用 fallback |
+| Spreadsheet tool | `spreadsheet.rs`、`tools.rs` | calamine workbook reader + rust_xlsxwriter writer；opencode/Codex first-class tool boundary | 受限 XLSX inspect/list/read/create/update，经 policy 与 ExecutionEnvironment 读写；同一 reader 同时服务只读预览 range API |
 | Git workflow | `git_workflow.rs`、`POST /api/threads/:id/git`、`RightContextRail.tsx` | Codex git-utils 的参数化 subprocess boundary | status/list/create/switch/commit/push/compare/worktree 安全核心与沙箱 API；桌面已完成 status/branch/create/switch/commit/push/compare，worktree/PR 仍待完成 |
-| Provider | `crates/opentopia-core/src/provider.rs`、`agent.rs` | Goose provider abstraction | OpenAI-compatible provider、tool_calls 解析、多轮工具结果回传、streaming token usage 解析；AgentEvent 流将 usage 持久化为 `token_usage` 事件；mock fallback |
+| Provider | `crates/opentopia-core/src/provider.rs`、`agent.rs` | Goose provider abstraction | OpenAI-compatible provider、tool_calls 解析、多轮工具结果回传、原生 user/tool image companion、streaming token usage；mock fallback |
 | CLI | `crates/opentopia-cli/src/main.rs` | Codex CLI split package | new/list/send |
 | Execution environment | `crates/opentopia-core/src/execution.rs` | Codex exec/sandbox boundary | 路径收敛、超时/取消/输出限制、sandbox command plan、stdio session |
 | OS sandbox | `crates/opentopia-core/src/sandbox.rs` | Codex 三平台隔离模型；Windows helper binary 直接复用 | read-only/workspace-write/danger-full-access、writable roots、受保护元数据、独立 backend enforcement、network policy；Windows unelevated 已做真实越界写拒绝测试 |
@@ -78,16 +83,15 @@ OpenTopia 当前采用的是"Electron 桌面壳 + Rust 本地 agent server + SQL
 
 ## 还应该继续借鉴但暂未实现的模块
 
-下一阶段优先级以 [Roadmap #4](https://github.com/StagoMax/OpenTopia/issues/4) 为准：
+当前开发只聚焦三个方向：
 
-1. P0 深化：provider-native 图片/文档内容、来源缺失状态、子智能体审批 continuation 与 token/resource budget。
-2. Git/UI 与内置浏览器：安全 Git core/API 及桌面分支/commit/push/compare 已完成；worktree 控件、PR/GitHub CLI 和 Browser runtime 尚未完成。
-3. Linux/macOS 沙箱：在对应原生发布机跑 bubblewrap/Seatbelt confinement 集成测试，并增加 seccomp/Landlock 与资源配额。
-4. Goose extension ecosystem：在现有 MCP host 上增加 schema cache 持久化和产品化 GitHub/Linear/Jira/browser/document 连接器。
-5. opencode desktop platform：继续补 notification、完整 deep link 路由、WSL path adapter。
-6. OpenHands trajectory：补 tool output 的更完整序列化和 replay tooling。
-7. **Docker/Remote 沙箱（明确延期）**：仅保留 `ExecutionEnvironment` 扩展点，当前不实现运行时。
-8. **签名发布（明确延期）**：Windows/macOS 签名、公证和正式发布流水线待分发阶段再配置。
+1. 任务闭环：持久 Turn、计划恢复、真实工具/验证证据和可恢复终态。
+2. 内置工作工具：Browser、Spreadsheet 和文件/图片/PDF/XLSX 预览已完成；后续按闭环需要补文档提取与编辑工具。
+3. 多智能体协作：父 Agent 分解、并发委派、批量收集和最终综合。
+
+以下方向按当前产品决定暂缓：子智能体审批/预算强化、Linux bubblewrap/macOS
+Seatbelt 原生验证、Linear/Jira 产品连接器、顶部菜单/前进后退/帮助、worktree/PR、
+notification/deep link/WSL、Docker/Remote，以及签名公证和正式发布流水线。
 
 ## 不建议直接复制的部分
 

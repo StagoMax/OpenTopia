@@ -11,6 +11,7 @@
     "dev:renderer": "vite --host 127.0.0.1",
     "start": "electron .",
     "build": "tsc --noEmit && vite build",
+    "smoke:browser-host": "electron electron/browser-host-smoke.cjs",
     "pack": "pnpm build && electron-builder --dir",
     "dist": "pnpm build && electron-builder",
     "typecheck": "tsc --noEmit",
@@ -31,12 +32,20 @@
       {
         "from": "resources",
         "to": ".",
-        "filter": ["opentopia-server", "opentopia-server.exe"]
+        "filter": [
+          "opentopia-server",
+          "opentopia-server.exe"
+        ]
       },
       {
         "from": "resources/codex-sandbox",
         "to": "codex-sandbox",
-        "filter": ["codex.exe", "codex-command-runner.exe", "codex-windows-sandbox-setup.exe", "LICENSE"]
+        "filter": [
+          "codex.exe",
+          "codex-command-runner.exe",
+          "codex-windows-sandbox-setup.exe",
+          "LICENSE"
+        ]
       }
     ],
     "publish": {
@@ -46,7 +55,9 @@
       "releaseType": "draft"
     },
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
     "nsis": {
@@ -54,14 +65,19 @@
       "allowToChangeInstallationDirectory": true
     },
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "category": "public.app-category.developer-tools",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "notarize": false
     },
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "category": "Development"
     }
   },
@@ -70,16 +86,17 @@
     "electron-updater": "^6.6.0",
     "lucide-react": "^0.575.0",
     "monaco-editor": "^0.52.2",
+    "pdfjs-dist": "4.10.38",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "xterm": "^5.3.0",
     "xterm-addon-fit": "^0.8.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^5.1.4",
     "@types/node": "^25.5.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
     "concurrently": "^9.2.1",
     "electron": "^41.0.0",
     "electron-builder": "^26.0.12",

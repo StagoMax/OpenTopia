@@ -265,16 +265,37 @@ impl OpenAiCompatibleProvider {
         if !request.tool_candidates.is_empty() {
             payload["tools"] = json!(openai_tools(&request.tool_candidates));
             payload["tool_choice"] = json!("auto");
+            payload["parallel_tool_calls"] = json!(false);
         }
 
         let mut response = self
             .client
-            .post(url)
+            .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/json")
             .json(&payload)
             .send()
             .await?;
+        if response.status().as_u16() == 400 && !request.tool_results.is_empty() {
+            let rejected_body = response.text().await?;
+            payload["messages"] = json!(openai_compatibility_messages(&request));
+            let retry = self
+                .client
+                .post(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                .header(CONTENT_TYPE, "application/json")
+                .json(&payload)
+                .send()
+                .await?;
+            if !retry.status().is_success() {
+                let retry_status = retry.status();
+                let retry_body = retry.text().await?;
+                anyhow::bail!(
+                    "provider request failed (400): {rejected_body}; compatibility retry failed ({retry_status}): {retry_body}"
+                );
+            }
+            response = retry;
+        }
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
@@ -603,22 +624,82 @@ fn openai_messages(request: &ModelRequest) -> Vec<Value> {
         "content": openai_message_content(&request.user_message, &request.user_content)
     }));
 
-    if !request.previous_tool_calls.is_empty() {
+    // AgentCore keeps completed calls as a flat durable history. Rebuild a valid
+    // Chat Completions sequence instead of collapsing calls from several model
+    // rounds into one synthetic assistant message.
+    let mut emitted_results = vec![false; request.tool_results.len()];
+    for call in &request.previous_tool_calls {
         messages.push(json!({
             "role": "assistant",
-            "content": null,
-            "tool_calls": request.previous_tool_calls.iter().map(openai_tool_call_message).collect::<Vec<_>>()
+            "content": "",
+            "tool_calls": [openai_tool_call_message(call)]
         }));
+        for (index, result) in request.tool_results.iter().enumerate() {
+            if result.call_id == call.id {
+                messages.push(openai_tool_result_message(result));
+                emitted_results[index] = true;
+            }
+        }
+    }
+    for (index, result) in request.tool_results.iter().enumerate() {
+        if !emitted_results[index] {
+            messages.push(openai_tool_result_message(result));
+        }
+    }
+    if let Some(companion) = openai_tool_image_companion(&request.tool_results) {
+        messages.push(companion);
     }
 
-    for result in &request.tool_results {
-        messages.push(json!({
-            "role": "tool",
-            "tool_call_id": &result.call_id,
-            "content": provider_tool_result_content(result)
-        }));
-    }
+    messages
+}
 
+fn openai_compatibility_messages(request: &ModelRequest) -> Vec<Value> {
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": &request.system_prompt
+    })];
+    messages.extend(request.conversation.iter().map(|message| {
+        json!({
+            "role": openai_conversation_role(message.role),
+            "content": openai_message_content(&message.content, &message.content_parts)
+        })
+    }));
+    messages.push(json!({
+        "role": "user",
+        "content": openai_message_content(&request.user_message, &request.user_content)
+    }));
+
+    let history = request
+        .previous_tool_calls
+        .iter()
+        .map(|call| {
+            let results = request
+                .tool_results
+                .iter()
+                .filter(|result| result.call_id == call.id)
+                .map(|result| {
+                    json!({
+                        "output": &result.output,
+                        "isError": result.is_error,
+                        "metadata": &result.metadata
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "callId": &call.id,
+                "name": &call.name,
+                "arguments": &call.arguments,
+                "results": results
+            })
+        })
+        .collect::<Vec<_>>();
+    messages.push(json!({
+        "role": "user",
+        "content": format!(
+            "Continue the original task using this authoritative completed tool history. Do not repeat completed calls unless needed:\n{}",
+            Value::Array(history)
+        )
+    }));
     messages
 }
 
@@ -713,10 +794,17 @@ fn openai_input_part(part: &ModelInputContent) -> Value {
     }
 }
 
+fn openai_tool_result_message(result: &ProviderToolResult) -> Value {
+    json!({
+        "role": "tool",
+        "tool_call_id": &result.call_id,
+        "content": provider_tool_result_content(result)
+    })
+}
+
 // A Chat Completions tool message is text-only across OpenAI-compatible APIs.
-// Preserve richer output inside its JSON envelope, including an image data URL,
-// so another runtime can recover it even when this provider cannot pass it as a
-// native image part after a function call.
+// Keep image metadata in its JSON envelope while the bytes travel in a native
+// multimodal companion message after every tool result has been acknowledged.
 fn openai_tool_result_part(part: &ModelInputContent) -> Value {
     match part {
         ModelInputContent::Text { text } => json!({ "type": "text", "text": text }),
@@ -724,7 +812,8 @@ fn openai_tool_result_part(part: &ModelInputContent) -> Value {
         ModelInputContent::Image { content_type, data } => json!({
             "type": "image",
             "contentType": content_type,
-            "dataUrl": format!("data:{content_type};base64,{}", encode_base64(data))
+            "bytes": data.len(),
+            "delivery": "native_companion"
         }),
         ModelInputContent::Resource {
             uri,
@@ -737,6 +826,26 @@ fn openai_tool_result_part(part: &ModelInputContent) -> Value {
             "name": name
         }),
     }
+}
+
+fn openai_tool_image_companion(results: &[ProviderToolResult]) -> Option<Value> {
+    let mut content = Vec::new();
+    for result in results {
+        for part in &result.content {
+            if matches!(part, ModelInputContent::Image { .. }) {
+                content.push(json!({
+                    "type": "text",
+                    "text": format!(
+                        "Tool image: {} (call {})",
+                        result.name, result.call_id
+                    )
+                }));
+                content.push(openai_input_part(part));
+            }
+        }
+    }
+
+    (!content.is_empty()).then(|| json!({ "role": "user", "content": content }))
 }
 
 fn resource_fallback_text(uri: &str, content_type: Option<&str>, name: Option<&str>) -> String {
@@ -1206,6 +1315,7 @@ mod tests {
         );
         assert_eq!(messages[3], json!({ "role": "user", "content": "current" }));
         assert_eq!(messages[4]["role"], "assistant");
+        assert_eq!(messages[4]["content"], "");
         assert_eq!(messages[4]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[5]["role"], "tool");
         assert_eq!(messages[5]["tool_call_id"], "call_1");
@@ -1261,6 +1371,130 @@ mod tests {
         assert_eq!(
             tool_content["content"][0]["value"],
             json!({ "ready": true })
+        );
+    }
+
+    #[test]
+    fn compacts_completed_tool_history_for_strict_compatible_providers() {
+        let mut request = model_request();
+        request.previous_tool_calls = vec![ProviderToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "SPEC.md" }),
+        }];
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            output: "contract".to_string(),
+            content: vec![ModelInputContent::text("contract")],
+            is_error: false,
+            metadata: json!({ "bytes": 8 }),
+        }];
+
+        let messages = openai_compatibility_messages(&request);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        let history = messages[2]["content"].as_str().unwrap();
+        assert!(history.contains("read_file"));
+        assert!(history.contains("SPEC.md"));
+        assert!(history.contains("contract"));
+        assert!(!messages.iter().any(|message| message["role"] == "tool"));
+    }
+
+    #[test]
+    fn appends_native_tool_images_after_all_tool_messages() {
+        let mut request = model_request();
+        request.previous_tool_calls = vec![
+            ProviderToolCall {
+                id: "call_first".to_string(),
+                name: "browser_screenshot".to_string(),
+                arguments: json!({}),
+            },
+            ProviderToolCall {
+                id: "call_second".to_string(),
+                name: "inspect_page".to_string(),
+                arguments: json!({}),
+            },
+        ];
+        request.tool_results = vec![
+            ProviderToolResult {
+                call_id: "call_first".to_string(),
+                name: "browser_screenshot".to_string(),
+                output: "first screenshot".to_string(),
+                content: vec![ModelInputContent::image(
+                    "image/png",
+                    vec![0x89, b'P', b'N', b'G'],
+                )],
+                is_error: false,
+                metadata: json!({}),
+            },
+            ProviderToolResult {
+                call_id: "call_second".to_string(),
+                name: "inspect_page".to_string(),
+                output: "page inspected".to_string(),
+                content: vec![
+                    ModelInputContent::json(json!({ "ready": true })),
+                    ModelInputContent::image("image/jpeg", vec![0xff, 0xd8, 0xff]),
+                ],
+                is_error: false,
+                metadata: json!({}),
+            },
+        ];
+
+        let messages = openai_messages(&request);
+
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_first");
+        assert_eq!(messages[3]["tool_call_id"], "call_first");
+        assert_eq!(messages[4]["role"], "assistant");
+        assert_eq!(messages[4]["tool_calls"][0]["id"], "call_second");
+        assert_eq!(messages[5]["tool_call_id"], "call_second");
+        assert_eq!(messages[6]["role"], "user");
+
+        let first_tool_content = messages[3]["content"].as_str().unwrap();
+        let second_tool_content = messages[5]["content"].as_str().unwrap();
+        assert!(!first_tool_content.contains("data:"));
+        assert!(!second_tool_content.contains("data:"));
+        let first_tool_content: Value = serde_json::from_str(first_tool_content).unwrap();
+        let second_tool_content: Value = serde_json::from_str(second_tool_content).unwrap();
+        assert_eq!(
+            first_tool_content["content"][0],
+            json!({
+                "type": "image",
+                "contentType": "image/png",
+                "bytes": 4,
+                "delivery": "native_companion"
+            })
+        );
+        assert_eq!(second_tool_content["content"][0]["type"], "json");
+        assert_eq!(
+            second_tool_content["content"][1]["delivery"],
+            "native_companion"
+        );
+
+        let companion = messages[6]["content"].as_array().unwrap();
+        assert_eq!(companion.len(), 4);
+        assert_eq!(
+            companion[0],
+            json!({
+                "type": "text",
+                "text": "Tool image: browser_screenshot (call call_first)"
+            })
+        );
+        assert_eq!(companion[1]["type"], "image_url");
+        assert_eq!(
+            companion[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw=="
+        );
+        assert_eq!(
+            companion[2]["text"],
+            "Tool image: inspect_page (call call_second)"
+        );
+        assert_eq!(
+            companion[3]["image_url"]["url"],
+            "data:image/jpeg;base64,/9j/"
         );
     }
 
@@ -1452,6 +1686,15 @@ mod tests {
             content: "history".to_string(),
             content_parts: Vec::new(),
         });
+        request.tool_candidates.push(ProviderToolCandidate {
+            name: "read_file".to_string(),
+            description: "Read a workspace file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        });
         let mut deltas = Vec::new();
 
         let response = provider
@@ -1468,6 +1711,8 @@ mod tests {
 
         assert_eq!(payload["stream"], true);
         assert_eq!(payload["stream_options"]["include_usage"], true);
+        assert_eq!(payload["tool_choice"], "auto");
+        assert_eq!(payload["parallel_tool_calls"], false);
         assert_eq!(payload["messages"][0]["role"], "system");
         assert_eq!(payload["messages"][1]["content"], "history");
         assert_eq!(payload["messages"][2]["content"], "current");

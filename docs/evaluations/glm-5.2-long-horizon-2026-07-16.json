@@ -1,0 +1,253 @@
+{
+    "schemaVersion":  1,
+    "runId":  "glm-5-2-20260716T075801Z",
+    "startedAt":  "2026-07-16T07:58:01.2471830Z",
+    "completedAt":  "2026-07-16T08:05:23.2008349Z",
+    "status":  "failed",
+    "objectiveScoringOnly":  true,
+    "provider":  {
+                     "profile":  "AUDIT_COPILOT_LLM",
+                     "baseUrl":  "https://api.tokenhub.market/v1",
+                     "model":  "glm-5.2",
+                     "credentials":  "redacted:set",
+                     "compatibleWithOpenTopia":  true,
+                     "modelListed":  true,
+                     "streamChat":  200,
+                     "streamToolsAuto":  200,
+                     "streamToolContinuation":  200,
+                     "streamSerializedToolHistory":  400,
+                     "streamCompactedToolHistory":  200,
+                     "streamToolsForced":  400,
+                     "openTopiaHealthReachable":  true,
+                     "openTopiaModelAvailable":  true
+                 },
+    "timing":  {
+                   "totalMs":  441958,
+                   "phase1Ms":  null,
+                   "restartMs":  null,
+                   "phase2Ms":  null,
+                   "hardTimeoutPerTurnSeconds":  420
+               },
+    "baseline":  {
+                     "publicTestsExitCode":  1,
+                     "library":  {
+                                     "schemaVersion":  1,
+                                     "phase":  "library",
+                                     "passed":  false,
+                                     "passedChecks":  2,
+                                     "totalChecks":  6,
+                                     "checks":  [
+                                                    {
+                                                        "id":  "module-loads",
+                                                        "passed":  true
+                                                    },
+                                                    {
+                                                        "id":  "csv-rfc4180-edge-cases",
+                                                        "passed":  false,
+                                                        "detail":  "parseTransactions is not implemented"
+                                                    },
+                                                    {
+                                                        "id":  "csv-validation",
+                                                        "passed":  false,
+                                                        "detail":  "The input did not match the regular expression /duplicate/i. Input:\n\n\u0027Error: parseTransactions is not implemented\u0027\n"
+                                                    },
+                                                    {
+                                                        "id":  "reconciliation-contract",
+                                                        "passed":  false,
+                                                        "detail":  "parseTransactions is not implemented"
+                                                    },
+                                                    {
+                                                        "id":  "report-contract",
+                                                        "passed":  false,
+                                                        "detail":  "parseTransactions is not implemented"
+                                                    },
+                                                    {
+                                                        "id":  "protected-files-unchanged",
+                                                        "passed":  true
+                                                    }
+                                                ]
+                                 },
+                     "full":  {
+                                  "schemaVersion":  1,
+                                  "phase":  "full",
+                                  "passed":  false,
+                                  "passedChecks":  3,
+                                  "totalChecks":  8,
+                                  "checks":  [
+                                                 {
+                                                     "id":  "module-loads",
+                                                     "passed":  true
+                                                 },
+                                                 {
+                                                     "id":  "csv-rfc4180-edge-cases",
+                                                     "passed":  false,
+                                                     "detail":  "parseTransactions is not implemented"
+                                                 },
+                                                 {
+                                                     "id":  "csv-validation",
+                                                     "passed":  false,
+                                                     "detail":  "The input did not match the regular expression /duplicate/i. Input:\n\n\u0027Error: parseTransactions is not implemented\u0027\n"
+                                                 },
+                                                 {
+                                                     "id":  "reconciliation-contract",
+                                                     "passed":  false,
+                                                     "detail":  "parseTransactions is not implemented"
+                                                 },
+                                                 {
+                                                     "id":  "report-contract",
+                                                     "passed":  false,
+                                                     "detail":  "parseTransactions is not implemented"
+                                                 },
+                                                 {
+                                                     "id":  "protected-files-unchanged",
+                                                     "passed":  true
+                                                 },
+                                                 {
+                                                     "id":  "cli-success-contract",
+                                                     "passed":  false,
+                                                     "detail":  "ledger CLI is not implemented\n\n\n1 !== 0\n"
+                                                 },
+                                                 {
+                                                     "id":  "cli-failure-contract",
+                                                     "passed":  true
+                                                 }
+                                             ]
+                              },
+                     "expectedFailureObserved":  true
+                 },
+    "turns":  [
+                  {
+                      "phase":  1,
+                      "status":  "not_completed",
+                      "elapsedMs":  null,
+                      "budgetContinuations":  0
+                  },
+                  {
+                      "phase":  2,
+                      "status":  "not_completed",
+                      "elapsedMs":  null,
+                      "budgetContinuations":  0
+                  }
+              ],
+    "recovery":  {
+                     "serverRestarted":  false,
+                     "threadRecovered":  false,
+                     "turnRecovered":  false,
+                     "messagesRecovered":  false,
+                     "eventsRecovered":  false,
+                     "durablePlanRecovered":  false,
+                     "activePlanRecovered":  false
+                 },
+    "recoveryPassed":  false,
+    "trajectoryMetrics":  {
+                              "eventCount":  508,
+                              "turnCount":  4,
+                              "toolCallsStarted":  42,
+                              "toolCallsFinished":  42,
+                              "toolCallsByName":  {
+                                                      "list_files":  5,
+                                                      "read_file":  15,
+                                                      "update_plan":  5,
+                                                      "write_file":  2,
+                                                      "shell":  15
+                                                  },
+                              "planUpdates":  5,
+                              "budgetCheckpoints":  3,
+                              "latestPlan":  {
+                                                 "pending":  2,
+                                                 "inProgress":  1,
+                                                 "completed":  4
+                                             },
+                              "testToolCalls":  6,
+                              "inputTokens":  442160,
+                              "outputTokens":  25267,
+                              "totalTokens":  467427,
+                              "errorEvents":  0
+                          },
+    "processContractPassed":  false,
+    "grading":  {
+                    "phase1Library":  {
+                                          "schemaVersion":  1,
+                                          "phase":  "library",
+                                          "passed":  true,
+                                          "passedChecks":  6,
+                                          "totalChecks":  6,
+                                          "checks":  [
+                                                         {
+                                                             "id":  "module-loads",
+                                                             "passed":  true
+                                                         },
+                                                         {
+                                                             "id":  "csv-rfc4180-edge-cases",
+                                                             "passed":  true
+                                                         },
+                                                         {
+                                                             "id":  "csv-validation",
+                                                             "passed":  true
+                                                         },
+                                                         {
+                                                             "id":  "reconciliation-contract",
+                                                             "passed":  true
+                                                         },
+                                                         {
+                                                             "id":  "report-contract",
+                                                             "passed":  true
+                                                         },
+                                                         {
+                                                             "id":  "protected-files-unchanged",
+                                                             "passed":  true
+                                                         }
+                                                     ]
+                                      },
+                    "final":  {
+                                  "schemaVersion":  1,
+                                  "phase":  "full",
+                                  "passed":  false,
+                                  "passedChecks":  7,
+                                  "totalChecks":  8,
+                                  "checks":  [
+                                                 {
+                                                     "id":  "module-loads",
+                                                     "passed":  true
+                                                 },
+                                                 {
+                                                     "id":  "csv-rfc4180-edge-cases",
+                                                     "passed":  true
+                                                 },
+                                                 {
+                                                     "id":  "csv-validation",
+                                                     "passed":  true
+                                                 },
+                                                 {
+                                                     "id":  "reconciliation-contract",
+                                                     "passed":  true
+                                                 },
+                                                 {
+                                                     "id":  "report-contract",
+                                                     "passed":  true
+                                                 },
+                                                 {
+                                                     "id":  "protected-files-unchanged",
+                                                     "passed":  true
+                                                 },
+                                                 {
+                                                     "id":  "cli-success-contract",
+                                                     "passed":  false,
+                                                     "detail":  "ledger CLI is not implemented\n\n\n1 !== 0\n"
+                                                 },
+                                                 {
+                                                     "id":  "cli-failure-contract",
+                                                     "passed":  true
+                                                 }
+                                             ]
+                              }
+                },
+    "secretAuditPassed":  true,
+    "error":  "Turn exceeded the configured hard timeout",
+    "artifacts":  {
+                      "runDirectory":  ".opentopia/evaluations/glm-5-2-20260716T075801Z",
+                      "providerProbe":  ".opentopia/evaluations/glm-5-2-20260716T075801Z/provider-probe.json",
+                      "phase1Trajectory":  null,
+                      "finalTrajectory":  ".opentopia/evaluations/glm-5-2-20260716T075801Z/trajectory-final.json"
+                  }
+}

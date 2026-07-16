@@ -18,12 +18,14 @@ Implemented:
 - SQLite-backed threads, messages, and events.
 - Bearer-authenticated local API with strict local-origin CORS and authenticated
   reconnecting fetch-SSE streams.
-- Per-thread serialized agent turns with status/cancel endpoints and a desktop Stop control.
+- SQLite-backed per-thread Turn lifecycle with running/waiting/succeeded/failed/cancelled/
+  interrupted states, startup recovery, status/cancel endpoints, and a desktop Stop control.
 - Incremental model/tool/event streaming with persisted token-usage events.
 - OpenAI-compatible provider with env reuse from the credit review project and
   an eight-round bounded autonomous built-in/MCP tool loop.
 - Built-in tools: `list_files`, `read_file`, `write_file`, `search`, `shell`, `git_diff`,
-  `apply_patch`, `spawn_agent`, `send_input`, `cancel_agent`, and `wait_agent`.
+  `apply_patch`, `update_plan`, `spreadsheet`, `browser`, `spawn_agent`, `send_input`,
+  `cancel_agent`, `wait_agent`, and concurrent `wait_agents`.
 - Permission modes plus persistent, resumable allow-once approvals. Approval
   restores the exact provider/tool-loop state instead of starting a full-access turn.
 - Dev/build scripts for Windows GNU Rust + WinLibs.
@@ -47,11 +49,30 @@ Implemented:
   message-persisted source and Skill references, bounded text injection, and right-rail recovery.
 - Persistent subagent runs with real AgentCore execution, bounded per-parent concurrency,
   queueing, recursion limits, input/wait/cancel tools, recursive cancellation, SQLite recovery,
-  SSE updates, and right-rail controls.
+  SSE updates, concurrent result collection, and right-rail controls.
+- Durable task plans inspired by Codex/opencode/Goose: typed plan events persist in the Thread,
+  incomplete plans return to later Turns, and the desktop renders current progress.
+- Local CDP Browser runtime with domain approval continuation, typed screenshots delivered as
+  native provider image input, downloads, and a desktop panel that follows model tool output.
+- Bounded XLSX inspect/list/read/create/update support using `calamine` and `rust_xlsxwriter`,
+  routed through the same workspace policy and `ExecutionEnvironment` file boundary.
 - Persisted sandbox mode/enforcement/network/read/write roots with Settings and Composer controls.
 - Validated Git workflow core and sandboxed Thread API for status, branch, commit, push,
   compare, and worktree actions, with desktop status/branch/create/switch/commit/push/compare
   controls. Worktree UI and PR/GitHub CLI remain open.
+
+## Current Product Focus
+
+Active development is intentionally limited to:
+
+1. End-to-end task completion and recoverable task state.
+2. Built-in work tools such as spreadsheets and the browser.
+3. Parent-controlled multi-agent decomposition, parallel execution, result collection,
+   and synthesis.
+
+Deferred from this focus: child-agent approval/budget hardening, Linux/macOS native sandbox
+validation, Linear/Jira product connectors, top-level menu/navigation/help, Docker/Remote,
+and release signing/publishing.
 
 ## P0: Make The MVP Product-Shaped
 
@@ -99,6 +120,10 @@ Future refinement:
 
 - Add workspace preference controls beyond Electron recents.
 - Support separate safeStorage keys per provider profile instead of one active provider key.
+- Bound and incrementally summarize compacted tool history for strict compatible
+  gateways; the current fallback is correct but can produce high cumulative token cost.
+- Add a phase-completion controller and repeated-tool budget. The 2026-07-16 GLM-5.2
+  evaluation passed the library grader but timed out before closing Phase 1.
 
 Acceptance:
 
@@ -170,8 +195,8 @@ Implemented:
 
 Future refinement:
 
-- Add provider-native image parts and document extraction. Images/PDF/Office files currently
-  contribute verified metadata only; binary bytes are never coerced into text prompts.
+- Provider-native image parts are implemented. Add PDF/Office content extraction; document
+  resources currently contribute verified metadata/URI rather than parsed document text.
 - Text source content is bounded and injected into the Turn where it is selected. Historical
   messages retain the source reference/metadata, but do not silently re-read a changed file
   into every later Turn.
@@ -186,13 +211,18 @@ Future refinement:
 
 Goal: move from raw tool output to a real coding workbench.
 
-Status: MVP implementation complete. The workbench distinguishes staged and unstaged changes and supports validated per-hunk stage, unstage, and explicit-confirm discard.
+Status: MVP implementation complete. The workbench distinguishes staged and unstaged changes,
+supports validated per-hunk stage/unstage/explicit-confirm discard, and opens workspace files or
+Thread artifacts as first-class preview tabs.
 
 Implemented:
 
 - Add file tree panel.
 - Add changed files list.
-- Add file preview/read-only editor.
+- Add authenticated preview descriptors and binary content for canonical workspace files and
+  Thread-scoped artifacts.
+- Add Monaco text/code preview, Blob-backed image controls, PDF.js page rendering, and virtualized
+  XLSX workbook/range preview with system-application fallback for unsupported formats.
 - Add selected-file diff review and explicit-confirm tracked file revert.
 - Add staged/index-aware status and diff views.
 - Add hunk-level stage/unstage/discard. The server re-reads and exactly matches
@@ -310,11 +340,21 @@ Acceptance:
 
 Goal: support non-code work loops.
 
-Tasks:
+Status: Browser and bounded XLSX workbooks are first-class built-in tools and run through the
+same model-controlled tool loop, policy checks, typed results, and desktop event surfaces.
+Workspace files and artifacts also have a first-class, read-only preview protocol.
+
+Implemented:
+
+- Sandboxed Electron `WebContentsView` browser with an authenticated loopback broker and shared
+  per-Thread user/Agent session; isolated CDP runtime and BrowserPanel remain the web fallback.
+- XLSX inspect/list/read/create/update with structured limits and errors.
+- Text/code, image, PDF, and XLSX preview tabs with authenticated content and bounded range APIs.
+
+Deferred tasks:
 
 - GitHub/Linear/Jira tools.
-- Browser automation bridge.
-- Docs/Sheets/PDF MCP servers.
+- Document/PDF extraction and editing tools beyond the completed read-only previews.
 - Scheduler/reminder tool.
 
 Acceptance:

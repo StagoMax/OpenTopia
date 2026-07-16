@@ -12,10 +12,10 @@ try {
   cargo build -p opentopia-server
 
   $serverPath = Join-Path $env:CARGO_TARGET_DIR "debug\opentopia-server.exe"
-  if (-not (Test-Path $serverPath)) {
+  if (-not (Test-Path -LiteralPath $serverPath)) {
     $serverPath = Join-Path $env:CARGO_TARGET_DIR "debug\opentopia-server"
   }
-  if (-not (Test-Path $serverPath)) {
+  if (-not (Test-Path -LiteralPath $serverPath)) {
     throw "opentopia-server debug binary not found"
   }
 
@@ -44,7 +44,6 @@ try {
       } catch {
       }
     }
-
     if (-not $healthy) {
       throw "server did not become healthy"
     }
@@ -70,138 +69,117 @@ try {
       }
     }
 
-    $threadBody = @{
-      title = "verification"
-      workspaceRoot = (Get-Location).Path
-    } | ConvertTo-Json
+    Invoke-RestMethod `
+      -Method Patch `
+      -Uri "http://127.0.0.1:8799/api/settings" `
+      -ContentType "application/json" `
+      -Body (@{ providerKind = "mock"; permissionMode = "auto" } | ConvertTo-Json) | Out-Null
 
     $thread = Invoke-RestMethod `
       -Method Post `
       -Uri "http://127.0.0.1:8799/api/threads" `
       -ContentType "application/json" `
-      -Body $threadBody
+      -Body (@{
+        title = "verification"
+        workspaceRoot = (Get-Location).Path
+      } | ConvertTo-Json)
 
-    $messageBody = @{ content = "/list" } | ConvertTo-Json
-    Invoke-RestMethod `
+    $preview = Invoke-RestMethod `
       -Method Post `
-      -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/messages" `
+      -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/previews/resolve" `
       -ContentType "application/json" `
-      -Body $messageBody | Out-Null
+      -Body (@{ source = "workspace"; path = "Cargo.toml" } | ConvertTo-Json)
+    if ($preview.kind -ne "text" -or $preview.contentType -notlike "text/*") {
+      throw "expected Cargo.toml to resolve as a text preview"
+    }
 
-    Start-Sleep -Seconds 1
-
-    $events = Invoke-RestMethod `
-      -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/events" `
+    $previewContent = Invoke-WebRequest `
+      -UseBasicParsing `
+      -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/previews/$([uri]::EscapeDataString($preview.id))/content" `
+      -Headers $apiHeaders `
       -TimeoutSec 5
+    if ($previewContent.Content -notmatch "\[workspace\]") {
+      throw "preview content did not preserve Cargo.toml text"
+    }
+    if ($previewContent.Headers["X-Content-Type-Options"] -ne "nosniff") {
+      throw "preview response is missing nosniff"
+    }
 
-    Invoke-RestMethod `
-      -Method Patch `
-      -Uri "http://127.0.0.1:8799/api/settings" `
-      -ContentType "application/json" `
-      -Body (@{ permissionMode = "full_access" } | ConvertTo-Json) | Out-Null
-    $cancelThread = Invoke-RestMethod `
-      -Method Post `
-      -Uri "http://127.0.0.1:8799/api/threads" `
-      -ContentType "application/json" `
-      -Body (@{ title = "cancel-verification"; workspaceRoot = (Get-Location).Path } | ConvertTo-Json)
-    Invoke-RestMethod `
-      -Method Post `
-      -Uri "http://127.0.0.1:8799/api/threads/$($cancelThread.id)/messages" `
-      -ContentType "application/json" `
-      -Body (@{ content = '/run powershell -NoProfile -Command "Start-Sleep -Seconds 30"' } | ConvertTo-Json) | Out-Null
-    $activeTurn = $null
-    for ($i = 0; $i -lt 30 -and -not $activeTurn; $i += 1) {
-      Start-Sleep -Milliseconds 100
-      $activeTurn = Invoke-RestMethod -Uri "http://127.0.0.1:8799/api/threads/$($cancelThread.id)/turn"
-    }
-    if (-not $activeTurn) {
-      throw "expected a running agent turn"
-    }
     try {
-      Invoke-RestMethod `
+      Invoke-WebRequest `
+        -UseBasicParsing `
         -Method Post `
-        -Uri "http://127.0.0.1:8799/api/threads/$($cancelThread.id)/messages" `
+        -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/previews/resolve" `
+        -Headers $apiHeaders `
         -ContentType "application/json" `
-        -Body (@{ content = "/list" } | ConvertTo-Json) | Out-Null
-      throw "concurrent message unexpectedly started"
+        -Body (@{ source = "workspace"; path = "..\Cargo.toml" } | ConvertTo-Json) | Out-Null
+      throw "preview unexpectedly accepted a parent-directory escape"
     } catch {
-      if ($_.Exception.Response.StatusCode.value__ -ne 409) {
+      if ($_.Exception.Response.StatusCode.value__ -ne 400) {
         throw
       }
     }
-    $cancelResult = Invoke-RestMethod `
+
+    $message = Invoke-RestMethod `
       -Method Post `
-      -Uri "http://127.0.0.1:8799/api/threads/$($cancelThread.id)/turn/cancel" `
+      -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/messages" `
       -ContentType "application/json" `
-      -Body (@{ turnId = $activeTurn.turnId } | ConvertTo-Json)
-    if (-not $cancelResult.cancelled) {
-      throw "turn cancellation was not accepted"
-    }
-    $remainingTurn = $activeTurn
+      -Body (@{ content = "Return a concise verification response." } | ConvertTo-Json)
+
+    $turn = $null
     for ($i = 0; $i -lt 100; $i += 1) {
       Start-Sleep -Milliseconds 100
-      $remainingTurn = Invoke-RestMethod -Uri "http://127.0.0.1:8799/api/threads/$($cancelThread.id)/turn"
-      if (-not $remainingTurn.turnId) {
-        $remainingTurn = $null
+      $turn = Invoke-RestMethod -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/turn"
+      if ($turn.status -in @("succeeded", "failed", "cancelled", "interrupted")) {
         break
       }
     }
-    if ($remainingTurn) {
-      throw "cancelled turn remained active with status $($remainingTurn.status)"
+    if (-not $turn) {
+      throw "expected a persisted turn record"
+    }
+    if ($turn.status -ne "succeeded") {
+      throw "expected succeeded turn, found $($turn.status): $($turn.error)"
+    }
+    if ($turn.userMessageId -ne $message.id) {
+      throw "turn does not reference the submitted user message"
     }
 
-    Invoke-RestMethod `
-      -Method Patch `
-      -Uri "http://127.0.0.1:8799/api/settings" `
-      -ContentType "application/json" `
-      -Body (@{ permissionMode = "approve" } | ConvertTo-Json) | Out-Null
-    $approvalWorkspace = Join-Path (Get-Location) ".opentopia\approval-verification"
-    Remove-Item -LiteralPath $approvalWorkspace -Recurse -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Path $approvalWorkspace -Force | Out-Null
-    $approvalThread = Invoke-RestMethod `
-      -Method Post `
-      -Uri "http://127.0.0.1:8799/api/threads" `
-      -ContentType "application/json" `
-      -Body (@{ title = "approval-verification"; workspaceRoot = $approvalWorkspace } | ConvertTo-Json)
-    Invoke-RestMethod `
-      -Method Post `
-      -Uri "http://127.0.0.1:8799/api/threads/$($approvalThread.id)/messages" `
-      -ContentType "application/json" `
-      -Body (@{ content = "/write approved.txt`napproved through continuation" } | ConvertTo-Json) | Out-Null
-    $pendingApproval = $null
-    for ($i = 0; $i -lt 30 -and -not $pendingApproval; $i += 1) {
-      Start-Sleep -Milliseconds 100
-      $pending = @(Invoke-RestMethod -Uri "http://127.0.0.1:8799/api/threads/$($approvalThread.id)/approvals?status=pending")
-      $pendingApproval = $pending | Select-Object -First 1
+    $events = @(Invoke-RestMethod `
+      -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/events" `
+      -TimeoutSec 5)
+    $eventTypes = @($events | ForEach-Object { $_.payload.type })
+    foreach ($requiredType in @("turn_started", "assistant_message", "turn_finished")) {
+      if ($requiredType -notin $eventTypes) {
+        throw "missing required event type: $requiredType"
+      }
     }
-    if (-not $pendingApproval) {
-      throw "expected a persisted pending approval"
-    }
-    $approvalDecision = Invoke-RestMethod `
-      -Method Post `
-      -Uri "http://127.0.0.1:8799/api/threads/$($approvalThread.id)/approvals/$($pendingApproval.approvalId)/decision" `
-      -ContentType "application/json" `
-      -Body (@{ approved = $true } | ConvertTo-Json)
-    if (-not $approvalDecision.executed) {
-      throw "approved continuation was not accepted for execution"
-    }
-    $approvedPath = Join-Path $approvalWorkspace "approved.txt"
-    for ($i = 0; $i -lt 30 -and -not (Test-Path -LiteralPath $approvedPath); $i += 1) {
-      Start-Sleep -Milliseconds 100
-    }
-    if ((Get-Content -LiteralPath $approvedPath -Raw) -ne "approved through continuation") {
-      throw "approved continuation did not execute the exact suspended write"
+
+    try {
+      Invoke-WebRequest `
+        -Method Post `
+        -Uri "http://127.0.0.1:8799/api/threads/$($thread.id)/messages" `
+        -Headers $apiHeaders `
+        -ContentType "application/json" `
+        -Body (@{ content = "/run echo bypass" } | ConvertTo-Json) | Out-Null
+      throw "legacy direct command unexpectedly reached the agent"
+    } catch {
+      if ($_.Exception.Response.StatusCode.value__ -ne 400) {
+        throw
+      }
     }
 
     [PSCustomObject]@{
       healthy = $healthy
       threadId = $thread.id
-      eventCount = $events.Count
+      turnId = $turn.turnId
+      turnStatus = $turn.status
+      eventCount = $eventTypes.Count
+      previewKind = $preview.kind
+      previewBytes = $previewContent.RawContentLength
+      previewEscapeStatus = 400
       unauthenticatedStatus = 401
       disallowedOriginStatus = 403
-      concurrentTurnStatus = 409
-      turnCancelled = $cancelResult.cancelled
-      approvalResumed = $approvalDecision.executed
+      legacyCommandStatus = 400
     }
   } finally {
     if ($server -and -not $server.HasExited) {

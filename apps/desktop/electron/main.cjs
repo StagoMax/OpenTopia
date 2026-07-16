@@ -1,6 +1,7 @@
 const {
   app,
   BrowserWindow,
+  WebContentsView,
   dialog,
   ipcMain,
   safeStorage,
@@ -12,6 +13,7 @@ const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const updater = require("./updater.cjs");
+const { createDesktopBrowserHost } = require("./browser-host.cjs");
 
 const isDev = !app.isPackaged;
 const defaultBackendUrl =
@@ -28,6 +30,8 @@ let crashLogFilePath = null;
 let logsDirPath = null;
 let crashLogsDirPath = null;
 let nextOpenRequestId = 1;
+let desktopBrowserHost = null;
+let desktopBrowserBroker = null;
 
 const secretsFilePath = "secrets.json";
 const providerSecretStorageKey = "provider-api-key";
@@ -567,6 +571,11 @@ function createBackendEnv(repoRoot, options = {}) {
     OPENTOPIA_API_TOKEN: backendApiToken,
   };
 
+  if (desktopBrowserBroker) {
+    env.OPENTOPIA_DESKTOP_BROWSER_BROKER_URL = desktopBrowserBroker.url;
+    env.OPENTOPIA_DESKTOP_BROWSER_BROKER_TOKEN = desktopBrowserBroker.token;
+  }
+
   if (isDev) {
     env.OPENTOPIA_DEV_ORIGIN =
       process.env.VITE_DEV_SERVER_URL || "http://127.0.0.1:5173";
@@ -1098,7 +1107,26 @@ async function startBackendIfNeeded() {
   }
 
   const command = isDev ? "cargo" : packagedServer.path;
-  const args = command === "cargo" ? ["run", "-p", "opentopia-server"] : [];
+  const endpoint = new URL(defaultBackendUrl);
+  const endpointHost = endpoint.hostname.replace(/^\[|\]$/g, "");
+  if (
+    endpoint.protocol !== "http:" ||
+    !["127.0.0.1", "::1", "localhost"].includes(endpointHost)
+  ) {
+    throw new Error(
+      "OPENTOPIA_SERVER_URL must use HTTP on a loopback host for the local desktop server.",
+    );
+  }
+  const serverArgs = [
+    "--host",
+    endpointHost === "localhost" ? "127.0.0.1" : endpointHost,
+    "--port",
+    endpoint.port || "8787",
+  ];
+  const args =
+    command === "cargo"
+      ? ["run", "-p", "opentopia-server", "--", ...serverArgs]
+      : serverArgs;
   const cwd = command === "cargo" ? repoRoot : undefined;
 
   try {
@@ -1191,6 +1219,8 @@ function createMainWindow() {
       sandbox: false,
     },
   });
+
+  desktopBrowserHost?.attachWindow(mainWindow);
 
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
@@ -1562,7 +1592,19 @@ if (!singleInstance) {
   });
 
   app.whenReady().then(async () => {
+    desktopBrowserHost = createDesktopBrowserHost({
+      app,
+      WebContentsView,
+      getMainWindow: () => mainWindow,
+      logger: (level, event, metadata) => logConsole(level, event, metadata),
+    });
+    try {
+      desktopBrowserBroker = await desktopBrowserHost.startBroker();
+    } catch (error) {
+      logConsole("error", "browser.broker.start.failed", { error });
+    }
     registerIpc();
+    desktopBrowserHost.registerIpc(ipcMain);
     await startBackendIfNeeded();
     createMainWindow();
 
@@ -1577,5 +1619,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  void desktopBrowserHost?.close().catch((error) => {
+    logConsole("warn", "browser.host.close.failed", { error });
+  });
   backendProcess?.kill();
 });

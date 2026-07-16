@@ -9,16 +9,26 @@ use crate::execution::{
 };
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
-use crate::model::{ApprovalStatus, ModelContentPart, ToolCall, ToolResult};
+use crate::model::{
+    ApprovalStatus, ModelContentPart, TaskPlan, TaskPlanStep, TaskPlanStepStatus, ToolCall,
+    ToolResult,
+};
 use crate::policy::{PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
 use crate::sandbox::LocalSandboxConfig;
 use crate::skills::{discover_skills, load_selected_skills};
+use crate::spreadsheet::{
+    execute_spreadsheet, CellRange, InspectWorkbookRequest, ListSheetsRequest, ReadRangeRequest,
+    SheetWriteRequest, SpreadsheetAction, SpreadsheetRequest, SpreadsheetResult,
+    WriteWorkbookRequest, MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
+};
 use crate::store::SessionStore;
-use crate::subagents::{SpawnSubagentRequest, SubagentScheduler, SubagentScope};
+use crate::subagents::{SpawnSubagentRequest, SubagentRunStatus, SubagentScheduler, SubagentScope};
 use anyhow::Context;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -129,9 +139,12 @@ impl ToolRegistry {
         tools.insert("send_input".to_string(), Arc::new(SendAgentInputTool));
         tools.insert("cancel_agent".to_string(), Arc::new(CancelAgentTool));
         tools.insert("wait_agent".to_string(), Arc::new(WaitAgentTool));
+        tools.insert("wait_agents".to_string(), Arc::new(WaitAgentsTool));
+        tools.insert("update_plan".to_string(), Arc::new(UpdatePlanTool));
         tools.insert("list_skills".to_string(), Arc::new(ListSkillsTool));
         tools.insert("read_skill".to_string(), Arc::new(ReadSkillTool));
         tools.insert("browser".to_string(), Arc::new(BrowserTool));
+        tools.insert("spreadsheet".to_string(), Arc::new(SpreadsheetTool));
         Self {
             tools: Arc::new(tools),
         }
@@ -148,6 +161,526 @@ impl ToolRegistry {
 
     pub fn list(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SpreadsheetToolAction {
+    Inspect,
+    ListSheets,
+    ReadRange,
+    Write,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpreadsheetToolInput {
+    action: SpreadsheetToolAction,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    sheet: Option<String>,
+    #[serde(default)]
+    range: Option<CellRange>,
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default)]
+    output_path: Option<String>,
+    #[serde(default)]
+    sheets: Vec<SheetWriteRequest>,
+}
+
+pub struct SpreadsheetTool;
+
+#[async_trait]
+impl Tool for SpreadsheetTool {
+    fn name(&self) -> &str {
+        "spreadsheet"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect, list, read, create, or update bounded XLSX workbooks. Uses zero-based row and column coordinates; writes preserve values, formulas, sheet order, and visibility but not formatting or embedded workbook objects."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["inspect", "list_sheets", "read_range", "write"]
+                },
+                "path": { "type": "string", "description": "Workspace-relative XLSX path for inspect/list/read." },
+                "sheet": { "type": "string", "description": "Worksheet name for read_range." },
+                "range": {
+                    "type": "object",
+                    "description": "Inclusive zero-based range for read_range.",
+                    "properties": {
+                        "start": { "$ref": "#/$defs/address" },
+                        "end": { "$ref": "#/$defs/address" }
+                    },
+                    "required": ["start", "end"],
+                    "additionalProperties": false
+                },
+                "sourcePath": { "type": "string", "description": "Optional existing XLSX to rebuild before applying writes." },
+                "outputPath": { "type": "string", "description": "Workspace-relative XLSX output path for write." },
+                "sheets": {
+                    "type": "array",
+                    "maxItems": 256,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "visibility": { "type": "string", "enum": ["visible", "hidden", "very_hidden"] },
+                            "cells": {
+                                "type": "array",
+                                "maxItems": 10000,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "address": { "$ref": "#/$defs/address" },
+                                        "value": {
+                                            "type": "object",
+                                            "properties": {
+                                                "type": { "type": "string", "enum": ["blank", "string", "integer", "number", "boolean", "formula"] },
+                                                "value": {}
+                                            },
+                                            "required": ["type"],
+                                            "additionalProperties": false
+                                        }
+                                    },
+                                    "required": ["address", "value"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false,
+            "$defs": {
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "row": { "type": "integer", "minimum": 0, "maximum": 1048575 },
+                        "column": { "type": "integer", "minimum": 0, "maximum": 16383 }
+                    },
+                    "required": ["row", "column"],
+                    "additionalProperties": false
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let input: SpreadsheetToolInput = serde_json::from_value(call.input.clone())
+            .context("spreadsheet received invalid arguments")?;
+        match input.action {
+            SpreadsheetToolAction::Inspect
+            | SpreadsheetToolAction::ListSheets
+            | SpreadsheetToolAction::ReadRange => {
+                execute_spreadsheet_read(call.id, input, ctx).await
+            }
+            SpreadsheetToolAction::Write => execute_spreadsheet_write(call.id, input, ctx).await,
+        }
+    }
+}
+
+async fn execute_spreadsheet_read(
+    call_id: Uuid,
+    input: SpreadsheetToolInput,
+    ctx: ToolContext,
+) -> anyhow::Result<ToolResult> {
+    let relative = input
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .context("spreadsheet read action requires path")?;
+    let logical_path = normalize_workspace_path(&ctx.workspace_root, relative);
+    ensure_xlsx_path(&logical_path)?;
+    match ctx.policy.inspect_read(&logical_path) {
+        PolicyDecision::Allow => {}
+        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
+        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+    }
+    let read = ctx
+        .environment
+        .read_file(FileReadRequest::new(&logical_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
+        .await?;
+    let resolved_path = read.path.clone();
+    let source_path = resolved_path.clone();
+    let source_bytes = read.bytes;
+    let action = input.action;
+    let sheet = input.sheet;
+    let range = input.range;
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let staging = SpreadsheetStaging::new()?;
+        let staged_input = staging.path("input.xlsx");
+        fs::write(&staged_input, source_bytes)
+            .with_context(|| format!("failed to stage {}", source_path.display()))?;
+        let action = match action {
+            SpreadsheetToolAction::Inspect => {
+                SpreadsheetAction::InspectWorkbook(InspectWorkbookRequest { path: staged_input })
+            }
+            SpreadsheetToolAction::ListSheets => {
+                SpreadsheetAction::ListSheets(ListSheetsRequest { path: staged_input })
+            }
+            SpreadsheetToolAction::ReadRange => SpreadsheetAction::ReadRange(ReadRangeRequest {
+                path: staged_input,
+                sheet: sheet
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .context("spreadsheet read_range requires sheet")?,
+                range: range.context("spreadsheet read_range requires range")?,
+            }),
+            SpreadsheetToolAction::Write => unreachable!(),
+        };
+        Ok(execute_spreadsheet(SpreadsheetRequest { action }))
+    })
+    .await
+    .context("spreadsheet worker task failed")??;
+    let mut result = match outcome {
+        Ok(result) => result,
+        Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
+    };
+    remap_spreadsheet_paths(&mut result, Some(&resolved_path), None);
+    spreadsheet_success_result(call_id, result, None)
+}
+
+async fn execute_spreadsheet_write(
+    call_id: Uuid,
+    input: SpreadsheetToolInput,
+    ctx: ToolContext,
+) -> anyhow::Result<ToolResult> {
+    let output_relative = input
+        .output_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .context("spreadsheet write requires outputPath")?;
+    let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative);
+    ensure_xlsx_path(&output_path)?;
+    match ctx.policy.inspect_write(&output_path) {
+        PolicyDecision::Allow => {}
+        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
+        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+    }
+
+    let source = if let Some(relative) = input
+        .source_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let path = normalize_workspace_path(&ctx.workspace_root, relative);
+        ensure_xlsx_path(&path)?;
+        match ctx.policy.inspect_read(&path) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
+            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+        }
+        Some(
+            ctx.environment
+                .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    let sheets = input.sheets;
+    let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let staging = SpreadsheetStaging::new()?;
+        let staged_source = if let Some(source) = source {
+            let path = staging.path("source.xlsx");
+            fs::write(&path, source.bytes)
+                .with_context(|| format!("failed to stage {}", source.path.display()))?;
+            Some(path)
+        } else {
+            None
+        };
+        let staged_output = staging.path("output.xlsx");
+        let outcome = execute_spreadsheet(SpreadsheetRequest {
+            action: SpreadsheetAction::WriteWorkbook(WriteWorkbookRequest {
+                source: staged_source,
+                output: staged_output.clone(),
+                sheets,
+            }),
+        });
+        match outcome {
+            Ok(result) => {
+                let bytes = fs::read(&staged_output)
+                    .with_context(|| format!("failed to read {}", staged_output.display()))?;
+                Ok(Ok((result, bytes)))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    })
+    .await
+    .context("spreadsheet worker task failed")??;
+    let (mut result, bytes) = match staged {
+        Ok(result) => result,
+        Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
+    };
+    let written = ctx
+        .environment
+        .write_file(FileWriteRequest::new(&output_path, bytes))
+        .await?;
+    remap_spreadsheet_paths(&mut result, None, Some(&written.path));
+    spreadsheet_success_result(call_id, result, Some(written.path))
+}
+
+fn spreadsheet_success_result(
+    call_id: Uuid,
+    result: SpreadsheetResult,
+    changed_path: Option<PathBuf>,
+) -> anyhow::Result<ToolResult> {
+    let action = result.kind();
+    let value = serde_json::to_value(&result)?;
+    let output = serde_json::to_string_pretty(&value)?;
+    let mut content = vec![ModelContentPart::json(value.clone())];
+    let mut metadata = json!({
+        "toolName": "spreadsheet",
+        "action": action,
+        "success": true
+    });
+    if let Some(path) = changed_path {
+        content.push(ModelContentPart::resource(
+            path.to_string_lossy(),
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()),
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string),
+        ));
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("changedPath".to_string(), json!(path));
+        }
+    }
+    Ok(ToolResult {
+        call_id,
+        output,
+        content,
+        metadata,
+    })
+}
+
+fn spreadsheet_error_result(
+    call_id: Uuid,
+    error: crate::spreadsheet::SpreadsheetError,
+) -> ToolResult {
+    let info = error.info();
+    ToolResult {
+        call_id,
+        output: serde_json::to_string_pretty(&info).unwrap_or_else(|_| error.to_string()),
+        content: vec![ModelContentPart::json(
+            serde_json::to_value(&info).unwrap_or_else(|_| json!({ "message": error.to_string() })),
+        )],
+        metadata: json!({
+            "toolName": "spreadsheet",
+            "success": false,
+            "errorCode": info.code,
+            "error": info.message
+        }),
+    }
+}
+
+fn remap_spreadsheet_paths(
+    result: &mut SpreadsheetResult,
+    source: Option<&Path>,
+    output: Option<&Path>,
+) {
+    match result {
+        SpreadsheetResult::WorkbookInspected(result) => {
+            if let Some(source) = source {
+                result.path = source.to_path_buf();
+            }
+        }
+        SpreadsheetResult::SheetsListed(result) => {
+            if let Some(source) = source {
+                result.path = source.to_path_buf();
+            }
+        }
+        SpreadsheetResult::RangeRead(result) => {
+            if let Some(source) = source {
+                result.path = source.to_path_buf();
+            }
+        }
+        SpreadsheetResult::WorkbookWritten(result) => {
+            if let Some(output) = output {
+                result.output = output.to_path_buf();
+            }
+        }
+    }
+}
+
+fn ensure_xlsx_path(path: &Path) -> anyhow::Result<()> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xlsx"))
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("spreadsheet tool supports only .xlsx files")
+    }
+}
+
+struct SpreadsheetStaging {
+    root: PathBuf,
+}
+
+impl SpreadsheetStaging {
+    fn new() -> anyhow::Result<Self> {
+        let root = std::env::temp_dir().join(format!("opentopia-xlsx-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create {}", root.display()))?;
+        Ok(Self { root })
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+}
+
+impl Drop for SpreadsheetStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+const MAX_TASK_PLAN_STEPS: usize = 20;
+const MAX_TASK_PLAN_STEP_CHARS: usize = 300;
+const MAX_TASK_PLAN_EXPLANATION_CHARS: usize = 2_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdatePlanInput {
+    #[serde(default)]
+    explanation: Option<String>,
+    plan: Vec<TaskPlanStep>,
+}
+
+pub struct UpdatePlanTool;
+
+#[async_trait]
+impl Tool for UpdatePlanTool {
+    fn name(&self) -> &str {
+        "update_plan"
+    }
+
+    fn description(&self) -> &str {
+        "Replace the current task checklist with concise steps and their progress. Use it for multi-step work and keep it current until every step is completed."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "explanation": {
+                    "type": "string",
+                    "description": "Optional reason for changing the plan."
+                },
+                "plan": {
+                    "type": "array",
+                    "maxItems": MAX_TASK_PLAN_STEPS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": { "type": "string", "description": "Short, verifiable task step." },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["plan"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        if ctx.subagent_depth > 0 {
+            anyhow::bail!("only the parent agent may update the shared task plan");
+        }
+        let input: UpdatePlanInput = serde_json::from_value(call.input.clone())
+            .context("update_plan received invalid arguments")?;
+        if input.plan.len() > MAX_TASK_PLAN_STEPS {
+            anyhow::bail!("task plan may contain at most {MAX_TASK_PLAN_STEPS} steps");
+        }
+
+        let mut in_progress = 0usize;
+        let mut unique_steps = HashSet::new();
+        let mut steps = Vec::with_capacity(input.plan.len());
+        for item in input.plan {
+            let step = item.step.trim();
+            if step.is_empty() {
+                anyhow::bail!("task plan steps cannot be empty");
+            }
+            if step.chars().count() > MAX_TASK_PLAN_STEP_CHARS {
+                anyhow::bail!(
+                    "task plan step exceeds the {MAX_TASK_PLAN_STEP_CHARS} character limit"
+                );
+            }
+            let normalized = step.to_lowercase();
+            if !unique_steps.insert(normalized) {
+                anyhow::bail!("task plan contains duplicate step: {step}");
+            }
+            if item.status == TaskPlanStepStatus::InProgress {
+                in_progress += 1;
+            }
+            steps.push(TaskPlanStep {
+                step: step.to_string(),
+                status: item.status,
+            });
+        }
+        if in_progress > 1 {
+            anyhow::bail!("task plan may contain at most one in_progress step");
+        }
+
+        let explanation = input
+            .explanation
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if explanation
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > MAX_TASK_PLAN_EXPLANATION_CHARS)
+        {
+            anyhow::bail!(
+                "task plan explanation exceeds the {MAX_TASK_PLAN_EXPLANATION_CHARS} character limit"
+            );
+        }
+
+        let plan = TaskPlan { explanation, steps };
+        let completed = plan
+            .steps
+            .iter()
+            .filter(|step| step.status == TaskPlanStepStatus::Completed)
+            .count();
+        let value = serde_json::to_value(&plan)?;
+        Ok(ToolResult {
+            call_id: call.id,
+            output: format!(
+                "Plan updated: {completed}/{} steps completed.",
+                plan.steps.len()
+            ),
+            content: vec![ModelContentPart::json(value.clone())],
+            metadata: json!({
+                "toolName": self.name(),
+                "taskPlan": value,
+                "completed": completed,
+                "total": plan.steps.len(),
+                "success": true
+            }),
+        })
     }
 }
 
@@ -282,9 +815,11 @@ impl Tool for BrowserTool {
             "navigate" => {
                 let url = required_string(&call.input, "url")?;
                 inspect_browser_url(&ctx, &url)?;
-                runtime
-                    .navigate(session, BrowserNavigateRequest::new(url))
-                    .await?
+                let mut request = BrowserNavigateRequest::new(url);
+                if let Some(wait) = request.wait.as_mut() {
+                    wait.timeout = timeout;
+                }
+                runtime.navigate(session, request).await?
             }
             "snapshot" => runtime.snapshot(session).await?,
             "screenshot" => runtime.screenshot(session).await?,
@@ -696,7 +1231,123 @@ impl Tool for WaitAgentTool {
                 "toolName": self.name(),
                 "runId": run_id,
                 "status": run.status,
-                "success": run.status.is_terminal()
+                "terminal": run.status.is_terminal(),
+                "success": run.status == SubagentRunStatus::Completed
+            }),
+        })
+    }
+}
+
+const MAX_BATCH_WAIT_AGENTS: usize = 8;
+
+pub struct WaitAgentsTool;
+
+#[async_trait]
+impl Tool for WaitAgentsTool {
+    fn name(&self) -> &str {
+        "wait_agents"
+    }
+
+    fn description(&self) -> &str {
+        "Wait concurrently for multiple direct child agents and return every completed result or timeout error in one structured response."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "runIds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_BATCH_WAIT_AGENTS,
+                    "items": { "type": "string", "description": "Child run UUID." }
+                },
+                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 120000 }
+            },
+            "required": ["runIds"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = ctx
+            .subagents
+            .as_ref()
+            .context("subagent runtime is unavailable")?;
+        let raw_ids = call
+            .input
+            .get("runIds")
+            .and_then(Value::as_array)
+            .context("wait_agents requires runIds")?;
+        if raw_ids.is_empty() || raw_ids.len() > MAX_BATCH_WAIT_AGENTS {
+            anyhow::bail!("wait_agents requires between 1 and {MAX_BATCH_WAIT_AGENTS} run IDs");
+        }
+        let mut unique = HashSet::new();
+        let mut run_ids = Vec::with_capacity(raw_ids.len());
+        for value in raw_ids {
+            let raw = value
+                .as_str()
+                .context("wait_agents runIds must contain UUID strings")?;
+            let run_id = Uuid::parse_str(raw).context("wait_agents received an invalid run ID")?;
+            if !unique.insert(run_id) {
+                anyhow::bail!("wait_agents received duplicate run ID {run_id}");
+            }
+            run_ids.push(run_id);
+        }
+
+        let timeout_ms = call
+            .input
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .clamp(1, 120_000);
+        let timeout = Duration::from_millis(timeout_ms);
+        let scope = subagent_scope(&ctx)?;
+        let waits = run_ids
+            .iter()
+            .map(|run_id| scheduler.wait_scoped(scope, *run_id, timeout));
+        let outcomes = futures_util::future::join_all(waits).await;
+        let runs = run_ids
+            .iter()
+            .zip(outcomes)
+            .map(|(run_id, outcome)| match outcome {
+                Ok(run) => json!({
+                    "runId": run_id,
+                    "status": run.status,
+                    "result": run.result,
+                    "error": run.error,
+                    "terminal": run.status.is_terminal(),
+                    "success": run.status == SubagentRunStatus::Completed
+                }),
+                Err(error) => json!({
+                    "runId": run_id,
+                    "terminal": false,
+                    "success": false,
+                    "waitError": error.to_string()
+                }),
+            })
+            .collect::<Vec<_>>();
+        let all_terminal = runs
+            .iter()
+            .all(|run| run.get("terminal").and_then(Value::as_bool) == Some(true));
+        let all_succeeded = runs
+            .iter()
+            .all(|run| run.get("success").and_then(Value::as_bool) == Some(true));
+        let value = json!({
+            "runs": runs,
+            "allTerminal": all_terminal,
+            "allSucceeded": all_succeeded
+        });
+        Ok(ToolResult {
+            call_id: call.id,
+            output: serde_json::to_string_pretty(&value)?,
+            content: vec![ModelContentPart::json(value.clone())],
+            metadata: json!({
+                "toolName": self.name(),
+                "runCount": run_ids.len(),
+                "allTerminal": all_terminal,
+                "allSucceeded": all_succeeded,
+                "success": all_succeeded
             }),
         })
     }
@@ -1809,6 +2460,8 @@ mod tests {
 
     struct PendingExecutor;
 
+    struct ImmediateExecutor;
+
     #[async_trait]
     impl SubagentExecutor for PendingExecutor {
         async fn execute(
@@ -1819,6 +2472,18 @@ mod tests {
         ) -> anyhow::Result<String> {
             cancellation.cancelled().await;
             anyhow::bail!("cancelled")
+        }
+    }
+
+    #[async_trait]
+    impl SubagentExecutor for ImmediateExecutor {
+        async fn execute(
+            &self,
+            run: SubagentRun,
+            _input: mpsc::UnboundedReceiver<String>,
+            _cancellation: CancellationToken,
+        ) -> anyhow::Result<String> {
+            Ok(format!("completed {}", run.input))
         }
     }
 
@@ -1990,5 +2655,168 @@ mod tests {
         assert!(error.to_string().contains("subagent run not found"));
 
         scheduler.cancel(run.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_plan_validates_progress_and_parent_ownership() {
+        let workspace_root = std::env::current_dir().unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local(workspace_root.clone(), policy.clone());
+        let result = UpdatePlanTool
+            .execute(
+                ToolCall::new(
+                    "update_plan",
+                    json!({
+                        "explanation": "Track the work",
+                        "plan": [
+                            { "step": "Inspect inputs", "status": "completed" },
+                            { "step": "Produce output", "status": "in_progress" }
+                        ]
+                    }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+        let plan: TaskPlan = serde_json::from_value(result.metadata["taskPlan"].clone()).unwrap();
+        assert_eq!(plan.steps.len(), 2);
+        assert!(plan.is_active());
+
+        let invalid = UpdatePlanTool
+            .execute(
+                ToolCall::new(
+                    "update_plan",
+                    json!({
+                        "plan": [
+                            { "step": "First", "status": "in_progress" },
+                            { "step": "Second", "status": "in_progress" }
+                        ]
+                    }),
+                ),
+                ToolContext::local(workspace_root.clone(), policy.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(invalid.to_string().contains("at most one in_progress"));
+
+        let mut child_context = ToolContext::local(workspace_root, policy);
+        child_context.subagent_depth = 1;
+        let denied = UpdatePlanTool
+            .execute(
+                ToolCall::new("update_plan", json!({ "plan": [] })),
+                child_context,
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("only the parent agent"));
+    }
+
+    #[tokio::test]
+    async fn wait_agents_collects_parallel_child_results() {
+        let scheduler = SubagentScheduler::new(
+            SubagentSchedulerConfig {
+                max_concurrency_per_parent: 2,
+                max_depth: 2,
+                timeout: Duration::from_secs(10),
+            },
+            Arc::new(ImmediateExecutor),
+            Arc::new(NoopSubagentObserver),
+        );
+        let thread_id = Uuid::new_v4();
+        let parent_turn_id = Uuid::new_v4();
+        let first = scheduler
+            .spawn(SpawnSubagentRequest {
+                parent_thread_id: thread_id,
+                parent_turn_id,
+                name: "first".to_string(),
+                input: "alpha".to_string(),
+                depth: 1,
+            })
+            .unwrap();
+        let second = scheduler
+            .spawn(SpawnSubagentRequest {
+                parent_thread_id: thread_id,
+                parent_turn_id,
+                name: "second".to_string(),
+                input: "beta".to_string(),
+                depth: 1,
+            })
+            .unwrap();
+
+        let result = WaitAgentsTool
+            .execute(
+                ToolCall::new(
+                    "wait_agents",
+                    json!({
+                        "runIds": [first.id, second.id],
+                        "timeoutMs": 1_000
+                    }),
+                ),
+                tool_context(scheduler, thread_id, parent_turn_id),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["allTerminal"], true);
+        assert_eq!(value["allSucceeded"], true);
+        assert_eq!(value["runs"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn spreadsheet_tool_round_trips_through_execution_environment() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-sheet-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local(workspace_root.clone(), policy.clone());
+        let written = SpreadsheetTool
+            .execute(
+                ToolCall::new(
+                    "spreadsheet",
+                    json!({
+                        "action": "write",
+                        "outputPath": "report.xlsx",
+                        "sheets": [{
+                            "name": "Summary",
+                            "cells": [{
+                                "address": { "row": 0, "column": 0 },
+                                "value": { "type": "string", "value": "ready" }
+                            }]
+                        }]
+                    }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.metadata["success"], true);
+        assert!(workspace_root.join("report.xlsx").is_file());
+
+        let read = SpreadsheetTool
+            .execute(
+                ToolCall::new(
+                    "spreadsheet",
+                    json!({
+                        "action": "read_range",
+                        "path": "report.xlsx",
+                        "sheet": "Summary",
+                        "range": {
+                            "start": { "row": 0, "column": 0 },
+                            "end": { "row": 0, "column": 0 }
+                        }
+                    }),
+                ),
+                ToolContext::local(workspace_root.clone(), policy),
+            )
+            .await
+            .unwrap();
+        assert!(read.output.contains("ready"));
+        fs::remove_dir_all(workspace_root).unwrap();
     }
 }

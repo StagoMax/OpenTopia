@@ -267,6 +267,16 @@ pub enum BrowserError {
     ScreenshotTooLarge { actual: usize, maximum: usize },
     #[error("Download did not complete before the timeout")]
     DownloadTimeout,
+    #[error("Desktop browser broker configuration is invalid: {0}")]
+    BrokerConfiguration(String),
+    #[error("Desktop browser broker is unavailable")]
+    BrokerUnavailable,
+    #[error("Desktop browser broker rejected the request with HTTP {status}: {message}")]
+    BrokerRejected { status: u16, message: String },
+    #[error(
+        "Desktop browser broker response is {actual} bytes, exceeding the configured {maximum}-byte limit"
+    )]
+    BrokerResponseTooLarge { actual: usize, maximum: usize },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("HTTP error: {0}")]

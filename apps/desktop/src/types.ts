@@ -390,6 +390,78 @@ export type ArtifactContent = {
   metadata?: unknown;
 };
 
+export type PreviewRenderer =
+  "text" | "code" | "image" | "pdf" | "spreadsheet" | "web" | "unsupported";
+
+export type PreviewTarget =
+  | { type: "workspace"; path: string }
+  | { type: "artifact"; artifactId: string }
+  | { type: "url"; url: string };
+
+export type PreviewDescriptor = {
+  id: string;
+  threadId: string;
+  target: PreviewTarget;
+  renderer: PreviewRenderer;
+  title: string;
+  contentType: string;
+  bytes?: number | null;
+  revision: string;
+  readonly: boolean;
+  truncated?: boolean;
+  externalPath?: string | null;
+};
+
+export type SpreadsheetSheetPreview = {
+  id: string;
+  name: string;
+  rowCount: number;
+  columnCount: number;
+  hidden?: boolean;
+};
+
+export type SpreadsheetPreview = {
+  previewId: string;
+  sheets: SpreadsheetSheetPreview[];
+};
+
+export type SpreadsheetPreviewCell = {
+  row: number;
+  column: number;
+  value: string | number | boolean | null;
+  formatted?: string | null;
+  formula?: string | null;
+};
+
+export type SpreadsheetPreviewRange = {
+  previewId: string;
+  sheetId: string;
+  rowStart: number;
+  columnStart: number;
+  rowCount: number;
+  columnCount: number;
+  cells: SpreadsheetPreviewCell[];
+};
+
+export type WebPreviewBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type WebPreviewState = {
+  sessionId: string;
+  url: string;
+  title?: string;
+  loading: boolean;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  visible?: boolean;
+  bounds?: WebPreviewBounds;
+  error?: string | null;
+};
+
 export type SandboxDescriptor = {
   id: string;
   threadId: string;
@@ -519,6 +591,18 @@ export type ToolResult = {
   metadata: unknown;
 };
 
+export type TaskPlanStepStatus = "pending" | "in_progress" | "completed";
+
+export type TaskPlanStep = {
+  step: string;
+  status: TaskPlanStepStatus;
+};
+
+export type TaskPlan = {
+  explanation?: string | null;
+  steps: TaskPlanStep[];
+};
+
 export type ModelContentPart =
   | { type: "text"; text: string }
   | { type: "json"; value: unknown }
@@ -544,6 +628,7 @@ export type AgentEventPayload =
   | { type: "model_delta"; text: string }
   | { type: "tool_call_started"; call: ToolCall }
   | { type: "tool_call_finished"; result: ToolResult }
+  | { type: "plan_updated"; plan: TaskPlan }
   | { type: "assistant_message"; message: Message }
   | { type: "file_changed"; path: string; summary: string }
   | { type: "subagent_updated"; run: SubagentRun }
@@ -587,8 +672,18 @@ export type TurnStatus = {
   turnId: string;
   threadId: string;
   userMessageId: string;
-  status: "running" | "cancelling";
+  status:
+    | "running"
+    | "waiting_approval"
+    | "cancelling"
+    | "succeeded"
+    | "failed"
+    | "cancelled"
+    | "interrupted";
   startedAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  error?: string | null;
 };
 
 export type TurnCancelResult = {
@@ -622,6 +717,30 @@ declare global {
         offset?: number,
         limit?: number,
       ): Promise<{ lines: string[]; total: number }>;
+      browserHost?: {
+        createSession(input: {
+          sessionId: string;
+          url?: string;
+          bounds?: WebPreviewBounds;
+          visible?: boolean;
+        }): Promise<WebPreviewState>;
+        destroySession(sessionId: string): Promise<void>;
+        getState(sessionId: string): Promise<WebPreviewState>;
+        navigate(sessionId: string, url: string): Promise<unknown>;
+        back(sessionId: string): Promise<unknown>;
+        forward(sessionId: string): Promise<unknown>;
+        reload(sessionId: string): Promise<unknown>;
+        setBounds(
+          sessionId: string,
+          bounds: WebPreviewBounds,
+        ): Promise<unknown>;
+        setVisibility(sessionId: string, visible: boolean): Promise<unknown>;
+        show(sessionId: string, bounds?: WebPreviewBounds): Promise<unknown>;
+        hide(sessionId: string): Promise<unknown>;
+        onStateChanged(
+          listener: (state: WebPreviewState) => void,
+        ): (() => void) | void;
+      };
     };
   }
 }

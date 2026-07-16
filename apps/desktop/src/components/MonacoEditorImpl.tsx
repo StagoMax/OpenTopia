@@ -30,13 +30,14 @@ export function MonacoEditorImpl({
   onChange,
   language,
   readOnly = false,
+  theme = "vs-dark",
 }: MonacoEditorProps) {
   return (
     <Editor
       value={value}
       onChange={(nextValue) => onChange?.(nextValue ?? "")}
       language={language}
-      theme="vs-dark"
+      theme={theme}
       options={{
         readOnly,
         minimap: { enabled: false },

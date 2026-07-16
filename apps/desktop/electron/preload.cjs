@@ -1,5 +1,34 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+const browserHost = Object.freeze({
+  createSession: (options) =>
+    ipcRenderer.invoke("browser-host:create", options),
+  destroySession: (sessionId) =>
+    ipcRenderer.invoke("browser-host:destroy", sessionId),
+  getState: (sessionId) =>
+    ipcRenderer.invoke("browser-host:get-state", sessionId),
+  navigate: (sessionId, url) =>
+    ipcRenderer.invoke("browser-host:navigate", sessionId, url),
+  back: (sessionId) => ipcRenderer.invoke("browser-host:back", sessionId),
+  forward: (sessionId) => ipcRenderer.invoke("browser-host:forward", sessionId),
+  reload: (sessionId) => ipcRenderer.invoke("browser-host:reload", sessionId),
+  setBounds: (sessionId, bounds) =>
+    ipcRenderer.invoke("browser-host:set-bounds", sessionId, bounds),
+  setVisibility: (sessionId, visible) =>
+    ipcRenderer.invoke("browser-host:set-visibility", sessionId, visible),
+  show: (sessionId, bounds) =>
+    ipcRenderer.invoke("browser-host:show", sessionId, bounds),
+  hide: (sessionId) => ipcRenderer.invoke("browser-host:hide", sessionId),
+  onStateChanged: (listener) => {
+    if (typeof listener !== "function") {
+      throw new TypeError("Browser state listener must be a function.");
+    }
+    const wrapped = (_event, state) => listener(state);
+    ipcRenderer.on("browser-host:state", wrapped);
+    return () => ipcRenderer.removeListener("browser-host:state", wrapped);
+  },
+});
+
 contextBridge.exposeInMainWorld("opentopia", {
   getPlatformInfo: () => ipcRenderer.invoke("platform:get-info"),
   openExternal: (url) => ipcRenderer.invoke("platform:open-external", url),
@@ -20,4 +49,5 @@ contextBridge.exposeInMainWorld("opentopia", {
   listLogFiles: () => ipcRenderer.invoke("logs:list"),
   readLogFile: (path, offset, limit) =>
     ipcRenderer.invoke("logs:read", path, offset, limit),
+  browserHost,
 });

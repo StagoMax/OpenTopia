@@ -293,6 +293,60 @@ impl ToolResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TaskPlanStepStatus {
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[>]",
+            Self::Completed => "[x]",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPlanStep {
+    pub step: String,
+    pub status: TaskPlanStepStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    pub steps: Vec<TaskPlanStep>,
+}
+
+impl TaskPlan {
+    pub fn is_active(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| step.status != TaskPlanStepStatus::Completed)
+    }
+
+    pub fn render_for_model(&self) -> String {
+        let mut lines = Vec::new();
+        if let Some(explanation) = self.explanation.as_deref() {
+            lines.push(explanation.to_string());
+        }
+        lines.extend(
+            self.steps
+                .iter()
+                .map(|step| format!("{} {}", step.status.marker(), step.step)),
+        );
+        lines.join("\n")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Artifact {
@@ -497,6 +551,85 @@ impl Approval {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+    Running,
+    WaitingApproval,
+    Cancelling,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl TurnStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Cancelling => "cancelling",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "running" => Ok(Self::Running),
+            "waiting_approval" => Ok(Self::WaitingApproval),
+            "cancelling" => Ok(Self::Cancelling),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            other => anyhow::bail!("unknown turn status: {other}"),
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::Cancelling)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRecord {
+    pub turn_id: Uuid,
+    pub thread_id: Uuid,
+    pub user_message_id: Uuid,
+    pub status: TurnStatus,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+impl TurnRecord {
+    pub fn running(thread_id: Uuid, user_message_id: Uuid) -> Self {
+        let now = Utc::now();
+        Self {
+            turn_id: Uuid::new_v4(),
+            thread_id,
+            user_message_id,
+            status: TurnStatus::Running,
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TerminalCommandStatus {
     Finished,
     Failed,
@@ -594,6 +727,9 @@ pub enum AgentEventPayload {
     ToolCallFinished {
         result: ToolResult,
     },
+    PlanUpdated {
+        plan: TaskPlan,
+    },
     AssistantMessage {
         message: Message,
     },
@@ -639,6 +775,7 @@ impl AgentEventPayload {
             Self::ModelDelta { .. } => "model_delta",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallFinished { .. } => "tool_call_finished",
+            Self::PlanUpdated { .. } => "plan_updated",
             Self::AssistantMessage { .. } => "assistant_message",
             Self::FileChanged { .. } => "file_changed",
             Self::ApprovalRequested { .. } => "approval_requested",

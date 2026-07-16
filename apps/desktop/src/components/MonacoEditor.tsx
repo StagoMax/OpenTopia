@@ -5,6 +5,7 @@ export type MonacoEditorProps = {
   onChange?: (value: string) => void;
   language?: string;
   readOnly?: boolean;
+  theme?: "vs" | "vs-dark";
 };
 
 const MonacoEditorImpl = lazy(() =>

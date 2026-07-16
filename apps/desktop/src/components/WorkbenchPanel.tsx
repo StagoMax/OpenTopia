@@ -321,7 +321,7 @@ export function WorkbenchPanel({
                 ? "Allow Domain"
                 : latestApprovalPayload.action === "Continue agent execution"
                   ? "Continue"
-                : "Allow Once"}
+                  : "Allow Once"}
             </button>
           </div>
         </section>
@@ -406,14 +406,6 @@ function FilesView({
 }) {
   const currentPath = workspaceTree?.path ?? "";
   const entries = workspaceTree?.entries ?? [];
-  const absoluteFilePath =
-    workspaceRoot && filePreview
-      ? toWorkspaceAbsolutePath(workspaceRoot, filePreview.path)
-      : null;
-  const absoluteContainingPath =
-    workspaceRoot && filePreview
-      ? toWorkspaceAbsolutePath(workspaceRoot, parentPath(filePreview.path))
-      : null;
 
   return (
     <div className="files-view">
@@ -458,54 +450,6 @@ function FilesView({
           <span className="muted">No files loaded.</span>
         )}
       </div>
-
-      {filePreview ? (
-        <div className="file-preview-panel">
-          <div className="file-preview-toolbar">
-            <div className="file-preview-title" title={filePreview.path}>
-              <FileText size={14} />
-              <span>{filePreview.path}</span>
-            </div>
-            <div className="file-preview-actions">
-              {filePreview.truncated && (
-                <span className="truncated-pill">Truncated</span>
-              )}
-              <span className="readonly-pill">
-                {filePreview.readonly ? "Read only" : "Writable"}
-              </span>
-              <button
-                className="secondary-button compact"
-                type="button"
-                disabled={!absoluteContainingPath}
-                title={absoluteContainingPath ?? undefined}
-                onClick={() =>
-                  absoluteContainingPath && onOpenPath(absoluteContainingPath)
-                }
-              >
-                <FolderOpen size={14} />
-                Open path
-              </button>
-              <button
-                className="secondary-button compact"
-                type="button"
-                disabled={!absoluteFilePath}
-                title={absoluteFilePath ?? undefined}
-                onClick={() => absoluteFilePath && onOpenPath(absoluteFilePath)}
-              >
-                <ExternalLink size={14} />
-                Open external
-              </button>
-            </div>
-          </div>
-          <MonacoEditor
-            value={filePreview.content}
-            language={detectLanguage(filePreview.path)}
-            readOnly
-          />
-        </div>
-      ) : (
-        <div className="workbench-empty-state">No file selected.</div>
-      )}
     </div>
   );
 }
@@ -1596,6 +1540,17 @@ function buildTerminalRows(events: AgentEvent[]): TerminalRow[] {
               event.payload.result.metadata,
               event.payload.result.output,
             ),
+          };
+        case "plan_updated":
+          return {
+            id: event.id,
+            kind: "info",
+            label: "task plan updated",
+            time,
+            body: event.payload.plan.steps
+              .map((item) => `[${item.status}] ${item.step}`)
+              .join("\n"),
+            artifacts: [],
           };
         case "assistant_message":
           return {

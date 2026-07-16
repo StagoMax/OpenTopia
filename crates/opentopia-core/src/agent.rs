@@ -2,7 +2,7 @@ use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
 use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    AgentEventPayload, Message, MessageRole, ModelContentPart, ToolCall, ToolResult,
+    AgentEventPayload, Message, MessageRole, ModelContentPart, TaskPlan, ToolCall, ToolResult,
 };
 use crate::policy::{BasicPolicyEngine, PermissionMode};
 use crate::provider::{
@@ -818,9 +818,11 @@ impl AgentCore {
     }
 
     fn provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
+        let subagents_available = self.subagents.is_some();
         self.tools
             .list()
             .into_iter()
+            .filter(|name| subagents_available || !is_subagent_tool(name))
             .filter_map(|name| {
                 self.tools.get(&name).map(|tool| ProviderToolCandidate {
                     name,
@@ -935,6 +937,13 @@ impl AgentCore {
         events.push(AgentEventPayload::ToolCallFinished {
             result: result.clone(),
         });
+        if name == "update_plan" {
+            if let Some(value) = result.metadata.get("taskPlan") {
+                if let Ok(plan) = serde_json::from_value::<TaskPlan>(value.clone()) {
+                    events.push(AgentEventPayload::PlanUpdated { plan });
+                }
+            }
+        }
         Ok(result)
     }
 }
@@ -1067,7 +1076,7 @@ fn suspend_for_budget_checkpoint(
 
 fn provider_system_prompt(status: &AgentBudgetStatus) -> String {
     format!(
-        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help.\n\nExecution budget for this slice: {}/{} tool-decision rounds used ({} remaining); {} ms remaining of {} ms. Context budget: {} used of {} tokens ({} remaining). When a budget reaches zero, execution pauses and the user may explicitly continue from this checkpoint. Do not claim work is complete merely because a budget is low.",
+        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help. For non-trivial multi-step work, use update_plan as durable task memory, keep it current, and complete every step before claiming completion. Delegate independent work with spawn_agent when useful, then use wait_agents to collect parallel results before synthesizing the final answer. Inspect every child status and error; a terminal child is not necessarily a successful child.\n\nExecution budget for this slice: {}/{} tool-decision rounds used ({} remaining); {} ms remaining of {} ms. Context budget: {} used of {} tokens ({} remaining). When a budget reaches zero, execution pauses and the user may explicitly continue from this checkpoint. Do not claim work is complete merely because a budget is low.",
         status.used_tool_rounds,
         status.max_tool_rounds,
         status.remaining_tool_rounds,
@@ -1076,6 +1085,13 @@ fn provider_system_prompt(status: &AgentBudgetStatus) -> String {
         status.context_used_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
         status.context_max_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
         status.context_remaining_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
+    )
+}
+
+fn is_subagent_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn_agent" | "send_input" | "cancel_agent" | "wait_agent" | "wait_agents"
     )
 }
 

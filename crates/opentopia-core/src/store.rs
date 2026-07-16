@@ -2,7 +2,7 @@ use crate::mcp::{McpServerConfig, ThreadMcpServer};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
     ArtifactStorage, ArtifactStorageMetadata, Message, MessagePart, MessageRole, Project,
-    TerminalCommandHistory, TerminalCommandStatus, Thread, ToolResult,
+    TerminalCommandHistory, TerminalCommandStatus, Thread, ToolResult, TurnRecord, TurnStatus,
 };
 use crate::settings::AppSettings;
 use crate::subagents::{SubagentRun, SubagentRunStatus};
@@ -68,6 +68,17 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     fn delete_thread(&self, id: Uuid) -> anyhow::Result<bool>;
     fn append_message(&self, message: Message) -> anyhow::Result<Message>;
     fn list_messages(&self, thread_id: Uuid) -> anyhow::Result<Vec<Message>>;
+    fn insert_turn(&self, turn: TurnRecord) -> anyhow::Result<TurnRecord>;
+    fn get_turn(&self, turn_id: Uuid) -> anyhow::Result<Option<TurnRecord>>;
+    fn get_active_turn(&self, thread_id: Uuid) -> anyhow::Result<Option<TurnRecord>>;
+    fn get_latest_turn(&self, thread_id: Uuid) -> anyhow::Result<Option<TurnRecord>>;
+    fn update_turn_status(
+        &self,
+        turn_id: Uuid,
+        status: TurnStatus,
+        error: Option<String>,
+    ) -> anyhow::Result<Option<TurnRecord>>;
+    fn interrupt_active_turns(&self) -> anyhow::Result<usize>;
     fn append_event(&self, event: AgentEvent) -> anyhow::Result<AgentEvent>;
     fn list_events(
         &self,
@@ -273,6 +284,22 @@ impl SqliteSessionStore {
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS turns (
+                turn_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                user_message_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                error TEXT,
+                CHECK(status IN (
+                    'running', 'waiting_approval', 'cancelling', 'succeeded',
+                    'failed', 'cancelled', 'interrupted'
+                )),
+                FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL,
@@ -395,6 +422,13 @@ impl SqliteSessionStore {
             CREATE INDEX IF NOT EXISTS idx_events_thread_seq
                 ON events(thread_id, seq);
 
+            CREATE INDEX IF NOT EXISTS idx_turns_thread_started
+                ON turns(thread_id, started_at DESC);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_thread_active
+                ON turns(thread_id)
+                WHERE status IN ('running', 'cancelling');
+
             CREATE INDEX IF NOT EXISTS idx_terminal_history_thread_seq
                 ON terminal_history(thread_id, seq_start, seq_end);
 
@@ -443,7 +477,9 @@ impl SqliteSessionStore {
         )?;
         if schema_version < 1 {
             backfill_thread_projects(&mut conn)?;
-            conn.execute_batch("PRAGMA user_version = 1;")?;
+        }
+        if schema_version < 2 {
+            conn.execute_batch("PRAGMA user_version = 2;")?;
         }
         Ok(())
     }
@@ -1002,6 +1038,142 @@ impl SessionStore for SqliteSessionStore {
         )?;
         let rows = stmt.query_map(params![thread_id.to_string()], map_message)?;
         collect_rows(rows)
+    }
+
+    fn insert_turn(&self, turn: TurnRecord) -> anyhow::Result<TurnRecord> {
+        anyhow::ensure!(
+            turn.status == TurnStatus::Running,
+            "new turns must start in running status"
+        );
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO turns (
+                turn_id, thread_id, user_message_id, status, started_at,
+                updated_at, completed_at, error
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                turn.turn_id.to_string(),
+                turn.thread_id.to_string(),
+                turn.user_message_id.to_string(),
+                turn.status.as_str(),
+                turn.started_at.to_rfc3339(),
+                turn.updated_at.to_rfc3339(),
+                turn.completed_at.map(|value| value.to_rfc3339()),
+                turn.error.as_deref(),
+            ],
+        )?;
+        touch_thread(&conn, turn.thread_id)?;
+        Ok(turn)
+    }
+
+    fn get_turn(&self, turn_id: Uuid) -> anyhow::Result<Option<TurnRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.query_row(
+            r#"
+            SELECT turn_id, thread_id, user_message_id, status, started_at,
+                   updated_at, completed_at, error
+            FROM turns
+            WHERE turn_id = ?1
+            "#,
+            params![turn_id.to_string()],
+            map_turn,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn get_active_turn(&self, thread_id: Uuid) -> anyhow::Result<Option<TurnRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.query_row(
+            r#"
+            SELECT turn_id, thread_id, user_message_id, status, started_at,
+                   updated_at, completed_at, error
+            FROM turns
+            WHERE thread_id = ?1 AND status IN ('running', 'cancelling')
+            ORDER BY started_at DESC, rowid DESC
+            LIMIT 1
+            "#,
+            params![thread_id.to_string()],
+            map_turn,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn get_latest_turn(&self, thread_id: Uuid) -> anyhow::Result<Option<TurnRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.query_row(
+            r#"
+            SELECT turn_id, thread_id, user_message_id, status, started_at,
+                   updated_at, completed_at, error
+            FROM turns
+            WHERE thread_id = ?1
+            ORDER BY started_at DESC, rowid DESC
+            LIMIT 1
+            "#,
+            params![thread_id.to_string()],
+            map_turn,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn update_turn_status(
+        &self,
+        turn_id: Uuid,
+        status: TurnStatus,
+        error: Option<String>,
+    ) -> anyhow::Result<Option<TurnRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now();
+        let completed_at = status.is_terminal().then(|| now.to_rfc3339());
+        let changed = conn.execute(
+            r#"
+            UPDATE turns
+            SET status = ?2, updated_at = ?3, completed_at = ?4, error = ?5
+            WHERE turn_id = ?1
+            "#,
+            params![
+                turn_id.to_string(),
+                status.as_str(),
+                now.to_rfc3339(),
+                completed_at,
+                error,
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        conn.query_row(
+            r#"
+            SELECT turn_id, thread_id, user_message_id, status, started_at,
+                   updated_at, completed_at, error
+            FROM turns
+            WHERE turn_id = ?1
+            "#,
+            params![turn_id.to_string()],
+            map_turn,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn interrupt_active_turns(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        let changed = conn.execute(
+            r#"
+            UPDATE turns
+            SET status = 'interrupted', updated_at = ?1, completed_at = ?1,
+                error = 'server restarted before turn completed'
+            WHERE status IN ('running', 'cancelling')
+            "#,
+            params![now],
+        )?;
+        Ok(changed)
     }
 
     fn append_event(&self, mut event: AgentEvent) -> anyhow::Result<AgentEvent> {
@@ -1839,6 +2011,33 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+fn map_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
+    let status_value: String = row.get(3)?;
+    let status = TurnStatus::from_str(&status_value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            )),
+        )
+    })?;
+    let completed_at: Option<String> = row.get(6)?;
+    Ok(TurnRecord {
+        turn_id: parse_uuid(row.get(0)?, 0)?,
+        thread_id: parse_uuid(row.get(1)?, 1)?,
+        user_message_id: parse_uuid(row.get(2)?, 2)?,
+        status,
+        started_at: parse_datetime(row.get(4)?, 4)?,
+        updated_at: parse_datetime(row.get(5)?, 5)?,
+        completed_at: completed_at
+            .map(|value| parse_datetime(value, 6))
+            .transpose()?,
+        error: row.get(7)?,
+    })
+}
+
 fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEvent> {
     let turn_id: Option<String> = row.get(2)?;
     let payload_json: String = row.get(4)?;
@@ -2130,6 +2329,101 @@ mod tests {
         assert_ne!(
             normalize_workspace_key(Path::new("/srv/Repo")),
             normalize_workspace_key(Path::new("/srv/repo"))
+        );
+    }
+
+    #[test]
+    fn turn_lifecycle_round_trips_and_returns_latest_record() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/turn-lifecycle"))
+            .expect("create thread");
+        let first = store
+            .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+            .expect("insert running turn");
+
+        assert_eq!(
+            store
+                .get_active_turn(thread.id)
+                .expect("get active turn")
+                .expect("active turn")
+                .turn_id,
+            first.turn_id
+        );
+        let waiting = store
+            .update_turn_status(first.turn_id, TurnStatus::WaitingApproval, None)
+            .expect("pause turn")
+            .expect("updated turn");
+        assert_eq!(waiting.status, TurnStatus::WaitingApproval);
+        assert!(waiting.completed_at.is_none());
+        assert!(store
+            .get_active_turn(thread.id)
+            .expect("get active turn")
+            .is_none());
+
+        let second = store
+            .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+            .expect("insert resumed turn");
+        let succeeded = store
+            .update_turn_status(second.turn_id, TurnStatus::Succeeded, None)
+            .expect("finish turn")
+            .expect("updated turn");
+        assert!(succeeded.completed_at.is_some());
+        assert_eq!(
+            store
+                .get_latest_turn(thread.id)
+                .expect("get latest turn")
+                .expect("latest turn")
+                .turn_id,
+            second.turn_id
+        );
+    }
+
+    #[test]
+    fn startup_recovery_interrupts_only_active_turns() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let first_thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/interrupted-running"))
+            .expect("create first thread");
+        let second_thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/interrupted-cancelling"))
+            .expect("create second thread");
+        let third_thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/waiting-approval"))
+            .expect("create third thread");
+        let running = store
+            .insert_turn(TurnRecord::running(first_thread.id, Uuid::new_v4()))
+            .expect("insert running turn");
+        let cancelling = store
+            .insert_turn(TurnRecord::running(second_thread.id, Uuid::new_v4()))
+            .expect("insert cancelling turn");
+        store
+            .update_turn_status(cancelling.turn_id, TurnStatus::Cancelling, None)
+            .expect("mark cancelling");
+        let waiting = store
+            .insert_turn(TurnRecord::running(third_thread.id, Uuid::new_v4()))
+            .expect("insert waiting turn");
+        store
+            .update_turn_status(waiting.turn_id, TurnStatus::WaitingApproval, None)
+            .expect("mark waiting");
+
+        assert_eq!(store.interrupt_active_turns().expect("recover turns"), 2);
+        for turn_id in [running.turn_id, cancelling.turn_id] {
+            let recovered = store
+                .get_turn(turn_id)
+                .expect("get recovered turn")
+                .expect("recovered turn");
+            assert_eq!(recovered.status, TurnStatus::Interrupted);
+            assert!(recovered.completed_at.is_some());
+            assert!(recovered.error.is_some());
+        }
+        assert_eq!(
+            store
+                .get_turn(waiting.turn_id)
+                .expect("get waiting turn")
+                .expect("waiting turn")
+                .status,
+            TurnStatus::WaitingApproval
         );
     }
 

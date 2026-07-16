@@ -1,0 +1,703 @@
+param(
+  [Parameter(Mandatory = $true)][string]$EnvFile,
+  [string]$Profile = "AUDIT_COPILOT_LLM",
+  [string]$ExpectedModel = "glm-5.2",
+  [int]$Port = 8812,
+  [int]$TurnTimeoutSeconds = 420,
+  [string]$SummaryPath = "",
+  [switch]$SkipBuild
+)
+
+$ErrorActionPreference = "Stop"
+
+function ConvertFrom-DotEnvFile {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  $values = @{}
+  Get-Content -LiteralPath $Path | ForEach-Object {
+    $line = $_.Trim()
+    if (-not $line -or $line.StartsWith("#") -or -not $line.Contains("=")) {
+      return
+    }
+    $parts = $line.Split("=", 2)
+    $value = $parts[1].Trim()
+    if (
+      $value.Length -ge 2 -and
+      (($value.StartsWith('"') -and $value.EndsWith('"')) -or
+        ($value.StartsWith("'") -and $value.EndsWith("'")))
+    ) {
+      $value = $value.Substring(1, $value.Length - 2)
+    }
+    $values[$parts[0].Trim()] = $value
+  }
+  return $values
+}
+
+function Protect-Text {
+  param(
+    [AllowNull()][string]$Text,
+    [Parameter(Mandatory = $true)][string]$Secret
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Text)) {
+    return $null
+  }
+  $safe = $Text.Replace($Secret, "<redacted>")
+  $safe = $safe -replace '(?i)Bearer\s+[A-Za-z0-9._~+/=-]+', 'Bearer <redacted>'
+  if ($safe.Length -gt 800) {
+    $safe = $safe.Substring(0, 800)
+  }
+  return $safe
+}
+
+function Invoke-EvalApi {
+  param(
+    [Parameter(Mandatory = $true)][string]$Method,
+    [Parameter(Mandatory = $true)][string]$Path,
+    [AllowNull()][object]$Body = $null,
+    [int]$TimeoutSeconds = 20
+  )
+
+  $parameters = @{
+    Method = $Method
+    Uri = "http://127.0.0.1:$Port$Path"
+    Headers = $script:ApiHeaders
+    TimeoutSec = $TimeoutSeconds
+  }
+  if ($null -ne $Body) {
+    $parameters.ContentType = "application/json"
+    $parameters.Body = $Body | ConvertTo-Json -Depth 30 -Compress
+  }
+  return Invoke-RestMethod @parameters
+}
+
+function Expand-EvalItems {
+  param([AllowNull()][object]$Value)
+
+  if ($null -eq $Value) {
+    return
+  }
+  if ($Value -is [System.Array]) {
+    foreach ($item in $Value) {
+      Expand-EvalItems $item
+    }
+    return
+  }
+  Write-Output $Value
+}
+
+function Start-EvalServer {
+  param(
+    [Parameter(Mandatory = $true)][string]$Label,
+    [Parameter(Mandatory = $true)][string]$ServerPath,
+    [Parameter(Mandatory = $true)][string]$DatabasePath,
+    [Parameter(Mandatory = $true)][string]$RunRoot
+  )
+
+  $stdoutPath = Join-Path $RunRoot "server-$Label.stdout.log"
+  $stderrPath = Join-Path $RunRoot "server-$Label.stderr.log"
+  $process = Start-Process `
+    -FilePath $ServerPath `
+    -ArgumentList @(
+      "--port", $Port,
+      "--db", $DatabasePath,
+      "--permission", "full-access"
+    ) `
+    -RedirectStandardOutput $stdoutPath `
+    -RedirectStandardError $stderrPath `
+    -PassThru `
+    -WindowStyle Hidden
+
+  $deadline = (Get-Date).AddSeconds(30)
+  while ((Get-Date) -lt $deadline) {
+    if ($process.HasExited) {
+      throw "Server exited before becoming healthy"
+    }
+    Start-Sleep -Milliseconds 250
+    try {
+      $health = Invoke-EvalApi "Get" "/health"
+      if ($health.ok -and $health.service -eq "opentopia-server") {
+        return $process
+      }
+    } catch {
+    }
+  }
+  throw "Server did not become healthy within 30 seconds"
+}
+
+function Stop-EvalServer {
+  param([AllowNull()][System.Diagnostics.Process]$Process)
+
+  if ($Process -and -not $Process.HasExited) {
+    Stop-Process -Id $Process.Id -Force
+    $Process.WaitForExit(5000) | Out-Null
+  }
+}
+
+function Wait-EvalTurn {
+  param(
+    [Parameter(Mandatory = $true)][string]$ThreadId,
+    [Parameter(Mandatory = $true)][string]$UserMessageId,
+    [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  $continuations = 0
+  $lastTurn = $null
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 500
+    $lastTurn = Invoke-EvalApi "Get" "/api/threads/$ThreadId/turn"
+    if (-not $lastTurn -or $lastTurn.userMessageId -ne $UserMessageId) {
+      continue
+    }
+    if ($lastTurn.status -eq "waiting_approval") {
+      $pending = @(Expand-EvalItems (
+        Invoke-EvalApi "Get" "/api/threads/$ThreadId/approvals?status=pending"
+      ))
+      if ($pending.Count -ne 1 -or $pending[0].action -ne "Continue agent execution") {
+        throw "Turn reached a non-budget approval boundary"
+      }
+      $approvalId = [string]$pending[0].approvalId
+      if (-not $approvalId) {
+        throw "Pending approval did not include approvalId"
+      }
+      Invoke-EvalApi `
+        -Method "Post" `
+        -Path "/api/threads/$ThreadId/approvals/$approvalId/decision" `
+        -Body @{ approved = $true } `
+        -TimeoutSeconds $TimeoutSeconds | Out-Null
+      $continuations += 1
+      continue
+    }
+    if ($lastTurn.status -in @("succeeded", "failed", "cancelled", "interrupted")) {
+      return [PSCustomObject]@{
+        Turn = $lastTurn
+        BudgetContinuations = $continuations
+      }
+    }
+  }
+
+  try {
+    Invoke-EvalApi "Post" "/api/threads/$ThreadId/turn/cancel" @{} | Out-Null
+  } catch {
+  }
+  throw "Turn exceeded the configured hard timeout"
+}
+
+function Invoke-HiddenGrader {
+  param(
+    [Parameter(Mandatory = $true)][string]$Workspace,
+    [Parameter(Mandatory = $true)][ValidateSet("library", "full")][string]$Phase,
+    [Parameter(Mandatory = $true)][string]$GraderPath
+  )
+
+  $output = & node $GraderPath $Workspace $Phase 2>&1
+  $exitCode = $LASTEXITCODE
+  $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+  try {
+    $result = $text | ConvertFrom-Json
+  } catch {
+    return [PSCustomObject]@{
+      phase = $Phase
+      passed = $false
+      passedChecks = 0
+      totalChecks = 1
+      checks = @([PSCustomObject]@{
+        id = "grader-output"
+        passed = $false
+        detail = "grader did not return JSON (exit $exitCode)"
+      })
+    }
+  }
+  return $result
+}
+
+function Get-TrajectoryMetrics {
+  param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Events)
+
+  $Events = @(Expand-EvalItems $Events)
+  $toolStarts = @($Events | Where-Object { $_.payload.type -eq "tool_call_started" })
+  $toolFinishes = @($Events | Where-Object { $_.payload.type -eq "tool_call_finished" })
+  $planEvents = @($Events | Where-Object { $_.payload.type -eq "plan_updated" })
+  $usageEvents = @($Events | Where-Object { $_.payload.type -eq "token_usage" })
+  $budgetCheckpoints = @($Events | Where-Object {
+    $_.payload.type -eq "approval_requested" -and
+    $_.payload.action -eq "Continue agent execution"
+  })
+  $toolByName = [ordered]@{}
+  foreach ($event in $toolStarts) {
+    $name = [string]$event.payload.call.name
+    if (-not $toolByName.Contains($name)) {
+      $toolByName[$name] = 0
+    }
+    $toolByName[$name] += 1
+  }
+  $testToolCalls = @($toolStarts | Where-Object {
+    $_.payload.call.name -eq "shell" -and
+    [string]$_.payload.call.input.command -match '(?i)(npm\s+test|node\s+--test)'
+  }).Count
+  $latestPlan = if ($planEvents.Count -gt 0) {
+    $planEvents[$planEvents.Count - 1].payload.plan
+  } else {
+    $null
+  }
+  $planStatus = [ordered]@{ pending = 0; inProgress = 0; completed = 0 }
+  if ($latestPlan) {
+    foreach ($step in @($latestPlan.steps)) {
+      switch ([string]$step.status) {
+        "pending" { $planStatus.pending += 1 }
+        "in_progress" { $planStatus.inProgress += 1 }
+        "completed" { $planStatus.completed += 1 }
+      }
+    }
+  }
+  $inputTokens = [int64](($usageEvents | ForEach-Object {
+    $_.payload.input_tokens
+  } | Measure-Object -Sum).Sum)
+  $outputTokens = [int64](($usageEvents | ForEach-Object {
+    $_.payload.output_tokens
+  } | Measure-Object -Sum).Sum)
+  $totalTokens = [int64](($usageEvents | ForEach-Object {
+    $_.payload.total_tokens
+  } | Measure-Object -Sum).Sum)
+  return [ordered]@{
+    eventCount = $Events.Count
+    turnCount = @($Events | ForEach-Object { $_.turnId } | Where-Object { $_ } |
+      Select-Object -Unique).Count
+    toolCallsStarted = $toolStarts.Count
+    toolCallsFinished = $toolFinishes.Count
+    toolCallsByName = $toolByName
+    planUpdates = $planEvents.Count
+    budgetCheckpoints = $budgetCheckpoints.Count
+    latestPlan = $planStatus
+    testToolCalls = $testToolCalls
+    inputTokens = $inputTokens
+    outputTokens = $outputTokens
+    totalTokens = $totalTokens
+    errorEvents = @($Events | Where-Object { $_.payload.type -eq "error" }).Count
+  }
+}
+
+function Test-FilesForSecret {
+  param(
+    [Parameter(Mandatory = $true)][string]$Root,
+    [Parameter(Mandatory = $true)][string]$Secret
+  )
+
+  $secretBytes = [Text.Encoding]::UTF8.GetBytes($Secret)
+  foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse) {
+    $bytes = [IO.File]::ReadAllBytes($file.FullName)
+    if ($bytes.Length -lt $secretBytes.Length) {
+      continue
+    }
+    for ($offset = 0; $offset -le $bytes.Length - $secretBytes.Length; $offset += 1) {
+      $match = $true
+      for ($index = 0; $index -lt $secretBytes.Length; $index += 1) {
+        if ($bytes[$offset + $index] -ne $secretBytes[$index]) {
+          $match = $false
+          break
+        }
+      }
+      if ($match) {
+        return $false
+      }
+    }
+  }
+  return $true
+}
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+. "$PSScriptRoot\dev-env.ps1"
+
+$values = ConvertFrom-DotEnvFile $EnvFile
+$apiKey = [string]$values["${Profile}_API_KEY"]
+$baseUrl = ([string]$values["${Profile}_BASE_URL"]).TrimEnd("/")
+$model = [string]$values["${Profile}_MODEL"]
+if (-not $apiKey -or -not $baseUrl -or -not $model) {
+  throw "The selected provider profile is incomplete"
+}
+if ($ExpectedModel -and $model -ne $ExpectedModel) {
+  throw "Selected model does not match the expected model"
+}
+
+$savedEnvironment = @{}
+foreach ($name in @(
+  "OPENTOPIA_API_KEY",
+  "OPENTOPIA_OPENAI_BASE_URL",
+  "OPENTOPIA_MODEL",
+  "OPENTOPIA_DB",
+  "OPENTOPIA_SANDBOX_MODE",
+  "OPENTOPIA_SANDBOX_ENFORCEMENT",
+  "OPENTOPIA_SANDBOX_NETWORK"
+)) {
+  $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+}
+[Environment]::SetEnvironmentVariable("OPENTOPIA_API_KEY", $apiKey, "Process")
+[Environment]::SetEnvironmentVariable("OPENTOPIA_OPENAI_BASE_URL", $baseUrl, "Process")
+[Environment]::SetEnvironmentVariable("OPENTOPIA_MODEL", $model, "Process")
+[Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_MODE", "workspace-write", "Process")
+[Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_ENFORCEMENT", "best-effort", "Process")
+[Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_NETWORK", "deny", "Process")
+
+$script:ApiHeaders = @{ Authorization = "Bearer $env:OPENTOPIA_API_TOKEN" }
+$runId = "glm-5-2-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+$runRoot = Join-Path $repoRoot ".opentopia\evaluations\$runId"
+$workspace = Join-Path $runRoot "workspace"
+$database = Join-Path $runRoot "evaluation.db"
+$probePath = Join-Path $runRoot "provider-probe.json"
+$trajectoryPhase1Path = Join-Path $runRoot "trajectory-phase1.json"
+$trajectoryFinalPath = Join-Path $runRoot "trajectory-final.json"
+$resultPath = Join-Path $runRoot "result.json"
+$seed = Join-Path $PSScriptRoot "fixtures\long-horizon\seed"
+$graderPath = Join-Path $PSScriptRoot "fixtures\long-horizon\grader.cjs"
+$server = $null
+$startedAt = Get-Date
+$phase1StartedAt = $null
+$phase2StartedAt = $null
+$phase1ElapsedMs = $null
+$phase2ElapsedMs = $null
+$restartElapsedMs = $null
+$providerProbe = $null
+$providerHealth = $null
+$phase1Turn = $null
+$phase2Turn = $null
+$phase1Continuations = 0
+$phase2Continuations = 0
+$thread = $null
+$eventsPhase1 = @()
+$eventsFinal = @()
+$recovery = [ordered]@{
+  serverRestarted = $false
+  threadRecovered = $false
+  turnRecovered = $false
+  messagesRecovered = $false
+  eventsRecovered = $false
+  durablePlanRecovered = $false
+  activePlanRecovered = $false
+}
+$runError = $null
+
+New-Item -ItemType Directory -Path $workspace -Force | Out-Null
+Copy-Item -Path (Join-Path $seed "*") -Destination $workspace -Recurse -Force
+
+& git -C $workspace init --quiet
+& git -C $workspace config user.name "OpenTopia Eval"
+& git -C $workspace config user.email "eval@localhost"
+& git -C $workspace add .
+& git -C $workspace commit --quiet -m "evaluation baseline"
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to initialize the evaluation fixture"
+}
+
+$baselinePublicOutput = & node --test (Join-Path $workspace "test\contract.test.js") 2>&1
+$baselinePublicExit = $LASTEXITCODE
+$baselineLibrary = Invoke-HiddenGrader $workspace "library" $graderPath
+$baselineFull = Invoke-HiddenGrader $workspace "full" $graderPath
+
+try {
+  $probeText = & "$PSScriptRoot\probe-openai-compatible.ps1" `
+    -EnvFile $EnvFile `
+    -Profile $Profile `
+    -ExpectedModel $ExpectedModel `
+    -OutputPath $probePath
+  $providerProbe = (($probeText | ForEach-Object { $_.ToString() }) -join "`n") |
+    ConvertFrom-Json
+  if (-not $providerProbe.compatibleWithOpenTopia) {
+    throw "Provider compatibility probe failed"
+  }
+
+  $targetDir = Join-Path $repoRoot ".opentopia\verify-target"
+  $env:CARGO_TARGET_DIR = $targetDir
+  if (-not $SkipBuild) {
+    Push-Location $repoRoot
+    try {
+      cargo build -p opentopia-server
+      if ($LASTEXITCODE -ne 0) {
+        throw "opentopia-server build failed"
+      }
+    } finally {
+      Pop-Location
+    }
+  }
+  $serverPath = Join-Path $targetDir "debug\opentopia-server.exe"
+  if (-not (Test-Path -LiteralPath $serverPath)) {
+    $serverPath = Join-Path $targetDir "debug\opentopia-server"
+  }
+  if (-not (Test-Path -LiteralPath $serverPath)) {
+    throw "opentopia-server debug binary was not found"
+  }
+
+  $server = Start-EvalServer "phase1" $serverPath $database $runRoot
+  $providerHealth = Invoke-EvalApi "Post" "/api/provider/test" @{}
+  if (-not $providerHealth.reachable -or -not $providerHealth.modelAvailable) {
+    throw "OpenTopia provider health check failed"
+  }
+  $settings = Invoke-EvalApi "Get" "/api/settings"
+  $activeProvider = @($settings.providers | Where-Object {
+    $_.id -eq $settings.activeProviderId
+  })[0]
+  if (-not $activeProvider) {
+    $activeProvider = @($settings.providers)[0]
+  }
+  if (
+    $activeProvider.kind -ne "open_ai_compatible" -or
+    $activeProvider.model -ne $ExpectedModel -or
+    $activeProvider.baseUrl.TrimEnd("/") -ne $baseUrl
+  ) {
+    throw "OpenTopia active provider settings do not match the selected profile"
+  }
+
+  $thread = Invoke-EvalApi "Post" "/api/threads" @{
+    title = "GLM-5.2 deterministic long-horizon evaluation"
+    workspaceRoot = $workspace
+  }
+  $phase1Prompt = @'
+This is phase 1 of a controlled two-session coding evaluation. Read SPEC.md and
+the existing code. Use update_plan to create a durable plan with at least four
+concrete steps covering both sessions. In this phase, implement and verify the
+CSV parsing, reconciliation, and report library in src/ledger.js. Run npm test.
+Do not modify SPEC.md or any file under test/. Leave the CLI/session-2 work
+pending in the plan and finish with a runnable, tested workspace.
+'@
+  $phase1StartedAt = Get-Date
+  $phase1Message = Invoke-EvalApi "Post" "/api/threads/$($thread.id)/messages" @{
+    content = $phase1Prompt
+  }
+  $phase1Wait = Wait-EvalTurn $thread.id $phase1Message.id $TurnTimeoutSeconds
+  $phase1ElapsedMs = [int64]((Get-Date) - $phase1StartedAt).TotalMilliseconds
+  $phase1Turn = $phase1Wait.Turn
+  $phase1Continuations = $phase1Wait.BudgetContinuations
+  $eventsPhase1 = @(Expand-EvalItems (
+    Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
+  ))
+  $trajectoryPhase1 = Invoke-EvalApi "Get" "/api/threads/$($thread.id)/trajectory"
+  $trajectoryPhase1Json = $trajectoryPhase1 | ConvertTo-Json -Depth 100
+  if ($trajectoryPhase1Json.Contains($apiKey)) {
+    throw "Secret audit rejected phase-1 trajectory"
+  }
+  [IO.File]::WriteAllText(
+    $trajectoryPhase1Path,
+    "$trajectoryPhase1Json`n",
+    [Text.UTF8Encoding]::new($false)
+  )
+
+  Stop-EvalServer $server
+  $server = $null
+  $restartStartedAt = Get-Date
+  $server = Start-EvalServer "phase2" $serverPath $database $runRoot
+  $restartElapsedMs = [int64]((Get-Date) - $restartStartedAt).TotalMilliseconds
+  $recovery.serverRestarted = $true
+  $threadsRecovered = @(Expand-EvalItems (Invoke-EvalApi "Get" "/api/threads"))
+  $recovery.threadRecovered = @($threadsRecovered | Where-Object {
+    $_.id -eq $thread.id
+  }).Count -eq 1
+  $recoveredTurn = Invoke-EvalApi "Get" "/api/threads/$($thread.id)/turn"
+  $recovery.turnRecovered =
+    $recoveredTurn.userMessageId -eq $phase1Message.id -and
+    $recoveredTurn.status -eq $phase1Turn.status
+  $messagesRecovered = @(Expand-EvalItems (
+    Invoke-EvalApi "Get" "/api/threads/$($thread.id)/messages"
+  ))
+  $recovery.messagesRecovered = $messagesRecovered.Count -ge 2
+  $recoveredEvents = @(Expand-EvalItems (
+    Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
+  ))
+  $recovery.eventsRecovered = $recoveredEvents.Count -eq $eventsPhase1.Count
+  $recoveredPlans = @($recoveredEvents | Where-Object {
+    $_.payload.type -eq "plan_updated"
+  })
+  $recovery.durablePlanRecovered = $recoveredPlans.Count -gt 0
+  if ($recoveredPlans.Count -gt 0) {
+    $recoveredPlan = $recoveredPlans[$recoveredPlans.Count - 1].payload.plan
+    $recovery.activePlanRecovered = @($recoveredPlan.steps | Where-Object {
+      $_.status -ne "completed"
+    }).Count -gt 0
+  }
+
+  $phase2Prompt = @'
+Continue the same task after the server restart. Recover the current state from
+the durable plan, prior messages, workspace, and git diff. Complete the remaining
+CLI contract in src/cli.js, repair any incomplete library behavior, run the full
+npm test suite, and update the durable plan so every step is completed. Do not
+modify SPEC.md or any file under test/. Do not claim completion unless tests pass.
+'@
+  $phase2StartedAt = Get-Date
+  $phase2Message = Invoke-EvalApi "Post" "/api/threads/$($thread.id)/messages" @{
+    content = $phase2Prompt
+  }
+  $phase2Wait = Wait-EvalTurn $thread.id $phase2Message.id $TurnTimeoutSeconds
+  $phase2ElapsedMs = [int64]((Get-Date) - $phase2StartedAt).TotalMilliseconds
+  $phase2Turn = $phase2Wait.Turn
+  $phase2Continuations = $phase2Wait.BudgetContinuations
+  $eventsFinal = @(Expand-EvalItems (
+    Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
+  ))
+  $trajectoryFinal = Invoke-EvalApi "Get" "/api/threads/$($thread.id)/trajectory"
+  $trajectoryFinalJson = $trajectoryFinal | ConvertTo-Json -Depth 100
+  if ($trajectoryFinalJson.Contains($apiKey)) {
+    throw "Secret audit rejected final trajectory"
+  }
+  [IO.File]::WriteAllText(
+    $trajectoryFinalPath,
+    "$trajectoryFinalJson`n",
+    [Text.UTF8Encoding]::new($false)
+  )
+} catch {
+  $runError = Protect-Text $_.Exception.Message $apiKey
+  if ($thread -and $server -and -not $server.HasExited) {
+    try {
+      $eventsFinal = @(Expand-EvalItems (
+        Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
+      ))
+      $failedTrajectory = Invoke-EvalApi `
+        "Get" `
+        "/api/threads/$($thread.id)/trajectory"
+      $failedTrajectoryJson = $failedTrajectory | ConvertTo-Json -Depth 100
+      if (-not $failedTrajectoryJson.Contains($apiKey)) {
+        [IO.File]::WriteAllText(
+          $trajectoryFinalPath,
+          "$failedTrajectoryJson`n",
+          [Text.UTF8Encoding]::new($false)
+        )
+      }
+    } catch {
+    }
+  }
+} finally {
+  Stop-EvalServer $server
+  foreach ($name in $savedEnvironment.Keys) {
+    [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], "Process")
+  }
+}
+
+$phase1Grade = Invoke-HiddenGrader $workspace "library" $graderPath
+$finalGrade = Invoke-HiddenGrader $workspace "full" $graderPath
+if ($eventsFinal.Count -eq 0 -and $eventsPhase1.Count -gt 0) {
+  $eventsFinal = $eventsPhase1
+}
+$metrics = Get-TrajectoryMetrics $eventsFinal
+$latestPlanComplete =
+  $metrics.planUpdates -gt 0 -and
+  $metrics.latestPlan.pending -eq 0 -and
+  $metrics.latestPlan.inProgress -eq 0 -and
+  $metrics.latestPlan.completed -ge 4
+$recoveryPassed =
+  $recovery.serverRestarted -and
+  $recovery.threadRecovered -and
+  $recovery.turnRecovered -and
+  $recovery.messagesRecovered -and
+  $recovery.eventsRecovered -and
+  $recovery.durablePlanRecovered -and
+  $recovery.activePlanRecovered
+$processContractPassed =
+  $metrics.planUpdates -ge 2 -and
+  $metrics.testToolCalls -ge 2 -and
+  $latestPlanComplete
+$providerPassed = $null -ne $providerProbe -and $providerProbe.compatibleWithOpenTopia
+$turnsPassed =
+  $null -ne $phase1Turn -and
+  $null -ne $phase2Turn -and
+  $phase1Turn.status -eq "succeeded" -and
+  $phase2Turn.status -eq "succeeded"
+$secretAuditPassed = Test-FilesForSecret $runRoot $apiKey
+$overallPassed =
+  $providerPassed -and
+  $turnsPassed -and
+  $phase1Grade.passed -and
+  $finalGrade.passed -and
+  $recoveryPassed -and
+  $processContractPassed -and
+  $secretAuditPassed -and
+  -not $runError
+
+$result = [ordered]@{
+  schemaVersion = 1
+  runId = $runId
+  startedAt = $startedAt.ToUniversalTime().ToString("o")
+  completedAt = (Get-Date).ToUniversalTime().ToString("o")
+  status = if ($overallPassed) { "passed" } else { "failed" }
+  objectiveScoringOnly = $true
+  provider = [ordered]@{
+    profile = $Profile
+    baseUrl = $baseUrl
+    model = $model
+    credentials = "redacted:set"
+    compatibleWithOpenTopia = $providerPassed
+    modelListed = if ($providerProbe) { $providerProbe.models.modelListed } else { $false }
+    streamChat = if ($providerProbe) { $providerProbe.streamChat.status } else { $null }
+    streamToolsAuto = if ($providerProbe) { $providerProbe.streamToolsAuto.status } else { $null }
+    streamToolContinuation = if ($providerProbe) { $providerProbe.streamToolContinuation.status } else { $null }
+    streamSerializedToolHistory = if ($providerProbe) { $providerProbe.streamSerializedToolHistory.status } else { $null }
+    streamCompactedToolHistory = if ($providerProbe) { $providerProbe.streamCompactedToolHistory.status } else { $null }
+    streamToolsForced = if ($providerProbe) { $providerProbe.streamToolsForced.status } else { $null }
+    openTopiaHealthReachable = if ($providerHealth) { $providerHealth.reachable } else { $false }
+    openTopiaModelAvailable = if ($providerHealth) { $providerHealth.modelAvailable } else { $false }
+  }
+  timing = [ordered]@{
+    totalMs = [int64]((Get-Date) - $startedAt).TotalMilliseconds
+    phase1Ms = $phase1ElapsedMs
+    restartMs = $restartElapsedMs
+    phase2Ms = $phase2ElapsedMs
+    hardTimeoutPerTurnSeconds = $TurnTimeoutSeconds
+  }
+  baseline = [ordered]@{
+    publicTestsExitCode = $baselinePublicExit
+    library = $baselineLibrary
+    full = $baselineFull
+    expectedFailureObserved =
+      $baselinePublicExit -ne 0 -and
+      -not $baselineLibrary.passed -and
+      -not $baselineFull.passed
+  }
+  turns = @(
+    [ordered]@{
+      phase = 1
+      status = if ($phase1Turn) { $phase1Turn.status } else { "not_completed" }
+      elapsedMs = $phase1ElapsedMs
+      budgetContinuations = $phase1Continuations
+    },
+    [ordered]@{
+      phase = 2
+      status = if ($phase2Turn) { $phase2Turn.status } else { "not_completed" }
+      elapsedMs = $phase2ElapsedMs
+      budgetContinuations = $phase2Continuations
+    }
+  )
+  recovery = $recovery
+  recoveryPassed = $recoveryPassed
+  trajectoryMetrics = $metrics
+  processContractPassed = $processContractPassed
+  grading = [ordered]@{
+    phase1Library = $phase1Grade
+    final = $finalGrade
+  }
+  secretAuditPassed = $secretAuditPassed
+  error = $runError
+  artifacts = [ordered]@{
+    runDirectory = ".opentopia/evaluations/$runId"
+    providerProbe = ".opentopia/evaluations/$runId/provider-probe.json"
+    phase1Trajectory = if (Test-Path $trajectoryPhase1Path) {
+      ".opentopia/evaluations/$runId/trajectory-phase1.json"
+    } else { $null }
+    finalTrajectory = if (Test-Path $trajectoryFinalPath) {
+      ".opentopia/evaluations/$runId/trajectory-final.json"
+    } else { $null }
+  }
+}
+
+$resultJson = $result | ConvertTo-Json -Depth 40
+if ($resultJson.Contains($apiKey)) {
+  throw "Secret audit rejected final evaluation report"
+}
+[IO.File]::WriteAllText($resultPath, "$resultJson`n", [Text.UTF8Encoding]::new($false))
+if ($SummaryPath) {
+  $summaryParent = Split-Path -Parent $SummaryPath
+  if ($summaryParent) {
+    New-Item -ItemType Directory -Path $summaryParent -Force | Out-Null
+  }
+  [IO.File]::WriteAllText($SummaryPath, "$resultJson`n", [Text.UTF8Encoding]::new($false))
+}
+$resultJson
+if (-not $overallPassed) {
+  exit 1
+}

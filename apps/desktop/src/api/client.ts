@@ -16,12 +16,16 @@ import type {
   McpServerView,
   Message,
   PermissionMode,
+  PreviewDescriptor,
+  PreviewTarget,
   Project,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
   SandboxDescriptor,
   SkillDescriptor,
+  SpreadsheetPreview,
+  SpreadsheetPreviewRange,
   SubagentRun,
   TerminalCancelResponse,
   TerminalEvent,
@@ -42,8 +46,57 @@ import { getLoadedApiToken } from "../platform";
 
 export type StreamHandle = { close(): void };
 
+export class ApiResponseError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApiResponseError";
+  }
+}
+
+type PreviewDescriptorResponse = {
+  id: string;
+  source: "workspace" | "artifact";
+  path?: string | null;
+  name: string;
+  kind: "text" | "image" | "pdf" | "spreadsheet" | "unsupported";
+  contentType: string;
+  bytes: number;
+  readonly: boolean;
+  revision: string;
+};
+
+type SpreadsheetWorkbookResponse = {
+  previewId: string;
+  sheets: Array<{
+    name: string;
+    kind: string;
+    visibility: "visible" | "hidden" | "very_hidden";
+    rowCount: number;
+    columnCount: number;
+  }>;
+};
+
+type SpreadsheetRangeResponse = {
+  previewId: string;
+  sheet: string;
+  range: {
+    start: { row: number; column: number };
+    end: { row: number; column: number };
+  };
+  rows: Array<
+    Array<{
+      value: { type: string; value?: unknown };
+      formula?: string | null;
+    }>
+  >;
+};
+
 export class ApiClient {
   private readonly apiToken: string;
+  private readonly legacyPreviewContent = new Map<string, Blob>();
 
   constructor(
     private readonly baseUrl: string,
@@ -463,6 +516,136 @@ export class ApiClient {
     };
   }
 
+  async resolvePreview(
+    threadId: string,
+    target: PreviewTarget,
+  ): Promise<PreviewDescriptor> {
+    if (target.type === "url") {
+      return {
+        id: `web:${threadId}`,
+        threadId,
+        target,
+        renderer: "web",
+        title: target.url || "Browser",
+        contentType: "text/html",
+        revision: target.url,
+        readonly: true,
+      };
+    }
+
+    try {
+      const response = await this.post<PreviewDescriptorResponse>(
+        `/api/threads/${threadId}/previews/resolve`,
+        target.type === "workspace"
+          ? { source: "workspace", path: target.path }
+          : { source: "artifact", artifactId: target.artifactId },
+      );
+      return {
+        id: response.id,
+        threadId,
+        target,
+        renderer:
+          response.kind === "text"
+            ? previewRenderer(response.name, response.contentType)
+            : response.kind,
+        title: response.name,
+        contentType: response.contentType,
+        bytes: response.bytes,
+        revision: response.revision,
+        readonly: response.readonly,
+        externalPath:
+          response.source === "artifact" ? response.path : undefined,
+      };
+    } catch (cause) {
+      if (cause instanceof ApiResponseError && cause.status === 404) {
+        return this.resolveLegacyPreview(threadId, target);
+      }
+      throw cause;
+    }
+  }
+
+  async getPreviewContent(threadId: string, previewId: string): Promise<Blob> {
+    const legacy = this.legacyPreviewContent.get(previewId);
+    if (legacy) return legacy;
+
+    const response = await fetch(
+      `${this.baseUrl}/api/threads/${threadId}/previews/${encodeURIComponent(previewId)}/content`,
+      { headers: this.authHeaders() },
+    );
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(
+        message ||
+          `Preview content failed: ${response.status} ${response.statusText}`,
+      );
+    }
+    return response.blob();
+  }
+
+  async getSpreadsheetPreview(
+    threadId: string,
+    previewId: string,
+  ): Promise<SpreadsheetPreview> {
+    const workbook = await this.get<SpreadsheetWorkbookResponse>(
+      `/api/threads/${threadId}/previews/${encodeURIComponent(previewId)}/workbook`,
+    );
+    return {
+      previewId: workbook.previewId,
+      sheets: workbook.sheets.map((sheet) => ({
+        id: sheet.name,
+        name: sheet.name,
+        rowCount: Math.max(1, sheet.rowCount),
+        columnCount: Math.max(1, sheet.columnCount),
+        hidden: sheet.visibility !== "visible",
+      })),
+    };
+  }
+
+  async getSpreadsheetPreviewRange(
+    threadId: string,
+    previewId: string,
+    sheetId: string,
+    input: {
+      rowStart: number;
+      rowCount: number;
+      columnStart: number;
+      columnCount: number;
+    },
+  ): Promise<SpreadsheetPreviewRange> {
+    const response = await this.get<SpreadsheetRangeResponse>(
+      `/api/threads/${threadId}/previews/${encodeURIComponent(previewId)}/range${queryString(
+        {
+          sheet: sheetId,
+          startRow: input.rowStart,
+          rowCount: input.rowCount,
+          startColumn: input.columnStart,
+          columnCount: input.columnCount,
+        },
+      )}`,
+    );
+    const cells = response.rows.flatMap((row, rowOffset) =>
+      row.map((cell, columnOffset) => ({
+        row: response.range.start.row + rowOffset,
+        column: response.range.start.column + columnOffset,
+        value: spreadsheetCellValue(cell.value),
+        formula: cell.formula,
+      })),
+    );
+    return {
+      previewId: response.previewId,
+      sheetId: response.sheet,
+      rowStart: response.range.start.row,
+      columnStart: response.range.start.column,
+      rowCount: response.rows.length,
+      columnCount: response.rows[0]?.length ?? 0,
+      cells,
+    };
+  }
+
+  async closePreview(previewId: string): Promise<void> {
+    this.legacyPreviewContent.delete(previewId);
+  }
+
   async listMcpServers(): Promise<McpServerView[]> {
     return this.get("/api/mcp/servers");
   }
@@ -537,6 +720,58 @@ export class ApiClient {
       headers: this.authHeaders(),
     });
     return parseResponse<T>(response);
+  }
+
+  private async resolveLegacyPreview(
+    threadId: string,
+    target: Exclude<PreviewTarget, { type: "url" }>,
+  ): Promise<PreviewDescriptor> {
+    if (target.type === "workspace") {
+      const file = await this.readWorkspaceFile(threadId, target.path);
+      const id = `legacy-workspace:${threadId}:${target.path}`;
+      const contentType = previewContentType(target.path);
+      this.legacyPreviewContent.set(
+        id,
+        new Blob([file.content], { type: contentType }),
+      );
+      return {
+        id,
+        threadId,
+        target,
+        renderer: previewRenderer(target.path, contentType),
+        title: previewTitle(target.path),
+        contentType,
+        bytes: file.bytes,
+        revision: `${file.bytes}:${file.truncated ? "truncated" : "complete"}`,
+        readonly: file.readonly,
+        truncated: file.truncated,
+      };
+    }
+
+    const artifact = await this.getArtifact(threadId, target.artifactId);
+    const displayPath = artifact.filePath || target.artifactId;
+    const id = `legacy-artifact:${threadId}:${target.artifactId}`;
+    const contentType = previewContentType(displayPath);
+    const hasReadableContent = !artifact.filePath;
+    if (hasReadableContent) {
+      this.legacyPreviewContent.set(
+        id,
+        new Blob([artifact.content], { type: contentType }),
+      );
+    }
+    return {
+      id,
+      threadId,
+      target,
+      renderer: hasReadableContent
+        ? previewRenderer(displayPath, contentType)
+        : "unsupported",
+      title: previewTitle(displayPath),
+      contentType,
+      revision: id,
+      readonly: true,
+      externalPath: artifact.filePath,
+    };
   }
 
   private async post<T>(path: string, body: unknown): Promise<T> {
@@ -703,7 +938,10 @@ function abortableDelay(
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `${response.status} ${response.statusText}`);
+    throw new ApiResponseError(
+      response.status,
+      text || `${response.status} ${response.statusText}`,
+    );
   }
   if (response.status === 204) return undefined as T;
   const text = await response.text();
@@ -719,6 +957,97 @@ function queryString(
   }
   const query = params.toString();
   return query ? `?${query}` : "";
+}
+
+function previewTitle(path: string): string {
+  const normalized = path.replace(/[\\/]+$/, "");
+  return normalized.split(/[\\/]/).at(-1) || path;
+}
+
+function previewRenderer(
+  path: string,
+  contentType: string,
+): PreviewDescriptor["renderer"] {
+  const extension = path.split(".").at(-1)?.toLocaleLowerCase() ?? "";
+  if (contentType.startsWith("image/")) return "image";
+  if (contentType === "application/pdf" || extension === "pdf") return "pdf";
+  if (["xlsx", "xlsm", "xltx"].includes(extension)) return "spreadsheet";
+  if (
+    [
+      "c",
+      "cc",
+      "cpp",
+      "css",
+      "go",
+      "h",
+      "html",
+      "java",
+      "js",
+      "jsx",
+      "json",
+      "md",
+      "py",
+      "rs",
+      "sh",
+      "toml",
+      "ts",
+      "tsx",
+      "xml",
+      "yaml",
+      "yml",
+    ].includes(extension)
+  ) {
+    return "code";
+  }
+  if (contentType.startsWith("text/")) return "text";
+  return "unsupported";
+}
+
+function previewContentType(path: string): string {
+  const extension = path.split(".").at(-1)?.toLocaleLowerCase() ?? "";
+  const known: Record<string, string> = {
+    bmp: "image/bmp",
+    css: "text/css",
+    csv: "text/csv",
+    gif: "image/gif",
+    html: "text/html",
+    jpeg: "image/jpeg",
+    jpg: "image/jpeg",
+    js: "text/javascript",
+    json: "application/json",
+    md: "text/markdown",
+    pdf: "application/pdf",
+    png: "image/png",
+    svg: "image/svg+xml",
+    ts: "text/typescript",
+    txt: "text/plain",
+    webp: "image/webp",
+    xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    xml: "application/xml",
+    yaml: "text/yaml",
+    yml: "text/yaml",
+  };
+  return known[extension] ?? "application/octet-stream";
+}
+
+function spreadsheetCellValue(value: {
+  type: string;
+  value?: unknown;
+}): string | number | boolean | null {
+  if (value.type === "empty") return null;
+  if (
+    typeof value.value === "string" ||
+    typeof value.value === "number" ||
+    typeof value.value === "boolean"
+  ) {
+    return value.value;
+  }
+  if (value.value && typeof value.value === "object") {
+    const serial = (value.value as { serial?: unknown }).serial;
+    if (typeof serial === "number") return serial;
+  }
+  return value.value == null ? null : String(value.value);
 }
 
 export function parseGitStatus(output: string): GitStatusSummary {
@@ -804,6 +1133,7 @@ export function parseGitBranches(output: string): GitBranchInfo[] {
 
 function gitFailureMessage(result: GitWorkflowResponse): string {
   const detail = result.stderr.trim() || result.stdout.trim();
-  const exit = result.exitCode === null ? "未知退出码" : `退出码 ${result.exitCode}`;
+  const exit =
+    result.exitCode === null ? "未知退出码" : `退出码 ${result.exitCode}`;
   return detail || `Git ${result.action} 执行失败（${exit}）`;
 }

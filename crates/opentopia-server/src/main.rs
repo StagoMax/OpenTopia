@@ -1,7 +1,8 @@
 use anyhow::Context;
 use async_trait::async_trait;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
@@ -18,18 +19,20 @@ use opentopia_core::{
     Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserDownloadRequest, BrowserNavigateRequest,
     BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId,
     BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, ChangedFile, ContextSourcePolicy,
-    ContextSourceRef, ContextSummary, ExecRequest, ExecutionContext, GitWorkflowAction,
-    GitWorkflowRequest, LocalBrowserRuntime, LocalExecutionEnvironment, McpCallResult,
-    McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole,
-    ModelContentPart, ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
-    OpenAiCompatibleProvider, PermissionMode, PolicyDecision, PolicyEngine, ProviderHealth,
-    ProviderHealthCheck, ProviderKind, ProviderSettings, ResourceLimit, SandboxDescriptor,
-    SandboxSettings, SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest,
-    SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver, SubagentRun,
-    SubagentScheduler, SubagentSchedulerConfig, TerminalCommandHistory, TerminalCommandStatus,
-    ThreadMcpServer, ToolCall, ToolPermissionDescriptor, ToolResult, WorkspaceDiff,
-    WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceFilePreview, WorkspaceTree,
+    ContextSourceRef, ContextSummary, DesktopBrowserRuntime, ExecRequest, ExecutionContext,
+    GitWorkflowAction, GitWorkflowRequest, LocalBrowserRuntime, LocalExecutionEnvironment,
+    McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart,
+    MessageRole, ModelContentPart, ModelConversationMessage, ModelConversationRole, ModelProvider,
+    ModelRequest, OpenAiCompatibleProvider, PermissionMode, PolicyDecision, PolicyEngine,
+    PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest, PreviewTarget,
+    PreviewWorkbook, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
+    ResolvedPreview, ResourceLimit, SandboxDescriptor, SandboxSettings, SessionStore,
+    SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
+    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
+    TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadMcpServer, ToolCall,
+    ToolPermissionDescriptor, ToolResult, TurnRecord, TurnStatus, WorkspaceDiff, WorkspaceDiffHunk,
+    WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
+    MAX_PREVIEW_CONTENT_BYTES,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -50,14 +53,14 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod auth;
 mod turns;
 
 use auth::ApiAuth;
-use turns::{TurnCancelResult, TurnHandle, TurnManager, TurnStatus};
+use turns::{TurnCancelResult, TurnHandle, TurnManager};
 
 #[derive(Debug, Parser)]
 #[command(name = "opentopia-server")]
@@ -84,6 +87,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let auth = ApiAuth::from_env()?;
     let store = Arc::new(SqliteSessionStore::open(&args.db)?);
+    let interrupted_turns = store.interrupt_active_turns()?;
+    if interrupted_turns > 0 {
+        info!(interrupted_turns, "recovered interrupted agent turns");
+    }
     let interrupted_subagents = store.fail_interrupted_subagent_runs()?;
     if interrupted_subagents > 0 {
         info!(interrupted_subagents, "recovered interrupted subagent runs");
@@ -106,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
             sandbox_config,
         ))
     });
-    let browser = Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default()));
+    let browser = initialize_browser_runtime().await;
     let mut initial_agent = AgentCore::from_settings(&loaded_settings);
     initial_agent.set_browser_runtime(browser.clone());
     let agent = Arc::new(RwLock::new(initial_agent));
@@ -127,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("agent lock poisoned")
         .set_subagent_scheduler(subagents.clone());
     let state = AppState {
-        store,
+        store: store.clone(),
         agent,
         settings,
         events: EventBus::default(),
@@ -136,14 +143,16 @@ async fn main() -> anyhow::Result<()> {
         browser,
         mcp_host,
         auth,
-        turns: TurnManager::default(),
+        turns: TurnManager::new(store.clone()),
         subagents,
     };
 
     let event_state = state.clone();
     let mut subagent_events = state.subagents.subscribe();
     tokio::spawn(async move {
-        while let Ok(event) = subagent_events.recv().await {
+        while let Some(event) =
+            recv_broadcast_after_lag(&mut subagent_events, "subagent events").await
+        {
             publish_payload(
                 &event_state,
                 event.run.parent_thread_id,
@@ -159,6 +168,60 @@ async fn main() -> anyhow::Result<()> {
     info!(%addr, db = %args.db.display(), "OpenTopia server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn recv_broadcast_after_lag<T: Clone>(
+    receiver: &mut broadcast::Receiver<T>,
+    stream_name: &'static str,
+) -> Option<T> {
+    loop {
+        match receiver.recv().await {
+            Ok(value) => return Some(value),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    stream_name,
+                    skipped, "broadcast receiver lagged; continuing"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
+async fn initialize_browser_runtime() -> Arc<dyn BrowserRuntime> {
+    let broker_url = std::env::var("OPENTOPIA_DESKTOP_BROWSER_BROKER_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let broker_token = std::env::var("OPENTOPIA_DESKTOP_BROWSER_BROKER_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    match (broker_url, broker_token) {
+        (Some(url), Some(token)) => match DesktopBrowserRuntime::new(&url, &token) {
+            Ok(runtime) => match runtime.health_check().await {
+                Ok(()) => {
+                    info!("using the Electron desktop browser broker");
+                    return Arc::new(runtime);
+                }
+                Err(error) => {
+                    warn!(%error, "desktop browser broker health check failed; using local browser runtime");
+                }
+            },
+            Err(error) => {
+                warn!(%error, "desktop browser broker configuration is invalid; using local browser runtime");
+            }
+        },
+        (None, None) => {
+            info!("desktop browser broker is not configured; using local browser runtime");
+        }
+        _ => {
+            warn!(
+                "desktop browser broker requires both URL and token; using local browser runtime"
+            );
+        }
+    }
+
+    Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default()))
 }
 
 fn build_router(state: AppState) -> Router {
@@ -273,6 +336,22 @@ fn build_router(state: AppState) -> Router {
             "/api/threads/:thread_id/artifacts/:artifact_id",
             get(get_artifact),
         )
+        .route(
+            "/api/threads/:thread_id/previews/resolve",
+            post(resolve_preview),
+        )
+        .route(
+            "/api/threads/:thread_id/previews/:preview_id/content",
+            get(read_preview_content),
+        )
+        .route(
+            "/api/threads/:thread_id/previews/:preview_id/workbook",
+            get(get_preview_workbook),
+        )
+        .route(
+            "/api/threads/:thread_id/previews/:preview_id/range",
+            get(read_preview_range),
+        )
         .route("/api/threads/:thread_id/approvals", get(list_approvals))
         .route(
             "/api/threads/:thread_id/approvals/:approval_id/decision",
@@ -314,7 +393,7 @@ struct AppState {
     events: EventBus,
     terminals: TerminalBus,
     ptys: PtyManager,
-    browser: Arc<LocalBrowserRuntime>,
+    browser: Arc<dyn BrowserRuntime>,
     mcp_host: McpExtensionHost,
     auth: ApiAuth,
     turns: TurnManager,
@@ -1140,13 +1219,20 @@ async fn send_message(
     let turn = state
         .turns
         .begin(thread_id, pending_message.id)
+        .map_err(ApiError::from)?
         .map_err(|active| {
             ApiError::conflict(format!("thread already has active turn {}", active.turn_id))
         })?;
     let user_message = match state.store.append_message(pending_message) {
         Ok(message) => message,
         Err(err) => {
-            state.turns.finish(thread_id, turn.turn_id);
+            finish_turn(
+                &state,
+                thread_id,
+                turn.turn_id,
+                TurnStatus::Failed,
+                Some(err.to_string()),
+            );
             return Err(err.into());
         }
     };
@@ -1181,6 +1267,20 @@ fn legacy_direct_tool_command(content: &str) -> Option<&'static str> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalExecution {
+    BrowserPanelGrant,
+    ResumeAgent,
+}
+
+fn approval_execution(action: &str, has_continuation: bool) -> ApprovalExecution {
+    if browser_domain_from_approval_action(action).is_some() && !has_continuation {
+        ApprovalExecution::BrowserPanelGrant
+    } else {
+        ApprovalExecution::ResumeAgent
+    }
+}
+
 async fn decide_approval(
     State(state): State<AppState>,
     Path((thread_id, approval_id)): Path<(Uuid, Uuid)>,
@@ -1202,7 +1302,12 @@ async fn decide_approval(
         )));
     }
 
-    if browser_domain_from_approval_action(&pending.action).is_some() {
+    let continuation_value = state
+        .store
+        .get_approval_continuation(approval_id, thread_id)?;
+    if approval_execution(&pending.action, continuation_value.is_some())
+        == ApprovalExecution::BrowserPanelGrant
+    {
         let status = if request.approved {
             ApprovalStatus::Approved
         } else {
@@ -1220,15 +1325,14 @@ async fn decide_approval(
         }));
     }
 
-    let continuation_value = state
-        .store
-        .get_approval_continuation(approval_id, thread_id)?
+    let continuation_value = continuation_value
         .ok_or_else(|| ApiError::conflict("approval continuation is not available"))?;
     let continuation: AgentContinuation = serde_json::from_value(continuation_value)
         .map_err(|err| ApiError::internal(format!("invalid approval continuation: {err}")))?;
     let turn = state
         .turns
         .begin(thread_id, continuation.user_message_id)
+        .map_err(ApiError::from)?
         .map_err(|active| {
             ApiError::conflict(format!("thread already has active turn {}", active.turn_id))
         })?;
@@ -1237,10 +1341,30 @@ async fn decide_approval(
     } else {
         ApprovalStatus::Denied
     };
-    state
-        .store
-        .update_approval_status(approval_id, status)?
-        .ok_or_else(|| ApiError::not_found(format!("approval not found: {approval_id}")))?;
+    match state.store.update_approval_status(approval_id, status) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let error = format!("approval not found: {approval_id}");
+            finish_turn(
+                &state,
+                thread_id,
+                turn.turn_id,
+                TurnStatus::Failed,
+                Some(error.clone()),
+            );
+            return Err(ApiError::not_found(error));
+        }
+        Err(error) => {
+            finish_turn(
+                &state,
+                thread_id,
+                turn.turn_id,
+                TurnStatus::Failed,
+                Some(error.to_string()),
+            );
+            return Err(error.into());
+        }
+    }
     let run_state = state.clone();
     tokio::spawn(async move {
         run_resumed_agent_turn(run_state, approval_id, continuation, request.approved, turn).await;
@@ -1255,9 +1379,9 @@ async fn decide_approval(
 async fn get_turn_status(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
-) -> Result<Json<Option<TurnStatus>>, ApiError> {
+) -> Result<Json<Option<TurnRecord>>, ApiError> {
     ensure_thread(&state, thread_id)?;
-    Ok(Json(state.turns.status(thread_id)))
+    Ok(Json(state.turns.status(thread_id)?))
 }
 
 async fn list_subagent_runs(
@@ -1274,9 +1398,10 @@ async fn spawn_subagent_run(
     Json(request): Json<SpawnSubagentRunRequest>,
 ) -> Result<Json<SubagentRun>, ApiError> {
     ensure_thread(&state, thread_id)?;
+    let latest_turn = state.turns.status(thread_id)?;
     let parent_turn_id = request
         .parent_turn_id
-        .or_else(|| state.turns.status(thread_id).map(|turn| turn.turn_id))
+        .or_else(|| latest_turn.map(|turn| turn.turn_id))
         .unwrap_or_else(Uuid::new_v4);
     let run = state
         .subagents
@@ -1363,10 +1488,9 @@ async fn cancel_agent_turn(
     Json(request): Json<CancelAgentTurnRequest>,
 ) -> Result<Json<TurnCancelResult>, ApiError> {
     ensure_thread(&state, thread_id)?;
-    let parent_turn_id = request
-        .turn_id
-        .or_else(|| state.turns.status(thread_id).map(|turn| turn.turn_id));
-    let result = state.turns.cancel(thread_id, request.turn_id);
+    let latest = state.turns.status(thread_id)?;
+    let parent_turn_id = request.turn_id.or_else(|| latest.map(|turn| turn.turn_id));
+    let result = state.turns.cancel(thread_id, request.turn_id)?;
     if result.cancelled {
         if let Some(parent_turn_id) = parent_turn_id {
             state.subagents.cancel_parent(parent_turn_id);
@@ -1402,6 +1526,172 @@ async fn get_artifact(
         .get_artifact(thread_id, artifact_id)?
         .ok_or_else(|| ApiError::not_found(format!("artifact not found: {artifact_id}")))?;
     Ok(Json(artifact))
+}
+
+async fn resolve_preview(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(target): Json<PreviewTarget>,
+) -> Result<Json<PreviewDescriptor>, ApiError> {
+    let thread = ensure_thread(&state, thread_id)?;
+    let preview = resolve_preview_target(&state.store, &thread, &target)?;
+    Ok(Json(preview.descriptor))
+}
+
+async fn read_preview_content(
+    State(state): State<AppState>,
+    Path((thread_id, preview_id)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
+    let descriptor = preview.descriptor.clone();
+    let etag = format!("\"{}\"", descriptor.revision);
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+    {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&etag).expect("preview revisions are valid header values"),
+        );
+        return Ok(response);
+    }
+
+    let bytes = tokio::task::spawn_blocking(move || {
+        opentopia_core::read_preview_content(&preview, MAX_PREVIEW_CONTENT_BYTES)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("preview content worker failed: {error}")))?
+    .map_err(preview_api_error)?;
+
+    let content_length = bytes.len();
+    let mut response = Response::new(Body::from(bytes));
+    let content_type = HeaderValue::from_str(&descriptor.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string())
+            .expect("content length is a valid header value"),
+    );
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).expect("preview revisions are valid header values"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "sandbox; default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'",
+        ),
+    );
+    Ok(response)
+}
+
+async fn get_preview_workbook(
+    State(state): State<AppState>,
+    Path((thread_id, preview_id)): Path<(Uuid, String)>,
+) -> Result<Json<PreviewWorkbook>, ApiError> {
+    let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
+    let workbook = tokio::task::spawn_blocking(move || opentopia_core::preview_workbook(&preview))
+        .await
+        .map_err(|error| ApiError::internal(format!("workbook preview worker failed: {error}")))?
+        .map_err(preview_api_error)?;
+    Ok(Json(workbook))
+}
+
+async fn read_preview_range(
+    State(state): State<AppState>,
+    Path((thread_id, preview_id)): Path<(Uuid, String)>,
+    Query(query): Query<PreviewRangeQuery>,
+) -> Result<Json<PreviewRange>, ApiError> {
+    let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
+    let request = PreviewRangeRequest {
+        sheet: query.sheet,
+        start_row: query.start_row.unwrap_or(0),
+        start_column: query.start_column.unwrap_or(0),
+        row_count: query.row_count.unwrap_or(100),
+        column_count: query.column_count.unwrap_or(26),
+    };
+    let range = tokio::task::spawn_blocking(move || {
+        opentopia_core::preview_spreadsheet_range(&preview, request)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("spreadsheet preview worker failed: {error}")))?
+    .map_err(preview_api_error)?;
+    Ok(Json(range))
+}
+
+fn resolve_preview_id_for_thread(
+    state: &AppState,
+    thread_id: Uuid,
+    preview_id: &str,
+) -> Result<ResolvedPreview, ApiError> {
+    let thread = ensure_thread(state, thread_id)?;
+    let target = opentopia_core::decode_preview_id(preview_id).map_err(preview_api_error)?;
+    resolve_preview_target(&state.store, &thread, &target)
+}
+
+fn resolve_preview_target(
+    store: &SqliteSessionStore,
+    thread: &opentopia_core::Thread,
+    target: &PreviewTarget,
+) -> Result<ResolvedPreview, ApiError> {
+    match target {
+        PreviewTarget::Workspace { path } => {
+            opentopia_core::resolve_workspace_preview(&thread.workspace_root, path)
+                .map_err(preview_api_error)
+        }
+        PreviewTarget::Artifact { artifact_id } => {
+            let artifact = store
+                .get_artifact(thread.id, *artifact_id)?
+                .ok_or_else(|| ApiError::not_found(format!("artifact not found: {artifact_id}")))?;
+            opentopia_core::resolve_artifact_preview(thread.id, &thread.workspace_root, &artifact)
+                .map_err(preview_api_error)
+        }
+    }
+}
+
+fn preview_api_error(error: PreviewError) -> ApiError {
+    let status = match &error {
+        PreviewError::WorkspaceRootNotFound(_) | PreviewError::PathNotFound(_) => {
+            StatusCode::NOT_FOUND
+        }
+        PreviewError::ArtifactThreadMismatch { .. } => StatusCode::NOT_FOUND,
+        PreviewError::ContentTooLarge { .. }
+        | PreviewError::Spreadsheet(opentopia_core::SpreadsheetError::FileTooLarge { .. }) => {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
+        PreviewError::NotSpreadsheet(_) | PreviewError::InlineSpreadsheetUnsupported => {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        }
+        PreviewError::Spreadsheet(opentopia_core::SpreadsheetError::SheetNotFound { .. }) => {
+            StatusCode::NOT_FOUND
+        }
+        PreviewError::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        PreviewError::InvalidPreviewId(_)
+        | PreviewError::ParentDirectoryNotAllowed
+        | PreviewError::OutsideWorkspace(_)
+        | PreviewError::NotAFile(_)
+        | PreviewError::InvalidRange(_)
+        | PreviewError::Spreadsheet(_) => StatusCode::BAD_REQUEST,
+    };
+    ApiError {
+        status,
+        message: error.to_string(),
+    }
 }
 
 async fn list_workspace_tree(
@@ -1977,13 +2267,12 @@ async fn stream_events(
     Query(query): Query<EventQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     ensure_thread(&state, thread_id)?;
-    let history = state.store.list_events(thread_id, query.since)?;
     let rx = state.events.subscribe(thread_id);
-    let history_stream = stream::iter(history);
-    let live_stream = BroadcastStream::new(rx).filter_map(|event| async move { event.ok() });
-    let event_stream = history_stream.chain(live_stream).map(|agent_event| {
+    let history = state.store.list_events(thread_id, query.since)?;
+    let event_stream = replay_then_live_events(history, rx, query.since).map(|agent_event| {
         let event_name = sse_event_name(agent_event.kind());
         let sse = Event::default()
+            .id(agent_event.seq.to_string())
             .event(event_name)
             .json_data(agent_event)
             .expect("agent event should serialize");
@@ -1991,6 +2280,29 @@ async fn stream_events(
     });
 
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+}
+
+fn replay_then_live_events(
+    history: Vec<AgentEvent>,
+    rx: broadcast::Receiver<AgentEvent>,
+    after_seq: Option<i64>,
+) -> impl futures_util::Stream<Item = AgentEvent> {
+    let mut last_seq = history
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or_else(|| after_seq.unwrap_or_default());
+    let history_stream = stream::iter(history);
+    let live_stream = BroadcastStream::new(rx).filter_map(move |result| {
+        let event = match result {
+            Ok(event) if event.seq > last_seq => {
+                last_seq = event.seq;
+                Some(event)
+            }
+            _ => None,
+        };
+        async move { event }
+    });
+    history_stream.chain(live_stream)
 }
 
 async fn get_terminal_session(
@@ -3250,6 +3562,22 @@ fn publish_payload(
     }
 }
 
+fn finish_turn(
+    state: &AppState,
+    thread_id: Uuid,
+    turn_id: Uuid,
+    status: TurnStatus,
+    turn_error: Option<String>,
+) {
+    match state.turns.finish(thread_id, turn_id, status, turn_error) {
+        Ok(Some(_)) => {}
+        Ok(None) => warn!(%thread_id, %turn_id, ?status, "turn was no longer active at finish"),
+        Err(error) => {
+            error!(?error, %thread_id, %turn_id, ?status, "failed to persist turn status")
+        }
+    }
+}
+
 async fn run_new_agent_turn(
     state: AppState,
     thread: opentopia_core::Thread,
@@ -3270,7 +3598,13 @@ async fn run_new_agent_turn(
                     reason: "Cancelled by user.".to_string(),
                 },
             );
-            state.turns.finish(thread_id, turn_id);
+            finish_turn(
+                &state,
+                thread_id,
+                turn_id,
+                TurnStatus::Cancelled,
+                None,
+            );
             return;
         }
         prepared = prepare_turn_context(&state, thread_id, user_message.id) => prepared,
@@ -3278,15 +3612,22 @@ async fn run_new_agent_turn(
     let prepared = match prepared_result {
         Ok(prepared) => prepared,
         Err(err) => {
+            let message = err.message;
             publish_payload(
                 &state,
                 thread_id,
                 Some(turn_id),
                 AgentEventPayload::Error {
-                    message: err.message,
+                    message: message.clone(),
                 },
             );
-            state.turns.finish(thread_id, turn_id);
+            finish_turn(
+                &state,
+                thread_id,
+                turn_id,
+                TurnStatus::Failed,
+                Some(message),
+            );
             return;
         }
     };
@@ -3330,7 +3671,13 @@ async fn run_new_agent_turn(
                 while let Ok(payload) = receiver.try_recv() {
                     persist_and_publish_payload(&state, thread_id, turn_id, payload);
                 }
-                state.turns.finish(thread_id, turn_id);
+                finish_turn(
+                    &state,
+                    thread_id,
+                    turn_id,
+                    TurnStatus::Cancelled,
+                    None,
+                );
                 return;
             }
             result = &mut future => break result,
@@ -3352,13 +3699,31 @@ async fn run_new_agent_turn(
             persist_and_publish_payload(&state, thread_id, turn_id, payload);
         }
     }
-    persist_deferred_approval_records(&state, thread_id, &deferred_approval_events);
-    persist_suspended_continuation(&state, thread_id, turn_id, &result);
+    let approval_persistence =
+        persist_deferred_approval_records(&state, thread_id, &deferred_approval_events);
+    let continuation_persistence = persist_suspended_continuation(&state, thread_id, &result);
     for payload in deferred_approval_events {
         publish_payload(&state, thread_id, Some(turn_id), payload);
     }
-    finish_agent_result(&state, thread_id, turn_id, result, None);
-    state.turns.finish(thread_id, turn_id);
+    let (mut status, mut turn_error) =
+        finish_agent_result(&state, thread_id, turn_id, result, None);
+    if let Some(error) = approval_persistence
+        .err()
+        .or_else(|| continuation_persistence.err())
+    {
+        let message = error.to_string();
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        status = TurnStatus::Failed;
+        turn_error = Some(message);
+    }
+    finish_turn(&state, thread_id, turn_id, status, turn_error);
 }
 
 async fn run_resumed_agent_turn(
@@ -3401,7 +3766,13 @@ async fn run_resumed_agent_turn(
                 while let Ok(payload) = receiver.try_recv() {
                     persist_and_publish_payload(&state, thread_id, turn_id, payload);
                 }
-                state.turns.finish(thread_id, turn_id);
+                finish_turn(
+                    &state,
+                    thread_id,
+                    turn_id,
+                    TurnStatus::Cancelled,
+                    None,
+                );
                 return;
             }
             result = &mut future => break result,
@@ -3423,13 +3794,31 @@ async fn run_resumed_agent_turn(
             persist_and_publish_payload(&state, thread_id, turn_id, payload);
         }
     }
-    persist_deferred_approval_records(&state, thread_id, &deferred_approval_events);
-    persist_suspended_continuation(&state, thread_id, turn_id, &result);
+    let approval_persistence =
+        persist_deferred_approval_records(&state, thread_id, &deferred_approval_events);
+    let continuation_persistence = persist_suspended_continuation(&state, thread_id, &result);
     for payload in deferred_approval_events {
         publish_payload(&state, thread_id, Some(turn_id), payload);
     }
-    finish_agent_result(&state, thread_id, turn_id, result, Some(approval_id));
-    state.turns.finish(thread_id, turn_id);
+    let (mut status, mut turn_error) =
+        finish_agent_result(&state, thread_id, turn_id, result, Some(approval_id));
+    if let Some(error) = approval_persistence
+        .err()
+        .or_else(|| continuation_persistence.err())
+    {
+        let message = error.to_string();
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        status = TurnStatus::Failed;
+        turn_error = Some(message);
+    }
+    finish_turn(&state, thread_id, turn_id, status, turn_error);
 }
 
 fn finish_agent_result(
@@ -3438,62 +3827,67 @@ fn finish_agent_result(
     turn_id: Uuid,
     result: anyhow::Result<opentopia_core::AgentTurnResult>,
     resolved_approval_id: Option<Uuid>,
-) {
-    match result {
-        Ok(_) => {}
-        Err(err) => publish_payload(
-            state,
-            thread_id,
-            Some(turn_id),
-            AgentEventPayload::Error {
-                message: err.to_string(),
-            },
-        ),
-    }
+) -> (TurnStatus, Option<String>) {
+    let (mut status, mut turn_error) = match result {
+        Ok(result) => match result.outcome {
+            AgentTurnOutcome::Completed => (TurnStatus::Succeeded, None),
+            AgentTurnOutcome::Suspended { .. } => (TurnStatus::WaitingApproval, None),
+        },
+        Err(err) => {
+            let message = err.to_string();
+            publish_payload(
+                state,
+                thread_id,
+                Some(turn_id),
+                AgentEventPayload::Error {
+                    message: message.clone(),
+                },
+            );
+            (TurnStatus::Failed, Some(message))
+        }
+    };
     if let Some(approval_id) = resolved_approval_id {
         if let Err(err) = state
             .store
             .delete_approval_continuation(approval_id, thread_id)
         {
             error!(?err, %approval_id, "failed to remove resolved continuation");
+            let message = format!("failed to remove resolved approval continuation: {err}");
+            publish_payload(
+                state,
+                thread_id,
+                Some(turn_id),
+                AgentEventPayload::Error {
+                    message: message.clone(),
+                },
+            );
+            status = TurnStatus::Failed;
+            turn_error = Some(message);
         }
     }
+    (status, turn_error)
 }
 
 fn persist_suspended_continuation(
     state: &AppState,
     thread_id: Uuid,
-    turn_id: Uuid,
     result: &anyhow::Result<opentopia_core::AgentTurnResult>,
-) {
+) -> anyhow::Result<()> {
     let Ok(result) = result else {
-        return;
+        return Ok(());
     };
     let AgentTurnOutcome::Suspended {
         approval_id,
         continuation,
     } = &result.outcome
     else {
-        return;
+        return Ok(());
     };
-    let persist_result = serde_json::to_value(continuation)
-        .map_err(anyhow::Error::from)
-        .and_then(|value| {
-            state
-                .store
-                .put_approval_continuation(*approval_id, thread_id, value)
-        });
-    if let Err(err) = persist_result {
-        error!(?err, %approval_id, "failed to persist approval continuation");
-        publish_payload(
-            state,
-            thread_id,
-            Some(turn_id),
-            AgentEventPayload::Error {
-                message: format!("failed to persist approval continuation: {err}"),
-            },
-        );
-    }
+    let value = serde_json::to_value(continuation)?;
+    state
+        .store
+        .put_approval_continuation(*approval_id, thread_id, value)
+        .with_context(|| format!("failed to persist approval continuation {approval_id}"))
 }
 
 fn persist_and_publish_payload(
@@ -3532,7 +3926,7 @@ fn persist_deferred_approval_records(
     state: &AppState,
     thread_id: Uuid,
     payloads: &[AgentEventPayload],
-) {
+) -> anyhow::Result<()> {
     for payload in payloads {
         let AgentEventPayload::ApprovalRequested {
             approval_id,
@@ -3543,10 +3937,12 @@ fn persist_deferred_approval_records(
             continue;
         };
         let approval = Approval::pending(*approval_id, thread_id, action.clone(), reason.clone());
-        if let Err(err) = state.store.insert_approval(approval) {
-            error!(?err, %approval_id, "failed to persist approval request");
-        }
+        state
+            .store
+            .insert_approval(approval)
+            .with_context(|| format!("failed to persist approval request {approval_id}"))?;
     }
+    Ok(())
 }
 
 struct PreparedTurnContext {
@@ -3563,6 +3959,11 @@ async fn prepare_turn_context(
     let messages = state.store.list_messages(thread_id)?;
     let events = state.store.list_events(thread_id, None)?;
     let mut summary = latest_context_summary_event(&events);
+    let active_plan = latest_active_plan_event(&events);
+    let active_plan_tokens = active_plan
+        .as_ref()
+        .map(|plan| estimate_tokens(&plan.render_for_model()))
+        .unwrap_or_default();
     let prior_messages = messages
         .iter()
         .filter(|message| message.id != current_message_id)
@@ -3581,7 +3982,8 @@ async fn prepare_turn_context(
     let summary_tokens = summary
         .as_ref()
         .map(|summary| estimate_tokens(&summary.summary))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .saturating_add(active_plan_tokens);
     let context_window = context_window_tokens();
     let usage_percent = summary_tokens
         .saturating_add(unsummarized_tokens)
@@ -3625,7 +4027,8 @@ async fn prepare_turn_context(
     let mut used = summary
         .as_ref()
         .map(|summary| estimate_tokens(&summary.summary))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .saturating_add(active_plan_tokens);
     let mut conversation = Vec::new();
     for message in messages.iter().skip(covered_messages).rev() {
         if message.id == current_message_id {
@@ -3646,7 +4049,7 @@ async fn prepare_turn_context(
     let mut budget = AgentContextBudget::new(context_window);
     budget.record_tokens(used);
     Ok(PreparedTurnContext {
-        summary: summary.map(|summary| summary.summary),
+        summary: durable_context(summary.map(|summary| summary.summary), active_plan.as_ref()),
         conversation,
         budget,
     })
@@ -3752,6 +4155,25 @@ fn latest_context_summary_event(events: &[AgentEvent]) -> Option<ContextSummary>
             None
         }
     })
+}
+
+fn latest_active_plan_event(events: &[AgentEvent]) -> Option<TaskPlan> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.payload {
+            AgentEventPayload::PlanUpdated { plan } => Some(plan.clone()),
+            _ => None,
+        })
+        .filter(TaskPlan::is_active)
+}
+
+fn durable_context(summary: Option<String>, active_plan: Option<&TaskPlan>) -> Option<String> {
+    let mut sections = summary.into_iter().collect::<Vec<_>>();
+    if let Some(plan) = active_plan.filter(|plan| plan.is_active()) {
+        sections.push(format!("Active task plan:\n{}", plan.render_for_model()));
+    }
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
 async fn generate_context_summary(
@@ -4664,6 +5086,16 @@ struct WorkspacePathQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PreviewRangeQuery {
+    sheet: String,
+    start_row: Option<u32>,
+    start_column: Option<u32>,
+    row_count: Option<u32>,
+    column_count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceDiffRevertRequest {
     path: String,
     #[serde(default)]
@@ -4938,6 +5370,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_artifact_resolution_is_scoped_to_the_route_thread() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let workspace = std::env::current_dir().expect("current directory");
+        let owner = store
+            .create_thread(Some("owner".to_string()), workspace.clone())
+            .expect("create owner thread");
+        let other = store
+            .create_thread(Some("other".to_string()), workspace)
+            .expect("create other thread");
+        let artifact = store
+            .insert_artifact(Artifact::inline(
+                owner.id,
+                "text",
+                "text/plain; charset=utf-8",
+                "thread private",
+                json!({"name": "private.txt"}),
+            ))
+            .expect("insert artifact");
+        let target = PreviewTarget::Artifact {
+            artifact_id: artifact.id,
+        };
+
+        let owner_preview =
+            resolve_preview_target(&store, &owner, &target).expect("owner resolves artifact");
+        assert_eq!(owner_preview.descriptor.name, "private.txt");
+
+        let error = resolve_preview_target(&store, &other, &target)
+            .expect_err("other thread must not resolve artifact");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn preview_target_contract_uses_tagged_camel_case_artifact_id() {
+        let artifact_id = Uuid::new_v4();
+        let target: PreviewTarget = serde_json::from_value(json!({
+            "source": "artifact",
+            "artifactId": artifact_id,
+        }))
+        .expect("deserialize preview target");
+        assert_eq!(target, PreviewTarget::Artifact { artifact_id });
+    }
+
+    #[test]
     fn project_patch_distinguishes_missing_null_and_value_workspace() {
         let missing: UpdateProjectRequest =
             serde_json::from_value(json!({})).expect("deserialize missing workspace");
@@ -5028,5 +5503,136 @@ mod tests {
         assert_eq!(legacy_direct_tool_command("/run"), Some("/run"));
         assert_eq!(legacy_direct_tool_command("/runner status"), None);
         assert_eq!(legacy_direct_tool_command("Please /run the tests"), None);
+    }
+
+    #[test]
+    fn browser_model_approval_with_continuation_resumes_agent() {
+        let action = browser_domain_approval_action("example.com");
+        assert_eq!(
+            approval_execution(&action, false),
+            ApprovalExecution::BrowserPanelGrant
+        );
+        assert_eq!(
+            approval_execution(&action, true),
+            ApprovalExecution::ResumeAgent
+        );
+        assert_eq!(
+            approval_execution("shell:run", false),
+            ApprovalExecution::ResumeAgent
+        );
+    }
+
+    #[test]
+    fn latest_incomplete_plan_is_added_to_durable_context() {
+        let thread_id = Uuid::new_v4();
+        let active = TaskPlan {
+            explanation: Some("Keep the backend lifecycle durable.".to_string()),
+            steps: vec![opentopia_core::TaskPlanStep {
+                step: "Persist the final status".to_string(),
+                status: opentopia_core::TaskPlanStepStatus::InProgress,
+            }],
+        };
+        let events = vec![AgentEvent::new(
+            thread_id,
+            None,
+            1,
+            AgentEventPayload::PlanUpdated {
+                plan: active.clone(),
+            },
+        )];
+
+        let restored = latest_active_plan_event(&events).expect("active plan");
+        assert_eq!(restored, active);
+        let context = durable_context(Some("Earlier decision".to_string()), Some(&restored))
+            .expect("durable context");
+        assert!(context.contains("Earlier decision"));
+        assert!(context.contains("Active task plan:"));
+        assert!(context.contains("[>] Persist the final status"));
+    }
+
+    #[test]
+    fn completed_latest_plan_does_not_restore_an_older_plan() {
+        let thread_id = Uuid::new_v4();
+        let active = TaskPlan {
+            explanation: None,
+            steps: vec![opentopia_core::TaskPlanStep {
+                step: "Old active step".to_string(),
+                status: opentopia_core::TaskPlanStepStatus::InProgress,
+            }],
+        };
+        let completed = TaskPlan {
+            explanation: None,
+            steps: vec![opentopia_core::TaskPlanStep {
+                step: "Old active step".to_string(),
+                status: opentopia_core::TaskPlanStepStatus::Completed,
+            }],
+        };
+        let events = vec![
+            AgentEvent::new(
+                thread_id,
+                None,
+                1,
+                AgentEventPayload::PlanUpdated { plan: active },
+            ),
+            AgentEvent::new(
+                thread_id,
+                None,
+                2,
+                AgentEventPayload::PlanUpdated { plan: completed },
+            ),
+        ];
+
+        assert!(latest_active_plan_event(&events).is_none());
+    }
+
+    #[tokio::test]
+    async fn event_replay_deduplicates_events_seen_after_subscribe() {
+        let bus = EventBus::default();
+        let thread_id = Uuid::new_v4();
+        let rx = bus.subscribe(thread_id);
+        let first = AgentEvent::new(
+            thread_id,
+            Some(Uuid::new_v4()),
+            1,
+            AgentEventPayload::ModelDelta {
+                text: "first".to_string(),
+            },
+        );
+        bus.publish(first.clone());
+
+        let mut events = Box::pin(replay_then_live_events(vec![first], rx, None));
+        assert_eq!(events.next().await.expect("history event").seq, 1);
+
+        let second = AgentEvent::new(
+            thread_id,
+            Some(Uuid::new_v4()),
+            2,
+            AgentEventPayload::ModelDelta {
+                text: "second".to_string(),
+            },
+        );
+        bus.publish(second);
+        let next = timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("live event timeout")
+            .expect("live event");
+        assert_eq!(next.seq, 2, "queued history event must be skipped");
+    }
+
+    #[tokio::test]
+    async fn broadcast_projection_continues_after_lag() {
+        let (sender, mut receiver) = broadcast::channel(1);
+        sender.send(1_u8).expect("send first value");
+        sender.send(2_u8).expect("send second value");
+
+        assert_eq!(
+            recv_broadcast_after_lag(&mut receiver, "test stream").await,
+            Some(2)
+        );
+        drop(sender);
+        assert_eq!(
+            recv_broadcast_after_lag(&mut receiver, "test stream").await,
+            None
+        );
     }
 }

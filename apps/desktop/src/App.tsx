@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   Activity,
@@ -45,10 +54,10 @@ import {
 } from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
-import { BrowserPanel } from "./components/BrowserPanel";
 import { LogViewer } from "./components/LogViewer";
-import { detectLanguage, MonacoEditor } from "./components/MonacoEditor";
+import { PreviewHost } from "./components/PreviewHost";
 import { RightContextRail } from "./components/RightContextRail";
+import { WebPreviewSurface } from "./components/WebPreviewSurface";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
 import {
   deleteSecret,
@@ -75,11 +84,13 @@ import type {
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
+  PreviewTarget,
   RecentWorkspace,
   SandboxDescriptor,
   SecretSources,
   SkillDescriptor,
   SubagentRun,
+  TaskPlan,
   TerminalEvent,
   TerminalSession,
   Thread,
@@ -94,22 +105,131 @@ import type {
 
 type ServerStatus = "checking" | "online" | "offline";
 
-type ToolTabKind = WorkbenchTab | "browser";
+type ToolTabKind = WorkbenchTab | "browser" | "preview";
 
 type ToolTab = {
   id: string;
   kind: ToolTabKind;
   title: string;
+  previewTarget?: PreviewTarget;
 };
 
 type DirectToolCommand =
-  | { kind: "run"; command: string }
-  | { kind: "read"; path: string };
+  { kind: "run"; command: string } | { kind: "read"; path: string };
 
-type ArtifactPreviewState =
-  | { status: "loading"; artifactId: string }
-  | { status: "ready"; artifactId: string; content: ArtifactContent }
-  | { status: "error"; artifactId: string; message: string };
+type WorkspaceResizeSide = "left" | "right";
+
+type WorkspaceLayoutPreferences = {
+  left?: number;
+  contextRight?: number;
+  toolRight?: number;
+};
+
+type WorkspaceLayout = {
+  left: number;
+  leftMin: number;
+  leftMax: number;
+  right: number;
+  rightMin: number;
+  rightMax: number;
+};
+
+type WorkspaceResizeDrag = {
+  side: WorkspaceResizeSide;
+  preferenceKey: keyof WorkspaceLayoutPreferences;
+  pointerId: number;
+  startX: number;
+  startSize: number;
+  latestSize: number;
+  min: number;
+  max: number;
+};
+
+const workspaceLayoutStorageKey = "opentopia.workspace-layout.v1";
+const workspaceThreePaneBreakpoint = 1120;
+const workspaceLeftMin = 200;
+const workspaceLeftMax = 420;
+
+function readWorkspaceLayoutPreferences(): WorkspaceLayoutPreferences {
+  if (typeof window === "undefined") return {};
+  try {
+    const parsed = JSON.parse(
+      window.localStorage.getItem(workspaceLayoutStorageKey) ?? "{}",
+    ) as Record<string, unknown>;
+    return {
+      left: validStoredPanelSize(parsed.left),
+      contextRight: validStoredPanelSize(parsed.contextRight),
+      toolRight: validStoredPanelSize(parsed.toolRight),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function validStoredPanelSize(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function clampPanelSize(value: number, min: number, max: number): number {
+  return Math.round(Math.min(Math.max(value, min), max));
+}
+
+function defaultWorkspaceLeftWidth(
+  workspaceWidth: number,
+  toolOnly: boolean,
+): number {
+  if (workspaceWidth <= 840) return toolOnly ? 210 : 226;
+  if (workspaceWidth <= workspaceThreePaneBreakpoint)
+    return toolOnly ? 210 : 252;
+  return toolOnly ? 220 : 264;
+}
+
+function resolveWorkspaceLayout(
+  preferences: WorkspaceLayoutPreferences,
+  workspaceWidth: number,
+  hasToolStage: boolean,
+  toolOnly: boolean,
+): WorkspaceLayout {
+  const width = Math.max(workspaceWidth, 760);
+  const compact = width <= workspaceThreePaneBreakpoint || toolOnly;
+  const compactMainMin = hasToolStage ? 560 : 440;
+  const centerMin = hasToolStage ? 360 : 480;
+  const rightMin = hasToolStage ? 360 : 240;
+  const rightCap = hasToolStage ? 1200 : 520;
+  const leftMax = Math.max(
+    workspaceLeftMin,
+    Math.min(
+      workspaceLeftMax,
+      width - (compact ? compactMainMin : centerMin + rightMin),
+    ),
+  );
+  const left = clampPanelSize(
+    preferences.left ?? defaultWorkspaceLeftWidth(width, toolOnly),
+    workspaceLeftMin,
+    leftMax,
+  );
+  const rightMax = Math.max(
+    rightMin,
+    Math.min(rightCap, width - left - centerMin),
+  );
+  const defaultRight = hasToolStage
+    ? width - left - clampPanelSize(width * 0.31, centerMin, 600)
+    : 286;
+  const preferredRight = hasToolStage
+    ? preferences.toolRight
+    : preferences.contextRight;
+
+  return {
+    left,
+    leftMin: workspaceLeftMin,
+    leftMax,
+    right: clampPanelSize(preferredRight ?? defaultRight, rightMin, rightMax),
+    rightMin,
+    rightMax,
+  };
+}
 
 function useDismissiblePopover(open: boolean, onClose: () => void) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -204,13 +324,25 @@ export function App() {
     null,
   );
   const [hunkActionKey, setHunkActionKey] = useState<string | null>(null);
-  const [artifactPreview, setArtifactPreview] =
-    useState<ArtifactPreviewState | null>(null);
   const [toolTabs, setToolTabs] = useState<ToolTab[]>([]);
   const [activeToolTabId, setActiveToolTabId] = useState<string | null>(null);
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
   const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
+  const [workspaceLayoutPreferences, setWorkspaceLayoutPreferences] =
+    useState<WorkspaceLayoutPreferences>(readWorkspaceLayoutPreferences);
+  const [workspaceWidth, setWorkspaceWidth] = useState(() =>
+    typeof window === "undefined" ? 1440 : window.innerWidth,
+  );
+  const [workspaceResizeSide, setWorkspaceResizeSide] =
+    useState<WorkspaceResizeSide | null>(null);
+  const workspaceRef = useRef<HTMLElement>(null);
+  const workspaceResizeDragRef = useRef<WorkspaceResizeDrag | null>(null);
+  const pendingWorkspaceSizeRef = useRef<{
+    key: keyof WorkspaceLayoutPreferences;
+    value: number;
+  } | null>(null);
+  const workspaceResizeFrameRef = useRef<number | null>(null);
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -232,6 +364,60 @@ export function App() {
   const activeToolTab = useMemo(
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
+  );
+  const workspaceLayout = useMemo(
+    () =>
+      resolveWorkspaceLayout(
+        workspaceLayoutPreferences,
+        workspaceWidth,
+        Boolean(activeToolTab),
+        conversationCollapsed,
+      ),
+    [
+      activeToolTab,
+      conversationCollapsed,
+      workspaceLayoutPreferences,
+      workspaceWidth,
+    ],
+  );
+  const workspaceStyle = {
+    "--workspace-left-width": `${workspaceLayout.left}px`,
+    "--workspace-right-width": `${workspaceLayout.right}px`,
+  } as CSSProperties;
+
+  useEffect(() => {
+    const element = workspaceRef.current;
+    if (!element) return;
+    const updateWidth = () => {
+      const nextWidth = Math.round(element.getBoundingClientRect().width);
+      setWorkspaceWidth((current) =>
+        current === nextWidth || nextWidth <= 0 ? current : nextWidth,
+      );
+    };
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    updateWidth();
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        workspaceLayoutStorageKey,
+        JSON.stringify(workspaceLayoutPreferences),
+      );
+    } catch {
+      // Layout persistence is best-effort when storage is unavailable.
+    }
+  }, [workspaceLayoutPreferences]);
+
+  useEffect(
+    () => () => {
+      if (workspaceResizeFrameRef.current !== null) {
+        window.cancelAnimationFrame(workspaceResizeFrameRef.current);
+      }
+    },
+    [],
   );
 
   useEffect(() => {
@@ -458,7 +644,11 @@ export function App() {
       if (cancelled) return;
       setMessages(loadedMessages);
       setEvents(loadedEvents);
-      setActiveTurnId(turnStatus?.turnId ?? null);
+      setActiveTurnId(
+        turnStatus?.status === "running" || turnStatus?.status === "cancelling"
+          ? turnStatus.turnId
+          : null,
+      );
       setPendingApprovalIds(
         pendingApprovals.map((approval) => approval.approvalId),
       );
@@ -679,7 +869,7 @@ export function App() {
     setActionError(null);
     try {
       let targetProject = thread.projectId
-        ? projects.find((project) => project.id === thread.projectId) ?? null
+        ? (projects.find((project) => project.id === thread.projectId) ?? null)
         : null;
       targetProject ??=
         projects.find(
@@ -693,9 +883,7 @@ export function App() {
           name: workspaceName(thread.workspaceRoot),
           workspaceRoot: thread.workspaceRoot,
         });
-        setProjects((current) =>
-          sortProjects([targetProject!, ...current]),
-        );
+        setProjects((current) => sortProjects([targetProject!, ...current]));
       }
 
       const restored = await client.updateThread(thread.id, {
@@ -712,11 +900,33 @@ export function App() {
   }
 
   function openToolTab(kind: ToolTabKind) {
+    if (kind === "preview") return;
     const id = `tool-${kind}`;
     setToolTabs((current) =>
       current.some((tab) => tab.id === id)
         ? current
         : [...current, { id, kind, title: toolTabTitle(kind) }],
+    );
+    setActiveToolTabId(id);
+    setConversationCollapsed(false);
+  }
+
+  function openPreviewTab(
+    threadId: string,
+    target: PreviewTarget,
+    title: string,
+  ) {
+    const targetKey =
+      target.type === "workspace"
+        ? `workspace:${target.path}`
+        : target.type === "artifact"
+          ? `artifact:${target.artifactId}`
+          : `url:${target.url}`;
+    const id = `preview:${threadId}:${targetKey}`;
+    setToolTabs((current) =>
+      current.some((tab) => tab.id === id)
+        ? current
+        : [...current, { id, kind: "preview", title, previewTarget: target }],
     );
     setActiveToolTabId(id);
     setConversationCollapsed(false);
@@ -822,8 +1032,11 @@ export function App() {
         setFilePreview(null);
         await refreshWorkbench(entry.path);
       } else if (entry.kind === "file") {
-        setFilePreview(
-          await client.readWorkspaceFile(activeThread.id, entry.path),
+        setFilePreview(null);
+        openPreviewTab(
+          activeThread.id,
+          { type: "workspace", path: entry.path },
+          entry.name,
         );
       }
     } catch (error) {
@@ -1098,8 +1311,7 @@ export function App() {
       if (activeThreadId === thread.id) {
         const nextThread =
           nextThreads.find(
-            (item) =>
-              !item.archivedAt && item.projectId === thread.projectId,
+            (item) => !item.archivedAt && item.projectId === thread.projectId,
           ) ?? null;
         if (nextThread) {
           selectThread(nextThread.id);
@@ -1154,6 +1366,17 @@ export function App() {
       setComposer("");
       setContextSources([]);
       setSelectedSkillIds([]);
+      try {
+        const turnStatus = await client.getTurnStatus(activeThread.id);
+        setActiveTurnId(
+          turnStatus?.status === "running" ||
+            turnStatus?.status === "cancelling"
+            ? turnStatus.turnId
+            : null,
+        );
+      } catch {
+        // The persisted event stream will reconcile Turn state after a successful send.
+      }
     } catch (error) {
       setActionError(`Could not send message: ${errorMessage(error)}`);
     } finally {
@@ -1239,19 +1462,13 @@ export function App() {
     return client.getArtifact(threadId, artifactId);
   }
 
-  async function openArtifact(threadId: string, artifactId: string) {
-    if (!client) return;
-    setArtifactPreview({ status: "loading", artifactId });
-    try {
-      const content = await client.getArtifact(threadId, artifactId);
-      setArtifactPreview({ status: "ready", artifactId, content });
-    } catch (error) {
-      setArtifactPreview({
-        status: "error",
-        artifactId,
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
+  function openArtifact(threadId: string, artifactId: string) {
+    const descriptor = artifacts.find((artifact) => artifact.id === artifactId);
+    openPreviewTab(
+      threadId,
+      { type: "artifact", artifactId },
+      artifactPreviewTitle(descriptor, artifactId),
+    );
   }
 
   async function compactContext() {
@@ -1405,6 +1622,135 @@ export function App() {
     }
   }
 
+  function commitWorkspacePanelSize(
+    key: keyof WorkspaceLayoutPreferences,
+    value: number,
+  ) {
+    setWorkspaceLayoutPreferences((current) =>
+      current[key] === value ? current : { ...current, [key]: value },
+    );
+  }
+
+  function scheduleWorkspacePanelSize(
+    key: keyof WorkspaceLayoutPreferences,
+    value: number,
+  ) {
+    pendingWorkspaceSizeRef.current = { key, value };
+    if (workspaceResizeFrameRef.current !== null) return;
+    workspaceResizeFrameRef.current = window.requestAnimationFrame(() => {
+      workspaceResizeFrameRef.current = null;
+      const pending = pendingWorkspaceSizeRef.current;
+      pendingWorkspaceSizeRef.current = null;
+      if (pending) commitWorkspacePanelSize(pending.key, pending.value);
+    });
+  }
+
+  function flushWorkspacePanelSize() {
+    if (workspaceResizeFrameRef.current !== null) {
+      window.cancelAnimationFrame(workspaceResizeFrameRef.current);
+      workspaceResizeFrameRef.current = null;
+    }
+    const pending = pendingWorkspaceSizeRef.current;
+    pendingWorkspaceSizeRef.current = null;
+    if (pending) commitWorkspacePanelSize(pending.key, pending.value);
+  }
+
+  function beginWorkspaceResize(
+    side: WorkspaceResizeSide,
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) {
+    if (event.button !== 0 || !event.isPrimary) return;
+    event.preventDefault();
+    const isLeft = side === "left";
+    workspaceResizeDragRef.current = {
+      side,
+      preferenceKey: isLeft
+        ? "left"
+        : activeToolTab
+          ? "toolRight"
+          : "contextRight",
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startSize: isLeft ? workspaceLayout.left : workspaceLayout.right,
+      latestSize: isLeft ? workspaceLayout.left : workspaceLayout.right,
+      min: isLeft ? workspaceLayout.leftMin : workspaceLayout.rightMin,
+      max: isLeft ? workspaceLayout.leftMax : workspaceLayout.rightMax,
+    };
+    setWorkspaceResizeSide(side);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function continueWorkspaceResize(
+    side: WorkspaceResizeSide,
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) {
+    const drag = workspaceResizeDragRef.current;
+    if (!drag || drag.side !== side || drag.pointerId !== event.pointerId)
+      return;
+    event.preventDefault();
+    const delta = event.clientX - drag.startX;
+    const nextSize = clampPanelSize(
+      drag.startSize + (side === "left" ? delta : -delta),
+      drag.min,
+      drag.max,
+    );
+    drag.latestSize = nextSize;
+    scheduleWorkspacePanelSize(drag.preferenceKey, nextSize);
+  }
+
+  function finishWorkspaceResize(
+    side: WorkspaceResizeSide,
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) {
+    const drag = workspaceResizeDragRef.current;
+    if (!drag || drag.side !== side || drag.pointerId !== event.pointerId)
+      return;
+    scheduleWorkspacePanelSize(drag.preferenceKey, drag.latestSize);
+    flushWorkspacePanelSize();
+    workspaceResizeDragRef.current = null;
+    setWorkspaceResizeSide(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function resizeWorkspaceWithKeyboard(
+    side: WorkspaceResizeSide,
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) {
+    const isLeft = side === "left";
+    const current = isLeft ? workspaceLayout.left : workspaceLayout.right;
+    const min = isLeft ? workspaceLayout.leftMin : workspaceLayout.rightMin;
+    const max = isLeft ? workspaceLayout.leftMax : workspaceLayout.rightMax;
+    const step = event.shiftKey ? 48 : 16;
+    let next: number | null = null;
+
+    if (event.key === "Home") next = min;
+    else if (event.key === "End") next = max;
+    else if (event.key === "ArrowLeft")
+      next = current + (isLeft ? -step : step);
+    else if (event.key === "ArrowRight")
+      next = current + (isLeft ? step : -step);
+    if (next === null) return;
+
+    event.preventDefault();
+    commitWorkspacePanelSize(
+      isLeft ? "left" : activeToolTab ? "toolRight" : "contextRight",
+      clampPanelSize(next, min, max),
+    );
+  }
+
+  function resetWorkspacePanelSize(side: WorkspaceResizeSide) {
+    const key: keyof WorkspaceLayoutPreferences =
+      side === "left" ? "left" : activeToolTab ? "toolRight" : "contextRight";
+    setWorkspaceLayoutPreferences((current) => {
+      if (current[key] === undefined) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }
+
   return (
     <div className="app-shell">
       <TopBar />
@@ -1422,7 +1768,9 @@ export function App() {
         </div>
       )}
       <main
-        className={`workspace ${activeToolTab ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""}`}
+        ref={workspaceRef}
+        className={`workspace ${activeToolTab ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
+        style={workspaceStyle}
       >
         <Sidebar
           projects={projects}
@@ -1461,7 +1809,26 @@ export function App() {
           }
           onSettings={() => setSettingsOpen(true)}
         />
-        <section className="center-pane">
+        <div
+          className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
+          role="separator"
+          tabIndex={0}
+          aria-label="调整左侧栏宽度"
+          aria-controls="workspace-sidebar"
+          aria-orientation="vertical"
+          aria-valuemin={workspaceLayout.leftMin}
+          aria-valuemax={workspaceLayout.leftMax}
+          aria-valuenow={workspaceLayout.left}
+          aria-valuetext={`${workspaceLayout.left} 像素`}
+          onPointerDown={(event) => beginWorkspaceResize("left", event)}
+          onPointerMove={(event) => continueWorkspaceResize("left", event)}
+          onPointerUp={(event) => finishWorkspaceResize("left", event)}
+          onPointerCancel={(event) => finishWorkspaceResize("left", event)}
+          onLostPointerCapture={(event) => finishWorkspaceResize("left", event)}
+          onDoubleClick={() => resetWorkspacePanelSize("left")}
+          onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
+        />
+        <section className="center-pane" id="workspace-center-pane">
           <ThreadHeader
             thread={activeThread}
             onOpenLocation={() =>
@@ -1560,6 +1927,27 @@ export function App() {
             />
           )}
         </section>
+        <div
+          className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
+          role="separator"
+          tabIndex={0}
+          aria-label="调整右侧栏宽度"
+          aria-controls="workspace-right-panel"
+          aria-orientation="vertical"
+          aria-valuemin={workspaceLayout.rightMin}
+          aria-valuemax={workspaceLayout.rightMax}
+          aria-valuenow={workspaceLayout.right}
+          aria-valuetext={`${workspaceLayout.right} 像素`}
+          onPointerDown={(event) => beginWorkspaceResize("right", event)}
+          onPointerMove={(event) => continueWorkspaceResize("right", event)}
+          onPointerUp={(event) => finishWorkspaceResize("right", event)}
+          onPointerCancel={(event) => finishWorkspaceResize("right", event)}
+          onLostPointerCapture={(event) =>
+            finishWorkspaceResize("right", event)
+          }
+          onDoubleClick={() => resetWorkspacePanelSize("right")}
+          onKeyDown={(event) => resizeWorkspaceWithKeyboard("right", event)}
+        />
         <RightPanel
           client={client}
           toolTabs={toolTabs}
@@ -1654,13 +2042,6 @@ export function App() {
         />
       )}
       {logViewerOpen && <LogViewer onClose={() => setLogViewerOpen(false)} />}
-      {artifactPreview && (
-        <ArtifactPreviewModal
-          preview={artifactPreview}
-          onOpenPath={(targetPath) => void openWorkspaceRoot(targetPath)}
-          onClose={() => setArtifactPreview(null)}
-        />
-      )}
       {renameTarget && (
         <RenameDialog
           target={renameTarget}
@@ -2422,7 +2803,7 @@ function Sidebar({
 
   return (
     <>
-      <aside className="sidebar">
+      <aside className="sidebar" id="workspace-sidebar">
         <div className="sidebar-brand-row">
           <strong>
             <span className="brand-open">Open</span>
@@ -2505,8 +2886,7 @@ function Sidebar({
         <div className="project-tree">
           {projects.map((project, projectIndex) => {
             const projectThreads = threads.filter(
-              (thread) =>
-                thread.projectId === project.id && !thread.archivedAt,
+              (thread) => thread.projectId === project.id && !thread.archivedAt,
             );
             const isActive = project.id === activeProjectId;
             const isExpanded = expandedProjects.has(project.id);
@@ -3128,6 +3508,11 @@ function MessageList({
           event.payload.type === "tool_call_finished",
       ).length
     : 0;
+  const latestPlan = events.reduce<TaskPlan | null>(
+    (current, event) =>
+      event.payload.type === "plan_updated" ? event.payload.plan : current,
+    null,
+  );
   return (
     <div className="message-list">
       {messages.length === 0 ? (
@@ -3147,6 +3532,9 @@ function MessageList({
           />
         ))
       )}
+      {latestPlan && latestPlan.steps.length > 0 && (
+        <TaskPlanCard plan={latestPlan} />
+      )}
       {streamingText && (
         <article className="message assistant streaming-message">
           <div className="message-body">
@@ -3164,6 +3552,39 @@ function MessageList({
         </div>
       )}
     </div>
+  );
+}
+
+function TaskPlanCard({ plan }: { plan: TaskPlan }) {
+  const completed = plan.steps.filter(
+    (step) => step.status === "completed",
+  ).length;
+  return (
+    <section className="task-plan-card" aria-label="任务计划">
+      <header>
+        <strong>任务计划</strong>
+        <span>
+          {completed}/{plan.steps.length}
+        </span>
+      </header>
+      {plan.explanation && <p>{plan.explanation}</p>}
+      <ol>
+        {plan.steps.map((item, index) => (
+          <li key={`${index}-${item.step}`} data-status={item.status}>
+            <span className="task-plan-status" aria-hidden="true">
+              {item.status === "completed" ? (
+                <Check size={12} />
+              ) : item.status === "in_progress" ? (
+                <Loader2 size={12} className="spin" />
+              ) : (
+                <span className="task-plan-dot" />
+              )}
+            </span>
+            <span>{item.step}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }
 
@@ -3973,7 +4394,7 @@ function RightPanel({
 
   if (activeToolTab) {
     return (
-      <aside className="right-panel tool-stage">
+      <aside className="right-panel tool-stage" id="workspace-right-panel">
         <ToolTabStrip
           tabs={toolTabs}
           activeTabId={activeToolTab.id}
@@ -3985,7 +4406,7 @@ function RightPanel({
         />
         <div className="tool-stage-body">
           {activeToolTab.kind === "browser" ? (
-            <BrowserPanel
+            <WebPreviewSurface
               client={client}
               threadId={thread?.id ?? null}
               events={events}
@@ -3993,7 +4414,16 @@ function RightPanel({
               decidingApprovalId={decidingApprovalId}
               onDecideApproval={onDecideApproval}
             />
+          ) : activeToolTab.kind === "preview" &&
+            activeToolTab.previewTarget ? (
+            <PreviewHost
+              client={client}
+              threadId={thread?.id ?? null}
+              workspaceRoot={workspaceRoot}
+              target={activeToolTab.previewTarget}
+            />
           ) : (
+            activeToolTab.kind !== "preview" &&
             renderWorkbench("stage", activeToolTab.kind)
           )}
         </div>
@@ -4002,7 +4432,10 @@ function RightPanel({
   }
 
   return (
-    <aside className="right-panel context-rail-shell">
+    <aside
+      className="right-panel context-rail-shell"
+      id="workspace-right-panel"
+    >
       <RightContextRail
         client={client}
         threadId={thread?.id ?? null}
@@ -4119,7 +4552,6 @@ function ToolTabStrip({
                 <button key={kind} role="menuitem" onClick={() => open(kind)}>
                   <Icon size={14} />
                   <span>{toolTabTitle(kind)}</span>
-                  {kind === "browser" && <small>未实现</small>}
                 </button>
               );
             })}
@@ -4274,74 +4706,6 @@ function OfflineState({
       <code>cargo run -p opentopia-server</code>
       <small>{backendUrl ?? "http://127.0.0.1:8787"}</small>
       {error && <pre>{error}</pre>}
-    </div>
-  );
-}
-
-function ArtifactPreviewModal({
-  preview,
-  onOpenPath,
-  onClose,
-}: {
-  preview: ArtifactPreviewState;
-  onOpenPath(targetPath: string): void;
-  onClose(): void;
-}) {
-  const content = preview.status === "ready" ? preview.content : null;
-
-  return (
-    <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <section
-        className="artifact-preview-modal"
-        role="dialog"
-        aria-modal="true"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <header>
-          <div>
-            <FileCode2 size={17} />
-            <strong>Artifact</strong>
-            <span title={preview.artifactId}>{preview.artifactId}</span>
-          </div>
-          <button
-            className="secondary-button compact"
-            type="button"
-            onClick={onClose}
-          >
-            Close
-          </button>
-        </header>
-        {preview.status === "loading" && (
-          <div className="workbench-empty-state">Loading artifact...</div>
-        )}
-        {preview.status === "error" && (
-          <p className="message-error">{preview.message}</p>
-        )}
-        {content && (
-          <>
-            <div className="artifact-preview-editor">
-              <MonacoEditor
-                value={content.content}
-                language={detectLanguage(
-                  content.filePath ?? preview.artifactId,
-                )}
-                readOnly
-              />
-            </div>
-            {content.filePath && (
-              <button
-                className="artifact-file-link"
-                type="button"
-                title={content.filePath}
-                onClick={() => onOpenPath(content.filePath ?? "")}
-              >
-                <ExternalLink size={12} />
-                {content.filePath}
-              </button>
-            )}
-          </>
-        )}
-      </section>
     </div>
   );
 }
@@ -4694,6 +5058,8 @@ function toolTabTitle(kind: ToolTabKind): string {
       return "沙箱";
     case "browser":
       return "浏览器";
+    case "preview":
+      return "预览";
   }
 }
 
@@ -4711,7 +5077,22 @@ function toolTabIcon(kind: ToolTabKind): typeof Folder {
       return Box;
     case "browser":
       return Globe2;
+    case "preview":
+      return FileCode2;
   }
+}
+
+function artifactPreviewTitle(
+  descriptor: ArtifactDescriptor | undefined,
+  artifactId: string,
+): string {
+  if (descriptor?.storage && "path" in descriptor.storage) {
+    const path = descriptor.storage.path;
+    if (typeof path === "string") {
+      return path.split(/[\\/]/).at(-1) || path;
+    }
+  }
+  return descriptor?.kind || artifactId;
 }
 
 function threadTitleFromPrompt(prompt: string): string {

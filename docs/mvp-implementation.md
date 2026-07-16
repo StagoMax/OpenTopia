@@ -86,6 +86,10 @@ Implemented:
 - `GET /api/threads/{thread_id}/trajectory`
 - `GET /api/threads/{thread_id}/artifacts`
 - `GET /api/threads/{thread_id}/artifacts/{artifact_id}`
+- `POST /api/threads/{thread_id}/previews/resolve`
+- `GET /api/threads/{thread_id}/previews/{preview_id}/content`
+- `GET /api/threads/{thread_id}/previews/{preview_id}/workbook`
+- `GET /api/threads/{thread_id}/previews/{preview_id}/range`
 - `GET /api/threads/{thread_id}/context`
 - `POST /api/threads/{thread_id}/context/compact`
 - `POST /api/threads/{thread_id}/git`
@@ -154,11 +158,11 @@ Implemented:
 - Workspace picker, recent workspace list, normalized path bridge, and
   open-path action through the preload API.
 - Settings modal for provider base URL, model, API-key env name, and permission mode.
-- Workbench skeleton panels for file tree, read-only file preview, git diff,
+- Workbench panels for file tree, first-class read-only preview tabs, git diff,
   MCP extension enablement, and local sandbox status.
 - Xterm-based per-command terminal streaming with cancel.
 - SQLite-backed terminal history and cancellation/timeout process-tree cleanup.
-- Artifact gallery, quick artifact preview, context status, explicit-confirm file revert,
+- Artifact gallery, artifact preview tabs, context status, explicit-confirm file revert,
   and staged/unstaged hunk stage/unstage/discard.
 - First-class SQLite Project/Thread ownership, normalized workspace uniqueness,
   archive/delete/rename/pin flows, and migration from the former renderer-only projection.
@@ -166,7 +170,23 @@ Implemented:
   sensitive/type/size limits, message-persisted references, bounded text context, and right-rail recovery.
 - Turn-scoped Codex-compatible Skills discovery/selection and bounded `SKILL.md` injection.
 - Real persistent subagents with AgentCore execution, concurrency/depth/timeout limits,
-  recursive cancellation, model-callable lifecycle tools, HTTP controls, SSE, and right-rail UI.
+  recursive cancellation, model-callable lifecycle tools, concurrent `wait_agents`, HTTP
+  controls, SSE, and right-rail UI.
+- Persisted main-Turn state with explicit terminal outcomes, startup interruption recovery,
+  race-free SSE replay, and desktop restoration from the stored Turn record.
+- `update_plan` durable task memory, restored into later Turns and rendered in the message view.
+- A shared per-Thread browser session: Electron uses a sandboxed `WebContentsView` for the
+  visible page and exposes a random-token loopback broker to the Rust `DesktopBrowserRuntime`.
+  The user and Agent therefore operate on the same page. Pure web mode retains the isolated
+  CDP runtime and `BrowserPanel` fallback. Navigation/snapshot/click/type/wait/screenshot/
+  download, domain approval continuation, and provider-native screenshot input are implemented.
+- First-class preview tabs for workspace files and Thread artifacts. The preview service
+  canonicalizes workspace paths, scopes artifacts to the active Thread, applies type/size
+  limits, and serves authenticated binary content with revision metadata. Monaco renders
+  text/code, Blob URLs render images, PDF.js renders PDF pages, and a virtualized range grid
+  renders XLSX sheets. Unsupported formats can be opened with the system application.
+- Built-in bounded XLSX inspect/list/read/create/update backed by `calamine` and
+  `rust_xlsxwriter`; workspace reads/writes still pass through policy and ExecutionEnvironment.
 - Sandboxed Git workflow API for branch/status/commit/push/compare/worktree actions,
   plus desktop status/branch/create/switch/commit/push/compare controls. Worktree UI,
   PR creation, and GitHub CLI remain follow-up work.
@@ -178,6 +198,13 @@ Implemented:
   safeStorage availability, selected backend when Electron exposes it, and the
   non-secret storage path under Electron `userData`.
 - Settings UI for write-only/delete-only desktop API-key management and provider connectivity tests.
+- Strict OpenAI-compatible continuation fallback: standard tool messages are tried
+  first; a tool-history HTTP 400 is retried once with compacted text history. The
+  provider probe covers text SSE, tool calls, continuation, and fallback behavior.
+- Deterministic two-phase long-horizon evaluation fixture with baseline failure,
+  protected files, hidden grading, restart recovery checks, hard timeouts, trajectory
+  metrics, and byte-level secret scanning. The 2026-07-16 GLM-5.2 run is documented
+  under `docs/evaluations/` and currently fails overall at phase closure.
 - Desktop packaging skeleton: `scripts/build-desktop.ps1` builds the release
   Rust server, stages it in `apps/desktop/resources`, and electron-builder
   copies it as an `extraResources` binary resolved from `process.resourcesPath`.
@@ -219,9 +246,11 @@ generates a new 256-bit token per launch; direct-server and browser development 
 `OPENTOPIA_API_TOKEN` and `VITE_OPENTOPIA_API_TOKEN`. CORS accepts only packaged
 file origins and configured loopback development origins.
 
-Agent turns are serialized per thread. `GET /api/threads/:id/turn` reports the
-active turn and `POST /api/threads/:id/turn/cancel` interrupts its provider stream
-or tool future. Provider SSE text is forwarded and persisted incrementally.
+Agent turns are serialized per thread and persisted in SQLite. `GET /api/threads/:id/turn`
+reports the latest running or terminal record; `POST /api/threads/:id/turn/cancel` interrupts
+its provider stream or tool future. Startup marks abandoned running/cancelling records as
+interrupted. Provider SSE text is forwarded and persisted incrementally, with subscribe-before-
+history replay and sequence deduplication.
 
 Approval suspension persists the provider conversation, completed tool results,
 pending calls, round number, original permission mode, and context budget. Allow
@@ -244,14 +273,16 @@ The current MVP intentionally does not yet include:
 - Secret values returned to renderer; only secret metadata/set/delete paths are exposed.
 - Production release signing, notarization, and update publication credentials.
 - Multiple named PTY sessions and shell selection; one long-lived PTY per thread is implemented.
-- Product-specific GitHub/Linear/Jira/browser/document connectors beyond the MCP host.
-- Provider-native image input and PDF/Office extraction; verified binary sources currently
-  contribute metadata only and are never coerced into text.
+- Product-specific GitHub/Linear/Jira/document connectors beyond the MCP host. Linear/Jira are
+  explicitly deferred under the current product focus.
+- PDF/Office extraction into model context and Office editing beyond the existing XLSX tool.
+  In-app PDF rendering and XLSX workbook/range preview are implemented; document resources do
+  not yet become model context automatically.
 - Automatic re-reading of historical attachment contents. Source references remain visible
   and durable, while bounded text content applies to the Turn where the source was selected.
 - Child-agent approval continuation UI and per-child token budgets. Child approval currently
   fails closed and returns control to the parent.
-- Worktree desktop controls, PR/GitHub CLI, and an embedded browser.
+- Worktree desktop controls and PR/GitHub CLI.
 
 Those are next slices; the interfaces are already shaped so they can be added without replacing the full skeleton.
 
@@ -300,7 +331,7 @@ Recommended order:
 
 1. Finish provider-native image/document context and child-agent approval/token hardening.
 2. Add worktree controls and PR/GitHub CLI on top of the completed desktop Git workflow.
-3. Add PR/GitHub CLI, embedded browser, and first product-specific connectors tracked in Roadmap #4.
+3. Add PR/GitHub CLI and the first product-specific connectors tracked in Roadmap #4.
 4. Run native Linux/macOS sandbox integration suites and add resource quotas.
 
 Docker/Remote execution and production signing/notarization/release publication remain deferred.
