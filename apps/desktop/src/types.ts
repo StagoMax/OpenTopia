@@ -108,6 +108,10 @@ export type ProviderSettings = {
   kind: ProviderKind;
   baseUrl: string;
   model: string;
+  temperature: number;
+  maxOutputTokens?: number | null;
+  contextWindowTokens: number;
+  reasoningEffort?: "low" | "medium" | "high" | null;
   apiKeySource: string;
   apiKeyConfigured: boolean;
   healthStatus?: string | null;
@@ -140,6 +144,7 @@ export type LogFileInfo = {
 
 export type SecretSource = {
   id: string;
+  providerId?: string;
   kind: "environment" | "keyring" | string;
   label: string;
   envName?: string;
@@ -154,6 +159,7 @@ export type SecretSource = {
 };
 
 export type KeyringMetadata = {
+  providerId?: string;
   available: boolean;
   encryptionAvailable: boolean;
   storageBackend?: string | null;
@@ -626,6 +632,7 @@ export type AgentEvent = {
 export type AgentEventPayload =
   | { type: "turn_started"; user_message_id: string }
   | { type: "model_delta"; text: string }
+  | { type: "reasoning_delta"; text: string }
   | { type: "tool_call_started"; call: ToolCall }
   | { type: "tool_call_finished"; result: ToolResult }
   | { type: "plan_updated"; plan: TaskPlan }
@@ -711,6 +718,12 @@ declare global {
       listSecretSources(): Promise<SecretSources>;
       setSecret(key: string, value: string): Promise<void>;
       deleteSecret(key: string): Promise<void>;
+      getProviderApiKeyMetadata(providerId: string): Promise<KeyringMetadata>;
+      setProviderApiKey(
+        providerId: string,
+        value: string,
+      ): Promise<KeyringMetadata>;
+      deleteProviderApiKey(providerId: string): Promise<KeyringMetadata>;
       listLogFiles(): Promise<LogFileInfo[]>;
       readLogFile(
         path: string,

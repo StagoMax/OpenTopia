@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertCircle,
@@ -13,9 +13,7 @@ import {
   FileText,
   Folder,
   GitBranch,
-  GitCompareArrows,
   GitCommitHorizontal,
-  Github,
   Laptop,
   Package,
   Plus,
@@ -29,7 +27,6 @@ import type { ApiClient } from "../api/client";
 import type {
   AgentEvent,
   ArtifactDescriptor,
-  GitBranchInfo,
   GitStatusSummary,
   GitWorkflowAction,
   GitWorkflowResponse,
@@ -55,7 +52,6 @@ export type RightContextRailProps = {
   onOpenDiff(): void;
   onOpenTerminal(): void;
   onOpenFiles(): void;
-  onOpenExtensions(): void;
   onAddSource(): void;
   onSpawnSubagent(name: string, input: string): Promise<void>;
   onCancelSubagent(runId: string): void;
@@ -96,7 +92,7 @@ type SourceItem = {
   dedupeKey: string;
 };
 
-type GitDialogMode = "branches" | "commit" | "push" | "compare";
+type GitRepositoryState = "unknown" | "ready" | "missing";
 
 const SOURCE_LIMIT = 4;
 
@@ -114,7 +110,6 @@ export function RightContextRail({
   onOpenDiff,
   onOpenTerminal,
   onOpenFiles,
-  onOpenExtensions,
   onAddSource,
   onSpawnSubagent,
   onCancelSubagent,
@@ -126,22 +121,21 @@ export function RightContextRail({
   const [isSpawningSubagent, setIsSpawningSubagent] = useState(false);
   const [subagentError, setSubagentError] = useState<string | null>(null);
   const [gitStatus, setGitStatus] = useState<GitStatusSummary | null>(null);
-  const [gitBranches, setGitBranches] = useState<GitBranchInfo[]>([]);
+  const [gitRepositoryState, setGitRepositoryState] =
+    useState<GitRepositoryState>("unknown");
   const [gitLoading, setGitLoading] = useState(false);
   const [gitBusy, setGitBusy] = useState<GitWorkflowAction["type"] | null>(
     null,
   );
   const [gitError, setGitError] = useState<string | null>(null);
   const [gitNotice, setGitNotice] = useState<string | null>(null);
-  const [gitDialog, setGitDialog] = useState<GitDialogMode | null>(null);
-  const [compareResult, setCompareResult] =
-    useState<GitWorkflowResponse | null>(null);
+  const [gitDialogOpen, setGitDialogOpen] = useState(false);
   const diffStats = countDiffLines(workspaceDiff?.diff ?? "");
   const branch =
     gitStatus?.branch ??
     (gitStatus?.detached ? "detached HEAD" : null) ??
     workspaceDiff?.branch?.trim() ??
-    "非 Git 仓库";
+    "HEAD";
   const activeProcesses = collectActiveProcesses(
     terminalSession,
     terminalEvents,
@@ -149,28 +143,32 @@ export function RightContextRail({
   const subagents = collectSubagents(subagentRuns, agentEvents);
   const allSources = collectSources(messages, agentEvents, artifacts);
   const sources = allSources.slice(0, SOURCE_LIMIT);
-  const gitAvailable = Boolean(client && threadId && workspaceRoot);
+  const gitAvailable = gitRepositoryState === "ready" && Boolean(gitStatus);
 
   const refreshGit = useCallback(async () => {
     if (!client || !threadId || !workspaceRoot) {
       setGitStatus(null);
-      setGitBranches([]);
+      setGitRepositoryState("unknown");
       setGitError(null);
       return;
     }
+    setGitRepositoryState("unknown");
     setGitLoading(true);
     setGitError(null);
     try {
-      const [status, branches] = await Promise.all([
-        client.getGitStatus(threadId),
-        client.listGitBranches(threadId),
-      ]);
+      const status = await client.getGitStatus(threadId);
       setGitStatus(status);
-      setGitBranches(branches);
+      setGitRepositoryState("ready");
     } catch (error) {
       setGitStatus(null);
-      setGitBranches([]);
-      setGitError(readableError(error));
+      const message = readableError(error);
+      if (isNotGitRepositoryError(message)) {
+        setGitRepositoryState("missing");
+        setGitError(null);
+      } else {
+        setGitRepositoryState("unknown");
+        setGitError(message);
+      }
     } finally {
       setGitLoading(false);
     }
@@ -202,11 +200,10 @@ export function RightContextRail({
     }
   }
 
-  function openGitDialog(mode: GitDialogMode) {
-    setGitDialog(mode);
+  function openGitDialog() {
+    setGitDialogOpen(true);
     setGitError(null);
     setGitNotice(null);
-    if (mode !== "compare") setCompareResult(null);
   }
 
   return (
@@ -259,50 +256,29 @@ export function RightContextRail({
             </span>
           }
         />
-        <RailRow
-          icon={GitBranch}
-          label="分支"
-          title={gitStatusTitle(gitStatus, workspaceRoot)}
-          disabled={!gitAvailable || gitLoading}
-          onClick={() => openGitDialog("branches")}
-          value={
-            <span className="right-context-rail__inline-value">
-              <StatusText muted={!gitStatus?.branch && !workspaceDiff?.branch}>
-                {gitLoading ? "读取中" : branch}
-              </StatusText>
-              {gitAvailable && !gitLoading && (
-                <ChevronDown size={13} aria-hidden="true" />
-              )}
-            </span>
-          }
-        />
-        <RailRow
-          icon={GitCommitHorizontal}
-          label="提交与推送"
-          value={
-            <StatusText muted={!gitStatus?.ahead}>
-              {gitStatus?.ahead ? `待推送 ${gitStatus.ahead}` : ""}
-            </StatusText>
-          }
-          title="创建本地提交或推送当前分支"
-          disabled={!gitAvailable || gitLoading}
-          onClick={() => openGitDialog("commit")}
-        />
-        <RailRow
-          icon={Github}
-          label="GitHub CLI"
-          value={<StatusText muted>不可用</StatusText>}
-          title="GitHub CLI 不可用；打开扩展"
-          onClick={onOpenExtensions}
-        />
-        <RailRow
-          icon={GitCompareArrows}
-          label="比较分支"
-          value={<StatusText muted>Diff</StatusText>}
-          title="比较两个 Git 引用"
-          disabled={!gitAvailable || gitLoading}
-          onClick={() => openGitDialog("compare")}
-        />
+        {gitAvailable && (
+          <>
+            <RailRow
+              icon={GitBranch}
+              label="分支"
+              title={gitStatusTitle(gitStatus, workspaceRoot)}
+              value={
+                <StatusText muted={!gitStatus?.branch}>{branch}</StatusText>
+              }
+            />
+            <RailRow
+              icon={GitCommitHorizontal}
+              label="提交与推送"
+              value={
+                <StatusText muted={!gitStatus?.ahead}>
+                  {gitStatus?.ahead ? `待推送 ${gitStatus.ahead}` : ""}
+                </StatusText>
+              }
+              title="提交当前改动或推送当前分支"
+              onClick={openGitDialog}
+            />
+          </>
+        )}
         {gitError && (
           <button
             className="right-context-rail__git-error"
@@ -317,78 +293,57 @@ export function RightContextRail({
         )}
       </RailSection>
 
-      {gitDialog &&
+      {gitDialogOpen && gitStatus &&
         createPortal(
-          <GitWorkflowDialog
-            mode={gitDialog}
+          <GitCommitDialog
             status={gitStatus}
-            branches={gitBranches}
+            diffStats={diffStats}
+            changedFiles={workspaceDiff?.files.length ?? gitStatus.changed}
             busy={gitBusy}
             error={gitError}
             notice={gitNotice}
-            compareResult={compareResult}
-            onClose={() => setGitDialog(null)}
-            onRefresh={() => void refreshGit()}
-            onChangeMode={openGitDialog}
-            onCreateBranch={async (newBranch, startPoint) => {
-              await runGitAction(
-                {
-                  type: "create_branch",
-                  request: { branch: newBranch, startPoint: startPoint || null },
-                },
-                `已创建分支 ${newBranch}`,
-              );
-            }}
-            onSwitchBranch={async (nextBranch) => {
-              if (
-                !window.confirm(
-                  `确认切换到分支“${nextBranch}”？\n\n此操作会修改当前工作区文件；Git 会在存在冲突时拒绝切换。`,
-                )
-              )
-                return;
-              await runGitAction(
-                { type: "switch_branch", request: { branch: nextBranch } },
-                `已切换到 ${nextBranch}`,
-              );
-            }}
-            onCommit={async (message, allTracked) => {
-              if (
-                !window.confirm(
-                  `确认创建本地提交？\n\n提交信息：${message}${allTracked ? "\n将同时包含所有已跟踪文件的改动。" : ""}`,
-                )
-              )
-                return;
-              await runGitAction(
+            onClose={() => setGitDialogOpen(false)}
+            onCommit={async (message, allTracked, pushAfterCommit) => {
+              const result = await runGitAction(
                 { type: "commit", request: { message, allTracked } },
                 "提交已创建",
               );
+              if (!result?.success) return false;
+              if (pushAfterCommit) {
+                const pushResult = await runGitAction(
+                  {
+                    type: "push",
+                    request: {
+                      remote: "origin",
+                      branch: gitStatus.branch ?? "HEAD",
+                      setUpstream: !gitStatus.upstream,
+                    },
+                  },
+                  `已推送 ${gitStatus.branch ?? "当前分支"}`,
+                );
+                return Boolean(pushResult?.success);
+              }
+              return true;
             }}
-            onPush={async (remote, pushBranch, setUpstream) => {
-              if (
-                !window.confirm(
-                  `确认推送 ${pushBranch} 到 ${remote}？${setUpstream ? "\n同时设置 upstream 跟踪关系。" : ""}\n\n此操作会更新远程仓库。`,
-                )
-              )
-                return;
-              await runGitAction(
+            generateCommitMessage={() =>
+              `更新 ${Math.max(
+                workspaceDiff?.files.length ?? gitStatus.changed,
+                1,
+              )} 个文件`
+            }
+            onPush={async () => {
+              const result = await runGitAction(
                 {
                   type: "push",
                   request: {
-                    remote,
-                    branch: pushBranch,
-                    setUpstream,
+                    remote: "origin",
+                    branch: gitStatus.branch ?? "HEAD",
+                    setUpstream: !gitStatus.upstream,
                   },
                 },
-                `已推送 ${pushBranch} 到 ${remote}`,
+                `已推送 ${gitStatus.branch ?? "当前分支"}`,
               );
-            }}
-            onCompare={async (base, head, mode) => {
-              setCompareResult(null);
-              const result = await runGitAction(
-                { type: "compare", request: { base, head, mode } },
-                `已比较 ${base} 与 ${head}`,
-              );
-              setCompareResult(result);
+              return Boolean(result?.success);
             }}
           />,
           document.body,
@@ -578,168 +533,117 @@ export function RightContextRail({
   );
 }
 
-function GitWorkflowDialog({
-  mode,
+function GitCommitDialog({
   status,
-  branches,
+  diffStats,
+  changedFiles,
   busy,
   error,
   notice,
-  compareResult,
   onClose,
-  onRefresh,
-  onChangeMode,
-  onCreateBranch,
-  onSwitchBranch,
+  generateCommitMessage,
   onCommit,
   onPush,
-  onCompare,
 }: {
-  mode: GitDialogMode;
-  status: GitStatusSummary | null;
-  branches: GitBranchInfo[];
+  status: GitStatusSummary;
+  diffStats: { additions: number; deletions: number };
+  changedFiles: number;
   busy: GitWorkflowAction["type"] | null;
   error: string | null;
   notice: string | null;
-  compareResult: GitWorkflowResponse | null;
   onClose(): void;
-  onRefresh(): void;
-  onChangeMode(mode: GitDialogMode): void;
-  onCreateBranch(branch: string, startPoint: string): Promise<void>;
-  onSwitchBranch(branch: string): Promise<void>;
-  onCommit(message: string, allTracked: boolean): Promise<void>;
-  onPush(
-    remote: string,
-    branch: string,
-    setUpstream: boolean,
-  ): Promise<void>;
-  onCompare(
-    base: string,
-    head: string,
-    mode: "direct" | "merge_base",
-  ): Promise<void>;
+  generateCommitMessage(): string;
+  onCommit(
+    message: string,
+    allTracked: boolean,
+    pushAfterCommit: boolean,
+  ): Promise<boolean>;
+  onPush(): Promise<boolean>;
 }) {
-  const localBranches = useMemo(
-    () => branches.filter((branch) => !branch.remote),
-    [branches],
-  );
-  const remoteBranches = useMemo(
-    () => branches.filter((branch) => branch.remote && !branch.symbolicTarget),
-    [branches],
-  );
-  const currentBranch = status?.branch ?? "";
-  const defaultBase =
-    localBranches.find(
-      (branch) =>
-        branch.name !== currentBranch && ["main", "master"].includes(branch.name),
-    )?.name ??
-    localBranches.find((branch) => branch.name !== currentBranch)?.name ??
-    remoteBranches.find((branch) => branch.name !== currentBranch)?.name ??
-    "main";
-  const [newBranch, setNewBranch] = useState("");
-  const [startPoint, setStartPoint] = useState("");
   const [commitMessage, setCommitMessage] = useState("");
-  const [allTracked, setAllTracked] = useState(false);
-  const [remote, setRemote] = useState("origin");
-  const [pushBranch, setPushBranch] = useState(currentBranch);
-  const [setUpstream, setSetUpstream] = useState(!status?.upstream);
-  const [compareBase, setCompareBase] = useState(defaultBase);
-  const [compareHead, setCompareHead] = useState(currentBranch || "HEAD");
-  const [compareMode, setCompareMode] = useState<"direct" | "merge_base">(
-    "merge_base",
-  );
-
-  useEffect(() => {
-    if (currentBranch) {
-      setPushBranch((value) => value || currentBranch);
-      setCompareHead((value) => (value === "HEAD" ? currentBranch : value));
-    }
-  }, [currentBranch]);
-
-  useEffect(() => {
-    setCompareBase((value) =>
-      !value || value === currentBranch ? defaultBase : value,
-    );
-  }, [currentBranch, defaultBase]);
+  const [allTracked, setAllTracked] = useState(true);
+  const busyNow = Boolean(busy);
+  const hasChanges = status.changed > 0 || changedFiles > 0;
 
   useEffect(() => {
     function closeOnEscape(event: KeyboardEvent) {
-      if (event.key === "Escape" && !busy) onClose();
+      if (event.key === "Escape" && !busyNow) onClose();
     }
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [busy, onClose]);
+  }, [busyNow, onClose]);
 
-  const title = {
-    branches: "分支管理",
-    commit: "提交改动",
-    push: "推送分支",
-    compare: "比较分支",
-  }[mode];
+  async function commit(pushAfterCommit: boolean) {
+    if (busyNow || !hasChanges) return;
+    const message = commitMessage.trim() || generateCommitMessage();
+    const succeeded = await onCommit(message, allTracked, pushAfterCommit);
+    if (succeeded) setCommitMessage("");
+  }
 
   return (
     <div
       className="right-context-rail__dialog-backdrop"
       role="presentation"
-      onClick={() => !busy && onClose()}
+      onClick={() => !busyNow && onClose()}
     >
       <section
-        className="right-context-rail__dialog right-context-rail__git-dialog"
+        className="right-context-rail__commit-dialog"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="git-workflow-title"
+        aria-labelledby="git-commit-title"
         onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault();
+            void commit(false);
+          }
+        }}
       >
-        <header className="right-context-rail__git-dialog-header">
-          <span>
-            <strong id="git-workflow-title">{title}</strong>
-            <small>{gitStatusTitle(status, null)}</small>
+        <header className="right-context-rail__commit-header">
+          <span className="right-context-rail__commit-branch">
+            <GitBranch size={15} aria-hidden="true" />
+            <strong id="git-commit-title">
+              {status.branch ?? (status.detached ? "detached HEAD" : "HEAD")}
+            </strong>
+            <ChevronDown size={13} aria-hidden="true" />
           </span>
-          <span className="right-context-rail__git-dialog-actions">
-            <button
-              type="button"
-              className="right-context-rail__icon-button"
-              title="刷新 Git 状态"
-              aria-label="刷新 Git 状态"
-              disabled={Boolean(busy)}
-              onClick={onRefresh}
-            >
-              <RefreshCw size={14} aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              className="right-context-rail__icon-button"
-              title="关闭"
-              aria-label="关闭"
-              disabled={Boolean(busy)}
-              onClick={onClose}
-            >
-              <X size={14} aria-hidden="true" />
-            </button>
+          <span className="right-context-rail__commit-stats">
+            <span className="is-addition">+{diffStats.additions}</span>
+            <span className="is-deletion">-{diffStats.deletions}</span>
           </span>
+          <button
+            className="right-context-rail__icon-button"
+            type="button"
+            title="关闭"
+            aria-label="关闭"
+            disabled={busyNow}
+            onClick={onClose}
+          >
+            <X size={15} aria-hidden="true" />
+          </button>
         </header>
 
-        <nav className="right-context-rail__git-tabs" aria-label="Git 工作流">
-          {(
-            ["branches", "commit", "push", "compare"] as GitDialogMode[]
-          ).map((item) => (
-            <button
-              key={item}
-              type="button"
-              className={item === mode ? "is-active" : ""}
-              aria-current={item === mode ? "page" : undefined}
-              disabled={Boolean(busy)}
-              onClick={() => onChangeMode(item)}
-            >
-              {{
-                branches: "分支",
-                commit: "提交",
-                push: "推送",
-                compare: "比较",
-              }[item]}
-            </button>
-          ))}
-        </nav>
+        <textarea
+          autoFocus
+          className="right-context-rail__commit-message"
+          maxLength={32768}
+          rows={4}
+          value={commitMessage}
+          placeholder="提交信息（留空将自动生成）…"
+          aria-label="提交信息"
+          onChange={(event) => setCommitMessage(event.target.value)}
+        />
+
+        <label className="right-context-rail__commit-checkbox">
+          <input
+            type="checkbox"
+            checked={allTracked}
+            disabled={busyNow}
+            onChange={(event) => setAllTracked(event.target.checked)}
+          />
+          <Check size={13} aria-hidden="true" />
+          <span>包含未暂存的更改</span>
+        </label>
 
         {error && (
           <div className="right-context-rail__git-message is-error" role="alert">
@@ -754,284 +658,34 @@ function GitWorkflowDialog({
           </div>
         )}
 
-        {mode === "branches" && (
-          <div className="right-context-rail__git-pane">
-            <div className="right-context-rail__branch-list" role="list">
-              {localBranches.length ? (
-                localBranches.map((branch) => (
-                  <div
-                    className={`right-context-rail__branch-item ${branch.current ? "is-current" : ""}`}
-                    key={branch.fullRef}
-                    role="listitem"
-                  >
-                    <GitBranch size={14} aria-hidden="true" />
-                    <span title={branch.fullRef}>
-                      <strong>{branch.name}</strong>
-                      <small>{branch.upstream || "仅本地"}</small>
-                    </span>
-                    {branch.current ? (
-                      <span className="right-context-rail__branch-current">
-                        <Check size={12} aria-hidden="true" /> 当前
-                      </span>
-                    ) : (
-                      <button
-                        type="button"
-                        disabled={Boolean(busy)}
-                        onClick={() => void onSwitchBranch(branch.name)}
-                      >
-                        切换
-                      </button>
-                    )}
-                  </div>
-                ))
-              ) : (
-                <p className="right-context-rail__git-empty">暂无本地分支</p>
-              )}
-              {remoteBranches.length > 0 && (
-                <details className="right-context-rail__remote-branches">
-                  <summary>远程分支 {remoteBranches.length}</summary>
-                  {remoteBranches.map((branch) => (
-                    <div key={branch.fullRef} title={branch.fullRef}>
-                      {branch.name}
-                    </div>
-                  ))}
-                </details>
-              )}
-            </div>
-            <form
-              className="right-context-rail__git-form is-inline"
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (!newBranch.trim() || busy) return;
-                void onCreateBranch(newBranch.trim(), startPoint.trim());
-              }}
-            >
-              <label>
-                新分支名称
-                <input
-                  autoComplete="off"
-                  value={newBranch}
-                  placeholder="feature/my-change"
-                  onChange={(event) => setNewBranch(event.target.value)}
-                />
-              </label>
-              <label>
-                起点（可选）
-                <input
-                  autoComplete="off"
-                  value={startPoint}
-                  placeholder={currentBranch || "HEAD"}
-                  list="git-branch-refs"
-                  onChange={(event) => setStartPoint(event.target.value)}
-                />
-              </label>
-              <button
-                className="right-context-rail__primary-button"
-                type="submit"
-                disabled={!newBranch.trim() || Boolean(busy)}
-              >
-                {busy === "create_branch" ? "创建中..." : "创建分支"}
-              </button>
-            </form>
-          </div>
-        )}
-
-        {mode === "commit" && (
-          <form
-            className="right-context-rail__git-pane right-context-rail__git-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (!commitMessage.trim() || busy) return;
-              void onCommit(commitMessage.trim(), allTracked);
-            }}
+        <div className="right-context-rail__commit-actions">
+          <button
+            type="button"
+            className="is-primary"
+            disabled={busyNow || !hasChanges}
+            onClick={() => void commit(false)}
           >
-            <div className="right-context-rail__git-summary">
-              <span>{status?.staged ?? 0} 个已暂存</span>
-              <span>{status?.unstaged ?? 0} 个未暂存</span>
-              <span>{status?.untracked ?? 0} 个未跟踪</span>
-            </div>
-            <label>
-              提交信息
-              <textarea
-                autoFocus
-                maxLength={32768}
-                rows={5}
-                value={commitMessage}
-                placeholder="简要说明本次改动"
-                onChange={(event) => setCommitMessage(event.target.value)}
-              />
-            </label>
-            <label className="right-context-rail__checkbox-row">
-              <input
-                type="checkbox"
-                checked={allTracked}
-                onChange={(event) => setAllTracked(event.target.checked)}
-              />
-              <span>
-                包含所有已跟踪文件改动
-                <small>等同于 git commit --all；不会包含未跟踪文件</small>
-              </span>
-            </label>
-            <footer>
-              <button type="button" onClick={() => onChangeMode("push")}>
-                前往推送
-              </button>
-              <button
-                type="submit"
-                disabled={!commitMessage.trim() || Boolean(busy)}
-              >
-                {busy === "commit" ? "提交中..." : "创建提交"}
-              </button>
-            </footer>
-          </form>
-        )}
-
-        {mode === "push" && (
-          <form
-            className="right-context-rail__git-pane right-context-rail__git-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (!remote.trim() || !pushBranch.trim() || busy) return;
-              void onPush(remote.trim(), pushBranch.trim(), setUpstream);
-            }}
+            <GitCommitHorizontal size={15} aria-hidden="true" />
+            <span>{busy === "commit" ? "提交中…" : "提交"}</span>
+            <kbd>Ctrl+↵</kbd>
+          </button>
+          <button
+            type="button"
+            disabled={busyNow || !hasChanges}
+            onClick={() => void commit(true)}
           >
-            <div className="right-context-rail__git-hero-icon">
-              <UploadCloud size={20} aria-hidden="true" />
-              <span>
-                <strong>{status?.ahead ?? 0} 个本地提交待推送</strong>
-                <small>{status?.upstream || "当前分支尚未设置 upstream"}</small>
-              </span>
-            </div>
-            <div className="right-context-rail__git-field-grid">
-              <label>
-                远程仓库
-                <input
-                  autoFocus
-                  autoComplete="off"
-                  value={remote}
-                  onChange={(event) => setRemote(event.target.value)}
-                />
-              </label>
-              <label>
-                分支
-                <input
-                  autoComplete="off"
-                  value={pushBranch}
-                  list="git-local-branch-refs"
-                  onChange={(event) => setPushBranch(event.target.value)}
-                />
-              </label>
-            </div>
-            <label className="right-context-rail__checkbox-row">
-              <input
-                type="checkbox"
-                checked={setUpstream}
-                onChange={(event) => setSetUpstream(event.target.checked)}
-              />
-              <span>设置为当前分支的 upstream</span>
-            </label>
-            <footer>
-              <button type="button" onClick={() => onChangeMode("commit")}>
-                返回提交
-              </button>
-              <button
-                type="submit"
-                disabled={
-                  !remote.trim() || !pushBranch.trim() || Boolean(busy)
-                }
-              >
-                {busy === "push" ? "推送中..." : "确认并推送"}
-              </button>
-            </footer>
-          </form>
-        )}
-
-        {mode === "compare" && (
-          <form
-            className="right-context-rail__git-pane right-context-rail__git-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (!compareBase.trim() || !compareHead.trim() || busy) return;
-              void onCompare(
-                compareBase.trim(),
-                compareHead.trim(),
-                compareMode,
-              );
-            }}
+            <UploadCloud size={15} aria-hidden="true" />
+            <span>提交并推送</span>
+          </button>
+          <button
+            type="button"
+            disabled={busyNow || status.ahead === 0}
+            onClick={() => void onPush()}
           >
-            <div className="right-context-rail__git-field-grid">
-              <label>
-                基准分支
-                <input
-                  autoFocus
-                  autoComplete="off"
-                  value={compareBase}
-                  list="git-branch-refs"
-                  onChange={(event) => setCompareBase(event.target.value)}
-                />
-              </label>
-              <label>
-                目标分支
-                <input
-                  autoComplete="off"
-                  value={compareHead}
-                  list="git-branch-refs"
-                  onChange={(event) => setCompareHead(event.target.value)}
-                />
-              </label>
-            </div>
-            <div
-              className="right-context-rail__segmented"
-              role="group"
-              aria-label="比较方式"
-            >
-              <button
-                type="button"
-                className={compareMode === "merge_base" ? "is-active" : ""}
-                onClick={() => setCompareMode("merge_base")}
-              >
-                从共同祖先
-              </button>
-              <button
-                type="button"
-                className={compareMode === "direct" ? "is-active" : ""}
-                onClick={() => setCompareMode("direct")}
-              >
-                直接比较
-              </button>
-            </div>
-            <button
-              className="right-context-rail__primary-button"
-              type="submit"
-              disabled={
-                !compareBase.trim() || !compareHead.trim() || Boolean(busy)
-              }
-            >
-              {busy === "compare" ? "比较中..." : "生成 Diff"}
-            </button>
-            {compareResult && (
-              <div className="right-context-rail__compare-result">
-                <header>
-                  <strong>比较结果</strong>
-                  <span>{compareResult.truncated ? "输出已截断" : "完整输出"}</span>
-                </header>
-                <pre>{compareResult.stdout || "两个引用之间没有文件差异。"}</pre>
-              </div>
-            )}
-          </form>
-        )}
-
-        <datalist id="git-branch-refs">
-          {branches.map((branch) => (
-            <option key={branch.fullRef} value={branch.name} />
-          ))}
-          <option value="HEAD" />
-        </datalist>
-        <datalist id="git-local-branch-refs">
-          {localBranches.map((branch) => (
-            <option key={branch.fullRef} value={branch.name} />
-          ))}
-        </datalist>
+            <UploadCloud size={15} aria-hidden="true" />
+            <span>{busy === "push" ? "推送中…" : "推送"}</span>
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -1059,6 +713,15 @@ function readableError(error: unknown): string {
     // The backend can also return a plain-text Git error.
   }
   return raw || "Git 操作失败";
+}
+
+function isNotGitRepositoryError(message: string): boolean {
+  const normalized = message.toLocaleLowerCase();
+  return (
+    normalized.includes("not a git repository") ||
+    normalized.includes("不是 git 仓库") ||
+    normalized.includes("并非 git 仓库")
+  );
 }
 
 function RailSection({

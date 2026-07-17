@@ -302,16 +302,13 @@ async fn execute_spreadsheet_read(
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .context("spreadsheet read action requires path")?;
-    let logical_path = normalize_workspace_path(&ctx.workspace_root, relative);
-    ensure_xlsx_path(&logical_path)?;
-    match ctx.policy.inspect_read(&logical_path) {
-        PolicyDecision::Allow => {}
-        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-    }
+    let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
+    enforce_read_policy(&ctx, &logical_path)?;
+    let resolved_path = ctx.environment.resolve_read_path(&logical_path)?;
+    ensure_xlsx_path(&resolved_path)?;
     let read = ctx
         .environment
-        .read_file(FileReadRequest::new(&logical_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
+        .read_file(FileReadRequest::new(&resolved_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
         .await?;
     let resolved_path = read.path.clone();
     let source_path = resolved_path.clone();
@@ -364,7 +361,7 @@ async fn execute_spreadsheet_write(
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .context("spreadsheet write requires outputPath")?;
-    let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative);
+    let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
     ensure_xlsx_path(&output_path)?;
     match ctx.policy.inspect_write(&output_path) {
         PolicyDecision::Allow => {}
@@ -378,13 +375,10 @@ async fn execute_spreadsheet_write(
         .map(str::trim)
         .filter(|path| !path.is_empty())
     {
-        let path = normalize_workspace_path(&ctx.workspace_root, relative);
+        let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
+        enforce_read_policy(&ctx, &logical_path)?;
+        let path = ctx.environment.resolve_read_path(&logical_path)?;
         ensure_xlsx_path(&path)?;
-        match ctx.policy.inspect_read(&path) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
         Some(
             ctx.environment
                 .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
@@ -1561,12 +1555,9 @@ impl Tool for ListFilesTool {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or(".");
-        let path = normalize_workspace_path(&ctx.workspace_root, relative);
-        match ctx.policy.inspect_read(&path) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
+        let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
+        enforce_read_policy(&ctx, &logical_path)?;
+        let path = ctx.environment.resolve_read_path(&logical_path)?;
 
         let entries = tokio::task::spawn_blocking(move || list_dir_entries(&path))
             .await
@@ -1610,12 +1601,9 @@ impl Tool for ReadFileTool {
             .get("path")
             .and_then(Value::as_str)
             .context("read_file requires a path")?;
-        let path = normalize_workspace_path(&ctx.workspace_root, relative);
-        match ctx.policy.inspect_read(&path) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
+        let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
+        enforce_read_policy(&ctx, &logical_path)?;
+        let path = ctx.environment.resolve_read_path(&logical_path)?;
 
         let read = ctx
             .environment
@@ -1705,7 +1693,7 @@ impl Tool for WriteFileTool {
             .get("content")
             .and_then(Value::as_str)
             .context("write_file requires content")?;
-        let path = normalize_workspace_path(&ctx.workspace_root, relative);
+        let path = normalize_workspace_path(&ctx.workspace_root, relative)?;
         match ctx.policy.inspect_write(&path) {
             PolicyDecision::Allow => {}
             PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
@@ -1787,12 +1775,9 @@ impl Tool for SearchTool {
             .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
             .min(SEARCH_MAX_RESULTS_LIMIT);
 
-        let path = normalize_workspace_path(&ctx.workspace_root, relative);
-        match ctx.policy.inspect_read(&path) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
+        let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
+        enforce_read_policy(&ctx, &logical_path)?;
+        let path = ctx.environment.resolve_read_path(&logical_path)?;
 
         let search_arg = search_command_path(relative, &path);
         let result =
@@ -1919,7 +1904,7 @@ impl Tool for ShellTool {
         let output = ctx
             .environment
             .exec(
-                ExecRequest::shell(command),
+                ExecRequest::shell(command).cwd(&ctx.workspace_root),
                 ctx.execution_context(Duration::from_secs(timeout_seconds)),
             )
             .await?;
@@ -2113,12 +2098,30 @@ impl Tool for ApplyPatchTool {
     }
 }
 
-fn normalize_workspace_path(workspace_root: &Path, path: &str) -> PathBuf {
+fn normalize_workspace_path(workspace_root: &Path, path: &str) -> anyhow::Result<PathBuf> {
     let candidate = PathBuf::from(path);
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "workspace path cannot contain '..': {}",
+            candidate.display()
+        );
+    }
     if candidate.is_absolute() {
-        candidate
+        Ok(candidate)
     } else {
-        workspace_root.join(candidate)
+        Ok(workspace_root.join(candidate))
+    }
+}
+
+fn enforce_read_policy(ctx: &ToolContext, path: &Path) -> anyhow::Result<()> {
+    match ctx.policy.inspect_read(path) {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
+        PolicyDecision::Ask { .. } if ctx.approval_granted => Ok(()),
+        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
     }
 }
 
@@ -2682,6 +2685,144 @@ mod tests {
         assert!(!looks_like_sandbox_denial("cargo test failed"));
     }
 
+    #[tokio::test]
+    async fn file_observation_tools_reject_parent_traversal_and_absolute_parent_paths() {
+        let id = Uuid::new_v4();
+        let workspace_root = std::env::temp_dir().join(format!("opentopia-tools-root-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-tools-outside-{id}"));
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "outside marker").unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut context = ToolContext::local(workspace_root.clone(), policy);
+
+        let traversal = ListFilesTool
+            .execute(
+                ToolCall::new("list_files", json!({ "path": "../.." })),
+                context.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(traversal.to_string().contains("cannot contain '..'"));
+
+        let outside_path = outside.display().to_string();
+        let approval_error = ReadFileTool
+            .execute(
+                ToolCall::new(
+                    "read_file",
+                    json!({ "path": outside.join("secret.txt").display().to_string() }),
+                ),
+                context.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(approval_error.to_string().contains("approval required"));
+
+        context.approval_granted = true;
+        let list_error = ListFilesTool
+            .execute(
+                ToolCall::new("list_files", json!({ "path": outside_path })),
+                context.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(list_error
+            .to_string()
+            .contains("no readable root authorized"));
+
+        let read_error = ReadFileTool
+            .execute(
+                ToolCall::new(
+                    "read_file",
+                    json!({ "path": outside.join("secret.txt").display().to_string() }),
+                ),
+                context.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(read_error
+            .to_string()
+            .contains("no readable root authorized"));
+
+        let search_error = SearchTool
+            .execute(
+                ToolCall::new(
+                    "search",
+                    json!({ "query": "marker", "path": outside.display().to_string() }),
+                ),
+                context,
+            )
+            .await
+            .unwrap_err();
+        assert!(search_error
+            .to_string()
+            .contains("no readable root authorized"));
+
+        fs::remove_dir_all(workspace_root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_observation_tools_preserve_explicit_additional_readable_roots() {
+        let id = Uuid::new_v4();
+        let workspace_root = std::env::temp_dir().join(format!("opentopia-tools-root-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-tools-readable-{id}"));
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("allowed.txt"), "configured marker").unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut config = LocalSandboxConfig::default();
+        config.read_paths = vec![outside.clone()];
+        let mut context =
+            ToolContext::local_with_sandbox_config(workspace_root.clone(), policy, config);
+        context.approval_granted = true;
+
+        let listed = ListFilesTool
+            .execute(
+                ToolCall::new(
+                    "list_files",
+                    json!({ "path": outside.display().to_string() }),
+                ),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(listed.output.contains("allowed.txt"));
+
+        let read = ReadFileTool
+            .execute(
+                ToolCall::new(
+                    "read_file",
+                    json!({ "path": outside.join("allowed.txt").display().to_string() }),
+                ),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(read.output.contains("configured marker"));
+
+        let searched = SearchTool
+            .execute(
+                ToolCall::new(
+                    "search",
+                    json!({ "query": "configured marker", "path": outside.display().to_string() }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+        assert!(searched.output.contains("configured marker"));
+
+        fs::remove_dir_all(workspace_root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
     #[test]
     fn browser_domain_grants_are_thread_scoped_and_normalized() {
         let store = SqliteSessionStore::open(":memory:").expect("open store");
@@ -3041,5 +3182,48 @@ mod tests {
             .unwrap();
         assert!(read.output.contains("ready"));
         fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn write_file_allows_verbatim_workspace_target_in_approve_mode() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "opentopia-write-verbatim-workspace-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(workspace_root.join("design")).expect("create workspace fixture");
+        let verbatim_root = workspace_root.canonicalize().expect("canonical workspace");
+        assert!(verbatim_root.to_string_lossy().starts_with(r"\\?\"));
+        let target = verbatim_root.join("design/requirements.md");
+        let policy = Arc::new(BasicPolicyEngine::new(
+            verbatim_root.clone(),
+            PermissionMode::Approve,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            verbatim_root,
+            policy,
+            LocalSandboxConfig::default(),
+        );
+
+        let result = WriteFileTool
+            .execute(
+                ToolCall::new(
+                    "write_file",
+                    json!({
+                        "path": target.display().to_string(),
+                        "content": "workspace write is authorized"
+                    }),
+                ),
+                context,
+            )
+            .await
+            .expect("workspace write must not require approval");
+
+        assert_eq!(result.metadata["changedPath"], target.display().to_string());
+        assert_eq!(
+            fs::read_to_string(&target).expect("read written fixture"),
+            "workspace write is authorized"
+        );
+        fs::remove_dir_all(workspace_root).expect("remove workspace fixture");
     }
 }

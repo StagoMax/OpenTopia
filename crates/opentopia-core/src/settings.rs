@@ -8,6 +8,7 @@ use std::path::PathBuf;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Mock,
+    #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible,
 }
 
@@ -27,6 +28,14 @@ pub struct ProviderSettings {
     pub kind: ProviderKind,
     pub base_url: String,
     pub model: String,
+    #[serde(default = "default_provider_temperature")]
+    pub temperature: f64,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default = "default_provider_context_window_tokens")]
+    pub context_window_tokens: usize,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub api_key_source: String,
     pub api_key_configured: bool,
     pub health_status: Option<String>,
@@ -39,6 +48,10 @@ impl Default for ProviderSettings {
             kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4.1-mini".to_string(),
+            temperature: default_provider_temperature(),
+            max_output_tokens: None,
+            context_window_tokens: default_provider_context_window_tokens(),
+            reasoning_effort: None,
             api_key_source: "OPENTOPIA_API_KEY".to_string(),
             api_key_configured: false,
             health_status: None,
@@ -51,16 +64,16 @@ impl ProviderSettings {
         let mut settings = Self::default();
         if let Some(base_url) = first_env([
             "OPENTOPIA_OPENAI_BASE_URL",
-            "CREDIT_REVIEW_LLM_BASE_URL",
             "AUDIT_COPILOT_LLM_BASE_URL",
+            "CREDIT_REVIEW_LLM_BASE_URL",
             "OPENAI_BASE_URL",
         ]) {
             settings.base_url = base_url;
         }
         if let Some(model) = first_env([
             "OPENTOPIA_MODEL",
-            "CREDIT_REVIEW_LLM_MODEL",
             "AUDIT_COPILOT_LLM_MODEL",
+            "CREDIT_REVIEW_LLM_MODEL",
             "CREDIT_REVIEW_LLM_CHEAP_MODEL",
             "CREDIT_REVIEW_LLM_STRONG_MODEL",
         ]) {
@@ -68,8 +81,8 @@ impl ProviderSettings {
         }
         if let Some((source, _value)) = first_env_with_key([
             "OPENTOPIA_API_KEY",
-            "CREDIT_REVIEW_LLM_API_KEY",
             "AUDIT_COPILOT_LLM_API_KEY",
+            "CREDIT_REVIEW_LLM_API_KEY",
             "OPENAI_API_KEY",
         ]) {
             settings.api_key_source = source;
@@ -77,6 +90,14 @@ impl ProviderSettings {
         }
         settings
     }
+}
+
+fn default_provider_temperature() -> f64 {
+    0.2
+}
+
+fn default_provider_context_window_tokens() -> usize {
+    128_000
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -469,6 +490,27 @@ mod tests {
         .expect("deserialize settings without sandbox");
 
         assert_eq!(settings.sandbox, SandboxSettings::default());
+    }
+
+    #[test]
+    fn legacy_provider_json_uses_generation_defaults() {
+        let provider: ProviderSettings = serde_json::from_str(
+            r#"{
+                "id": "legacy",
+                "kind": "openai_compatible",
+                "baseUrl": "https://example.test/v1",
+                "model": "legacy-model",
+                "apiKeySource": "OPENTOPIA_API_KEY",
+                "apiKeyConfigured": true,
+                "healthStatus": null
+            }"#,
+        )
+        .expect("deserialize provider without generation settings");
+
+        assert_eq!(provider.temperature, 0.2);
+        assert_eq!(provider.max_output_tokens, None);
+        assert_eq!(provider.context_window_tokens, 128_000);
+        assert_eq!(provider.reasoning_effort, None);
     }
 
     #[test]

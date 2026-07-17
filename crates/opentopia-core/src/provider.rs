@@ -90,6 +90,9 @@ pub enum ModelStreamDelta {
     Text {
         text: String,
     },
+    Reasoning {
+        text: String,
+    },
     ToolCall {
         index: usize,
         id: Option<String>,
@@ -183,6 +186,9 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: String,
     model: String,
+    temperature: f64,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -196,6 +202,9 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
+            temperature: 0.2,
+            max_output_tokens: None,
+            reasoning_effort: None,
         }
     }
 
@@ -203,23 +212,23 @@ impl OpenAiCompatibleProvider {
         let env = ProviderEnv::load();
         let api_key = env.first([
             "OPENTOPIA_API_KEY",
-            "CREDIT_REVIEW_LLM_API_KEY",
             "AUDIT_COPILOT_LLM_API_KEY",
+            "CREDIT_REVIEW_LLM_API_KEY",
             "OPENAI_API_KEY",
         ])?;
         let base_url = env
             .first([
                 "OPENTOPIA_OPENAI_BASE_URL",
-                "CREDIT_REVIEW_LLM_BASE_URL",
                 "AUDIT_COPILOT_LLM_BASE_URL",
+                "CREDIT_REVIEW_LLM_BASE_URL",
                 "OPENAI_BASE_URL",
             ])
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         let model = env
             .first([
                 "OPENTOPIA_MODEL",
-                "CREDIT_REVIEW_LLM_MODEL",
                 "AUDIT_COPILOT_LLM_MODEL",
+                "CREDIT_REVIEW_LLM_MODEL",
                 "CREDIT_REVIEW_LLM_CHEAP_MODEL",
                 "CREDIT_REVIEW_LLM_STRONG_MODEL",
             ])
@@ -235,18 +244,27 @@ impl OpenAiCompatibleProvider {
             .ok()
             .filter(|value| !value.is_empty())
             .or_else(|| {
+                if settings.api_key_source != "OPENTOPIA_API_KEY" {
+                    return None;
+                }
                 ProviderEnv::load().first([
                     "OPENTOPIA_API_KEY",
-                    "CREDIT_REVIEW_LLM_API_KEY",
                     "AUDIT_COPILOT_LLM_API_KEY",
+                    "CREDIT_REVIEW_LLM_API_KEY",
                     "OPENAI_API_KEY",
                 ])
             })?;
-        Some(Self::new(
-            settings.base_url.clone(),
-            api_key,
-            settings.model.clone(),
-        ))
+        Some(
+            Self::new(settings.base_url.clone(), api_key, settings.model.clone())
+                .with_generation_settings(settings),
+        )
+    }
+
+    fn with_generation_settings(mut self, settings: &ProviderSettings) -> Self {
+        self.temperature = settings.temperature;
+        self.max_output_tokens = settings.max_output_tokens;
+        self.reasoning_effort = settings.reasoning_effort.clone();
+        self
     }
 
     async fn stream_completion(
@@ -257,11 +275,21 @@ impl OpenAiCompatibleProvider {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut payload = json!({
             "model": self.model,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "messages": openai_messages(&request),
             "stream": true,
             "stream_options": { "include_usage": true }
         });
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            payload["max_tokens"] = json!(max_output_tokens);
+        }
+        if let Some(reasoning_effort) = self
+            .reasoning_effort
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            payload["reasoning_effort"] = json!(reasoning_effort);
+        }
         if !request.tool_candidates.is_empty() {
             payload["tools"] = json!(openai_tools(&request.tool_candidates));
             payload["tool_choice"] = json!("auto");
@@ -417,6 +445,10 @@ impl OpenAiStreamAccumulator {
         let Some(delta) = event.pointer("/choices/0/delta") else {
             return Ok(());
         };
+        let reasoning = extract_stream_reasoning(delta);
+        if !reasoning.is_empty() {
+            on_delta(ModelStreamDelta::Reasoning { text: reasoning })?;
+        }
         let text = extract_stream_text(delta.get("content"));
         if !text.is_empty() {
             self.text.push_str(&text);
@@ -496,6 +528,31 @@ fn extract_stream_text(content: Option<&Value>) -> String {
             })
             .collect::<Vec<_>>()
             .join(""),
+        _ => String::new(),
+    }
+}
+
+fn extract_stream_reasoning(delta: &Value) -> String {
+    delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .map(extract_reasoning_value)
+        .unwrap_or_default()
+}
+
+fn extract_reasoning_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(extract_reasoning_value)
+            .collect::<Vec<_>>()
+            .join(""),
+        Value::Object(fields) => ["text", "content", "summary", "output_text"]
+            .into_iter()
+            .find_map(|key| fields.get(key))
+            .map(extract_reasoning_value)
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -1631,6 +1688,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn emits_provider_supplied_reasoning_deltas_without_synthesizing_text() {
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        let mut deltas = Vec::new();
+        let mut collect = |delta| {
+            deltas.push(delta);
+            Ok(())
+        };
+
+        accumulator
+            .apply(
+                &json!({
+                    "choices": [{"delta": {
+                        "reasoning_content": "检查工作区"
+                    }}]
+                }),
+                &mut collect,
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                &json!({
+                    "choices": [{"delta": {
+                        "reasoning": {
+                            "summary": [{"type": "summary_text", "text": "并制定计划"}]
+                        }
+                    }}]
+                }),
+                &mut collect,
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                &json!({
+                    "choices": [{"delta": {"content": "开始执行"}}]
+                }),
+                &mut collect,
+            )
+            .unwrap();
+
+        let response = accumulator.finish().unwrap();
+        assert_eq!(response.text, "开始执行");
+        assert_eq!(
+            deltas,
+            vec![
+                ModelStreamDelta::Reasoning {
+                    text: "检查工作区".to_string(),
+                },
+                ModelStreamDelta::Reasoning {
+                    text: "并制定计划".to_string(),
+                },
+                ModelStreamDelta::Text {
+                    text: "开始执行".to_string(),
+                },
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn default_stream_emits_one_complete_text_delta() {
         let provider = MockProvider;
@@ -1678,8 +1793,11 @@ mod tests {
                 .unwrap();
             socket.shutdown().await.unwrap();
         });
-        let provider =
+        let mut provider =
             OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+        provider.temperature = 0.7;
+        provider.max_output_tokens = Some(2048);
+        provider.reasoning_effort = Some("high".to_string());
         let mut request = model_request();
         request.conversation.push(ModelConversationMessage {
             role: ModelConversationRole::Assistant,
@@ -1710,6 +1828,10 @@ mod tests {
         let payload: Value = serde_json::from_str(body).unwrap();
 
         assert_eq!(payload["stream"], true);
+        let temperature = payload["temperature"].as_f64().unwrap();
+        assert!((temperature - 0.7).abs() < 0.000_001);
+        assert_eq!(payload["max_tokens"], 2048);
+        assert_eq!(payload["reasoning_effort"], "high");
         assert_eq!(payload["stream_options"]["include_usage"], true);
         assert_eq!(payload["tool_choice"], "auto");
         assert_eq!(payload["parallel_tool_calls"], false);

@@ -2308,6 +2308,36 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_store_round_trips_reasoning_delta_events() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/reasoning-events"))
+            .expect("create thread");
+        let turn_id = Uuid::new_v4();
+        let event = AgentEvent::new(
+            thread.id,
+            Some(turn_id),
+            0,
+            AgentEventPayload::ReasoningDelta {
+                text: "正在核对依赖".to_string(),
+            },
+        );
+
+        let stored = store.append_event(event).expect("append reasoning event");
+        assert_eq!(stored.kind(), "reasoning_delta");
+
+        let events = store.list_events(thread.id, None).expect("list events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].turn_id, Some(turn_id));
+        match &events[0].payload {
+            AgentEventPayload::ReasoningDelta { text } => {
+                assert_eq!(text, "正在核对依赖");
+            }
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+    }
+
+    #[test]
     fn workspace_keys_normalize_windows_drive_and_unc_paths() {
         let drive = normalize_workspace_key(Path::new(r"J:\Project\OpenTopia\"));
         assert_eq!(drive, "j:/project/opentopia");

@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -11,9 +12,11 @@ import {
 import { createPortal } from "react-dom";
 import {
   Activity,
+  AlertCircle,
   Archive,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
   Bot,
   Box,
   Check,
@@ -30,6 +33,8 @@ import {
   GitPullRequest,
   GitFork,
   Globe2,
+  Hand,
+  Laptop,
   Loader2,
   Menu,
   MessageCircle,
@@ -44,8 +49,9 @@ import {
   Plus,
   RotateCcw,
   Search,
-  Send,
   Settings,
+  ShieldAlert,
+  ShieldCheck,
   Square,
   SquarePen,
   TerminalSquare,
@@ -55,19 +61,24 @@ import {
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
 import { LogViewer } from "./components/LogViewer";
+import {
+  ApprovalDialog,
+  type ApprovalRequest,
+} from "./components/ApprovalDialog";
 import { PreviewHost } from "./components/PreviewHost";
 import { RightContextRail } from "./components/RightContextRail";
+import { TurnActivityTimeline } from "./components/TurnActivityTimeline";
 import { WebPreviewSurface } from "./components/WebPreviewSurface";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
 import {
-  deleteSecret,
+  deleteProviderApiKey,
   getRecentWorkspaces,
   listSecretSources,
   loadPlatformInfo,
   openPath,
   selectContextFiles,
   selectWorkspace,
-  setSecret,
+  setProviderApiKey,
 } from "./platform";
 import type {
   AgentEvent,
@@ -79,18 +90,19 @@ import type {
   McpServerView,
   Message,
   MessagePart,
+  KeyringMetadata,
   PlatformInfo,
   Project,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
+  ProviderSettings,
   PreviewTarget,
   RecentWorkspace,
   SandboxDescriptor,
   SecretSources,
   SkillDescriptor,
   SubagentRun,
-  TaskPlan,
   TerminalEvent,
   TerminalSession,
   Thread,
@@ -116,6 +128,9 @@ type ToolTab = {
 
 type DirectToolCommand =
   { kind: "run"; command: string } | { kind: "read"; path: string };
+
+type ExecutionPermissionMode = "auto" | "approve" | "full_access";
+type NewTaskLaunchMode = "local" | "new_worktree";
 
 type WorkspaceResizeSide = "left" | "right";
 
@@ -276,6 +291,8 @@ export function App() {
   const [terminalSession, setTerminalSession] =
     useState<TerminalSession | null>(null);
   const [composer, setComposer] = useState("");
+  const [newTaskLaunchMode, setNewTaskLaunchMode] =
+    useState<NewTaskLaunchMode>("local");
   const [contextSources, setContextSources] = useState<ContextSourceFile[]>([]);
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
@@ -285,6 +302,9 @@ export function App() {
   const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(
     null,
   );
+  const [approvalDecisionError, setApprovalDecisionError] = useState<
+    string | null
+  >(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [providerHealth, setProviderHealth] = useState<ProviderHealth[]>([]);
@@ -365,6 +385,31 @@ export function App() {
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
   );
+  const pendingApprovalQueue = useMemo(
+    () =>
+      events
+        .filter(
+          (event): event is AgentEvent & { payload: ApprovalRequest } =>
+            event.payload.type === "approval_requested" &&
+            pendingApprovalIds.includes(event.payload.approval_id),
+        )
+        .sort((a, b) => a.seq - b.seq),
+    [events, pendingApprovalIds],
+  );
+  const activeApproval = pendingApprovalQueue[0]?.payload ?? null;
+
+  useEffect(() => {
+    if (!activeApproval) return;
+    setConversationCollapsed(false);
+    setActiveToolTabId(null);
+    setActionError((current) =>
+      current &&
+      /resolve the pending approval before starting another turn/i.test(current)
+        ? null
+        : current,
+    );
+  }, [activeApproval?.approval_id]);
+
   const workspaceLayout = useMemo(
     () =>
       resolveWorkspaceLayout(
@@ -456,8 +501,16 @@ export function App() {
 
     if (event.payload.type === "approval_requested") {
       const approvalId = event.payload.approval_id;
+      setApprovalDecisionError(null);
+      setConversationCollapsed(false);
       setPendingApprovalIds((current) =>
         current.includes(approvalId) ? current : [...current, approvalId],
+      );
+    }
+
+    if (event.payload.type === "error") {
+      setActionError(
+        `Agent 请求失败：${friendlyProviderError(event.payload.message)}`,
       );
     }
 
@@ -566,6 +619,16 @@ export function App() {
           nextClient.listMcpServers(),
         ]);
 
+        if (
+          loadedSettings.permissionMode === "chat" ||
+          loadedSettings.permissionMode === "read_only"
+        ) {
+          loadedSettings = await nextClient.updateSettings({
+            permissionMode: "auto",
+            sandbox: controlledSandboxSettings(loadedSettings.sandbox),
+          });
+        }
+
         try {
           const migrated = await migrateLegacyProjectData(
             nextClient,
@@ -623,6 +686,9 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    setPendingApprovalIds([]);
+    setDecidingApprovalId(null);
+    setApprovalDecisionError(null);
     if (!client || !activeThreadId) return;
     let cancelled = false;
     let source: StreamHandle | null = null;
@@ -772,6 +838,7 @@ export function App() {
     setMessages([]);
     setEvents([]);
     setComposer("");
+    setNewTaskLaunchMode("local");
     setContextSources([]);
     setSelectedSkillIds([]);
     setActiveTurnId(null);
@@ -1061,15 +1128,7 @@ export function App() {
   }
 
   async function saveSettings(input: {
-    providers?: {
-      id: string;
-      kind: ProviderKind;
-      baseUrl: string;
-      model: string;
-      apiKeySource: string;
-      apiKeyConfigured: boolean;
-      healthStatus?: string | null;
-    }[];
+    providers?: ProviderSettings[];
     activeProviderId?: string;
     providerKind?: ProviderKind;
     baseUrl?: string;
@@ -1085,9 +1144,37 @@ export function App() {
       setSettings(updated);
       setProviderHealth(await client.getProviderHealth());
       if (activeThread) setSandbox(await client.getSandbox(activeThread.id));
+    } catch (error) {
+      setActionError(`保存设置失败：${errorMessage(error)}`);
     } finally {
       setIsSavingSettings(false);
     }
+  }
+
+  function changeExecutionPreset(
+    permissionMode: "auto" | "approve" | "full_access",
+  ) {
+    if (!settings || isSavingSettings || activeTurnId) return;
+    if (
+      permissionMode === "full_access" &&
+      !window.confirm(
+        "完全访问权限将允许访问互联网和此电脑上的任意文件。确认继续？",
+      )
+    ) {
+      return;
+    }
+    void saveSettings({
+      permissionMode,
+      sandbox:
+        permissionMode === "full_access"
+          ? {
+              ...settings.sandbox,
+              sandboxMode: "danger-full-access",
+              enforcement: "disabled",
+              network: "allow",
+            }
+          : controlledSandboxSettings(settings.sandbox),
+    });
   }
 
   function changeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]) {
@@ -1188,6 +1275,12 @@ export function App() {
 
   async function createThread(initialPrompt?: string): Promise<Thread | null> {
     if (!client) return null;
+    if (newTaskLaunchMode === "new_worktree") {
+      setActionError(
+        "“新工作树”启动模式尚未接入线程创建；请选择“在本地处理”后继续。",
+      );
+      return null;
+    }
     const directCommand = parseDirectToolCommand(initialPrompt ?? "");
     if (!directCommand && isLegacyDirectToolCommand(initialPrompt ?? "")) {
       setActionError("/run and /read require an argument.");
@@ -1334,7 +1427,8 @@ export function App() {
         contextSources.length === 0 &&
         selectedSkillIds.length === 0) ||
       isSending ||
-      activeTurnId
+      activeTurnId ||
+      activeApproval
     )
       return;
     const directCommand = parseDirectToolCommand(composer);
@@ -1396,10 +1490,22 @@ export function App() {
   async function decideApproval(approvalId: string, approved: boolean) {
     if (!client || !activeThread || decidingApprovalId) return;
     setDecidingApprovalId(approvalId);
+    setApprovalDecisionError(null);
     try {
-      await client.decideApproval(activeThread.id, approvalId, approved);
+      const decision = await client.decideApproval(
+        activeThread.id,
+        approvalId,
+        approved,
+      );
+      if (!decision.accepted) {
+        throw new Error("服务端未接受该审批决定，请重试。");
+      }
       setPendingApprovalIds((current) =>
         current.filter((id) => id !== approvalId),
+      );
+    } catch (error) {
+      setApprovalDecisionError(
+        `审批决定提交失败：${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {
       setDecidingApprovalId(null);
@@ -1575,38 +1681,57 @@ export function App() {
     }
   }
 
-  async function storeProviderApiKey(value: string) {
-    if (!secretSources?.keyring || isSavingSecret) return;
+  async function storeProviderApiKey(
+    providerId: string,
+    value: string,
+  ): Promise<KeyringMetadata | null> {
+    if (isSavingSecret) return null;
     setIsSavingSecret(true);
     setServerError(null);
     try {
-      await setSecret(secretSources.keyring.providerApiKeySourceId, value);
+      const metadata = await setProviderApiKey(providerId, value);
       setSecretSources(await listSecretSources());
+      return metadata;
     } catch (error) {
       setServerError(error instanceof Error ? error.message : String(error));
+      return null;
     } finally {
       setIsSavingSecret(false);
     }
   }
 
-  async function removeProviderApiKey() {
-    if (!secretSources?.keyring || isSavingSecret) return;
+  async function removeProviderApiKey(
+    providerId: string,
+  ): Promise<KeyringMetadata | null> {
+    if (isSavingSecret) return null;
     setIsSavingSecret(true);
     setServerError(null);
     try {
-      await deleteSecret(secretSources.keyring.providerApiKeySourceId);
+      const metadata = await deleteProviderApiKey(providerId);
       setSecretSources(await listSecretSources());
+      return metadata;
     } catch (error) {
       setServerError(error instanceof Error ? error.message : String(error));
+      return null;
     } finally {
       setIsSavingSecret(false);
     }
   }
 
-  async function testProviderConnection(providerId: string) {
+  async function testProviderConnection(
+    providerId: string,
+    providerDrafts?: ProviderSettings[],
+  ) {
     if (!client || providerTest?.status === "testing") return;
     setProviderTest({ providerId, status: "testing" });
     try {
+      if (providerDrafts) {
+        const updated = await client.updateSettings({
+          providers: providerDrafts,
+        });
+        setSettings(updated);
+        setProviderHealth(await client.getProviderHealth());
+      }
       const result = await client.testProviderConnection(providerId);
       setProviderTest({ providerId, status: "complete", result });
     } catch (error) {
@@ -1616,7 +1741,9 @@ export function App() {
         result: {
           reachable: false,
           modelAvailable: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: friendlyProviderError(
+            error instanceof Error ? error.message : String(error),
+          ),
         },
       });
     }
@@ -1828,7 +1955,10 @@ export function App() {
           onDoubleClick={() => resetWorkspacePanelSize("left")}
           onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
         />
-        <section className="center-pane" id="workspace-center-pane">
+        <section
+          className={`center-pane ${activeApproval ? "has-approval" : ""}`}
+          id="workspace-center-pane"
+        >
           <ThreadHeader
             thread={activeThread}
             onOpenLocation={() =>
@@ -1862,38 +1992,54 @@ export function App() {
                   void openArtifact(activeThread.id, artifactId)
                 }
               />
-              <Composer
-                value={composer}
-                isSending={isSending}
-                isRunning={Boolean(activeTurnId)}
-                model={
-                  settings?.providers.find(
-                    (provider) => provider.id === settings.activeProviderId,
-                  )?.model ?? "Model"
-                }
-                permissionMode={settings?.permissionMode ?? "auto"}
-                sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
-                contextSources={contextSources}
-                skills={skills}
-                selectedSkillIds={selectedSkillIds}
-                workspaceRoot={null}
-                projectName={null}
-                projects={projects}
-                canOpenThreadTools
-                onChange={setComposer}
-                onSubmit={submitMessage}
-                onCancel={() => void cancelTurn()}
-                onOpenTool={openToolTab}
-                onPickWorkspace={() => void chooseWorkspace()}
-                onSelectProject={selectProject}
-                onChangePermissionMode={(permissionMode) =>
-                  void saveSettings({ permissionMode })
-                }
-                onChangeSandboxMode={changeSandboxMode}
-                onAddContextSources={() => void addContextSources()}
-                onRemoveContextSource={removeContextSource}
-                onToggleSkill={toggleSkill}
-              />
+              {activeApproval ? (
+                <ApprovalDialog
+                  key={activeApproval.approval_id}
+                  request={activeApproval}
+                  queuePosition={1}
+                  queueLength={pendingApprovalQueue.length}
+                  isSubmitting={
+                    decidingApprovalId === activeApproval.approval_id
+                  }
+                  error={approvalDecisionError}
+                  onDecision={(approved) =>
+                    void decideApproval(activeApproval.approval_id, approved)
+                  }
+                />
+              ) : (
+                <Composer
+                  value={composer}
+                  isSending={isSending}
+                  isRunning={Boolean(activeTurnId)}
+                  model={
+                    settings?.providers.find(
+                      (provider) => provider.id === settings.activeProviderId,
+                    )?.model ?? "Model"
+                  }
+                  permissionMode={settings?.permissionMode ?? "auto"}
+                  sandboxMode={
+                    settings?.sandbox.sandboxMode ?? "workspace-write"
+                  }
+                  contextSources={contextSources}
+                  skills={skills}
+                  selectedSkillIds={selectedSkillIds}
+                  workspaceRoot={null}
+                  projectName={null}
+                  projects={projects}
+                  canOpenThreadTools
+                  onChange={setComposer}
+                  onSubmit={submitMessage}
+                  onCancel={() => void cancelTurn()}
+                  onOpenTool={openToolTab}
+                  onPickWorkspace={() => void chooseWorkspace()}
+                  onSelectProject={selectProject}
+                  onChangePermissionMode={changeExecutionPreset}
+                  onChangeSandboxMode={changeSandboxMode}
+                  onAddContextSources={() => void addContextSources()}
+                  onRemoveContextSource={removeContextSource}
+                  onToggleSkill={toggleSkill}
+                />
+              )}
             </>
           ) : (
             <NewTaskState
@@ -1912,13 +2058,13 @@ export function App() {
               skills={skills}
               selectedSkillIds={selectedSkillIds}
               isSending={isSending}
+              launchMode={newTaskLaunchMode}
               onChange={setComposer}
+              onChangeLaunchMode={setNewTaskLaunchMode}
               onPickWorkspace={() => void chooseWorkspace(true)}
               onSelectProject={selectProject}
               onOpenTool={openToolTab}
-              onChangePermissionMode={(permissionMode) =>
-                void saveSettings({ permissionMode })
-              }
+              onChangePermissionMode={changeExecutionPreset}
               onChangeSandboxMode={changeSandboxMode}
               onAddContextSources={() => void addContextSources()}
               onRemoveContextSource={removeContextSource}
@@ -2029,11 +2175,11 @@ export function App() {
           isSaving={isSavingSettings}
           isSavingSecret={isSavingSecret}
           onSave={(input) => void saveSettings(input)}
-          onTestProvider={(providerId) =>
-            void testProviderConnection(providerId)
+          onTestProvider={(providerId, providers) =>
+            void testProviderConnection(providerId, providers)
           }
-          onStoreProviderApiKey={(value) => void storeProviderApiKey(value)}
-          onDeleteProviderApiKey={() => void removeProviderApiKey()}
+          onStoreProviderApiKey={storeProviderApiKey}
+          onDeleteProviderApiKey={removeProviderApiKey}
           onOpenLogs={() => {
             setSettingsOpen(false);
             setLogViewerOpen(true);
@@ -2198,15 +2344,7 @@ function SettingsPanel({
   isSaving: boolean;
   isSavingSecret: boolean;
   onSave(input: {
-    providers?: {
-      id: string;
-      kind: ProviderKind;
-      baseUrl: string;
-      model: string;
-      apiKeySource: string;
-      apiKeyConfigured: boolean;
-      healthStatus?: string | null;
-    }[];
+    providers?: ProviderSettings[];
     activeProviderId?: string;
     providerKind?: ProviderKind;
     baseUrl?: string;
@@ -2215,23 +2353,18 @@ function SettingsPanel({
     permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
     sandbox?: AppSettings["sandbox"];
   }): void;
-  onTestProvider(providerId: string): void;
-  onStoreProviderApiKey(value: string): void;
-  onDeleteProviderApiKey(): void;
+  onTestProvider(providerId: string, providers: ProviderSettings[]): void;
+  onStoreProviderApiKey(
+    providerId: string,
+    value: string,
+  ): Promise<KeyringMetadata | null>;
+  onDeleteProviderApiKey(providerId: string): Promise<KeyringMetadata | null>;
   onOpenLogs(): void;
   onClose(): void;
 }) {
-  const [providers, setProviders] = useState<
-    {
-      id: string;
-      kind: ProviderKind;
-      baseUrl: string;
-      model: string;
-      apiKeySource: string;
-      apiKeyConfigured: boolean;
-      healthStatus?: string | null;
-    }[]
-  >(settings?.providers ?? []);
+  const [providers, setProviders] = useState<ProviderSettings[]>(
+    settings?.providers ?? [],
+  );
   const [activeProviderId, setActiveProviderId] = useState(
     settings?.activeProviderId ?? providers[0]?.id ?? "default",
   );
@@ -2266,7 +2399,15 @@ function SettingsPanel({
     }
   }, [settings]);
 
-  function updateProvider(id: string, field: string, value: string) {
+  useEffect(() => {
+    setProviderApiKey("");
+  }, [editingProviderId]);
+
+  function updateProvider<K extends keyof ProviderSettings>(
+    id: string,
+    field: K,
+    value: ProviderSettings[K],
+  ) {
     setProviders((current) =>
       current.map((p) => (p.id === id ? { ...p, [field]: value } : p)),
     );
@@ -2281,6 +2422,10 @@ function SettingsPanel({
         kind: "openai_compatible",
         baseUrl: "https://api.openai.com/v1",
         model: "gpt-4.1-mini",
+        temperature: 0.2,
+        maxOutputTokens: null,
+        contextWindowTokens: 128000,
+        reasoningEffort: null,
         apiKeySource: "OPENTOPIA_API_KEY",
         apiKeyConfigured: false,
         healthStatus: null,
@@ -2344,18 +2489,24 @@ function SettingsPanel({
             Permission
             <select
               value={permissionMode}
-              onChange={(event) =>
-                setPermissionMode(
-                  event.target.value as
-                    "chat" | "read_only" | "auto" | "approve" | "full_access",
-                )
-              }
+              onChange={(event) => {
+                const nextMode = event.target.value as ExecutionPermissionMode;
+                setPermissionMode(nextMode);
+                setSandboxSettings((current) =>
+                  nextMode === "full_access"
+                    ? {
+                        ...current,
+                        sandboxMode: "danger-full-access",
+                        enforcement: "disabled",
+                        network: "allow",
+                      }
+                    : controlledSandboxSettings(current),
+                );
+              }}
             >
-              <option value="chat">Chat</option>
-              <option value="read_only">Read Only</option>
-              <option value="auto">Auto</option>
-              <option value="approve">Approve</option>
-              <option value="full_access">Full Access</option>
+              <option value="approve">请求批准</option>
+              <option value="auto">替我审批</option>
+              <option value="full_access">完全访问权限</option>
             </select>
           </label>
 
@@ -2524,9 +2675,8 @@ function SettingsPanel({
                     ID
                     <input
                       value={editingProvider.id}
-                      onChange={(e) =>
-                        updateProvider(editingProvider.id, "id", e.target.value)
-                      }
+                      disabled
+                      title="Provider ID 创建后保持稳定，用于关联安全存储中的凭据"
                     />
                   </label>
                   <label>
@@ -2537,7 +2687,7 @@ function SettingsPanel({
                         updateProvider(
                           editingProvider.id,
                           "kind",
-                          e.target.value,
+                          e.target.value as ProviderKind,
                         )
                       }
                     >
@@ -2573,19 +2723,83 @@ function SettingsPanel({
                       }
                     />
                   </label>
-                  <label>
-                    API Key Env
-                    <input
-                      value={editingProvider.apiKeySource}
-                      onChange={(e) =>
-                        updateProvider(
-                          editingProvider.id,
-                          "apiKeySource",
-                          e.target.value,
-                        )
-                      }
-                    />
-                  </label>
+                  <div className="settings-provider-parameters">
+                    <label>
+                      Temperature
+                      <input
+                        type="number"
+                        min="0"
+                        max="2"
+                        step="0.1"
+                        value={editingProvider.temperature}
+                        onChange={(event) =>
+                          updateProvider(
+                            editingProvider.id,
+                            "temperature",
+                            Number(event.target.value),
+                          )
+                        }
+                      />
+                    </label>
+                    <label>
+                      Max output tokens
+                      <input
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={editingProvider.maxOutputTokens ?? ""}
+                        placeholder="Provider default"
+                        onChange={(event) =>
+                          updateProvider(
+                            editingProvider.id,
+                            "maxOutputTokens",
+                            event.target.value
+                              ? Number(event.target.value)
+                              : null,
+                          )
+                        }
+                      />
+                    </label>
+                    <label>
+                      Context window
+                      <input
+                        type="number"
+                        min="4096"
+                        step="1024"
+                        value={editingProvider.contextWindowTokens}
+                        onChange={(event) =>
+                          updateProvider(
+                            editingProvider.id,
+                            "contextWindowTokens",
+                            Number(event.target.value),
+                          )
+                        }
+                      />
+                    </label>
+                    <label>
+                      Reasoning effort
+                      <select
+                        value={editingProvider.reasoningEffort ?? ""}
+                        onChange={(event) =>
+                          updateProvider(
+                            editingProvider.id,
+                            "reasoningEffort",
+                            (event.target.value || null) as
+                              "low" | "medium" | "high" | null,
+                          )
+                        }
+                      >
+                        <option value="">Provider default</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="settings-provider-key-reference">
+                    Credential reference:{" "}
+                    <code>{editingProvider.apiKeySource}</code>
+                  </div>
                   <div className="settings-provider-health-status">
                     {(() => {
                       const health = providerHealth.find(
@@ -2613,7 +2827,9 @@ function SettingsPanel({
                       type="button"
                       className="secondary-button"
                       disabled={providerTest?.status === "testing"}
-                      onClick={() => onTestProvider(editingProvider.id)}
+                      onClick={() =>
+                        onTestProvider(editingProvider.id, providers)
+                      }
                     >
                       {providerTest?.providerId === editingProvider.id &&
                       providerTest.status === "testing"
@@ -2635,7 +2851,7 @@ function SettingsPanel({
                     secretSources?.keyring && (
                       <div className="settings-secret-section">
                         <label>
-                          Desktop API key
+                          API key for {editingProvider.id}
                           <input
                             type="password"
                             autoComplete="off"
@@ -2658,8 +2874,32 @@ function SettingsPanel({
                               !providerApiKey.trim()
                             }
                             onClick={() => {
-                              onStoreProviderApiKey(providerApiKey);
-                              setProviderApiKey("");
+                              const providerId = editingProvider.id;
+                              const value = providerApiKey;
+                              void onStoreProviderApiKey(
+                                providerId,
+                                value,
+                              ).then((metadata) => {
+                                if (!metadata) return;
+                                const nextProviders = providers.map(
+                                  (provider) =>
+                                    provider.id === providerId
+                                      ? {
+                                          ...provider,
+                                          apiKeySource: metadata.envTarget,
+                                          apiKeyConfigured: true,
+                                        }
+                                      : provider,
+                                );
+                                setProviders(nextProviders);
+                                setProviderApiKey("");
+                                onSave({
+                                  providers: nextProviders,
+                                  activeProviderId,
+                                  permissionMode,
+                                  sandbox: sandboxSettings,
+                                });
+                              });
                             }}
                           >
                             Store key
@@ -2669,15 +2909,38 @@ function SettingsPanel({
                             className="secondary-button"
                             disabled={
                               isSavingSecret ||
-                              !secretSources.keyring.providerApiKeyConfigured
+                              !editingProvider.apiKeyConfigured
                             }
-                            onClick={onDeleteProviderApiKey}
+                            onClick={() => {
+                              const providerId = editingProvider.id;
+                              void onDeleteProviderApiKey(providerId).then(
+                                (metadata) => {
+                                  if (!metadata) return;
+                                  const nextProviders = providers.map(
+                                    (provider) =>
+                                      provider.id === providerId
+                                        ? {
+                                            ...provider,
+                                            apiKeyConfigured: false,
+                                          }
+                                        : provider,
+                                  );
+                                  setProviders(nextProviders);
+                                  onSave({
+                                    providers: nextProviders,
+                                    activeProviderId,
+                                    permissionMode,
+                                    sandbox: sandboxSettings,
+                                  });
+                                },
+                              );
+                            }}
                           >
                             Remove key
                           </button>
                           <span className="settings-provider-test-result">
-                            {secretSources.keyring.providerApiKeyConfigured
-                              ? "Stored for the next backend start"
+                            {editingProvider.apiKeyConfigured
+                              ? "Encrypted in safeStorage and active"
                               : secretSources.keyring.status}
                           </span>
                         </div>
@@ -3501,17 +3764,23 @@ function MessageList({
         )
         .join("")
     : "";
-  const completedToolSteps = activeTurnId
-    ? events.filter(
-        (event) =>
-          event.turnId === activeTurnId &&
-          event.payload.type === "tool_call_finished",
-      ).length
-    : 0;
-  const latestPlan = events.reduce<TaskPlan | null>(
-    (current, event) =>
-      event.payload.type === "plan_updated" ? event.payload.plan : current,
-    null,
+  const eventsByTurn = new Map<string, AgentEvent[]>();
+  const turnIdByUserMessage = new Map<string, string>();
+  for (const event of events) {
+    if (event.turnId) {
+      const current = eventsByTurn.get(event.turnId) ?? [];
+      current.push(event);
+      eventsByTurn.set(event.turnId, current);
+    }
+    if (event.turnId && event.payload.type === "turn_started") {
+      turnIdByUserMessage.set(event.payload.user_message_id, event.turnId);
+    }
+  }
+  const anchoredTurnIds = new Set(turnIdByUserMessage.values());
+  const orphanTurnErrors = events.filter(
+    (event) =>
+      event.payload.type === "error" &&
+      (!event.turnId || !anchoredTurnIds.has(event.turnId)),
   );
   return (
     <div className="message-list">
@@ -3522,19 +3791,46 @@ function MessageList({
           <p>当前任务尚未产生消息。</p>
         </div>
       ) : (
-        messages.map((message) => (
-          <MessageBubble
-            key={message.id}
-            message={message}
-            threadId={threadId}
-            artifacts={artifacts}
-            onOpenArtifact={onOpenArtifact}
-          />
-        ))
+        messages.map((message) => {
+          const turnId =
+            message.role === "user"
+              ? turnIdByUserMessage.get(message.id)
+              : undefined;
+          const turnEvents = turnId ? (eventsByTurn.get(turnId) ?? []) : [];
+          return (
+            <Fragment key={message.id}>
+              <MessageBubble
+                message={message}
+                threadId={threadId}
+                artifacts={artifacts}
+                onOpenArtifact={onOpenArtifact}
+              />
+              {turnId && (
+                <TurnActivityTimeline
+                  events={turnEvents}
+                  isActive={activeTurnId === turnId}
+                  formatError={friendlyProviderError}
+                />
+              )}
+            </Fragment>
+          );
+        })
       )}
-      {latestPlan && latestPlan.steps.length > 0 && (
-        <TaskPlanCard plan={latestPlan} />
-      )}
+      {orphanTurnErrors.map((event) => (
+        <article
+          className="message assistant turn-error-message"
+          key={event.id}
+        >
+          <div className="message-body" role="alert">
+            <AlertCircle size={15} aria-hidden="true" />
+            <span>
+              {event.payload.type === "error"
+                ? friendlyProviderError(event.payload.message)
+                : "Agent 请求失败"}
+            </span>
+          </div>
+        </article>
+      ))}
       {streamingText && (
         <article className="message assistant streaming-message">
           <div className="message-body">
@@ -3542,49 +3838,7 @@ function MessageList({
           </div>
         </article>
       )}
-      {activeTurnId && (
-        <div className="agent-progress" role="status">
-          <Loader2 size={14} className="spin" />
-          <span>{streamingText ? "正在生成回复" : "正在思考"}</span>
-          {completedToolSteps > 0 && (
-            <small>已完成 {completedToolSteps} 个工具步骤</small>
-          )}
-        </div>
-      )}
     </div>
-  );
-}
-
-function TaskPlanCard({ plan }: { plan: TaskPlan }) {
-  const completed = plan.steps.filter(
-    (step) => step.status === "completed",
-  ).length;
-  return (
-    <section className="task-plan-card" aria-label="任务计划">
-      <header>
-        <strong>任务计划</strong>
-        <span>
-          {completed}/{plan.steps.length}
-        </span>
-      </header>
-      {plan.explanation && <p>{plan.explanation}</p>}
-      <ol>
-        {plan.steps.map((item, index) => (
-          <li key={`${index}-${item.step}`} data-status={item.status}>
-            <span className="task-plan-status" aria-hidden="true">
-              {item.status === "completed" ? (
-                <Check size={12} />
-              ) : item.status === "in_progress" ? (
-                <Loader2 size={12} className="spin" />
-              ) : (
-                <span className="task-plan-dot" />
-              )}
-            </span>
-            <span>{item.step}</span>
-          </li>
-        ))}
-      </ol>
-    </section>
   );
 }
 
@@ -3742,6 +3996,7 @@ function Composer({
   workspaceRoot,
   projectName,
   projects,
+  launchMode,
   canOpenThreadTools = false,
   onChange,
   onSubmit,
@@ -3749,6 +4004,7 @@ function Composer({
   onOpenTool,
   onPickWorkspace,
   onSelectProject,
+  onChangeLaunchMode,
   onChangePermissionMode,
   onChangeSandboxMode,
   onAddContextSources,
@@ -3767,6 +4023,7 @@ function Composer({
   workspaceRoot: string | null;
   projectName: string | null;
   projects: Project[];
+  launchMode?: NewTaskLaunchMode;
   canOpenThreadTools?: boolean;
   onChange(value: string): void;
   onSubmit(): void;
@@ -3774,7 +4031,8 @@ function Composer({
   onOpenTool(kind: ToolTabKind): void;
   onPickWorkspace(): void;
   onSelectProject(projectId: string): void;
-  onChangePermissionMode(mode: AppSettings["permissionMode"]): void;
+  onChangeLaunchMode?(mode: NewTaskLaunchMode): void;
+  onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onAddContextSources(): void;
   onRemoveContextSource(path: string): void;
@@ -3857,54 +4115,124 @@ function Composer({
             )}
           </div>
           <div className="composer-menu-wrap">
-            <button
-              className="composer-context-button"
-              type="button"
-              aria-expanded={openMenu === "environment"}
-              onClick={() =>
-                setOpenMenu((current) =>
-                  current === "environment" ? null : "environment",
-                )
-              }
-            >
-              <TerminalSquare size={12} />
-              <span>{sandboxModeLabel(sandboxMode)}</span>
-              <ChevronDown size={11} />
-            </button>
-            {openMenu === "environment" && (
-              <div className="tool-popover environment-popover" role="menu">
-                {sandboxModeOptions.map((option) => (
-                  <button
-                    className={sandboxMode === option.value ? "active" : ""}
-                    key={option.value}
-                    role="menuitemradio"
-                    aria-checked={sandboxMode === option.value}
-                    onClick={() => {
-                      onChangeSandboxMode(option.value);
-                      setOpenMenu(null);
-                    }}
-                  >
-                    {sandboxMode === option.value ? (
-                      <Check size={13} />
-                    ) : (
-                      <span className="menu-icon-spacer" />
-                    )}
-                    <span>{option.label}</span>
-                    <small>{option.detail}</small>
-                  </button>
-                ))}
-                <div className="tool-popover-separator" />
-                <button disabled title="Git 工作树创建尚未实现">
-                  <GitFork size={14} />
-                  <span>新工作树</span>
-                  <small>未实现</small>
+            {launchMode && onChangeLaunchMode ? (
+              <>
+                <button
+                  className="composer-context-button"
+                  type="button"
+                  aria-label="选择启动模式"
+                  aria-expanded={openMenu === "environment"}
+                  onClick={() =>
+                    setOpenMenu((current) =>
+                      current === "environment" ? null : "environment",
+                    )
+                  }
+                >
+                  {launchMode === "local" ? (
+                    <Laptop size={12} />
+                  ) : (
+                    <GitFork size={12} />
+                  )}
+                  <span>{newTaskLaunchModeLabel(launchMode)}</span>
+                  <ChevronDown size={11} />
                 </button>
-                <button disabled title="远程执行环境尚未实现">
-                  <Cloud size={14} />
-                  <span>云环境</span>
-                  <small>未实现</small>
+                {openMenu === "environment" && (
+                  <div className="tool-popover launch-mode-popover" role="menu">
+                    <div className="tool-popover-note">
+                      <strong>启动模式</strong>
+                      <span>选择新任务使用的工作区方式</span>
+                    </div>
+                    <button
+                      className={launchMode === "local" ? "active" : ""}
+                      role="menuitemradio"
+                      aria-checked={launchMode === "local"}
+                      onClick={() => {
+                        onChangeLaunchMode("local");
+                        setOpenMenu(null);
+                      }}
+                    >
+                      <Laptop size={14} />
+                      <span>在本地处理</span>
+                      {launchMode === "local" && <Check size={13} />}
+                    </button>
+                    <button
+                      className={launchMode === "new_worktree" ? "active" : ""}
+                      role="menuitemradio"
+                      aria-checked={launchMode === "new_worktree"}
+                      title="线程级工作树创建尚未接入"
+                      onClick={() => {
+                        onChangeLaunchMode("new_worktree");
+                        setOpenMenu(null);
+                      }}
+                    >
+                      <GitFork size={14} />
+                      <span>新工作树</span>
+                      <small>内部未实现</small>
+                    </button>
+                    <button
+                      disabled
+                      role="menuitem"
+                      title="云端任务执行尚未实现"
+                    >
+                      <Cloud size={14} />
+                      <span>发送至云端</span>
+                      <small>未实现</small>
+                    </button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <button
+                  className="composer-context-button"
+                  type="button"
+                  aria-expanded={openMenu === "environment"}
+                  onClick={() =>
+                    setOpenMenu((current) =>
+                      current === "environment" ? null : "environment",
+                    )
+                  }
+                >
+                  <TerminalSquare size={12} />
+                  <span>{sandboxModeLabel(sandboxMode)}</span>
+                  <ChevronDown size={11} />
                 </button>
-              </div>
+                {openMenu === "environment" && (
+                  <div className="tool-popover environment-popover" role="menu">
+                    {sandboxModeOptions.map((option) => (
+                      <button
+                        className={sandboxMode === option.value ? "active" : ""}
+                        key={option.value}
+                        role="menuitemradio"
+                        aria-checked={sandboxMode === option.value}
+                        onClick={() => {
+                          onChangeSandboxMode(option.value);
+                          setOpenMenu(null);
+                        }}
+                      >
+                        {sandboxMode === option.value ? (
+                          <Check size={13} />
+                        ) : (
+                          <span className="menu-icon-spacer" />
+                        )}
+                        <span>{option.label}</span>
+                        <small>{option.detail}</small>
+                      </button>
+                    ))}
+                    <div className="tool-popover-separator" />
+                    <button disabled title="Git 工作树创建尚未实现">
+                      <GitFork size={14} />
+                      <span>新工作树</span>
+                      <small>未实现</small>
+                    </button>
+                    <button disabled title="远程执行环境尚未实现">
+                      <Cloud size={14} />
+                      <span>云环境</span>
+                      <small>未实现</small>
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </div>
           <button
@@ -3968,7 +4296,12 @@ function Composer({
         placeholder="请求后续更改"
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={(event) => {
-          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+          if (
+            event.key === "Enter" &&
+            !event.altKey &&
+            !event.nativeEvent.isComposing &&
+            !event.repeat
+          ) {
             event.preventDefault();
             onSubmit();
           }
@@ -4121,25 +4454,37 @@ function Composer({
           </button>
           {openMenu === "permission" && (
             <div className="tool-popover permission-popover" role="menu">
-              {permissionModeOptions.map((option) => (
-                <button
-                  className={permissionMode === option.value ? "active" : ""}
-                  key={option.value}
-                  role="menuitemradio"
-                  aria-checked={permissionMode === option.value}
-                  onClick={() => {
-                    onChangePermissionMode(option.value);
-                    setOpenMenu(null);
-                  }}
-                >
-                  {permissionMode === option.value ? (
-                    <Check size={13} />
-                  ) : (
-                    <span className="menu-icon-spacer" />
-                  )}
-                  <span>{option.label}</span>
-                </button>
-              ))}
+              <div className="permission-popover-header">
+                <span>应如何批准 OpenTopia 操作？</span>
+                <span title="权限预设会同时调整审批策略和本地沙箱">
+                  了解更多
+                </span>
+              </div>
+              {permissionModeOptions.map((option) => {
+                const Icon = option.icon;
+                const selected =
+                  normalizedPermissionMode(permissionMode) === option.value;
+                return (
+                  <button
+                    className={`permission-option ${selected ? "active" : ""} ${option.value === "full_access" ? "is-danger" : ""}`}
+                    disabled={isRunning || isSending}
+                    key={option.value}
+                    role="menuitemradio"
+                    aria-checked={selected}
+                    onClick={() => {
+                      onChangePermissionMode(option.value);
+                      setOpenMenu(null);
+                    }}
+                  >
+                    <Icon size={17} aria-hidden="true" />
+                    <span className="permission-option-copy">
+                      <strong>{option.label}</strong>
+                      <small>{option.detail}</small>
+                    </span>
+                    {selected ? <Check size={15} aria-hidden="true" /> : null}
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
@@ -4188,7 +4533,7 @@ function Composer({
         ) : isSending ? (
           <Loader2 size={17} className="spin" />
         ) : (
-          <Send size={17} />
+          <ArrowUp size={18} strokeWidth={2.25} />
         )}
       </button>
     </div>
@@ -4196,14 +4541,29 @@ function Composer({
 }
 
 const permissionModeOptions: Array<{
-  value: AppSettings["permissionMode"];
+  value: ExecutionPermissionMode;
   label: string;
+  detail: string;
+  icon: typeof Hand;
 }> = [
-  { value: "chat", label: "仅聊天" },
-  { value: "read_only", label: "只读" },
-  { value: "auto", label: "自动" },
-  { value: "approve", label: "需要审批" },
-  { value: "full_access", label: "完全访问" },
+  {
+    value: "approve",
+    label: "请求批准",
+    detail: "编辑外部文件和使用互联网时始终询问",
+    icon: Hand,
+  },
+  {
+    value: "auto",
+    label: "替我审批",
+    detail: "仅对检测到的风险操作请求批准",
+    icon: ShieldCheck,
+  },
+  {
+    value: "full_access",
+    label: "完全访问权限",
+    detail: "可不受限制地访问互联网和此电脑上的任何文件",
+    icon: ShieldAlert,
+  },
 ];
 
 const sandboxModeOptions: Array<{
@@ -4223,18 +4583,20 @@ function sandboxModeLabel(mode: AppSettings["sandbox"]["sandboxMode"]): string {
 }
 
 function permissionModeLabel(mode: AppSettings["permissionMode"]): string {
-  switch (mode) {
+  switch (normalizedPermissionMode(mode)) {
     case "full_access":
-      return "完全访问";
-    case "read_only":
-      return "只读";
+      return "完全访问权限";
     case "approve":
-      return "需要审批";
-    case "chat":
-      return "仅聊天";
+      return "请求批准";
     default:
-      return "自动";
+      return "替我审批";
   }
+}
+
+function normalizedPermissionMode(
+  mode: AppSettings["permissionMode"],
+): ExecutionPermissionMode {
+  return mode === "approve" || mode === "full_access" ? mode : "auto";
 }
 
 function RightPanel({
@@ -4450,7 +4812,6 @@ function RightPanel({
         onOpenDiff={() => onOpenToolTab("diff")}
         onOpenTerminal={() => onOpenToolTab("terminal")}
         onOpenFiles={() => onOpenToolTab("files")}
-        onOpenExtensions={() => onOpenToolTab("extensions")}
         onAddSource={onAddContextSources}
         onSpawnSubagent={onSpawnSubagent}
         onCancelSubagent={onCancelSubagent}
@@ -4574,7 +4935,9 @@ function NewTaskState({
   skills,
   selectedSkillIds,
   isSending,
+  launchMode,
   onChange,
+  onChangeLaunchMode,
   onPickWorkspace,
   onSelectProject,
   onOpenTool,
@@ -4596,11 +4959,13 @@ function NewTaskState({
   skills: SkillDescriptor[];
   selectedSkillIds: string[];
   isSending: boolean;
+  launchMode: NewTaskLaunchMode;
   onChange(value: string): void;
+  onChangeLaunchMode(mode: NewTaskLaunchMode): void;
   onPickWorkspace(): void;
   onSelectProject(projectId: string): void;
   onOpenTool(kind: ToolTabKind): void;
-  onChangePermissionMode(mode: AppSettings["permissionMode"]): void;
+  onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onAddContextSources(): void;
   onRemoveContextSource(path: string): void;
@@ -4670,6 +5035,7 @@ function NewTaskState({
         contextSources={contextSources}
         skills={skills}
         selectedSkillIds={selectedSkillIds}
+        launchMode={launchMode}
         workspaceRoot={workspaceRoot}
         projectName={
           projectName ?? (workspaceRoot ? workspaceName(workspaceRoot) : null)
@@ -4681,6 +5047,7 @@ function NewTaskState({
         onOpenTool={onOpenTool}
         onPickWorkspace={onPickWorkspace}
         onSelectProject={onSelectProject}
+        onChangeLaunchMode={onChangeLaunchMode}
         onChangePermissionMode={onChangePermissionMode}
         onChangeSandboxMode={onChangeSandboxMode}
         onAddContextSources={onAddContextSources}
@@ -4689,6 +5056,10 @@ function NewTaskState({
       />
     </>
   );
+}
+
+function newTaskLaunchModeLabel(mode: NewTaskLaunchMode): string {
+  return mode === "new_worktree" ? "新工作树" : "在本地处理";
 }
 
 function OfflineState({
@@ -4898,8 +5269,26 @@ function sortProjects(projects: Project[]): Project[] {
   );
 }
 
+function controlledSandboxSettings(
+  sandbox: AppSettings["sandbox"],
+): AppSettings["sandbox"] {
+  return {
+    ...sandbox,
+    sandboxMode: "workspace-write",
+    enforcement: "enforce",
+    network: sandbox.network === "allow" ? "inherit" : sandbox.network,
+  };
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function friendlyProviderError(message: string): string {
+  if (/401|auth_failed|master_key|unauthorized/i.test(message)) {
+    return "认证失败：当前 Provider 的 Base URL 拒绝了 API Key。请在设置中更新该 Provider 的密钥并测试连接。";
+  }
+  return message;
 }
 
 function parseDirectToolCommand(value: string): DirectToolCommand | null {

@@ -1,5 +1,6 @@
 import type {
   ContextSourcePickResult,
+  KeyringMetadata,
   LogFileInfo,
   PlatformInfo,
   RecentWorkspace,
@@ -130,6 +131,34 @@ export async function deleteSecret(key: string): Promise<void> {
     return window.opentopia.deleteSecret(key);
   }
   throw new Error("Secret storage not available in web mode");
+}
+
+export async function getProviderApiKeyMetadata(
+  providerId: string,
+): Promise<KeyringMetadata> {
+  if (window.opentopia?.getProviderApiKeyMetadata) {
+    return window.opentopia.getProviderApiKeyMetadata(providerId);
+  }
+  throw new Error("Provider credential storage is not available in web mode");
+}
+
+export async function setProviderApiKey(
+  providerId: string,
+  value: string,
+): Promise<KeyringMetadata> {
+  if (window.opentopia?.setProviderApiKey) {
+    return window.opentopia.setProviderApiKey(providerId, value);
+  }
+  throw new Error("Provider credential storage is not available in web mode");
+}
+
+export async function deleteProviderApiKey(
+  providerId: string,
+): Promise<KeyringMetadata> {
+  if (window.opentopia?.deleteProviderApiKey) {
+    return window.opentopia.deleteProviderApiKey(providerId);
+  }
+  throw new Error("Provider credential storage is not available in web mode");
 }
 
 export async function listLogFiles(): Promise<LogFileInfo[]> {

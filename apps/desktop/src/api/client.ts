@@ -22,6 +22,7 @@ import type {
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
+  ProviderSettings,
   SandboxDescriptor,
   SkillDescriptor,
   SpreadsheetPreview,
@@ -118,15 +119,7 @@ export class ApiClient {
   }
 
   async updateSettings(input: {
-    providers?: {
-      id: string;
-      kind: ProviderKind;
-      baseUrl: string;
-      model: string;
-      apiKeySource: string;
-      apiKeyConfigured: boolean;
-      healthStatus?: string | null;
-    }[];
+    providers?: ProviderSettings[];
     activeProviderId?: string;
     providerKind?: ProviderKind;
     baseUrl?: string;

@@ -11,7 +11,7 @@ use crate::provider::{
     ModelStreamDelta, OpenAiCompatibleProvider, ProviderToolCall, ProviderToolCandidate,
     ProviderToolResult,
 };
-use crate::sandbox::LocalSandboxConfig;
+use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::settings::{AppSettings, ProviderKind};
 use crate::store::SessionStore;
 use crate::subagents::SubagentScheduler;
@@ -22,7 +22,7 @@ use crate::tools::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -522,6 +522,8 @@ impl AgentCore {
                 ModelRequest {
                     system_prompt: provider_system_prompt(
                         &execution_budget.status(0, 0, started_at, budget.as_ref()),
+                        &input.workspace_root,
+                        &self.sandbox_config,
                         false,
                         false,
                     ),
@@ -951,6 +953,8 @@ impl AgentCore {
                                 started_at,
                                 budget.as_ref(),
                             ),
+                            &workspace_root,
+                            &self.sandbox_config,
                             loop_guard.completion_mode,
                             loop_guard.implementation_mode,
                         ),
@@ -1030,6 +1034,9 @@ impl AgentCore {
             match delta {
                 ModelStreamDelta::Text { text } => {
                     events.push(AgentEventPayload::ModelDelta { text });
+                }
+                ModelStreamDelta::Reasoning { text } => {
+                    events.push(AgentEventPayload::ReasoningDelta { text });
                 }
                 ModelStreamDelta::Usage { usage } => {
                     events.push(AgentEventPayload::TokenUsage {
@@ -1764,6 +1771,8 @@ fn suspend_for_budget_checkpoint(
 
 fn provider_system_prompt(
     status: &AgentBudgetStatus,
+    workspace_root: &Path,
+    sandbox_config: &LocalSandboxConfig,
     completion_mode: bool,
     implementation_mode: bool,
 ) -> String {
@@ -1777,8 +1786,9 @@ fn provider_system_prompt(
     } else {
         ""
     };
+    let workspace_scope = workspace_scope_instruction(workspace_root, sandbox_config);
     format!(
-        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help. For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. After a successful test, build, lint, check, or verify command, finish with one final action: update_plan with all current steps completed (set current_scope_complete with verification when later-phase steps remain pending), or call complete_task with a concise summary, concrete verification evidence, and any deliberately deferred work. Do not perform more investigation after that final action. Delegate independent work with spawn_agent when useful, then use wait_agents to collect parallel results before synthesizing the final answer. Inspect every child status and error; a terminal child is not necessarily a successful child.{completion_instruction}{implementation_instruction}\n\nExecution budget for this slice: {}/{} tool-decision rounds used ({} remaining). Total tool-decision budget: {}/{} used ({} remaining). Equivalent tool calls without an intervening state change are limited to {}. Observation tool calls without a workspace change are limited to {} before implementation mode activates. Time budget: {} ms remaining of {} ms. Context budget: {} used of {} tokens ({} remaining). A slice budget checkpoint requires explicit continuation. When the total tool budget reaches zero, stop using tools and provide the best truthful final response. Do not claim work is complete merely because a budget is low.",
+        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help. {workspace_scope} For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. After a successful test, build, lint, check, or verify command, finish with one final action: update_plan with all current steps completed (set current_scope_complete with verification when later-phase steps remain pending), or call complete_task with a concise summary, concrete verification evidence, and any deliberately deferred work. Do not perform more investigation after that final action. Delegate independent work with spawn_agent when useful, then use wait_agents to collect parallel results before synthesizing the final answer. Inspect every child status and error; a terminal child is not necessarily a successful child.{completion_instruction}{implementation_instruction}\n\nExecution budget for this slice: {}/{} tool-decision rounds used ({} remaining). Total tool-decision budget: {}/{} used ({} remaining). Equivalent tool calls without an intervening state change are limited to {}. Observation tool calls without a workspace change are limited to {} before implementation mode activates. Time budget: {} ms remaining of {} ms. Context budget: {} used of {} tokens ({} remaining). A slice budget checkpoint requires explicit continuation. When the total tool budget reaches zero, stop using tools and provide the best truthful final response. Do not claim work is complete merely because a budget is low.",
         status.used_tool_rounds,
         status.max_tool_rounds,
         status.remaining_tool_rounds,
@@ -1792,6 +1802,35 @@ fn provider_system_prompt(
         status.context_used_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
         status.context_max_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
         status.context_remaining_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
+    )
+}
+
+fn workspace_scope_instruction(
+    workspace_root: &Path,
+    sandbox_config: &LocalSandboxConfig,
+) -> String {
+    let workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let additional_roots = sandbox_config
+        .effective_readable_roots(&workspace_root)
+        .into_iter()
+        .filter(|root| root != &workspace_root)
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>();
+    let additional_roots = if additional_roots.is_empty() {
+        "none".to_string()
+    } else {
+        additional_roots.join(", ")
+    };
+    let full_access_note = if sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess {
+        " Full-access capability is not an instruction to explore outside the workspace."
+    } else {
+        ""
+    };
+    format!(
+        "The thread workspace root is '{}'. Resolve every relative file path and shell working directory against this root; the default shell working directory is this root. Begin with the workspace and complete the task there whenever it contains enough information. Do not list, search, read, or probe parent directories or unrelated absolute paths for context. Access outside the workspace only when the user explicitly requests it or the path is an additional configured readable root. Configured additional readable roots: {additional_roots}.{full_access_note}",
+        workspace_root.display()
     )
 }
 
@@ -1999,6 +2038,109 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    struct ReasoningProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ReasoningProvider {
+        async fn complete(&self, _request: ModelRequest) -> anyhow::Result<ModelResponse> {
+            Ok(ModelResponse::text("已完成检查"))
+        }
+
+        async fn stream(
+            &self,
+            request: ModelRequest,
+            on_delta: &mut crate::provider::ModelStreamCallback<'_>,
+        ) -> anyhow::Result<ModelResponse> {
+            let response = self.complete(request).await?;
+            on_delta(ModelStreamDelta::Reasoning {
+                text: "正在检查项目结构".to_string(),
+            })?;
+            on_delta(ModelStreamDelta::Text {
+                text: response.text.clone(),
+            })?;
+            Ok(response)
+        }
+
+        async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
+            Ok(ProviderHealthCheck {
+                reachable: true,
+                latency_ms: None,
+                model_available: true,
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn system_prompt_prioritizes_workspace_and_limits_parent_discovery() {
+        let workspace = test_workspace("system-prompt-workspace-scope");
+        let additional_root = test_workspace("system-prompt-additional-root");
+        let mut sandbox_config = LocalSandboxConfig::default();
+        sandbox_config.read_paths = vec![additional_root.clone()];
+        let execution_budget = AgentExecutionBudget::default().normalized();
+        let prompt = provider_system_prompt(
+            &execution_budget.status(0, 0, Instant::now(), None),
+            &workspace,
+            &sandbox_config,
+            false,
+            false,
+        );
+
+        assert!(prompt.contains(&format!(
+            "The thread workspace root is '{}'",
+            workspace.canonicalize().unwrap().display()
+        )));
+        assert!(prompt.contains("default shell working directory is this root"));
+        assert!(prompt.contains("complete the task there whenever it contains enough information"));
+        assert!(prompt.contains("Do not list, search, read, or probe parent directories"));
+        assert!(prompt.contains(&additional_root.display().to_string()));
+
+        let full_access_prompt = provider_system_prompt(
+            &execution_budget.status(0, 0, Instant::now(), None),
+            &workspace,
+            &LocalSandboxConfig::danger_full_access(),
+            false,
+            false,
+        );
+        assert!(full_access_prompt.contains(
+            "Full-access capability is not an instruction to explore outside the workspace"
+        ));
+
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(additional_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_reasoning_stream_becomes_a_reasoning_event() {
+        let workspace = test_workspace("provider-reasoning-event");
+        let agent = AgentCore::new(Arc::new(ReasoningProvider), ToolRegistry::with_builtins());
+
+        let events = agent
+            .run_turn(AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "检查项目".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                store: None,
+                cancellation: None,
+            })
+            .await
+            .expect("turn succeeds");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ReasoningDelta { text }
+                if text == "正在检查项目结构"
+        )));
+
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[tokio::test]
@@ -2686,8 +2828,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_provider_write_resumes_suspended_action() {
-        let workspace = test_workspace("approved-direct-continuation");
+    async fn approve_mode_workspace_write_completes_without_suspension() {
+        let workspace = test_workspace("approve-workspace-write");
         let provider = Arc::new(ScriptedProvider::new(vec![
             ModelResponse {
                 text: String::new(),
@@ -2719,18 +2861,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("turn suspends");
-        assert!(!workspace.join("approved.txt").exists());
-        let continuation = match result.outcome {
-            AgentTurnOutcome::Suspended { continuation, .. } => continuation,
-            AgentTurnOutcome::Completed => panic!("turn should wait for approval"),
-        };
-
-        let resumed = agent
-            .resume_turn_streaming(continuation, true, None, None, None)
-            .await
-            .expect("approved turn resumes");
-        assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
+            .expect("workspace write completes");
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
         assert_eq!(
             fs::read_to_string(workspace.join("approved.txt")).unwrap(),
             "approved once"
@@ -2862,15 +2994,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_provider_write_completes_without_execution() {
-        let workspace = test_workspace("denied-direct-continuation");
+    async fn denied_protected_metadata_write_completes_without_execution() {
+        let workspace = test_workspace("denied-protected-continuation");
         let provider = Arc::new(ScriptedProvider::new(vec![
             ModelResponse {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_denied_write".to_string(),
                     name: "write_file".to_string(),
-                    arguments: json!({ "path": "denied.txt", "content": "never written" }),
+                    arguments: json!({
+                        "path": ".codex/denied.txt",
+                        "content": "never written"
+                    }),
                 }],
                 usage: None,
             },
@@ -2883,7 +3018,7 @@ mod tests {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "Create denied.txt with the requested content.".to_string(),
+                    content: "Create protected metadata with the requested content.".to_string(),
                     user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
@@ -2906,12 +3041,12 @@ mod tests {
             .await
             .expect("denied turn resolves");
         assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
-        assert!(!workspace.join("denied.txt").exists());
+        assert!(!workspace.join(".codex/denied.txt").exists());
         let _ = fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn denied_provider_tool_call_is_returned_to_model_as_error() {
+    async fn denied_protected_tool_call_is_returned_to_model_as_error() {
         let workspace = test_workspace("denied-provider-continuation");
         let provider = Arc::new(ScriptedProvider::new(vec![
             ModelResponse {
@@ -2920,7 +3055,7 @@ mod tests {
                     id: "call_write".to_string(),
                     name: "write_file".to_string(),
                     arguments: json!({
-                        "path": "denied-provider.txt",
+                        "path": ".codex/denied-provider.txt",
                         "content": "must not exist"
                     }),
                 }],
@@ -2935,7 +3070,7 @@ mod tests {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "Create denied-provider.txt".to_string(),
+                    content: "Create protected provider metadata".to_string(),
                     user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
@@ -2950,7 +3085,7 @@ mod tests {
             .expect("provider turn suspends");
         let continuation = match result.outcome {
             AgentTurnOutcome::Suspended { continuation, .. } => continuation,
-            AgentTurnOutcome::Completed => panic!("provider write should require approval"),
+            AgentTurnOutcome::Completed => panic!("protected write should require approval"),
         };
 
         let resumed = agent
@@ -2959,7 +3094,7 @@ mod tests {
             .expect("provider receives denial result");
         assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
         assert!(assistant_text(&resumed.events).contains("approval was denied"));
-        assert!(!workspace.join("denied-provider.txt").exists());
+        assert!(!workspace.join(".codex/denied-provider.txt").exists());
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].tool_results[0].is_error);

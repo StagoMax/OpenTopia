@@ -1,0 +1,130 @@
+.tool-execution-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.file-change-stats {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.file-change-additions {
+  color: #238653;
+}
+
+.file-change-deletions {
+  color: #c44843;
+}
+
+.file-change-summary-list {
+  display: grid;
+  gap: 1px;
+  padding: 0 7px 7px 30px;
+}
+
+.file-change-summary-list > div {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  color: #525952;
+}
+
+.file-change-summary-list > div > span:nth-child(2) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-file-list > .activity-file-item {
+  display: block;
+  min-height: 0;
+}
+
+.activity-file-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto 16px;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 28px;
+  padding: 3px 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #525952;
+  font: inherit;
+  text-align: left;
+}
+
+.activity-file-row:hover {
+  background: #f7f8f6;
+}
+
+.activity-file-row:focus-visible {
+  outline: 2px solid #7da68e;
+  outline-offset: -2px;
+}
+
+.activity-file-row > span:nth-child(2) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-file-meta {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  color: #8a918a;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.activity-file-detail {
+  margin: 1px 20px 7px 25px;
+  padding: 7px 8px;
+  border: 1px solid #e4e7e4;
+  border-radius: 4px;
+  background: #f5f6f4;
+  color: #666d66;
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.reasoning-activity-detail {
+  max-height: 280px;
+  margin: 2px 7px 9px 28px;
+  padding: 8px 10px;
+  border-left: 2px solid #d8ddd8;
+  background: #f7f8f6;
+  color: #555c55;
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1.6;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 720px) {
+  .activity-file-meta > span:first-child {
+    display: none;
+  }
+
+  .file-change-summary-list,
+  .activity-file-list {
+    padding-left: 18px;
+  }
+}

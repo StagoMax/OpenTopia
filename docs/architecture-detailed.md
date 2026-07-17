@@ -1,1510 +1,642 @@
-# OpenTopia 实现原理（教学版）
+# OpenTopia 架构教程（以当前实现为准）
 
-> 本文档不讲代码怎么调的，不讲函数之间的调用关系。我们用**大白话 + 生活比喻**来解释 OpenTopia 每个模块"为什么存在"和"怎么工作的"。
-
----
-
-## 目录
-
-1. [整体架构：餐厅 + 后厨](#1-整体架构餐厅--后厨)
-2. [Desktop Shell — 桌面主进程](#2-desktop-shell--桌面主进程)
-3. [Platform Bridge — 桌面能力桥](#3-platform-bridge--桌面能力桥)
-4. [Workbench UI — 用户界面](#4-workbench-ui--用户界面)
-5. [客户端组件库 — 新功能模块](#5-客户端组件库--新功能模块)
-6. [Agent Event Protocol — 事件协议](#6-agent-event-protocol--事件协议)
-7. [Local Server — 后端服务](#7-local-server--后端服务)
-8. [Session Store — 数据持久化](#8-session-store--数据持久化)
-9. [Agent Loop — 智能体核心循环](#9-agent-loop--智能体核心循环)
-10. [Provider Tool Loop — 模型工具循环](#10-provider-tool-loop--模型工具循环)
-11. [Execution Engine — 执行引擎](#11-execution-engine--执行引擎)
-12. [Sandbox — 沙箱隔离](#12-sandbox--沙箱隔离)
-13. [Permission / Approval — 权限控制](#13-permission--approval--权限控制)
-14. [Built-in Tools — 内置工具](#14-built-in-tools--内置工具)
-15. [MCP — 模型上下文协议](#15-mcp--模型上下文协议)
-16. [Browser Runtime — 浏览器运行时](#16-browser-runtime--浏览器运行时)
-17. [Context Sources — 上下文源](#17-context-sources--上下文源)
-18. [Skills — 技能系统](#18-skills--技能系统)
-19. [Subagents — 子智能体调度器](#19-subagents--子智能体调度器)
-20. [Git Workflow — Git 工作流引擎](#20-git-workflow--git-工作流引擎)
-21. [Model Provider — 模型接入层](#21-model-provider--模型接入层)
-22. [Settings — 设置管理](#22-settings--设置管理)
-23. [Workspace — 工作区管理](#23-workspace--工作区管理)
-24. [CLI — 命令行入口](#24-cli--命令行入口)
-25. [Windows Dev/Build — 开发与构建](#25-windows-devbuild--开发与构建)
-26. [总结：一条消息的完整旅程](#26-总结一条消息的完整旅程)
-27. [借鉴来源：我们站在谁的肩上](#27-借鉴来源我们站在谁的肩上)
+> 这是一份面向学习的架构教程：先解释“为什么要这样拆分”，再说明代码“如何实现”。它以当前仓库源码为准，不把设计灵感、后续计划或某个依赖库的潜在能力表述为 OpenTopia 已具备的功能。
+>
+> 主要对应目录：`apps/desktop/`、`crates/opentopia-server/`、`crates/opentopia-core/` 与 `crates/opentopia-cli/`。HTTP 路由以 `crates/opentopia-server/src/main.rs` 的 `build_router` 为准。
 
 ---
 
-## 1. 整体架构：餐厅 + 后厨
+## 0. 如何学习这份架构
 
-OpenTopia 只有**两大部分**：
+阅读架构时，不要先背文件名。对每一个模块都问四个问题：
 
-- **桌面应用（Electron）** = 餐厅本身。包括大堂（用户界面）和餐厅经理（主进程），它们在同一栋楼里，有内部通道连接。
-- **Rust 后端** = 后厨（独立厨房）。跟餐厅是分开的，通过点菜窗口（HTTP）沟通。
+1. **它接收什么输入，产生什么输出？** 这能帮助你画出数据流。
+2. **为什么不把它放到别的模块？** 这能看出边界和职责。
+3. **它失败、刷新页面或重启进程后会怎样？** 这能看出可靠性设计。
+4. **谁有权限调用它？** 这能看出安全边界。
 
-### 桌面应用内部：经理和大堂
+建议按下面的顺序阅读：
 
-Electron 桌面应用内部又分两个角色，但注意——**它们是同一家店的不同职能，不是独立的楼层**：
+1. 先读第 1、5 和 15 节，建立“一条消息如何变成一次 Agent 执行”的全景。
+2. 再读第 2、3、4 节，理解为什么 UI、服务端、数据库必须分开。
+3. 然后读第 7、8 节，理解“模型能做什么”不等于“模型应该被允许做什么”。
+4. 最后按需要阅读 MCP、浏览器、预览、XLSX 和子智能体等扩展能力。
 
-- **主进程（Desktop Shell）** = 餐厅经理。顾客看不到他，但他的工作很关键：开店（创建窗口）、关店（退出清理）、检查厨房有没有着火（启动后端）、备好调料（环境变量）、保管保险箱（API Key 安全存储）。经理不直接服务顾客。
-- **渲染进程（React UI）** = 整个大堂。包括餐桌（聊天区域）、菜单（操作界面）、工具箱（工作台）——顾客看到的、交互的一切都在这里。
-- **Platform Bridge** = 服务员专用的传话本。大堂的服务员不能直接冲进经理办公室，但可以通过这本传话本传递特定的信息，比如"客人想知道厨房地址"、"帮客人开一下大门"、"帮客人选一个工作目录"、"经理帮我存一下这个密码"。
+### 0.1 先认识几个词
 
-### 桌面应用 ↔ 后厨
+| 术语 | 通俗解释 | 在本项目中的意义 |
+|---|---|---|
+| 进程 | 操作系统中独立运行的程序 | Electron、React 所在的渲染进程和 Rust 服务端不是同一个进程 |
+| API | 模块之间约定的“请求格式和返回格式” | React 用 HTTP 调 Rust 服务端，而不是直接摸数据库 |
+| 状态 | 系统当前记住的事实 | 线程、消息、正在运行的 Turn、审批、终端历史等 |
+| 持久化 | 把状态写到磁盘，重启后仍能恢复 | SQLite 保存本地会话与执行记录 |
+| 事件流 | 按时间顺序不断推送发生过的事 | SSE 把模型文本、工具调用和审批变化推给 UI |
+| 策略 | 在执行前判断“是否应允许” | `Allow`、`Ask`、`Deny` 三种决定 |
+| 沙箱 | 操作系统层面对进程实际能碰到什么的限制 | 限制文件根目录、网络和子进程权限 |
+| Token | 用来证明调用方身份的一段随机值 | 防止其他本机网页或进程随意调用本地 API |
 
-桌面应用和后厨（Rust 后端）是**两个独立的进程**，通过 HTTP 通信：
+### 0.2 用一个例子建立心智模型
 
-- 大堂写好点菜单（HTTP 请求），从点菜窗口递给后厨
-- 后厨收到后喊一声"收到"（HTTP 返回 200），然后开始做菜
-- 每做完一道菜就摇铃（SSE 事件推送，SSE 是 Server-Sent Events 的缩写，一种服务端主动向浏览器推送消息的技术），服务员听到铃声就去端菜上桌
+假设用户输入：“检查项目中的构建错误并修复。”系统不是把这句话直接交给一个拥有所有电脑权限的模型，而是经过下面这条链：
 
----
-
-## 2. Desktop Shell — 桌面主进程
-
-**它解决什么问题？**
-
-用户双击图标后，需要一个**完整的桌面应用**——有窗口、有菜单栏、能最小化到系统托盘。浏览器做不到这些，Electron 就是干这个的。
-
-**核心原理：一个会自我修复的管家**
-
-Electron 主进程做的事情比以前想象的多得多：
-
-### 1. 开店关店（窗口管理）
-
-- 开一扇窗户（创建窗口），先让窗户"隐形"，等页面加载好了再"亮出来"，避免白屏闪烁
-- 单实例锁定：用户再双击一次，不会开第二个窗口，而是把已有窗口弹到最前面
-- 窗口关闭时自动退出应用（macOS 除外，mac 的习惯是不退出）
-
-### 2. 检查厨房有没有火（启动后端）
-
-桌面应用分两部分：前端的网页 + 后端的 Rust 服务器。用户双击后：
-1. 先去 `http://localhost:8787/health` 问一下"你活着吗？"（超时 1.2 秒）
-2. 如果活着，直接开店
-3. 如果没响应，自动启动后端的 exe 文件
-4. **每半秒再去问一次**，最多等 15 秒
-
-### 3. 备好调料（环境准备）
-
-给后厨传一堆环境变量：API Key、数据库路径、权限模式、沙箱配置。具体包括：
-- 搜索并加载 `.env` 文件（从项目目录或周边项目找）
-- API Key 别名映射（兼容旧项目的各种变量名）
-- 探测 Codex 沙箱二进制（`codex.exe`），找到后把路径设为 `OPENTOPIA_CODEX_SANDBOX_BIN` 环境变量
-- 设置沙箱模式（开发用 best_effort，生产用 enforce）和沙箱工作目录
-- Windows 特殊处理：设置 Rust GNU 工具链、把 MinGW gcc 加入 PATH
-
-### 4. 保管保险箱（密钥管理）
-
-API Key 是敏感信息，不能明文保存在文件里。Electron 主进程利用操作系统提供的**安全加密存储**（Windows 上是 DPAPI，macOS 上是 Keychain）来加密保存 API Key：
-
-- 用户通过设置面板输入 API Key → 主进程收到后用 `safeStorage.encryptString` 加密 → 存到 `secrets.json` 文件（加密后的数据）
-- 每次启动后端时，主进程解密 API Key 并通过环境变量传给后厨
-- 用户看不到解密后的 Key，安全日志里也会自动打码（`[redacted]`）
-
-### 5. 写工作日志（日志系统）
-
-主进程会把启动过程中的重要事件全部记录下来，格式是 JSONL（每行一个 JSON 对象）：
-- 启动了哪些进程、花了多长时间
-- 后端健康检查的结果
-- 未捕获的异常和崩溃（写入专门的 crash 日志）
-- 渲染进程崩溃（Electron 的特有事件）
-
-所有的日志内容会自动过滤 API Key、Token 等敏感信息。
-
-### 6. 处理深度链接（Deep Link）
-
-注册 `opentopia://` 协议，让操作系统知道：当用户点击 `opentopia://workspace?path=C:\myproject` 这样的链接时，打开 OpenTopia 并跳转到指定工作区。
-
-### 7. 自动更新（Auto Updater）
-
-非开发模式下，主进程启动后会自动检查更新，发现新版本就下载，下次退出时安装。
-
-### 8. 管理最近工作区
-
-维护一个最近打开的工作区列表（JSON 文件），方便用户快速切换。
-
----
-
-## 3. Platform Bridge — 桌面能力桥
-
-**它解决什么问题？**
-
-Electron 的安全模型要求网页不能直接操作电脑——否则你打开一个网页，它就能读你硬盘的文件。
-
-但网页有时候确实需要知道一些电脑信息，或者触发一些系统操作。
-
-**核心原理：一扇只开若干条缝的门**
-
-网页（渲染进程）和 Node.js 世界之间有一堵墙。墙上只开了**有限的几条缝**，每条缝都是一个"一问一答"的通道：
-
-| 能力 | 说明 | 为什么需要这条缝 |
-|------|------|--|
-| `getPlatformInfo` | 获取平台信息（操作系统、后端地址） | 前端需要知道连哪个后端 |
-| `openExternal` | 用系统浏览器打开链接 | 用户点外链时 |
-| `openPath` | 用系统默认程序打开文件/目录 | 用户想看工作区文件 |
-| `selectWorkspace` | 弹出系统文件夹选择对话框 | 让用户选工作目录 |
-| `getRecentWorkspaces` | 读取最近工作区列表 | 快速切换 |
-| `saveRecentWorkspace` | 保存最近工作区 | 记录用户选择 |
-| `listSecretSources` / `setSecret` / `deleteSecret` | 查看和管理加密密钥 | 安全存储 API Key |
-| `listLogFiles` / `readLogFile` | 读取日志文件 | 调试和排查问题 |
-
-**为什么只开这几条缝？**
-
-**最小权限原则**——只给恰好够用的能力，不多给。前端永远拿不到真实的 API Key 值，只能问"Key 配好了吗？"（是/否）。
-
-**双重运行模式**
-
-Platform Bridge 被设计成可以在两种模式下工作：
-1. **桌面模式**（`window.opentopia` 存在）：通过 Electron IPC 调用系统能力
-2. **浏览器模式**（`window.opentopia` 不存在）：用浏览器 API（localStorage）做降级，部分能力不可用
-
-这意味着同一个前端代码可以在 Electron 里跑，也可以在浏览器里跑。
-
----
-
-## 4. Workbench UI — 用户界面
-
-**它解决什么问题？**
-
-给用户一个**看得见、点得着**的界面：管理多个对话线程、看消息、发指令、审批准入、浏览工作区、看代码差异、操作终端。
-
-**核心原理：三栏布局 + 事件驱动渲染**
-
-- **左侧（Sidebar）**：工作区选择器 + 最近工作区列表 + 线程列表
-- **中间（Center Pane）**：聊天主区域（消息列表 + 输入框）
-- **右侧（Right Panel）**：多功能工作台面板，包含：
-
-**UI 不「猜」状态，只「消费」事件**
-
-后端每做一步就发一个事件，前端收到什么事件就画什么。收到 `ToolCallStarted` 就显示"工具正在执行"，收到 `ToolCallFinished` 就显示结果。前端不需要自己维护状态机。
-
-**启动流程**
-
-```
-加载平台信息 → 检查后端健康 → 获取秘密源信息 → 获取最近工作区
-→ 如果后端在线：加载线程列表 + 设置 + 提供者健康 + MCP 服务器
-→ 切换到第一个线程：加载消息 + 事件 + 打开 SSE 事件流
-→ 同时加载终端历史 + 打开终端 SSE 流 + 初始化 PTY 会话
-→ 刷新工作台面板（文件树、差异、沙箱状态、MCP、产物、上下文）
+```text
+用户输入
+  -> UI 发请求给服务端
+  -> 服务端保存“用户说了什么”，创建一次 Turn
+  -> Agent 请求模型思考
+  -> 模型提出“读取文件 / 执行命令 / 修改文件”等工具调用
+  -> 策略和沙箱检查是否允许
+  -> 工具执行，结果再交回模型
+  -> 模型给出最终回答
+  -> 过程中的事件和最终结果保存到 SQLite，并实时显示到 UI
 ```
 
-**状态集中在 App 组件**
-
-所有核心状态集中在 `App()` 组件，通过 props 向下分发。没有使用 Redux/Zustand 等外部状态管理库。全局状态包括：线程列表、当前消息、事件列表、终端会话、工作区信息、设置等约 30 个状态。
+这样设计的目的有三个：**可控**（危险动作可拦截）、**可观察**（用户能看到正在发生什么）、**可恢复**（刷新或重启后不把已发生的工作忘掉）。后续章节都是在解释这条链中的某一段。
 
 ---
 
-## 5. 客户端组件库 — 新功能模块
-
-前端新增了几个独立组件，每一个对应一个桌面 IDE 的典型功能：
-
-### WorkbenchPanel — 多功能工作台
-
-右侧面板是一个**标签页容器**，可以切换：
-
-- **Files（文件）**：浏览工作区文件树；点击文件后打开独立预览标签，而不是把内容挤在文件树内部
-- **Diff（差异）**：显示 Git diff，支持逐段 stage/unstage/discard 修改
-- **Terminal（终端）**：集成 xterm.js，可以执行命令、看实时输出
-- **Extensions（扩展）**：管理 MCP 服务器的启用/禁用
-- **Sandbox（沙箱）**：查看沙箱状态和配置
-
-### MonacoEditor — 代码编辑器
-
-基于 Microsoft 的 Monaco Editor（就是 VS Code 用的那个）。支持：
-- 语法高亮（通过文件名自动检测语言）
-- 只读模式（预览文件时使用）
-- Artifact 预览
-
-### XtermTerminal — 终端模拟器
-
-基于 xterm.js + @xterm/xterm，可以在桌面应用内打开一个真正的终端。它：
-- 连接到后端的 PTY 会话（伪终端）
-- 支持输入（用户在终端里打字）和输出（看到命令结果）
-- 支持调整大小（resize）
-- 支持关闭会话
-
-### ArtifactGallery — 产物画廊
-
-AI 在运行过程中可能生成"产物"（Artifact），比如生成的代码文件、分析报告等。ArtifactGallery 列出所有产物，点击后进入与工作区文件相同的预览标签协议；后端会校验产物确实属于当前 Thread。
-
-### LogViewer — 日志查看器
-
-读取和显示 Electron 主进程写入的日志文件（JSONL 格式），方便调试。
-
-### RightContextRail — 右侧上下文栏
-
-右侧新增了一个**独立的上下文信息栏**（`RightContextRail`），与工作台面板并列。它显示当前线程的"上下文快照"——包括关联的 Skill、Context Source 文件的图标列表、以及 Agent 当前正在使用的工具和状态。这是一个窄条状的侧边栏，始终可见，不与工作台面板的标签页冲突。
-
-### PreviewHost — 文件与产物预览
-
-`PreviewHost` 是只读预览标签的统一入口。前端先用 `POST .../previews/resolve` 获取受限描述符，再通过带 Bearer Token 的接口读取内容：
-
-- 文本和代码：Monaco Editor，只读、自动语言检测
-- 图片：认证 fetch 转为 Blob URL，支持适应视图、原尺寸和缩放
-- PDF：PDF.js Worker + Canvas，支持分页和缩放
-- XLSX：后端 `calamine` 解析工作簿，前端按区间加载并虚拟滚动，不把整张大表一次性送进 DOM
-- 其他格式：展示明确的“不支持”状态，可交给系统应用打开
-
-工作区路径先做 canonicalize 并限制在 Thread 的 workspace root 内；Artifact 必须属于当前 Thread。内容接口返回正确 MIME、`nosniff` 与 revision/ETag 元数据，预览标签本身不能写文件。
-
-### WebPreviewSurface — 共享网页预览
-
-Electron 模式使用原生 `WebContentsView` 显示真实网页；用户看到的页面和 Agent 工具操作的是同一个 Thread 会话。地址栏、前进、后退、刷新和系统浏览器打开均为真实交互，不是截图模拟。纯浏览器开发模式没有 Electron preload 时，降级到原有 `BrowserPanel`，展示隔离 CDP runtime 的截图、页面摘要与可交互元素。
-
-### MonacoEditorImpl — Monaco 编辑器实现
-
-代码编辑器组件从单纯的 Monaco Editor 封装扩展为支持**语言自动检测**（在原有基础上增补了更多文件类型映射）、多语言语法高亮的实现层组件。
-
----
-
-## 6. Agent Event Protocol — 事件协议
-
-（内容基本不变，核心设计仍然相同）
-
-**它解决什么问题？**
-
-AI 智能体的执行过程不是瞬间完成的——它要思考、调用工具、等结果、再思考。这个过程需要完整记录下来，并且让前端实时看到进展。
-
-**核心原理：不可变的流水日志**
-
-每个事件都有：
-- `id`：全局唯一
-- `thread_id`：属于哪个对话
-- `turn_id`：属于哪个"轮次"
-- `seq`：线程内单调递增的序号（由数据库自动分配）
-- `created_at`：时间戳
-- `payload`：事件内容（13 种变体）
-
-**事件类型**
-
-| 事件 | 含义 |
-|------|------|
-| `TurnStarted` | 一轮 AI 思考开始 |
-| `ModelDelta` | 模型流式输出的文本片段 |
-| `ToolCallStarted` | 工具调用开始 |
-| `ToolCallFinished` | 工具调用结束（含结果） |
-| `AssistantMessage` | 助手完整消息 |
-| `FileChanged` | 文件被修改 |
-| `ApprovalRequested` | 需要用户审批 |
-| `ContextCompacted` | 上下文被压缩 |
-| `TokenUsage` | 模型调用的 token 用量统计 |
-| `TurnFinished` | 一轮思考正常结束 |
-| `TurnSuspended` | Turn 因需要审批而挂起（等待恢复） |
-| `TurnCancelled` | Turn 被用户取消 |
-| `Error` | 错误 |
-
-**新增事件说明：**
-- `TokenUsage`：模型调用完成后发出，包含 `input_tokens`、`output_tokens`、`total_tokens`，供前端展示用量
-- `TurnSuspended`：当工具调用触发 `Ask` 审批时，Turn 不再直接结束，而是挂起等待用户决策。事件携带 `approval_id` 和挂起原因，后续可通过 `resume_turn` 恢复
-- `TurnCancelled`：用户通过 API 取消正在执行的 Turn 时发出，携带取消原因
-
-**消息和事件的区别？**
-
-- **事件**：底层的执行日志，粒度很细
-- **消息**：给用户看的对话单元，粒度较粗
-
-事件是"流水账"，消息是"最终呈现"。两者分离的好处是：你可以改变消息的组装方式而不影响底层日志记录。
-
----
-
-## 7. Local Server — 后端服务
-
-**它解决什么问题？**
-
-前端需要一个后端接口来发送消息、获取数据。Local Server 就是这个后端，用 Rust 的 Axum 框架写的异步 HTTP 服务。
-
-**核心原理：一个带实时推送的 HTTP API**
-
-### 路由总览
-
-后端提供了约 35 个 API 端点，按功能分组：
-
-| 分组 | 端点 | 作用 |
-|------|------|------|
-| **健康检查** | `/health` | 问后端活着吗 |
-| **设置** | `/api/settings` | 读写设置（模型、权限等） |
-| **模型提供者** | `/api/provider/health`、`/api/provider/test` | 查看和测试模型配置 |
-| **线程** | `/api/threads` | 创建和列出对话 |
-| **消息** | `/api/threads/:id/messages` | 发消息和看消息 |
-| **事件** | `/api/threads/:id/events`、`/events/stream` | 拉取和实时推送事件 |
-| **Turn 管理** | `/api/threads/:id/turn`、`/turn/cancel` | 查询和取消正在执行的 Turn |
-| **终端（命令）** | `/api/threads/:id/terminal/commands` 等 | 执行一次性命令 |
-| **终端（会话）** | `/api/threads/:id/terminal/session` 等 | 持久化的 PTY 终端 |
-| **工作区** | `/api/threads/:id/workspace/tree` 等 | 浏览文件、看 diff |
-| **沙箱** | `/api/threads/:id/sandbox` | 查看沙箱状态 |
-| **上下文** | `/api/threads/:id/context` | 上下文预算和压缩 |
-| **审批** | `/api/threads/:id/approvals/:id/decision` | 审批决策 |
-| **产物** | `/api/threads/:id/artifacts` | 产物管理 |
-| **轨迹** | `/api/threads/:id/trajectory` | 导出完整执行轨迹 |
-| **MCP** | `/api/mcp/servers` 等 | MCP 服务器管理 |
-
-### SSE 双段拼接：历史 + 实时
-
-前端连接事件流时可以带上 `since=N`，意思是"我已经有 N 号之前的事件了"。
-
-后端的处理方式：
-1. 从数据库里查出 `seq > N` 的所有历史事件
-2. 同时订阅内存中的广播频道
-3. 把历史事件和实时事件拼接成一个流
-
-这样前端断线重连时，一条事件都不会漏。
-
-### 异步执行与 Turn 管理
-
-AI 回复可能要十几秒甚至更久。后端的处理流程现在是：
-
-1. 检查该 thread 是否有待处理的审批请求——有则返回 409 冲突
-2. 通过 `TurnManager::begin()` 注册一个新的 Turn，防止同一 thread 的并发执行
-3. 保存用户消息到数据库，返回 200
-4. 用 `tokio::spawn` 启动后台任务
-
-后台任务通过 `mpsc::UnboundedChannel` 实时接收 Agent 发出的事件，每收到一个就立即持久化到 SQLite 并通过 EventBus 广播给 SSE 订阅者。如果用户取消 Turn，`CancellationToken` 会传播到执行引擎，终止正在运行的子进程。
-
-### API 认证系统
-
-所有 `/api/*` 路由现在都经过认证中间件保护。后端启动时要求设置 `OPENTOPIA_API_TOKEN` 环境变量（至少 32 字节）。前端每次请求需要在 HTTP 头中携带 `Authorization: Bearer <token>`。
-
-认证架构分为两层：
-
-**第一层：CORS 源检查**——浏览器请求必须在允许的源列表中：
-- `null`（Electron 内嵌页面的 origin）
-- `file://`（本地文件加载）
-- `http://127.0.0.1:5173`（Vite 开发服务器）
-- `http://localhost:5173`
-- 可通过 `OPENTOPIA_DEV_ORIGIN` 环境变量添加额外开发源（必须是 loopback 地址）
-
-**第二层：Bearer Token 校验**——使用常数时间比较（`constant_time_eq`）防止时序攻击。验证失败时返回 `401 Unauthorized`。
-
-注意：Electron 主进程在启动后端时，通过 `createBackendEnv` 自动设置 `OPENTOPIA_API_TOKEN`，preload 脚本中的 fetch 请求自动添加 Authorization 头，用户不需要手动配置。浏览器模式下仍需手动配置。
-
-### 多提供者支持
-
-后端现在支持管理**多个模型提供者**，用户可以在设置面板添加多个 provider（比如一个用 GPT-4，一个用本地模型），在它们之间切换，测试连接是否正常。
-
----
-
-## 8. Session Store — 数据持久化
-
-**它解决什么问题？**
-
-用户关闭应用再打开，聊天记录不能丢。所有数据必须持久化到硬盘。
-
-**核心原理：一个本地的 SQLite 档案馆**
-
-SQLite 是一种嵌入式的数据库，不需要安装服务器。OpenTopia 用多个表来存数据：
-
-| 表 | 相当于 | 存什么 |
-|------|--------|--------|
-| `threads` | 档案盒 | 对话标题、工作区路径 |
-| `messages` | 文件 | 谁说了什么、包含哪些内容 |
-| `events` | 执行日志 | 每一步操作的详细记录 |
-| `approvals` | 审批单 | 审批请求和决策 |
-| `artifacts` | 产物清单 | AI 生成的文件或内容 |
-| `terminal_history` | 终端日志 | 执行过的命令和输出 |
-| `mcp_servers` | 扩展配置 | MCP 服务器设置 |
-| `thread_mcp_servers` | 扩展绑定 | 线程与 MCP 的关联 |
-| `settings` | 配置单 | 应用设置 |
-
-**为什么用 Trait 抽象？**
-
-代码里定义了 `SessionStore` trait（接口），包含线程、消息、事件、终端历史、产物、审批的核心操作。目前只有 `SqliteSessionStore` 一种实现。
-
-但 `SqliteSessionStore` 还额外实现了 trait 范围之外的方法——设置管理（`load_settings`、`save_settings`）和 MCP 服务器管理（CRUD 操作）。这些方法不在 trait 中，是因为它们属于存储层的具体实现细节，未来如果换成 PostgreSQL，"设置"和"MCP 配置"的存取方式可能完全不同。
-
-这就是面向接口编程：不依赖具体实现，依赖抽象约定。需要扩展时只加 trait 方法，不改调用方。
-
----
-
-## 9. Agent Loop — 智能体核心循环
-
-**它解决什么问题？**
-
-用户在输入框里说"帮我看看项目结构"，AI 要理解这句话、决定怎么处理、调用工具、组织回复。
-
-**核心原理：两条路径 + MCP 集成 + 流式执行 + 挂起/恢复**
-
-Agent 收到用户消息后，先做一道选择题：
-
-### 路径一：命令直达（不走 AI）
-
-如果用户输入的是 `/list`、`/read`、`/write`、`/run`、`/diff`、`/patch`、`/mcp` 这类**确定性命令**，Agent 直接执行对应的工具函数，不经过 AI。好处是极速响应。
-
-### 路径二：LLM 推理（走 AI + 工具循环）
-
-如果用户说的是自然语言，Agent 做了两件事：
-1. **先自动做一次 `list_files`**：把工作区根目录的文件列表发给 AI，让 AI 知道项目结构
-2. **把控制权交给 AI + 工具循环**：AI 可以自主决定调用哪些工具、按什么顺序调用
-
-### Turn 的新模型：Completed / Suspended
-
-以前的 Turn 只有"完成"一个结局。现在 Turn 可以有三种结局：
-
-- **Completed**：正常完成，输出最终回复，发出 `TurnFinished` 事件
-- **Suspended**：工具调用触发 `Ask` 审批决策 → 发出 `ApprovalRequested` + `TurnSuspended` → Turn 挂起等待用户决策。后端将 Turn 的完整上下文（`AgentContinuation`）持久化到数据库，后续可通过 `resume_turn_streaming` 恢复执行
-- **Cancelled**：用户通过 API 取消 → 发出 `TurnCancelled` 事件 → 正在执行的子进程被 `CancellationToken` 终止
-
-### 流式执行与实时事件推送
-
-Agent 执行过程中产生的所有事件，不再等 Turn 结束后才发，而是通过 `mpsc::UnboundedChannel` 实时推送到主循环，主循环一边接收事件一边通过 SSE 推给前端：
-
-```
-Agent.run_turn_detailed_streaming(input, sink)
-  → 把 AgentEventSender 注入 TurnEvents
-  → 每产生一个事件就 sender.send(payload)
-  → 主循环 receiver.recv() 收到后立即持久化 + SSE 发布
+## 1. 架构概览：为什么要分层
+
+OpenTopia 是本地优先的桌面 Agent 工作台。它不是一个单体 Electron 应用，而是由五个可替换的运行边界组成：
+
+| 边界 | 实现 | 职责 |
+|---|---|---|
+| 桌面壳 | Electron 主进程 | 窗口、启动本地服务、密钥安全存储、文件选择、系统打开、日志和可见浏览器宿主 |
+| 渲染层 | React + TypeScript | 项目/线程工作台、消息和事件展示、审批、终端、预览及设置界面 |
+| 本地 API | Axum | 鉴权后的 REST/SSE 接口、Turn 调度、终端和 PTY 管理、持久化编排 |
+| Agent 核心 | Rust core crate | 模型工具循环、策略判定、执行环境、MCP、浏览器、子智能体、预览和表格逻辑 |
+| 本地状态 | SQLite | 项目、线程、消息、事件、Turn、审批、产物、MCP 配置、终端记录及应用设置 |
+
+CLI（`crates/opentopia-cli`）是另一入口：它复用核心模型和 SQLite 会话，而不是绕过桌面端另建一套业务逻辑。
+
+**为什么不把这些都写进 Electron 或一个 Rust 程序？** 因为它们的风险和变化速度不同：界面需要快速迭代；命令执行和文件写入需要严格限制；持久化需要在重启后稳定；模型接入又可能频繁更换。把它们拆开以后，修改 UI 不会直接破坏文件权限，替换模型也不必改窗口代码。
+
+```text
+Electron main process
+  ├─ BrowserWindow / preload bridge
+  ├─ secure secret storage / desktop browser broker
+  └─ starts or reuses opentopia-server
+
+React renderer -- Bearer token over HTTP/SSE --> Axum local server
+                                                   ├─ SQLite session store
+                                                   ├─ AgentCore + provider + tools
+                                                   ├─ policy + execution environment + sandbox
+                                                   ├─ MCP stdio host / browser runtime / subagents
+                                                   └─ event and terminal broadcast buses
 ```
 
-这意味着前端可以实时看到 `ModelDelta`（模型逐字输出）、`ToolCallStarted`、`ToolCallFinished`，不需要等整个 Turn 完成。
+桌面端和服务端是独立进程。渲染层不直接调用 Node.js、SQLite 或 Rust 内部 API；它只能访问 preload 暴露的受限桌面能力，以及带认证的本地 HTTP API。
 
-### 取消机制（Cancellation）
-
-每个 Turn 都有一个 `CancellationToken`。Agent 在创建 `ToolContext` 时注入这个 token，`execution.rs` 中的 `LocalExecutionEnvironment.exec()` 使用 `tokio::select!` 监听取消信号。用户通过 `POST /api/threads/:id/turn/cancel` 触发取消时：
-1. `TurnManager` 标记取消状态
-2. `CancellationToken` 触发
-3. 正在执行的子进程被 kill
-4. 发出 `TurnCancelled` 事件
-5. Turn 结束
-
-### 并发防护（TurnManager）
-
-每个线程（thread）同一时间只能有一个正在执行的 Turn。`send_message` 和 `decide_approval` 在启动新 Turn 前先通过 `TurnManager::begin()` 检查——如果该 thread 已有运行中的 Turn，则拒绝并返回 409 冲突。Turn 完成后调用 `TurnManager::finish()` 释放锁。
-
-### Turn 状态查询
-
-前端可以通过 `GET /api/threads/:id/turn` 查询当前 Turn 的状态：`{ turn_id, status: "running" | "cancelling", started_at }`。
-
-新增的命令：
-- `/search path -- query`：在文件中搜索内容
-- `/mcp server__tool {"arg":"value"}`：调用 MCP 工具
-
-### 路径二：LLM 推理（走 AI + 工具循环）
-
-如果用户说的是自然语言，Agent 做了两件事：
-
-1. **先自动做一次 `list_files`**：把工作区根目录的文件列表发给 AI，让 AI 知道项目结构
-2. **把控制权交给 AI + 工具循环**：AI 可以自主决定调用哪些工具、按什么顺序调用
-
-### Turn 是什么？
-
-"Turn" 是**一次完整的请求-响应循环**：
-1. 用户发一条消息 → 触发一个 Turn
-2. Turn 开始 → 产生一系列事件
-3. Turn 结束 → 输出最终回复
-
-一个 Turn 产生的所有事件共享一个 `turn_id`，方便追溯。
-
-### MCP 工具同步
-
-Agent 在每次执行前，会从 MCP Host 拉取所有已注册的 MCP 工具，把它们同步到工具注册表中。这样 AI 就可以像调用内置工具一样调用 MCP 工具。
-
-### 上下文预算
-
-当前 `GET /context` 根据消息内容估算 token 使用量并返回最近一次 durable
-summary。它还没有 provider-reported 精确 token accounting，也不会按阈值自动压缩。
-
-用户触发压缩后，服务端把有界的 messages + typed events 轨迹发给当前
-OpenAI-compatible provider，要求保留目标、决策、文件路径、命令、验证结果和未解决
-问题。生成结果以 `ContextCompacted` 事件持久化，metadata 记录 provider、model、
-mode 和 covered sequence；后续普通 turn 以及审批继续执行都会把最新 summary 放入
-模型请求。手工 summary 仍作为显式覆盖入口保留。
+**可以这样理解职责：** React 负责“让用户看见和操作”；服务端负责“判断、执行、记录”；核心库负责“可复用的规则和能力”；Electron 负责“只有桌面应用才能做的事”。这叫作**关注点分离**，目标不是制造更多文件，而是让高风险能力集中在更容易审查的位置。
 
 ---
 
-## 10. Provider Tool Loop — 模型工具循环
+## 2. 进程启动与桌面边界
 
-**它解决什么问题？**
+**这一层要解决的问题：** 网页界面擅长展示和交互，却不应该天然拥有读取磁盘、启动进程或保存密钥的权限。Electron 将“像网页一样的界面”和“本机桌面能力”放在不同进程，并用窄桥连接它们。
 
-AI 不只是一个"一问一答"的聊天机器人，它可以**主动决定调用工具**来获取信息或执行操作。而且它可以连续调用多个工具，每一步都根据前一步的结果决定下一步做什么。
+学习时可抓住一个原则：**权限应该从少到多逐层增加，而不是从多到少再试图收回。** 渲染进程从零权限开始；preload 只开放具体动作；主进程再决定是否执行；真正的工作区变更仍转交 Rust 服务端。
 
-**核心原理：最多 8 轮的对话式执行**
+### 2.1 Electron 主进程
 
-```
-第 0 步：给 AI 发消息 + 工具列表
-  ↓
-AI 回复 → 包含工具调用请求（比如 "帮我读 package.json"）
-  ↓
-Agent 执行工具 → 把结果发给 AI
-  ↓
-AI 再回复 → 可能再要调用工具（"再读一下 src/index.ts"）
-  ↓
-Agent 再执行 → 再发给 AI
-  ↓
-...
-  ↓
-AI 回复纯文本 → 完成
-```
+`apps/desktop/electron/main.cjs` 负责桌面生命周期。
 
-**关键设计**：
-- 最多 8 轮工具调用，防止无限循环
-- 每轮 Agent 都把之前的工具调用历史发给 AI，让 AI 知道上下文
-- 达到上限后，如果 AI 还想调用工具，Agent 会收集已完成的工具结果，不再继续
+- 创建主窗口，并通过 preload 启用 `contextBridge`；渲染进程没有直接的 Node.js 权限。
+- 启动前探测本地服务的 `/health`。若服务不可用，才启动随应用携带或开发环境中的 `opentopia-server`；退出时清理由本进程启动的子进程。
+- 为每次 Electron 启动生成随机 API Token，并以 `OPENTOPIA_API_TOKEN` 注入服务端。Token 不提供给任意网页或外部来源。
+- 导入项目 `.env` 和兼容别名，准备 Rust/MinGW 与 Windows Codex sandbox 所需环境；这些是开发和桌面启动辅助，不是 Agent 的权限豁免。
+- 写入 JSONL 启动/崩溃日志。日志写入前会按密钥名、Bearer 值和常见 API Key 形态进行脱敏。
+- 管理最近工作区、系统文件夹选择和外部文件/链接打开。
+- 启动可见浏览器宿主时，同时启动仅回环可访问、带随机 Token 的 broker，供 Rust 端共享操作 Electron 页面。
 
-### 审批如何处理？（挂起/恢复模型）
+开发模式和打包模式使用相同的服务端协议；区别仅在服务端二进制的解析和加载来源。生产更新逻辑位于 `electron/updater.cjs`，目前是打包后的更新骨架，签名、发布和公证不是该代码库已经完成的发布流程。
 
-当某步工具执行触发了权限系统的 `Ask` 决策（危险操作需要用户确认），Agent 现在的行为是：
-1. 发出 `ApprovalRequested` 事件（前端弹审批卡）
-2. 发出 `TurnSuspended` 事件（标记 Turn 被挂起）
-3. 将当前 Turn 的完整上下文打包成 `AgentContinuation`，持久化到数据库的 `approvals` 表（`continuation_json` 字段）
-4. Agent 返回 `AgentTurnOutcome::Suspended`，Turn 执行线程完成
+### 2.2 Preload Platform Bridge
 
-用户在界面上点"允许"或"拒绝"时：
-1. `POST /api/threads/:id/approvals/:id/decision` 被调用
-2. 后端从数据库读取 `AgentContinuation`
-3. 启动一个新的后台任务，调用 `agent.resume_turn_streaming(continuation, approved)`
-4. 如果允许：以 `FullAccess` 权限继续执行被暂停的工具，然后回到 Provider Tool Loop
-5. 如果拒绝：向模型返回一条"用户拒绝了此调用"的工具结果（`approvalDenied: true`），让模型决定下一步
+`apps/desktop/electron/preload.cjs` 只暴露白名单 IPC：
 
-相比旧版"以 FullAccess 重新执行整个 Turn"的方式，新版只在暂停点精确恢复，不重复执行已经完成的操作。
+| 分类 | 暴露能力 |
+|---|---|
+| 平台 | `getPlatformInfo`、`openExternal`、`openPath` |
+| 工作区与上下文 | 选择工作区/上下文文件、读取/写入/删除最近工作区 |
+| 密钥 | 列出密钥来源元数据、设置、删除；不提供“读取明文密钥”接口 |
+| 日志 | 列出日志、按偏移量读取日志 |
+| 浏览器宿主 | 创建、显示、隐藏、导航、前进后退和观察 `WebContentsView` 状态 |
+
+因此，`window.opentopia` 是能力桥而不是通用 IPC 通道。普通浏览器模式下 `apps/desktop/src/platform.ts` 提供降级实现，但浏览器模式并不具备 Electron 的密钥、原生窗口或路径打开能力。
+
+### 2.3 API Key 的存放和注入
+
+Electron 使用 `safeStorage` 加密 `userData` 下的密钥记录。渲染层只能写入、删除或获取“是否已配置”等元数据。主进程在启动服务端时，只有在显式环境变量和 `.env` 都没有提供 Key 的情况下，才将已解密的 provider Key 作为 `OPENTOPIA_API_KEY` 传给该服务端子进程。
+
+这意味着：安全存储降低了本地静态明文泄漏面，但服务端进程运行期间仍需在其环境中使用 Key；它不是远程密钥托管系统。
+
+**设计目的：** 将“用户输入密钥的界面”和“拿到明文密钥的代码”隔离开。即使前端遭到普通 XSS 风险，也没有一个 `getSecret()` 接口可直接把 Key 交出去。这是安全设计里常说的**最小暴露面**。
 
 ---
 
-## 11. Execution Engine — 执行引擎
+## 3. 本地 API、鉴权与事件流
 
-**它解决什么问题？**
+**这一层要解决的问题：** Electron 中仍可能加载网页内容，开发时也可能有浏览器访问本机端口。只要有 HTTP 服务，就不能因为它叫“localhost”而默认信任所有调用方。
 
-Agent 需要执行命令、读写文件，但这些操作需要统一的安全控制和资源管理。
+### 3.1 本地 API 的认证
 
-**核心原理：一个带沙箱的进程管理器**
+所有路由都经过 `auth::authorize`，包括 `/health` 和 SSE：
 
-执行引擎是一个 trait（接口），定义了这些操作：
-- `exec`：执行一条命令，等待返回（适合一次性命令）
-- `spawn_stdio`：启动一个交互式进程，可以持续读写 stdin/stdout/stderr
-- `read_file`：读取文件
-- `write_file`：写入文件
-- `apply_patch`：应用 git patch
-- `cancel`：取消正在执行的命令
+- 服务启动要求 `OPENTOPIA_API_TOKEN`，且 Token 至少 32 字节。
+- 客户端必须发送 `Authorization: Bearer <token>`；比较使用常量时间比较函数。
+- 浏览器请求还会检查 Origin。允许打包应用的 `file:`/`null` 来源和配置的回环开发来源；非本机 Web Origin 会被拒绝。
+- CORS 仅允许 `GET`、`POST`、`PATCH`、`PUT`、`DELETE` 及认证/内容类型相关请求头。
 
-### 本地执行环境
+服务默认监听 `127.0.0.1:8787`。这是一项本地进程认证设计，并不等价于可安全暴露到局域网或公网。
 
-默认实现 `LocalExecutionEnvironment` 是真正干活的地方：
+**为什么健康检查也要 Token？** 如果 `/health` 例外，通常会慢慢出现更多“为了方便”的例外，最终让安全边界变得不可推理。这里统一要求 Token，使规则变成简单的一句话：任何 API 调用都先认证。
 
-1. **路径解析**：相对路径自动拼接到工作区根目录
-2. **沙箱集成**：执行命令前通过 `build_local_sandbox_command` 检查是否需要沙箱包装
-3. **资源限制**：支持设置超时时间、输出大小上限
-4. **并发控制**：通过 `CancellationToken` 支持随时取消正在执行的命令
-5. **输出截断**：超出上限的输出自动截断，加上 `[output truncated by resource limit]` 标记
+### 3.2 路由分组
 
-### 执行过程（exec 方法）
+| 分组 | 主要接口 | 说明 |
+|---|---|---|
+| 健康与设置 | `/health`、`/api/settings`、`/api/provider/*` | 服务可用性、Provider 设置、健康和连接测试 |
+| 项目与线程 | `/api/projects`、`/api/threads`、`/messages` | 项目/线程 CRUD、发送消息、读取消息 |
+| Turn 与事件 | `/turn`、`/turn/cancel`、`/events`、`/events/stream` | 当前/最近 Turn、取消、历史事件和 SSE |
+| 审批 | `/approvals`、`/approvals/:id/decision` | 查看审批和允许/拒绝后的续跑 |
+| 工作区 | `/workspace/tree`、`/file`、`/diff`、`/diff/revert`、`/diff/hunk` | 文件树、只读预览、Git diff 与受控变更操作 |
+| 终端 | `/terminal/commands`、`/terminal/stream`、`/terminal/session/*` | 一次性命令、持久 PTY 会话和流式输出 |
+| 扩展与运行时 | `/mcp/*`、`/browser`、`/sandbox`、`/context`、`/skills` | MCP、浏览器、沙箱描述、上下文与 Skill 目录 |
+| 产物与预览 | `/artifacts`、`/previews/*`、`/trajectory` | 产物、二进制/表格预览和线程轨迹导出 |
+| Git 与子智能体 | `/git`、`/subagents/*` | 受控 Git 工作流、子智能体的创建、输入、等待和取消 |
 
-```
-接收 ExecRequest（程序、参数、工作目录、stdin）
-→ 通过沙箱构建命令计划（可能包装 bwrap/sandbox-exec）
-→ spawn 子进程
-→ 注册 CancellationToken（支持通过 request_id 取消）
-→ 异步读取 stdout/stderr（超出限制则自动截断）
-→ 等待结果（超时/手动取消/输出超限/正常退出）
-→ 返回 ExecResult（stdout, stderr, exit_code, success, truncated）
-```
+接口的完整方法组合、参数和返回模型应以 `main.rs` 为准；上表用于理解职责边界，而不是替代 API 契约。
 
-### Stdio 交互式会话（spawn_stdio）
+### 3.3 SSE：持久化历史加实时通知
 
-跟 exec 不同，spawn_stdio 不是等命令执行完再返回，而是返回一个 `StdioSession` 对象，调用者可以：
-- 持续写入 stdin
-- 持续读取 stdout/stderr
-- 最后调用 `close` 等待命令结束
-- 随时调用 `kill` 强制终止
+Agent 事件先写入 SQLite，再发布到进程内 `EventBus`。`GET /api/threads/:thread_id/events` 读取历史事件；`/events/stream` 将历史回放和实时广播拼成同一 SSE 流，并支持 `since` 序号增量同步。客户端应把 `seq` 作为去重和断线恢复依据，而不是假设 SSE 永不丢失。
+
+终端输出使用独立的 `TerminalBus` 和 `/terminal/stream`。它与 Agent 事件流分离，避免把 shell 的字节流混入 Agent 生命周期事件。
+
+**为什么不用“请求完成后一次性返回结果”？** Agent 运行可能持续数分钟，也可能等待用户审批。SSE 让 UI 在过程中看到“模型正在输出”“工具正在执行”“需要批准”等状态。更重要的是，事件先保存到 SQLite：网络断开只会失去实时通知，不会丢失已经发生的事实。这个组合叫作“**持久化日志 + 可重连订阅**”。
 
 ---
 
-## 12. Sandbox — 沙箱隔离
+## 4. 持久化领域模型
 
-**它解决什么问题？**
+**这一层要解决的问题：** 如果状态只存在 React 内存或 Rust 内存，刷新窗口、崩溃或重启后，一次执行就会变成无法解释的黑盒。数据库将“发生过什么”变成可查询的事实。
 
-AI 可以执行任意 Shell 命令。如果不加限制，一个 `rm -rf /` 或者恶意脚本可能会造成严重破坏。沙箱就是给命令执行加上**操作系统级别的隔离**。
+`SqliteSessionStore` 是服务端唯一的会话持久化入口。它建表和迁移旧 schema，服务启动时还会把遗留的运行中 Turn 标记为 `interrupted`，把未完成子智能体标记为失败，防止 UI 将进程重启前的任务误认为仍在执行。
 
-**核心原理：权限档案、后端失败策略和审批是三条独立轴。**
+主要数据关系如下：
 
-### 文件系统权限档案（SandboxMode）
+```text
+Project 1 ── * Thread 1 ── * Message
+                     ├── * AgentEvent (按 seq 排序)
+                     ├── * TurnRecord
+                     ├── * Approval ── 0..1 ApprovalContinuation
+                     ├── * Artifact
+                     ├── * TerminalCommandHistory
+                     └── * SubagentRun
 
-| 模式 | 文件系统与命令边界 | 网络默认值 |
-|------|--------------------|------------|
-| `read-only` | 可读取工作区和显式 readable roots；内置写工具直接拒绝，子进程工作区只读 | deny |
-| `workspace-write` | 可读取工作区，在工作区和 `writable_roots` 内写入；桌面应用默认值 | deny |
-| `danger-full-access` | 不包装子进程，内置文件工具也可访问工作区外路径 | allow |
-
-额外目录通过 `OPENTOPIA_SANDBOX_WRITABLE_ROOTS` 扩展，不需要关闭整个沙箱。
-旧的 `OPENTOPIA_SANDBOX_WRITE_PATHS` 仍作为迁移别名读取。工作区和额外可写根
-下的 `.git`、`.agents`、`.codex` 默认保持只读，避免通过 hooks 或 agent 配置
-改变后续执行权限。
-
-未设置 `OPENTOPIA_SANDBOX_MODE` 时也采用 `workspace-write`，不会静默回退为
-不受限模式；无法识别的模式值按 `read-only + enforce` 失败安全处理。
-
-### 后端失败策略（OsSandboxMode）
-
-它只回答“平台沙箱后端不可用时怎么办”，不再表示用户授予的文件权限：
-
-| 模式 | 行为 |
-|------|------|
-| `disabled` | 不启动 OS 沙箱后端；仅用于显式不受限或兼容调试 |
-| `best-effort` | 后端可用时包装命令；不可用时返回明确 passthrough 状态 |
-| `enforce` | 后端不可用或 profile 无法生成时失败关闭 |
-
-新配置使用 `OPENTOPIA_SANDBOX_ENFORCEMENT`。迁移期间，旧版把
-`disabled`/`best_effort`/`enforce` 写入 `OPENTOPIA_SANDBOX_MODE` 的配置仍可解析。
-审批由第 13 节的 policy/continuation 层处理，不存入 `LocalSandboxConfig`，也不会
-在执行层维护另一份命令白名单。
-
-当一次工具调用确实越过当前边界并获得用户批准时，continuation 仅为该调用创建
-`danger-full-access` 执行环境；调用完成后，后续工具立即恢复线程原有沙箱。拒绝审批
-不会执行任何升级路径。
-
-### 三个平台的实现
-
-OpenTopia 不在应用层做沙箱，而是利用各操作系统原生的沙箱机制：
-
-| 平台 | 沙箱工具 | 原理 |
-|------|----------|------|
-| Linux | bubblewrap（bwrap） | 用 Linux namespace 隔离文件系统、网络、进程 |
-| macOS | sandbox-exec（Seatbelt） | 用 macOS 的 Seatbelt 强制访问控制 |
-| Windows | codex restricted-token | 用 Windows 受限令牌 + 桌面隔离 |
-
-### Linux 沙箱（bubblewrap）
-
-bubblewrap 是 Linux 上最常用的沙箱工具。OpenTopia 用它：
-- 创建独立的 PID/IPC/UTS namespace
-- 只读挂载系统目录（`/bin`, `/etc`, `/usr`, `/lib` 等）
-- 读写挂载工作区目录（ReadOnly 模式下改用只读挂载）
-- 如果配置了网络限制，加上 `--unshare-net`
-
-当前 Linux adapter 尚未增加 Codex 的 seccomp/Landlock 纵深层；Ubuntu 上 bwrap
-所需的 AppArmor user-namespace 配置属于部署前置条件，不是 OpenTopia 自动生成的策略。
-现有 `.git/.agents/.codex` 会被重新只读挂载；若目录原本不存在，任意 shell 命令的
-“禁止首次创建”仍依赖后续 Landlock 层。内置文件工具已经在 Rust 路径检查中拒绝该写入。
-
-### macOS 沙箱（sandbox-exec）
-
-macOS 有内置的 Seatbelt 沙箱。OpenTopia 生成一个 Seatbelt 配置文件，内容大致是：
-- 默认拒绝所有操作
-- 允许读取系统路径
-- 允许读写工作区路径（ReadOnly 模式下不生成 file-write* 规则）
-- 根据网络策略决定是否允许网络访问
-
-### Windows 沙箱（codex restricted-token）
-
-Windows 不自行重写高风险的 token/ACL/job-object 代码，而是调用 Codex 的
-`codex sandbox` CLI 边界。Electron 主进程启动时会自动搜索 `codex.exe`
-（依次检查 `OPENTOPIA_CODEX_SANDBOX_BIN` 环境变量、打包目录下的
-`resources/codex-sandbox/codex.exe`、`~/.codex/plugins/.plugin-appserver/codex.exe`），
-找到后通过 `OPENTOPIA_CODEX_SANDBOX_BIN` 将路径传递给 Rust 后端。Rust 在包装每次
-受限调用时，再为该子进程注入隔离的 `CODEX_HOME` 和
-`OPENTOPIA_SANDBOX_WORKSPACE`。安装包包含 `codex.exe`、command runner、sandbox setup helper 和
-Apache-2.0 license。严格模式下 helper 缺失会失败关闭；本仓库测试会实际尝试写入
-工作区外的非临时路径，并断言 restricted-token 后端拒绝该操作。
-
-Codex 原生 Windows 后端分 `elevated` 和 `unelevated`：前者需要管理员批准的
-专用低权限用户、防火墙和本地策略设置；后者使用当前用户派生的 restricted token
-与 ACL，隔离强度较低。OpenTopia 当前默认并已验证的是 `unelevated`，可通过
-`OPENTOPIA_WINDOWS_SANDBOX=elevated` 选择前者，但 elevated 安装/升级流程仍需独立验收。
-两者默认启用 private desktop。
-
-Linux/macOS adapter 已生成严格的 bubblewrap/Seatbelt 策略并在后端缺失时失败，
-但仍需在各自原生发布机跑端到端 confinement 测试；不能把 Windows 验证结果外推成
-三平台都已完成生产认证。
-
-### Windows Codex profile
-
-只有 Windows adapter 会在独立 sandbox root 的 `codex-home/config.toml` 中生成
-Codex 配置，避免误配置 root 时覆盖同目录的普通 `config.toml`。它选择
-`:read-only`、`:workspace` 或自定义 `opentopia` permission profile；自定义 profile
-只承载 readable/writable roots 和网络规则。审批策略不会写入这个文件。
-
-### 沙箱状态查询
-
-前端可以通过 API 查询当前沙箱的状态，了解：
-- 沙箱类型（local/docker/remote）
-- 生命周期状态（ready/starting/stopped/error）
-- 文件系统权限档案（read-only/workspace-write/danger-full-access）
-- 后端失败策略（disabled/best_effort/enforce）
-- 网络策略（inherit/allow/deny）
-- readable roots、writable roots 和受保护元数据路径
-- 启用状态和可用性
-
----
-
-## 13. Permission / Approval — 权限控制
-
-**它解决什么问题？**
-
-AI 智能体可以执行命令、读写文件。如果不加限制，它可能误删文件、读到敏感信息。
-
-**核心原理：五级权限 + 三种决策 + 命令规则**
-
-（五级权限表和之前一样，这里不再重复）
-
-**新增：命令策略规则**
-
-除了按模式判断，现在还可以设置**精细的命令匹配规则**：
-
-```rust
-CommandPolicyRule {
-    pattern: "npm install",      // 匹配模式
-    match_kind: Prefix,          // 匹配方式（前缀 / 包含）
-    effect: Allow,               // 策略效果（Allow / Ask / Deny）
-    reason: "包安装是安全的",     // 原因说明
-}
+AppSettings 1 ── * McpServer
+Thread * ── * McpServer (thread_mcp_servers)
 ```
 
-**新增：MCP 工具权限**
+| 实体 | 关键作用 |
+|---|---|
+| `Project` / `Thread` | 工作区的项目归属、线程标题、固定/归档等 UI 所需状态 |
+| `Message` | 用户和助手消息；消息部分可包含文本、选中的上下文源和 Skill 引用 |
+| `AgentEvent` | 附带线程、可选 Turn 和顺序号的事件审计记录 |
+| `TurnRecord` | 一个用户请求的执行状态：`running`、`waiting_approval`、`cancelling`、`succeeded`、`failed`、`cancelled`、`interrupted` |
+| `Approval` | 待决动作、原因和最终状态；续跑所需的 `AgentContinuation` 单独持久化 |
+| `Artifact` | 线程范围内的 inline 文本或文件路径产物；大工具输出可变为产物而非无限塞进消息 |
+| `TaskPlan` / `ContextSummary` | 可恢复的任务计划与上下文压缩摘要 |
 
-MCP 工具也有权限标签。工具声明可以带注解（annotations）：
-- `readOnlyHint: true` → 只读工具，安全
-- `destructiveHint: true` → 破坏性工具，需要谨慎
-- `openWorldHint: true` → 涉及网络访问
+SQLite 解决的是本地可恢复性和审计，不是多用户并发数据库。服务端用 `TurnManager` 限制一个线程同时只有一个活动 Turn；数据库也有相应的活动 Turn 唯一索引作为第二层约束。
 
-这些标签映射为权限标签，通过 `ToolPermissionDescriptor` 传给策略引擎判断。
-
-**双重防护（文件路径检查）**
-
-1. 第一层：拒绝任何包含 `..`（父目录）的路径
-2. 第二层：把路径解析成绝对路径后，检查是否在工作区内
-
----
-
-## 14. Built-in Tools — 内置工具
-
-（结构基本一致，但新增了搜索工具和 MCP 工具包装器）
-
-| 工具 | 相当于 | 做什么 |
-|------|--------|--------|
-| list_files | 侦察兵 | 查看目录下有什么文件 |
-| read_file | 阅读者 | 读取文件内容（限制 16000 字符） |
-| write_file | 文书 | 写入/修改文件 |
-| shell | 万能工 | 执行命令（默认 30 秒超时） |
-| git_diff | 质检员 | 查看代码变更 |
-| apply_patch | 修理工 | 应用代码补丁 |
-| search | 侦探 | 先用 ripgrep 搜索，找不到回退到逐行子串扫描（限制 4096 字符） |
-| browser_navigate / browser_snapshot / browser_click / browser_type / browser_screenshot / browser_download | 浏览器操作员 | 通过 CDP 控制本地浏览器（导航、截图、点击、输入、下载） |
-| list_skills | 技能管理员 | 列出工作区和用户目录下可用的 Skill |
-| read_skill | 技能阅读器 | 读取指定 Skill 的指令内容 |
-| mcp__* | 外援 | 由 MCP 插件提供的工具（动态注册） |
-
-**浏览器工具**：AI 可以通过 `browser_navigate` 打开网页、`browser_snapshot` 获取页面文本摘要、`browser_screenshot` 截取 PNG、`browser_click` 点击按钮、`browser_type` 填写表单、`browser_download` 下载文件。这些工具对应 `BrowserTool` 包装器，内部调用 `BrowserRuntime` trait。
-
-**技能工具**：`list_skills` 发现并列出可用 Skill，`read_skill` 读取指定 Skill 的完整指令内容。AI 可以通过这些工具自主选择在合适的时候加载技能。
-
-**工具执行上下文**
-
-每个工具执行时都会带一个 `ToolContext`，包含：
-- `workspace_root`：工作区根目录
-- `policy`：策略引擎（用于权限判断）
-- `environment`：执行环境（带沙箱，封装了 exec/read_file/write_file 等能力）
-- `store`：数据存储（可选，用于记录产物）
-- `thread_id`：当前线程 ID
-- `cancel`：可选的 `CancellationToken`，用于支持工具执行被用户取消
+**为什么既有 `TurnManager` 又有数据库唯一索引？** 这是典型的双层保护：内存管理器负责快速协调当前进程；数据库约束在并发竞争或未来代码改动时兜底。只靠前者，重启后信息会消失；只靠后者，错误反馈和取消管理会变得笨重。
 
 ---
 
-## 15. MCP — 模型上下文协议
+## 5. 从发送消息到最终回答
 
-**它解决什么问题？**
+**这一节是整份文档的核心。** `Turn` 可以理解为“用户一次请求对应的一次可追踪执行”。不要把它和一条消息混为一谈：一条用户消息会创建一个 Turn，但一个 Turn 内可能发生多次模型调用、工具调用、审批暂停和恢复。
 
-OpenTopia 的工具是有限的（list_files、read_file 等 7 个）。但世界上有成千上万有用的工具——数据库查询、天气查询、代码分析等等。MCP（Model Context Protocol）就是**一个开放的工具接入标准**，让任何人写的外挂工具都能被 OpenTopia 使用。
+### 5.1 创建 Turn
 
-**核心原理：JSON-RPC over stdio**
+`POST /api/threads/:thread_id/messages` 执行以下步骤：
 
-MCP 的标准实现方式是：MCP 服务器是一个独立的子进程，OpenTopia 通过 stdin/stdout 与它通信，通信协议是 JSON-RPC 2.0：
+1. 校验线程存在，拒绝空消息（除非附带上下文源或选中的 Skill）。旧式 `/run`、`/read` 直接工具命令会被拒绝，用户应使用工作区/终端 API 或正常 Agent 请求。
+2. 规范化并加载所选上下文源；发现工作区可用 Skills，并只将用户选中的 Skill 作为消息引用保存。
+3. 若存在待决审批则拒绝新请求，避免两个执行链竞争同一线程。
+4. 由 `TurnManager` 原子地开始 Turn，持久化用户消息。
+5. 在 Tokio 后台任务中运行 Agent；HTTP 请求立即返回已保存的用户消息。
 
-```
-OpenTopia → stdin: {"jsonrpc":"2.0","id":1,"method":"tools/list"}
-MCP 服务器 ← stdout: {"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}
+服务端组装模型输入时会带上近期对话、最新上下文摘要、用户附加源的内容和可用工具目录。选择某个 Skill 不等于把整个 `SKILL.md` 自动注入提示词：它只是固定为用户上下文；模型仍可通过 `list_skills` 和 `read_skill` 自主加载说明。
 
-OpenTopia → stdin: {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hello"}}}
-MCP 服务器 ← stdout: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"echo: hello"}]}}
+**为什么先保存消息再后台运行？** 这样 API 可以迅速确认“请求已收到”，而长时间模型调用不会占住 HTTP 请求。即使随后模型调用失败，用户的原始请求、失败事件和 Turn 状态仍可被诊断和重试。
+
+### 5.2 Agent 工具循环
+
+`AgentCore::run_turn_detailed_streaming` 的职责是将 Provider、工具、策略和事件串起来：
+
+```text
+TurnStarted
+  -> Provider SSE 文本/工具调用 delta
+  -> ToolCallStarted
+  -> 策略判定 + 执行环境执行
+  -> ToolCallFinished / ToolCallFailed
+  -> 继续 Provider（携带工具结果）
+  -> AssistantMessage + TurnCompleted
 ```
 
-可以理解成一个"动手能力极强的外援"——你跟他说一声，他就自己跑起来，通过 stdin/stdout 跟你对话。
+Provider 首轮没有工具调用时，直接落库助手消息并结束。否则 Agent 在每一轮把模型工具调用转为 `ToolCall`，顺序执行后将结构化 `ToolResult` 回传给 Provider。大文件、搜索和 shell 输出会在满足阈值时保存为 Artifact，并在工具结果中返回引用。
 
-### 架构
+Agent 不会在每个 Turn 开始时自动执行 `list_files`，也不会承诺“先读文件再改文件”的固定工作流。是否调用工具由模型和系统提示共同决定。
 
-```
-McpExtensionHost（宿主）
-  ├── 管理多个 McpServer
-  │   ├── McpServer A（例如：文件系统服务器）
-  │   │   ├── 工具: read, write, search
-  │   │   └── 状态: ready / error / disabled
-  │   ├── McpServer B（例如：数据库服务器）
-  │   │   ├── 工具: query, schema
-  │   │   └── 状态: ready / error / disabled
-  │   └── ...
-  └── 全局工具路由表（public_name → server_id + tool_name）
-```
+**这里的逻辑分工很重要：** 模型负责提出下一步；工具负责做确定性的操作；服务端负责让这两者之间有记录、有权限检查、有超时。模型不是直接执行 PowerShell 的主体，而是“提出工具调用请求”的决策者。
 
-### 生命周期
+### 5.3 预算、无进展防护与显式完成
 
-1. **注册**：用户在设置面板添加 MCP 服务器（输入命令、参数、环境变量等）
-2. **启动**：OpenTopia spawn 子进程，通过 initialize 握手，确认协议版本
-3. **发现**：调用 `tools/list`，获取服务器提供的所有工具列表
-4. **路由**：每个工具被赋予一个全局唯一的名字（`服务器名__工具名`），注册到路由表
-5. **调用**：通过路由表找到对应的服务器和工具名，调用 `tools/call`
-6. **停止**：关闭 stdin，杀掉子进程
+当前默认执行预算为：单个执行片段最多 8 个 Provider 工具决策轮、整个任务最多 24 个工具决策轮、最多 15 分钟。它还限制等价工具调用和无工作区变更的连续观察操作。
 
-### 工具名防止冲突
+超过当前片段的工具轮、时间或上下文窗口预算时，Agent 产生一个 `BudgetCheckpoint` continuation，而不是简单地把“8 轮”当作任务完成。该 continuation 需要显式继续。通过验证命令后，系统会进入完成模式，仅保留 `update_plan` 和 `complete_task` 等收尾动作；持续观察而无变更时会进入实现模式，限制工具集以推动实际修改。
 
-MCP 工具名可能跟内置工具名冲突。OpenTopia 的处理方式：
-- 内置工具：`list_files`, `read_file`, `write_file`, `shell`, `git_diff`, `apply_patch`, `search`
-- MCP 工具：`服务器名__工具名`（例如 `file_system__read_file`）
+**为什么要有预算？** 语言模型可能反复观察同一信息、重复同一工具调用，或在上下文过长时变得不稳定。预算不是“强行让任务失败”，而是把一次无限循环切成可保存、可继续、可解释的片段。它同时控制成本、等待时间和无效操作。
 
-这样即使 MCP 服务器也有个叫 `read_file` 的工具，也不会冲突。
+### 5.4 取消与审批续跑
 
-### 安全性
+取消 `/turn/cancel` 触发 `CancellationToken`，用于中断 Provider 流或工具 future；最终状态由 Turn 管理器写回。
 
-MCP 工具调用也会经过权限系统检查。工具声明中的注解（annotations）会映射为权限标签，策略引擎根据这些标签将工具分为五类风险等级并决定是否放行：
+当策略返回 `Ask` 时：
 
-| 注解标记 | 映射标签 | 风险分类 | 行为（以 Auto 模式为例） |
-|---------|---------|---------|------------------------|
-| `readOnlyHint: true` | `read` | 只读 | Allow（直接放行） |
-| 无注解或仅有 write | — | 写入 | 同文件写入权限规则 |
-| `destructiveHint: true` | `destructive` | 破坏性 | Ask（需审批） |
-| `openWorldHint: true` | `network` | 网络 | Ask（需审批） |
-| `permissionLabels: ["secret"]` | `secret` | 秘密 | Ask（需审批） |
-| 以上均无 | `unknown` | 未知 | Ask（需审批）
+1. Agent 写入待决 `Approval`，持久化当前 Provider 对话、已完成工具结果、待执行调用、预算和循环防护状态。
+2. Turn 转为 `waiting_approval`，并发送 `ApprovalRequested` / `TurnSuspended` 事件。
+3. 用户调用审批接口。允许只授予这次待决调用；拒绝会作为结构化工具错误回传给同一个模型对话。
+4. 服务端新建恢复 Turn，使用已持久化 continuation 继续，而非重新开始整个请求。
+
+浏览器面板的域名授权是一个特例：它只记录域名授权，不隐式重放先前导航。用户或模型必须再次发起明确操作。
+
+**为什么审批要保存 continuation？** 如果只保存“用户点了允许”，系统已经忘了模型当时想调用什么工具、前面得到了哪些结果。保存 continuation 后，允许或拒绝都能回到同一段推理链继续，而不是重新问模型一次并产生不同结果。
 
 ---
 
-## 16. Browser Runtime — 浏览器运行时
+## 6. Provider 与上下文管理
 
-**它解决什么问题？**
+**这一层要解决的问题：** 应用业务不应该绑死在某个模型厂商、URL 或工具消息格式上。Provider 抽象把“应用想让模型做什么”与“某个 API 要怎么调用”分开。
 
-AI 有时需要"看一眼"网页——查看页面内容、截图、点击按钮、填写表单、下载文件。OpenTopia 的浏览器运行时让 AI 可以像人类一样使用浏览器。
+### 6.1 Provider 抽象
 
-**核心原理：桌面原生页面为主，CDP 为无 Electron 场景降级**
+`ModelProvider` 定义 `complete`、`stream` 和健康检查。默认运行时使用：
 
-OpenTopia 有两个实现同一 `BrowserRuntime` 行为契约的后端：
+- `OpenAiCompatibleProvider`：OpenAI Chat Completions 风格的流式 SSE、文本增量、工具调用增量和使用量解析。
+- `MockProvider`：没有可用真实 Provider 配置时的本地替代实现。
 
-1. **Electron Desktop 主路径**：`browser-host.cjs` 为每个 Thread 创建一个 sandboxed `WebContentsView`。React 的 `WebPreviewSurface` 负责位置和可见性，Rust 的 `DesktopBrowserRuntime` 通过主进程代理执行 Agent 操作。用户和 Agent 始终看到同一页。
-2. **Headless fallback**：CLI、测试或纯 Web 开发模式继续使用 `browser.rs`，自动发现 Chrome/Edge 并通过 CDP 控制隔离页面。
+`AppSettings` 可以保存多个 Provider，并由 `active_provider_id` 选择当前 Provider。每个真实 Provider 配置包含类型、base URL、模型名和 API Key 的环境变量来源。更新设置后，服务端会重建使用新设置的 `AgentCore`。
 
-### Electron Browser Host
+对于工具结果历史被部分兼容网关拒绝的情形，OpenAI-compatible Provider 仅在收到 HTTP 400 且请求确实含工具结果时，尝试一次紧凑兼容格式的重试；其他错误不做无限重试。
 
-主进程启动时在随机 `127.0.0.1` 端口创建 broker，并生成独立的高熵 Bearer Token；URL 与 Token 只注入本次 Rust sidecar 进程。`DesktopBrowserRuntime` 还会强制校验 loopback 地址、禁用代理和重定向、限制响应大小与超时，并对错误信息脱敏。
+**这体现了一个可靠性原则：重试必须有条件、有上限。** 没有条件的重试会把临时故障变成无限请求；这里仅针对已知的兼容性问题，且只重试一次。
 
-每个 Thread ID 同时作为 UI 与 Agent 的浏览器 session ID。`WebPreviewSurface` 挂载时设置原生视图 bounds/visible，切换标签时只隐藏而不销毁会话，因此 Agent 操作后用户能继续浏览相同页面。主 React 页面发生 reload/navigation 时，主进程会主动隐藏所有原生视图，避免旧视图覆盖新 UI。
+### 6.2 上下文源和摘要
 
-`WebContentsView` 配置：`nodeIntegration=false`、`contextIsolation=true`、`sandbox=true`、`webSecurity=true`、内存 partition；默认拒绝权限请求、新窗口、危险协议和下载外跳。显式地址栏导航或 Agent 导航会把目标 host 加入当前会话允许集合，未显式允许的跨 host 主框架跳转会被阻止。
+`context_sources.rs` 在服务端加载用户显式选择的文件，执行路径规范化、类型/大小限制并产生适合模型的内容部分。它不是对工作区做全量索引。
 
-### Headless CDP Fallback
+上下文预算按近似 token 数量累计。服务端支持手动和自动压缩：摘要及覆盖范围持久化为 `ContextSummary`，后续模型请求注入最新摘要并保留有限近期消息。若 Provider 不能执行摘要或预算不足，调用会返回可见错误，而不是伪造摘要。
 
-fallback 启动时按环境变量、系统安装目录和 `PATH` 搜索 Chrome/Edge，使用随机 DevTools 端口和独立临时 profile/download 目录。通过 `tokio-tungstenite` 连接 DevTools WebSocket，完成页面创建、命令发送和事件等待。该路径不与 Electron 原生页面共享渲染进程，仅在 desktop broker 不可用时启用。
-
-### 支持的操作
-
-| 操作 | 说明 | Desktop 主路径 / fallback |
-|------|------|--------------------------|
-| 导航（navigate） | 打开显式 URL | `webContents.loadURL` / `Page.navigate` |
-| 快照（snapshot） | 页面文本和可交互元素 | `executeJavaScript` / `Runtime.evaluate` |
-| 截图（screenshot） | PNG 截图 | `capturePage` / `Page.captureScreenshot` |
-| 点击（click） | CSS selector 点击 | DOM bridge / CDP DOM + Input |
-| 输入（type_text） | 聚焦并写入文本 | DOM bridge / CDP Runtime + Input |
-| 等待（wait） | 等待加载、元素或文本 | DOM polling / CDP polling |
-| 下载（download） | 下载并返回受限文件结果 | session download handler / CDP download events |
-| 关闭会话（close_session） | 清理页面和临时数据 | destroy view / close browser process |
-
-### 浏览器内容类型
-
-浏览器操作返回的内容不再是单纯的文本，而是支持**多模态输出**（`BrowserContent` 枚举）：
-- `Text`：页面文本（被截断时可标记 `truncated`）
-- `Json`：结构化数据（如导航信息、交互元素列表）
-- `Image`：PNG 截图（base64 解码后的二进制数据）
-- `File`：下载的文件（路径、大小、MIME 类型）
-
-这为未来的多模态模型交互奠定了基础。
-
-### 安全措施
-
-- 只允许 `http`/`https`，拒绝 `file:`、`javascript:`、`data:` 等危险主导航协议
-- Agent 的新域名导航继续走持久 approval continuation；用户在地址栏的显式导航视为直接用户操作
-- Electron broker 仅监听 loopback 且每次启动换 Token，Rust proxy 拒绝非 loopback broker 和重定向
-- 原生页面拒绝权限、新窗口和跨 host 隐式主框架导航；Agent/用户共享会话但不共享 Node 能力
-- fallback 启动时清除 API Key 环境变量，profile 与下载目录按会话隔离并默认清理
+**为什么不能把所有历史都发给模型？** 模型的上下文窗口有限，历史越长成本越高，重要信息也越容易被淹没。摘要是“有损压缩”：牺牲部分原文细节，保留后续任务需要的结论。因此摘要必须保存覆盖范围，才能知道它替代了哪些旧内容。
 
 ---
 
-## 17. Context Sources — 上下文源
+## 7. 权限、执行环境与沙箱
 
-**它解决什么问题？**
+**这一层要解决的问题：** “模型说要执行”只是一个建议，不能自动转换为“操作系统允许执行”。OpenTopia 将决策、实际执行和操作系统隔离分开，避免单点失效。
 
-用户或 AI 需要把特定文件"喂"给模型作为上下文——比如一个源码文件、截图、PDF 文档。Context Sources 就是统一的文件加载器。
+这三个层次必须分开理解：
 
-**核心原理：带安全检查的文件加载器**
+| 层次 | 负责什么 | 典型结果 |
+|---|---|---|
+| `BasicPolicyEngine` | 请求是否可读、可写、可执行、可访问网络/MCP | `Allow`、`Ask`、`Deny` |
+| `LocalExecutionEnvironment` | 将逻辑路径限制在工作区，执行读写、补丁、命令或 stdio 进程 | 解析后路径、stdout/stderr、超时和取消结果 |
+| `LocalSandboxConfig` | 对子进程增加 OS 级命令包装、根目录和网络限制 | disabled/best_effort/enforce 等实际隔离策略 |
 
-`load_context_sources` 接收一组文件路径和加载策略，返回结构化的模型上下文：
+### 7.1 权限模式
 
-### 文件分类
+配置支持 `chat`、`read_only`、`auto`、`approve`、`full_access`。具体结论还取决于命令规则、工作区路径、MCP 工具描述和网络策略，因此不应将任一模式简单描述为“永远允许”或“永远询问”。
 
-根据扩展名自动分类：
+策略检查在工具执行之前。读写工具检查目标路径，shell 与 patch 检查命令，MCP 通过工具注解评估风险；返回 `Ask` 时才进入审批 continuation。
 
-| 分类 | 示例扩展名 | 处理方式 |
-|------|-----------|---------|
-| Text | .rs, .ts, .js, .py, .md, .json, .yaml, .toml 等 | 读取文本内容（UTF-8），超出限制截断 |
-| Image | .png, .jpg, .gif, .webp | 读取二进制数据，包装为 `ModelContentPart::Image` |
-| Document | .pdf, .docx, .xlsx, .pptx | 读取二进制数据，包装为 `ModelContentPart::Resource` |
+### 7.2 本地执行环境
 
-不支持的文件类型会返回错误。
+执行环境处理的核心不变量：
 
-### 加载限制
+- 读取现有路径时 canonicalize，并验证其仍位于工作区根目录下。
+- 写入路径逐段检查，拒绝利用 `..` 或符号链接逃逸工作区。
+- `ExecRequest` 可限制 cwd、环境、stdin、超时、输出大小和取消 Token。
+- `apply_patch` 最终调用受控的 `git apply --whitespace=nowarn -`；它不是对任意系统路径的写权限。
+- 交互式终端使用 `portable-pty`，与一次性 shell 命令分开管理。
 
-为了避免撑爆模型上下文，Context Sources 强制执行多层限制：
+### 7.3 OS 沙箱
 
-| 限制 | 默认值 | 说明 |
-|------|--------|------|
-| `max_files` | 20 | 一次最多加载的文件数 |
-| `max_file_bytes` | 25 MB | 单个文件最大大小（超过直接拒绝，不截断） |
-| `max_text_bytes` | 256 KB | 单个文本文件最大读取量（超出的截断） |
-| `max_total_text_bytes` | 512 KB | 所有文本文件的总读取量上限 |
+沙箱配置包含文件系统根、网络策略和执行环境类型。不同平台使用不同 wrapper：Linux 使用 `bwrap`，macOS 使用 `sandbox-exec`，Windows 使用 Codex restricted-token helpers。`best_effort` 在本机缺少必要工具时可以退回；`enforce` 要求隔离建立成功；`danger_full_access`/`disabled` 则弱化或关闭该层。
 
-### 安全性
+因此，权限策略可拒绝一个操作，沙箱也可能在策略已允许后阻止子进程；二者都需要保留，不能互相替代。
 
-- **敏感文件拦截**：自动拒绝 `.env`、`.npmrc`、`.netrc`、`secrets.json`、私钥文件、证书文件（`.pem`、`.key`、`.p12` 等）
-- **路径去重**：通过 `canonicalize` 解析真实路径后去重，防止符号链接绕过
-- **非文件拒绝**：目录路径会返回 `NotAFile` 错误
+**可以用两道门来理解：** 策略门问“按产品规则，这次操作该不该做”；沙箱门问“即使要做，操作系统实际允许它碰到哪些资源”。第一道门便于向用户解释和审批，第二道门用于在实现出错或命令被绕过时继续兜底。
 
 ---
 
-## 18. Skills — 技能系统
+## 8. 内置工具与工作区能力
 
-**它解决什么问题？**
+**这一层要解决的问题：** 模型擅长决定“需要查什么、改什么”，却不擅长可靠地直接操作文件、进程或 Git。工具把这些操作变成有 schema、有返回值、可审计的程序接口。
 
-Skill 是一组**预定义的 Markdown 指令文件**，告诉 AI 如何完成特定任务（比如"如何做代码审查"、"项目的构建流程是什么"）。用户可以把团队的 SOP、项目规范写成 Skill，AI 在执行相关任务时自动加载。
+`ToolRegistry::with_builtins()` 注册以下一等工具：
 
-**核心原理：按目录发现 + 前 YAML 元数据**
+| 工具 | 用途 |
+|---|---|
+| `list_files`、`read_file`、`write_file` | 工作区内的目录和 UTF-8 文本文件操作 |
+| `search` | 首选 `rg`，不可用时使用受限的文本扫描回退 |
+| `shell` | 带超时、输出截断、取消和策略检查的 shell 命令 |
+| `git_diff`、`apply_patch` | 获取 diff、用 `git apply` 应用统一补丁 |
+| `update_plan`、`complete_task` | 将计划和任务完成状态作为可恢复的 Agent 状态 |
+| `list_skills`、`read_skill` | 发现并按需读取 `SKILL.md` |
+| `browser` | 以 action 执行导航、快照、点击、输入、等待、截图和下载 |
+| `spreadsheet` | 检查、列 Sheet、读区间、创建或更新 XLSX |
+| `spawn_agent`、`send_input`、`wait_agent`、`wait_agents`、`cancel_agent` | 子智能体生命周期控制 |
+| `mcp__*` | 运行时同步的 MCP 工具包装器 |
 
-Skill 是放在特定目录下的 `SKILL.md` 文件，包含 YAML 前置元数据和具体的指令内容：
+工具调用不是 HTTP API 的旁路。所有内置读写和命令工具都带 `ToolContext`，其中包含工作区、策略、执行环境、取消 Token、线程、存储、浏览器和子智能体调度器。
 
-```markdown
----
-name: Code Review
-description: Guidelines for reviewing Rust code
----
+**学习工具设计时可以观察三个要点：** 输入有明确 schema（模型不能随意猜参数）；执行有明确上下文（工具知道自己在哪个工作区、谁发起、何时取消）；输出既有文本也有结构化 metadata（UI、模型和数据库都能使用）。
 
-1. Check for unsafe blocks...
-2. Verify error handling...
-```
+### 8.1 工作区和 Git UI API
 
-### 发现路径
+工作区 HTTP 接口提供文件树、单文件读取、staged/unstaged diff、文件 revert 和 hunk stage/unstage/discard。路径解析在服务端完成，前端不应把任意绝对路径当作可信输入。
 
-OpenTopia 在三个位置搜索 Skill：
+另有 `/api/threads/:thread_id/git` 的 Git Workflow，支持状态、分支列举/创建/切换、提交、推送、比较和 worktree 创建等明确动作。该 API 经执行环境和沙箱运行 Git，不承诺具备 GitHub PR 创建或远程凭证管理能力。
 
-| 优先级 | 路径 | 范围 |
-|--------|------|------|
-| 1 | `<workspace_root>/.agents/skills/` | 工作区级 |
-| 2 | `<workspace_root>/.codex/skills/` | 工作区级（兼容 Codex 格式） |
-| 3 | `$CODEX_HOME/skills/` 或 `~/.codex/skills/` | 用户级 |
+### 8.2 终端
 
-发现过程递归遍历目录（最多 4 层），寻找名为 `SKILL.md` 的文件。
+终端分为两种会话：
 
-### 元数据
+- 一次性命令：执行、取消、历史和 SSE 输出；历史持久化在 `terminal_history`。
+- 持久 PTY：按线程维护 shell、输入、尺寸调整和关闭；UI 通过 xterm.js 与它交互。
 
-文件开头的 `---...---` 之间是 YAML 格式的元数据：
+终端是用户显式操作面，Agent 的 `shell` 工具是模型工具面。二者共享工作区与安全边界，但事件流和生命周期不同。
 
-```yaml
-name: Code Review          # 技能名称（用于显示）
-description: Guidelines...  # 技能描述
-```
-
-如果文件没有 YAML 前置元数据，技能名称会使用父目录名作为回退。
-
-### 加载限制
-
-| 限制 | 说明 |
-|------|------|
-| 每次 Turn 最多选择 | 5 个 Skill |
-| 单个 Skill 文件大小上限 | 1 MB（超过则排除） |
-| 单次加载所有 Skill 总大小 | 128 KB（超出的截断） |
-| 单个 Skill 读取上限 | 64 KB |
-
-### 渲染给模型
-
-加载后的 Skill 以 `<skill>` XML 标签格式嵌入到模型上下文中：
-
-```xml
-<skill>
-Name: Code Review
-Description: Guidelines for reviewing Rust code
-Path: /workspace/.agents/skills/review/SKILL.md
-Truncated: false
-
-1. Check for unsafe blocks...
-</skill>
-```
+**为什么不复用同一个“命令执行接口”？** 用户终端需要交互、持续输入和模拟终端尺寸；Agent shell 需要受控超时、简洁结果和模型可读输出。外表都像“运行命令”，但交互模型不同，拆开反而更简单。
 
 ---
 
-## 19. Subagents — 子智能体调度器
+## 9. MCP、Skills 与子智能体
 
-**它解决什么问题？**
+**这一层要解决的问题：** Agent 的核心能力应保持小而稳定；外部工具、领域说明和并行任务则应按需接入。MCP、Skills、子智能体分别解决“接入能力”“告诉模型如何做”“并行完成独立工作”。
 
-复杂的任务可以拆分成多个子任务并行执行——比如同时搜索多个文件、同时检查多个 API。Subagent 调度器让 OpenTopia 可以**派生子 Agent 并行工作**。
+### 9.1 MCP
 
-**核心原理：带并发控制和隔离的子任务调度器**
+MCP 配置（命令、参数、cwd、环境变量名、超时、启用状态）持久化在 SQLite。`McpExtensionHost` 通过受控 stdio 进程启动 MCP server，完成初始化、工具列表获取和 JSON-RPC 调用。
 
-`SubagentScheduler` 像一个轻量级的"任务调度中心"，管理子 Agent 的整个生命周期。
+工具名称会转换为公开名称，并拒绝跨服务的名称冲突。线程可单独启用或禁用某个 MCP server；Agent 在运行前只同步该线程启用服务的工具。MCP server 进程也由执行环境工厂创建，因此仍受本地 sandbox 配置约束。
 
-### 核心概念
+MCP 是对本地 Agent 能力的扩展，不是自动信任边界。MCP 工具调用仍经过 Policy Engine 的工具风险判断。
 
-- **SubagentRun**：一个子任务运行实例，有唯一 ID、父线程 ID、名称、输入、状态、结果
-- **SubagentScope**：子任务的可见性边界（`thread_id` + `parent_turn_id` + `depth`），用于隔离
-- **SubagentExecutor**：trait，真正执行子任务的地方。由调用方实现
-- **SubagentObserver**：trait，子任务状态变更时的回调
+**为什么 MCP 要用独立 stdio 进程？** 扩展可以崩溃、卡住或升级，而核心服务仍应保留自己的状态。进程边界配合超时让外部扩展不会直接变成核心内存的一部分。
 
-### 生命周期
+### 9.2 Skills
 
-```
-Queued → Running → Completed / Failed / Cancelled / TimedOut
-```
+Skills 从用户目录和工作区的 `.codex/skills/` 发现，使用 `SKILL.md` 的前置 YAML 元数据生成 `SkillDescriptor`。读取时有大小限制和截断标识，避免把无界文档直接塞入模型上下文。
 
-### 并发控制
+用户在消息中选择 Skill 时保存引用；模型可以随后选择 `read_skill` 读取其正文。这将“用户固定的上下文”与“模型按需加载的指令”区分开来。
 
-每个父 Turn 最多同时运行 4 个子 Agent（可配置）。调度器使用 `tokio::sync::Semaphore` 限制并发，保证公平调度。
+### 9.3 子智能体
 
-### 深度限制
+`SubagentScheduler` 将子任务表示为可持久化 `SubagentRun`，并通过 executor 运行另一个带子上下文的 `AgentCore`。它支持：
 
-子 Agent 可以再派生子 Agent，形成树状结构。默认最大深度 2 层，防止无限递归。
+- 并发上限（Semaphore）；
+- 深度上限，防止无限递归；
+- 超时、等待、增量输入和取消；
+- 父 Turn 取消时递归取消子任务；
+- 通过广播事件将状态变化回传到父线程的事件流。
 
-### 超时
+子智能体的完成、失败、取消或超时不等价于主 Agent 已完成任务。主 Agent 需要读取其状态和结果后再汇总。
 
-子 Agent 执行有默认 15 分钟的超时时间，超时自动取消。
-
-### 隔离（Scope）
-
-子任务只能被其直接父级看到和操作：
-- `send_input_scoped`：只允许父级向子任务发送消息
-- `cancel_scoped`：只允许父级取消子任务
-- `wait_scoped`：只允许父级等待子任务
-
-这防止了线程 A 意外干扰线程 B 的子 Agent。
-
-### 层级取消
-
-调用 `cancel_parent(turn_id)` 会**级联取消**该父级下的所有子孙 Subagent。这在用户取消主 Agent Turn 时自动触发，确保不留下孤儿子进程。
+**子智能体不是“免费加速按钮”。** 并发能缩短互不依赖的工作，但会增加协调、上下文传递和失败处理成本。因此调度器显式保存父 Turn、深度、状态和取消关系。
 
 ---
 
-## 20. Git Workflow — Git 工作流引擎
+## 10. 浏览器运行时
 
-**它解决什么问题？**
+**这一层要解决的问题：** 用户希望看到网页，模型希望读取和操作网页；如果两者操作两个不同浏览器，登录状态、页面内容和结果就会不一致。
 
-AI 需要执行 Git 操作——查看状态、创建分支、提交代码、推送远程。但这些操作如果直接通过 Shell 工具执行，存在参数注入的安全风险。Git Workflow 引擎提供了**类型安全的 Git 操作接口**。
+`BrowserRuntime` 抽象统一会话、导航、快照、点击、输入、等待、截图和下载。
 
-**核心原理：强类型请求 → 严格的参数校验 → 安全的 git 命令构造**
+### 桌面模式：共享可见页面
 
-```
-用户请求（结构化）→ 参数校验 → 构造 git 命令 → 通过 ExecutionEnvironment 执行 → 返回结构化结果
-```
+Electron 创建每线程浏览器会话对应的 `WebContentsView`。Rust `DesktopBrowserRuntime` 通过带 Token 的回环 broker 操作同一会话，因此用户在 UI 中看到的页面与 Agent 操作的页面是同一个页面。broker 自身由 Electron 主进程拥有，渲染层只能通过白名单 IPC 控制视图布局和导航状态。
 
-### 支持的操作
+### 非桌面模式：CDP 回退
 
-| 操作 | 说明 | 是否变更（mutation） |
-|------|------|-------------------|
-| Status | 查看 Git 状态（porcelain v2 格式） | ❌ |
-| ListBranches | 列出分支（含远程、上游跟踪信息） | ❌ |
-| CreateBranch | 创建新分支 | ✅ |
-| SwitchBranch | 切换分支 | ✅ |
-| Commit | 提交代码（支持 `--all`） | ✅ |
-| Push | 推送到远程（支持 `--set-upstream`） | ✅ |
-| Compare | 比较两个分支差异 | ❌ |
-| CreateWorktree | 创建新的工作树 | ✅ |
+没有可用 Electron broker 时，服务端使用 `LocalBrowserRuntime`，连接本地 Chrome/Edge 的 CDP 运行时。它是功能回退，不会自动得到桌面可见浏览器的会话状态。
 
-### 安全校验
+### 域名审批和下载
 
-每个操作在构造 git 命令前都经过严格校验，防止参数注入：
+浏览器工具和浏览器面板会检查域名授权。对于需确认的域名，先创建审批记录；用户同意后只写入授权，不自动重试旧请求。下载路径和文件访问仍应通过工作区/预览规则处理，不能把网页下载视为可信输入。
 
-| 校验 | 说明 |
-|------|------|
-| 分支名称 | 不能以 `-` 开头、不能包含 `..` / `@{` / NUL 等、不能是保留名称（HEAD、FETCH_HEAD 等）|
-| Ref 引用 | 同上 + 不能是空字符串 |
-| 远程名称 | 只允许字母数字和 `-_\.`、不能以 `-` 开头 |
-| 提交信息 | 不能包含 NUL、不能为空、最长 32KB |
-| 仓库路径 | 不能为空、不能包含 NUL/换行 |
-| 工作树路径 | 必须是有效 Unicode、不能包含 NUL/换行 |
-
-### 变更操作的事务性
-
-变更操作（mutation）执行失败时返回 `GitWorkflowError::MutationFailed`，其中保留了完整的 `GitWorkflowResult`（stdout、stderr、exit_code），方便调用方获取错误详情进行恢复。
-
-### 解析功能
-
-工具函数可以直接解析 git 输出：
-- `parse_current_branch`：从 `--porcelain=v2` 输出中提取当前分支名
-- `parse_branch_list`：解析 `for-each-ref` 输出为结构化 `GitBranchInfo` 列表
-- `parse_ahead_behind`：解析 ahead/behind 数值
+**共享会话的价值：** 用户可以看到模型点击了什么，模型也不会在一个看不见的浏览器里得到与 UI 不同的页面。这提高了可解释性，但也让网页访问成为需要审批和隔离的高风险能力。
 
 ---
 
-## 21. Model Provider — 模型接入层
+## 11. 产物、文件预览与 XLSX
 
-**它解决什么问题？**
+**这一层要解决的问题：** 文件预览看似是 UI 功能，实际也涉及路径授权、线程归属和大文件控制。若让浏览器直接按用户传入路径读磁盘，会绕开服务端的安全边界。
 
-OpenTopia 需要调用大语言模型（LLM），但 LLM 有很多种。Model Provider 就是统一接入层。
+### 11.1 预览服务
 
-**核心原理：一个通用的模型插头 + 流式输出**
+预览是线程范围内的只读服务，而不是前端直接读取本机文件。请求先解析 `PreviewTarget`：
 
-```rust
-trait ModelProvider: Send + Sync {
-    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse>;
-    async fn stream(
-        &self,
-        request: ModelRequest,
-        on_delta: &mut dyn FnMut(ModelStreamDelta) -> Result<()>,
-    ) -> Result<ModelResponse>;
-    async fn check_health() -> Result<ProviderHealthCheck>;
-}
+- 工作区目标必须在当前线程工作区内，且路径规范化后仍是普通文件。
+- Artifact 目标必须属于当前线程。
+- 服务端按类型和大小限制生成 `PreviewDescriptor`，含预览标识、来源、名称、内容类型、大小和 revision。
+- 内容、工作簿元数据和单元格区间分别通过认证的 `/previews/:id/content`、`/workbook`、`/range` 获取。
+
+当前预览种类包括文本、图片、PDF、电子表格和不支持的文件。前端 `PreviewHost` 使用 Monaco 显示只读文本/代码、Blob URL 显示图片、PDF.js 显示 PDF、虚拟化区间网格显示 XLSX。无法预览的格式可以请求系统应用打开，但不会被前端当作脚本执行。
+
+### 11.2 电子表格工具
+
+`spreadsheet` 工具只面向 `.xlsx`：
+
+| action | 作用 | 变更工作区 |
+|---|---|---|
+| `inspect` | 工作簿摘要 | 否 |
+| `list_sheets` | Sheet 列表及属性 | 否 |
+| `read_range` | 按零基、包含端点的单元格区间读取 | 否 |
+| `write` | 创建新工作簿，或重建源工作簿后写出到指定路径 | 是 |
+
+读取使用 `calamine`，写入使用 `rust_xlsxwriter`。写操作会保留读取到的值、公式、Sheet 顺序和可见性，但不保证复制样式、图表、图片、宏或其他嵌入对象。写入输入支持空值、字符串、整数、数字、布尔和公式；每个请求均校验 Sheet 名称、零基单元格坐标、重复更新、输入/输出大小及总单元格等上限。
+
+表格读写仍先经过 Policy Engine，文件通过 `ExecutionEnvironment` 读写。因此它不是绕过普通工作区权限的专用通道。
+
+**为什么 XLSX 需要专门工具？** XLSX 本质是多个 XML 文件组成的压缩包。让模型直接拼 XML 很容易损坏文件。专用工具把操作提升为“读 Sheet、读范围、写单元格”，并把格式保真等限制明确暴露出来。
+
+---
+
+## 12. React Workbench
+
+**这一层要解决的问题：** 前端要让用户感觉系统是连贯的，但又不能把浏览器内存当成唯一事实来源。它因此同时维护交互状态，并从服务端恢复业务事实。
+
+`apps/desktop/src/App.tsx` 是当前工作台的大部分状态编排层，没有引入 Redux 或 Zustand。它通过 `ApiClient`：
+
+- 初始化平台信息、服务健康、最近工作区、项目/线程、设置、Provider 健康、MCP 和 sandbox 状态；
+- 为当前线程加载消息、事件、审批、工作区、产物、上下文、Git 和终端记录；
+- 订阅 Agent SSE 与终端 SSE，按序号合并增量状态；
+- 打开文件/产物预览标签和可见浏览器标签；
+- 将审批、取消、上下文压缩、Git 操作及子智能体操作提交到服务端。
+
+主要组件职责如下：
+
+| 组件 | 职责 |
+|---|---|
+| `WorkbenchPanel` | 文件、diff、终端、扩展和 sandbox 等工作台页签 |
+| `RightContextRail` | 线程上下文、审批、子智能体、Git 操作和运行状态 |
+| `XtermTerminal` | xterm.js 的输入、输出和尺寸变化桥接 |
+| `ArtifactGallery` | 线程 Artifact 列表和预览入口 |
+| `PreviewHost` | 文本、图片、PDF、XLSX 的只读预览 |
+| `WebPreviewSurface` / `BrowserPanel` | Electron 共享网页或 CDP 回退页面 |
+| `LogViewer` | 通过 preload 读取 Electron 脱敏日志 |
+
+UI 是事件的消费者，但并非“完全不维护状态”：它维护当前选择、加载/错误状态、缓存和 SSE 去重。服务端持久化事件是跨刷新和重启的事实来源。
+
+**这里适合学习“前端状态的两类来源”：** 抽屉是否展开、当前选中哪个标签属于短暂 UI 状态；消息、审批、Turn 和产物属于业务事实。前者可以在刷新后丢失，后者必须从 API/数据库恢复。把两者混在一起是桌面工作台常见的复杂度来源。
+
+---
+
+## 13. 构建、开发与验证
+
+**这一层要解决的问题：** 多语言、多进程项目最容易出现“本机能跑，打包后缺一个二进制或环境变量”的问题。脚本把构建顺序和必要依赖写成可重复执行的步骤。
+
+### 13.1 依赖和入口
+
+- Rust workspace：`opentopia-core`、`opentopia-server`、`opentopia-cli`。
+- 桌面 workspace：`apps/desktop`，Vite 构建 React，Electron 负责宿主和打包。
+- Windows 开发环境：`scripts/dev-env.ps1` 准备 GNU Rust toolchain、WinLibs、环境别名和默认的本地验证 Token。
+
+### 13.2 服务与桌面启动
+
+```powershell
+.\scripts\dev-env.ps1
+cargo run -p opentopia-server
+
+pnpm.cmd install
+pnpm.cmd dev:desktop
 ```
 
-`stream` 方法是新增的。与 `complete` 不同，它不是等全部结果返回，而是通过回调函数 `on_delta` 逐步推送三种类型的增量：
+直接启动服务端时必须设置符合长度要求的 `OPENTOPIA_API_TOKEN`。`dev-env.ps1` 仅为本地验证提供默认 Token；Electron 启动时会替换为每次启动随机生成的 Token。
 
-- `ModelStreamDelta::Text { text }`：模型输出的文本片段（逐片段推送，前端可实时显示）
-- `ModelStreamDelta::ToolCall { index, id, name, arguments_delta }`：工具调用声明
-- `ModelStreamDelta::Usage { usage }`：完成后的 token 用量统计
+### 13.3 打包
 
-Agent Loop 调用 `stream` 而非 `complete`，产生的 Text delta 实时转换为 `ModelDelta` 事件通过 SSE 推给前端，让用户看到 AI "逐字输出"的效果。
+`scripts/build-desktop.ps1` 按顺序：
 
-`ModelRequest` 现在不只是简单的文本，还可以包含：
-- `system_prompt`：系统提示词
-- `conversation`：多轮对话历史（`Vec<ModelConversationMessage>`），结构化表示之前的对话记录
-- `user_message`：用户消息
-- `tool_candidates`：可以调用的工具列表（AI 可以自主选择调用）
-- `previous_tool_calls`：之前已经调用的工具
-- `tool_results`：之前工具调用的结果
+1. 构建 release 版 `opentopia-server`；
+2. 将二进制复制到 `apps/desktop/resources/`；
+3. 在 Windows 上校验并暂存 Codex restricted-token sandbox helpers；
+4. 构建桌面前端并调用 `electron-builder`。
 
-`ModelResponse` 现在也包含：
-- `text`：AI 的文本回复
-- `tool_calls`：AI 要求调用的工具列表
-- `usage`：可选的 `ModelUsage`，包含 `input_tokens`、`output_tokens`、`total_tokens`、`cached_input_tokens`、`reasoning_tokens`
+`scripts/check.ps1` 运行 `cargo check --workspace`、桌面 TypeScript typecheck 和前端 build。它是基础静态/构建验证，不替代 Provider、沙箱、浏览器或端到端人工验证。
 
-### 三种 API 格式兼容
-
-`OpenAiCompatibleProvider` 能同时处理三种不同的 API 响应格式：
-
-1. **Chat Completions API**（标准）：从 `choices[0].message.content` 取文本，从 `choices[0].message.tool_calls` 取工具调用
-2. **Legacy function_call**（旧版兼容）：从 `choices[0].message.function_call` 取函数调用
-3. **Responses API**（新版）：从 `output` 数组中取 type 为 `function_call` 的条目
-
-### 健康检查策略
-
-健康检查分两步：先用 `GET /models`（超时 5 秒），如果失败则用最小请求 `POST /chat/completions` 测试连通性。检查结果包含 `reachable`、`latency_ms`、`model_available`、`error`。
-
-### 严格 OpenAI-compatible 网关兼容
-
-模型工具请求默认声明 `parallel_tool_calls: false`，避免兼容网关返回无法续接的并行调用历史。标准 tool-call/tool-result 消息仍是首选路径；如果带工具历史的请求收到 HTTP 400，Provider 仅重试一次，将已完成调用压成纯文本 JSON 上下文。该 fallback 不会在其他状态码上重试，也不会形成无限循环。
-
-`scripts/probe-openai-compatible.ps1` 不再只测一次聊天请求，还验证 SSE、自动工具调用、工具结果 continuation、多段历史和 compacted-history fallback。2026-07-16 的 GLM-5.2 长程报告位于 `docs/evaluations/`。
-
-现在可以配置**多个模型提供者**：
-
-| 字段 | 说明 |
-|------|------|
-| `id` | 提供者 ID（如 "default"、"my-local-model"） |
-| `kind` | 类型（Mock / OpenAiCompatible） |
-| `base_url` | API 地址 |
-| `model` | 模型名称 |
-| `api_key_source` | API Key 来源（环境变量名） |
-| `api_key_configured` | 是否已配置 Key |
-
-用户在设置面板可以：
-- 添加/删除提供者
-- 切换当前使用的提供者
-- 修改提供者的 base URL 和 model
-- 测试连接是否正常
-
-### 健康检查
-
-每个提供者支持健康检查，检查结果包含：
-- `reachable`：API 地址是否可达
-- `latency_ms`：延迟
-- `model_available`：模型是否可用
-- `error`：错误信息（如果有）
+**验证应分层进行：** 编译检查类型和链接；单元测试检查局部逻辑；服务端验证检查 API；桌面端手工或端到端验证检查真实进程边界。任何一层通过，都不意味着其他层已经正确。
 
 ---
 
-## 22. Settings — 设置管理
+## 14. 关键边界与维护原则
 
-**它解决什么问题？**
+1. **所有本地 API 都需要认证。** 新路由必须位于鉴权中间件之后；不能为健康检查或 SSE 建未认证例外。
+2. **Electron 不得成为 Rust 安全模型的旁路。** 新 IPC 只能提供桌面能力，文件变更、shell、审批和 sandbox 仍应留在 Rust 服务端。
+3. **策略、执行环境与 OS 沙箱要同时检查。** 不要把其中一层的成功当作其他两层已经生效。
+4. **事件先持久化，再广播。** 新可恢复 UI 状态需要有 SQLite 事实来源，并支持用序号重放。
+5. **审批必须可恢复且动作范围明确。** 允许某个 pending tool call 不应悄悄扩大为整个线程的永久授权。
+6. **文件和 Artifact 必须绑定线程/工作区。** 预览、下载、上下文源和 MCP 输入都不能因为前端传入路径而绕过作用域验证。
+7. **将计划与已实现能力分开记录。** 对更新签名、远程发布、PR 创建、格式保真 XLSX、远程多用户部署等内容，应在设计或 backlog 中说明，不应写为当前运行时保证。
 
-用户需要配置模型、权限模式、工作区等。这些设置需要持久化。
+---
 
-**核心原理：一个持久化的配置对象**
+## 15. 一条请求的完整路径
 
-```rust
-AppSettings {
-    providers: Vec<ProviderSettings>,   // 多个模型提供者
-    active_provider_id: String,         // 当前使用的提供者
-    permission_mode: PermissionMode,    // 权限模式
-    default_workspace_root: Option<PathBuf>,  // 默认工作区
-    updated_at: DateTime<Utc>,          // 最后修改时间
-}
+```text
+用户在 React 工作台提交消息和可选上下文源
+  -> ApiClient 携带 Bearer token 调用本地服务
+  -> 服务端校验 Origin/Token、加载源和 Skill 引用、创建并保存 Turn 与用户消息
+  -> 后台 AgentCore 流式调用 Provider
+  -> 模型按需发出工具调用
+  -> PolicyEngine 决定 allow / ask / deny
+  -> allow：ExecutionEnvironment 在 sandbox 配置下执行，结果写事件/产物并回传模型
+  -> ask：保存 ApprovalContinuation，Turn 等待用户决定
+  -> 完成：保存助手消息和 Turn 终态
+  -> SQLite 事件经 SSE 历史回放和实时广播返回 UI
+  -> UI 根据事件、Turn、审批和产物更新视图；刷新后从 API 恢复状态
 ```
 
-**多提供者如何切换？**
-
-用户在前端设置面板：
-1. 选择一个提供者作为 active
-2. 修改它的 base URL / model / apiKeySource
-3. 点击保存 → PATCH 到后端
-4. 后端更新设置 → 重新创建 AgentCore（使用新的提供者配置）
-
-**从环境变量初始化**
-
-启动时如果没有持久化的设置，会从环境变量自动推断：
-- `OPENTOPIA_OPENAI_BASE_URL` → base URL
-- `OPENTOPIA_MODEL` → model
-- `OPENTOPIA_API_KEY` → API Key
-- `OPENTOPIA_PERMISSION` → 权限模式
+这条路径体现了 OpenTopia 的核心取舍：UI 负责交互，服务端负责协调和可恢复状态，核心库负责 Agent 能力与安全边界，Electron 只承担桌面特权能力。
 
 ---
 
-## 23. Workspace — 工作区管理
+## 16. 跟读源码的练习路线
 
-**它解决什么问题？**
+下面的路线适合一边读代码、一边验证本文的说法。每一步都只追踪一条因果链，避免一开始陷入所有文件。
 
-AI 需要跟用户的工作目录打交道——看目录结构、读文件内容、查看 Git 变更、修改文件。
+### 练习 1：追踪一条用户消息
 
-**核心原理：一组只读的工作区查看 API**
+1. 从 `apps/desktop/src/App.tsx` 中提交消息的处理函数开始，找到 `ApiClient` 的调用。
+2. 在 `apps/desktop/src/api/client.ts` 中找到 `POST /api/threads/:thread_id/messages`。
+3. 跳到 `crates/opentopia-server/src/main.rs` 的 `send_message`，观察它先创建 Turn、再保存 Message、最后 `tokio::spawn` 后台任务的顺序。
+4. 继续跟到 `run_new_agent_turn` 和 `AgentCore::run_turn_detailed_streaming`。
 
-工作区 API 都是**只读的**（实际写文件通过工具系统，受权限控制）：
+完成后回答：**为什么 HTTP 接口先返回用户消息，而不等待模型最终回答？**
 
-| API | 作用 |
-|-----|------|
-| `workspace/tree` | 列出目录内容（只显示一层） |
-| `workspace/file` | 读取文件内容（限制 64000 字符） |
-| `workspace/diff` | 查看 Git diff |
-| `workspace/diff/revert` | 安全地恢复文件修改 |
-| `workspace/diff/hunk` | 逐段 stage/unstage/discard |
-| `trajectory` | 导出完整执行轨迹（含消息、事件、审批、产物、diff） |
+### 练习 2：画出 Turn 状态机
 
-### 安全性
+从 `crates/opentopia-core/src/model.rs` 的 `TurnStatus` 开始，画出下面的状态转换：
 
-所有路径操作都做了安全检查：
-1. 拒绝包含 `..` 的路径
-2. 路径必须是工作区的子路径
-3. 不存在的路径返回 404
-
-### Git Diff 操作
-
-后端的 git diff 功能支持：
-- 查看暂存区（staged）和未暂存区（unstaged）的差异
-- 解析 diff hunk（逐段修改块）
-- 安全地应用 / 撤销 hunk
-
----
-
-## 24. CLI — 命令行入口
-
-（基本不变，但值得一提）
-
-**核心原理：复用一切，只是入口不同**
-
-CLI 和桌面后端共享同一套 Rust 代码——`AgentCore`、`SqliteSessionStore`、工具集全都一样。
-
-CLI 命令：
-- `opentopia threads` — 列出所有对话
-- `opentopia new --title "..."` — 创建新对话
-- `opentopia send <id> "<msg>"` — 发消息
-
-**设计原则**：CLI 不做任何与桌面端不同的逻辑。你在桌面端创建的对话，在 CLI 里也能看到。
-
----
-
-## 25. Windows Dev/Build — 开发与构建
-
-（基本覆盖之前的版本，新增要点）
-
-**沙箱二进制分发**
-
-构建时会检测 `codex-sandbox` 二进制（用于 Windows 沙箱），将其路径通过环境变量传给后端。
-
-**打包流程**
-
-```
-1. 导入 dev-env.ps1（确保环境正确）
-2. cargo build --release -p opentopia-server
-3. 复制二进制到 apps/desktop/resources/
-4. pnpm --filter @opentopia/desktop dist
-5. 检测 codex-sandbox 路径并注入环境变量
+```text
+running -> succeeded
+running -> failed
+running -> cancelling -> cancelled
+running -> waiting_approval
+waiting_approval -- 用户允许或拒绝 --> 新建一个 running 的恢复 Turn -> succeeded / failed
+进程重启时：running 或 cancelling -> interrupted
 ```
 
----
+`waiting_approval` 记录保留为已暂停的执行事实；恢复时创建一个新的 Turn，并从保存的 continuation 继续。再读 `crates/opentopia-server/src/turns.rs`，找出“同一线程不能同时运行两个活动 Turn”是在哪里保证的。这个练习会帮助你理解：状态机不是画图工具，而是用来限制非法状态和恢复异常状态的设计。
 
-## 26. 总结：一条消息的完整旅程
+### 练习 3：追踪一次工具调用
 
-把整个流程串起来讲一遍：
+1. 从 `crates/opentopia-core/src/tools.rs` 的 `ToolRegistry::with_builtins` 选择 `shell` 或 `write_file`。
+2. 观察工具如何读取输入 schema，如何调用 `ctx.policy`，以及如何通过 `ctx.environment` 执行。
+3. 再读 `policy.rs` 和 `execution.rs`，分别回答“产品规则是否同意？”与“底层如何安全完成？”。
+4. 最后读 `sandbox.rs`，理解 OS 级限制为什么仍然需要存在。
 
-> 用户在输入框打字 → 前端 POST 给后端 → 后端存消息并启动 Agent → Agent 自动 list_files → Agent 把文件列表 + 用户消息发给 LLM → LLM 决定调用工具 → Agent 检查权限 → 通过沙箱执行工具 → 结果发给 LLM → （循环最多 8 轮） → LLM 输出最终回复 → 存为 AssistantMessage → 所有事件通过 SSE 推回前端 → 前端实时渲染
+完成后回答：**若把策略检查只写在 UI 按钮里，模型、CLI 或未来新 API 能否绕过它？为什么？**
 
-或者用比喻：
+### 练习 4：验证可恢复事件流
 
-1. 你（顾客）跟服务员（前端 UI）说："帮我看看项目结构，然后优化构建脚本"
-2. 服务员写张条子（HTTP 请求）递给后厨（Rust 后端）
-3. 后厨喊了一声"收到"，然后开始忙活（异步 Agent）
-4. 后厨先看了一眼冰箱（`list_files`）
-5. 然后把冰箱里的东西和你的要求一起告诉大厨（LLM）
-6. 大厨说："先看看 package.json"（ToolCall）
-7. 后厨检查了权限，打开冰箱拿出 package.json 念给大厨听
-8. 大厨听完说："改这几行"（另一个 ToolCall）
-9. 后厨改了文件，发出 `FileChanged` 事件
-10. 大厨满意了，说"搞定了"（AssistantMessage）
-11. 后厨每做一步就摇铃（SSE 事件），服务员听到铃声就端菜上桌
-12. 如果大厨要用你的私房调料（危险操作），后厨会喊"顾客同意吗？"（ApprovalRequested）
+1. 在 `main.rs` 中找到 `publish_payload`，确认事件何时写入存储、何时广播。
+2. 找到 `stream_events`，观察历史事件和实时 SSE 如何拼接。
+3. 回到 `App.tsx`，查看 UI 如何订阅并使用 `seq` 合并事件。
 
-整个过程中，后厨的每一项操作都写在流水账里（SQLite 持久化），端上桌的每一道菜都有视频回放（事件轨迹导出）。
+完成后回答：**如果 SSE 在工具执行中断开，用户刷新页面后哪些数据应从 SQLite 恢复，哪些只是短暂 UI 状态？**
 
----
+### 练习 5：观察一次审批续跑
 
-## 27. 借鉴来源：我们站在谁的肩上
+1. 在 `agent.rs` 中搜索 `ApprovalRequested` 和 `AgentContinuation`。
+2. 在 `main.rs` 中阅读 `decide_approval`，比较允许和拒绝的两条路径。
+3. 注意 continuation 中保存的是模型对话和待执行调用，而不只是一个布尔值。
 
-OpenTopia 没有从零发明一切。每个模块的设计都参考了业内已有的开源项目——不是复制代码，而是**理解其架构模式后重新实现**。
+完成后回答：**为什么“允许”不能仅仅设置一个全局开关，然后重新发起原始用户消息？**
 
-以下是各模块的借鉴来源和具体对应关系：
+### 练习 6：自己设计一个新能力
 
-### 桌面壳（Desktop Shell）
+假设要加入一个“读取 JSON 并显示格式化结果”的工具。先不要写代码，先回答：
 
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Goose** | Electron 主进程架构、窗口生命周期、设置/菜单/更新的主进程承载 | `apps/desktop/electron/main.cjs` |
-| **opencode** | sidecar 后端健康检查、自动拉起、进程清理 | `startBackendIfNeeded()` 轮询策略 |
+1. 它应该是 React 组件、HTTP 路由，还是 `ToolRegistry` 中的工具？是否需要三者配合？
+2. 输入路径如何验证在工作区中？
+3. 它需要 `inspect_read`、`inspect_write` 还是 `inspect_command`？
+4. 结果是只返回给模型、保存为 Artifact，还是同时提供预览？
+5. 出错、取消、输出过大时各自应该怎样表现？
 
-### 桌面能力桥（Platform Bridge）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **opencode** | `PlatformProvider` 风格的桌面能力抽象——平台信息、路径操作、对话框 | `apps/desktop/electron/preload.cjs` 的 `contextBridge` 和 `apps/desktop/src/platform.ts` 的降级兼容层 |
-
-### 用户界面（Workbench UI）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex / Trae** | 三栏工作台布局（左侧线程、中间聊天、右侧工作区） | `apps/desktop/src/App.tsx` 的 layout 结构 |
-| **opencode** | 可换主题、token 化 UI、工作台视觉基调 | `apps/desktop/src/styles/app.css` 的样式体系 |
-
-### Agent 事件协议（Agent Event Protocol）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | SQ/EQ 异步事件队列、类型化事件载荷（typed event payload） | `crates/opentopia-core/src/model.rs` 的 `AgentEventPayload` 枚举 |
-| **OpenHands** | event trajectory 思路——完整记录每一步操作，支持回溯和回放 | `AgentEvent` 的 `seq` 序号和 `turn_id` 归组 |
-
-### 后端服务（Local Server）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | REST + SSE 事件流、审批决策 API 模式 | `crates/opentopia-server/src/main.rs` 的异步 agent 执行和 SSE 双段拼接 |
-| **Codex** | Turn 管理——运行中 Turn 的并发控制和取消 | `crates/opentopia-server/src/turns.rs` 的 `TurnManager` |
-| **Codex** | Bearer token API 认证与 CORS 安全 | `crates/opentopia-server/src/auth.rs` 的 `ApiAuth` |
-| **OpenHands** | event service 抽象、分页/增量查询 | `since` 参数的事件列表和持久化 |
-| **Goose** | provider/tool/session 组合的服务端编排 | `AppState` 中的 agent + settings + mcp_host 组合 |
-
-### 数据持久化（Session Store）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **OpenHands** | conversation + event 持久化模式、SQLite schema 设计 | `crates/opentopia-core/src/store.rs` 的 `SqliteSessionStore` |
-
-### 智能体循环（Agent Loop）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Goose** | agent loop 结构——provider 调用 + 工具执行 + session 管理 | `crates/opentopia-core/src/agent.rs` 的 `AgentCore` 和 `run_turn` |
-| **Goose** | 确定性本地工具命令（/list, /read 等）不走 LLM 直接执行 | `ParsedTask::parse` 命令解析器 |
-| **Codex** | MCP 工具作为 Agent 能力扩展层 | `sync_mcp_tools()` 和 `McpToolWrapper` |
-
-### 执行引擎（Execution Engine）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | 带沙箱的进程执行、输出截断、资源限制 | `crates/opentopia-core/src/execution.rs` 的 `LocalExecutionEnvironment` |
-| **portable-pty crate** | 跨平台伪终端（PTY）支持 | `PtySession` 和后端的交互式终端 |
-
-### 沙箱隔离（Sandbox）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | OS 级沙箱架构：Linux bwrap + seccomp、macOS Seatbelt、Windows native sandbox | `crates/opentopia-core/src/sandbox.rs` 的三平台 adapter（Linux 当前只落地 bwrap，seccomp/Landlock 待办） |
-| **Codex** | 沙箱命令包装策略——在原始命令外套一层沙箱工具 | `build_local_sandbox_command` 的 `SandboxCommandPlan` |
-
-### 权限控制（Permission / Approval）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | 命令风险判定、exec policy、patch 工具进入权限链路 | `crates/opentopia-core/src/policy.rs` 的 `CommandPolicyRule` 和 `PolicyDecision` |
-| **Goose** | permission inspector——工具调用前分层检查（Allow / Ask / Deny） | `BasicPolicyEngine` 的 `inspect_read` / `inspect_write` / `inspect_command` |
-
-### 内置工具（Built-in Tools）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | 一等工具设计（first-class tool）、apply_patch 作为独立工具 | `crates/opentopia-core/src/tools.rs` 的 `Tool` trait 和七个内置工具 |
-| **Codex** | shell 命令的跨平台实现（Windows PowerShell vs Unix sh） | `ExecRequest::shell()` 的跨平台分支 |
-
-### 浏览器运行时（Browser Runtime）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Playwright / Puppeteer** | CDP 浏览器自动化模式 | `crates/opentopia-core/src/browser.rs` 的 CDP 通信和命令模式 |
-| **Electron** | `WebContentsView` 的原生页面托管、session 隔离和权限回调 | `apps/desktop/electron/browser-host.cjs` + `desktop_browser.rs` 的共享桌面会话与 broker |
-| **Codex** | 浏览器 sandbox 中的受限浏览器工具 | 浏览器操作审批和域白名单策略 |
-
-### 文件预览（Preview Runtime）
-
-| 来源项目/库 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|-------------|-----------|-------------------|
-| **Codex / opencode** | 工具和文件作为一等工作台标签，而不是临时模态框 | `App.tsx` 的 preview tab 模型和 `PreviewHost.tsx` |
-| **Monaco / PDF.js** | 成熟的代码高亮与 PDF Canvas 渲染 | 文本/代码和 PDF renderer |
-| **calamine** | XLSX 元数据和按区间读取 | `spreadsheet.rs` + preview workbook/range API |
-
-### Skills 技能系统
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | `.codex/skills/` 目录发现 + 前 YAML 元数据 | `crates/opentopia-core/src/skills.rs` 的 `discover_skills` 和 `SkillDescriptor` |
-| **Goose** | `SKILL.md` 命名约定和 Markdown 指令格式 | Skill 加载和模型渲染格式 |
-
-### Git 工作流引擎
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | 类型安全的 Git 操作、参数注入防护 | `crates/opentopia-core/src/git_workflow.rs` 的 `build_git_exec_request` 和输入校验 |
-
-### Subagent 调度器
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Goose** | 子 Agent 编排思路 | `crates/opentopia-core/src/subagents.rs` 的 `SubagentScheduler` |
-| **Codex** | 并发控制 Semaphore、层级取消 | 同上的并发 Semaphore 和 `cancel_parent` |
-
-### Context Sources
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Goose** | 文件上下文加载模式 | `crates/opentopia-core/src/context_sources.rs` 的 `load_context_sources` |
-
-### 模型接入层（Model Provider）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Goose** | extension manager——MCP 管理器作为 agent 能力扩展层 | `McpExtensionHost` 和 `McpStdioClient` |
-| **Codex** | MCP 工具调用链路、权限路由、JSON-RPC over stdio | `mcp_host.rs` 的 request/response 模式 |
-
-### 模型接入层（Model Provider）
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Goose** | provider 抽象层——统一模型调用接口，支持多种后端 | `crates/opentopia-core/src/provider.rs` 的 `ModelProvider` trait |
-| **Goose** | tool_calls 解析和多轮工具结果回传 | `ModelRequest` 的 `tool_candidates` / `previous_tool_calls` / `tool_results` |
-| **Codex** | 模型流式输出（streaming）、token 用量追踪 | `ModelProvider::stream` 和 `ModelStreamDelta` / `ModelUsage` |
-
-### CLI 命令行
-
-| 来源项目 | 借鉴了什么 | 落到 OpenTopia 哪里 |
-|----------|-----------|-------------------|
-| **Codex** | CLI 作为独立 crate 复用 core，不做重复逻辑 | `crates/opentopia-cli/src/main.rs` |
-
-### 整体架构与组合方式
-
-| 理念 | 来源 | 说明 |
-|------|------|------|
-| Electron 桌面壳 + Rust agent server + SQLite 持久化 + React UI | **Goose + opencode + Codex** 的组合借鉴 | 桌面壳借鉴 Goose（成熟 Electron 经验），Sidecar 方式借鉴 opencode，Rust runtime 借鉴 Codex，持久化借鉴 OpenHands |
-| 事件驱动 UI（后端发事件，前端消费） | **Codex SQ/EQ** | 前端不推断状态，只消费事件 |
-| 完整执行轨迹导出 | **OpenHands trajectory** | `GET /api/threads/:id/trajectory` 导出 messages/events/approvals/artifacts |
-
-> 详细的源码借鉴映射和每个模块的落地对照表见 [docs/source-adaptation-map.md](file:///j:/Project/OpenTopia/docs/source-adaptation-map.md)。
+这五个问题就是架构设计的基本功：先确定边界和失败模式，再决定代码放在哪里。

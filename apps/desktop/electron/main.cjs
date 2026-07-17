@@ -35,6 +35,7 @@ let desktopBrowserBroker = null;
 
 const secretsFilePath = "secrets.json";
 const providerSecretStorageKey = "provider-api-key";
+const providerSecretStoragePrefix = `${providerSecretStorageKey}:`;
 const keyringProviderApiKeySourceId = `keyring:${providerSecretStorageKey}`;
 const keyringProviderApiKeyEnvName = "OPENTOPIA_API_KEY";
 
@@ -353,6 +354,54 @@ function resolveOpenTopiaEnvFile(repoRoot) {
   return null;
 }
 
+function importProviderCredentialFallback(env, repoRoot, selectedEnvFile) {
+  // A generic OPENAI_API_KEY may belong to a different endpoint. It must not
+  // prevent a workspace-specific credential from being loaded for a custom
+  // OpenAI-compatible base URL.
+  const explicitProviderSecretNames = [
+    "OPENTOPIA_API_KEY",
+    "CREDIT_REVIEW_LLM_API_KEY",
+    "AUDIT_COPILOT_LLM_API_KEY",
+  ];
+  if (explicitProviderSecretNames.some((name) => Boolean(env[name]))) return;
+
+  const workspaceRoot = path.dirname(repoRoot);
+  const creditReviewProjectName = String.fromCodePoint(
+    0x4fe1,
+    0x8d37,
+    0x5ba1,
+    0x6838,
+    0x52a9,
+    0x624b,
+  );
+  const preferred = path.join(
+    workspaceRoot,
+    creditReviewProjectName,
+    ".env",
+  );
+  const candidates = [preferred];
+  try {
+    for (const entry of fs.readdirSync(workspaceRoot, {
+      withFileTypes: true,
+    })) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(workspaceRoot, entry.name, ".env");
+      if (candidate !== preferred) candidates.push(candidate);
+    }
+  } catch {
+    // The preferred sibling path is still checked below.
+  }
+
+  const markers = ["CREDIT_REVIEW_LLM_API_KEY", "AUDIT_COPILOT_LLM_API_KEY"];
+  for (const candidate of candidates) {
+    if (candidate === selectedEnvFile || !fs.existsSync(candidate)) continue;
+    const content = fs.readFileSync(candidate, "utf8");
+    if (!markers.some((marker) => content.includes(marker))) continue;
+    importEnvFile(env, candidate);
+    if (explicitProviderSecretNames.some((name) => Boolean(env[name]))) return;
+  }
+}
+
 function applyProviderAliases(env) {
   const setFromAliases = (target, aliases) => {
     if (env[target]) return;
@@ -365,18 +414,18 @@ function applyProviderAliases(env) {
   };
 
   setFromAliases("OPENTOPIA_API_KEY", [
-    "CREDIT_REVIEW_LLM_API_KEY",
     "AUDIT_COPILOT_LLM_API_KEY",
+    "CREDIT_REVIEW_LLM_API_KEY",
     "OPENAI_API_KEY",
   ]);
   setFromAliases("OPENTOPIA_OPENAI_BASE_URL", [
-    "CREDIT_REVIEW_LLM_BASE_URL",
     "AUDIT_COPILOT_LLM_BASE_URL",
+    "CREDIT_REVIEW_LLM_BASE_URL",
     "OPENAI_BASE_URL",
   ]);
   setFromAliases("OPENTOPIA_MODEL", [
-    "CREDIT_REVIEW_LLM_MODEL",
     "AUDIT_COPILOT_LLM_MODEL",
+    "CREDIT_REVIEW_LLM_MODEL",
     "CREDIT_REVIEW_LLM_CHEAP_MODEL",
     "CREDIT_REVIEW_LLM_STRONG_MODEL",
   ]);
@@ -473,6 +522,34 @@ function providerApiKeySecretEntry() {
   return readSecretStore().secrets[providerSecretStorageKey] || null;
 }
 
+function normalizeProviderId(providerId) {
+  const value = String(providerId || "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(value)) {
+    throw new Error(
+      "Provider ID must start with a letter or number and contain only letters, numbers, dots, underscores, or hyphens",
+    );
+  }
+  return value;
+}
+
+function providerSecretStorageKeyFor(providerId) {
+  return `${providerSecretStoragePrefix}${normalizeProviderId(providerId)}`;
+}
+
+function providerSecretSourceId(providerId) {
+  return `keyring:${providerSecretStorageKeyFor(providerId)}`;
+}
+
+function providerSecretEnvTarget(providerId) {
+  const digest = crypto
+    .createHash("sha256")
+    .update(normalizeProviderId(providerId))
+    .digest("hex")
+    .slice(0, 16)
+    .toUpperCase();
+  return `OPENTOPIA_PROVIDER_${digest}_API_KEY`;
+}
+
 function isProviderApiKeyConfigured() {
   return Boolean(providerApiKeySecretEntry()?.encryptedHex);
 }
@@ -524,11 +601,36 @@ function readProviderApiKeySecret() {
   }
 }
 
-function injectKeyringProviderApiKey(env) {
-  if (env[keyringProviderApiKeyEnvName]) return;
+function decryptSecretEntry(entry) {
+  if (!safeStorage.isEncryptionAvailable() || !entry?.encryptedHex) return null;
+  try {
+    return safeStorage.decryptString(Buffer.from(entry.encryptedHex, "hex"));
+  } catch (error) {
+    logConsole("warn", "secrets.provider.decrypt.failed", { error });
+    return null;
+  }
+}
 
+function injectKeyringProviderApiKey(env) {
   const value = readProviderApiKeySecret();
-  if (value) env[keyringProviderApiKeyEnvName] = value;
+  // Legacy single-key storage is a fallback only. New user-entered credentials
+  // use provider-specific env targets below and always win for that profile.
+  if (value && !env[keyringProviderApiKeyEnvName]) {
+    env[keyringProviderApiKeyEnvName] = value;
+  }
+
+  for (const [storageKey, entry] of Object.entries(readSecretStore().secrets)) {
+    if (!storageKey.startsWith(providerSecretStoragePrefix)) continue;
+    const providerId = storageKey.slice(providerSecretStoragePrefix.length);
+    let envTarget;
+    try {
+      envTarget = entry.envTarget || providerSecretEnvTarget(providerId);
+    } catch {
+      continue;
+    }
+    const providerValue = decryptSecretEntry(entry);
+    if (providerValue) env[envTarget] = providerValue;
+  }
 }
 
 function setProviderApiKeySecret(value) {
@@ -560,6 +662,58 @@ function deleteProviderApiKeySecret() {
   return keyringMetadata();
 }
 
+function providerKeyringMetadata(providerId) {
+  const normalizedId = normalizeProviderId(providerId);
+  const storageKey = providerSecretStorageKeyFor(normalizedId);
+  const configured = Boolean(
+    readSecretStore().secrets[storageKey]?.encryptedHex,
+  );
+  const encryptionAvailable = safeStorage.isEncryptionAvailable();
+  return {
+    providerId: normalizedId,
+    available: encryptionAvailable,
+    encryptionAvailable,
+    storageBackend: selectedSafeStorageBackend(),
+    storagePath: secretsPath(),
+    providerApiKeyConfigured: configured,
+    providerApiKeySourceId: providerSecretSourceId(normalizedId),
+    envTarget: providerSecretEnvTarget(normalizedId),
+    status: !encryptionAvailable
+      ? configured
+        ? "configured_unavailable"
+        : "unavailable"
+      : configured
+        ? "available"
+        : "not_configured",
+  };
+}
+
+function setProviderKeyringSecret(providerId, value) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("Encryption not available on this system");
+  }
+  const metadata = providerKeyringMetadata(providerId);
+  const secretValue = String(value || "").trim();
+  if (!secretValue) throw new Error("Provider API key cannot be empty");
+  const store = readSecretStore();
+  store.secrets[providerSecretStorageKeyFor(metadata.providerId)] = {
+    kind: "safeStorage",
+    envTarget: metadata.envTarget,
+    encryptedHex: safeStorage.encryptString(secretValue).toString("hex"),
+    updatedAt: new Date().toISOString(),
+  };
+  writeSecretStore(store);
+  return providerKeyringMetadata(metadata.providerId);
+}
+
+function deleteProviderKeyringSecret(providerId) {
+  const metadata = providerKeyringMetadata(providerId);
+  const store = readSecretStore();
+  delete store.secrets[providerSecretStorageKeyFor(metadata.providerId)];
+  writeSecretStore(store);
+  return providerKeyringMetadata(metadata.providerId);
+}
+
 function createBackendEnv(repoRoot, options = {}) {
   const defaultDatabasePath = isDev
     ? path.join(repoRoot, ".opentopia", "opentopia.db")
@@ -581,7 +735,9 @@ function createBackendEnv(repoRoot, options = {}) {
       process.env.VITE_DEV_SERVER_URL || "http://127.0.0.1:5173";
   }
 
-  importEnvFile(env, resolveOpenTopiaEnvFile(repoRoot));
+  const selectedEnvFile = resolveOpenTopiaEnvFile(repoRoot);
+  importEnvFile(env, selectedEnvFile);
+  importProviderCredentialFallback(env, repoRoot, selectedEnvFile);
   applyProviderAliases(env);
   if (options.includeKeyring !== false) {
     injectKeyringProviderApiKey(env);
@@ -1141,12 +1297,13 @@ async function startBackendIfNeeded() {
       isDev,
     });
 
-    backendProcess = spawn(command, args, {
+    const spawnedBackend = spawn(command, args, {
       cwd,
       env: createBackendEnv(repoRoot),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
+    backendProcess = spawnedBackend;
 
     writeLog("info", "backend.spawn.started", {
       pid: backendProcess.pid,
@@ -1155,19 +1312,19 @@ async function startBackendIfNeeded() {
       cwd,
     });
 
-    backendProcess.stdout?.on("data", (chunk) =>
+    spawnedBackend.stdout?.on("data", (chunk) =>
       logConsole("info", "backend.stdout", {
         chunk: chunk.toString(),
       }),
     );
-    backendProcess.stderr?.on("data", (chunk) =>
+    spawnedBackend.stderr?.on("data", (chunk) =>
       logConsole("error", "backend.stderr", {
         chunk: chunk.toString(),
       }),
     );
-    backendProcess.on("exit", (code) => {
+    spawnedBackend.on("exit", (code) => {
       writeLog("info", "backend.spawn.exited", { code });
-      backendProcess = null;
+      if (backendProcess === spawnedBackend) backendProcess = null;
     });
 
     for (let i = 0; i < 30; i += 1) {
@@ -1186,6 +1343,50 @@ async function startBackendIfNeeded() {
     });
   } catch (error) {
     logConsole("error", "backend.spawn.failed", { error });
+  }
+}
+
+async function stopManagedBackend() {
+  const child = backendProcess;
+  if (!child) return;
+
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error("Timed out while stopping the local backend")),
+      10_000,
+    );
+    child.once("exit", () => finish());
+    child.once("error", finish);
+
+    if (process.platform === "win32") {
+      const killer = spawn(
+        "taskkill",
+        ["/pid", String(child.pid), "/t", "/f"],
+        { windowsHide: true, stdio: "ignore" },
+      );
+      killer.once("error", finish);
+    } else if (!child.kill("SIGTERM")) {
+      finish(new Error("The local backend process could not be stopped"));
+    }
+  });
+}
+
+async function restartManagedBackend() {
+  if (!backendProcess) {
+    throw new Error("The local backend is not managed by this desktop process");
+  }
+  await stopManagedBackend();
+  await startBackendIfNeeded();
+  if (!(await isBackendHealthy())) {
+    throw new Error("The local backend did not become ready after restart");
   }
 }
 
@@ -1275,14 +1476,41 @@ function listSecretSources() {
     status: "available",
   }));
   const keyring = keyringMetadata();
+  const providerKeySources = Object.keys(readSecretStore().secrets)
+    .filter((key) => key.startsWith(providerSecretStoragePrefix))
+    .flatMap((key) => {
+      try {
+        const providerId = key.slice(providerSecretStoragePrefix.length);
+        const metadata = providerKeyringMetadata(providerId);
+        return [
+          {
+            id: metadata.providerApiKeySourceId,
+            kind: "keyring",
+            label: `Provider API key (${providerId})`,
+            configured: metadata.providerApiKeyConfigured,
+            readableByRenderer: false,
+            storesValue: true,
+            status: metadata.status,
+            available: metadata.available,
+            storageBackend: metadata.storageBackend,
+            storagePath: metadata.storagePath,
+            envTarget: metadata.envTarget,
+            providerId,
+          },
+        ];
+      } catch {
+        return [];
+      }
+    });
   const activeProviderKeySource =
+    (keyring.available && keyring.providerApiKeyConfigured
+      ? keyringProviderApiKeySourceId
+      : null) ||
     envSources.find(
       (source) => source.envName === "OPENTOPIA_API_KEY" && source.configured,
     )?.id ||
     envSources.find((source) => source.configured)?.id ||
-    (keyring.available && keyring.providerApiKeyConfigured
-      ? keyringProviderApiKeySourceId
-      : null);
+    null;
 
   return {
     activeProviderKeySource,
@@ -1303,6 +1531,7 @@ function listSecretSources() {
         storagePath: keyring.storagePath,
         envTarget: keyring.envTarget,
       },
+      ...providerKeySources,
     ],
     notes: [
       "Renderer receives metadata only. Secret values stay in env/keyring-capable main process paths.",
@@ -1374,7 +1603,39 @@ function registerIpc() {
       configured: metadata.providerApiKeyConfigured,
       status: metadata.status,
     });
+    await restartManagedBackend();
     return listSecretSources();
+  });
+
+  ipcMain.handle("secrets:get-provider-key-metadata", (_event, providerId) =>
+    providerKeyringMetadata(providerId),
+  );
+
+  ipcMain.handle(
+    "secrets:set-provider-key",
+    async (_event, providerId, value) => {
+      const metadata = setProviderKeyringSecret(providerId, value);
+      writeLog("info", "secrets.provider-profile.set", {
+        providerId: metadata.providerId,
+        sourceId: metadata.providerApiKeySourceId,
+        configured: metadata.providerApiKeyConfigured,
+        status: metadata.status,
+      });
+      await restartManagedBackend();
+      return metadata;
+    },
+  );
+
+  ipcMain.handle("secrets:delete-provider-key", async (_event, providerId) => {
+    const metadata = deleteProviderKeyringSecret(providerId);
+    writeLog("info", "secrets.provider-profile.delete", {
+      providerId: metadata.providerId,
+      sourceId: metadata.providerApiKeySourceId,
+      configured: metadata.providerApiKeyConfigured,
+      status: metadata.status,
+    });
+    await restartManagedBackend();
+    return metadata;
   });
 
   ipcMain.handle("secrets:delete", async (_event, key) => {
@@ -1385,6 +1646,7 @@ function registerIpc() {
       configured: metadata.providerApiKeyConfigured,
       status: metadata.status,
     });
+    await restartManagedBackend();
     return listSecretSources();
   });
 

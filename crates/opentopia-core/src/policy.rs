@@ -276,7 +276,7 @@ impl BasicPolicyEngine {
             workspace_root.join(path)
         };
         let candidate = canonicalize_existing_ancestor(&candidate);
-        candidate.starts_with(&workspace_root)
+        path_starts_with(&candidate, &workspace_root)
     }
 
     fn classify_mcp_tool(&self, descriptor: &ToolPermissionDescriptor) -> McpToolRisk {
@@ -341,6 +341,33 @@ fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn path_starts_with(candidate: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows_comparison_path(candidate).starts_with(windows_comparison_path(root))
+    }
+
+    #[cfg(not(windows))]
+    {
+        candidate.starts_with(root)
+    }
+}
+
+#[cfg(windows)]
+fn windows_comparison_path(path: &Path) -> PathBuf {
+    let value = path.to_string_lossy().replace('/', "\\");
+    let value = if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else if let Some(rest) = value.strip_prefix(r"\??\") {
+        rest.to_string()
+    } else {
+        value
+    };
+    PathBuf::from(value.to_lowercase())
+}
+
 impl PolicyEngine for BasicPolicyEngine {
     fn inspect_read(&self, path: &Path) -> PolicyDecision {
         if !self.inside_workspace(path) {
@@ -368,10 +395,9 @@ impl PolicyEngine for BasicPolicyEngine {
             PermissionMode::Chat | PermissionMode::ReadOnly => PolicyDecision::Deny {
                 reason: "Current permission mode does not allow writes.".to_string(),
             },
-            PermissionMode::Approve => PolicyDecision::Ask {
-                reason: format!("Write requires approval: {}", path.display()),
-            },
-            PermissionMode::Auto | PermissionMode::FullAccess => PolicyDecision::Allow,
+            PermissionMode::Auto | PermissionMode::Approve | PermissionMode::FullAccess => {
+                PolicyDecision::Allow
+            }
         }
     }
 
@@ -392,10 +418,9 @@ impl PolicyEngine for BasicPolicyEngine {
             PermissionMode::Chat | PermissionMode::ReadOnly => PolicyDecision::Deny {
                 reason: "Current permission mode does not allow shell commands.".to_string(),
             },
-            PermissionMode::Approve => PolicyDecision::Ask {
-                reason: format!("Command requires approval: {command}"),
-            },
-            PermissionMode::Auto | PermissionMode::FullAccess => PolicyDecision::Allow,
+            PermissionMode::Auto | PermissionMode::Approve | PermissionMode::FullAccess => {
+                PolicyDecision::Allow
+            }
         }
     }
 
@@ -450,6 +475,12 @@ impl PolicyEngine for BasicPolicyEngine {
             return PolicyDecision::Allow;
         }
 
+        if self.mode == PermissionMode::Approve {
+            return PolicyDecision::Ask {
+                reason: format!("Network access requires approval: {host}"),
+            };
+        }
+
         self.config
             .network
             .default_effect
@@ -484,6 +515,7 @@ impl McpToolRisk {
 mod tests {
     use super::*;
     use serde_json::json;
+    use uuid::Uuid;
 
     fn policy(mode: PermissionMode) -> BasicPolicyEngine {
         BasicPolicyEngine::new(PathBuf::from("."), mode)
@@ -519,5 +551,73 @@ mod tests {
             json!({ "destructiveHint": true }),
         ));
         assert!(matches!(decision, PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn approve_mode_allows_workspace_work_but_still_asks_for_external_risks() {
+        let id = Uuid::new_v4();
+        let workspace = std::env::temp_dir().join(format!("opentopia-policy-workspace-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-policy-outside-{id}"));
+        std::fs::create_dir_all(workspace.join("design")).expect("create workspace fixture");
+        std::fs::create_dir_all(&outside).expect("create outside fixture");
+        let policy = BasicPolicyEngine::new(workspace.clone(), PermissionMode::Approve);
+
+        assert!(matches!(
+            policy.inspect_write(&workspace.join("design/requirements.md")),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.inspect_write(&outside.join("requirements.md")),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            policy.inspect_command("cargo test -p opentopia-core"),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.inspect_command("git reset --hard HEAD~1"),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            policy.inspect_network("example.com"),
+            PolicyDecision::Ask { .. }
+        ));
+
+        std::fs::remove_dir_all(workspace).expect("remove workspace fixture");
+        std::fs::remove_dir_all(outside).expect("remove outside fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_comparison_accepts_verbatim_and_case_variants() {
+        let workspace = Path::new(r"\\?\J:\Project\OneTree");
+        let target = Path::new(r"j:\project\onetree\design\requirements.md");
+        let sibling = Path::new(r"J:\Project\OneTree-copy\design\requirements.md");
+        let unc_workspace = Path::new(r"\\?\UNC\server\share\OneTree");
+        let unc_target = Path::new(r"\\server\share\onetree\design\requirements.md");
+
+        assert!(path_starts_with(target, workspace));
+        assert!(!path_starts_with(sibling, workspace));
+        assert!(path_starts_with(unc_target, unc_workspace));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn approve_mode_allows_missing_file_under_verbatim_workspace_root() {
+        let workspace = std::env::temp_dir().join(format!(
+            "opentopia-policy-verbatim-workspace-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(workspace.join("design")).expect("create workspace fixture");
+        let verbatim_workspace = workspace.canonicalize().expect("canonical workspace");
+        assert!(verbatim_workspace.to_string_lossy().starts_with(r"\\?\"));
+        let policy = BasicPolicyEngine::new(verbatim_workspace.clone(), PermissionMode::Approve);
+
+        assert!(matches!(
+            policy.inspect_write(&verbatim_workspace.join("design/new-document.md")),
+            PolicyDecision::Allow
+        ));
+
+        std::fs::remove_dir_all(workspace).expect("remove workspace fixture");
     }
 }

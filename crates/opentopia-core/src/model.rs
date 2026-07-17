@@ -721,6 +721,9 @@ pub enum AgentEventPayload {
     ModelDelta {
         text: String,
     },
+    ReasoningDelta {
+        text: String,
+    },
     ToolCallStarted {
         call: ToolCall,
     },
@@ -773,6 +776,7 @@ impl AgentEventPayload {
         match self {
             Self::TurnStarted { .. } => "turn_started",
             Self::ModelDelta { .. } => "model_delta",
+            Self::ReasoningDelta { .. } => "reasoning_delta",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallFinished { .. } => "tool_call_finished",
             Self::PlanUpdated { .. } => "plan_updated",
@@ -824,5 +828,20 @@ mod tests {
         let serialized = serde_json::to_string(&content).unwrap();
         let restored: Vec<ModelContentPart> = serde_json::from_str(&serialized).unwrap();
         assert_eq!(restored, content);
+    }
+
+    #[test]
+    fn reasoning_delta_uses_the_public_snake_case_event_contract() {
+        let payload = AgentEventPayload::ReasoningDelta {
+            text: "检查项目结构".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).unwrap(),
+            json!({
+                "type": "reasoning_delta",
+                "text": "检查项目结构"
+            })
+        );
     }
 }

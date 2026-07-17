@@ -245,6 +245,36 @@ pub trait ExecutionEnvironment: Send + Sync {
     fn kind(&self) -> ExecutionEnvironmentKind;
     fn workspace_root(&self) -> &Path;
 
+    fn resolve_read_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("workspace path cannot contain '..': {}", path.display());
+        }
+        let workspace_root = self.workspace_root().canonicalize().with_context(|| {
+            format!(
+                "workspace root does not exist: {}",
+                self.workspace_root().display()
+            )
+        })?;
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace_root.join(path)
+        };
+        let resolved = candidate
+            .canonicalize()
+            .with_context(|| format!("path does not exist: {}", candidate.display()))?;
+        if !resolved.starts_with(&workspace_root) {
+            anyhow::bail!(
+                "path is outside the workspace and no readable root authorized it: {}",
+                path.display()
+            );
+        }
+        Ok(resolved)
+    }
+
     async fn exec(
         &self,
         request: ExecRequest,
@@ -376,7 +406,10 @@ impl LocalExecutionEnvironment {
                 .effective_readable_roots(&self.workspace_root),
         );
         if !readable_roots.iter().any(|root| resolved.starts_with(root)) {
-            anyhow::bail!("path escapes workspace: {}", path.display());
+            anyhow::bail!(
+                "path is outside the workspace and no readable root authorized it: {}",
+                path.display()
+            );
         }
         Ok(resolved)
     }
@@ -450,6 +483,10 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
 
     fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    fn resolve_read_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        self.resolve_existing_path(path)
     }
 
     async fn exec(
@@ -998,6 +1035,132 @@ mod tests {
         assert!(String::from_utf8_lossy(&exec.stdout).contains("ok"));
 
         std::fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[tokio::test]
+    async fn relative_paths_and_default_shell_cwd_are_workspace_scoped() {
+        let root =
+            std::env::temp_dir().join(format!("opentopia-core-workspace-cwd-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("nested")).expect("create temp workspace");
+        std::fs::write(root.join("nested/value.txt"), "workspace").expect("write fixture");
+        let env = LocalExecutionEnvironment::new(root.clone());
+
+        let read = env
+            .read_file(FileReadRequest::new("nested/value.txt"))
+            .await
+            .expect("relative read resolves from workspace root");
+        assert_eq!(
+            read.path,
+            root.join("nested/value.txt").canonicalize().unwrap()
+        );
+
+        let command = if cfg!(windows) {
+            "(Get-Location).Path"
+        } else {
+            "pwd -P"
+        };
+        let exec = env
+            .exec(
+                ExecRequest::shell(command),
+                ExecutionContext::with_timeout(Duration::from_secs(30)),
+            )
+            .await
+            .expect("shell starts in workspace root");
+        assert!(exec.success);
+        let reported_cwd = PathBuf::from(String::from_utf8_lossy(&exec.stdout).trim())
+            .canonicalize()
+            .expect("reported shell cwd exists");
+        assert_eq!(
+            reported_cwd,
+            root.canonicalize().expect("canonical workspace root")
+        );
+
+        let nested_exec = env
+            .exec(
+                ExecRequest::shell(command).cwd("nested"),
+                ExecutionContext::with_timeout(Duration::from_secs(30)),
+            )
+            .await
+            .expect("relative shell cwd resolves from workspace root");
+        assert!(nested_exec.success);
+        let reported_nested_cwd =
+            PathBuf::from(String::from_utf8_lossy(&nested_exec.stdout).trim())
+                .canonicalize()
+                .expect("reported nested shell cwd exists");
+        assert_eq!(
+            reported_nested_cwd,
+            root.join("nested")
+                .canonicalize()
+                .expect("canonical nested cwd")
+        );
+
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[tokio::test]
+    async fn parent_paths_are_blocked_but_configured_readable_roots_remain_available() {
+        let id = Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("opentopia-core-scope-root-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-core-scope-outside-{id}"));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        std::fs::create_dir_all(&outside).expect("create additional readable root");
+        std::fs::write(outside.join("allowed.txt"), "allowed").expect("write outside fixture");
+
+        let env = LocalExecutionEnvironment::new(root.clone());
+        let traversal = env
+            .read_file(FileReadRequest::new("../.."))
+            .await
+            .expect_err("parent traversal must be rejected");
+        assert!(traversal.to_string().contains("cannot contain '..'"));
+
+        let absolute_parent = env
+            .read_file(FileReadRequest::new(outside.join("allowed.txt")))
+            .await
+            .expect_err("unconfigured absolute parent path must be rejected");
+        assert!(absolute_parent
+            .to_string()
+            .contains("no readable root authorized"));
+
+        let parent_cwd = env
+            .exec(
+                ExecRequest::shell(if cfg!(windows) {
+                    "Write-Output blocked"
+                } else {
+                    "printf blocked"
+                })
+                .cwd(&outside),
+                ExecutionContext::with_timeout(Duration::from_secs(30)),
+            )
+            .await
+            .expect_err("unconfigured shell cwd must be rejected");
+        assert!(parent_cwd
+            .to_string()
+            .contains("no readable root authorized"));
+
+        let mut config = LocalSandboxConfig::default();
+        config.read_paths = vec![outside.clone()];
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
+        let read = env
+            .read_file(FileReadRequest::new(outside.join("allowed.txt")))
+            .await
+            .expect("configured readable root remains available");
+        assert_eq!(read.bytes, b"allowed");
+        let exec = env
+            .exec(
+                ExecRequest::shell(if cfg!(windows) {
+                    "Write-Output allowed"
+                } else {
+                    "printf allowed"
+                })
+                .cwd(&outside),
+                ExecutionContext::with_timeout(Duration::from_secs(30)),
+            )
+            .await
+            .expect("configured readable root is a valid shell cwd");
+        assert!(exec.success);
+
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+        std::fs::remove_dir_all(outside).expect("remove additional readable root");
     }
 
     #[tokio::test]

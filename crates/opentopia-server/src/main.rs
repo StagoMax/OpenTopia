@@ -888,6 +888,7 @@ async fn update_settings(
 ) -> Result<Json<AppSettings>, ApiError> {
     let mut settings = current_settings(&state);
     if let Some(providers) = request.providers {
+        validate_provider_settings(&providers)?;
         settings.providers = providers;
     }
     if let Some(active_provider_id) = request.active_provider_id {
@@ -3984,7 +3985,7 @@ async fn prepare_turn_context(
         .map(|summary| estimate_tokens(&summary.summary))
         .unwrap_or_default()
         .saturating_add(active_plan_tokens);
-    let context_window = context_window_tokens();
+    let context_window = context_window_tokens(state);
     let usage_percent = summary_tokens
         .saturating_add(unsummarized_tokens)
         .saturating_mul(100)
@@ -4113,12 +4114,76 @@ fn message_token_estimate(message: &Message) -> usize {
         .saturating_add(12)
 }
 
-fn context_window_tokens() -> usize {
+fn context_window_tokens(state: &AppState) -> usize {
+    let configured = current_settings(state)
+        .active_provider()
+        .context_window_tokens;
+    if configured >= 4_096 {
+        return configured;
+    }
     std::env::var("OPENTOPIA_CONTEXT_WINDOW_TOKENS")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|value| *value >= 4_096)
         .unwrap_or(128_000)
+}
+
+fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiError> {
+    if providers.is_empty() {
+        return Err(ApiError::bad_request("at least one provider is required"));
+    }
+    let mut ids = HashSet::new();
+    for provider in providers {
+        let id = provider.id.trim();
+        if id.is_empty() || !ids.insert(id) {
+            return Err(ApiError::bad_request(
+                "provider IDs must be non-empty and unique",
+            ));
+        }
+        if id.len() > 80
+            || !id.chars().enumerate().all(|(index, ch)| {
+                ch.is_ascii_alphanumeric() || (index > 0 && matches!(ch, '.' | '_' | '-'))
+            })
+        {
+            return Err(ApiError::bad_request(
+                "provider IDs may contain only letters, numbers, dots, underscores, and hyphens",
+            ));
+        }
+        let base_url = reqwest::Url::parse(provider.base_url.trim()).map_err(|_| {
+            ApiError::bad_request(format!("invalid provider base URL: {}", provider.base_url))
+        })?;
+        if !matches!(base_url.scheme(), "http" | "https") {
+            return Err(ApiError::bad_request(
+                "provider base URL must use HTTP or HTTPS",
+            ));
+        }
+        if provider.model.trim().is_empty() {
+            return Err(ApiError::bad_request("provider model cannot be empty"));
+        }
+        if !provider.temperature.is_finite() || !(0.0..=2.0).contains(&provider.temperature) {
+            return Err(ApiError::bad_request(
+                "provider temperature must be between 0 and 2",
+            ));
+        }
+        if provider.max_output_tokens == Some(0) {
+            return Err(ApiError::bad_request(
+                "max output tokens must be greater than zero",
+            ));
+        }
+        if provider.context_window_tokens < 4_096 {
+            return Err(ApiError::bad_request(
+                "context window must be at least 4096 tokens",
+            ));
+        }
+        if let Some(effort) = provider.reasoning_effort.as_deref() {
+            if !["", "low", "medium", "high"].contains(&effort) {
+                return Err(ApiError::bad_request(
+                    "reasoning effort must be low, medium, high, or empty",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn context_compact_threshold_percent() -> usize {
@@ -4138,7 +4203,9 @@ fn current_settings(state: &AppState) -> AppSettings {
 }
 
 fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResponse, ApiError> {
-    let budget = state.store.get_context_budget(thread_id)?;
+    let mut budget = state.store.get_context_budget(thread_id)?;
+    budget.total_tokens = context_window_tokens(state);
+    budget.estimated_usage = budget.used_tokens.saturating_mul(100) / budget.total_tokens.max(1);
     let events = state.store.list_events(thread_id, None)?;
     let latest_summary = latest_context_summary_event(&events);
     Ok(ContextStatusResponse {
@@ -5368,6 +5435,22 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_settings_validate_generation_limits_and_ids() {
+        let mut provider = ProviderSettings::default();
+        provider.id = "custom-glm".to_string();
+        provider.base_url = "https://example.test/v1".to_string();
+        provider.temperature = 0.7;
+        provider.max_output_tokens = Some(8_192);
+        provider.context_window_tokens = 128_000;
+        provider.reasoning_effort = Some("high".to_string());
+        validate_provider_settings(&[provider.clone()]).expect("valid provider settings");
+
+        provider.temperature = 3.0;
+        let error = validate_provider_settings(&[provider]).expect_err("reject temperature");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn preview_artifact_resolution_is_scoped_to_the_route_thread() {
