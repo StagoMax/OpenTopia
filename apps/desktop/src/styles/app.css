@@ -5123,3 +5123,236 @@ button:disabled {
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
+
+.extensions-toolbar,
+.mcp-editor-header,
+.mcp-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.extensions-view .icon-button {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--text-secondary);
+}
+
+.extensions-view .icon-button:hover:not(:disabled),
+.extensions-view .icon-button:focus-visible {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.extensions-view .icon-button.danger {
+  color: var(--danger);
+}
+
+.extensions-view .icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.mcp-editor {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  padding: 10px;
+}
+
+.mcp-editor-header strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mcp-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.mcp-editor-grid label {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.mcp-editor-grid label:nth-child(3),
+.mcp-editor-grid label:nth-child(4) {
+  grid-column: span 1;
+}
+
+.mcp-editor-grid label > span,
+.mcp-enabled-toggle span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 550;
+}
+
+.mcp-editor-grid input,
+.mcp-editor-grid textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  outline: none;
+  background: #fff;
+  color: var(--text);
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.mcp-editor-grid input {
+  height: 32px;
+}
+
+.mcp-editor-grid textarea {
+  min-height: 68px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.mcp-editor-grid input:focus,
+.mcp-editor-grid textarea:focus {
+  border-color: #3676cf;
+  box-shadow: 0 0 0 2px rgb(54 118 207 / 14%);
+}
+
+.mcp-enabled-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+}
+
+.mcp-editor-actions .primary-button {
+  gap: 6px;
+}
+
+.extensions-view .extension-list {
+  gap: 5px;
+}
+
+.extensions-view .extension-row {
+  display: grid;
+  grid-template-columns: 18px minmax(120px, 1fr) auto auto;
+  grid-template-rows: auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  padding: 7px 8px;
+}
+
+.extensions-view .extension-row:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+
+.extensions-view .extension-row > input {
+  grid-row: auto;
+  margin: 0;
+}
+
+.extension-main {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.extension-main span,
+.extension-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.extension-main span {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.extension-main small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.extensions-view .extension-row .mcp-status {
+  grid-row: auto;
+  grid-column: auto;
+  min-width: 68px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  padding: 0 7px;
+  font-size: 10px;
+  font-style: normal;
+  line-height: 24px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.extensions-view .mcp-status.is-ready {
+  border-color: #b9d8c0;
+  background: #f2faf4;
+  color: #397348;
+}
+
+.extensions-view .mcp-status.is-error {
+  border-color: #e4b8b3;
+  background: #fff6f5;
+  color: var(--danger);
+}
+
+.extensions-view .mcp-status.is-starting {
+  border-color: #c7d4e8;
+  background: #f4f8fd;
+  color: #356cae;
+}
+
+.extension-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.spinning {
+  animation: spin 0.9s linear infinite;
+}
+
+@media (max-width: 720px) {
+  .mcp-editor-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .extensions-view .extension-row {
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+  }
+
+  .extensions-view .extension-row .mcp-status {
+    grid-column: 2;
+    grid-row: 2;
+    width: max-content;
+  }
+
+  .extension-actions {
+    grid-column: 3;
+    grid-row: 1 / 3;
+  }
+}

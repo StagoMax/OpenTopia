@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import {
   Box,
   Check,
@@ -1230,7 +1237,7 @@ function ExtensionsView({
     }
   }
 
-  async function submitEditor(event: React.FormEvent<HTMLFormElement>) {
+  async function submitEditor(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!editor) return;
     const name = editor.name.trim();
