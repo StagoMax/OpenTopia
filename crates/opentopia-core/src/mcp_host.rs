@@ -1611,7 +1611,55 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::mcp::mcp_public_tool_name;
+    use std::sync::atomic::AtomicUsize;
     use tokio::io::{duplex, AsyncWriteExt};
+
+    struct MockMcpChildProcess {
+        task: Option<JoinHandle<()>>,
+    }
+
+    #[async_trait]
+    impl McpChildProcess for MockMcpChildProcess {
+        async fn kill(&mut self) -> Result<(), McpHostError> {
+            if let Some(task) = self.task.as_ref() {
+                task.abort();
+            }
+            Ok(())
+        }
+
+        async fn wait(&mut self) -> Result<(), McpHostError> {
+            if let Some(task) = self.task.take() {
+                let _ = task.await;
+            }
+            Ok(())
+        }
+
+        fn start_kill(&mut self) {
+            if let Some(task) = self.task.as_ref() {
+                task.abort();
+            }
+        }
+    }
+
+    struct CountingMcpSpawner {
+        starts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl McpProcessSpawner for CountingMcpSpawner {
+        async fn spawn(&self, _config: &McpServerConfig) -> Result<McpSpawnedProcess, McpHostError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let (client_stdin, server_stdin) = duplex(16 * 1024);
+            let (server_stdout, client_stdout) = duplex(16 * 1024);
+            let task = tokio::spawn(run_mock_mcp_server(server_stdin, server_stdout));
+            Ok(McpSpawnedProcess {
+                stdin: Box::new(client_stdin),
+                stdout: Box::new(client_stdout),
+                stderr: None,
+                process: Box::new(MockMcpChildProcess { task: Some(task) }),
+            })
+        }
+    }
 
     #[test]
     fn empty_env_keys_do_not_inherit_application_secrets() {
@@ -1695,6 +1743,30 @@ mod tests {
             mcp_public_tool_name("File System", "Read-File!"),
             "file_system__read_file"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_server_serializes_concurrent_starts_and_reuses_ready_runtime() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let host = McpExtensionHost::with_spawner(Arc::new(CountingMcpSpawner {
+            starts: starts.clone(),
+        }));
+        let mut config = McpServerConfig::new("Mock Server".to_string(), "mock".to_string());
+        config.timeout_ms = 5_000;
+
+        let (left, right) = tokio::join!(
+            host.ensure_server(config.clone()),
+            host.ensure_server(config.clone())
+        );
+
+        assert!(matches!(left.unwrap().status, McpLifecycleStatus::Ready));
+        assert!(matches!(right.unwrap().status, McpLifecycleStatus::Ready));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(host.list_tools(config.server_id).await.unwrap().len(), 1);
+
+        host.stop_server(config.server_id)
+            .await
+            .expect("mock server should stop");
     }
 
     #[tokio::test]
