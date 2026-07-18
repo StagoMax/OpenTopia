@@ -118,7 +118,9 @@ Approval requests are stored in SQLite with `pending`, `approved`, or `denied` s
 Settings and MCP server configurations are persisted in SQLite. MCP stdio servers
 run through the configured OS sandbox, receive only a minimal environment plus
 explicit `envKeys`, refresh `tools/list_changed`, and expose tools only to Threads
-where the server is enabled. Direct calls require a Thread and use its policy/timeline.
+where the server is enabled. Enabled servers are restored on startup; create, update,
+Thread enablement, and first Agent use all converge on an idempotent lifecycle guard.
+Direct calls require a Thread and use its policy/timeline.
 Artifacts are indexed in SQLite and trajectory export includes artifact metadata.
 Large read/search/shell outputs can surface artifact metadata for UI retrieval.
 Context compaction calls the active OpenAI-compatible provider, records durable
@@ -159,7 +161,7 @@ Implemented:
   open-path action through the preload API.
 - Settings modal for provider base URL, model, API-key env name, and permission mode.
 - Workbench panels for file tree, first-class read-only preview tabs, git diff,
-  MCP extension enablement, and local sandbox status.
+  MCP extension create/edit/restart/delete and per-Thread enablement, and local sandbox status.
 - Xterm-based per-command terminal streaming with cancel.
 - SQLite-backed terminal history and cancellation/timeout process-tree cleanup.
 - Artifact gallery, artifact preview tabs, context status, explicit-confirm file revert,

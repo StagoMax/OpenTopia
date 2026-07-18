@@ -318,9 +318,12 @@ Implemented:
 - Add per-thread enable/disable.
 - Implement `McpStdioClient` with full stdio process lifecycle, JSON-RPC, initialize/list_tools/call_tool, timeout handling, stderr logging.
 - Implement `McpExtensionHost` with tool schema caching, routing by public name, duplicate name detection.
+- Restore enabled servers on startup and serialize create/update/enable/first-use startup through
+  an idempotent per-server lifecycle guard with live status reporting.
 - Wire `restart`, `tools`, and `call-tool` routes into the server.
 - Route MCP calls through descriptor/annotation-aware policy checks.
 - Register cached MCP descriptors into `AgentCore` and expose `/mcp server__tool {json}`.
+- Expose desktop create/edit/restart/delete controls plus per-Thread enablement and inline status.
 - Start MCP stdio through the current OS sandbox, clear inherited environment secrets,
   allow only explicit `envKeys`, refresh `tools/list_changed`, and filter schemas by
   per-Thread enablement. Direct API calls require the owning Thread.
