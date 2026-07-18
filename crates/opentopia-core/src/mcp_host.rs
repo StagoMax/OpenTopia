@@ -1647,7 +1647,10 @@ mod tests {
 
     #[async_trait]
     impl McpProcessSpawner for CountingMcpSpawner {
-        async fn spawn(&self, _config: &McpServerConfig) -> Result<McpSpawnedProcess, McpHostError> {
+        async fn spawn(
+            &self,
+            _config: &McpServerConfig,
+        ) -> Result<McpSpawnedProcess, McpHostError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             let (client_stdin, server_stdin) = duplex(16 * 1024);
             let (server_stdout, client_stdout) = duplex(16 * 1024);
