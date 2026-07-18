@@ -864,6 +864,25 @@ code {
   grid-column: span 3;
 }
 
+.settings-security-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  border-left: 3px solid var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  color: #e4c49f;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-security-warning svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--warning);
+}
+
 .settings-providers-header,
 .settings-provider-actions,
 .settings-provider-item-header,
@@ -2816,6 +2835,13 @@ button:disabled {
   background: #d4d7d3;
   color: #fff;
   opacity: 1;
+}
+
+.send-button.is-running:disabled {
+  background: #202326;
+  color: #fff;
+  cursor: progress;
+  opacity: 0.72;
 }
 
 .right-panel {

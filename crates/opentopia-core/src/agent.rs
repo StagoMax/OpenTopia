@@ -7,9 +7,9 @@ use crate::model::{
 };
 use crate::policy::{BasicPolicyEngine, PermissionMode};
 use crate::provider::{
-    MockProvider, ModelConversationMessage, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamDelta, OpenAiCompatibleProvider, ProviderToolCall, ProviderToolCandidate,
-    ProviderToolResult,
+    MockProvider, ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
+    ModelResponse, ModelStreamDelta, OpenAiCompatibleProvider, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolResult,
 };
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::settings::{AppSettings, ProviderKind};
@@ -24,18 +24,18 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const DEFAULT_MAX_PROVIDER_TOOL_ROUNDS: usize = 8;
-const DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS: usize = 24;
 const DEFAULT_MAX_EQUIVALENT_TOOL_CALLS: usize = 3;
-const DEFAULT_MAX_OBSERVATION_TOOL_CALLS_WITHOUT_WORKSPACE_CHANGE: usize = 12;
+const DEFAULT_MAX_REPEATED_TOOL_CYCLES: usize = 3;
+const DEFAULT_MAX_LOOP_GUARD_CORRECTIONS: usize = 3;
+const MAX_TRACKED_TOOL_SIGNATURES: usize = 24;
+const MAX_DETECTED_TOOL_CYCLE_LENGTH: usize = 6;
+const MIN_RETAINED_TOOL_RESULTS_AFTER_COMPACTION: usize = 4;
+const MAX_COMPACTED_TOOL_HISTORY_CHARS: usize = 12_000;
 const MAX_COMPLETION_MODE_VIOLATIONS: usize = 2;
-const MAX_IMPLEMENTATION_MODE_VIOLATIONS: usize = 3;
-const DEFAULT_MAX_TURN_ELAPSED_MS: u64 = 15 * 60 * 1_000;
 
 pub type AgentEventSender = mpsc::UnboundedSender<AgentEventPayload>;
 
@@ -56,67 +56,47 @@ pub enum AgentTurnOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentExecutionBudget {
-    pub max_tool_rounds: usize,
-    #[serde(default = "default_max_total_tool_rounds")]
-    pub max_total_tool_rounds: usize,
+pub struct AgentLoopPolicy {
     #[serde(default = "default_max_equivalent_tool_calls")]
     pub max_equivalent_tool_calls: usize,
-    #[serde(default = "default_max_observation_tool_calls_without_workspace_change")]
-    pub max_observation_tool_calls_without_workspace_change: usize,
-    pub max_elapsed_ms: u64,
+    #[serde(default = "default_max_repeated_tool_cycles")]
+    pub max_repeated_tool_cycles: usize,
+    #[serde(default = "default_max_loop_guard_corrections")]
+    pub max_loop_guard_corrections: usize,
 }
 
-impl Default for AgentExecutionBudget {
+impl Default for AgentLoopPolicy {
     fn default() -> Self {
         Self {
-            max_tool_rounds: DEFAULT_MAX_PROVIDER_TOOL_ROUNDS,
-            max_total_tool_rounds: DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS,
             max_equivalent_tool_calls: DEFAULT_MAX_EQUIVALENT_TOOL_CALLS,
-            max_observation_tool_calls_without_workspace_change:
-                DEFAULT_MAX_OBSERVATION_TOOL_CALLS_WITHOUT_WORKSPACE_CHANGE,
-            max_elapsed_ms: DEFAULT_MAX_TURN_ELAPSED_MS,
+            max_repeated_tool_cycles: DEFAULT_MAX_REPEATED_TOOL_CYCLES,
+            max_loop_guard_corrections: DEFAULT_MAX_LOOP_GUARD_CORRECTIONS,
         }
     }
 }
 
-impl AgentExecutionBudget {
+impl AgentLoopPolicy {
     fn normalized(mut self) -> Self {
-        self.max_tool_rounds = self.max_tool_rounds.max(1);
-        self.max_total_tool_rounds = self.max_total_tool_rounds.max(self.max_tool_rounds);
         self.max_equivalent_tool_calls = self.max_equivalent_tool_calls.max(1);
-        self.max_observation_tool_calls_without_workspace_change = self
-            .max_observation_tool_calls_without_workspace_change
-            .max(1);
-        self.max_elapsed_ms = self.max_elapsed_ms.max(1);
+        self.max_repeated_tool_cycles = self.max_repeated_tool_cycles.max(2);
+        self.max_loop_guard_corrections = self.max_loop_guard_corrections.max(1);
         self
     }
 
     fn status(
         &self,
-        used_tool_rounds: usize,
         total_tool_rounds: usize,
-        started_at: Instant,
+        loop_guard_corrections: usize,
         context_budget: Option<&ContextBudget>,
-    ) -> AgentBudgetStatus {
-        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    ) -> AgentLoopStatus {
         let context_used_tokens = context_budget.map(|budget| budget.used_tokens);
         let context_max_tokens = context_budget.map(|budget| budget.max_tokens);
-        AgentBudgetStatus {
-            max_tool_rounds: self.max_tool_rounds,
-            used_tool_rounds,
-            remaining_tool_rounds: self.max_tool_rounds.saturating_sub(used_tool_rounds),
-            max_total_tool_rounds: self.max_total_tool_rounds,
+        AgentLoopStatus {
             total_tool_rounds,
-            remaining_total_tool_rounds: self
-                .max_total_tool_rounds
-                .saturating_sub(total_tool_rounds),
             max_equivalent_tool_calls: self.max_equivalent_tool_calls,
-            max_observation_tool_calls_without_workspace_change: self
-                .max_observation_tool_calls_without_workspace_change,
-            max_elapsed_ms: self.max_elapsed_ms,
-            elapsed_ms,
-            remaining_time_ms: self.max_elapsed_ms.saturating_sub(elapsed_ms),
+            max_repeated_tool_cycles: self.max_repeated_tool_cycles,
+            max_loop_guard_corrections: self.max_loop_guard_corrections,
+            loop_guard_corrections,
             context_max_tokens,
             context_used_tokens,
             context_remaining_tokens: context_max_tokens
@@ -128,33 +108,27 @@ impl AgentExecutionBudget {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentBudgetStatus {
-    pub max_tool_rounds: usize,
-    pub used_tool_rounds: usize,
-    pub remaining_tool_rounds: usize,
-    pub max_total_tool_rounds: usize,
+pub struct AgentLoopStatus {
     pub total_tool_rounds: usize,
-    pub remaining_total_tool_rounds: usize,
     pub max_equivalent_tool_calls: usize,
-    pub max_observation_tool_calls_without_workspace_change: usize,
-    pub max_elapsed_ms: u64,
-    pub elapsed_ms: u64,
-    pub remaining_time_ms: u64,
+    pub max_repeated_tool_cycles: usize,
+    pub max_loop_guard_corrections: usize,
+    pub loop_guard_corrections: usize,
     pub context_max_tokens: Option<usize>,
     pub context_used_tokens: Option<usize>,
     pub context_remaining_tokens: Option<usize>,
-}
-
-fn default_max_total_tool_rounds() -> usize {
-    DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS
 }
 
 fn default_max_equivalent_tool_calls() -> usize {
     DEFAULT_MAX_EQUIVALENT_TOOL_CALLS
 }
 
-fn default_max_observation_tool_calls_without_workspace_change() -> usize {
-    DEFAULT_MAX_OBSERVATION_TOOL_CALLS_WITHOUT_WORKSPACE_CHANGE
+fn default_max_repeated_tool_cycles() -> usize {
+    DEFAULT_MAX_REPEATED_TOOL_CYCLES
+}
+
+fn default_max_loop_guard_corrections() -> usize {
+    DEFAULT_MAX_LOOP_GUARD_CORRECTIONS
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -164,6 +138,14 @@ pub struct AgentLoopGuardState {
     pub blocked_equivalent_calls: usize,
     #[serde(default)]
     equivalent_call_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    recent_tool_signatures: Vec<String>,
+    #[serde(default)]
+    progress_tool_signatures: BTreeMap<String, usize>,
+    #[serde(default)]
+    last_result_fingerprints: BTreeMap<String, String>,
+    #[serde(default)]
+    loop_guard_corrections_since_progress: usize,
     #[serde(default)]
     last_plan_fingerprint: Option<String>,
     #[serde(default)]
@@ -176,30 +158,6 @@ pub struct AgentLoopGuardState {
     completion_mode: bool,
     #[serde(default)]
     blocked_completion_mode_calls: usize,
-    #[serde(default)]
-    observation_tool_calls_since_workspace_change: usize,
-    #[serde(default)]
-    implementation_mode: bool,
-    #[serde(default)]
-    blocked_implementation_mode_calls: usize,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentBudgetCheckpointReason {
-    ToolRounds,
-    ElapsedTime,
-    ContextWindow,
-}
-
-impl AgentBudgetCheckpointReason {
-    fn message(self) -> &'static str {
-        match self {
-            Self::ToolRounds => "The tool-decision budget for this execution slice was reached.",
-            Self::ElapsedTime => "The execution time budget for this slice was reached.",
-            Self::ContextWindow => "The context budget for this execution slice was reached.",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,8 +170,8 @@ pub struct AgentContinuation {
     pub conversation: Vec<ModelConversationMessage>,
     pub permission_mode: PermissionMode,
     pub context_budget: Option<ContextBudget>,
-    #[serde(default)]
-    pub execution_budget: AgentExecutionBudget,
+    #[serde(default, alias = "executionBudget")]
+    pub loop_policy: AgentLoopPolicy,
     #[serde(default)]
     pub loop_guard: AgentLoopGuardState,
     #[serde(default)]
@@ -226,7 +184,9 @@ pub struct AgentContinuation {
 pub enum AgentContinuationKind {
     #[default]
     Approval,
-    BudgetCheckpoint,
+    // Kept so continuations persisted by versions before progress-based loop detection still load.
+    #[serde(rename = "budget_checkpoint")]
+    LegacyBudgetCheckpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +200,8 @@ pub enum AgentContinuationState {
         provider_tool_calls: Vec<ProviderToolCall>,
         provider_tool_results: Vec<ProviderToolResult>,
         pending_tool_calls: Vec<ProviderToolCall>,
+        #[serde(default)]
+        compacted_tool_history: String,
         current_round: usize,
     },
 }
@@ -502,8 +464,7 @@ impl AgentCore {
     ) -> anyhow::Result<AgentTurnResult> {
         let mut events = TurnEvents::new(sender);
         let mut budget = input.context_budget;
-        let execution_budget = AgentExecutionBudget::default().normalized();
-        let started_at = Instant::now();
+        let loop_policy = AgentLoopPolicy::default().normalized();
 
         events.push(AgentEventPayload::TurnStarted {
             user_message_id: input.user_message_id,
@@ -521,10 +482,9 @@ impl AgentCore {
             .complete_model(
                 ModelRequest {
                     system_prompt: provider_system_prompt(
-                        &execution_budget.status(0, 0, started_at, budget.as_ref()),
+                        &loop_policy.status(0, 0, budget.as_ref()),
                         &input.workspace_root,
                         &self.sandbox_config,
-                        false,
                         false,
                     ),
                     conversation: input.conversation.clone(),
@@ -563,9 +523,8 @@ impl AgentCore {
             input.conversation,
             input.permission_mode,
             budget,
-            execution_budget,
+            loop_policy,
             loop_guard,
-            started_at,
             input.store,
             input.cancellation,
             model_user_message,
@@ -574,6 +533,7 @@ impl AgentCore {
             provider_tool_calls,
             Vec::new(),
             response.tool_calls,
+            String::new(),
             1,
             &mut events,
         )
@@ -593,11 +553,10 @@ impl AgentCore {
             user_message_id: continuation.user_message_id,
         });
 
-        let is_budget_checkpoint =
-            continuation.continuation_kind == AgentContinuationKind::BudgetCheckpoint;
-        let execution_budget = continuation.execution_budget.clone().normalized();
+        let is_legacy_budget_checkpoint =
+            continuation.continuation_kind == AgentContinuationKind::LegacyBudgetCheckpoint;
+        let loop_policy = continuation.loop_policy.clone().normalized();
         let mut loop_guard = continuation.loop_guard.clone();
-        let started_at = Instant::now();
 
         match continuation.state {
             AgentContinuationState::Provider {
@@ -607,12 +566,14 @@ impl AgentCore {
                 provider_tool_calls,
                 mut provider_tool_results,
                 mut pending_tool_calls,
+                compacted_tool_history,
                 current_round,
             } => {
-                if is_budget_checkpoint {
+                if is_legacy_budget_checkpoint {
                     if !approved {
                         events.push(AgentEventPayload::TurnFinished {
-                            summary: "Budget checkpoint left paused by the user.".to_string(),
+                            summary: "Legacy execution checkpoint left paused by the user."
+                                .to_string(),
                         });
                         return Ok(AgentTurnResult {
                             events: events.into_vec(),
@@ -629,9 +590,8 @@ impl AgentCore {
                             continuation.conversation,
                             continuation.permission_mode,
                             continuation.context_budget,
-                            execution_budget,
+                            loop_policy,
                             loop_guard.clone(),
-                            started_at,
                             store,
                             cancellation,
                             model_user_message,
@@ -640,6 +600,7 @@ impl AgentCore {
                             provider_tool_calls,
                             provider_tool_results,
                             pending_tool_calls,
+                            compacted_tool_history,
                             current_round,
                             &mut events,
                         )
@@ -652,28 +613,57 @@ impl AgentCore {
                     .ok_or_else(|| anyhow::anyhow!("provider continuation has no pending call"))?;
                 pending_tool_calls.remove(0);
                 if approved {
-                    let policy = Arc::new(BasicPolicyEngine::new(
+                    let approved_sandbox = approved_sandbox_config_for_call(
+                        &self.sandbox_config,
+                        &continuation.workspace_root,
+                        &pending,
+                    );
+                    let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
                         continuation.workspace_root.clone(),
-                        PermissionMode::FullAccess,
+                        continuation.permission_mode,
+                        &approved_sandbox,
                     ));
                     let mut ctx = ToolContext::local_with_sandbox_config(
                         continuation.workspace_root.clone(),
                         policy,
-                        crate::sandbox::LocalSandboxConfig::danger_full_access(),
+                        approved_sandbox,
                     );
                     ctx.store = store.clone();
                     ctx.thread_id = Some(continuation.thread_id);
                     ctx.cancel = cancellation.clone();
                     ctx.approval_granted = true;
                     self.apply_subagent_context(&mut ctx, continuation.user_message_id);
-                    let result = self
+                    let result = match self
                         .execute_provider_tool_call(&pending, ctx, &mut events)
-                        .await?;
-                    loop_guard.observe_tool_result(
-                        &pending,
-                        &result,
-                        execution_budget.max_observation_tool_calls_without_workspace_change,
-                    );
+                        .await
+                    {
+                        Ok(mut result) => {
+                            if let Some(metadata) = result.metadata.as_object_mut() {
+                                metadata.insert("approvalGranted".to_string(), json!(true));
+                                metadata.insert("sandboxEscalation".to_string(), json!("scoped"));
+                            }
+                            result
+                        }
+                        Err(err) if err.to_string().contains("approval required") => {
+                            let output = format!(
+                                "The approved tool call remained blocked by the configured sandbox: {err}"
+                            );
+                            ProviderToolResult {
+                                call_id: pending.id.clone(),
+                                name: pending.name.clone(),
+                                output: output.clone(),
+                                content: vec![ModelContentPart::text(output)],
+                                is_error: true,
+                                metadata: json!({
+                                    "approvalGranted": true,
+                                    "sandboxEscalation": "denied",
+                                    "sandboxEscalationDenied": true,
+                                }),
+                            }
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    loop_guard.observe_tool_result(&pending, &result);
                     provider_tool_results.push(result);
                 } else {
                     provider_tool_results.push(ProviderToolResult {
@@ -701,9 +691,8 @@ impl AgentCore {
                     continuation.conversation,
                     continuation.permission_mode,
                     context_budget,
-                    execution_budget,
+                    loop_policy,
                     loop_guard,
-                    started_at,
                     store,
                     cancellation,
                     model_user_message,
@@ -712,6 +701,7 @@ impl AgentCore {
                     provider_tool_calls,
                     provider_tool_results,
                     pending_tool_calls,
+                    compacted_tool_history,
                     current_round,
                     &mut events,
                 )
@@ -727,12 +717,11 @@ impl AgentCore {
         user_message_id: Uuid,
         workspace_root: PathBuf,
         context_summary: Option<String>,
-        conversation: Vec<ModelConversationMessage>,
+        mut conversation: Vec<ModelConversationMessage>,
         permission_mode: PermissionMode,
         mut budget: Option<ContextBudget>,
-        execution_budget: AgentExecutionBudget,
+        loop_policy: AgentLoopPolicy,
         mut loop_guard: AgentLoopGuardState,
-        started_at: Instant,
         store: Option<Arc<dyn SessionStore>>,
         cancellation: Option<CancellationToken>,
         model_user_message: String,
@@ -741,49 +730,11 @@ impl AgentCore {
         mut provider_tool_calls: Vec<ProviderToolCall>,
         mut provider_tool_results: Vec<ProviderToolResult>,
         mut pending_tool_calls: Vec<ProviderToolCall>,
+        mut compacted_tool_history: String,
         mut current_round: usize,
         events: &mut TurnEvents,
     ) -> anyhow::Result<AgentTurnResult> {
         loop {
-            if let Some(reason) = budget_checkpoint_reason(
-                &execution_budget,
-                current_round,
-                started_at,
-                budget.as_ref(),
-            ) {
-                let completion_is_pending = pending_tool_calls
-                    .first()
-                    .is_some_and(|call| call.name == "complete_task");
-                let total_budget_is_exhausted =
-                    loop_guard.total_tool_rounds >= execution_budget.max_total_tool_rounds;
-                let should_finish_without_checkpoint =
-                    matches!(reason, AgentBudgetCheckpointReason::ToolRounds)
-                        && (completion_is_pending || total_budget_is_exhausted);
-                if !should_finish_without_checkpoint {
-                    return Ok(suspend_for_budget_checkpoint(
-                        thread_id,
-                        user_message_id,
-                        workspace_root,
-                        context_summary,
-                        conversation,
-                        permission_mode,
-                        budget,
-                        execution_budget,
-                        loop_guard,
-                        started_at,
-                        reason,
-                        model_user_message,
-                        model_user_content,
-                        tool_candidates,
-                        provider_tool_calls,
-                        provider_tool_results,
-                        pending_tool_calls,
-                        current_round,
-                        std::mem::replace(events, TurnEvents::new(None)),
-                    ));
-                }
-            }
-
             while let Some(provider_call) = pending_tool_calls.first().cloned() {
                 if loop_guard.completion_mode
                     && !matches!(provider_call.name.as_str(), "update_plan" | "complete_task")
@@ -815,21 +766,19 @@ impl AgentCore {
                     }
                     continue;
                 }
-                if loop_guard.implementation_mode
-                    && !tool_call_can_change_workspace(&provider_call)
-                    && provider_call.name != "complete_task"
+                if let Some(violation) = loop_guard.register_tool_call(&provider_call, &loop_policy)
                 {
-                    loop_guard.blocked_implementation_mode_calls += 1;
-                    let result = blocked_implementation_mode_tool_result(&provider_call, events);
+                    let result =
+                        blocked_loop_tool_result(&provider_call, &violation, &loop_policy, events);
                     if let Some(ref mut budget) = budget {
                         budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
                     }
                     provider_tool_results.push(result);
                     pending_tool_calls.remove(0);
-                    if loop_guard.blocked_implementation_mode_calls
-                        >= MAX_IMPLEMENTATION_MODE_VIOLATIONS
+                    if loop_guard.loop_guard_corrections_since_progress
+                        >= loop_policy.max_loop_guard_corrections
                     {
-                        let output = incomplete_stagnation_output(&loop_guard);
+                        let output = loop_stagnation_output(&loop_guard, &violation);
                         return Ok(finalize_provider_turn(
                             thread_id,
                             ModelResponse::text(output),
@@ -840,26 +789,11 @@ impl AgentCore {
                     }
                     continue;
                 }
-                if let Some(equivalent_call_count) = loop_guard
-                    .register_tool_call(&provider_call, execution_budget.max_equivalent_tool_calls)
-                {
-                    let result = blocked_equivalent_tool_result(
-                        &provider_call,
-                        equivalent_call_count,
-                        execution_budget.max_equivalent_tool_calls,
-                        events,
-                    );
-                    if let Some(ref mut budget) = budget {
-                        budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
-                    }
-                    provider_tool_results.push(result);
-                    pending_tool_calls.remove(0);
-                    continue;
-                }
 
-                let policy = Arc::new(BasicPolicyEngine::new(
+                let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
                     workspace_root.clone(),
                     permission_mode,
+                    &self.sandbox_config,
                 ));
                 let mut ctx = ToolContext::local_with_sandbox_config(
                     workspace_root.clone(),
@@ -875,11 +809,7 @@ impl AgentCore {
                     .await
                 {
                     Ok(result) => {
-                        loop_guard.observe_tool_result(
-                            &provider_call,
-                            &result,
-                            execution_budget.max_observation_tool_calls_without_workspace_change,
-                        );
+                        loop_guard.observe_tool_result(&provider_call, &result);
                         let completion_output = explicit_task_completion_output(&result)
                             .or_else(|| verified_plan_completion_output(&result, &loop_guard));
                         if let Some(ref mut budget) = budget {
@@ -921,7 +851,7 @@ impl AgentCore {
                                     conversation,
                                     permission_mode,
                                     context_budget: budget,
-                                    execution_budget: execution_budget.clone(),
+                                    loop_policy: loop_policy.clone(),
                                     loop_guard,
                                     continuation_kind: AgentContinuationKind::Approval,
                                     state: AgentContinuationState::Provider {
@@ -931,6 +861,7 @@ impl AgentCore {
                                         provider_tool_calls,
                                         provider_tool_results,
                                         pending_tool_calls,
+                                        compacted_tool_history,
                                         current_round,
                                     },
                                 },
@@ -941,59 +872,42 @@ impl AgentCore {
                 }
             }
 
-            let total_budget_exhausted =
-                loop_guard.total_tool_rounds >= execution_budget.max_total_tool_rounds;
+            compact_completed_tool_history(
+                &mut conversation,
+                &mut provider_tool_calls,
+                &mut provider_tool_results,
+                &mut compacted_tool_history,
+                &mut budget,
+            );
             let response = self
                 .complete_model(
                     ModelRequest {
                         system_prompt: provider_system_prompt(
-                            &execution_budget.status(
-                                current_round,
+                            &loop_policy.status(
                                 loop_guard.total_tool_rounds,
-                                started_at,
+                                loop_guard.loop_guard_corrections_since_progress,
                                 budget.as_ref(),
                             ),
                             &workspace_root,
                             &self.sandbox_config,
                             loop_guard.completion_mode,
-                            loop_guard.implementation_mode,
                         ),
                         conversation: conversation.clone(),
                         user_message: model_user_message.clone(),
                         user_content: model_user_content.clone(),
-                        tool_candidates: if !total_budget_exhausted
-                            && current_round < execution_budget.max_tool_rounds
-                        {
-                            if loop_guard.completion_mode {
-                                tool_candidates
-                                    .iter()
-                                    .filter(|candidate| {
-                                        matches!(
-                                            candidate.name.as_str(),
-                                            "update_plan" | "complete_task"
-                                        )
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else if loop_guard.implementation_mode {
-                                tool_candidates
-                                    .iter()
-                                    .filter(|candidate| {
-                                        matches!(
-                                            candidate.name.as_str(),
-                                            "write_file"
-                                                | "apply_patch"
-                                                | "spreadsheet"
-                                                | "complete_task"
-                                        )
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                tool_candidates.clone()
-                            }
+                        tool_candidates: if loop_guard.completion_mode {
+                            tool_candidates
+                                .iter()
+                                .filter(|candidate| {
+                                    matches!(
+                                        candidate.name.as_str(),
+                                        "update_plan" | "complete_task"
+                                    )
+                                })
+                                .cloned()
+                                .collect()
                         } else {
-                            Vec::new()
+                            tool_candidates.clone()
                         },
                         previous_tool_calls: provider_tool_calls.clone(),
                         tool_results: provider_tool_results.clone(),
@@ -1005,7 +919,7 @@ impl AgentCore {
                 budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
             }
 
-            if response.tool_calls.is_empty() || total_budget_exhausted {
+            if response.tool_calls.is_empty() {
                 return Ok(finalize_provider_turn(
                     thread_id,
                     response,
@@ -1030,6 +944,18 @@ impl AgentCore {
         request: ModelRequest,
         events: &mut TurnEvents,
     ) -> anyhow::Result<ModelResponse> {
+        let round = events
+            .items
+            .iter()
+            .filter(|event| matches!(event, AgentEventPayload::ModelRequest { .. }))
+            .count()
+            + 1;
+        let request_snapshot = serde_json::to_value(&request)
+            .unwrap_or_else(|error| json!({ "serializationError": error.to_string() }));
+        events.push(AgentEventPayload::ModelRequest {
+            round,
+            request: request_snapshot,
+        });
         let mut on_delta = |delta| {
             match delta {
                 ModelStreamDelta::Text { text } => {
@@ -1123,6 +1049,7 @@ impl AgentCore {
         metadata_overlay: Option<Value>,
     ) -> anyhow::Result<crate::model::ToolResult> {
         let name = call.name.clone();
+        let approval_granted = ctx.approval_granted;
         events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
         let tool = match self.tools.get(&name) {
             Some(tool) => tool,
@@ -1133,6 +1060,7 @@ impl AgentCore {
                     "success": false,
                     "error": err.to_string()
                 });
+                insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
                 merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
                 events.push(AgentEventPayload::ToolCallFinished {
                     result: ToolResult {
@@ -1153,6 +1081,7 @@ impl AgentCore {
                     "success": false,
                     "error": err.to_string()
                 });
+                insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
                 merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
                 events.push(AgentEventPayload::ToolCallFinished {
                     result: ToolResult {
@@ -1168,6 +1097,7 @@ impl AgentCore {
         if let Some(object) = result.metadata.as_object_mut() {
             object.insert("toolName".to_string(), json!(&name));
         }
+        insert_approval_execution_metadata(&mut result.metadata, approval_granted, None);
         merge_metadata_overlay(&mut result.metadata, metadata_overlay.as_ref());
         events.push(AgentEventPayload::ToolCallFinished {
             result: result.clone(),
@@ -1180,6 +1110,27 @@ impl AgentCore {
             }
         }
         Ok(result)
+    }
+}
+
+fn insert_approval_execution_metadata(
+    metadata: &mut Value,
+    approval_granted: bool,
+    error: Option<&anyhow::Error>,
+) {
+    if !approval_granted {
+        return;
+    }
+    let denied = error.is_some_and(|error| error.to_string().contains("approval required"));
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("approvalGranted".to_string(), json!(true));
+        object.insert(
+            "sandboxEscalation".to_string(),
+            json!(if denied { "denied" } else { "scoped" }),
+        );
+        if denied {
+            object.insert("sandboxEscalationDenied".to_string(), json!(true));
+        }
     }
 }
 
@@ -1224,63 +1175,93 @@ impl AgentLoopGuardState {
     fn register_tool_call(
         &mut self,
         call: &ProviderToolCall,
-        max_equivalent_tool_calls: usize,
-    ) -> Option<usize> {
+        policy: &AgentLoopPolicy,
+    ) -> Option<ToolLoopViolation> {
         if call.name == "complete_task" {
             return None;
         }
         let signature = provider_tool_call_signature(call);
-        let count = self.equivalent_call_counts.entry(signature).or_default();
-        *count += 1;
-        if *count > max_equivalent_tool_calls {
-            self.blocked_equivalent_calls += 1;
-            Some(*count)
-        } else {
-            None
+        self.recent_tool_signatures.push(signature.clone());
+        if self.recent_tool_signatures.len() > MAX_TRACKED_TOOL_SIGNATURES {
+            self.recent_tool_signatures.remove(0);
         }
+
+        let count = self
+            .equivalent_call_counts
+            .entry(signature.clone())
+            .or_default();
+        *count += 1;
+        if let Some((cycle_length, repetitions)) = repeated_tool_cycle(
+            &self.recent_tool_signatures,
+            policy.max_repeated_tool_cycles,
+        ) {
+            self.loop_guard_corrections_since_progress += 1;
+            return Some(ToolLoopViolation::RepeatedCycle {
+                cycle_length,
+                repetitions,
+            });
+        }
+        if *count > policy.max_equivalent_tool_calls {
+            self.blocked_equivalent_calls += 1;
+            self.loop_guard_corrections_since_progress += 1;
+            return Some(ToolLoopViolation::EquivalentCall { count: *count });
+        }
+        None
     }
 
-    fn observe_tool_result(
-        &mut self,
-        call: &ProviderToolCall,
-        result: &ProviderToolResult,
-        max_observation_tool_calls_without_workspace_change: usize,
-    ) {
+    fn observe_tool_result(&mut self, call: &ProviderToolCall, result: &ProviderToolResult) {
         let workspace_mutation_succeeded = !result.is_error && tool_call_can_change_workspace(call);
-        if workspace_mutation_succeeded {
-            self.observation_tool_calls_since_workspace_change = 0;
-            self.implementation_mode = false;
-            self.blocked_implementation_mode_calls = 0;
-        } else if call.name != "complete_task" {
-            self.observation_tool_calls_since_workspace_change += 1;
-        }
-
         if result.is_error {
-            self.refresh_implementation_mode(max_observation_tool_calls_without_workspace_change);
             return;
         }
 
+        let signature = provider_tool_call_signature(call);
+        let result_fingerprint = provider_tool_result_fingerprint(result);
+        let observation_changed = self
+            .last_result_fingerprints
+            .get(&signature)
+            .is_some_and(|previous| previous != &result_fingerprint);
+        self.last_result_fingerprints
+            .insert(signature.clone(), result_fingerprint);
         let verification_command = successful_verification_command(call);
         if let Some(command) = verification_command.as_ref() {
             self.last_successful_verification = Some(command.clone());
         }
 
-        let changed_state = if call.name == "update_plan" {
-            self.latest_plan = result
+        let plan_progress = if call.name == "update_plan" {
+            let next_plan = result
                 .metadata
                 .get("taskPlan")
                 .and_then(|value| serde_json::from_value(value.clone()).ok());
             let fingerprint = result.metadata.get("taskPlan").map(canonical_json_string);
-            let changed = fingerprint != self.last_plan_fingerprint;
+            let changed = fingerprint != self.last_plan_fingerprint
+                && plan_made_progress(self.latest_plan.as_ref(), next_plan.as_ref());
+            self.latest_plan = next_plan;
             self.last_plan_fingerprint = fingerprint;
             changed
         } else {
-            workspace_mutation_succeeded
+            false
         };
+        let progress_tool_advanced =
+            if workspace_mutation_succeeded || verification_command.is_some() {
+                let count = self
+                    .progress_tool_signatures
+                    .entry(signature.clone())
+                    .or_default();
+                *count += 1;
+                *count == 1
+            } else {
+                false
+            };
+        let changed_state = plan_progress || progress_tool_advanced || observation_changed;
 
         if changed_state {
             self.equivalent_call_counts.clear();
-            if call.name != "update_plan" {
+            self.equivalent_call_counts.insert(signature.clone(), 1);
+            self.recent_tool_signatures.clear();
+            self.recent_tool_signatures.push(signature);
+            self.loop_guard_corrections_since_progress = 0;
+            if workspace_mutation_succeeded && progress_tool_advanced {
                 self.last_successful_verification = None;
                 self.workspace_changed_since_verification = true;
                 self.completion_mode = false;
@@ -1296,31 +1277,135 @@ impl AgentLoopGuardState {
         {
             self.completion_mode = true;
             self.blocked_completion_mode_calls = 0;
-            self.implementation_mode = false;
             self.workspace_changed_since_verification = false;
-        }
-        self.refresh_implementation_mode(max_observation_tool_calls_without_workspace_change);
-    }
-
-    fn refresh_implementation_mode(
-        &mut self,
-        max_observation_tool_calls_without_workspace_change: usize,
-    ) {
-        if !self.completion_mode
-            && self.observation_tool_calls_since_workspace_change
-                >= max_observation_tool_calls_without_workspace_change
-            && self
-                .latest_plan
-                .as_ref()
-                .is_some_and(plan_needs_workspace_change)
-        {
-            self.implementation_mode = true;
         }
     }
 }
 
+#[derive(Debug, Clone)]
+enum ToolLoopViolation {
+    EquivalentCall {
+        count: usize,
+    },
+    RepeatedCycle {
+        cycle_length: usize,
+        repetitions: usize,
+    },
+}
+
+fn repeated_tool_cycle(
+    signatures: &[String],
+    required_repetitions: usize,
+) -> Option<(usize, usize)> {
+    let max_cycle_length = MAX_DETECTED_TOOL_CYCLE_LENGTH.min(
+        signatures
+            .len()
+            .checked_div(required_repetitions)
+            .unwrap_or_default(),
+    );
+    for cycle_length in 2..=max_cycle_length {
+        let compared = cycle_length * required_repetitions;
+        let suffix = &signatures[signatures.len() - compared..];
+        let cycle = &suffix[..cycle_length];
+        let is_multi_step = cycle.iter().skip(1).any(|signature| signature != &cycle[0]);
+        if is_multi_step
+            && suffix
+                .chunks_exact(cycle_length)
+                .all(|chunk| chunk == cycle)
+        {
+            return Some((cycle_length, required_repetitions));
+        }
+    }
+    None
+}
+
+fn plan_made_progress(previous: Option<&TaskPlan>, next: Option<&TaskPlan>) -> bool {
+    let Some(next) = next else {
+        return false;
+    };
+    let Some(previous) = previous else {
+        return !next.steps.is_empty();
+    };
+    let previous_completed = previous
+        .steps
+        .iter()
+        .filter(|step| step.status == TaskPlanStepStatus::Completed)
+        .count();
+    let next_completed = next
+        .steps
+        .iter()
+        .filter(|step| step.status == TaskPlanStepStatus::Completed)
+        .count();
+    if next_completed > previous_completed {
+        return true;
+    }
+
+    next.steps.iter().any(|next_step| {
+        next_step.status == TaskPlanStepStatus::InProgress
+            && previous.steps.iter().all(|previous_step| {
+                previous_step.step != next_step.step
+                    || previous_step.status == TaskPlanStepStatus::Pending
+            })
+    })
+}
+
 fn provider_tool_call_signature(call: &ProviderToolCall) -> String {
     format!("{}:{}", call.name, canonical_json_string(&call.arguments))
+}
+
+fn provider_tool_result_fingerprint(result: &ProviderToolResult) -> String {
+    let stable_output = serde_json::from_str::<Value>(&result.output)
+        .ok()
+        .map(|value| canonical_json_string(&stable_result_value(&value)))
+        .unwrap_or_else(|| result.output.clone());
+    let output = if stable_output.chars().count() <= 1_024 {
+        stable_output
+    } else {
+        let char_count = stable_output.chars().count();
+        let prefix = stable_output.chars().take(512).collect::<String>();
+        let suffix = stable_output
+            .chars()
+            .rev()
+            .take(512)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        format!("{prefix}[...{char_count} chars...]{suffix}")
+    };
+    format!(
+        "{}:{}:{}",
+        result.is_error,
+        canonical_json_string(&stable_result_value(&result.metadata)),
+        output
+    )
+}
+
+fn stable_result_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(stable_result_value).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "providerToolCallId"
+                            | "callId"
+                            | "requestId"
+                            | "durationMs"
+                            | "elapsedMs"
+                            | "startedAt"
+                            | "finishedAt"
+                            | "updatedAt"
+                            | "timestamp"
+                    )
+                })
+                .map(|(key, value)| (key.clone(), stable_result_value(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
 }
 
 fn canonical_json_string(value: &Value) -> String {
@@ -1383,12 +1468,7 @@ fn step_looks_like_verification(step: &str) -> bool {
     .any(|keyword| step.contains(keyword))
 }
 
-fn plan_needs_workspace_change(plan: &TaskPlan) -> bool {
-    plan.steps.iter().any(|step| {
-        step.status != TaskPlanStepStatus::Completed && step_looks_like_workspace_change(&step.step)
-    })
-}
-
+#[cfg(test)]
 fn step_looks_like_workspace_change(step: &str) -> bool {
     let step = step.to_lowercase();
     [
@@ -1472,25 +1552,52 @@ fn verified_plan_completion_output(
     Some(output)
 }
 
-fn blocked_equivalent_tool_result(
+fn blocked_loop_tool_result(
     provider_call: &ProviderToolCall,
-    equivalent_call_count: usize,
-    max_equivalent_tool_calls: usize,
+    violation: &ToolLoopViolation,
+    policy: &AgentLoopPolicy,
     events: &mut TurnEvents,
 ) -> ProviderToolResult {
     let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
     events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
-    let output = format!(
-        "Equivalent tool call blocked after {max_equivalent_tool_calls} executions without an intervening state change. Do not retry the same call. Make a state-changing step, use different evidence, or finish the task."
-    );
-    let metadata = json!({
+    let (output, violation_metadata) = match violation {
+        ToolLoopViolation::EquivalentCall { count } => (
+            format!(
+                "Equivalent tool call blocked after {} executions without meaningful progress. Do not retry the same operation. Change the approach, use new evidence, make a concrete state change, or finish truthfully.",
+                policy.max_equivalent_tool_calls
+            ),
+            json!({
+                "kind": "equivalent_call",
+                "equivalentCallCount": count,
+                "maxEquivalentToolCalls": policy.max_equivalent_tool_calls
+            }),
+        ),
+        ToolLoopViolation::RepeatedCycle {
+            cycle_length,
+            repetitions,
+        } => (
+            format!(
+                "Repeated tool-call cycle blocked after {repetitions} repetitions of a {cycle_length}-step pattern without meaningful progress. Break the cycle with a different approach or finish truthfully."
+            ),
+            json!({
+                "kind": "repeated_cycle",
+                "cycleLength": cycle_length,
+                "cycleRepetitions": repetitions,
+                "maxRepeatedToolCycles": policy.max_repeated_tool_cycles
+            }),
+        ),
+    };
+    let mut metadata = json!({
         "toolName": &provider_call.name,
         "providerToolCallId": &provider_call.id,
         "success": false,
         "loopGuardBlocked": true,
-        "equivalentCallCount": equivalent_call_count,
-        "maxEquivalentToolCalls": max_equivalent_tool_calls
+        "loopGuardCorrectionLimit": policy.max_loop_guard_corrections
     });
+    if let (Some(target), Some(source)) = (metadata.as_object_mut(), violation_metadata.as_object())
+    {
+        target.extend(source.clone());
+    }
     events.push(AgentEventPayload::ToolCallFinished {
         result: ToolResult {
             call_id: call.id,
@@ -1521,37 +1628,6 @@ fn blocked_completion_mode_tool_result(
         "providerToolCallId": &provider_call.id,
         "success": false,
         "completionModeBlocked": true
-    });
-    events.push(AgentEventPayload::ToolCallFinished {
-        result: ToolResult {
-            call_id: call.id,
-            output: output.clone(),
-            metadata: metadata.clone(),
-            content: vec![ModelContentPart::text(output.clone())],
-        },
-    });
-    ProviderToolResult {
-        call_id: provider_call.id.clone(),
-        name: provider_call.name.clone(),
-        output: output.clone(),
-        content: vec![ModelContentPart::text(output)],
-        metadata,
-        is_error: true,
-    }
-}
-
-fn blocked_implementation_mode_tool_result(
-    provider_call: &ProviderToolCall,
-    events: &mut TurnEvents,
-) -> ProviderToolResult {
-    let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
-    events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
-    let output = "Tool call blocked because exploration has continued without a workspace change. Implementation mode only permits write_file, apply_patch, spreadsheet write, or complete_task. Make the planned concrete change now.".to_string();
-    let metadata = json!({
-        "toolName": &provider_call.name,
-        "providerToolCallId": &provider_call.id,
-        "success": false,
-        "implementationModeBlocked": true
     });
     events.push(AgentEventPayload::ToolCallFinished {
         result: ToolResult {
@@ -1657,7 +1733,10 @@ fn step_is_explicitly_deferred(step: &str) -> bool {
     .any(|keyword| step.contains(keyword))
 }
 
-fn incomplete_stagnation_output(loop_guard: &AgentLoopGuardState) -> String {
+fn loop_stagnation_output(
+    loop_guard: &AgentLoopGuardState,
+    violation: &ToolLoopViolation,
+) -> String {
     let plan = loop_guard.latest_plan.as_ref();
     let remaining = plan
         .map(|plan| {
@@ -1667,138 +1746,122 @@ fn incomplete_stagnation_output(loop_guard: &AgentLoopGuardState) -> String {
                 .count()
         })
         .unwrap_or(0);
+    let pattern = match violation {
+        ToolLoopViolation::EquivalentCall { .. } => "the same tool call",
+        ToolLoopViolation::RepeatedCycle { .. } => "the same tool-call cycle",
+    };
     format!(
-        "Task remains incomplete. The turn was stopped after {MAX_IMPLEMENTATION_MODE_VIOLATIONS} implementation-mode violations without a workspace change. The durable plan retains {remaining} unfinished step(s) for a retry or user-directed continuation."
+        "Task remains incomplete. The runtime stopped {pattern} after {} loop-guard corrections produced no meaningful progress. There is no elapsed-time or total-round limit; execution stopped only because the model kept returning to an equivalent problem state. The durable plan retains {remaining} unfinished step(s) for a retry or user-directed continuation.",
+        loop_guard.loop_guard_corrections_since_progress
     )
 }
 
-fn budget_checkpoint_reason(
-    execution_budget: &AgentExecutionBudget,
-    used_tool_rounds: usize,
-    started_at: Instant,
-    context_budget: Option<&ContextBudget>,
-) -> Option<AgentBudgetCheckpointReason> {
-    if used_tool_rounds >= execution_budget.max_tool_rounds {
-        return Some(AgentBudgetCheckpointReason::ToolRounds);
+fn compact_completed_tool_history(
+    conversation: &mut Vec<ModelConversationMessage>,
+    provider_tool_calls: &mut Vec<ProviderToolCall>,
+    provider_tool_results: &mut Vec<ProviderToolResult>,
+    compacted_tool_history: &mut String,
+    budget: &mut Option<ContextBudget>,
+) {
+    const COMPACTION_MARKER: &str = "[Automatically compacted tool history]";
+    let Some(context_budget) = budget.as_mut() else {
+        return;
+    };
+    if context_budget.used_tokens.saturating_mul(100) < context_budget.max_tokens.saturating_mul(80)
+    {
+        return;
     }
-    if started_at.elapsed().as_millis() >= u128::from(execution_budget.max_elapsed_ms) {
-        return Some(AgentBudgetCheckpointReason::ElapsedTime);
-    }
-    context_budget
-        .filter(|budget| budget.is_exceeded())
-        .map(|_| AgentBudgetCheckpointReason::ContextWindow)
-}
 
-#[allow(clippy::too_many_arguments)]
-fn suspend_for_budget_checkpoint(
-    thread_id: Uuid,
-    user_message_id: Uuid,
-    workspace_root: PathBuf,
-    context_summary: Option<String>,
-    conversation: Vec<ModelConversationMessage>,
-    permission_mode: PermissionMode,
-    context_budget: Option<ContextBudget>,
-    execution_budget: AgentExecutionBudget,
-    loop_guard: AgentLoopGuardState,
-    started_at: Instant,
-    checkpoint_reason: AgentBudgetCheckpointReason,
-    model_user_message: String,
-    model_user_content: Vec<ModelContentPart>,
-    tool_candidates: Vec<ProviderToolCandidate>,
-    provider_tool_calls: Vec<ProviderToolCall>,
-    provider_tool_results: Vec<ProviderToolResult>,
-    pending_tool_calls: Vec<ProviderToolCall>,
-    used_tool_rounds: usize,
-    mut events: TurnEvents,
-) -> AgentTurnResult {
-    let approval_id = Uuid::new_v4();
-    let status = execution_budget.status(
-        used_tool_rounds,
-        loop_guard.total_tool_rounds,
-        started_at,
-        context_budget.as_ref(),
-    );
-    let reason = format!(
-        "{} Continue to grant another execution slice (slice rounds remaining: {}, total rounds remaining: {}, time remaining: {} ms, context remaining: {}).",
-        checkpoint_reason.message(),
-        status.remaining_tool_rounds,
-        status.remaining_total_tool_rounds,
-        status.remaining_time_ms,
-        status
-            .context_remaining_tokens
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "not tracked".to_string()),
-    );
-    events.push(AgentEventPayload::ApprovalRequested {
-        approval_id,
-        action: "Continue agent execution".to_string(),
-        reason: reason.clone(),
-    });
-    events.push(AgentEventPayload::TurnSuspended {
-        approval_id,
-        reason,
-    });
-    AgentTurnResult {
-        events: events.into_vec(),
-        outcome: AgentTurnOutcome::Suspended {
-            approval_id,
-            continuation: AgentContinuation {
-                thread_id,
-                user_message_id,
-                workspace_root,
-                context_summary,
-                conversation,
-                permission_mode,
-                context_budget,
-                execution_budget,
-                loop_guard,
-                continuation_kind: AgentContinuationKind::BudgetCheckpoint,
-                state: AgentContinuationState::Provider {
-                    model_user_message,
-                    model_user_content,
-                    tool_candidates,
-                    provider_tool_calls,
-                    provider_tool_results,
-                    pending_tool_calls,
-                    // A resumed slice receives a fresh execution budget. Prior tool calls remain
-                    // in the provider history, but they do not consume the new slice's allowance.
-                    current_round: 0,
-                },
+    let target_tokens = context_budget.max_tokens.saturating_mul(65) / 100;
+    let mut dropped_tokens = 0usize;
+    let mut summary_lines = Vec::new();
+    while context_budget.used_tokens.saturating_sub(dropped_tokens) > target_tokens
+        && provider_tool_results.len() > MIN_RETAINED_TOOL_RESULTS_AFTER_COMPACTION
+    {
+        let result = provider_tool_results.remove(0);
+        let call = provider_tool_calls
+            .iter()
+            .position(|call| call.id == result.call_id)
+            .map(|index| provider_tool_calls.remove(index));
+        dropped_tokens =
+            dropped_tokens.saturating_add(ContextBudget::estimate_tokens(&result.output));
+        let arguments = call
+            .as_ref()
+            .map(|call| truncate_for_summary(&canonical_json_string(&call.arguments), 240))
+            .unwrap_or_else(|| "{}".to_string());
+        summary_lines.push(format!(
+            "- {} {}: {}\n  {}",
+            result.name,
+            arguments,
+            if result.is_error {
+                "failed"
+            } else {
+                "succeeded"
             },
-        },
+            truncate_for_summary(&result.output, 480).replace('\n', " ")
+        ));
     }
+    if summary_lines.is_empty() {
+        return;
+    }
+
+    let old_summary_tokens = ContextBudget::estimate_tokens(compacted_tool_history);
+    if !compacted_tool_history.is_empty() {
+        compacted_tool_history.push('\n');
+    }
+    compacted_tool_history.push_str(&summary_lines.join("\n"));
+    let summary_char_limit = context_budget
+        .max_tokens
+        .saturating_mul(4)
+        .saturating_div(5)
+        .min(MAX_COMPACTED_TOOL_HISTORY_CHARS);
+    *compacted_tool_history = truncate_for_summary(compacted_tool_history, summary_char_limit);
+    let summary_content = format!(
+        "{COMPACTION_MARKER}\nEarlier completed tool calls were compacted automatically to keep the long-running turn inside the model context window. Treat these records as durable observations; do not repeat them unless later state makes them stale.\n{}",
+        compacted_tool_history
+    );
+    if let Some(message) = conversation
+        .iter_mut()
+        .find(|message| message.content.starts_with(COMPACTION_MARKER))
+    {
+        message.content = summary_content;
+        message.content_parts.clear();
+    } else {
+        conversation.push(ModelConversationMessage {
+            role: ModelConversationRole::System,
+            content: summary_content,
+            content_parts: Vec::new(),
+        });
+    }
+
+    let new_summary_tokens = ContextBudget::estimate_tokens(compacted_tool_history);
+    context_budget.used_tokens = context_budget
+        .used_tokens
+        .saturating_sub(dropped_tokens)
+        .saturating_sub(old_summary_tokens)
+        .saturating_add(new_summary_tokens);
+    context_budget.warnings.clear();
 }
 
 fn provider_system_prompt(
-    status: &AgentBudgetStatus,
+    status: &AgentLoopStatus,
     workspace_root: &Path,
     sandbox_config: &LocalSandboxConfig,
     completion_mode: bool,
-    implementation_mode: bool,
 ) -> String {
     let completion_instruction = if completion_mode {
         " A terminal verification command just succeeded. Completion mode is active: only update_plan and complete_task are available. Do not resume implementation or investigation. Submit the truthful final plan state now, or use complete_task if the requested scope is actually complete."
     } else {
         ""
     };
-    let implementation_instruction = if implementation_mode {
-        " Exploration has exceeded the no-progress limit. Implementation mode is active: only write_file, apply_patch, spreadsheet write, and complete_task are available. Make the concrete workspace change required by the current plan now. Do not inspect more files, run tests, or revise the plan until a workspace change succeeds."
-    } else {
-        ""
-    };
     let workspace_scope = workspace_scope_instruction(workspace_root, sandbox_config);
     format!(
-        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help. {workspace_scope} For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. After a successful test, build, lint, check, or verify command, finish with one final action: update_plan with all current steps completed (set current_scope_complete with verification when later-phase steps remain pending), or call complete_task with a concise summary, concrete verification evidence, and any deliberately deferred work. Do not perform more investigation after that final action. Delegate independent work with spawn_agent when useful, then use wait_agents to collect parallel results before synthesizing the final answer. Inspect every child status and error; a terminal child is not necessarily a successful child.{completion_instruction}{implementation_instruction}\n\nExecution budget for this slice: {}/{} tool-decision rounds used ({} remaining). Total tool-decision budget: {}/{} used ({} remaining). Equivalent tool calls without an intervening state change are limited to {}. Observation tool calls without a workspace change are limited to {} before implementation mode activates. Time budget: {} ms remaining of {} ms. Context budget: {} used of {} tokens ({} remaining). A slice budget checkpoint requires explicit continuation. When the total tool budget reaches zero, stop using tools and provide the best truthful final response. Do not claim work is complete merely because a budget is low.",
-        status.used_tool_rounds,
-        status.max_tool_rounds,
-        status.remaining_tool_rounds,
+        "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help. {workspace_scope} For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. After a successful test, build, lint, check, or verify command, finish with one final action: update_plan with all current steps completed (set current_scope_complete with verification when later-phase steps remain pending), or call complete_task with a concise summary, concrete verification evidence, and any deliberately deferred work. Do not perform more investigation after that final action. Delegate independent work with spawn_agent when useful, then use wait_agents to collect parallel results before synthesizing the final answer. Inspect every child status and error; a terminal child is not necessarily a successful child.{completion_instruction}\n\nThis turn has no elapsed-time or total tool-round limit. It has completed {} tool-decision rounds so far. Loop protection is progress-based: an equivalent call may repeat up to {} times, a repeated multi-step cycle is detected after {} repetitions, and {} ignored loop corrections without meaningful progress stop only that repeated pattern. Current loop corrections since progress: {}. Tool history is compacted automatically near the context-window boundary. Context budget: {} used of {} tokens ({} remaining).",
         status.total_tool_rounds,
-        status.max_total_tool_rounds,
-        status.remaining_total_tool_rounds,
         status.max_equivalent_tool_calls,
-        status.max_observation_tool_calls_without_workspace_change,
-        status.remaining_time_ms,
-        status.max_elapsed_ms,
+        status.max_repeated_tool_cycles,
+        status.max_loop_guard_corrections,
+        status.loop_guard_corrections,
         status.context_used_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
         status.context_max_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
         status.context_remaining_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "not tracked".to_string()),
@@ -1913,6 +1976,53 @@ fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
             .map(|host| browser_domain_approval_action(&host))
             .unwrap_or_else(|| format!("browser {}", call.arguments)),
         _ => format!("/mcp {} {}", call.name, call.arguments),
+    }
+}
+
+fn approved_sandbox_config_for_call(
+    base: &LocalSandboxConfig,
+    workspace_root: &Path,
+    call: &ProviderToolCall,
+) -> LocalSandboxConfig {
+    let mut config = base.clone();
+    let path = |key: &str| {
+        call.arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|value| approval_path(workspace_root, value))
+    };
+
+    match call.name.as_str() {
+        "list_files" | "read_file" | "search" => {
+            if let Some(path) = path("path") {
+                config.grant_read_path(path);
+            }
+        }
+        "write_file" => {
+            if let Some(path) = path("path") {
+                config.grant_write_path(path);
+            }
+        }
+        "spreadsheet" => {
+            if let Some(path) = path("path").or_else(|| path("sourcePath")) {
+                config.grant_read_path(path);
+            }
+            if let Some(path) = path("outputPath") {
+                config.grant_write_path(path);
+            }
+        }
+        _ => {}
+    }
+
+    config
+}
+
+fn approval_path(workspace_root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
     }
 }
 
@@ -2079,12 +2189,11 @@ mod tests {
         let additional_root = test_workspace("system-prompt-additional-root");
         let mut sandbox_config = LocalSandboxConfig::default();
         sandbox_config.read_paths = vec![additional_root.clone()];
-        let execution_budget = AgentExecutionBudget::default().normalized();
+        let loop_policy = AgentLoopPolicy::default().normalized();
         let prompt = provider_system_prompt(
-            &execution_budget.status(0, 0, Instant::now(), None),
+            &loop_policy.status(0, 0, None),
             &workspace,
             &sandbox_config,
-            false,
             false,
         );
 
@@ -2098,10 +2207,9 @@ mod tests {
         assert!(prompt.contains(&additional_root.display().to_string()));
 
         let full_access_prompt = provider_system_prompt(
-            &execution_budget.status(0, 0, Instant::now(), None),
+            &loop_policy.status(0, 0, None),
             &workspace,
             &LocalSandboxConfig::danger_full_access(),
-            false,
             false,
         );
         assert!(full_access_prompt.contains(
@@ -2447,8 +2555,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stagnant_exploration_requires_a_workspace_change() {
-        let workspace = test_workspace("implementation-mode");
+    async fn many_distinct_observations_do_not_disable_tools() {
+        let workspace = test_workspace("distinct-observations");
         fs::create_dir_all(workspace.join("src")).unwrap();
         for index in 0..11 {
             fs::write(workspace.join(format!("context-{index}.txt")), "context").unwrap();
@@ -2519,34 +2627,24 @@ mod tests {
                 None,
             )
             .await
-            .expect("implementation mode recovers after a workspace change");
+            .expect("distinct observations remain allowed");
 
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
         let requests = provider.requests();
         assert_eq!(requests.len(), 5);
-        for request in &requests[2..4] {
-            let mut tool_names = request
+        for request in &requests[2..] {
+            assert!(request
                 .tool_candidates
                 .iter()
-                .map(|candidate| candidate.name.as_str())
-                .collect::<Vec<_>>();
-            tool_names.sort_unstable();
-            assert_eq!(
-                tool_names,
-                vec!["apply_patch", "complete_task", "spreadsheet", "write_file"]
-            );
+                .any(|candidate| candidate.name == "read_file"));
             assert!(request
                 .system_prompt
-                .contains("Implementation mode is active"));
+                .contains("no elapsed-time or total tool-round limit"));
         }
-        assert!(requests[4]
-            .tool_candidates
-            .iter()
-            .any(|candidate| candidate.name == "read_file"));
-        assert!(result.events.iter().any(|event| matches!(
+        assert!(!result.events.iter().any(|event| matches!(
             event,
             AgentEventPayload::ToolCallFinished { result }
-                if result.metadata.get("implementationModeBlocked") == Some(&Value::Bool(true))
+                if result.metadata.get("loopGuardBlocked") == Some(&Value::Bool(true))
         )));
         assert_eq!(
             fs::read_to_string(workspace.join("src").join("cli.js")).unwrap(),
@@ -2698,45 +2796,142 @@ mod tests {
         assert!(step_is_explicitly_deferred("后续阶段暂缓实现"));
     }
 
-    #[tokio::test]
-    async fn repeated_implementation_mode_violations_stop_as_incomplete() {
-        let workspace = test_workspace("implementation-mode-stop");
-        for index in 0..11 {
-            fs::write(workspace.join(format!("context-{index}.txt")), "context").unwrap();
-        }
-        let mut responses = vec![
-            ModelResponse {
-                text: String::new(),
-                tool_calls: vec![ProviderToolCall {
-                    id: "call_plan".to_string(),
-                    name: "update_plan".to_string(),
-                    arguments: json!({
-                        "plan": [
-                            { "step": "Implement CLI contract", "status": "in_progress" },
-                            { "step": "Run tests", "status": "pending" }
-                        ]
+    #[test]
+    fn changing_tool_results_reset_equivalent_call_detection() {
+        let policy = AgentLoopPolicy::default().normalized();
+        let mut guard = AgentLoopGuardState::default();
+        for index in 0..12 {
+            let call = ProviderToolCall {
+                id: format!("call_{index}"),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "changing.txt" }),
+            };
+            assert!(guard.register_tool_call(&call, &policy).is_none());
+            guard.observe_tool_result(
+                &call,
+                &ProviderToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: format!("state {index}"),
+                    content: Vec::new(),
+                    is_error: false,
+                    metadata: json!({
+                        "providerToolCallId": call.id,
+                        "durationMs": index,
+                        "success": true
                     }),
-                }],
-                usage: None,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn result_fingerprint_ignores_transport_ids_and_timing() {
+        let result = |call_id: &str, duration_ms: u64, status: &str| ProviderToolResult {
+            call_id: call_id.to_string(),
+            name: "wait_agents".to_string(),
+            output: json!({
+                "status": status,
+                "updatedAt": format!("2026-07-18T12:00:{duration_ms:02}Z")
+            })
+            .to_string(),
+            content: Vec::new(),
+            is_error: false,
+            metadata: json!({
+                "providerToolCallId": call_id,
+                "durationMs": duration_ms,
+                "success": true
+            }),
+        };
+        assert_eq!(
+            provider_tool_result_fingerprint(&result("call_1", 1, "running")),
+            provider_tool_result_fingerprint(&result("call_2", 9, "running"))
+        );
+        assert_ne!(
+            provider_tool_result_fingerprint(&result("call_1", 1, "running")),
+            provider_tool_result_fingerprint(&result("call_2", 9, "completed"))
+        );
+    }
+
+    #[test]
+    fn legacy_budget_continuation_deserializes_into_loop_policy() {
+        let continuation = AgentContinuation {
+            thread_id: Uuid::new_v4(),
+            user_message_id: Uuid::new_v4(),
+            workspace_root: PathBuf::from("workspace"),
+            context_summary: None,
+            conversation: Vec::new(),
+            permission_mode: PermissionMode::Auto,
+            context_budget: None,
+            loop_policy: AgentLoopPolicy::default(),
+            loop_guard: AgentLoopGuardState::default(),
+            continuation_kind: AgentContinuationKind::LegacyBudgetCheckpoint,
+            state: AgentContinuationState::Provider {
+                model_user_message: "continue".to_string(),
+                model_user_content: Vec::new(),
+                tool_candidates: Vec::new(),
+                provider_tool_calls: Vec::new(),
+                provider_tool_results: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                compacted_tool_history: String::new(),
+                current_round: 8,
             },
-            ModelResponse {
-                text: String::new(),
-                tool_calls: (0..11)
-                    .map(|index| ProviderToolCall {
-                        id: format!("call_read_{index}"),
-                        name: "read_file".to_string(),
-                        arguments: json!({ "path": format!("context-{index}.txt") }),
-                    })
-                    .collect(),
-                usage: None,
-            },
-        ];
-        responses.extend((1..=3).map(|index| ModelResponse {
+        };
+        let mut value = serde_json::to_value(continuation).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("loopPolicy");
+        object.insert(
+            "executionBudget".to_string(),
+            json!({
+                "maxToolRounds": 8,
+                "maxTotalToolRounds": 24,
+                "maxEquivalentToolCalls": 3,
+                "maxObservationToolCallsWithoutWorkspaceChange": 12,
+                "maxElapsedMs": 900_000
+            }),
+        );
+        value
+            .get_mut("state")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove("compactedToolHistory");
+
+        let restored: AgentContinuation = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.loop_policy.max_equivalent_tool_calls, 3);
+        assert_eq!(
+            restored.loop_policy.max_repeated_tool_cycles,
+            DEFAULT_MAX_REPEATED_TOOL_CYCLES
+        );
+        assert!(matches!(
+            restored.continuation_kind,
+            AgentContinuationKind::LegacyBudgetCheckpoint
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_multi_step_cycle_stops_as_incomplete() {
+        let workspace = test_workspace("repeated-tool-cycle");
+        fs::write(workspace.join("a.txt"), "a").unwrap();
+        fs::write(workspace.join("b.txt"), "b").unwrap();
+        let mut responses = vec![ModelResponse {
             text: String::new(),
             tool_calls: vec![ProviderToolCall {
-                id: format!("call_violation_{index}"),
-                name: "list_files".to_string(),
-                arguments: json!({ "path": "." }),
+                id: "call_plan".to_string(),
+                name: "update_plan".to_string(),
+                arguments: json!({
+                    "plan": [
+                        { "step": "Resolve the current problem", "status": "in_progress" }
+                    ]
+                }),
+            }],
+            usage: None,
+        }];
+        responses.extend((0..8).map(|index| ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ProviderToolCall {
+                id: format!("call_cycle_{index}"),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": if index % 2 == 0 { "a.txt" } else { "b.txt" } }),
             }],
             usage: None,
         }));
@@ -2749,7 +2944,8 @@ mod tests {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "Implement the CLI.".to_string(),
+                    content: "Resolve the problem without repeating the same investigation."
+                        .to_string(),
                     user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
@@ -2761,12 +2957,19 @@ mod tests {
                 None,
             )
             .await
-            .expect("stagnation stop closes the turn");
+            .expect("cycle detection closes the turn");
 
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
-        assert_eq!(provider.requests().len(), 5);
+        assert_eq!(provider.requests().len(), 9);
         assert!(assistant_text(&result.events).contains("Task remains incomplete"));
-        assert!(assistant_text(&result.events).contains("3 implementation-mode violations"));
+        assert!(assistant_text(&result.events).contains("same tool-call cycle"));
+        assert!(assistant_text(&result.events).contains("no elapsed-time or total-round limit"));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallFinished { result }
+                if result.metadata.get("kind").and_then(Value::as_str)
+                    == Some("repeated_cycle")
+        )));
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -2871,8 +3074,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_protected_metadata_write_uses_one_shot_sandbox_escalation() {
-        let workspace = test_workspace("approved-sandbox-escalation");
+    async fn approved_protected_metadata_write_uses_one_shot_path_grant() {
+        let workspace = test_workspace("approved-path-grant");
         let provider = Arc::new(ScriptedProvider::new(vec![
             ModelResponse {
                 text: String::new(),
@@ -2917,7 +3120,7 @@ mod tests {
         let resumed = agent
             .resume_turn_streaming(continuation, true, None, None, None)
             .await
-            .expect("approved sandbox escalation resumes");
+            .expect("approved path grant resumes");
 
         assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
         assert_eq!(
@@ -2927,10 +3130,84 @@ mod tests {
         let _ = fs::remove_dir_all(workspace);
     }
 
+    #[tokio::test]
+    async fn approved_external_write_grant_does_not_authorize_a_sibling_call() {
+        let workspace = test_workspace("approved-external-path-grant");
+        let outside = test_workspace("approved-external-path-target");
+        let approved_path = outside.join("approved.txt");
+        let sibling_path = outside.join("not-approved.txt");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_approved_path".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": approved_path,
+                        "content": "approved once"
+                    }),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_sibling_path".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": sibling_path,
+                        "content": "must require its own approval"
+                    }),
+                }],
+                usage: None,
+            },
+        ]));
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins())
+            .with_sandbox_config(LocalSandboxConfig::enforce());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Write only the explicitly approved external file.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::Approve,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("external write waits for approval");
+        let continuation = match result.outcome {
+            AgentTurnOutcome::Suspended { continuation, .. } => continuation,
+            AgentTurnOutcome::Completed => panic!("external write should wait for approval"),
+        };
+
+        let resumed = agent
+            .resume_turn_streaming(continuation, true, None, None, None)
+            .await
+            .expect("approved external path is written");
+
+        assert!(matches!(
+            resumed.outcome,
+            AgentTurnOutcome::Suspended { .. }
+        ));
+        assert_eq!(fs::read_to_string(&approved_path).unwrap(), "approved once");
+        assert!(!sibling_path.exists());
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(outside);
+    }
+
     #[cfg(windows)]
     #[tokio::test]
-    async fn sandbox_blocked_shell_write_resumes_with_one_shot_approval() {
-        let workspace = test_workspace("approved-shell-sandbox-escalation");
+    async fn approved_shell_command_cannot_disable_the_os_sandbox() {
+        let workspace = test_workspace("approved-shell-remains-sandboxed");
         let outside = std::env::current_dir()
             .expect("current directory")
             .parent()
@@ -2952,7 +3229,8 @@ mod tests {
             },
             ModelResponse::text("Approved shell command completed."),
         ]));
-        let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
+            .with_sandbox_config(LocalSandboxConfig::enforce());
 
         let result = agent
             .run_turn_detailed_streaming(
@@ -2982,13 +3260,28 @@ mod tests {
         let resumed = agent
             .resume_turn_streaming(continuation, true, None, None, None)
             .await
-            .expect("approved sandbox escalation resumes");
+            .expect("approved call returns the sandbox denial to the model");
 
         assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
+        assert!(!outside.exists());
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
         assert_eq!(
-            fs::read_to_string(&outside).unwrap().trim(),
-            "approved-shell"
+            requests[1].tool_results[0]
+                .metadata
+                .get("sandboxEscalationDenied")
+                .and_then(Value::as_bool),
+            Some(true)
         );
+        assert!(resumed.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallFinished { result }
+                if result
+                    .metadata
+                    .get("sandboxEscalationDenied")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        )));
         let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(workspace);
     }
@@ -3220,16 +3513,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_budget_suspends_without_a_harness_summary_and_resumes() {
-        let workspace = test_workspace("tool-budget-checkpoint");
-        fs::write(workspace.join("sample.txt"), "checkpoint content").unwrap();
+    async fn eight_tool_rounds_continue_without_approval() {
+        let workspace = test_workspace("eight-tool-rounds");
+        for index in 0..8 {
+            fs::write(workspace.join(format!("sample-{index}.txt")), "content").unwrap();
+        }
         let tool_responses = (0..8)
             .map(|index| ModelResponse {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: format!("call_{index}"),
                     name: "read_file".to_string(),
-                    arguments: json!({ "path": "sample.txt" }),
+                    arguments: json!({ "path": format!("sample-{index}.txt") }),
                 }],
                 usage: None,
             })
@@ -3238,7 +3533,7 @@ mod tests {
             tool_responses
                 .into_iter()
                 .chain(std::iter::once(ModelResponse::text(
-                    "Completed after the user continued the checkpoint.",
+                    "Completed all eight distinct observations without a checkpoint.",
                 )))
                 .collect(),
         ));
@@ -3262,78 +3557,52 @@ mod tests {
                 None,
             )
             .await
-            .expect("turn checkpoints at the tool budget");
+            .expect("turn continues without a checkpoint");
 
-        assert!(!result
-            .events
-            .iter()
-            .any(|event| matches!(event, AgentEventPayload::AssistantMessage { .. })));
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert!(assistant_text(&result.events).contains("without a checkpoint"));
         assert!(!result.events.iter().any(|event| matches!(
             event,
-            AgentEventPayload::ModelDelta { text }
-                if text.contains("tool-call budget ended")
+            AgentEventPayload::ApprovalRequested { action, .. }
+                if action == "Continue agent execution"
         )));
-        let continuation = match result.outcome {
-            AgentTurnOutcome::Suspended { continuation, .. } => continuation,
-            AgentTurnOutcome::Completed => panic!("turn should pause at the budget"),
-        };
-        assert_eq!(
-            continuation.continuation_kind,
-            AgentContinuationKind::BudgetCheckpoint
-        );
-        match &continuation.state {
-            AgentContinuationState::Provider {
-                pending_tool_calls,
-                current_round,
-                ..
-            } => {
-                assert_eq!(pending_tool_calls.len(), 1);
-                assert_eq!(pending_tool_calls[0].id, "call_7");
-                assert_eq!(*current_round, 0);
-            }
-        }
-        assert!(provider.requests()[0]
-            .system_prompt
-            .contains("Execution budget for this slice: 0/8"));
-
-        let resumed = agent
-            .resume_turn_streaming(continuation, true, None, None, None)
-            .await
-            .expect("budget checkpoint resumes");
-        assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
-        assert!(assistant_text(&resumed.events).contains("Completed after the user continued"));
         assert_eq!(provider.requests().len(), 9);
+        assert!(provider.requests()[8]
+            .system_prompt
+            .contains("no elapsed-time or total tool-round limit"));
 
         let _ = fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn total_tool_budget_forces_a_final_response_across_continuations() {
-        let workspace = test_workspace("total-tool-budget");
-        fs::write(workspace.join("sample.txt"), "bounded content").unwrap();
-        let responses = (0..DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS)
+    async fn more_than_twenty_four_distinct_tool_rounds_can_complete() {
+        let workspace = test_workspace("unbounded-tool-rounds");
+        for index in 0..30 {
+            fs::write(workspace.join(format!("sample-{index}.txt")), "content").unwrap();
+        }
+        let responses = (0..30)
             .map(|index| ModelResponse {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: format!("call_{index}"),
                     name: "read_file".to_string(),
-                    arguments: json!({ "path": "sample.txt" }),
+                    arguments: json!({ "path": format!("sample-{index}.txt") }),
                 }],
                 usage: None,
             })
             .chain(std::iter::once(ModelResponse::text(
-                "Stopped at the total tool budget.",
+                "Completed after thirty distinct tool rounds.",
             )))
             .collect();
         let provider = Arc::new(ScriptedProvider::new(responses));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
-        let mut result = agent
+        let result = agent
             .run_turn_detailed_streaming(
                 AgentTurnInput {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "Exercise the total loop guard.".to_string(),
+                    content: "Inspect all thirty distinct inputs.".to_string(),
                     user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
@@ -3345,33 +3614,80 @@ mod tests {
                 None,
             )
             .await
-            .expect("initial slice runs");
-        let mut checkpoints = 0;
+            .expect("long turn completes without continuation");
 
-        loop {
-            let continuation = match result.outcome {
-                AgentTurnOutcome::Completed => break,
-                AgentTurnOutcome::Suspended { continuation, .. } => continuation,
-            };
-            checkpoints += 1;
-            assert_eq!(
-                continuation.continuation_kind,
-                AgentContinuationKind::BudgetCheckpoint
-            );
-            result = agent
-                .resume_turn_streaming(continuation, true, None, None, None)
-                .await
-                .expect("budget continuation runs");
-        }
-
-        assert_eq!(checkpoints, 2);
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert!(assistant_text(&result.events).contains("thirty distinct tool rounds"));
         let requests = provider.requests();
-        assert_eq!(requests.len(), DEFAULT_MAX_TOTAL_PROVIDER_TOOL_ROUNDS + 1);
+        assert_eq!(requests.len(), 31);
         let final_request = requests.last().expect("final provider request");
-        assert!(final_request.tool_candidates.is_empty());
+        assert!(!final_request.tool_candidates.is_empty());
         assert!(final_request
             .system_prompt
-            .contains("Total tool-decision budget: 24/24"));
+            .contains("completed 30 tool-decision rounds"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn long_turn_compacts_completed_tool_history_automatically() {
+        let workspace = test_workspace("automatic-tool-history-compaction");
+        for index in 0..10 {
+            fs::write(
+                workspace.join(format!("large-{index}.txt")),
+                format!("record-{index}-{}", "x".repeat(2_000)),
+            )
+            .unwrap();
+        }
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: (0..10)
+                    .map(|index| ProviderToolCall {
+                        id: format!("call_{index}"),
+                        name: "read_file".to_string(),
+                        arguments: json!({ "path": format!("large-{index}.txt") }),
+                    })
+                    .collect(),
+                usage: None,
+            },
+            ModelResponse::text("Completed after automatic context maintenance."),
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Inspect all large records.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: Some(ContextBudget::new(4_096)),
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("history compaction is automatic");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].previous_tool_calls.len() < 10);
+        assert!(requests[1].previous_tool_calls.len() >= 4);
+        assert!(requests[1].conversation.iter().any(|message| message
+            .content
+            .starts_with("[Automatically compacted tool history]")));
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ApprovalRequested { action, .. }
+                if action == "Continue agent execution"
+        )));
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -3455,6 +3771,19 @@ mod tests {
             .tool_candidates
             .iter()
             .any(|candidate| candidate.name == "list_files"));
+        let (round, snapshot) = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEventPayload::ModelRequest { round, request } => Some((round, request)),
+                _ => None,
+            })
+            .expect("model request snapshot");
+        assert_eq!(*round, 1);
+        assert_eq!(snapshot["userMessage"], requests[0].user_message);
+        assert_eq!(
+            snapshot["toolCandidates"],
+            serde_json::to_value(&requests[0].tool_candidates).unwrap()
+        );
 
         let _ = fs::remove_dir_all(workspace);
     }

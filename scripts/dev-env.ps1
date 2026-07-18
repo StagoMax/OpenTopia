@@ -203,7 +203,10 @@ if ($env:OS -eq "Windows_NT") {
 }
 
 if (-not $env:OPENTOPIA_SANDBOX_MODE) {
-  $env:OPENTOPIA_SANDBOX_MODE = "best_effort"
+  $env:OPENTOPIA_SANDBOX_MODE = "workspace-write"
+}
+if (-not $env:OPENTOPIA_SANDBOX_ENFORCEMENT) {
+  $env:OPENTOPIA_SANDBOX_ENFORCEMENT = "enforce"
 }
 if (-not $env:OPENTOPIA_SANDBOX_NETWORK) {
   $env:OPENTOPIA_SANDBOX_NETWORK = "deny"

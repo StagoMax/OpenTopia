@@ -1051,6 +1051,7 @@ mod tests {
             exit_code: Some(if success { 0 } else { 1 }),
             success,
             truncated: false,
+            sandbox: None,
         }
     }
 

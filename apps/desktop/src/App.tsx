@@ -87,6 +87,7 @@ import type {
   ArtifactDescriptor,
   ContextStatus,
   ContextSourceFile,
+  McpServerInput,
   McpServerView,
   Message,
   MessagePart,
@@ -298,6 +299,7 @@ export function App() {
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [isSending, setIsSending] = useState(false);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [cancellingTurnId, setCancellingTurnId] = useState<string | null>(null);
   const [pendingApprovalIds, setPendingApprovalIds] = useState<string[]>([]);
   const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(
     null,
@@ -516,6 +518,7 @@ export function App() {
 
     if (event.payload.type === "turn_started" && event.turnId) {
       setActiveTurnId(event.turnId);
+      setCancellingTurnId(null);
     } else if (
       event.payload.type === "turn_finished" ||
       event.payload.type === "turn_suspended" ||
@@ -523,6 +526,9 @@ export function App() {
       event.payload.type === "error"
     ) {
       setActiveTurnId((current) =>
+        !event.turnId || current === event.turnId ? null : current,
+      );
+      setCancellingTurnId((current) =>
         !event.turnId || current === event.turnId ? null : current,
       );
     }
@@ -689,6 +695,8 @@ export function App() {
     setPendingApprovalIds([]);
     setDecidingApprovalId(null);
     setApprovalDecisionError(null);
+    setActiveTurnId(null);
+    setCancellingTurnId(null);
     if (!client || !activeThreadId) return;
     let cancelled = false;
     let source: StreamHandle | null = null;
@@ -1127,6 +1135,42 @@ export function App() {
     }
   }
 
+  async function refreshMcpState() {
+    if (!client) return;
+    const [servers, bindings] = await Promise.all([
+      client.listMcpServers(),
+      activeThread
+        ? client.listThreadMcpServers(activeThread.id)
+        : Promise.resolve([]),
+    ]);
+    setMcpServers(servers);
+    setThreadMcpServers(bindings);
+  }
+
+  async function createMcpServer(input: McpServerInput) {
+    if (!client) throw new Error("OpenTopia API is unavailable.");
+    await client.createMcpServer(input);
+    await refreshMcpState();
+  }
+
+  async function updateMcpServer(serverId: string, input: McpServerInput) {
+    if (!client) throw new Error("OpenTopia API is unavailable.");
+    await client.updateMcpServer(serverId, input);
+    await refreshMcpState();
+  }
+
+  async function restartMcpServer(serverId: string) {
+    if (!client) throw new Error("OpenTopia API is unavailable.");
+    await client.restartMcpServer(serverId);
+    await refreshMcpState();
+  }
+
+  async function deleteMcpServer(serverId: string) {
+    if (!client) throw new Error("OpenTopia API is unavailable.");
+    await client.deleteMcpServer(serverId);
+    await refreshMcpState();
+  }
+
   async function saveSettings(input: {
     providers?: ProviderSettings[];
     activeProviderId?: string;
@@ -1334,13 +1378,14 @@ export function App() {
         contextSources.length > 0 ||
         selectedSkillIds.length > 0
       ) {
-        const message = await client.sendMessage(
+        const { message, turnId } = await client.sendMessage(
           thread.id,
           initialPrompt?.trim() ?? "",
           contextSources.map((source) => source.path),
           selectedSkillIds,
         );
         setMessages([message]);
+        if (turnId) setActiveTurnId(turnId);
         setComposer("");
         setContextSources([]);
         setSelectedSkillIds([]);
@@ -1450,13 +1495,14 @@ export function App() {
         setComposer("");
         return;
       }
-      const message = await client.sendMessage(
+      const { message, turnId } = await client.sendMessage(
         activeThread.id,
         composer.trim(),
         contextSources.map((source) => source.path),
         selectedSkillIds,
       );
       setMessages((current) => [...current, message]);
+      if (turnId) setActiveTurnId(turnId);
       setComposer("");
       setContextSources([]);
       setSelectedSkillIds([]);
@@ -1479,11 +1525,25 @@ export function App() {
   }
 
   async function cancelTurn() {
-    if (!client || !activeThread || !activeTurnId) return;
+    if (
+      !client ||
+      !activeThread ||
+      !activeTurnId ||
+      cancellingTurnId === activeTurnId
+    )
+      return;
+    const turnId = activeTurnId;
+    setCancellingTurnId(turnId);
+    setActionError(null);
     try {
-      await client.cancelTurn(activeThread.id, activeTurnId);
+      const result = await client.cancelTurn(activeThread.id, turnId);
+      if (!result.cancelled) {
+        setCancellingTurnId(null);
+        setActionError(result.message);
+      }
     } catch (error) {
-      setServerError(error instanceof Error ? error.message : String(error));
+      setCancellingTurnId(null);
+      setActionError(`中断执行失败：${errorMessage(error)}`);
     }
   }
 
@@ -2011,6 +2071,9 @@ export function App() {
                   value={composer}
                   isSending={isSending}
                   isRunning={Boolean(activeTurnId)}
+                  isCancelling={
+                    Boolean(activeTurnId) && cancellingTurnId === activeTurnId
+                  }
                   model={
                     settings?.providers.find(
                       (provider) => provider.id === settings.activeProviderId,
@@ -2132,6 +2195,10 @@ export function App() {
           onToggleThreadMcp={(serverId, enabled) =>
             void toggleThreadMcp(serverId, enabled)
           }
+          onCreateMcpServer={createMcpServer}
+          onUpdateMcpServer={updateMcpServer}
+          onRestartMcpServer={restartMcpServer}
+          onDeleteMcpServer={deleteMcpServer}
           onOpenWorkspace={(workspaceRoot) =>
             void openWorkspaceRoot(workspaceRoot)
           }
@@ -2610,6 +2677,23 @@ function SettingsPanel({
                 />
               </label>
             </div>
+            {sandboxSettings.sandboxMode !== "danger-full-access" &&
+              sandboxSettings.enforcement === "best-effort" && (
+                <p className="settings-security-warning" role="status">
+                  <ShieldAlert size={14} aria-hidden="true" />
+                  Best effort may run commands without OS isolation when the
+                  platform backend is unavailable. Use Enforce for security
+                  testing.
+                </p>
+              )}
+            {(sandboxSettings.sandboxMode === "danger-full-access" ||
+              sandboxSettings.enforcement === "disabled") && (
+              <p className="settings-security-warning" role="status">
+                <ShieldAlert size={14} aria-hidden="true" />
+                OS sandbox enforcement is disabled. Commands can access the full
+                system and network allowed by the current user account.
+              </p>
+            )}
           </div>
 
           <div className="settings-providers-section">
@@ -3987,6 +4071,7 @@ function Composer({
   value,
   isSending,
   isRunning,
+  isCancelling,
   model,
   permissionMode,
   sandboxMode,
@@ -4014,6 +4099,7 @@ function Composer({
   value: string;
   isSending: boolean;
   isRunning: boolean;
+  isCancelling: boolean;
   model: string;
   permissionMode: AppSettings["permissionMode"];
   sandboxMode: AppSettings["sandbox"]["sandboxMode"];
@@ -4517,23 +4603,48 @@ function Composer({
         </div>
       </div>
       <button
-        className="send-button"
+        className={`send-button${isRunning ? " is-running" : ""}`}
+        type="button"
         disabled={
-          !isRunning &&
-          (isSending ||
-            (!value.trim() &&
-              contextSources.length === 0 &&
-              selectedSkillIds.length === 0))
+          isRunning
+            ? isCancelling
+            : isSending ||
+              (!value.trim() &&
+                contextSources.length === 0 &&
+                selectedSkillIds.length === 0)
         }
         onClick={isRunning ? onCancel : onSubmit}
-        title={isRunning ? "Stop turn" : "Send message"}
+        title={
+          isRunning
+            ? isCancelling
+              ? "正在中断执行"
+              : "中断执行"
+            : isSending
+              ? "正在发送消息"
+              : "发送消息"
+        }
+        aria-label={
+          isRunning
+            ? isCancelling
+              ? "正在中断智能体执行"
+              : "中断智能体执行"
+            : isSending
+              ? "正在发送消息"
+              : "发送消息"
+        }
+        aria-busy={isSending || isCancelling}
       >
         {isRunning ? (
-          <Square size={15} fill="currentColor" />
+          <Square
+            className="stop-icon"
+            size={15}
+            fill="currentColor"
+            aria-hidden="true"
+          />
         ) : isSending ? (
-          <Loader2 size={17} className="spin" />
+          <Loader2 size={17} className="spin" aria-hidden="true" />
         ) : (
-          <ArrowUp size={18} strokeWidth={2.25} />
+          <ArrowUp size={18} strokeWidth={2.25} aria-hidden="true" />
         )}
       </button>
     </div>
@@ -4631,6 +4742,10 @@ function RightPanel({
   onOpenWorkspacePath,
   onOpenWorkspaceEntry,
   onToggleThreadMcp,
+  onCreateMcpServer,
+  onUpdateMcpServer,
+  onRestartMcpServer,
+  onDeleteMcpServer,
   onOpenWorkspace,
   onEnsureTerminalSession,
   onWriteTerminalSession,
@@ -4680,6 +4795,10 @@ function RightPanel({
   onOpenWorkspacePath(path?: string): void;
   onOpenWorkspaceEntry(entry: WorkspaceEntry): void;
   onToggleThreadMcp(serverId: string, enabled: boolean): void;
+  onCreateMcpServer(input: McpServerInput): Promise<void>;
+  onUpdateMcpServer(serverId: string, input: McpServerInput): Promise<void>;
+  onRestartMcpServer(serverId: string): Promise<void>;
+  onDeleteMcpServer(serverId: string): Promise<void>;
   onOpenWorkspace(workspaceRoot: string): void;
   onEnsureTerminalSession(threadId: string): Promise<TerminalSession>;
   onWriteTerminalSession(
@@ -4741,6 +4860,10 @@ function RightPanel({
       onOpenWorkspacePath={onOpenWorkspacePath}
       onOpenWorkspaceEntry={onOpenWorkspaceEntry}
       onToggleThreadMcp={onToggleThreadMcp}
+      onCreateMcpServer={onCreateMcpServer}
+      onUpdateMcpServer={onUpdateMcpServer}
+      onRestartMcpServer={onRestartMcpServer}
+      onDeleteMcpServer={onDeleteMcpServer}
       onOpenPath={onOpenWorkspace}
       onEnsureTerminalSession={onEnsureTerminalSession}
       onWriteTerminalSession={onWriteTerminalSession}
@@ -5029,6 +5152,7 @@ function NewTaskState({
         value={value}
         isSending={isSending}
         isRunning={false}
+        isCancelling={false}
         model={model}
         permissionMode={permissionMode}
         sandboxMode={sandboxMode}

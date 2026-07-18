@@ -374,11 +374,7 @@ function importProviderCredentialFallback(env, repoRoot, selectedEnvFile) {
     0x52a9,
     0x624b,
   );
-  const preferred = path.join(
-    workspaceRoot,
-    creditReviewProjectName,
-    ".env",
-  );
+  const preferred = path.join(workspaceRoot, creditReviewProjectName, ".env");
   const candidates = [preferred];
   try {
     for (const entry of fs.readdirSync(workspaceRoot, {
@@ -744,11 +740,17 @@ function createBackendEnv(repoRoot, options = {}) {
     const sandbox = resolveCodexSandboxBinary();
     if (sandbox.exists) {
       env.OPENTOPIA_CODEX_SANDBOX_BIN = sandbox.path;
+    } else if (sandbox.reason) {
+      env.OPENTOPIA_SANDBOX_BACKEND_ERROR = sandbox.reason;
+      writeLog("error", "sandbox.helper.integrity-failed", {
+        path: sandbox.path,
+        reason: sandbox.reason,
+      });
     }
+    if (!isDev) env.OPENTOPIA_REQUIRE_CODEX_SANDBOX_BIN = "true";
     env.OPENTOPIA_SANDBOX_MODE ||= "workspace-write";
     env.OPENTOPIA_SANDBOX_ENFORCEMENT ||=
-      process.env.OPENTOPIA_SANDBOX_ENFORCEMENT ||
-      (isDev ? "best-effort" : "enforce");
+      process.env.OPENTOPIA_SANDBOX_ENFORCEMENT || "enforce";
     env.OPENTOPIA_SANDBOX_NETWORK ||= "deny";
     env.OPENTOPIA_WINDOWS_SANDBOX ||=
       process.env.OPENTOPIA_WINDOWS_SANDBOX || "unelevated";
@@ -1230,9 +1232,22 @@ function resolvePackagedServerBinary() {
 }
 
 function resolveCodexSandboxBinary() {
+  const packaged = path.join(
+    process.resourcesPath || "",
+    "codex-sandbox",
+    "codex.exe",
+  );
+  if (!isDev) {
+    const verification = verifyCodexSandboxBundle(packaged);
+    return {
+      path: packaged,
+      exists: verification.valid,
+      reason: verification.reason,
+    };
+  }
   const candidates = [
     process.env.OPENTOPIA_CODEX_SANDBOX_BIN,
-    path.join(process.resourcesPath || "", "codex-sandbox", "codex.exe"),
+    packaged,
     path.join(
       process.env.USERPROFILE || "",
       ".codex",
@@ -1246,6 +1261,62 @@ function resolveCodexSandboxBinary() {
     path: found || candidates[0] || "codex.exe",
     exists: Boolean(found),
   };
+}
+
+function verifyCodexSandboxBundle(codexPath) {
+  const directory = path.dirname(codexPath);
+  const manifestPath = path.join(directory, "manifest.json");
+  if (!fs.existsSync(manifestPath)) {
+    return {
+      valid: false,
+      reason: `Sandbox manifest is missing: ${manifestPath}`,
+    };
+  }
+
+  try {
+    const expectedManifest = JSON.parse(
+      fs.readFileSync(
+        path.join(__dirname, "codex-sandbox-manifest.json"),
+        "utf8",
+      ),
+    );
+    const packagedManifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    if (JSON.stringify(packagedManifest) !== JSON.stringify(expectedManifest)) {
+      return {
+        valid: false,
+        reason: "Sandbox manifest does not match the application bundle.",
+      };
+    }
+    const files = expectedManifest?.files;
+    if (!files || typeof files !== "object") {
+      return { valid: false, reason: "Sandbox manifest has no file hashes." };
+    }
+    for (const [name, expectedHash] of Object.entries(files)) {
+      const helperPath = path.join(directory, name);
+      if (!fs.existsSync(helperPath)) {
+        return { valid: false, reason: `Sandbox helper is missing: ${name}` };
+      }
+      const actualHash = crypto
+        .createHash("sha256")
+        .update(fs.readFileSync(helperPath))
+        .digest("hex");
+      if (
+        typeof expectedHash !== "string" ||
+        actualHash.toLowerCase() !== expectedHash.toLowerCase()
+      ) {
+        return {
+          valid: false,
+          reason: `Sandbox helper hash mismatch: ${name}`,
+        };
+      }
+    }
+    return { valid: true, reason: null };
+  } catch (error) {
+    return {
+      valid: false,
+      reason: `Sandbox manifest validation failed: ${String(error)}`,
+    };
+  }
 }
 
 async function startBackendIfNeeded() {

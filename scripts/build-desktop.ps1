@@ -65,10 +65,32 @@ try {
       "codex-command-runner.exe",
       "codex-windows-sandbox-setup.exe"
     )
+    $sandboxManifestPath = Join-Path $desktopRoot "electron\codex-sandbox-manifest.json"
+    if (-not (Test-Path -LiteralPath $sandboxManifestPath)) {
+      throw "Codex Windows sandbox manifest not found: $sandboxManifestPath"
+    }
+    $sandboxManifest = Get-Content -Raw -LiteralPath $sandboxManifestPath | ConvertFrom-Json
+    $actualVersion = (& (Join-Path $codexSandboxSource "codex.exe") --version).Trim()
+    $expectedVersion = "codex-cli $($sandboxManifest.codexCliVersion)"
+    if ($actualVersion -ne $expectedVersion) {
+      throw "Codex sandbox helper version mismatch: expected '$expectedVersion', got '$actualVersion'"
+    }
     foreach ($helper in $requiredHelpers) {
       $source = Join-Path $codexSandboxSource $helper
       if (-not (Test-Path -LiteralPath $source)) {
         throw "Required Codex Windows sandbox helper not found: $source"
+      }
+      $expectedHash = $sandboxManifest.files.$helper
+      $actualHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+      if (-not $expectedHash -or $actualHash -ne $expectedHash) {
+        throw "Codex Windows sandbox helper hash mismatch: $helper"
+      }
+      $signature = Get-AuthenticodeSignature -LiteralPath $source
+      if (
+        $signature.Status -ne "Valid" -or
+        $signature.SignerCertificate.Subject -ne $sandboxManifest.signerSubject
+      ) {
+        throw "Codex Windows sandbox helper signature validation failed: $helper"
       }
     }
     New-Item -ItemType Directory -Force -Path $codexSandboxResources | Out-Null
@@ -92,6 +114,10 @@ try {
     Copy-Item `
       -LiteralPath @($codexLicenseCandidates)[0] `
       -Destination (Join-Path $codexSandboxResources "LICENSE") `
+      -Force
+    Copy-Item `
+      -LiteralPath $sandboxManifestPath `
+      -Destination (Join-Path $codexSandboxResources "manifest.json") `
       -Force
     Write-Host "Staged Codex restricted-token sandbox helpers: $codexSandboxResources"
   }

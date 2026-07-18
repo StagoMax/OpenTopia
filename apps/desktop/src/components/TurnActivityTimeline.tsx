@@ -11,6 +11,7 @@ import {
   FileText,
   Globe2,
   Loader2,
+  Send,
   Table2,
   TerminalSquare,
   Wrench,
@@ -18,6 +19,7 @@ import {
 } from "lucide-react";
 import type {
   AgentEvent,
+  ModelRequestSnapshot,
   SubagentRun,
   TaskPlan,
   ToolCall,
@@ -56,6 +58,13 @@ type ActivityFile = {
 
 type PrimitiveActivity =
   | { kind: "tool"; seq: number; execution: ToolExecution }
+  | {
+      kind: "model-request";
+      seq: number;
+      round: number;
+      request: ModelRequestSnapshot;
+      createdAt: string;
+    }
   | {
       kind: "plan";
       seq: number;
@@ -147,7 +156,9 @@ export function TurnActivityTimeline({
   const operationCount =
     tools.length +
     fileCount +
-    entries.filter((entry) => entry.kind === "subagent").length;
+    entries.filter(
+      (entry) => entry.kind === "subagent" || entry.kind === "model-request",
+    ).length;
 
   if (!isActive && entries.length === 0) return null;
 
@@ -237,6 +248,9 @@ function ActivityEntryView({
   }
   if (entry.kind === "reasoning") {
     return <ReasoningActivity text={entry.text} />;
+  }
+  if (entry.kind === "model-request") {
+    return <ModelRequestActivity round={entry.round} request={entry.request} />;
   }
   if (entry.kind === "plan") {
     return (
@@ -382,6 +396,7 @@ function ToolExecutionItem({
     fileChanges.length === 1 ? fileChanges[0] : undefined;
   const input = formatToolInput(execution.call, fileChanges.length > 0);
   const output = formatToolOutput(execution.result);
+  const sandbox = formatToolSandbox(execution.result);
   const title = primaryFileChange
     ? primaryFileChange.path
     : fileChanges.length > 1
@@ -413,6 +428,15 @@ function ToolExecutionItem({
               <FileChangeStatsView change={primaryFileChange} />
             )}
             {timing && <span>· {timing}</span>}
+            {sandbox && (
+              <span
+                className="tool-sandbox-state"
+                data-tone={sandbox.unsafe ? "warning" : "neutral"}
+                title={sandbox.detail}
+              >
+                · {sandbox.label}
+              </span>
+            )}
           </small>
         </span>
         {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -563,6 +587,50 @@ function ReasoningActivity({ text }: { text: string }) {
       {expanded && (
         <pre className="reasoning-activity-detail">
           {truncateText(redactText(text), 12_000)}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function ModelRequestActivity({
+  round,
+  request,
+}: {
+  round: number;
+  request: ModelRequestSnapshot;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const historyCount = request.conversation?.length ?? 0;
+  const toolCount = request.toolCandidates?.length ?? 0;
+  const resultCount = request.toolResults?.length ?? 0;
+  const summary = [
+    `${historyCount} history`,
+    `${toolCount} tools`,
+    `${resultCount} results`,
+  ].join(" / ");
+
+  return (
+    <div
+      className="activity-group model-request-activity"
+      data-state="complete"
+    >
+      <button
+        className="activity-group-header"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="activity-group-icon" aria-hidden="true">
+          <Send size={13} />
+        </span>
+        <span>Model request #{round}</span>
+        <small className="activity-group-count">{summary}</small>
+        {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+      </button>
+      {expanded && (
+        <pre className="model-request-activity-detail">
+          {JSON.stringify(request, null, 2)}
         </pre>
       )}
     </div>
@@ -790,6 +858,14 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         seq: event.seq,
         text: reasoning.text,
         isDelta: reasoning.isDelta,
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "model_request") {
+      primitives.push({
+        kind: "model-request",
+        seq: event.seq,
+        round: payload.round,
+        request: payload.request,
         createdAt: event.createdAt,
       });
     } else if (payload.type === "tool_call_started") {
@@ -1535,6 +1611,63 @@ function formatToolOutput(result?: ToolResult) {
   return output
     ? truncateText(output, 20_000)
     : "工具执行完成，未返回文本输出。";
+}
+
+function formatToolSandbox(
+  result?: ToolResult,
+): { label: string; detail: string; unsafe: boolean } | null {
+  if (!result) return null;
+  const metadata = asRecord(result.metadata);
+  const escalation = metadata?.sandboxEscalation;
+  if (escalation === "scoped") {
+    return {
+      label: "scoped approval",
+      detail: "This approval applied only to the replayed tool call.",
+      unsafe: false,
+    };
+  }
+  if (escalation === "denied") {
+    return {
+      label: "sandbox kept",
+      detail: "The approval did not disable the configured OS sandbox.",
+      unsafe: false,
+    };
+  }
+
+  const sandbox = asRecord(metadata?.sandbox);
+  if (!sandbox || typeof sandbox.status !== "string") return null;
+  const profile =
+    typeof sandbox.permissionProfile === "string"
+      ? sandbox.permissionProfile
+      : "unknown profile";
+  if (sandbox.status === "wrapped") {
+    const backend =
+      typeof sandbox.backend === "string" ? sandbox.backend : "OS sandbox";
+    return {
+      label: `${backend} / ${profile}`,
+      detail: `Wrapped by ${backend} with permission profile ${profile}.`,
+      unsafe: false,
+    };
+  }
+  if (sandbox.status === "best_effort_passthrough") {
+    const reason =
+      typeof sandbox.reason === "string"
+        ? sandbox.reason
+        : "The OS sandbox backend was unavailable.";
+    return { label: "sandbox passthrough", detail: reason, unsafe: true };
+  }
+  if (sandbox.status === "unrestricted") {
+    return {
+      label: "unrestricted",
+      detail: "This process ran with danger-full-access.",
+      unsafe: true,
+    };
+  }
+  return {
+    label: "sandbox disabled",
+    detail: `OS sandbox wrapping was disabled for profile ${profile}.`,
+    unsafe: true,
+  };
 }
 
 function toolResultFailed(result?: ToolResult) {

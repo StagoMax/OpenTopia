@@ -288,7 +288,7 @@ metrics:
 3. 启动计时并发送规范 Prompt。
 4. 持续记录 SSE、模型流、工具调用、审批、计划和 Token usage。
 5. 仅按任务声明的策略自动处理审批。
-6. 达到硬超时、Token、工具调用或重复调用预算时取消 Turn。
+6. Runner 达到任务级硬超时或 Token/成本上限时取消 Turn；产品运行时仅在确认等价调用或重复调用序列持续无进展时停止。
 7. 多阶段任务在指定边界停止 Server/Desktop，并从持久化状态恢复。
 
 ### 9.4 Phase D：评分
@@ -317,7 +317,7 @@ metrics:
 | `passed` | 所有硬检查通过且任务正确闭环 | 是 |
 | `failed` | 产品或 Agent 执行后未通过硬检查 | 是 |
 | `timeout` | 达到任务硬超时 | 是，按失败处理 |
-| `cancelled_by_policy` | 达到安全或预算策略并被取消 | 是，按失败处理 |
+| `cancelled_by_policy` | 达到安全策略或无进展循环防护并被取消 | 是，按失败处理 |
 | `infra_error` | 端口、磁盘、Runner 崩溃等非产品错误 | 否，修复后重跑 |
 | `provider_error` | 外部 Provider 持续不可用或限流 | 单独报告，默认不进入模型能力分母 |
 | `invalid_task` | 基线已通过、评分歧义或参考实现失败 | 否 |
@@ -361,7 +361,7 @@ metrics:
 | `closure_rate` | 在预算内主动结束且最终成功的运行数 / 有效运行数 |
 | `plan_completion_accuracy` | 标记 completed 且对应硬检查通过的步骤数 / 标记 completed 的步骤数 |
 | `restart_recovery_rate` | 重启后完整恢复线程、消息、计划、审批和事件的任务比例 |
-| `continuation_success_rate` | 审批/预算 continuation 后正确续接的次数 / continuation 总数 |
+| `continuation_success_rate` | 权限审批 continuation 后正确续接的次数 / continuation 总数 |
 | `cancel_success_rate` | 在时限内停止 Turn 与子进程的取消请求数 / 取消请求总数 |
 | `orphan_process_rate` | 运行结束后发现残留进程的任务数 / 有效任务数 |
 
@@ -375,7 +375,7 @@ metrics:
 | `test_before_completion_rate` | 声称完成前执行了任务要求测试的成功运行比例 |
 | `change_revert_rate` | 被后续完全撤销的写入批次数 / 写入批次总数 |
 | `approval_efficiency` | 必需审批数 / 总审批数；同时报告多余审批数 |
-| `progress_per_slice` | 每个 `turn_started` 执行切片新增通过的硬检查或完成阶段数 |
+| `progress_per_turn` | 每个 `turn_started` 新增通过的硬检查或完成阶段数 |
 
 “等价重复调用”由规范化后的工具名、目标路径和主要参数判定。读取同一文件的不同范围不一定等价；相同命令、相同工作目录且中间状态未变化通常视为等价。
 

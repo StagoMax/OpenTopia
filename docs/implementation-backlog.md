@@ -190,7 +190,7 @@ Implemented:
 - Codex-compatible `SKILL.md` discovery under workspace/user skill roots, YAML metadata,
   allowlisted IDs, five Skills per Turn, and 128 KiB aggregate instruction limit.
 - Subagent scheduler and real AgentCore executor with inherited workspace/provider/policy/sandbox,
-  four concurrent children per parent, depth two, 15-minute timeout, typed events, SQLite
+  four concurrent children per parent, depth two, no default execution timeout, typed events, SQLite
   persistence/restart recovery, model-callable tools, HTTP controls, and desktop status/actions.
 
 Future refinement:

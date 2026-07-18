@@ -718,6 +718,10 @@ pub enum AgentEventPayload {
     TurnStarted {
         user_message_id: Uuid,
     },
+    ModelRequest {
+        round: usize,
+        request: Value,
+    },
     ModelDelta {
         text: String,
     },
@@ -775,6 +779,7 @@ impl AgentEventPayload {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::TurnStarted { .. } => "turn_started",
+            Self::ModelRequest { .. } => "model_request",
             Self::ModelDelta { .. } => "model_delta",
             Self::ReasoningDelta { .. } => "reasoning_delta",
             Self::ToolCallStarted { .. } => "tool_call_started",
@@ -841,6 +846,29 @@ mod tests {
             json!({
                 "type": "reasoning_delta",
                 "text": "检查项目结构"
+            })
+        );
+    }
+
+    #[test]
+    fn model_request_uses_the_public_snapshot_event_contract() {
+        let payload = AgentEventPayload::ModelRequest {
+            round: 2,
+            request: json!({
+                "systemPrompt": "system",
+                "userMessage": "current"
+            }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).unwrap(),
+            json!({
+                "type": "model_request",
+                "round": 2,
+                "request": {
+                    "systemPrompt": "system",
+                    "userMessage": "current"
+                }
             })
         );
     }

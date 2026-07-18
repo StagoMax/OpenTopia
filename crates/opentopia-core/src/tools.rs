@@ -112,6 +112,15 @@ impl ToolContext {
     }
 }
 
+fn enforce_policy_decision(decision: PolicyDecision, approval_granted: bool) -> anyhow::Result<()> {
+    match decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
+        PolicyDecision::Ask { .. } if approval_granted => Ok(()),
+        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -363,11 +372,7 @@ async fn execute_spreadsheet_write(
         .context("spreadsheet write requires outputPath")?;
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
     ensure_xlsx_path(&output_path)?;
-    match ctx.policy.inspect_write(&output_path) {
-        PolicyDecision::Allow => {}
-        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-    }
+    enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
 
     let source = if let Some(relative) = input
         .source_path
@@ -882,15 +887,9 @@ impl Tool for ReadSkillTool {
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
         let id = required_string(&call.input, "id")?;
-        let descriptor = discover_skills(Some(&ctx.workspace_root))
-            .into_iter()
-            .find(|skill| skill.id == id)
-            .context("Skill is unavailable")?;
-        match ctx.policy.inspect_read(&descriptor.path) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
+        // load_selected_skills resolves the opaque ID against the bounded, canonicalized Skill
+        // catalog. It cannot be used as a general-purpose path read, including for user Skills
+        // that intentionally live outside the thread workspace.
         let loaded = load_selected_skills(Some(&ctx.workspace_root), &[id])?
             .into_iter()
             .next()
@@ -1105,11 +1104,7 @@ pub fn browser_domain_is_approved(
 
 fn inspect_browser_url(ctx: &ToolContext, raw_url: &str) -> anyhow::Result<()> {
     let host = browser_domain_from_url(raw_url)?;
-    match ctx.policy.inspect_network(&host) {
-        PolicyDecision::Allow => {}
-        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-    }
+    enforce_policy_decision(ctx.policy.inspect_network(&host), ctx.approval_granted)?;
 
     if ctx.approval_granted
         || ctx
@@ -1128,11 +1123,10 @@ fn inspect_browser_url(ctx: &ToolContext, raw_url: &str) -> anyhow::Result<()> {
 }
 
 fn inspect_browser_interaction(ctx: &ToolContext) -> anyhow::Result<()> {
-    match ctx.policy.inspect_network("browser-interaction") {
-        PolicyDecision::Allow => Ok(()),
-        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-    }
+    enforce_policy_decision(
+        ctx.policy.inspect_network("browser-interaction"),
+        ctx.approval_granted,
+    )
 }
 
 fn browser_output_to_tool_result(
@@ -1694,11 +1688,7 @@ impl Tool for WriteFileTool {
             .and_then(Value::as_str)
             .context("write_file requires content")?;
         let path = normalize_workspace_path(&ctx.workspace_root, relative)?;
-        match ctx.policy.inspect_write(&path) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
+        enforce_policy_decision(ctx.policy.inspect_write(&path), ctx.approval_granted)?;
 
         let written = ctx
             .environment
@@ -1888,11 +1878,7 @@ impl Tool for ShellTool {
             .get("command")
             .and_then(Value::as_str)
             .context("shell requires a command")?;
-        match ctx.policy.inspect_command(command) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
+        enforce_policy_decision(ctx.policy.inspect_command(command), ctx.approval_granted)?;
 
         let timeout_seconds = call
             .input
@@ -1933,7 +1919,8 @@ impl Tool for ShellTool {
             content: Vec::new(),
             metadata: json!({
                 "exitCode": output.exit_code,
-                "success": output.success
+                "success": output.success,
+                "sandbox": output.sandbox
             }),
         };
 
@@ -2016,7 +2003,8 @@ impl Tool for GitDiffTool {
             content: Vec::new(),
             metadata: json!({
                 "exitCode": output.exit_code,
-                "success": output.success
+                "success": output.success,
+                "sandbox": output.sandbox
             }),
         })
     }
@@ -2051,14 +2039,11 @@ impl Tool for ApplyPatchTool {
             .and_then(Value::as_str)
             .context("apply_patch requires a patch")?;
 
-        match ctx
-            .policy
-            .inspect_command("git apply --whitespace=nowarn -")
-        {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
+        enforce_policy_decision(
+            ctx.policy
+                .inspect_command("git apply --whitespace=nowarn -"),
+            ctx.approval_granted,
+        )?;
 
         let result = ctx
             .environment
@@ -2092,7 +2077,8 @@ impl Tool for ApplyPatchTool {
             content: Vec::new(),
             metadata: json!({
                 "success": true,
-                "bytes": result.bytes
+                "bytes": result.bytes,
+                "sandbox": output.sandbox
             }),
         })
     }
@@ -2117,12 +2103,7 @@ fn normalize_workspace_path(workspace_root: &Path, path: &str) -> anyhow::Result
 }
 
 fn enforce_read_policy(ctx: &ToolContext, path: &Path) -> anyhow::Result<()> {
-    match ctx.policy.inspect_read(path) {
-        PolicyDecision::Allow => Ok(()),
-        PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-        PolicyDecision::Ask { .. } if ctx.approval_granted => Ok(()),
-        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-    }
+    enforce_policy_decision(ctx.policy.inspect_read(path), ctx.approval_granted)
 }
 
 fn looks_like_sandbox_denial(stderr: &str) -> bool {
@@ -2234,7 +2215,7 @@ async fn run_rg_search(
         stdout.lines().count(),
         stdout.len(),
         max_results,
-        json!({ "used": false }),
+        json!({ "used": false, "sandbox": output.sandbox }),
     )))
 }
 
@@ -2470,11 +2451,10 @@ impl Tool for McpToolWrapper {
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
         let permission = ToolPermissionDescriptor::from(&self.descriptor);
-        match ctx.policy.inspect_mcp_tool_call(&permission) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-            PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
-        }
+        enforce_policy_decision(
+            ctx.policy.inspect_mcp_tool_call(&permission),
+            ctx.approval_granted,
+        )?;
 
         let result: McpCallResult = self
             .host
@@ -2648,7 +2628,7 @@ mod tests {
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: 1,
                 max_depth: 2,
-                timeout: Duration::from_secs(10),
+                timeout: Some(Duration::from_secs(10)),
             },
             Arc::new(PendingExecutor),
             Arc::new(NoopSubagentObserver),
@@ -2719,7 +2699,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(approval_error.to_string().contains("approval required"));
+        assert!(approval_error
+            .to_string()
+            .contains("no readable root authorized"));
 
         context.approval_granted = true;
         let list_error = ListFilesTool
@@ -2773,15 +2755,15 @@ mod tests {
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("allowed.txt"), "configured marker").unwrap();
-        let policy = Arc::new(BasicPolicyEngine::new(
-            workspace_root.clone(),
-            PermissionMode::FullAccess,
-        ));
         let mut config = LocalSandboxConfig::default();
         config.read_paths = vec![outside.clone()];
-        let mut context =
+        let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+            workspace_root.clone(),
+            PermissionMode::Auto,
+            &config,
+        ));
+        let context =
             ToolContext::local_with_sandbox_config(workspace_root.clone(), policy, config);
-        context.approval_granted = true;
 
         let listed = ListFilesTool
             .execute(
@@ -2818,6 +2800,46 @@ mod tests {
             .await
             .unwrap();
         assert!(searched.output.contains("configured marker"));
+
+        fs::remove_dir_all(workspace_root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_preserves_explicit_additional_writable_roots() {
+        let id = Uuid::new_v4();
+        let workspace_root = std::env::temp_dir().join(format!("opentopia-tools-root-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-tools-writable-{id}"));
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let mut config = LocalSandboxConfig::default();
+        config.writable_roots = vec![outside.clone()];
+        let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+            workspace_root.clone(),
+            PermissionMode::Auto,
+            &config,
+        ));
+        let context =
+            ToolContext::local_with_sandbox_config(workspace_root.clone(), policy, config);
+        let target = outside.join("dependency-cache.txt");
+
+        WriteFileTool
+            .execute(
+                ToolCall::new(
+                    "write_file",
+                    json!({
+                        "path": target.display().to_string(),
+                        "content": "configured writable root"
+                    }),
+                ),
+                context,
+            )
+            .await
+            .expect("configured writable root should not require approval");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "configured writable root"
+        );
 
         fs::remove_dir_all(workspace_root).unwrap();
         fs::remove_dir_all(outside).unwrap();
@@ -3084,7 +3106,7 @@ mod tests {
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: 2,
                 max_depth: 2,
-                timeout: Duration::from_secs(10),
+                timeout: Some(Duration::from_secs(10)),
             },
             Arc::new(ImmediateExecutor),
             Arc::new(NoopSubagentObserver),

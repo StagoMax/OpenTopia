@@ -12,6 +12,7 @@ import type {
   GitWorkflowAction,
   GitWorkflowResponse,
   McpCallResult,
+  McpServerInput,
   McpServerStatus,
   McpServerView,
   Message,
@@ -218,12 +219,20 @@ export class ApiClient {
     content: string,
     sourcePaths: string[] = [],
     skillIds: string[] = [],
-  ): Promise<Message> {
-    return this.post(`/api/threads/${threadId}/messages`, {
-      content,
-      sourcePaths,
-      skillIds,
-    });
+  ): Promise<{ message: Message; turnId: string | null }> {
+    const response = await fetch(
+      `${this.baseUrl}/api/threads/${threadId}/messages`,
+      {
+        method: "POST",
+        headers: this.authHeaders(true),
+        body: JSON.stringify({ content, sourcePaths, skillIds }),
+      },
+    );
+    const turnId = response.headers.get("x-opentopia-turn-id");
+    return {
+      message: await parseResponse<Message>(response),
+      turnId,
+    };
   }
 
   async runBrowserCommand(
@@ -643,16 +652,22 @@ export class ApiClient {
     return this.get("/api/mcp/servers");
   }
 
-  async createMcpServer(input: {
-    name: string;
-    command: string;
-    args?: string[];
-    cwd?: string;
-    envKeys?: string[];
-    timeoutMs?: number;
-    enabled?: boolean;
-  }): Promise<McpServerView> {
+  async createMcpServer(input: McpServerInput): Promise<McpServerView> {
     return this.post("/api/mcp/servers", input);
+  }
+
+  async updateMcpServer(
+    serverId: string,
+    input: McpServerInput,
+  ): Promise<McpServerView> {
+    return this.patch(`/api/mcp/servers/${serverId}`, {
+      ...input,
+      clearCwd: !input.cwd,
+    });
+  }
+
+  async deleteMcpServer(serverId: string): Promise<void> {
+    await this.delete(`/api/mcp/servers/${serverId}`);
   }
 
   async listThreadMcpServers(threadId: string): Promise<ThreadMcpServerView[]> {

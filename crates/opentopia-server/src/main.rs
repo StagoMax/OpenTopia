@@ -14,25 +14,25 @@ use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
     browser_domain_approval_action, browser_domain_from_approval_action, browser_domain_from_url,
     browser_domain_is_approved, build_local_sandbox_command, discover_skills, execute_git_workflow,
-    load_context_sources, AgentContextBudget, AgentContinuation, AgentCore, AgentEvent,
-    AgentEventPayload, AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus,
-    Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserDownloadRequest, BrowserNavigateRequest,
-    BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId,
-    BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, ChangedFile, ContextSourcePolicy,
-    ContextSourceRef, ContextSummary, DesktopBrowserRuntime, ExecRequest, ExecutionContext,
-    GitWorkflowAction, GitWorkflowRequest, LocalBrowserRuntime, LocalExecutionEnvironment,
-    McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart,
-    MessageRole, ModelContentPart, ModelConversationMessage, ModelConversationRole, ModelProvider,
-    ModelRequest, OpenAiCompatibleProvider, PermissionMode, PolicyDecision, PolicyEngine,
-    PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest, PreviewTarget,
-    PreviewWorkbook, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
-    ResolvedPreview, ResourceLimit, SandboxDescriptor, SandboxSettings, SessionStore,
-    SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
-    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
-    TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadMcpServer, ToolCall,
-    ToolPermissionDescriptor, ToolResult, TurnRecord, TurnStatus, WorkspaceDiff, WorkspaceDiffHunk,
-    WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
-    MAX_PREVIEW_CONTENT_BYTES,
+    load_context_sources, load_selected_skills, AgentContextBudget, AgentContinuation, AgentCore,
+    AgentEvent, AgentEventPayload, AgentTurnInput, AgentTurnOutcome, AppSettings, Approval,
+    ApprovalStatus, Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserDownloadRequest,
+    BrowserNavigateRequest, BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector,
+    BrowserSessionId, BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, ChangedFile,
+    ContextSourcePolicy, ContextSourceRef, ContextSummary, DesktopBrowserRuntime, ExecRequest,
+    ExecutionContext, GitWorkflowAction, GitWorkflowRequest, LocalBrowserRuntime,
+    LocalExecutionEnvironment, McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor,
+    Message, MessagePart, MessageRole, ModelContentPart, ModelConversationMessage,
+    ModelConversationRole, ModelProvider, ModelRequest, OpenAiCompatibleProvider, PermissionMode,
+    PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange,
+    PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderHealth, ProviderHealthCheck,
+    ProviderKind, ProviderSettings, ResolvedPreview, ResourceLimit, SandboxDescriptor,
+    SandboxSettings, SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest,
+    SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver, SubagentRun,
+    SubagentScheduler, SubagentSchedulerConfig, TaskPlan, TerminalCommandHistory,
+    TerminalCommandStatus, ThreadMcpServer, ToolCall, ToolPermissionDescriptor, ToolResult,
+    TurnRecord, TurnStatus, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,
+    WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree, MAX_PREVIEW_CONTENT_BYTES,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,7 @@ use uuid::Uuid;
 mod auth;
 mod turns;
 
-use auth::ApiAuth;
+use auth::{ApiAuth, TURN_ID_HEADER};
 use turns::{TurnCancelResult, TurnHandle, TurnManager};
 
 #[derive(Debug, Parser)]
@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
             sandbox_config,
         ))
     });
+    restore_enabled_mcp_servers(store.clone(), mcp_host.clone());
     let browser = initialize_browser_runtime().await;
     let mut initial_agent = AgentCore::from_settings(&loaded_settings);
     initial_agent.set_browser_runtime(browser.clone());
@@ -168,6 +169,37 @@ async fn main() -> anyhow::Result<()> {
     info!(%addr, db = %args.db.display(), "OpenTopia server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn restore_enabled_mcp_servers(store: Arc<SqliteSessionStore>, host: McpExtensionHost) {
+    tokio::spawn(async move {
+        let servers = match store.list_mcp_servers() {
+            Ok(servers) => servers,
+            Err(err) => {
+                error!(?err, "failed to restore MCP server configuration");
+                return;
+            }
+        };
+        for server in servers.into_iter().filter(|server| server.enabled) {
+            let server_id = server.server_id;
+            if let Err(err) = host.ensure_server(server).await {
+                warn!(?err, %server_id, "failed to restore MCP server");
+            }
+        }
+    });
+}
+
+async fn ensure_mcp_server_status(
+    host: &McpExtensionHost,
+    server: &McpServerConfig,
+) -> McpServerStatus {
+    match host.ensure_server(server.clone()).await {
+        Ok(status) => status,
+        Err(err) => {
+            warn!(?err, server_id = %server.server_id, "failed to apply MCP server configuration");
+            host.status_for_config(server).await
+        }
+    }
 }
 
 async fn recv_broadcast_after_lag<T: Clone>(
@@ -446,7 +478,13 @@ impl SubagentExecutor for ServerSubagentExecutor {
             let mut agent = self.agent.read().expect("agent lock poisoned").clone();
             agent.set_mcp_host(self.mcp_host.clone());
             agent.set_subagent_context(run.id, run.depth);
-            sync_thread_mcp_tools(&self.store, run.parent_thread_id, &mut agent).await;
+            sync_thread_mcp_tools(
+                &self.store,
+                &self.mcp_host,
+                run.parent_thread_id,
+                &mut agent,
+            )
+            .await;
             let result = agent
                 .run_turn_detailed_streaming(
                     AgentTurnInput {
@@ -1151,7 +1189,7 @@ async fn send_message(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
     Json(request): Json<SendMessageRequest>,
-) -> Result<Json<Message>, ApiError> {
+) -> Result<(HeaderMap, Json<Message>), ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
     if let Some(command) = legacy_direct_tool_command(&request.content) {
         return Err(ApiError::bad_request(format!(
@@ -1167,31 +1205,18 @@ async fn send_message(
 
     let sources = load_context_sources(&request.source_paths, &ContextSourcePolicy::default())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    // Skills are pinned user context, not an instruction pipeline. The model can inspect the
-    // catalog and read a Skill through tools when it decides that the task calls for one.
-    let skill_catalog = discover_skills(Some(&thread.workspace_root))
-        .into_iter()
-        .map(|skill| (skill.id.clone(), skill))
-        .collect::<HashMap<_, _>>();
-    let mut pinned_skills = Vec::new();
-    let mut seen_skill_ids = HashSet::new();
-    for skill_id in &request.skill_ids {
-        if !seen_skill_ids.insert(skill_id) {
-            continue;
-        }
-        let skill = skill_catalog.get(skill_id).ok_or_else(|| {
-            ApiError::bad_request(format!("unknown or unavailable skill: {skill_id}"))
-        })?;
-        pinned_skills.push(SkillRef {
-            id: skill.id.clone(),
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            path: skill.path.clone(),
-            truncated: false,
-        });
-    }
+    // Explicit Skill selection is structured user input. Load its bounded main prompt once,
+    // persist only the reference, and inject the instructions into this Turn's user context.
+    let loaded_skills = load_selected_skills(Some(&thread.workspace_root), &request.skill_ids)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let pinned_skills = loaded_skills.iter().map(SkillRef::from).collect::<Vec<_>>();
     let prompt = if request.content.trim().is_empty() {
-        "Review the attached sources.".to_string()
+        match (sources.is_empty(), loaded_skills.is_empty()) {
+            (false, false) => "Use the selected Skill instructions to review the attached sources.",
+            (true, false) => "Follow the selected Skill instructions for this task.",
+            _ => "Review the attached sources.",
+        }
+        .to_string()
     } else {
         request.content.clone()
     };
@@ -1224,6 +1249,7 @@ async fn send_message(
         .map_err(|active| {
             ApiError::conflict(format!("thread already has active turn {}", active.turn_id))
         })?;
+    let turn_id = turn.turn_id;
     let user_message = match state.store.append_message(pending_message) {
         Ok(message) => message,
         Err(err) => {
@@ -1241,10 +1267,15 @@ async fn send_message(
     let run_state = state.clone();
     let run_message = user_message.clone();
     let model_content = prompt;
-    let model_user_content = sources
+    let mut model_user_content = sources
         .iter()
         .flat_map(|source| source.content_or_legacy_text())
         .collect::<Vec<_>>();
+    model_user_content.extend(
+        loaded_skills
+            .iter()
+            .map(|skill| ModelContentPart::text(skill.render_for_model())),
+    );
     tokio::spawn(async move {
         run_new_agent_turn(
             run_state,
@@ -1257,7 +1288,12 @@ async fn send_message(
         .await;
     });
 
-    Ok(Json(user_message))
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        TURN_ID_HEADER,
+        HeaderValue::from_str(&turn_id.to_string()).expect("turn IDs are valid header values"),
+    );
+    Ok((headers, Json(user_message)))
 }
 
 fn legacy_direct_tool_command(content: &str) -> Option<&'static str> {
@@ -3269,15 +3305,12 @@ async fn list_mcp_servers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<McpServerView>>, ApiError> {
     let servers = state.store.list_mcp_servers()?;
-    Ok(Json(
-        servers
-            .into_iter()
-            .map(|server| McpServerView {
-                status: McpServerStatus::from_config(&server),
-                server,
-            })
-            .collect(),
-    ))
+    let mut views = Vec::with_capacity(servers.len());
+    for server in servers {
+        let status = state.mcp_host.status_for_config(&server).await;
+        views.push(McpServerView { server, status });
+    }
+    Ok(Json(views))
 }
 
 async fn create_mcp_server(
@@ -3286,10 +3319,8 @@ async fn create_mcp_server(
 ) -> Result<Json<McpServerView>, ApiError> {
     let server = request.into_config()?;
     let server = state.store.insert_mcp_server(server)?;
-    Ok(Json(McpServerView {
-        status: McpServerStatus::from_config(&server),
-        server,
-    }))
+    let status = ensure_mcp_server_status(&state.mcp_host, &server).await;
+    Ok(Json(McpServerView { status, server }))
 }
 
 async fn update_mcp_server(
@@ -3307,10 +3338,8 @@ async fn update_mcp_server(
         .store
         .update_mcp_server(server)?
         .ok_or_else(|| ApiError::not_found(format!("MCP server not found: {server_id}")))?;
-    Ok(Json(McpServerView {
-        status: McpServerStatus::from_config(&server),
-        server,
-    }))
+    let status = ensure_mcp_server_status(&state.mcp_host, &server).await;
+    Ok(Json(McpServerView { status, server }))
 }
 
 async fn delete_mcp_server(
@@ -3343,11 +3372,12 @@ async fn list_mcp_tools(
     State(state): State<AppState>,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<McpToolDescriptor>>, ApiError> {
-    state
+    let server = state
         .store
         .get_mcp_server(server_id)?
         .ok_or_else(|| ApiError::not_found(format!("MCP server not found: {server_id}")))?;
-    Ok(Json(state.mcp_host.cached_tools(server_id).await))
+    state.mcp_host.ensure_server(server).await?;
+    Ok(Json(state.mcp_host.list_tools(server_id).await?))
 }
 
 async fn call_mcp_tool(
@@ -3374,6 +3404,7 @@ async fn call_mcp_tool(
             "MCP server is not enabled for this thread",
         ));
     }
+    state.mcp_host.ensure_server(server.clone()).await?;
 
     let tools = state.mcp_host.cached_tools(server_id).await;
     let descriptor = tools
@@ -3498,15 +3529,17 @@ async fn set_thread_mcp_server(
     Json(request): Json<ThreadMcpServerRequest>,
 ) -> Result<Json<ThreadMcpServer>, ApiError> {
     ensure_thread(&state, thread_id)?;
-    state
+    let server = state
         .store
         .get_mcp_server(server_id)?
         .ok_or_else(|| ApiError::not_found(format!("MCP server not found: {server_id}")))?;
-    Ok(Json(state.store.set_thread_mcp_server(
-        thread_id,
-        server_id,
-        request.enabled,
-    )?))
+    let binding = state
+        .store
+        .set_thread_mcp_server(thread_id, server_id, request.enabled)?;
+    if request.enabled && server.enabled {
+        let _ = ensure_mcp_server_status(&state.mcp_host, &server).await;
+    }
+    Ok(Json(binding))
 }
 
 fn sse_event_name(kind: &str) -> &str {
@@ -3524,13 +3557,18 @@ fn ensure_thread(state: &AppState, thread_id: Uuid) -> Result<opentopia_core::Th
         .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))
 }
 
-async fn sync_thread_mcp_tools(store: &SqliteSessionStore, thread_id: Uuid, agent: &mut AgentCore) {
+async fn sync_thread_mcp_tools(
+    store: &SqliteSessionStore,
+    host: &McpExtensionHost,
+    thread_id: Uuid,
+    agent: &mut AgentCore,
+) {
     let enabled_servers = match store.list_mcp_servers() {
         Ok(servers) => servers
             .into_iter()
             .filter(|server| server.enabled)
-            .map(|server| server.server_id)
-            .collect::<HashSet<_>>(),
+            .map(|server| (server.server_id, server))
+            .collect::<HashMap<_, _>>(),
         Err(err) => {
             error!(?err, %thread_id, "failed to load MCP server configuration");
             return;
@@ -3539,7 +3577,7 @@ async fn sync_thread_mcp_tools(store: &SqliteSessionStore, thread_id: Uuid, agen
     let server_ids = match store.list_thread_mcp_servers(thread_id) {
         Ok(bindings) => bindings
             .into_iter()
-            .filter(|binding| binding.enabled && enabled_servers.contains(&binding.server_id))
+            .filter(|binding| binding.enabled && enabled_servers.contains_key(&binding.server_id))
             .map(|binding| binding.server_id)
             .collect::<Vec<_>>(),
         Err(err) => {
@@ -3547,7 +3585,19 @@ async fn sync_thread_mcp_tools(store: &SqliteSessionStore, thread_id: Uuid, agen
             return;
         }
     };
-    agent.sync_mcp_tools_for_servers(&server_ids).await;
+    let mut ready_server_ids = Vec::with_capacity(server_ids.len());
+    for server_id in server_ids {
+        let Some(server) = enabled_servers.get(&server_id) else {
+            continue;
+        };
+        match host.ensure_server(server.clone()).await {
+            Ok(_) => ready_server_ids.push(server_id),
+            Err(err) => {
+                warn!(?err, %thread_id, %server_id, "failed to start thread MCP server");
+            }
+        }
+    }
+    agent.sync_mcp_tools_for_servers(&ready_server_ids).await;
 }
 
 fn publish_payload(
@@ -3650,7 +3700,7 @@ async fn run_new_agent_turn(
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
     agent.set_mcp_host(state.mcp_host.clone());
     agent.set_subagent_context(turn_id, 0);
-    sync_thread_mcp_tools(&state.store, thread_id, &mut agent).await;
+    sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let future = agent.run_turn_detailed_streaming(input, Some(sender));
     tokio::pin!(future);
@@ -3739,7 +3789,7 @@ async fn run_resumed_agent_turn(
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
     agent.set_mcp_host(state.mcp_host.clone());
     agent.set_subagent_context(turn_id, 0);
-    sync_thread_mcp_tools(&state.store, thread_id, &mut agent).await;
+    sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let future = agent.resume_turn_streaming(
         continuation,
@@ -4326,7 +4376,8 @@ fn build_context_snapshot(messages: &[Message], events: &[AgentEvent]) -> String
     let mut event_lines = Vec::new();
     for event in events.iter().rev().take(160).rev() {
         let rendered = match &event.payload {
-            AgentEventPayload::ModelDelta { .. }
+            AgentEventPayload::ModelRequest { .. }
+            | AgentEventPayload::ModelDelta { .. }
             | AgentEventPayload::AssistantMessage { .. }
             | AgentEventPayload::TurnStarted { .. } => continue,
             payload => serde_json::to_string(payload)

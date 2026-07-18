@@ -42,8 +42,8 @@ The agent loop currently:
 2. Emits a small model delta.
 3. Executes deterministic local tool commands when the user uses slash commands.
 4. Otherwise calls the configured OpenAI-compatible provider, falling back to the mock provider.
-5. Parses provider `tool_calls`, executes built-in or enabled MCP tools through policy checks, and returns tool results to the provider for up to eight rounds.
-6. Emits tool start/finish events and stops safely at the round limit.
+5. Parses provider `tool_calls`, executes built-in or enabled MCP tools through policy checks, and returns tool results to the provider while the task keeps making progress.
+6. Emits tool start/finish events, blocks equivalent calls or repeated multi-step cycles without progress, and automatically compacts older completed tool history near the context-window boundary.
 7. Emits an assistant message and `turn_finished`.
 
 ### Rust Server
@@ -169,7 +169,8 @@ Implemented:
 - Explicit file/image/document source selection through Electron, server-side canonicalization,
   sensitive/type/size limits, message-persisted references, bounded text context, and right-rail recovery.
 - Turn-scoped Codex-compatible Skills discovery/selection and bounded `SKILL.md` injection.
-- Real persistent subagents with AgentCore execution, concurrency/depth/timeout limits,
+- Real persistent subagents with AgentCore execution, concurrency/depth controls, optional
+  execution timeouts (disabled by default),
   recursive cancellation, model-callable lifecycle tools, concurrent `wait_agents`, HTTP
   controls, SSE, and right-rail UI.
 - Persisted main-Turn state with explicit terminal outcomes, startup interruption recovery,

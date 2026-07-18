@@ -319,9 +319,7 @@ export function WorkbenchPanel({
             >
               {latestApprovalPayload.action.startsWith("browser:domain:")
                 ? "Allow Domain"
-                : latestApprovalPayload.action === "Continue agent execution"
-                  ? "Continue"
-                  : "Allow Once"}
+                : "Allow Once"}
             </button>
           </div>
         </section>
@@ -1217,6 +1215,10 @@ function SandboxView({ sandbox }: { sandbox: SandboxDescriptor | null }) {
         <div>
           <dt>Backend</dt>
           <dd>{sandbox.backend ?? `${sandbox.platform} unavailable`}</dd>
+        </div>
+        <div>
+          <dt>Permission profile</dt>
+          <dd>{sandbox.permissionProfile}</dd>
         </div>
         <div>
           <dt>Readable roots</dt>

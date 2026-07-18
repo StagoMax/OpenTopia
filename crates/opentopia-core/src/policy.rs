@@ -1,3 +1,4 @@
+use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
@@ -238,13 +239,34 @@ pub trait PolicyEngine: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct BasicPolicyEngine {
     workspace_root: PathBuf,
+    readable_roots: Vec<PathBuf>,
+    writable_roots: Vec<PathBuf>,
+    unrestricted_file_access: bool,
     mode: PermissionMode,
     config: PolicyConfig,
 }
 
 impl BasicPolicyEngine {
     pub fn new(workspace_root: PathBuf, mode: PermissionMode) -> Self {
-        Self::new_with_config(workspace_root, mode, PolicyConfig::default())
+        Self::new_with_config_and_sandbox(
+            workspace_root,
+            mode,
+            PolicyConfig::default(),
+            &LocalSandboxConfig::default(),
+        )
+    }
+
+    pub fn new_with_sandbox_config(
+        workspace_root: PathBuf,
+        mode: PermissionMode,
+        sandbox_config: &LocalSandboxConfig,
+    ) -> Self {
+        Self::new_with_config_and_sandbox(
+            workspace_root,
+            mode,
+            PolicyConfig::default(),
+            sandbox_config,
+        )
     }
 
     pub fn new_with_config(
@@ -252,14 +274,34 @@ impl BasicPolicyEngine {
         mode: PermissionMode,
         config: PolicyConfig,
     ) -> Self {
+        Self::new_with_config_and_sandbox(
+            workspace_root,
+            mode,
+            config,
+            &LocalSandboxConfig::default(),
+        )
+    }
+
+    pub fn new_with_config_and_sandbox(
+        workspace_root: PathBuf,
+        mode: PermissionMode,
+        config: PolicyConfig,
+        sandbox_config: &LocalSandboxConfig,
+    ) -> Self {
+        let readable_roots = sandbox_config.effective_readable_roots(&workspace_root);
+        let writable_roots = sandbox_config.effective_writable_roots(&workspace_root);
         Self {
             workspace_root,
+            readable_roots,
+            writable_roots,
+            unrestricted_file_access: mode == PermissionMode::FullAccess
+                || sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess,
             mode,
             config,
         }
     }
 
-    fn inside_workspace(&self, path: &Path) -> bool {
+    fn inside_roots(&self, path: &Path, roots: &[PathBuf]) -> bool {
         if path
             .components()
             .any(|component| matches!(component, Component::ParentDir))
@@ -276,7 +318,10 @@ impl BasicPolicyEngine {
             workspace_root.join(path)
         };
         let candidate = canonicalize_existing_ancestor(&candidate);
-        path_starts_with(&candidate, &workspace_root)
+        roots.iter().any(|root| {
+            let root = canonicalize_existing_ancestor(root);
+            path_starts_with(&candidate, &root)
+        })
     }
 
     fn classify_mcp_tool(&self, descriptor: &ToolPermissionDescriptor) -> McpToolRisk {
@@ -370,34 +415,38 @@ fn windows_comparison_path(path: &Path) -> PathBuf {
 
 impl PolicyEngine for BasicPolicyEngine {
     fn inspect_read(&self, path: &Path) -> PolicyDecision {
-        if !self.inside_workspace(path) {
-            return PolicyDecision::Ask {
-                reason: format!("Reading outside the workspace: {}", path.display()),
+        if self.mode == PermissionMode::Chat {
+            return PolicyDecision::Deny {
+                reason: "Chat mode does not allow file access.".to_string(),
             };
         }
 
-        match self.mode {
-            PermissionMode::Chat => PolicyDecision::Deny {
-                reason: "Chat mode does not allow file access.".to_string(),
-            },
-            _ => PolicyDecision::Allow,
+        if self.unrestricted_file_access || self.inside_roots(path, &self.readable_roots) {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Ask {
+                reason: format!("Reading outside authorized roots: {}", path.display()),
+            }
         }
     }
 
     fn inspect_write(&self, path: &Path) -> PolicyDecision {
-        if !self.inside_workspace(path) {
-            return PolicyDecision::Ask {
-                reason: format!("Writing outside the workspace: {}", path.display()),
-            };
-        }
-
         match self.mode {
             PermissionMode::Chat | PermissionMode::ReadOnly => PolicyDecision::Deny {
                 reason: "Current permission mode does not allow writes.".to_string(),
             },
-            PermissionMode::Auto | PermissionMode::Approve | PermissionMode::FullAccess => {
+            PermissionMode::FullAccess => PolicyDecision::Allow,
+            PermissionMode::Auto | PermissionMode::Approve if self.unrestricted_file_access => {
                 PolicyDecision::Allow
             }
+            PermissionMode::Auto | PermissionMode::Approve
+                if self.inside_roots(path, &self.writable_roots) =>
+            {
+                PolicyDecision::Allow
+            }
+            PermissionMode::Auto | PermissionMode::Approve => PolicyDecision::Ask {
+                reason: format!("Writing outside authorized roots: {}", path.display()),
+            },
         }
     }
 
@@ -585,6 +634,106 @@ mod tests {
 
         std::fs::remove_dir_all(workspace).expect("remove workspace fixture");
         std::fs::remove_dir_all(outside).expect("remove outside fixture");
+    }
+
+    #[test]
+    fn configured_capability_roots_control_read_and_write_access() {
+        let id = Uuid::new_v4();
+        let workspace = std::env::temp_dir().join(format!("opentopia-policy-workspace-{id}"));
+        let readable = std::env::temp_dir().join(format!("opentopia-policy-readable-{id}"));
+        let writable = std::env::temp_dir().join(format!("opentopia-policy-writable-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-policy-outside-{id}"));
+        for root in [&workspace, &readable, &writable, &outside] {
+            std::fs::create_dir_all(root).expect("create capability root fixture");
+        }
+        let mut sandbox = LocalSandboxConfig::default();
+        sandbox.read_paths = vec![readable.clone()];
+        sandbox.writable_roots = vec![writable.clone()];
+        let policy = BasicPolicyEngine::new_with_sandbox_config(
+            workspace.clone(),
+            PermissionMode::Auto,
+            &sandbox,
+        );
+
+        assert!(matches!(
+            policy.inspect_read(&readable.join("reference.txt")),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.inspect_write(&readable.join("reference.txt")),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            policy.inspect_read(&writable.join("dependency-cache.bin")),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.inspect_write(&writable.join("dependency-cache.bin")),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.inspect_read(&outside.join("unconfigured.txt")),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            policy.inspect_write(&outside.join("unconfigured.txt")),
+            PolicyDecision::Ask { .. }
+        ));
+
+        for root in [workspace, readable, writable, outside] {
+            std::fs::remove_dir_all(root).expect("remove capability root fixture");
+        }
+    }
+
+    #[test]
+    fn full_access_modes_bypass_workspace_boundaries_but_not_chat_or_read_only_rules() {
+        let outside = std::env::temp_dir().join(format!(
+            "opentopia-policy-full-access-outside-{}",
+            Uuid::new_v4()
+        ));
+        let workspace = PathBuf::from(".");
+
+        let permission_full_access =
+            BasicPolicyEngine::new(workspace.clone(), PermissionMode::FullAccess);
+        assert!(matches!(
+            permission_full_access.inspect_read(&outside),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            permission_full_access.inspect_write(&outside),
+            PolicyDecision::Allow
+        ));
+
+        let sandbox = LocalSandboxConfig::danger_full_access();
+        let auto = BasicPolicyEngine::new_with_sandbox_config(
+            workspace.clone(),
+            PermissionMode::Auto,
+            &sandbox,
+        );
+        assert!(matches!(auto.inspect_read(&outside), PolicyDecision::Allow));
+        assert!(matches!(
+            auto.inspect_write(&outside),
+            PolicyDecision::Allow
+        ));
+
+        let chat = BasicPolicyEngine::new_with_sandbox_config(
+            workspace.clone(),
+            PermissionMode::Chat,
+            &sandbox,
+        );
+        let read_only = BasicPolicyEngine::new_with_sandbox_config(
+            workspace,
+            PermissionMode::ReadOnly,
+            &sandbox,
+        );
+        assert!(matches!(
+            chat.inspect_read(&outside),
+            PolicyDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            read_only.inspect_write(&outside),
+            PolicyDecision::Deny { .. }
+        ));
     }
 
     #[cfg(windows)]

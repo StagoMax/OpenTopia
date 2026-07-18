@@ -1,9 +1,11 @@
 use crate::sandbox::{
-    build_local_sandbox_command, is_protected_metadata_path, ExecutionEnvironmentKind,
-    LocalSandboxConfig, SandboxCommandStatus, SandboxMode,
+    build_local_sandbox_command, is_protected_metadata_path, sandbox_permission_profile,
+    ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy, OsSandboxPlatform,
+    SandboxCommandStatus, SandboxMode,
 };
 use anyhow::Context;
 use async_trait::async_trait;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -163,6 +165,16 @@ pub struct ExecResult {
     pub exit_code: Option<i32>,
     pub success: bool,
     pub truncated: bool,
+    pub sandbox: Option<ExecutionSandboxMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionSandboxMetadata {
+    pub status: SandboxCommandStatus,
+    pub permission_profile: String,
+    pub sandbox_mode: SandboxMode,
+    pub network: NetworkPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -446,7 +458,11 @@ impl LocalExecutionEnvironment {
         else {
             anyhow::bail!("write path escapes workspace: {}", path.display());
         };
-        if is_protected_metadata_path(&resolved_candidate, root) {
+        if is_protected_metadata_path(&resolved_candidate, root)
+            && !self
+                .sandbox_config
+                .is_approved_write_path(&resolved_candidate)
+        {
             anyhow::bail!(
                 "approval required: write to protected workspace metadata: {}",
                 path.display()
@@ -508,6 +524,15 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             &self.workspace_root,
             &self.sandbox_config,
         )?;
+        let sandbox = Some(ExecutionSandboxMetadata {
+            status: command_plan.status.clone(),
+            permission_profile: sandbox_permission_profile(
+                OsSandboxPlatform::current(),
+                &self.sandbox_config,
+            ),
+            sandbox_mode: self.sandbox_config.sandbox_mode,
+            network: self.sandbox_config.network,
+        });
 
         if let SandboxCommandStatus::BestEffortPassthrough { platform, reason } =
             &command_plan.status
@@ -654,6 +679,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
                 exit_code: exit_status.code(),
                 success: exit_status.success(),
                 truncated,
+                sandbox: sandbox.clone(),
             },
             WaitOutcome::OutputLimitExceeded => ExecResult {
                 stdout,
@@ -661,6 +687,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
                 exit_code: None,
                 success: false,
                 truncated: true,
+                sandbox,
             },
             WaitOutcome::Cancelled(reason) | WaitOutcome::TimedOut(reason) => {
                 anyhow::bail!("{reason}");
@@ -696,6 +723,15 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             &self.workspace_root,
             &self.sandbox_config,
         )?;
+        let sandbox = Some(ExecutionSandboxMetadata {
+            status: command_plan.status.clone(),
+            permission_profile: sandbox_permission_profile(
+                OsSandboxPlatform::current(),
+                &self.sandbox_config,
+            ),
+            sandbox_mode: self.sandbox_config.sandbox_mode,
+            network: self.sandbox_config.network,
+        });
         let mut process = Command::new(&command_plan.program);
         if request.clear_env {
             process.env_clear();
@@ -743,6 +779,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             cancel_token: Some(cancel_token),
             request_id: Some(request_id),
             env: Some(Arc::new(self.clone())),
+            sandbox,
         }))
     }
 
@@ -853,6 +890,7 @@ pub struct LocalStdioSession {
     cancel_token: Option<CancellationToken>,
     request_id: Option<String>,
     env: Option<std::sync::Arc<LocalExecutionEnvironment>>,
+    sandbox: Option<ExecutionSandboxMetadata>,
 }
 
 #[async_trait]
@@ -946,6 +984,7 @@ impl StdioSession for LocalStdioSession {
                 exit_code: exit_status.code(),
                 success: exit_status.success(),
                 truncated: false,
+                sandbox: self.sandbox.clone(),
             });
         }
 
@@ -961,6 +1000,7 @@ impl StdioSession for LocalStdioSession {
             exit_code: None,
             success: true,
             truncated: false,
+            sandbox: self.sandbox.clone(),
         })
     }
 
@@ -1033,6 +1073,12 @@ mod tests {
             .expect("exec shell command");
         assert!(exec.success);
         assert!(String::from_utf8_lossy(&exec.stdout).contains("ok"));
+        assert!(matches!(
+            exec.sandbox
+                .expect("execution records sandbox metadata")
+                .status,
+            SandboxCommandStatus::Disabled
+        ));
 
         std::fs::remove_dir_all(root).expect("remove temp workspace");
     }
@@ -1265,6 +1311,15 @@ mod tests {
 
         assert!(exec.success);
         assert!(String::from_utf8_lossy(&exec.stdout).contains("ok"));
+        let sandbox = exec.sandbox.expect("execution records sandbox metadata");
+        assert_eq!(sandbox.permission_profile, ":workspace");
+        assert!(matches!(
+            sandbox.status,
+            SandboxCommandStatus::Wrapped {
+                platform: OsSandboxPlatform::Windows,
+                ..
+            }
+        ));
 
         std::fs::remove_dir_all(root).expect("remove temp workspace");
     }

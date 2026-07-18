@@ -2,7 +2,7 @@ use crate::AppState;
 use anyhow::{bail, Context};
 use axum::extract::{Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -14,6 +14,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 const API_TOKEN_ENV: &str = "OPENTOPIA_API_TOKEN";
 const DEV_ORIGIN_ENV: &str = "OPENTOPIA_DEV_ORIGIN";
 const MINIMUM_TOKEN_BYTES: usize = 32;
+pub(crate) const TURN_ID_HEADER: HeaderName = HeaderName::from_static("x-opentopia-turn-id");
 
 #[derive(Clone)]
 pub(crate) struct ApiAuth {
@@ -69,6 +70,7 @@ impl ApiAuth {
                 Method::DELETE,
             ])
             .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT])
+            .expose_headers([TURN_ID_HEADER])
             .max_age(Duration::from_secs(600))
     }
 

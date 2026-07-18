@@ -89,7 +89,7 @@ pub struct SubagentScope {
 pub struct SubagentSchedulerConfig {
     pub max_concurrency_per_parent: usize,
     pub max_depth: u8,
-    pub timeout: Duration,
+    pub timeout: Option<Duration>,
 }
 
 impl Default for SubagentSchedulerConfig {
@@ -97,7 +97,7 @@ impl Default for SubagentSchedulerConfig {
         Self {
             max_concurrency_per_parent: 4,
             max_depth: 2,
-            timeout: Duration::from_secs(15 * 60),
+            timeout: None,
         }
     }
 }
@@ -453,27 +453,45 @@ impl SubagentScheduler {
             .executor
             .execute(run, input, control.cancellation.child_token());
         tokio::pin!(execution);
-        let timeout = tokio::time::sleep(self.inner.config.timeout);
-        tokio::pin!(timeout);
-        tokio::select! {
-            _ = control.cancellation.cancelled() => {
-                self.finish(&control, SubagentRunStatus::Cancelled, None, None);
-            }
-            _ = &mut timeout => {
-                control.cancellation.cancel();
-                let run_id = control.run.lock().expect("subagent run mutex poisoned").id;
-                self.cancel_parent(run_id);
-                self.finish(&control, SubagentRunStatus::TimedOut, None, Some("subagent execution timed out".to_string()));
-            }
-            result = &mut execution => match result {
-                Ok(result) => self.finish(&control, SubagentRunStatus::Completed, Some(result), None),
-                Err(_) if control.cancellation.is_cancelled() => {
-                    self.finish(&control, SubagentRunStatus::Cancelled, None, None)
+        if let Some(timeout_duration) = self.inner.config.timeout {
+            let timeout = tokio::time::sleep(timeout_duration);
+            tokio::pin!(timeout);
+            tokio::select! {
+                _ = control.cancellation.cancelled() => {
+                    self.finish(&control, SubagentRunStatus::Cancelled, None, None);
                 }
-                Err(error) => self.finish(&control, SubagentRunStatus::Failed, None, Some(error.to_string())),
+                _ = &mut timeout => {
+                    control.cancellation.cancel();
+                    let run_id = control.run.lock().expect("subagent run mutex poisoned").id;
+                    self.cancel_parent(run_id);
+                    self.finish(&control, SubagentRunStatus::TimedOut, None, Some("subagent execution timed out".to_string()));
+                }
+                result = &mut execution => self.finish_execution_result(&control, result),
+            }
+        } else {
+            tokio::select! {
+                _ = control.cancellation.cancelled() => {
+                    self.finish(&control, SubagentRunStatus::Cancelled, None, None);
+                }
+                result = &mut execution => self.finish_execution_result(&control, result),
             }
         }
         drop(permit);
+    }
+
+    fn finish_execution_result(&self, control: &RunControl, result: anyhow::Result<String>) {
+        match result {
+            Ok(result) => self.finish(control, SubagentRunStatus::Completed, Some(result), None),
+            Err(_) if control.cancellation.is_cancelled() => {
+                self.finish(control, SubagentRunStatus::Cancelled, None, None)
+            }
+            Err(error) => self.finish(
+                control,
+                SubagentRunStatus::Failed,
+                None,
+                Some(error.to_string()),
+            ),
+        }
     }
 
     fn transition_running(&self, control: &RunControl) {
@@ -578,7 +596,7 @@ mod tests {
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: max,
                 max_depth: 2,
-                timeout,
+                timeout: Some(timeout),
             },
             executor.clone(),
             Arc::new(NoopSubagentObserver),
@@ -594,6 +612,11 @@ mod tests {
             input: "work".to_string(),
             depth: 1,
         }
+    }
+
+    #[test]
+    fn default_scheduler_has_no_execution_timeout() {
+        assert_eq!(SubagentSchedulerConfig::default().timeout, None);
     }
 
     fn owning_scope(run: &SubagentRun) -> SubagentScope {

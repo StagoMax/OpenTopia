@@ -86,6 +86,7 @@ pub enum McpHostError {
 pub struct McpExtensionHost {
     inner: Arc<RwLock<McpExtensionHostInner>>,
     spawner: Arc<dyn McpProcessSpawner>,
+    lifecycle_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
 }
 
 impl Default for McpExtensionHost {
@@ -103,6 +104,7 @@ impl McpExtensionHost {
         Self {
             inner: Arc::new(RwLock::new(McpExtensionHostInner::default())),
             spawner,
+            lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -125,7 +127,42 @@ impl McpExtensionHost {
         &self,
         config: McpServerConfig,
     ) -> Result<McpServerStatus, McpHostError> {
-        self.stop_server(config.server_id).await?;
+        let lifecycle_lock = self.lifecycle_lock(config.server_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        self.restart_server_locked(config).await
+    }
+
+    pub async fn ensure_server(
+        &self,
+        config: McpServerConfig,
+    ) -> Result<McpServerStatus, McpHostError> {
+        let lifecycle_lock = self.lifecycle_lock(config.server_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let current = {
+            let inner = self.inner.read().await;
+            inner.servers.get(&config.server_id).and_then(|runtime| {
+                (runtime.config.updated_at == config.updated_at)
+                    .then(|| inner.statuses.get(&config.server_id).cloned())
+                    .flatten()
+            })
+        };
+        if let Some(status) = current.filter(|status| {
+            matches!(
+                status.status,
+                McpLifecycleStatus::Ready | McpLifecycleStatus::Disabled
+            )
+        }) {
+            return Ok(status);
+        }
+
+        self.restart_server_locked(config).await
+    }
+
+    async fn restart_server_locked(
+        &self,
+        config: McpServerConfig,
+    ) -> Result<McpServerStatus, McpHostError> {
+        self.stop_server_locked(config.server_id).await?;
 
         if !config.enabled {
             let status = McpServerStatus {
@@ -191,6 +228,12 @@ impl McpExtensionHost {
     }
 
     pub async fn stop_server(&self, server_id: Uuid) -> Result<(), McpHostError> {
+        let lifecycle_lock = self.lifecycle_lock(server_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        self.stop_server_locked(server_id).await
+    }
+
+    async fn stop_server_locked(&self, server_id: Uuid) -> Result<(), McpHostError> {
         let runtime = {
             let mut inner = self.inner.write().await;
             inner
@@ -204,6 +247,15 @@ impl McpExtensionHost {
         }
 
         Ok(())
+    }
+
+    async fn lifecycle_lock(&self, server_id: Uuid) -> Arc<Mutex<()>> {
+        self.lifecycle_locks
+            .lock()
+            .await
+            .entry(server_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub async fn status_for_config(&self, config: &McpServerConfig) -> McpServerStatus {

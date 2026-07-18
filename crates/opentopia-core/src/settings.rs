@@ -262,6 +262,8 @@ impl SandboxSettings {
             sandbox_mode: self.sandbox_mode,
             writable_roots: self.writable_roots.clone(),
             sandbox_home: None,
+            approved_read_paths: Vec::new(),
+            approved_write_paths: Vec::new(),
         }
     }
 

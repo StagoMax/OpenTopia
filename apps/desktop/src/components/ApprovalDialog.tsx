@@ -30,10 +30,6 @@ type RiskPresentation = {
   icon: typeof ShieldAlert;
 };
 
-function isContinuationAction(action: string): boolean {
-  return action.trim().toLowerCase() === "continue agent execution";
-}
-
 function actionKind(action: string): string {
   const normalized = action.trimStart().toLowerCase();
   const firstLine = normalized.split(/\r?\n/, 1)[0] ?? "";
@@ -42,15 +38,6 @@ function actionKind(action: string): string {
 
 function describeRisk(action: string): RiskPresentation {
   const kind = actionKind(action);
-
-  if (isContinuationAction(action)) {
-    return {
-      label: "继续执行",
-      description: "当前任务已完成一个执行阶段，需要确认是否继续下一阶段。",
-      level: "medium",
-      icon: ShieldAlert,
-    };
-  }
 
   if (kind.startsWith("browser:") || kind.startsWith("network:")) {
     return {
@@ -103,16 +90,6 @@ function describeRisk(action: string): RiskPresentation {
 }
 
 function displayReason(request: ApprovalRequest): string {
-  if (isContinuationAction(request.action)) {
-    if (/context budget/i.test(request.reason)) {
-      return "当前执行阶段的上下文额度已使用完。继续后，Agent 会整理现有上下文并进入下一阶段。";
-    }
-    if (/tool-decision budget/i.test(request.reason)) {
-      return "当前执行阶段的工具调用额度已使用完。继续后，Agent 会保留任务进度并进入下一阶段。";
-    }
-    return "当前执行阶段已经结束。继续后，Agent 会保留任务进度并开始下一阶段。";
-  }
-
   const reason = request.reason.replace(/^approval required:\s*/i, "").trim();
   const pathReason =
     /^(reading outside the workspace|writing outside the workspace|write requires approval):\s*(.+)$/i.exec(
@@ -135,7 +112,7 @@ function displayReason(request: ApprovalRequest): string {
 }
 
 function displayAction(action: string): string {
-  return isContinuationAction(action) ? "继续执行当前任务" : action;
+  return action;
 }
 
 function isCommandAction(action: string): boolean {
@@ -161,7 +138,6 @@ export function ApprovalDialog({
   const risk = describeRisk(request.action);
   const RiskIcon = risk.icon;
   const commandAction = isCommandAction(request.action);
-  const continuationAction = isContinuationAction(request.action);
   const decisionPending = isSubmitting || decisionRequested;
 
   useEffect(() => {
@@ -203,11 +179,9 @@ export function ApprovalDialog({
         </span>
         <div className="approval-dialog-heading">
           <h2 id="approval-dialog-title">
-            {continuationAction
-              ? "是否继续执行当前任务？"
-              : commandAction
-                ? "是否允许运行这个命令？"
-                : "是否允许执行这个操作？"}
+            {commandAction
+              ? "是否允许运行这个命令？"
+              : "是否允许执行这个操作？"}
           </h2>
           <p id="approval-dialog-description">
             <strong>{risk.label}</strong>
@@ -263,8 +237,6 @@ export function ApprovalDialog({
               />
               正在提交
             </>
-          ) : continuationAction ? (
-            "继续"
           ) : commandAction ? (
             "运行"
           ) : (

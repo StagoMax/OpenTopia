@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "codexCliVersion": "0.145.0-alpha.18",
+  "signerSubject": "CN=\"OpenAI OpCo, LLC\", O=\"OpenAI OpCo, LLC\", L=San Francisco, S=California, C=US",
+  "files": {
+    "codex.exe": "20D611EF1C9851F4DA1CB4609BEB6763904F72275CB91517B2400639CA1C28C4",
+    "codex-command-runner.exe": "ED8F3C45EE67D330A6F934F7F1AD7A146AE1BFE6372A5E543E93F44E4418426E",
+    "codex-windows-sandbox-setup.exe": "41376B8A973FFC5CCFB16FD19FD0E3463C2317AC6946599480E87E20BE6F5EBD"
+  }
+}

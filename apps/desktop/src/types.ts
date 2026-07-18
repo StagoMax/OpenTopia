@@ -484,6 +484,7 @@ export type SandboxDescriptor = {
   writableRoots: string[];
   protectedPaths: string[];
   backend?: string | null;
+  permissionProfile: string;
   enforced: boolean;
   available: boolean;
 };
@@ -499,6 +500,16 @@ export type McpServerConfig = {
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
+};
+
+export type McpServerInput = {
+  name: string;
+  command: string;
+  args?: string[];
+  cwd?: string;
+  envKeys?: string[];
+  timeoutMs?: number;
+  enabled?: boolean;
 };
 
 export type McpServerStatus = {
@@ -620,6 +631,35 @@ export type ModelContentPart =
       name?: string | null;
     };
 
+export type ModelRequestSnapshot = {
+  systemPrompt: string;
+  conversation: Array<{
+    role: "system" | "user" | "assistant";
+    content: string;
+    contentParts?: ModelContentPart[];
+  }>;
+  userMessage: string;
+  userContent?: ModelContentPart[];
+  toolCandidates: Array<{
+    name: string;
+    description: string;
+    inputSchema: unknown;
+  }>;
+  previousToolCalls: Array<{
+    id: string;
+    name: string;
+    arguments: unknown;
+  }>;
+  toolResults: Array<{
+    callId: string;
+    name: string;
+    output: string;
+    content?: ModelContentPart[];
+    isError: boolean;
+    metadata: unknown;
+  }>;
+};
+
 export type AgentEvent = {
   id: string;
   threadId: string;
@@ -631,6 +671,7 @@ export type AgentEvent = {
 
 export type AgentEventPayload =
   | { type: "turn_started"; user_message_id: string }
+  | { type: "model_request"; round: number; request: ModelRequestSnapshot }
   | { type: "model_delta"; text: string }
   | { type: "reasoning_delta"; text: string }
   | { type: "tool_call_started"; call: ToolCall }

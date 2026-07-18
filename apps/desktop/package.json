@@ -44,6 +44,7 @@
           "codex.exe",
           "codex-command-runner.exe",
           "codex-windows-sandbox-setup.exe",
+          "manifest.json",
           "LICENSE"
         ]
       }

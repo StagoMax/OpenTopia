@@ -143,7 +143,7 @@ function Wait-EvalTurn {
   )
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  $continuations = 0
+  $unexpectedExecutionCheckpoints = 0
   $deniedApprovals = 0
   $lastTurn = $null
   while ((Get-Date) -lt $deadline) {
@@ -163,14 +163,15 @@ function Wait-EvalTurn {
       if (-not $approvalId) {
         throw "Pending approval did not include approvalId"
       }
-      $isBudgetCheckpoint = $pending[0].action -eq "Continue agent execution"
+      $isUnexpectedExecutionCheckpoint =
+        $pending[0].action -eq "Continue agent execution"
       Invoke-EvalApi `
         -Method "Post" `
         -Path "/api/threads/$ThreadId/approvals/$approvalId/decision" `
-        -Body @{ approved = $isBudgetCheckpoint } `
+        -Body @{ approved = $false } `
         -TimeoutSeconds $TimeoutSeconds | Out-Null
-      if ($isBudgetCheckpoint) {
-        $continuations += 1
+      if ($isUnexpectedExecutionCheckpoint) {
+        $unexpectedExecutionCheckpoints += 1
       } else {
         $deniedApprovals += 1
       }
@@ -179,7 +180,7 @@ function Wait-EvalTurn {
     if ($lastTurn.status -in @("succeeded", "failed", "cancelled", "interrupted")) {
       return [PSCustomObject]@{
         Turn = $lastTurn
-        BudgetContinuations = $continuations
+        UnexpectedExecutionCheckpoints = $unexpectedExecutionCheckpoints
         DeniedApprovals = $deniedApprovals
       }
     }
@@ -228,7 +229,7 @@ function Get-TrajectoryMetrics {
   $toolFinishes = @($Events | Where-Object { $_.payload.type -eq "tool_call_finished" })
   $planEvents = @($Events | Where-Object { $_.payload.type -eq "plan_updated" })
   $usageEvents = @($Events | Where-Object { $_.payload.type -eq "token_usage" })
-  $budgetCheckpoints = @($Events | Where-Object {
+  $unexpectedExecutionCheckpoints = @($Events | Where-Object {
     $_.payload.type -eq "approval_requested" -and
     $_.payload.action -eq "Continue agent execution"
   })
@@ -247,14 +248,11 @@ function Get-TrajectoryMetrics {
   $completionToolCalls = @($toolStarts | Where-Object {
     $_.payload.call.name -eq "complete_task"
   }).Count
-  $blockedEquivalentToolCalls = @($toolFinishes | Where-Object {
+  $blockedLoopGuardToolCalls = @($toolFinishes | Where-Object {
     $_.payload.result.metadata.loopGuardBlocked -eq $true
   }).Count
   $blockedCompletionModeToolCalls = @($toolFinishes | Where-Object {
     $_.payload.result.metadata.completionModeBlocked -eq $true
-  }).Count
-  $blockedImplementationModeToolCalls = @($toolFinishes | Where-Object {
-    $_.payload.result.metadata.implementationModeBlocked -eq $true
   }).Count
   $verifiedPlanCompletionCalls = @($toolFinishes | Where-Object {
     $_.payload.result.metadata.toolName -eq "update_plan" -and
@@ -299,15 +297,14 @@ function Get-TrajectoryMetrics {
     toolCallsFinished = $toolFinishes.Count
     toolCallsByName = $toolByName
     planUpdates = $planEvents.Count
-    budgetCheckpoints = $budgetCheckpoints.Count
+    unexpectedExecutionCheckpoints = $unexpectedExecutionCheckpoints.Count
     latestPlan = $planStatus
     testToolCalls = $testToolCalls
     completionToolCalls = $completionToolCalls
     verifiedPlanCompletionCalls = $verifiedPlanCompletionCalls
     fallbackVerifiedCompletions = $fallbackVerifiedCompletions
-    blockedEquivalentToolCalls = $blockedEquivalentToolCalls
+    blockedLoopGuardToolCalls = $blockedLoopGuardToolCalls
     blockedCompletionModeToolCalls = $blockedCompletionModeToolCalls
-    blockedImplementationModeToolCalls = $blockedImplementationModeToolCalls
     inputTokens = $inputTokens
     outputTokens = $outputTokens
     totalTokens = $totalTokens
@@ -434,8 +431,8 @@ $providerProbe = $null
 $providerHealth = $null
 $phase1Turn = $null
 $phase2Turn = $null
-$phase1Continuations = 0
-$phase2Continuations = 0
+$phase1UnexpectedExecutionCheckpoints = 0
+$phase2UnexpectedExecutionCheckpoints = 0
 $phase1DeniedApprovals = 0
 $phase2DeniedApprovals = 0
 $thread = $null
@@ -540,7 +537,7 @@ try {
   $phase1Wait = Wait-EvalTurn $thread.id $phase1Message.id $TurnTimeoutSeconds
   $phase1ElapsedMs = [int64]((Get-Date) - $phase1StartedAt).TotalMilliseconds
   $phase1Turn = $phase1Wait.Turn
-  $phase1Continuations = $phase1Wait.BudgetContinuations
+  $phase1UnexpectedExecutionCheckpoints = $phase1Wait.UnexpectedExecutionCheckpoints
   $phase1DeniedApprovals = $phase1Wait.DeniedApprovals
   $eventsPhase1 = @(Expand-EvalItems (
     Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
@@ -597,7 +594,7 @@ try {
   $phase2Wait = Wait-EvalTurn $thread.id $phase2Message.id $TurnTimeoutSeconds
   $phase2ElapsedMs = [int64]((Get-Date) - $phase2StartedAt).TotalMilliseconds
   $phase2Turn = $phase2Wait.Turn
-  $phase2Continuations = $phase2Wait.BudgetContinuations
+  $phase2UnexpectedExecutionCheckpoints = $phase2Wait.UnexpectedExecutionCheckpoints
   $phase2DeniedApprovals = $phase2Wait.DeniedApprovals
   $eventsFinal = @(Expand-EvalItems (
     Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
@@ -763,14 +760,14 @@ $result = [ordered]@{
       phase = 1
       status = if ($phase1Turn) { $phase1Turn.status } else { "not_completed" }
       elapsedMs = $phase1ElapsedMs
-      budgetContinuations = $phase1Continuations
+      unexpectedExecutionCheckpoints = $phase1UnexpectedExecutionCheckpoints
       deniedApprovals = $phase1DeniedApprovals
     },
     [ordered]@{
       phase = 2
       status = if ($phase2Turn) { $phase2Turn.status } else { "not_completed" }
       elapsedMs = $phase2ElapsedMs
-      budgetContinuations = $phase2Continuations
+      unexpectedExecutionCheckpoints = $phase2UnexpectedExecutionCheckpoints
       deniedApprovals = $phase2DeniedApprovals
     }
   )
