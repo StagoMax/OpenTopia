@@ -362,7 +362,7 @@ Agent Turn 不设置总工具轮次或总运行时长上限。只要工具调用
 | `browser` | 以 action 执行导航、快照、点击、输入、等待、截图和下载 |
 | `spreadsheet` | 检查、列 Sheet、读区间、创建或更新 XLSX |
 | `spawn_agent`、`send_input`、`wait_agent`、`wait_agents`、`cancel_agent` | 子智能体生命周期控制 |
-| `mcp__*` | 运行时同步的 MCP 工具包装器 |
+| `<server>__<tool>` | 运行时同步的 MCP 工具包装器 |
 
 工具调用不是 HTTP API 的旁路。所有内置读写和命令工具都带 `ToolContext`，其中包含工作区、策略、执行环境、取消 Token、线程、存储、浏览器和子智能体调度器。
 

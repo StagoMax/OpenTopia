@@ -1219,8 +1219,20 @@ function toolExecutionTitle(call: ToolCall) {
   if (call.name === "list_skills") return "查看可用 Skill";
   if (call.name === "read_skill")
     return `读取 Skill ${stringField(input, "name") || ""}`.trim();
-  if (call.name.startsWith("mcp__")) return `MCP · ${call.name.slice(5)}`;
+  const mcpTool = mcpToolNameParts(call.name);
+  if (mcpTool) return `MCP · ${mcpTool.server} / ${mcpTool.tool}`;
   return call.name;
+}
+
+function mcpToolNameParts(
+  name: string,
+): { server: string; tool: string } | null {
+  const separator = name.indexOf("__");
+  if (separator <= 0 || separator >= name.length - 2) return null;
+  return {
+    server: name.slice(0, separator),
+    tool: name.slice(separator + 2),
+  };
 }
 
 function toolDisplayName(name: string) {
@@ -1242,7 +1254,7 @@ function toolDisplayName(name: string) {
     update_plan: "任务计划",
     complete_task: "任务闭环",
   };
-  return names[name] || (name.startsWith("mcp__") ? "MCP" : name);
+  return names[name] || (mcpToolNameParts(name) ? "MCP" : name);
 }
 
 function toolFileChangeSummaries(

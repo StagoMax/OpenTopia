@@ -74,7 +74,12 @@ impl McpServerStatus {
             server_id: config.server_id,
             name: config.name.clone(),
             status,
-            message: "MCP stdio host boundary is configured; process lifecycle is not started in this skeleton.".to_string(),
+            message: if config.enabled {
+                "MCP server is configured and waiting to start."
+            } else {
+                "MCP server is disabled."
+            }
+            .to_string(),
             tools_count: 0,
             updated_at: config.updated_at,
         }
