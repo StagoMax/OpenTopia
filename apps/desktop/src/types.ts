@@ -61,11 +61,14 @@ export type BrowserOutput = {
   metadata: unknown;
 };
 
+export type ExperienceMode = "work" | "code";
+
 export type Thread = {
   id: string;
   title: string;
   workspaceRoot: string;
   projectId: string | null;
+  experienceMode: ExperienceMode;
   archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -84,7 +87,7 @@ export type Project = {
 export type PermissionMode =
   "chat" | "read_only" | "auto" | "approve" | "full_access";
 
-export type ProviderKind = "mock" | "openai_compatible";
+export type ProviderKind = "mock" | "openai_compatible" | "openai_responses";
 
 export type AppSettings = {
   providers: ProviderSettings[];
@@ -111,7 +114,11 @@ export type ProviderSettings = {
   temperature: number;
   maxOutputTokens?: number | null;
   contextWindowTokens: number;
-  reasoningEffort?: "low" | "medium" | "high" | null;
+  reasoningEffort?:
+    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+  storeResponses: boolean;
+  parallelToolCalls: boolean;
+  promptCacheKey?: string | null;
   apiKeySource: string;
   apiKeyConfigured: boolean;
   healthStatus?: string | null;
@@ -658,6 +665,64 @@ export type ModelRequestSnapshot = {
     isError: boolean;
     metadata: unknown;
   }>;
+  contextItems?: ModelContextItem[];
+  previousResponseItems?: unknown[];
+  promptCacheKey?: string | null;
+};
+
+export type ModelContextItem = {
+  id: string;
+  kind:
+    | "base_instructions"
+    | "developer_instructions"
+    | "repository_instructions"
+    | "environment"
+    | "world_state"
+    | "skill"
+    | "summary"
+    | "conversation"
+    | "user"
+    | "tool_call"
+    | "tool_result";
+  role: "system" | "developer" | "user" | "assistant" | "tool";
+  source: string;
+  content: ModelContentPart[];
+  contentHash: string;
+  tokenEstimate: number;
+  cacheScope: "stable" | "thread" | "turn" | "round" | "none";
+  sensitivity: "public" | "workspace" | "sensitive";
+  metadata?: unknown;
+};
+
+export type ThreadContextSnapshot = {
+  capturedAt: string;
+  providerId: string;
+  providerKind: string;
+  model: string;
+  workspaceRoot: string;
+  cwd: string;
+  experienceMode: string;
+  permissionMode: string;
+  sandboxMode: string;
+  instructions: unknown[];
+  toolCatalogHash: string;
+  worldStateHash: string;
+  contextHash: string;
+};
+
+export type TurnContextSnapshot = {
+  capturedAt: string;
+  cwd: string;
+  workspaceRoots: string[];
+  experienceMode: string;
+  permissionMode: string;
+  sandboxMode: string;
+  instructions: unknown[];
+  worldState: Record<string, unknown>;
+  worldStateHash: string;
+  previousWorldStateHash?: string | null;
+  changedKeys: string[];
+  contextHash: string;
 };
 
 export type AgentEvent = {
@@ -670,8 +735,50 @@ export type AgentEvent = {
 };
 
 export type AgentEventPayload =
+  | { type: "thread_context_snapshot"; snapshot: ThreadContextSnapshot }
+  | { type: "turn_context_snapshot"; snapshot: TurnContextSnapshot }
   | { type: "turn_started"; user_message_id: string }
-  | { type: "model_request"; round: number; request: ModelRequestSnapshot }
+  | {
+      type: "model_context_built";
+      request_id: string;
+      round: number;
+      context_hash: string;
+      token_estimate: number;
+      items: ModelContextItem[];
+    }
+  | {
+      type: "model_request";
+      request_id: string;
+      round: number;
+      request: ModelRequestSnapshot;
+    }
+  | {
+      type: "provider_request_sent";
+      request_id: string;
+      round: number;
+      attempt: number;
+      adapter: string;
+      method: string;
+      endpoint: string;
+      body: unknown;
+    }
+  | {
+      type: "provider_request_retried";
+      request_id: string;
+      round: number;
+      attempt: number;
+      reason: string;
+      body: unknown;
+    }
+  | {
+      type: "provider_response_received";
+      request_id: string;
+      round: number;
+      attempt: number;
+      status?: number | null;
+      response_id?: string | null;
+      body: unknown;
+    }
   | { type: "model_delta"; text: string }
   | { type: "reasoning_delta"; text: string }
   | { type: "tool_call_started"; call: ToolCall }

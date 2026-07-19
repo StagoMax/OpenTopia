@@ -7,6 +7,7 @@ import type {
   ContextStatus,
   ContextSummary,
   DiffFileActionResult,
+  ExperienceMode,
   GitBranchInfo,
   GitStatusSummary,
   GitWorkflowAction,
@@ -191,6 +192,7 @@ export class ApiClient {
     title?: string;
     workspaceRoot?: string;
     projectId?: string;
+    experienceMode?: ExperienceMode;
   }): Promise<Thread> {
     return this.post("/api/threads", input);
   }

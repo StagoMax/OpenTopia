@@ -42,8 +42,8 @@ The agent loop currently:
 2. Emits a small model delta.
 3. Executes deterministic local tool commands when the user uses slash commands.
 4. Otherwise calls the configured OpenAI-compatible provider, falling back to the mock provider.
-5. Parses provider `tool_calls`, executes built-in or enabled MCP tools through policy checks, and returns tool results to the provider while the task keeps making progress.
-6. Emits tool start/finish events, blocks equivalent calls or repeated multi-step cycles without progress, and automatically compacts older completed tool history near the context-window boundary.
+5. Parses provider `tool_calls`, executes built-in or enabled MCP tools through policy checks, and returns tool results to the provider until the provider reaches a terminal response.
+6. Emits tool start/finish events and automatically compacts older completed tool history near the context-window boundary without imposing a task-level round or elapsed-time limit.
 7. Emits an assistant message and `turn_finished`.
 
 ### Rust Server
@@ -171,8 +171,8 @@ Implemented:
 - Explicit file/image/document source selection through Electron, server-side canonicalization,
   sensitive/type/size limits, message-persisted references, bounded text context, and right-rail recovery.
 - Turn-scoped Codex-compatible Skills discovery/selection and bounded `SKILL.md` injection.
-- Real persistent subagents with AgentCore execution, concurrency/depth controls, optional
-  execution timeouts (disabled by default),
+- Real persistent subagents with AgentCore execution, concurrency/depth controls, no scheduler
+  execution deadline,
   recursive cancellation, model-callable lifecycle tools, concurrent `wait_agents`, HTTP
   controls, SSE, and right-rail UI.
 - Persisted main-Turn state with explicit terminal outcomes, startup interruption recovery,
@@ -205,7 +205,7 @@ Implemented:
   first; a tool-history HTTP 400 is retried once with compacted text history. The
   provider probe covers text SSE, tool calls, continuation, and fallback behavior.
 - Deterministic two-phase long-horizon evaluation fixture with baseline failure,
-  protected files, hidden grading, restart recovery checks, hard timeouts, trajectory
+  protected files, hidden grading, restart recovery checks, terminal-state waiting, trajectory
   metrics, and byte-level secret scanning. The 2026-07-16 GLM-5.2 run is documented
   under `docs/evaluations/` and currently fails overall at phase closure.
 - Desktop packaging skeleton: `scripts/build-desktop.ps1` builds the release

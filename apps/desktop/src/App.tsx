@@ -19,11 +19,13 @@ import {
   ArrowUp,
   Bot,
   Box,
+  BriefcaseBusiness,
   Check,
   ChevronDown,
   CircleHelp,
   Cloud,
   Clock3,
+  Code2,
   ExternalLink,
   FileCode2,
   FileText,
@@ -47,6 +49,7 @@ import {
   Pin,
   Plug,
   Plus,
+  Presentation,
   RotateCcw,
   Search,
   Settings,
@@ -54,6 +57,7 @@ import {
   ShieldCheck,
   Square,
   SquarePen,
+  Table2,
   TerminalSquare,
   Trash2,
   X,
@@ -87,6 +91,7 @@ import type {
   ArtifactDescriptor,
   ContextStatus,
   ContextSourceFile,
+  ExperienceMode,
   McpServerInput,
   McpServerView,
   Message,
@@ -162,9 +167,21 @@ type WorkspaceResizeDrag = {
 };
 
 const workspaceLayoutStorageKey = "opentopia.workspace-layout.v1";
+const experienceModeStorageKey = "opentopia.experience-mode.v1";
 const workspaceThreePaneBreakpoint = 1120;
 const workspaceLeftMin = 200;
 const workspaceLeftMax = 420;
+
+function readExperienceMode(): ExperienceMode {
+  if (typeof window === "undefined") return "code";
+  try {
+    return window.localStorage.getItem(experienceModeStorageKey) === "work"
+      ? "work"
+      : "code";
+  } catch {
+    return "code";
+  }
+}
 
 function readWorkspaceLayoutPreferences(): WorkspaceLayoutPreferences {
   if (typeof window === "undefined") return {};
@@ -280,6 +297,8 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [experienceMode, setExperienceMode] =
+    useState<ExperienceMode>(readExperienceMode);
   const [selectedWorkspaceRoot, setSelectedWorkspaceRoot] = useState<
     string | null
   >(null);
@@ -457,6 +476,14 @@ export function App() {
       // Layout persistence is best-effort when storage is unavailable.
     }
   }, [workspaceLayoutPreferences]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(experienceModeStorageKey, experienceMode);
+    } catch {
+      // Mode persistence is best-effort when storage is unavailable.
+    }
+  }, [experienceMode]);
 
   useEffect(
     () => () => {
@@ -661,6 +688,7 @@ export function App() {
         const firstVisibleThread = loadedThreads.find(
           (thread) =>
             !thread.archivedAt &&
+            thread.experienceMode === experienceMode &&
             thread.projectId &&
             projectIds.has(thread.projectId),
         );
@@ -832,6 +860,7 @@ export function App() {
   function selectThread(threadId: string) {
     const thread = threads.find((item) => item.id === threadId);
     setActiveThreadId(threadId);
+    if (thread) setExperienceMode(thread.experienceMode);
     setDraftProjectId(null);
     setContextSources([]);
     setSelectedSkillIds([]);
@@ -856,6 +885,16 @@ export function App() {
     setConversationCollapsed(false);
     setSelectedWorkspaceRoot(workspaceRoot);
     setDraftProjectId(projectId);
+  }
+
+  function changeExperienceMode(nextMode: ExperienceMode) {
+    if (nextMode === experienceMode) return;
+    const project = activeProject ?? draftProject;
+    setExperienceMode(nextMode);
+    prepareNewThread(
+      project?.workspaceRoot ?? currentWorkspaceRoot,
+      project?.id ?? draftProjectId,
+    );
   }
 
   function beginNewThread() {
@@ -1363,6 +1402,7 @@ export function App() {
           : project.name,
         workspaceRoot: project.workspaceRoot,
         projectId: project.id,
+        experienceMode,
       });
       setThreads((current) => [thread, ...current]);
       setActiveThreadId(thread.id);
@@ -1967,6 +2007,8 @@ export function App() {
           activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
           workspaceError={workspaceError}
           isPickingWorkspace={isPickingWorkspace}
+          experienceMode={experienceMode}
+          onExperienceModeChange={changeExperienceMode}
           onSelect={selectThread}
           onNew={beginNewThread}
           onPickWorkspace={() => void chooseWorkspace()}
@@ -1994,6 +2036,7 @@ export function App() {
           onOpenThreadWorkspace={(workspaceRoot) =>
             void openWorkspaceRoot(workspaceRoot)
           }
+          onOpenExtensions={() => openToolTab("extensions")}
           onSettings={() => setSettingsOpen(true)}
         />
         <div
@@ -2122,6 +2165,7 @@ export function App() {
               selectedSkillIds={selectedSkillIds}
               isSending={isSending}
               launchMode={newTaskLaunchMode}
+              experienceMode={experienceMode}
               onChange={setComposer}
               onChangeLaunchMode={setNewTaskLaunchMode}
               onPickWorkspace={() => void chooseWorkspace(true)}
@@ -2493,6 +2537,9 @@ function SettingsPanel({
         maxOutputTokens: null,
         contextWindowTokens: 128000,
         reasoningEffort: null,
+        storeResponses: false,
+        parallelToolCalls: false,
+        promptCacheKey: null,
         apiKeySource: "OPENTOPIA_API_KEY",
         apiKeyConfigured: false,
         healthStatus: null,
@@ -2778,6 +2825,7 @@ function SettingsPanel({
                       <option value="openai_compatible">
                         OpenAI Compatible
                       </option>
+                      <option value="openai_responses">OpenAI Responses</option>
                       <option value="mock">Mock</option>
                     </select>
                   </label>
@@ -2869,16 +2917,71 @@ function SettingsPanel({
                             editingProvider.id,
                             "reasoningEffort",
                             (event.target.value || null) as
-                              "low" | "medium" | "high" | null,
+                              | "none"
+                              | "minimal"
+                              | "low"
+                              | "medium"
+                              | "high"
+                              | "xhigh"
+                              | "max"
+                              | null,
                           )
                         }
                       >
                         <option value="">Provider default</option>
+                        <option value="none">None</option>
+                        <option value="minimal">Minimal</option>
                         <option value="low">Low</option>
                         <option value="medium">Medium</option>
                         <option value="high">High</option>
+                        <option value="xhigh">Extra high</option>
+                        <option value="max">Max</option>
                       </select>
                     </label>
+                    <label>
+                      Prompt cache key
+                      <input
+                        value={editingProvider.promptCacheKey ?? ""}
+                        placeholder="Automatic per workspace"
+                        onChange={(event) =>
+                          updateProvider(
+                            editingProvider.id,
+                            "promptCacheKey",
+                            event.target.value || null,
+                          )
+                        }
+                      />
+                    </label>
+                    <label>
+                      <span>Parallel tool calls</span>
+                      <input
+                        type="checkbox"
+                        checked={editingProvider.parallelToolCalls}
+                        onChange={(event) =>
+                          updateProvider(
+                            editingProvider.id,
+                            "parallelToolCalls",
+                            event.target.checked,
+                          )
+                        }
+                      />
+                    </label>
+                    {editingProvider.kind === "openai_responses" && (
+                      <label>
+                        <span>Store Responses state</span>
+                        <input
+                          type="checkbox"
+                          checked={editingProvider.storeResponses}
+                          onChange={(event) =>
+                            updateProvider(
+                              editingProvider.id,
+                              "storeResponses",
+                              event.target.checked,
+                            )
+                          }
+                        />
+                      </label>
+                    )}
                   </div>
                   <div className="settings-provider-key-reference">
                     Credential reference:{" "}
@@ -3052,6 +3155,8 @@ function Sidebar({
   activeWorkspaceRemoteUrl,
   workspaceError,
   isPickingWorkspace,
+  experienceMode,
+  onExperienceModeChange,
   onSelect,
   onNew,
   onPickWorkspace,
@@ -3065,6 +3170,7 @@ function Sidebar({
   onRenameThread,
   onArchiveThread,
   onRestoreThread,
+  onOpenExtensions,
   onSettings,
 }: {
   projects: Project[];
@@ -3074,6 +3180,8 @@ function Sidebar({
   activeWorkspaceRemoteUrl: string | null;
   workspaceError: string | null;
   isPickingWorkspace: boolean;
+  experienceMode: ExperienceMode;
+  onExperienceModeChange(mode: ExperienceMode): void;
   onSelect(id: string): void;
   onNew(): void;
   onPickWorkspace(): void;
@@ -3087,8 +3195,10 @@ function Sidebar({
   onRenameThread(thread: Thread): void;
   onArchiveThread(thread: Thread): void;
   onRestoreThread(thread: Thread): void;
+  onOpenExtensions(): void;
   onSettings(): void;
 }) {
+  const [experienceMenuOpen, setExperienceMenuOpen] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("New project");
@@ -3108,6 +3218,9 @@ function Sidebar({
   );
   const projectMenuRef = useDismissiblePopover(projectMenuOpen, () =>
     setProjectMenuOpen(false),
+  );
+  const experienceMenuRef = useDismissiblePopover(experienceMenuOpen, () =>
+    setExperienceMenuOpen(false),
   );
   const unassignedThreads = threads.filter(
     (thread) => !thread.projectId && !thread.archivedAt,
@@ -3152,10 +3265,58 @@ function Sidebar({
     <>
       <aside className="sidebar" id="workspace-sidebar">
         <div className="sidebar-brand-row">
-          <strong>
-            <span className="brand-open">Open</span>
-            <span>Topia</span>
-          </strong>
+          <div className="experience-mode-menu" ref={experienceMenuRef}>
+            <button
+              type="button"
+              className="experience-mode-trigger"
+              aria-label={`当前模式：${experienceMode === "work" ? "Work" : "Code"}`}
+              aria-haspopup="menu"
+              aria-expanded={experienceMenuOpen}
+              onClick={() => setExperienceMenuOpen((current) => !current)}
+            >
+              {experienceMode === "work" ? (
+                <BriefcaseBusiness size={15} aria-hidden="true" />
+              ) : (
+                <Code2 size={15} aria-hidden="true" />
+              )}
+              <span>{experienceMode === "work" ? "Work" : "Code"}</span>
+              <ChevronDown
+                className={experienceMenuOpen ? "open" : undefined}
+                size={14}
+                aria-hidden="true"
+              />
+            </button>
+            {experienceMenuOpen && (
+              <div className="tool-popover experience-mode-popover" role="menu">
+                {(
+                  [
+                    { id: "work", label: "Work", icon: BriefcaseBusiness },
+                    { id: "code", label: "Code", icon: Code2 },
+                  ] as const
+                ).map((option) => {
+                  const Icon = option.icon;
+                  const selected = option.id === experienceMode;
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={selected}
+                      className={selected ? "active" : undefined}
+                      onClick={() => {
+                        onExperienceModeChange(option.id);
+                        setExperienceMenuOpen(false);
+                      }}
+                    >
+                      <Icon size={14} aria-hidden="true" />
+                      <span>{option.label}</span>
+                      {selected && <Check size={13} aria-hidden="true" />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
           <button
             className="sidebar-icon-button"
             disabled
@@ -3175,7 +3336,7 @@ function Sidebar({
             <span>已安排</span>
             <small>未实现</small>
           </button>
-          <button disabled title="MCP 插件已实现，请在右侧扩展标签管理">
+          <button onClick={onOpenExtensions} title="管理 MCP 扩展">
             <Plug size={15} />
             <span>插件</span>
             <small>MCP</small>
@@ -3458,9 +3619,17 @@ function Sidebar({
         </div>
 
         <div className="sidebar-footer">
-          <button onClick={onSettings}>
+          <button
+            className="sidebar-settings-button"
+            title="设置"
+            aria-label="设置"
+            onClick={onSettings}
+          >
             <Settings size={15} />
-            <span>设置</span>
+            <span className="opentopia-wordmark" aria-hidden="true">
+              <span className="brand-open">Open</span>
+              <span>Topia</span>
+            </span>
           </button>
           <button disabled title="帮助 · 未实现" aria-label="帮助">
             <CircleHelp size={15} />
@@ -5059,6 +5228,7 @@ function NewTaskState({
   selectedSkillIds,
   isSending,
   launchMode,
+  experienceMode,
   onChange,
   onChangeLaunchMode,
   onPickWorkspace,
@@ -5083,6 +5253,7 @@ function NewTaskState({
   selectedSkillIds: string[];
   isSending: boolean;
   launchMode: NewTaskLaunchMode;
+  experienceMode: ExperienceMode;
   onChange(value: string): void;
   onChangeLaunchMode(mode: NewTaskLaunchMode): void;
   onPickWorkspace(): void;
@@ -5095,36 +5266,64 @@ function NewTaskState({
   onToggleSkill(skillId: string): void;
   onSubmit(): void;
 }) {
-  const suggestions = [
-    {
-      icon: Search,
-      label: "探索并理解代码",
-      prompt: "分析这个项目的架构和核心模块",
-    },
-    {
-      icon: FileCode2,
-      label: "构建新功能",
-      prompt: "为这个项目实现一个新功能",
-    },
-    {
-      icon: Check,
-      label: "审查代码更改",
-      prompt: "审查当前工作区中的代码更改",
-    },
-    { icon: Activity, label: "修复问题", prompt: "检查并修复当前项目中的问题" },
-  ];
+  const suggestions =
+    experienceMode === "work"
+      ? [
+          {
+            icon: Search,
+            label: "研究并汇总资料",
+            prompt: "研究这个主题，核对来源并整理成清晰的结论",
+          },
+          {
+            icon: FileText,
+            label: "撰写与整理文档",
+            prompt: "根据项目资料撰写并整理一份完整文档",
+          },
+          {
+            icon: Table2,
+            label: "分析表格与数据",
+            prompt: "分析项目中的表格和数据，并总结关键发现",
+          },
+          {
+            icon: Presentation,
+            label: "制作演示或报告",
+            prompt: "根据项目内容制作一份结构清晰的演示或报告",
+          },
+        ]
+      : [
+          {
+            icon: Search,
+            label: "探索并理解代码",
+            prompt: "分析这个项目的架构和核心模块",
+          },
+          {
+            icon: FileCode2,
+            label: "构建新功能",
+            prompt: "为这个项目实现一个新功能",
+          },
+          {
+            icon: Check,
+            label: "审查代码更改",
+            prompt: "审查当前工作区中的代码更改",
+          },
+          {
+            icon: Activity,
+            label: "修复问题",
+            prompt: "检查并修复当前项目中的问题",
+          },
+        ];
 
   return (
     <>
       <div className="new-task-state">
         <Bot size={34} />
         <h2>
-          我们应该在{" "}
+          {experienceMode === "work" ? "今天想在" : "我们应该在"}{" "}
           <u>
             {projectName ??
               (workspaceRoot ? workspaceName(workspaceRoot) : "项目")}
           </u>{" "}
-          中构建什么？
+          {experienceMode === "work" ? "中完成什么？" : "中构建什么？"}
         </h2>
         <div className="task-suggestions">
           {suggestions.map((suggestion) => {

@@ -4,9 +4,11 @@ pub mod context_sources;
 pub mod desktop_browser;
 pub mod execution;
 pub mod git_workflow;
+pub mod instructions;
 pub mod mcp;
 pub mod mcp_host;
 pub mod model;
+pub mod model_context;
 pub mod policy;
 pub mod preview;
 pub mod provider;
@@ -20,8 +22,8 @@ pub mod tools;
 pub mod workspace;
 
 pub use agent::{
-    AgentContinuation, AgentCore, AgentEventSender, AgentTurnInput, AgentTurnOutcome,
-    AgentTurnResult, ContextBudget as AgentContextBudget,
+    default_agent_model_context, AgentContinuation, AgentCore, AgentEventSender, AgentTurnInput,
+    AgentTurnOutcome, AgentTurnResult, ContextBudget as AgentContextBudget,
 };
 pub use browser::{
     BrowserContent, BrowserDownload, BrowserDownloadRequest, BrowserError, BrowserNavigateRequest,
@@ -45,6 +47,9 @@ pub use git_workflow::{
     GitWorkflowActionKind, GitWorkflowError, GitWorkflowRequest, GitWorkflowResult,
     ListBranchesRequest, PushRequest, SwitchBranchRequest, WorktreeTarget,
 };
+pub use instructions::{
+    resolve_instruction_documents, InstructionDocument, InstructionResolution, InstructionScope,
+};
 pub use mcp::{
     McpCallResult, McpLifecycleStatus, McpServerConfig, McpServerStatus, McpToolDescriptor,
     ThreadMcpServer,
@@ -52,10 +57,16 @@ pub use mcp::{
 pub use mcp_host::{McpExtensionHost, McpHostError, McpToolRoute};
 pub use model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    ArtifactStorage, ArtifactStorageMetadata, ContextSourceRef, ContextSummary, Message,
-    MessagePart, MessageRole, ModelContentPart, Project, SkillRef, TaskPlan, TaskPlanStep,
+    ArtifactStorage, ArtifactStorageMetadata, ContextSourceRef, ContextSummary, ExperienceMode,
+    Message, MessagePart, MessageRole, ModelContentPart, Project, SkillRef, TaskPlan, TaskPlanStep,
     TaskPlanStepStatus, TerminalCommandHistory, TerminalCommandStatus, Thread, ToolCall,
     ToolResult, TurnRecord, TurnStatus,
+};
+pub use model_context::{
+    content_fingerprint, estimate_tokens as estimate_model_context_tokens, world_state_item,
+    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
+    InstructionSnapshotRef, ModelContextItem, ThreadContextSnapshot, TurnContextSnapshot,
+    WorldStateSkill, WorldStateSnapshot,
 };
 pub use policy::{
     BasicPolicyEngine, CommandPolicyRule, CommandRuleMatch, NetworkPolicyConfig, PermissionMode,
@@ -69,9 +80,10 @@ pub use preview::{
     ResolvedPreview, MAX_PREVIEW_CONTENT_BYTES,
 };
 pub use provider::{
-    MockProvider, ModelConversationMessage, ModelConversationRole, ModelInputContent,
-    ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
-    OpenAiCompatibleProvider, ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
+    redact_model_observation, MockProvider, ModelConversationMessage, ModelConversationRole,
+    ModelInputContent, ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
+    OpenAiCompatibleProvider, OpenAiResponsesProvider, PreparedProviderRequest, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolResult, ProviderTransportEvent,
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,

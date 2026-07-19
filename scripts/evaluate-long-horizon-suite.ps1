@@ -9,7 +9,6 @@ param(
   ),
   [ValidateRange(1, 10)][int]$Repetitions = 1,
   [int]$StartPort = 8812,
-  [int]$TurnTimeoutSeconds = 300,
   [string]$SummaryPath = "",
   [switch]$SkipBuild
 )
@@ -51,7 +50,6 @@ foreach ($manifest in $TaskManifests) {
       "-ExpectedModel", $ExpectedModel,
       "-TaskManifest", $manifestPath,
       "-Port", $port,
-      "-TurnTimeoutSeconds", $TurnTimeoutSeconds,
       "-SummaryPath", $childSummary
     )
     if ($buildCompleted) {
@@ -125,9 +123,6 @@ $taskSummaries = @($validRuns | Group-Object taskId | ForEach-Object {
         totalTokens = $_.result.trajectoryMetrics.totalTokens
         completionToolCalls = $_.result.trajectoryMetrics.completionToolCalls
         verifiedPlanCompletionCalls = $_.result.trajectoryMetrics.verifiedPlanCompletionCalls
-        fallbackVerifiedCompletions = $_.result.trajectoryMetrics.fallbackVerifiedCompletions
-        blockedLoopGuardToolCalls = $_.result.trajectoryMetrics.blockedLoopGuardToolCalls
-        blockedCompletionModeToolCalls = $_.result.trajectoryMetrics.blockedCompletionModeToolCalls
         recoveryPassed = $_.result.recoveryPassed
         processContractPassed = $_.result.processContractPassed
         error = $_.result.error
@@ -153,7 +148,6 @@ $summary = [ordered]@{
   }
   configuration = [ordered]@{
     repetitions = $Repetitions
-    turnTimeoutSeconds = $TurnTimeoutSeconds
     taskManifests = @($TaskManifests)
   }
   aggregate = [ordered]@{

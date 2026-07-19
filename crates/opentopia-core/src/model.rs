@@ -1,4 +1,5 @@
 use crate::context_sources::{ContextSourceKind, LoadedContextSource};
+use crate::model_context::{ModelContextItem, ThreadContextSnapshot, TurnContextSnapshot};
 use crate::skills::LoadedSkill;
 use crate::subagents::SubagentRun;
 use chrono::{DateTime, Utc};
@@ -41,19 +42,55 @@ pub struct Thread {
     pub title: String,
     pub workspace_root: PathBuf,
     pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub experience_mode: ExperienceMode,
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceMode {
+    Work,
+    #[default]
+    Code,
+}
+
+impl ExperienceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Code => "code",
+        }
+    }
+
+    pub fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "work" => Ok(Self::Work),
+            "code" => Ok(Self::Code),
+            other => anyhow::bail!("unknown experience mode: {other}"),
+        }
+    }
+}
+
 impl Thread {
     pub fn new(title: impl Into<String>, workspace_root: PathBuf) -> Self {
+        Self::new_with_mode(title, workspace_root, ExperienceMode::Code)
+    }
+
+    pub fn new_with_mode(
+        title: impl Into<String>,
+        workspace_root: PathBuf,
+        experience_mode: ExperienceMode,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             title: title.into(),
             workspace_root,
             project_id: None,
+            experience_mode,
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -65,7 +102,16 @@ impl Thread {
         workspace_root: PathBuf,
         project_id: Uuid,
     ) -> Self {
-        let mut thread = Self::new(title, workspace_root);
+        Self::new_in_project_with_mode(title, workspace_root, project_id, ExperienceMode::Code)
+    }
+
+    pub fn new_in_project_with_mode(
+        title: impl Into<String>,
+        workspace_root: PathBuf,
+        project_id: Uuid,
+        experience_mode: ExperienceMode,
+    ) -> Self {
+        let mut thread = Self::new_with_mode(title, workspace_root, experience_mode);
         thread.project_id = Some(project_id);
         thread
     }
@@ -715,12 +761,52 @@ impl AgentEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEventPayload {
+    ThreadContextSnapshot {
+        snapshot: ThreadContextSnapshot,
+    },
+    TurnContextSnapshot {
+        snapshot: TurnContextSnapshot,
+    },
     TurnStarted {
         user_message_id: Uuid,
     },
+    ModelContextBuilt {
+        #[serde(default = "Uuid::new_v4")]
+        request_id: Uuid,
+        round: usize,
+        context_hash: String,
+        token_estimate: usize,
+        items: Vec<ModelContextItem>,
+    },
     ModelRequest {
+        #[serde(default = "Uuid::new_v4")]
+        request_id: Uuid,
         round: usize,
         request: Value,
+    },
+    ProviderRequestSent {
+        request_id: Uuid,
+        round: usize,
+        attempt: usize,
+        adapter: String,
+        method: String,
+        endpoint: String,
+        body: Value,
+    },
+    ProviderRequestRetried {
+        request_id: Uuid,
+        round: usize,
+        attempt: usize,
+        reason: String,
+        body: Value,
+    },
+    ProviderResponseReceived {
+        request_id: Uuid,
+        round: usize,
+        attempt: usize,
+        status: Option<u16>,
+        response_id: Option<String>,
+        body: Value,
     },
     ModelDelta {
         text: String,
@@ -778,8 +864,14 @@ pub enum AgentEventPayload {
 impl AgentEventPayload {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::ThreadContextSnapshot { .. } => "thread_context_snapshot",
+            Self::TurnContextSnapshot { .. } => "turn_context_snapshot",
             Self::TurnStarted { .. } => "turn_started",
+            Self::ModelContextBuilt { .. } => "model_context_built",
             Self::ModelRequest { .. } => "model_request",
+            Self::ProviderRequestSent { .. } => "provider_request_sent",
+            Self::ProviderRequestRetried { .. } => "provider_request_retried",
+            Self::ProviderResponseReceived { .. } => "provider_response_received",
             Self::ModelDelta { .. } => "model_delta",
             Self::ReasoningDelta { .. } => "reasoning_delta",
             Self::ToolCallStarted { .. } => "tool_call_started",
@@ -853,6 +945,7 @@ mod tests {
     #[test]
     fn model_request_uses_the_public_snapshot_event_contract() {
         let payload = AgentEventPayload::ModelRequest {
+            request_id: Uuid::nil(),
             round: 2,
             request: json!({
                 "systemPrompt": "system",
@@ -864,6 +957,7 @@ mod tests {
             serde_json::to_value(payload).unwrap(),
             json!({
                 "type": "model_request",
+                "request_id": Uuid::nil(),
                 "round": 2,
                 "request": {
                     "systemPrompt": "system",

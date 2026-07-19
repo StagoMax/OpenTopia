@@ -3,7 +3,6 @@ param(
   [string]$Profile = "AUDIT_COPILOT_LLM",
   [string]$ExpectedModel = "glm-5.2",
   [int]$Port = 8812,
-  [int]$TurnTimeoutSeconds = 420,
   [string]$SummaryPath = "",
   [string]$TaskManifest = "scripts\fixtures\long-horizon\task.json",
   [switch]$SkipBuild
@@ -138,15 +137,12 @@ function Stop-EvalServer {
 function Wait-EvalTurn {
   param(
     [Parameter(Mandatory = $true)][string]$ThreadId,
-    [Parameter(Mandatory = $true)][string]$UserMessageId,
-    [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    [Parameter(Mandatory = $true)][string]$UserMessageId
   )
 
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  $unexpectedExecutionCheckpoints = 0
   $deniedApprovals = 0
   $lastTurn = $null
-  while ((Get-Date) -lt $deadline) {
+  while ($true) {
     Start-Sleep -Milliseconds 500
     $lastTurn = Invoke-EvalApi "Get" "/api/threads/$ThreadId/turn"
     if (-not $lastTurn -or $lastTurn.userMessageId -ne $UserMessageId) {
@@ -163,34 +159,20 @@ function Wait-EvalTurn {
       if (-not $approvalId) {
         throw "Pending approval did not include approvalId"
       }
-      $isUnexpectedExecutionCheckpoint =
-        $pending[0].action -eq "Continue agent execution"
       Invoke-EvalApi `
         -Method "Post" `
         -Path "/api/threads/$ThreadId/approvals/$approvalId/decision" `
-        -Body @{ approved = $false } `
-        -TimeoutSeconds $TimeoutSeconds | Out-Null
-      if ($isUnexpectedExecutionCheckpoint) {
-        $unexpectedExecutionCheckpoints += 1
-      } else {
-        $deniedApprovals += 1
-      }
+        -Body @{ approved = $false } | Out-Null
+      $deniedApprovals += 1
       continue
     }
     if ($lastTurn.status -in @("succeeded", "failed", "cancelled", "interrupted")) {
       return [PSCustomObject]@{
         Turn = $lastTurn
-        UnexpectedExecutionCheckpoints = $unexpectedExecutionCheckpoints
         DeniedApprovals = $deniedApprovals
       }
     }
   }
-
-  try {
-    Invoke-EvalApi "Post" "/api/threads/$ThreadId/turn/cancel" @{} | Out-Null
-  } catch {
-  }
-  throw "Turn exceeded the configured hard timeout"
 }
 
 function Invoke-HiddenGrader {
@@ -229,10 +211,6 @@ function Get-TrajectoryMetrics {
   $toolFinishes = @($Events | Where-Object { $_.payload.type -eq "tool_call_finished" })
   $planEvents = @($Events | Where-Object { $_.payload.type -eq "plan_updated" })
   $usageEvents = @($Events | Where-Object { $_.payload.type -eq "token_usage" })
-  $unexpectedExecutionCheckpoints = @($Events | Where-Object {
-    $_.payload.type -eq "approval_requested" -and
-    $_.payload.action -eq "Continue agent execution"
-  })
   $toolByName = [ordered]@{}
   foreach ($event in $toolStarts) {
     $name = [string]$event.payload.call.name
@@ -248,12 +226,6 @@ function Get-TrajectoryMetrics {
   $completionToolCalls = @($toolStarts | Where-Object {
     $_.payload.call.name -eq "complete_task"
   }).Count
-  $blockedLoopGuardToolCalls = @($toolFinishes | Where-Object {
-    $_.payload.result.metadata.loopGuardBlocked -eq $true
-  }).Count
-  $blockedCompletionModeToolCalls = @($toolFinishes | Where-Object {
-    $_.payload.result.metadata.completionModeBlocked -eq $true
-  }).Count
   $verifiedPlanCompletionCalls = @($toolFinishes | Where-Object {
     $_.payload.result.metadata.toolName -eq "update_plan" -and
     $_.payload.result.metadata.success -eq $true -and
@@ -261,9 +233,6 @@ function Get-TrajectoryMetrics {
       $_.payload.result.metadata.currentScopeComplete -eq $true -or
       $_.payload.result.metadata.allStepsComplete -eq $true
     )
-  }).Count
-  $fallbackVerifiedCompletions = @($planEvents | Where-Object {
-    [string]$_.payload.plan.explanation -like "Runtime fallback reconciled the durable plan*"
   }).Count
   $latestPlan = if ($planEvents.Count -gt 0) {
     $planEvents[$planEvents.Count - 1].payload.plan
@@ -297,14 +266,10 @@ function Get-TrajectoryMetrics {
     toolCallsFinished = $toolFinishes.Count
     toolCallsByName = $toolByName
     planUpdates = $planEvents.Count
-    unexpectedExecutionCheckpoints = $unexpectedExecutionCheckpoints.Count
     latestPlan = $planStatus
     testToolCalls = $testToolCalls
     completionToolCalls = $completionToolCalls
     verifiedPlanCompletionCalls = $verifiedPlanCompletionCalls
-    fallbackVerifiedCompletions = $fallbackVerifiedCompletions
-    blockedLoopGuardToolCalls = $blockedLoopGuardToolCalls
-    blockedCompletionModeToolCalls = $blockedCompletionModeToolCalls
     inputTokens = $inputTokens
     outputTokens = $outputTokens
     totalTokens = $totalTokens
@@ -431,8 +396,6 @@ $providerProbe = $null
 $providerHealth = $null
 $phase1Turn = $null
 $phase2Turn = $null
-$phase1UnexpectedExecutionCheckpoints = 0
-$phase2UnexpectedExecutionCheckpoints = 0
 $phase1DeniedApprovals = 0
 $phase2DeniedApprovals = 0
 $thread = $null
@@ -534,10 +497,9 @@ try {
   $phase1Message = Invoke-EvalApi "Post" "/api/threads/$($thread.id)/messages" @{
     content = $phase1Prompt
   }
-  $phase1Wait = Wait-EvalTurn $thread.id $phase1Message.id $TurnTimeoutSeconds
+  $phase1Wait = Wait-EvalTurn $thread.id $phase1Message.id
   $phase1ElapsedMs = [int64]((Get-Date) - $phase1StartedAt).TotalMilliseconds
   $phase1Turn = $phase1Wait.Turn
-  $phase1UnexpectedExecutionCheckpoints = $phase1Wait.UnexpectedExecutionCheckpoints
   $phase1DeniedApprovals = $phase1Wait.DeniedApprovals
   $eventsPhase1 = @(Expand-EvalItems (
     Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
@@ -591,10 +553,9 @@ try {
   $phase2Message = Invoke-EvalApi "Post" "/api/threads/$($thread.id)/messages" @{
     content = $phase2Prompt
   }
-  $phase2Wait = Wait-EvalTurn $thread.id $phase2Message.id $TurnTimeoutSeconds
+  $phase2Wait = Wait-EvalTurn $thread.id $phase2Message.id
   $phase2ElapsedMs = [int64]((Get-Date) - $phase2StartedAt).TotalMilliseconds
   $phase2Turn = $phase2Wait.Turn
-  $phase2UnexpectedExecutionCheckpoints = $phase2Wait.UnexpectedExecutionCheckpoints
   $phase2DeniedApprovals = $phase2Wait.DeniedApprovals
   $eventsFinal = @(Expand-EvalItems (
     Invoke-EvalApi "Get" "/api/threads/$($thread.id)/events"
@@ -662,12 +623,10 @@ $minCompletedPlanSteps = if ($null -ne $task.process.minCompletedPlanSteps) {
 $requireExplicitCompletion = $task.process.requireExplicitCompletion -eq $true
 $phase1CompletionSignals =
   $phase1Metrics.completionToolCalls +
-  $phase1Metrics.verifiedPlanCompletionCalls +
-  $phase1Metrics.fallbackVerifiedCompletions
+  $phase1Metrics.verifiedPlanCompletionCalls
 $completionSignals =
   $metrics.completionToolCalls +
-  $metrics.verifiedPlanCompletionCalls +
-  $metrics.fallbackVerifiedCompletions
+  $metrics.verifiedPlanCompletionCalls
 $latestPlanComplete =
   $metrics.planUpdates -gt 0 -and
   $metrics.latestPlan.pending -eq 0 -and
@@ -744,7 +703,6 @@ $result = [ordered]@{
     phase1Ms = $phase1ElapsedMs
     restartMs = $restartElapsedMs
     phase2Ms = $phase2ElapsedMs
-    hardTimeoutPerTurnSeconds = $TurnTimeoutSeconds
   }
   baseline = [ordered]@{
     publicTestsExitCode = $baselinePublicExit
@@ -760,14 +718,12 @@ $result = [ordered]@{
       phase = 1
       status = if ($phase1Turn) { $phase1Turn.status } else { "not_completed" }
       elapsedMs = $phase1ElapsedMs
-      unexpectedExecutionCheckpoints = $phase1UnexpectedExecutionCheckpoints
       deniedApprovals = $phase1DeniedApprovals
     },
     [ordered]@{
       phase = 2
       status = if ($phase2Turn) { $phase2Turn.status } else { "not_completed" }
       elapsedMs = $phase2ElapsedMs
-      unexpectedExecutionCheckpoints = $phase2UnexpectedExecutionCheckpoints
       deniedApprovals = $phase2DeniedApprovals
     }
   )
@@ -781,8 +737,6 @@ $result = [ordered]@{
     totalCompletionCalls = $metrics.completionToolCalls
     phase1VerifiedPlanCompletions = $phase1Metrics.verifiedPlanCompletionCalls
     totalVerifiedPlanCompletions = $metrics.verifiedPlanCompletionCalls
-    phase1FallbackVerifiedCompletions = $phase1Metrics.fallbackVerifiedCompletions
-    totalFallbackVerifiedCompletions = $metrics.fallbackVerifiedCompletions
     minPlanUpdates = $minPlanUpdates
     minTestToolCalls = $minTestToolCalls
     minCompletedPlanSteps = $minCompletedPlanSteps

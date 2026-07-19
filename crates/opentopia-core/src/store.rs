@@ -1,8 +1,9 @@
 use crate::mcp::{McpServerConfig, ThreadMcpServer};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    ArtifactStorage, ArtifactStorageMetadata, Message, MessagePart, MessageRole, Project,
-    TerminalCommandHistory, TerminalCommandStatus, Thread, ToolResult, TurnRecord, TurnStatus,
+    ArtifactStorage, ArtifactStorageMetadata, ExperienceMode, Message, MessagePart, MessageRole,
+    Project, TerminalCommandHistory, TerminalCommandStatus, Thread, ToolResult, TurnRecord,
+    TurnStatus,
 };
 use crate::settings::AppSettings;
 use crate::subagents::{SubagentRun, SubagentRunStatus};
@@ -47,10 +48,22 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         title: Option<String>,
         workspace_root: PathBuf,
     ) -> anyhow::Result<Thread>;
+    fn create_thread_with_mode(
+        &self,
+        title: Option<String>,
+        workspace_root: PathBuf,
+        experience_mode: ExperienceMode,
+    ) -> anyhow::Result<Thread>;
     fn create_thread_in_project(
         &self,
         title: Option<String>,
         project_id: Uuid,
+    ) -> anyhow::Result<Thread>;
+    fn create_thread_in_project_with_mode(
+        &self,
+        title: Option<String>,
+        project_id: Uuid,
+        experience_mode: ExperienceMode,
     ) -> anyhow::Result<Thread>;
     fn get_thread(&self, id: Uuid) -> anyhow::Result<Option<Thread>>;
     fn list_threads(&self) -> anyhow::Result<Vec<Thread>>;
@@ -269,6 +282,8 @@ impl SqliteSessionStore {
                 title TEXT NOT NULL,
                 workspace_root TEXT NOT NULL,
                 project_id TEXT,
+                experience_mode TEXT NOT NULL DEFAULT 'code'
+                    CHECK(experience_mode IN ('work', 'code')),
                 archived_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -467,6 +482,12 @@ impl SqliteSessionStore {
         if !table_has_column(&conn, "threads", "archived_at")? {
             conn.execute("ALTER TABLE threads ADD COLUMN archived_at TEXT", [])?;
         }
+        if !table_has_column(&conn, "threads", "experience_mode")? {
+            conn.execute(
+                "ALTER TABLE threads ADD COLUMN experience_mode TEXT NOT NULL DEFAULT 'code' CHECK(experience_mode IN ('work', 'code'))",
+                [],
+            )?;
+        }
         conn.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_threads_project_updated
@@ -478,8 +499,8 @@ impl SqliteSessionStore {
         if schema_version < 1 {
             backfill_thread_projects(&mut conn)?;
         }
-        if schema_version < 2 {
-            conn.execute_batch("PRAGMA user_version = 2;")?;
+        if schema_version < 3 {
+            conn.execute_batch("PRAGMA user_version = 3;")?;
         }
         Ok(())
     }
@@ -872,9 +893,19 @@ impl SessionStore for SqliteSessionStore {
         title: Option<String>,
         workspace_root: PathBuf,
     ) -> anyhow::Result<Thread> {
-        let thread = Thread::new(
+        self.create_thread_with_mode(title, workspace_root, ExperienceMode::Code)
+    }
+
+    fn create_thread_with_mode(
+        &self,
+        title: Option<String>,
+        workspace_root: PathBuf,
+        experience_mode: ExperienceMode,
+    ) -> anyhow::Result<Thread> {
+        let thread = Thread::new_with_mode(
             title.unwrap_or_else(|| "Untitled thread".to_string()),
             workspace_root,
+            experience_mode,
         );
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         insert_thread(&conn, &thread)?;
@@ -886,16 +917,26 @@ impl SessionStore for SqliteSessionStore {
         title: Option<String>,
         project_id: Uuid,
     ) -> anyhow::Result<Thread> {
+        self.create_thread_in_project_with_mode(title, project_id, ExperienceMode::Code)
+    }
+
+    fn create_thread_in_project_with_mode(
+        &self,
+        title: Option<String>,
+        project_id: Uuid,
+        experience_mode: ExperienceMode,
+    ) -> anyhow::Result<Thread> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let project =
             query_project(&conn, project_id)?.ok_or(StoreError::ProjectNotFound(project_id))?;
         let workspace_root = project
             .workspace_root
             .ok_or(StoreError::ProjectHasNoWorkspace(project_id))?;
-        let thread = Thread::new_in_project(
+        let thread = Thread::new_in_project_with_mode(
             title.unwrap_or_else(|| "Untitled thread".to_string()),
             workspace_root,
             project_id,
+            experience_mode,
         );
         insert_thread(&conn, &thread)?;
         Ok(thread)
@@ -906,7 +947,7 @@ impl SessionStore for SqliteSessionStore {
         let thread = conn
             .query_row(
                 r#"
-                SELECT id, title, workspace_root, project_id, archived_at, created_at, updated_at
+                SELECT id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
                 FROM threads
                 WHERE id = ?1
                 "#,
@@ -928,13 +969,13 @@ impl SessionStore for SqliteSessionStore {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let sql = if include_archived {
             r#"
-            SELECT id, title, workspace_root, project_id, archived_at, created_at, updated_at
+            SELECT id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
             FROM threads
             ORDER BY updated_at DESC
             "#
         } else {
             r#"
-            SELECT id, title, workspace_root, project_id, archived_at, created_at, updated_at
+            SELECT id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
             FROM threads
             WHERE archived_at IS NULL
             ORDER BY updated_at DESC
@@ -1909,9 +1950,9 @@ fn insert_thread(conn: &Connection, thread: &Thread) -> anyhow::Result<()> {
     conn.execute(
         r#"
         INSERT INTO threads (
-            id, title, workspace_root, project_id, archived_at, created_at, updated_at
+            id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
         params![
             thread.id.to_string(),
@@ -1919,6 +1960,7 @@ fn insert_thread(conn: &Connection, thread: &Thread) -> anyhow::Result<()> {
             thread.workspace_root.to_string_lossy(),
             thread.project_id.map(|id| id.to_string()),
             thread.archived_at.map(|value| value.to_rfc3339()),
+            thread.experience_mode.as_str(),
             thread.created_at.to_rfc3339(),
             thread.updated_at.to_rfc3339(),
         ],
@@ -1929,7 +1971,7 @@ fn insert_thread(conn: &Connection, thread: &Thread) -> anyhow::Result<()> {
 fn query_thread(conn: &Connection, id: Uuid) -> anyhow::Result<Option<Thread>> {
     conn.query_row(
         r#"
-        SELECT id, title, workspace_root, project_id, archived_at, created_at, updated_at
+        SELECT id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
         FROM threads
         WHERE id = ?1
         "#,
@@ -1962,16 +2004,28 @@ where
 fn map_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     let project_id: Option<String> = row.get(3)?;
     let archived_at: Option<String> = row.get(4)?;
+    let experience_mode_value: String = row.get(5)?;
+    let experience_mode = ExperienceMode::from_str(&experience_mode_value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            )),
+        )
+    })?;
     Ok(Thread {
         id: parse_uuid(row.get(0)?, 0)?,
         title: row.get(1)?,
         workspace_root: PathBuf::from(row.get::<_, String>(2)?),
         project_id: project_id.map(|value| parse_uuid(value, 3)).transpose()?,
+        experience_mode,
         archived_at: archived_at
             .map(|value| parse_datetime(value, 4))
             .transpose()?,
-        created_at: parse_datetime(row.get(5)?, 5)?,
-        updated_at: parse_datetime(row.get(6)?, 6)?,
+        created_at: parse_datetime(row.get(6)?, 6)?,
+        updated_at: parse_datetime(row.get(7)?, 7)?,
     })
 }
 
@@ -2531,8 +2585,40 @@ mod tests {
             Thread::new_in_project("Thread", PathBuf::from(r"J:\Project\OpenTopia"), project.id);
         let thread_json = serde_json::to_value(&thread).expect("serialize thread");
         assert_eq!(thread_json["projectId"], project.id.to_string());
+        assert_eq!(thread_json["experienceMode"], "code");
         assert_eq!(thread_json["archivedAt"], Value::Null);
         assert!(thread_json.get("project_id").is_none());
+    }
+
+    #[test]
+    fn thread_experience_mode_defaults_to_code_and_round_trips_work() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let project = store
+            .create_project(
+                "OpenTopia".to_string(),
+                Some(PathBuf::from(r"J:\Project\OpenTopia")),
+                false,
+                0,
+            )
+            .expect("create project");
+
+        let code_thread = store
+            .create_thread_in_project(Some("Code task".to_string()), project.id)
+            .expect("create code thread");
+        assert_eq!(code_thread.experience_mode, ExperienceMode::Code);
+
+        let work_thread = store
+            .create_thread_in_project_with_mode(
+                Some("Work task".to_string()),
+                project.id,
+                ExperienceMode::Work,
+            )
+            .expect("create work thread");
+        let loaded = store
+            .get_thread(work_thread.id)
+            .expect("load work thread")
+            .expect("work thread exists");
+        assert_eq!(loaded.experience_mode, ExperienceMode::Work);
     }
 
     #[test]
@@ -2800,6 +2886,9 @@ mod tests {
                 .list_threads_including_archived(true)
                 .expect("list migrated threads");
             assert_eq!(threads.len(), 4);
+            assert!(threads
+                .iter()
+                .all(|thread| thread.experience_mode == ExperienceMode::Code));
             let mut project_counts = HashMap::new();
             for thread in threads {
                 *project_counts

@@ -87,6 +87,14 @@ type PrimitiveActivity =
       isDelta: boolean;
       createdAt: string;
     }
+  | {
+      kind: "observability";
+      seq: number;
+      title: string;
+      summary: string;
+      detail: unknown;
+      createdAt: string;
+    }
   | { kind: "subagent"; seq: number; run: SubagentRun; createdAt: string }
   | {
       kind: "approval";
@@ -251,6 +259,15 @@ function ActivityEntryView({
   }
   if (entry.kind === "model-request") {
     return <ModelRequestActivity round={entry.round} request={entry.request} />;
+  }
+  if (entry.kind === "observability") {
+    return (
+      <JsonActivity
+        title={entry.title}
+        summary={entry.summary}
+        detail={entry.detail}
+      />
+    );
   }
   if (entry.kind === "plan") {
     return (
@@ -637,6 +654,43 @@ function ModelRequestActivity({
   );
 }
 
+function JsonActivity({
+  title,
+  summary,
+  detail,
+}: {
+  title: string;
+  summary: string;
+  detail: unknown;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div
+      className="activity-group model-request-activity"
+      data-state="complete"
+    >
+      <button
+        className="activity-group-header"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="activity-group-icon" aria-hidden="true">
+          <Activity size={13} />
+        </span>
+        <span>{title}</span>
+        <small className="activity-group-count">{summary}</small>
+        {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+      </button>
+      {expanded && (
+        <pre className="model-request-activity-detail">
+          {JSON.stringify(detail, null, 2)}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 function PlanActivity({
   plan,
   stepTimings,
@@ -860,12 +914,86 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         isDelta: reasoning.isDelta,
         createdAt: event.createdAt,
       });
+    } else if (payload.type === "thread_context_snapshot") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: "Thread context",
+        summary: `${payload.snapshot.providerKind} / ${payload.snapshot.model}`,
+        detail: payload.snapshot,
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "turn_context_snapshot") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: "Turn world state",
+        summary:
+          payload.snapshot.changedKeys.length > 0
+            ? payload.snapshot.changedKeys.join(", ")
+            : "unchanged",
+        detail: payload.snapshot,
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "model_context_built") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: `Model context #${payload.round}`,
+        summary: `${payload.items.length} items / ~${payload.token_estimate} tokens`,
+        detail: {
+          requestId: payload.request_id,
+          contextHash: payload.context_hash,
+          items: payload.items,
+        },
+        createdAt: event.createdAt,
+      });
     } else if (payload.type === "model_request") {
       primitives.push({
         kind: "model-request",
         seq: event.seq,
         round: payload.round,
         request: payload.request,
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "provider_request_sent") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: `Provider request #${payload.round}`,
+        summary: `${payload.adapter} / attempt ${payload.attempt}`,
+        detail: {
+          requestId: payload.request_id,
+          method: payload.method,
+          endpoint: payload.endpoint,
+          body: payload.body,
+        },
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "provider_request_retried") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: `Provider retry #${payload.round}`,
+        summary: `attempt ${payload.attempt}`,
+        detail: {
+          requestId: payload.request_id,
+          reason: payload.reason,
+          body: payload.body,
+        },
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "provider_response_received") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: `Provider response #${payload.round}`,
+        summary: `HTTP ${payload.status ?? "n/a"} / attempt ${payload.attempt}`,
+        detail: {
+          requestId: payload.request_id,
+          responseId: payload.response_id,
+          body: payload.body,
+        },
         createdAt: event.createdAt,
       });
     } else if (payload.type === "tool_call_started") {

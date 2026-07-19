@@ -2354,21 +2354,51 @@ button:disabled {
   padding: 0 10px 0 12px;
 }
 
-.sidebar-brand-row strong {
-  color: #303530;
-  font-size: 19px;
-  font-weight: 400;
+.experience-mode-menu {
+  position: relative;
+  min-width: 0;
 }
 
-.sidebar-brand-row strong span {
-  color: #e8a87c;
-  font-size: 19px;
+.experience-mode-trigger {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 7px;
+  min-width: 108px;
+  height: 30px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #303530;
+  padding: 0 7px;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 600;
 }
 
-.sidebar-brand-row strong .brand-open {
+.experience-mode-trigger:hover,
+.experience-mode-trigger[aria-expanded="true"] {
+  background: var(--surface-hover);
+}
+
+.experience-mode-trigger > svg:last-child {
+  color: #858c85;
+  transition: transform 160ms ease;
+}
+
+.experience-mode-trigger > svg:last-child.open {
+  transform: rotate(180deg);
+}
+
+.experience-mode-popover {
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 132px;
+}
+
+.experience-mode-popover button[aria-checked="true"] {
   color: #303530;
-  font-size: 19px;
-  font-weight: 550;
+  font-weight: 600;
 }
 
 .sidebar-icon-button,
@@ -2571,6 +2601,20 @@ button:disabled {
 
 .sidebar-footer button:first-child {
   flex: 1;
+}
+
+.sidebar-settings-button .opentopia-wordmark {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: baseline;
+  color: #e8a87c;
+  font-size: 15px;
+  font-weight: 400;
+}
+
+.sidebar-settings-button .opentopia-wordmark .brand-open {
+  color: #303530;
+  font-weight: 600;
 }
 
 .center-pane {

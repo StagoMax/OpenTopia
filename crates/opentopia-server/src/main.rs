@@ -7,32 +7,38 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
     browser_domain_approval_action, browser_domain_from_approval_action, browser_domain_from_url,
-    browser_domain_is_approved, build_local_sandbox_command, discover_skills, execute_git_workflow,
-    load_context_sources, load_selected_skills, AgentContextBudget, AgentContinuation, AgentCore,
-    AgentEvent, AgentEventPayload, AgentTurnInput, AgentTurnOutcome, AppSettings, Approval,
-    ApprovalStatus, Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserDownloadRequest,
-    BrowserNavigateRequest, BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector,
-    BrowserSessionId, BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, ChangedFile,
+    browser_domain_is_approved, build_local_sandbox_command, content_fingerprint,
+    default_agent_model_context, discover_skills, execute_git_workflow, load_context_sources,
+    load_selected_skills, redact_model_observation, resolve_instruction_documents,
+    world_state_item, AgentContextBudget, AgentContinuation, AgentCore, AgentEvent,
+    AgentEventPayload, AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus,
+    Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserDownloadRequest, BrowserNavigateRequest,
+    BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId,
+    BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, ChangedFile,
+    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
     ContextSourcePolicy, ContextSourceRef, ContextSummary, DesktopBrowserRuntime, ExecRequest,
-    ExecutionContext, GitWorkflowAction, GitWorkflowRequest, LocalBrowserRuntime,
-    LocalExecutionEnvironment, McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor,
-    Message, MessagePart, MessageRole, ModelContentPart, ModelConversationMessage,
-    ModelConversationRole, ModelProvider, ModelRequest, OpenAiCompatibleProvider, PermissionMode,
-    PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange,
-    PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderHealth, ProviderHealthCheck,
-    ProviderKind, ProviderSettings, ResolvedPreview, ResourceLimit, SandboxDescriptor,
+    ExecutionContext, ExperienceMode, GitWorkflowAction, GitWorkflowRequest, LoadedSkill,
+    LocalBrowserRuntime, LocalExecutionEnvironment, McpCallResult, McpServerConfig,
+    McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole, ModelContentPart,
+    ModelContextItem, ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
+    OpenAiCompatibleProvider, OpenAiResponsesProvider, PermissionMode, PolicyDecision,
+    PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest,
+    PreviewTarget, PreviewWorkbook, ProviderHealth, ProviderHealthCheck, ProviderKind,
+    ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit, SandboxDescriptor,
     SandboxSettings, SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest,
     SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver, SubagentRun,
     SubagentScheduler, SubagentSchedulerConfig, TaskPlan, TerminalCommandHistory,
-    TerminalCommandStatus, ThreadMcpServer, ToolCall, ToolPermissionDescriptor, ToolResult,
-    TurnRecord, TurnStatus, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,
-    WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree, MAX_PREVIEW_CONTENT_BYTES,
+    TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer, ToolCall,
+    ToolPermissionDescriptor, ToolResult, TurnContextSnapshot, TurnRecord, TurnStatus,
+    WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
+    WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
+    MAX_PREVIEW_CONTENT_BYTES,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -1030,8 +1036,20 @@ async fn test_provider_connection(
     } else {
         settings.active_provider()
     };
-    let provider = OpenAiCompatibleProvider::from_settings(provider_settings)
-        .ok_or_else(|| ApiError::bad_request("provider is not an OpenAI-compatible provider"))?;
+    let provider: Box<dyn ModelProvider> = match provider_settings.kind {
+        ProviderKind::Mock => {
+            return Err(ApiError::bad_request(
+                "mock provider has no remote connection",
+            ))
+        }
+        ProviderKind::OpenAiCompatible => {
+            OpenAiCompatibleProvider::from_settings(provider_settings)
+                .map(|provider| Box::new(provider) as Box<dyn ModelProvider>)
+        }
+        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(provider_settings)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+    }
+    .ok_or_else(|| ApiError::bad_request("provider has no configured API key"))?;
     let result = provider.check_health().await?;
     Ok(Json(result))
 }
@@ -1052,20 +1070,28 @@ async fn create_thread(
     Json(request): Json<CreateThreadRequest>,
 ) -> Result<Json<opentopia_core::Thread>, ApiError> {
     let thread = if let Some(project_id) = request.project_id {
-        state
-            .store
-            .create_thread_in_project(request.title, project_id)?
+        state.store.create_thread_in_project_with_mode(
+            request.title,
+            project_id,
+            request.experience_mode,
+        )?
     } else if let Some(workspace_root) = request.workspace_root {
         let workspace_root = canonicalize_workspace_root(workspace_root);
         let project = state
             .store
             .find_or_create_project(project_name_for_workspace(&workspace_root), workspace_root)?;
-        state
-            .store
-            .create_thread_in_project(request.title, project.id)?
+        state.store.create_thread_in_project_with_mode(
+            request.title,
+            project.id,
+            request.experience_mode,
+        )?
     } else {
         let workspace_root = std::env::current_dir().map_err(anyhow::Error::from)?;
-        state.store.create_thread(request.title, workspace_root)?
+        state.store.create_thread_with_mode(
+            request.title,
+            workspace_root,
+            request.experience_mode,
+        )?
     };
     Ok(Json(thread))
 }
@@ -1267,15 +1293,10 @@ async fn send_message(
     let run_state = state.clone();
     let run_message = user_message.clone();
     let model_content = prompt;
-    let mut model_user_content = sources
+    let model_user_content = sources
         .iter()
         .flat_map(|source| source.content_or_legacy_text())
         .collect::<Vec<_>>();
-    model_user_content.extend(
-        loaded_skills
-            .iter()
-            .map(|skill| ModelContentPart::text(skill.render_for_model())),
-    );
     tokio::spawn(async move {
         run_new_agent_turn(
             run_state,
@@ -1283,6 +1304,7 @@ async fn send_message(
             run_message,
             model_content,
             model_user_content,
+            loaded_skills,
             turn,
         )
         .await;
@@ -3635,6 +3657,7 @@ async fn run_new_agent_turn(
     user_message: Message,
     content: String,
     user_content: Vec<ModelContentPart>,
+    selected_skills: Vec<LoadedSkill>,
     turn: TurnHandle,
 ) {
     let thread_id = thread.id;
@@ -3683,10 +3706,11 @@ async fn run_new_agent_turn(
         }
     };
     let settings = current_settings(&state);
+    let workspace_root = thread.workspace_root.clone();
     let input = AgentTurnInput {
         thread_id,
         user_message_id: user_message.id,
-        workspace_root: thread.workspace_root,
+        workspace_root: workspace_root.clone(),
         content,
         user_content,
         context_summary: prepared.summary,
@@ -3701,8 +3725,40 @@ async fn run_new_agent_turn(
     agent.set_mcp_host(state.mcp_host.clone());
     agent.set_subagent_context(turn_id, 0);
     sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
+    let built_context = build_turn_model_context(
+        &state,
+        &settings,
+        thread_id,
+        &workspace_root,
+        thread.experience_mode,
+        &selected_skills,
+        &agent,
+    )
+    .await;
+    if built_context.emit_thread_snapshot {
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::ThreadContextSnapshot {
+                snapshot: built_context.thread_snapshot,
+            },
+        );
+    }
+    publish_payload(
+        &state,
+        thread_id,
+        Some(turn_id),
+        AgentEventPayload::TurnContextSnapshot {
+            snapshot: built_context.turn_snapshot,
+        },
+    );
     let (sender, mut receiver) = mpsc::unbounded_channel();
-    let future = agent.run_turn_detailed_streaming(input, Some(sender));
+    let future = agent.run_turn_detailed_streaming_with_context(
+        input,
+        Some(built_context.context),
+        Some(sender),
+    );
     tokio::pin!(future);
     let mut deferred_approval_events = Vec::new();
 
@@ -4002,6 +4058,264 @@ struct PreparedTurnContext {
     budget: AgentContextBudget,
 }
 
+struct BuiltTurnModelContext {
+    context: CompiledModelContext,
+    thread_snapshot: ThreadContextSnapshot,
+    turn_snapshot: TurnContextSnapshot,
+    emit_thread_snapshot: bool,
+}
+
+async fn build_turn_model_context(
+    state: &AppState,
+    settings: &AppSettings,
+    thread_id: Uuid,
+    workspace_root: &FsPath,
+    experience_mode: ExperienceMode,
+    selected_skills: &[LoadedSkill],
+    agent: &AgentCore,
+) -> BuiltTurnModelContext {
+    let cwd = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let sandbox = settings.sandbox.to_local_sandbox_config();
+    let mut context = default_agent_model_context(&cwd, &sandbox);
+    context.items.push(ModelContextItem::text(
+        ContextItemKind::DeveloperInstructions,
+        ContextRole::Developer,
+        "opentopia:experience_mode",
+        experience_mode_instruction(experience_mode),
+        ContextCacheScope::Thread,
+        ContextSensitivity::Public,
+    ));
+    let instruction_resolution = resolve_instruction_documents(&cwd, &cwd);
+    let instruction_refs = instruction_resolution
+        .documents
+        .iter()
+        .map(|document| document.snapshot_ref())
+        .collect::<Vec<_>>();
+    context
+        .items
+        .extend(instruction_resolution.documents.iter().map(|document| {
+            ModelContextItem::text(
+                ContextItemKind::RepositoryInstructions,
+                ContextRole::Developer,
+                document.path.display().to_string(),
+                &document.content,
+                ContextCacheScope::Thread,
+                ContextSensitivity::Workspace,
+            )
+            .with_metadata(json!({
+                "scope": document.scope.as_str(),
+                "path": document.path,
+                "truncated": document.truncated,
+                "bytes": document.bytes,
+            }))
+        }));
+    context.items.extend(selected_skills.iter().map(|skill| {
+        ModelContextItem::text(
+            ContextItemKind::Skill,
+            ContextRole::Developer,
+            skill.descriptor.path.display().to_string(),
+            skill.render_for_model(),
+            ContextCacheScope::Turn,
+            ContextSensitivity::Workspace,
+        )
+        .with_metadata(json!({
+            "skillId": skill.descriptor.id,
+            "name": skill.descriptor.name,
+            "truncated": skill.truncated,
+        }))
+    }));
+    context.items.push(ModelContextItem::text(
+        ContextItemKind::Environment,
+        ContextRole::Developer,
+        "opentopia:permissions",
+        format!(
+            "Permission mode: {}\nSandbox mode: {}\nNetwork policy: {}",
+            permission_mode_name(settings.permission_mode),
+            settings.sandbox.sandbox_mode.as_str(),
+            serde_json::to_value(settings.sandbox.network)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        ContextCacheScope::Thread,
+        ContextSensitivity::Workspace,
+    ));
+
+    let tool_catalog = agent.provider_tool_catalog();
+    let mcp_tool_count = agent.mcp_tool_catalog().await.len();
+    let tool_catalog_hash = content_fingerprint(
+        serde_json::to_vec(&tool_catalog)
+            .unwrap_or_default()
+            .as_slice(),
+    );
+    let skill_catalog = discover_skills(Some(&cwd))
+        .into_iter()
+        .map(|skill| WorldStateSkill {
+            content_hash: content_fingerprint(
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    skill.id,
+                    skill.name,
+                    skill.description,
+                    skill.path.display()
+                )
+                .as_bytes(),
+            ),
+            id: skill.id,
+            name: skill.name,
+            description: skill.description,
+            scope: match skill.scope {
+                opentopia_core::SkillScope::Workspace => "workspace".to_string(),
+                opentopia_core::SkillScope::User => "user".to_string(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let git_branch = run_git(&cwd, ["symbolic-ref", "--short", "HEAD"])
+        .await
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let git_status = run_git(
+        &cwd,
+        ["status", "--short", "--branch", "--untracked-files=normal"],
+    )
+    .await
+    .ok()
+    .map(|value| truncate_with_flag(&value, 16_000).0)
+    .filter(|value| !value.trim().is_empty());
+    let local_now = Local::now();
+    let world_state = WorldStateSnapshot {
+        cwd: cwd.clone(),
+        workspace_roots: vec![cwd.clone()],
+        current_date: local_now.date_naive().to_string(),
+        timezone: local_now.offset().to_string(),
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        git_branch,
+        git_status,
+        skill_catalog,
+        tool_count: tool_catalog.len(),
+        mcp_tool_count,
+        tool_catalog_hash: tool_catalog_hash.clone(),
+        metadata: json!({
+            "instructionWarnings": instruction_resolution.warnings,
+            "selectedSkillIds": selected_skills
+                .iter()
+                .map(|skill| skill.descriptor.id.clone())
+                .collect::<Vec<_>>(),
+        }),
+    };
+    let world_state_hash = world_state.content_hash();
+    context.items.push(world_state_item(&world_state));
+    let active = settings.active_provider();
+    context.prompt_cache_key = active.prompt_cache_key.clone().or_else(|| {
+        Some(format!(
+            "opentopia-{}",
+            content_fingerprint(
+                format!(
+                    "{}\n{}\n{}\n{}\n{}",
+                    active.id,
+                    active.model,
+                    active.kind.as_str(),
+                    cwd.display(),
+                    experience_mode.as_str()
+                )
+                .as_bytes()
+            )
+        ))
+    });
+    let context_hash = context.content_hash();
+    let events = state.store.list_events(thread_id, None).unwrap_or_default();
+    let previous_world_state = events.iter().rev().find_map(|event| match &event.payload {
+        AgentEventPayload::TurnContextSnapshot { snapshot } => Some(&snapshot.world_state),
+        _ => None,
+    });
+    let previous_world_state_hash = previous_world_state.map(WorldStateSnapshot::content_hash);
+    let changed_keys = world_state.changed_keys(previous_world_state);
+    let captured_at = Utc::now();
+    let thread_snapshot = ThreadContextSnapshot {
+        captured_at,
+        provider_id: active.id.clone(),
+        provider_kind: active.kind.as_str().to_string(),
+        model: active.model.clone(),
+        workspace_root: cwd.clone(),
+        cwd: cwd.clone(),
+        experience_mode: experience_mode.as_str().to_string(),
+        permission_mode: permission_mode_name(settings.permission_mode).to_string(),
+        sandbox_mode: settings.sandbox.sandbox_mode.as_str().to_string(),
+        instructions: instruction_refs.clone(),
+        tool_catalog_hash: tool_catalog_hash.clone(),
+        world_state_hash: world_state_hash.clone(),
+        context_hash: context_hash.clone(),
+    };
+    let turn_snapshot = TurnContextSnapshot {
+        captured_at,
+        cwd: cwd.clone(),
+        workspace_roots: vec![cwd],
+        experience_mode: experience_mode.as_str().to_string(),
+        permission_mode: permission_mode_name(settings.permission_mode).to_string(),
+        sandbox_mode: settings.sandbox.sandbox_mode.as_str().to_string(),
+        instructions: instruction_refs,
+        world_state,
+        world_state_hash,
+        previous_world_state_hash,
+        changed_keys,
+        context_hash,
+    };
+    BuiltTurnModelContext {
+        context,
+        thread_snapshot,
+        turn_snapshot,
+        emit_thread_snapshot: !events.iter().any(|event| {
+            matches!(
+                event.payload,
+                AgentEventPayload::ThreadContextSnapshot { .. }
+            )
+        }),
+    }
+}
+
+fn experience_mode_instruction(mode: ExperienceMode) -> &'static str {
+    match mode {
+        ExperienceMode::Work => {
+            "Experience mode: Work. This mode changes collaboration and presentation only; it does not change the available tool catalog, tool eligibility, permissions, sandbox, or supported artifact types. Freely use code, shell, browser, documents, spreadsheets, presentations, previews, and every other available capability when they help. Collaborate in terms of the user's goal, progress, sources, artifacts, and finished outputs. Lead with the outcome, keep implementation details concise by default, and expand technical details when the user asks or when they are necessary to make a decision."
+        }
+        ExperienceMode::Code => {
+            "Experience mode: Code. This mode changes collaboration and presentation only; it does not change the available tool catalog, tool eligibility, permissions, sandbox, or supported artifact types. Freely use documents, spreadsheets, presentations, previews, browser, shell, code, and every other available capability when they help. Collaborate in implementation terms: foreground relevant files, commands, diffs, tests, verification, and technical tradeoffs while still leading with the completed outcome."
+        }
+    }
+}
+
+#[cfg(test)]
+mod experience_mode_tests {
+    use super::*;
+
+    #[test]
+    fn experience_modes_change_presentation_without_changing_capabilities() {
+        for mode in [ExperienceMode::Work, ExperienceMode::Code] {
+            let instruction = experience_mode_instruction(mode);
+            assert!(instruction.contains("does not change the available tool catalog"));
+            assert!(instruction.contains("permissions"));
+            assert!(instruction.contains("sandbox"));
+        }
+        assert!(experience_mode_instruction(ExperienceMode::Work)
+            .contains("goal, progress, sources, artifacts, and finished outputs"));
+        assert!(experience_mode_instruction(ExperienceMode::Code)
+            .contains("files, commands, diffs, tests, verification"));
+    }
+}
+
+fn permission_mode_name(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Chat => "chat",
+        PermissionMode::ReadOnly => "read_only",
+        PermissionMode::Auto => "auto",
+        PermissionMode::Approve => "approve",
+        PermissionMode::FullAccess => "full_access",
+    }
+}
+
 async fn prepare_turn_context(
     state: &AppState,
     thread_id: Uuid,
@@ -4226,11 +4540,22 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
             ));
         }
         if let Some(effort) = provider.reasoning_effort.as_deref() {
-            if !["", "low", "medium", "high"].contains(&effort) {
-                return Err(ApiError::bad_request(
-                    "reasoning effort must be low, medium, high, or empty",
-                ));
+            if ![
+                "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+            ]
+            .contains(&effort)
+            {
+                return Err(ApiError::bad_request("reasoning effort is not supported"));
             }
+        }
+        if provider
+            .prompt_cache_key
+            .as_deref()
+            .is_some_and(|value| value.len() > 256)
+        {
+            return Err(ApiError::bad_request(
+                "prompt cache key must be at most 256 characters",
+            ));
         }
     }
     Ok(())
@@ -4307,28 +4632,116 @@ async fn generate_context_summary(
             "real context summarization requires an OpenAI-compatible provider",
         ));
     }
-    let provider = OpenAiCompatibleProvider::from_settings(&active).ok_or_else(|| {
+    let provider: Box<dyn ModelProvider> = match active.kind {
+        ProviderKind::Mock => None,
+        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(&active)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(&active)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+    }
+    .ok_or_else(|| {
         ApiError::bad_request(format!(
             "provider '{}' has no configured API key",
             active.id
         ))
     })?;
     let snapshot = build_context_snapshot(messages, events);
-    let response = timeout(
+    let request = ModelRequest {
+        system_prompt: context_summary_system_prompt().to_string(),
+        conversation: Vec::new(),
+        user_message: snapshot,
+        user_content: Vec::new(),
+        tool_candidates: Vec::new(),
+        previous_tool_calls: Vec::new(),
+        tool_results: Vec::new(),
+        context_items: Vec::new(),
+        previous_response_items: Vec::new(),
+        prompt_cache_key: None,
+    };
+    let request_id = Uuid::new_v4();
+    let request_snapshot = serde_json::to_value(&request)
+        .map(|value| redact_model_observation(&value))
+        .unwrap_or_else(|error| json!({ "serializationError": error.to_string() }));
+    publish_payload(
+        state,
+        thread_id,
+        None,
+        AgentEventPayload::ModelRequest {
+            request_id,
+            round: 0,
+            request: request_snapshot,
+        },
+    );
+    let prepared = provider.prepare(request_id, request).map_err(|err| {
+        ApiError::bad_gateway(format!("context request preparation failed: {err}"))
+    })?;
+    publish_payload(
+        state,
+        thread_id,
+        None,
+        AgentEventPayload::ProviderRequestSent {
+            request_id,
+            round: 0,
+            attempt: 1,
+            adapter: prepared.adapter.clone(),
+            method: prepared.method.clone(),
+            endpoint: prepared.endpoint.clone(),
+            body: prepared.observation_body.clone(),
+        },
+    );
+    let mut transport_events = Vec::new();
+    let mut on_delta = |_| Ok(());
+    let mut on_transport = |event| {
+        transport_events.push(event);
+        Ok(())
+    };
+    let response_result = timeout(
         Duration::from_secs(90),
-        provider.complete(ModelRequest {
-            system_prompt: context_summary_system_prompt().to_string(),
-            conversation: Vec::new(),
-            user_message: snapshot,
-            user_content: Vec::new(),
-            tool_candidates: Vec::new(),
-            previous_tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-        }),
+        provider.stream_prepared(prepared, &mut on_delta, &mut on_transport),
     )
-    .await
-    .map_err(|_| ApiError::gateway_timeout("context summarization timed out"))?
-    .map_err(|err| ApiError::bad_gateway(format!("context summarization failed: {err}")))?;
+    .await;
+    drop(on_transport);
+    for observation in transport_events {
+        match observation {
+            ProviderTransportEvent::Retry {
+                attempt,
+                reason,
+                body,
+            } => publish_payload(
+                state,
+                thread_id,
+                None,
+                AgentEventPayload::ProviderRequestRetried {
+                    request_id,
+                    round: 0,
+                    attempt,
+                    reason,
+                    body,
+                },
+            ),
+            ProviderTransportEvent::Response {
+                attempt,
+                status,
+                response_id,
+                body,
+            } => publish_payload(
+                state,
+                thread_id,
+                None,
+                AgentEventPayload::ProviderResponseReceived {
+                    request_id,
+                    round: 0,
+                    attempt,
+                    status,
+                    response_id,
+                    body,
+                },
+            ),
+        }
+    }
+    let response = response_result
+        .map_err(|_| ApiError::gateway_timeout("context summarization timed out"))?
+        .map_err(|err| ApiError::bad_gateway(format!("context summarization failed: {err}")))?;
     if response.text.trim().is_empty() {
         return Err(ApiError::bad_gateway(
             "context summarization provider returned empty text",
@@ -4376,7 +4789,13 @@ fn build_context_snapshot(messages: &[Message], events: &[AgentEvent]) -> String
     let mut event_lines = Vec::new();
     for event in events.iter().rev().take(160).rev() {
         let rendered = match &event.payload {
-            AgentEventPayload::ModelRequest { .. }
+            AgentEventPayload::ThreadContextSnapshot { .. }
+            | AgentEventPayload::TurnContextSnapshot { .. }
+            | AgentEventPayload::ModelContextBuilt { .. }
+            | AgentEventPayload::ModelRequest { .. }
+            | AgentEventPayload::ProviderRequestSent { .. }
+            | AgentEventPayload::ProviderRequestRetried { .. }
+            | AgentEventPayload::ProviderResponseReceived { .. }
             | AgentEventPayload::ModelDelta { .. }
             | AgentEventPayload::AssistantMessage { .. }
             | AgentEventPayload::TurnStarted { .. } => continue,
@@ -4919,6 +5338,8 @@ struct CreateThreadRequest {
     title: Option<String>,
     workspace_root: Option<PathBuf>,
     project_id: Option<Uuid>,
+    #[serde(default)]
+    experience_mode: ExperienceMode,
 }
 
 #[derive(Debug, Default, Deserialize)]

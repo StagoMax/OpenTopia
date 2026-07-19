@@ -1,4 +1,5 @@
 use crate::model::ModelContentPart;
+use crate::model_context::ModelContextItem;
 use crate::settings::{ProviderHealthCheck, ProviderKind, ProviderSettings};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -7,6 +8,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -50,6 +52,12 @@ pub struct ModelRequest {
     pub previous_tool_calls: Vec<ProviderToolCall>,
     #[serde(default)]
     pub tool_results: Vec<ProviderToolResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_items: Vec<ModelContextItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_response_items: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +68,10 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ProviderToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ModelUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_items: Vec<Value>,
 }
 
 impl ModelResponse {
@@ -68,6 +80,8 @@ impl ModelResponse {
             text: text.into(),
             tool_calls: Vec::new(),
             usage: None,
+            response_id: None,
+            provider_items: Vec::new(),
         }
     }
 }
@@ -105,6 +119,35 @@ pub enum ModelStreamDelta {
 }
 
 pub type ModelStreamCallback<'a> = dyn FnMut(ModelStreamDelta) -> anyhow::Result<()> + Send + 'a;
+
+#[derive(Debug, Clone)]
+pub struct PreparedProviderRequest {
+    pub request_id: Uuid,
+    pub adapter: String,
+    pub method: String,
+    pub endpoint: String,
+    pub body: Value,
+    pub observation_body: Value,
+    pub logical_request: ModelRequest,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProviderTransportEvent {
+    Retry {
+        attempt: usize,
+        reason: String,
+        body: Value,
+    },
+    Response {
+        attempt: usize,
+        status: Option<u16>,
+        response_id: Option<String>,
+        body: Value,
+    },
+}
+
+pub type ProviderTransportCallback<'a> =
+    dyn FnMut(ProviderTransportEvent) -> anyhow::Result<()> + Send + 'a;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -150,6 +193,39 @@ impl ProviderToolResult {
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse>;
 
+    fn prepare(
+        &self,
+        request_id: Uuid,
+        request: ModelRequest,
+    ) -> anyhow::Result<PreparedProviderRequest> {
+        let body = serde_json::to_value(&request)?;
+        Ok(PreparedProviderRequest {
+            request_id,
+            adapter: "logical".to_string(),
+            method: "MODEL".to_string(),
+            endpoint: "provider://logical".to_string(),
+            observation_body: redact_transport_value(&body),
+            body,
+            logical_request: request,
+        })
+    }
+
+    async fn stream_prepared(
+        &self,
+        prepared: PreparedProviderRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        let response = self.stream(prepared.logical_request, on_delta).await?;
+        on_transport(ProviderTransportEvent::Response {
+            attempt: 1,
+            status: None,
+            response_id: response.response_id.clone(),
+            body: model_response_observation(&response),
+        })?;
+        Ok(response)
+    }
+
     async fn stream(
         &self,
         request: ModelRequest,
@@ -189,6 +265,8 @@ pub struct OpenAiCompatibleProvider {
     temperature: f64,
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<String>,
+    parallel_tool_calls: bool,
+    prompt_cache_key: Option<String>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -205,6 +283,8 @@ impl OpenAiCompatibleProvider {
             temperature: 0.2,
             max_output_tokens: None,
             reasoning_effort: None,
+            parallel_tool_calls: false,
+            prompt_cache_key: None,
         }
     }
 
@@ -264,14 +344,16 @@ impl OpenAiCompatibleProvider {
         self.temperature = settings.temperature;
         self.max_output_tokens = settings.max_output_tokens;
         self.reasoning_effort = settings.reasoning_effort.clone();
+        self.parallel_tool_calls = settings.parallel_tool_calls;
+        self.prompt_cache_key = settings.prompt_cache_key.clone();
         self
     }
 
-    async fn stream_completion(
+    fn prepare_chat_request(
         &self,
+        request_id: Uuid,
         request: ModelRequest,
-        on_delta: &mut ModelStreamCallback<'_>,
-    ) -> anyhow::Result<ModelResponse> {
+    ) -> anyhow::Result<PreparedProviderRequest> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut payload = json!({
             "model": self.model,
@@ -293,31 +375,72 @@ impl OpenAiCompatibleProvider {
         if !request.tool_candidates.is_empty() {
             payload["tools"] = json!(openai_tools(&request.tool_candidates));
             payload["tool_choice"] = json!("auto");
-            payload["parallel_tool_calls"] = json!(false);
+            payload["parallel_tool_calls"] = json!(self.parallel_tool_calls);
+        }
+        if let Some(prompt_cache_key) = request
+            .prompt_cache_key
+            .as_deref()
+            .or(self.prompt_cache_key.as_deref())
+            .filter(|value| !value.is_empty())
+        {
+            payload["prompt_cache_key"] = json!(prompt_cache_key);
         }
 
+        Ok(PreparedProviderRequest {
+            request_id,
+            adapter: "openai_chat_completions".to_string(),
+            method: "POST".to_string(),
+            endpoint: url,
+            observation_body: redact_transport_value(&payload),
+            body: payload,
+            logical_request: request,
+        })
+    }
+
+    async fn execute_chat_request(
+        &self,
+        mut prepared: PreparedProviderRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        let mut attempt = 1;
         let mut response = self
             .client
-            .post(&url)
+            .post(&prepared.endpoint)
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/json")
-            .json(&payload)
+            .json(&prepared.body)
             .send()
             .await?;
-        if response.status().as_u16() == 400 && !request.tool_results.is_empty() {
+        if response.status().as_u16() == 400 && !prepared.logical_request.tool_results.is_empty() {
             let rejected_body = response.text().await?;
-            payload["messages"] = json!(openai_compatibility_messages(&request));
+            attempt = 2;
+            prepared.body["messages"] =
+                json!(openai_compatibility_messages(&prepared.logical_request));
+            on_transport(ProviderTransportEvent::Retry {
+                attempt,
+                reason: truncate_observation_text(&format!(
+                    "provider rejected structured tool history with HTTP 400: {rejected_body}"
+                )),
+                body: redact_transport_value(&prepared.body),
+            })?;
             let retry = self
                 .client
-                .post(&url)
+                .post(&prepared.endpoint)
                 .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
                 .header(CONTENT_TYPE, "application/json")
-                .json(&payload)
+                .json(&prepared.body)
                 .send()
                 .await?;
             if !retry.status().is_success() {
                 let retry_status = retry.status();
                 let retry_body = retry.text().await?;
+                on_transport(ProviderTransportEvent::Response {
+                    attempt,
+                    status: Some(retry_status.as_u16()),
+                    response_id: None,
+                    body: json!({ "error": truncate_observation_text(&retry_body) }),
+                })?;
                 anyhow::bail!(
                     "provider request failed (400): {rejected_body}; compatibility retry failed ({retry_status}): {retry_body}"
                 );
@@ -327,6 +450,12 @@ impl OpenAiCompatibleProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
+            on_transport(ProviderTransportEvent::Response {
+                attempt,
+                status: Some(status.as_u16()),
+                response_id: None,
+                body: json!({ "error": truncate_observation_text(&body) }),
+            })?;
             anyhow::bail!("provider request failed ({status}): {body}");
         }
 
@@ -354,6 +483,173 @@ impl OpenAiCompatibleProvider {
         if response.text.is_empty() && response.tool_calls.is_empty() {
             anyhow::bail!("provider returned an empty streaming response");
         }
+        on_transport(ProviderTransportEvent::Response {
+            attempt,
+            status: Some(status.as_u16()),
+            response_id: response.response_id.clone(),
+            body: model_response_observation(&response),
+        })?;
+        Ok(response)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiResponsesProvider {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+    temperature: f64,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
+    store_responses: bool,
+    parallel_tool_calls: bool,
+    prompt_cache_key: Option<String>,
+}
+
+impl OpenAiResponsesProvider {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            temperature: 0.2,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            store_responses: false,
+            parallel_tool_calls: false,
+            prompt_cache_key: None,
+        }
+    }
+
+    pub fn from_settings(settings: &ProviderSettings) -> Option<Self> {
+        if settings.kind != ProviderKind::OpenAiResponses {
+            return None;
+        }
+        let api_key = provider_api_key(settings)?;
+        let mut provider = Self::new(settings.base_url.clone(), api_key, settings.model.clone());
+        provider.temperature = settings.temperature;
+        provider.max_output_tokens = settings.max_output_tokens;
+        provider.reasoning_effort = settings.reasoning_effort.clone();
+        provider.store_responses = settings.store_responses;
+        provider.parallel_tool_calls = settings.parallel_tool_calls;
+        provider.prompt_cache_key = settings.prompt_cache_key.clone();
+        Some(provider)
+    }
+
+    fn prepare_responses_request(
+        &self,
+        request_id: Uuid,
+        request: ModelRequest,
+    ) -> anyhow::Result<PreparedProviderRequest> {
+        let endpoint = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let mut payload = json!({
+            "model": self.model,
+            "instructions": request.system_prompt,
+            "input": responses_input(&request),
+            "stream": true,
+            "store": self.store_responses,
+            "parallel_tool_calls": self.parallel_tool_calls,
+            "temperature": self.temperature,
+        });
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            payload["max_output_tokens"] = json!(max_output_tokens);
+        }
+        if let Some(reasoning_effort) = self
+            .reasoning_effort
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            payload["reasoning"] = json!({ "effort": reasoning_effort });
+            if !self.store_responses {
+                payload["include"] = json!(["reasoning.encrypted_content"]);
+            }
+        }
+        if !request.tool_candidates.is_empty() {
+            payload["tools"] = json!(responses_tools(&request.tool_candidates));
+            payload["tool_choice"] = json!("auto");
+        }
+        if let Some(prompt_cache_key) = request
+            .prompt_cache_key
+            .as_deref()
+            .or(self.prompt_cache_key.as_deref())
+            .filter(|value| !value.is_empty())
+        {
+            payload["prompt_cache_key"] = json!(prompt_cache_key);
+        }
+
+        Ok(PreparedProviderRequest {
+            request_id,
+            adapter: "openai_responses".to_string(),
+            method: "POST".to_string(),
+            endpoint,
+            observation_body: redact_transport_value(&payload),
+            body: payload,
+            logical_request: request,
+        })
+    }
+
+    async fn execute_responses_request(
+        &self,
+        prepared: PreparedProviderRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        let response = self
+            .client
+            .post(&prepared.endpoint)
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .json(&prepared.body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            on_transport(ProviderTransportEvent::Response {
+                attempt: 1,
+                status: Some(status.as_u16()),
+                response_id: None,
+                body: json!({ "error": truncate_observation_text(&body) }),
+            })?;
+            anyhow::bail!("provider request failed ({status}): {body}");
+        }
+
+        let mut decoder = SseDecoder::default();
+        let mut accumulator = ResponsesStreamAccumulator::default();
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await? {
+            for data in decoder.push(&chunk)? {
+                if data == "[DONE]" {
+                    continue;
+                }
+                let event: Value = serde_json::from_str(&data)
+                    .map_err(|err| anyhow::anyhow!("invalid Responses SSE data: {err}: {data}"))?;
+                accumulator.apply(&event, on_delta)?;
+            }
+        }
+        for data in decoder.finish()? {
+            if data != "[DONE]" {
+                let event: Value = serde_json::from_str(&data)
+                    .map_err(|err| anyhow::anyhow!("invalid Responses SSE data: {err}: {data}"))?;
+                accumulator.apply(&event, on_delta)?;
+            }
+        }
+        let response = accumulator.finish()?;
+        if response.text.is_empty() && response.tool_calls.is_empty() {
+            anyhow::bail!("Responses API returned an empty streaming response");
+        }
+        on_transport(ProviderTransportEvent::Response {
+            attempt: 1,
+            status: Some(status.as_u16()),
+            response_id: response.response_id.clone(),
+            body: model_response_observation(&response),
+        })?;
         Ok(response)
     }
 }
@@ -512,6 +808,187 @@ impl OpenAiStreamAccumulator {
             text: self.text,
             tool_calls,
             usage: self.usage,
+            response_id: None,
+            provider_items: Vec::new(),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResponsesStreamAccumulator {
+    text: String,
+    tool_calls: BTreeMap<usize, StreamingToolCall>,
+    provider_items: BTreeMap<usize, Value>,
+    usage: Option<ModelUsage>,
+    response_id: Option<String>,
+    completed_response: Option<Value>,
+}
+
+impl ResponsesStreamAccumulator {
+    fn apply(
+        &mut self,
+        event: &Value,
+        on_delta: &mut ModelStreamCallback<'_>,
+    ) -> anyhow::Result<()> {
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(event_type, "error" | "response.failed") {
+            anyhow::bail!("Responses stream returned an error: {event}");
+        }
+        if let Some(response_id) = event
+            .get("response_id")
+            .or_else(|| event.pointer("/response/id"))
+            .and_then(Value::as_str)
+        {
+            self.response_id = Some(response_id.to_string());
+        }
+        if let Some(usage) = parse_model_usage(
+            event
+                .get("usage")
+                .or_else(|| event.pointer("/response/usage")),
+        ) {
+            self.usage = Some(usage.clone());
+            on_delta(ModelStreamDelta::Usage { usage })?;
+        }
+
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    self.text.push_str(delta);
+                    on_delta(ModelStreamDelta::Text {
+                        text: delta.to_string(),
+                    })?;
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    on_delta(ModelStreamDelta::Reasoning {
+                        text: delta.to_string(),
+                    })?;
+                }
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                let index = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(self.provider_items.len() as u64)
+                    as usize;
+                if let Some(item) = event.get("item") {
+                    self.provider_items.insert(index, item.clone());
+                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                        let call = self.tool_calls.entry(index).or_default();
+                        if let Some(id) = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            call.id = id.to_string();
+                        }
+                        if let Some(name) = item.get("name").and_then(Value::as_str) {
+                            call.name = name.to_string();
+                        }
+                        if event_type == "response.output_item.done" {
+                            if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+                                call.arguments = arguments.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let index = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                let call = self.tool_calls.entry(index).or_default();
+                call.arguments.push_str(delta);
+                on_delta(ModelStreamDelta::ToolCall {
+                    index,
+                    id: (!call.id.is_empty()).then(|| call.id.clone()),
+                    name: (!call.name.is_empty()).then(|| call.name.clone()),
+                    arguments_delta: delta.to_string(),
+                })?;
+            }
+            "response.function_call_arguments.done" => {
+                let index = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                if let Some(arguments) = event.get("arguments").and_then(Value::as_str) {
+                    self.tool_calls.entry(index).or_default().arguments = arguments.to_string();
+                }
+            }
+            "response.completed" => {
+                if let Some(response) = event.get("response") {
+                    self.completed_response = Some(response.clone());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> anyhow::Result<ModelResponse> {
+        if let Some(completed) = self.completed_response.as_ref() {
+            let completed_text = extract_response_text(completed);
+            if !completed_text.is_empty() {
+                self.text = completed_text;
+            }
+            let completed_calls = extract_provider_tool_calls(completed)?;
+            if !completed_calls.is_empty() {
+                self.tool_calls = completed_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| {
+                        (
+                            index,
+                            StreamingToolCall {
+                                id: call.id,
+                                name: call.name,
+                                arguments: call.arguments.to_string(),
+                            },
+                        )
+                    })
+                    .collect();
+            }
+            if let Some(output) = completed.get("output").and_then(Value::as_array) {
+                self.provider_items = output
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .collect::<BTreeMap<_, _>>();
+            }
+            self.usage = parse_model_usage(completed.get("usage")).or(self.usage);
+            self.response_id = completed
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or(self.response_id);
+        }
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(|(index, call)| {
+                if call.name.is_empty() {
+                    anyhow::bail!("Responses tool call {index} was missing a function name");
+                }
+                Ok(ProviderToolCall {
+                    id: if call.id.is_empty() {
+                        format!("call_{index}")
+                    } else {
+                        call.id
+                    },
+                    name: call.name,
+                    arguments: parse_tool_arguments(Some(&Value::String(call.arguments)))?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(ModelResponse {
+            text: self.text,
+            tool_calls,
+            usage: self.usage,
+            response_id: self.response_id,
+            provider_items: self.provider_items.into_values().collect(),
         })
     }
 }
@@ -560,6 +1037,23 @@ fn extract_reasoning_value(value: &Value) -> String {
 #[derive(Debug, Default)]
 struct ProviderEnv {
     values: HashMap<String, String>,
+}
+
+fn provider_api_key(settings: &ProviderSettings) -> Option<String> {
+    std::env::var(&settings.api_key_source)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            if settings.api_key_source != "OPENTOPIA_API_KEY" {
+                return None;
+            }
+            ProviderEnv::load().first([
+                "OPENTOPIA_API_KEY",
+                "AUDIT_COPILOT_LLM_API_KEY",
+                "CREDIT_REVIEW_LLM_API_KEY",
+                "OPENAI_API_KEY",
+            ])
+        })
 }
 
 impl ProviderEnv {
@@ -784,6 +1278,127 @@ fn openai_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
         .collect()
 }
 
+fn responses_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "type": "function",
+                "name": &candidate.name,
+                "description": &candidate.description,
+                "parameters": &candidate.input_schema,
+                "strict": false,
+            })
+        })
+        .collect()
+}
+
+fn responses_input(request: &ModelRequest) -> Vec<Value> {
+    let mut input = request
+        .conversation
+        .iter()
+        .map(|message| {
+            json!({
+                "role": openai_conversation_role(message.role),
+                "content": responses_message_content(
+                    message.role,
+                    &message.content,
+                    &message.content_parts,
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    input.push(json!({
+        "role": "user",
+        "content": responses_message_content(
+            ModelConversationRole::User,
+            &request.user_message,
+            &request.user_content,
+        ),
+    }));
+
+    if request.previous_response_items.is_empty() {
+        input.extend(request.previous_tool_calls.iter().map(|call| {
+            json!({
+                "type": "function_call",
+                "call_id": &call.id,
+                "name": &call.name,
+                "arguments": call.arguments.to_string(),
+            })
+        }));
+    } else {
+        input.extend(request.previous_response_items.iter().cloned());
+    }
+    input.extend(request.tool_results.iter().map(|result| {
+        json!({
+            "type": "function_call_output",
+            "call_id": &result.call_id,
+            "output": provider_tool_result_content(result),
+        })
+    }));
+    if let Some(companion) = responses_tool_image_companion(&request.tool_results) {
+        input.push(companion);
+    }
+    input
+}
+
+fn responses_message_content(
+    role: ModelConversationRole,
+    legacy_text: &str,
+    parts: &[ModelInputContent],
+) -> Value {
+    if parts.is_empty() {
+        return Value::String(legacy_text.to_string());
+    }
+    let text_type = if role == ModelConversationRole::Assistant {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    let mut content = Vec::new();
+    if !legacy_text.is_empty() {
+        content.push(json!({ "type": text_type, "text": legacy_text }));
+    }
+    content.extend(parts.iter().map(|part| match part {
+        ModelInputContent::Text { text } => json!({ "type": text_type, "text": text }),
+        ModelInputContent::Json { value } => {
+            json!({ "type": text_type, "text": value.to_string() })
+        }
+        ModelInputContent::Image { content_type, data } => json!({
+            "type": "input_image",
+            "image_url": format!("data:{content_type};base64,{}", encode_base64(data)),
+        }),
+        ModelInputContent::Resource {
+            uri,
+            content_type,
+            name,
+        } => json!({
+            "type": text_type,
+            "text": resource_fallback_text(uri, content_type.as_deref(), name.as_deref()),
+        }),
+    }));
+    Value::Array(content)
+}
+
+fn responses_tool_image_companion(results: &[ProviderToolResult]) -> Option<Value> {
+    let mut content = Vec::new();
+    for result in results {
+        for part in &result.content {
+            if let ModelInputContent::Image { content_type, data } = part {
+                content.push(json!({
+                    "type": "input_text",
+                    "text": format!("Tool image: {} (call {})", result.name, result.call_id),
+                }));
+                content.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{content_type};base64,{}", encode_base64(data)),
+                }));
+            }
+        }
+    }
+    (!content.is_empty()).then(|| json!({ "role": "user", "content": content }))
+}
+
 fn openai_tool_call_message(call: &ProviderToolCall) -> Value {
     json!({
         "id": &call.id,
@@ -939,12 +1554,90 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
+fn redact_transport_value(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase();
+                    let is_image_bytes = normalized == "data"
+                        && fields.get("type").and_then(Value::as_str) == Some("image")
+                        && value.is_array();
+                    let value = if is_image_bytes {
+                        Value::String(format!(
+                            "[binary image omitted: {} bytes]",
+                            value.as_array().map(Vec::len).unwrap_or_default()
+                        ))
+                    } else if matches!(
+                        normalized.as_str(),
+                        "authorization"
+                            | "api_key"
+                            | "apikey"
+                            | "password"
+                            | "secret"
+                            | "access_token"
+                            | "refresh_token"
+                    ) {
+                        Value::String("[REDACTED]".to_string())
+                    } else {
+                        redact_transport_value(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_transport_value).collect()),
+        Value::String(text) if text.starts_with("data:") && text.contains(";base64,") => {
+            Value::String(format!("[data URL omitted: {} chars]", text.len()))
+        }
+        Value::String(text) if text.len() > 256_000 => Value::String(format!(
+            "{}\n[observation truncated: {} chars total]",
+            text.chars().take(256_000).collect::<String>(),
+            text.len()
+        )),
+        value => value.clone(),
+    }
+}
+
+pub fn redact_model_observation(value: &Value) -> Value {
+    redact_transport_value(value)
+}
+
+fn truncate_observation_text(text: &str) -> String {
+    const LIMIT: usize = 16_000;
+    if text.len() <= LIMIT {
+        return text.to_string();
+    }
+    format!(
+        "{}\n[observation truncated: {} chars total]",
+        text.chars().take(LIMIT).collect::<String>(),
+        text.len()
+    )
+}
+
+fn model_response_observation(response: &ModelResponse) -> Value {
+    json!({
+        "responseId": response.response_id,
+        "textChars": response.text.len(),
+        "toolCalls": response.tool_calls,
+        "usage": response.usage,
+        "providerItems": redact_transport_value(&Value::Array(response.provider_items.clone())),
+    })
+}
+
 #[cfg(test)]
 fn parse_model_response_body(body: &Value) -> anyhow::Result<ModelResponse> {
     Ok(ModelResponse {
         text: extract_response_text(body),
         tool_calls: extract_provider_tool_calls(body)?,
         usage: parse_model_usage(body.get("usage")),
+        response_id: body.get("id").and_then(Value::as_str).map(str::to_string),
+        provider_items: body
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -984,7 +1677,6 @@ fn parse_model_usage(value: Option<&Value>) -> Option<ModelUsage> {
     })
 }
 
-#[cfg(test)]
 fn extract_response_text(body: &Value) -> String {
     if let Some(text) = body
         .pointer("/choices/0/message/content")
@@ -1011,13 +1703,27 @@ fn extract_response_text(body: &Value) -> String {
         }
     }
 
-    body.pointer("/output_text")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+    if let Some(text) = body.get("output_text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+
+    body.get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
-#[cfg(test)]
 fn extract_provider_tool_calls(body: &Value) -> anyhow::Result<Vec<ProviderToolCall>> {
     let mut calls = Vec::new();
 
@@ -1048,7 +1754,6 @@ fn extract_provider_tool_calls(body: &Value) -> anyhow::Result<Vec<ProviderToolC
     Ok(calls)
 }
 
-#[cfg(test)]
 fn parse_chat_tool_call(value: &Value, index: usize) -> anyhow::Result<ProviderToolCall> {
     let function = value
         .get("function")
@@ -1071,7 +1776,6 @@ fn parse_chat_tool_call(value: &Value, index: usize) -> anyhow::Result<ProviderT
     })
 }
 
-#[cfg(test)]
 fn parse_legacy_function_call(value: &Value, index: usize) -> anyhow::Result<ProviderToolCall> {
     let name = value
         .get("name")
@@ -1084,7 +1788,6 @@ fn parse_legacy_function_call(value: &Value, index: usize) -> anyhow::Result<Pro
     })
 }
 
-#[cfg(test)]
 fn parse_responses_function_call(value: &Value, index: usize) -> anyhow::Result<ProviderToolCall> {
     let name = value
         .get("name")
@@ -1117,7 +1820,17 @@ fn parse_tool_arguments(value: Option<&Value>) -> anyhow::Result<Value> {
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
-        self.stream_completion(request, &mut |_| Ok(())).await
+        let prepared = self.prepare(Uuid::new_v4(), request)?;
+        self.stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(()))
+            .await
+    }
+
+    fn prepare(
+        &self,
+        request_id: Uuid,
+        request: ModelRequest,
+    ) -> anyhow::Result<PreparedProviderRequest> {
+        self.prepare_chat_request(request_id, request)
     }
 
     async fn stream(
@@ -1125,7 +1838,19 @@ impl ModelProvider for OpenAiCompatibleProvider {
         request: ModelRequest,
         on_delta: &mut ModelStreamCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
-        self.stream_completion(request, on_delta).await
+        let prepared = self.prepare(Uuid::new_v4(), request)?;
+        self.stream_prepared(prepared, on_delta, &mut |_| Ok(()))
+            .await
+    }
+
+    async fn stream_prepared(
+        &self,
+        prepared: PreparedProviderRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        self.execute_chat_request(prepared, on_delta, on_transport)
+            .await
     }
 
     async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
@@ -1213,6 +1938,79 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 }
 
+#[async_trait]
+impl ModelProvider for OpenAiResponsesProvider {
+    async fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        let prepared = self.prepare(Uuid::new_v4(), request)?;
+        self.stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(()))
+            .await
+    }
+
+    fn prepare(
+        &self,
+        request_id: Uuid,
+        request: ModelRequest,
+    ) -> anyhow::Result<PreparedProviderRequest> {
+        self.prepare_responses_request(request_id, request)
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        let prepared = self.prepare(Uuid::new_v4(), request)?;
+        self.stream_prepared(prepared, on_delta, &mut |_| Ok(()))
+            .await
+    }
+
+    async fn stream_prepared(
+        &self,
+        prepared: PreparedProviderRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        self.execute_responses_request(prepared, on_delta, on_transport)
+            .await
+    }
+
+    async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
+        let start = std::time::Instant::now();
+        let models_url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client
+                .get(&models_url)
+                .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let reachable = response.status().is_success();
+                Ok(ProviderHealthCheck {
+                    reachable,
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                    model_available: reachable,
+                    error: (!reachable).then(|| format!("HTTP {}", response.status())),
+                })
+            }
+            Ok(Err(error)) => Ok(ProviderHealthCheck {
+                reachable: false,
+                latency_ms: Some(start.elapsed().as_millis() as u64),
+                model_available: false,
+                error: Some(error.to_string()),
+            }),
+            Err(_) => Ok(ProviderHealthCheck {
+                reachable: false,
+                latency_ms: None,
+                model_available: false,
+                error: Some("timeout".to_string()),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MockProvider;
 
@@ -1251,6 +2049,9 @@ mod tests {
             tool_candidates: Vec::new(),
             previous_tool_calls: Vec::new(),
             tool_results: Vec::new(),
+            context_items: Vec::new(),
+            previous_response_items: Vec::new(),
+            prompt_cache_key: None,
         }
     }
 
@@ -1847,6 +2648,141 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn responses_input_replays_typed_items_and_correlates_tool_outputs() {
+        let mut request = model_request();
+        request.previous_response_items = vec![
+            json!({
+                "type": "reasoning",
+                "encrypted_content": "opaque",
+                "summary": []
+            }),
+            json!({
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"Cargo.toml\"}"
+            }),
+        ];
+        request.previous_tool_calls = vec![ProviderToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "Cargo.toml" }),
+        }];
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            output: "workspace".to_string(),
+            content: Vec::new(),
+            is_error: false,
+            metadata: json!({}),
+        }];
+
+        let input = responses_input(&request);
+
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item.get("type") == Some(&json!("function_call")))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_provider_prepares_redacted_body_and_collects_typed_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            request_tx.send(request).unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\"}}\n\n",
+                        "data: {\"type\":\"response.output_item.added\",\"response_id\":\"resp_123\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n",
+                        "data: {\"type\":\"response.function_call_arguments.delta\",\"response_id\":\"resp_123\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}\n\n",
+                        "data: {\"type\":\"response.output_item.done\",\"response_id\":\"resp_123\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}],\"usage\":{\"input_tokens\":20,\"output_tokens\":5,\"total_tokens\":25}}}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let provider =
+            OpenAiResponsesProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+        let mut request = model_request();
+        request.user_content = vec![ModelInputContent::image("image/png", vec![1, 2, 3])];
+        request.prompt_cache_key = Some("workspace-cache".to_string());
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        }];
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        assert_eq!(prepared.adapter, "openai_responses");
+        assert_eq!(
+            prepared.observation_body["prompt_cache_key"],
+            "workspace-cache"
+        );
+        assert!(prepared
+            .observation_body
+            .to_string()
+            .contains("data URL omitted"));
+        assert!(!prepared.observation_body.to_string().contains("AQID"));
+        let mut transport = Vec::new();
+        let response = provider
+            .stream_prepared(prepared, &mut |_| Ok(()), &mut |event| {
+                transport.push(event);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let raw_request = request_rx.await.unwrap();
+        let (_, body) = raw_request.split_once("\r\n\r\n").unwrap();
+        let payload: Value = serde_json::from_str(body).unwrap();
+
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["tools"][0]["name"], "read_file");
+        assert!(payload["tools"][0].get("function").is_none());
+        assert_eq!(payload["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(response.response_id.as_deref(), Some("resp_123"));
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            json!({ "path": "Cargo.toml" })
+        );
+        assert_eq!(response.provider_items.len(), 1);
+        assert_eq!(response.usage.unwrap().total_tokens, 25);
+        assert!(matches!(
+            transport.as_slice(),
+            [ProviderTransportEvent::Response {
+                status: Some(200),
+                response_id: Some(response_id),
+                ..
+            }] if response_id == "resp_123"
+        ));
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {

@@ -187,18 +187,14 @@ protectedPaths:
   - test/**
 phases:
   - id: library
-    timeoutSeconds: 420
   - id: cli-after-restart
-    timeoutSeconds: 420
 budgets:
   maxInputTokens: 500000
   maxOutputTokens: 40000
-  maxToolCalls: 80
-  maxRepeatedEquivalentCalls: 8
 environment:
   sandboxMode: workspace-write
   network: deny
-  approvalPolicy: budget-checkpoint-only
+  approvalPolicy: security-boundaries-only
 repetitions: 3
 hardChecks:
   - hidden-grader
@@ -288,7 +284,7 @@ metrics:
 3. 启动计时并发送规范 Prompt。
 4. 持续记录 SSE、模型流、工具调用、审批、计划和 Token usage。
 5. 仅按任务声明的策略自动处理审批。
-6. Runner 达到任务级硬超时或 Token/成本上限时取消 Turn；产品运行时仅在确认等价调用或重复调用序列持续无进展时停止。
+6. Runner 持续等待 Turn 到达终态；任务级执行不设置轮次或时长上限，用户仍可主动取消。
 7. 多阶段任务在指定边界停止 Server/Desktop，并从持久化状态恢复。
 
 ### 9.4 Phase D：评分
@@ -316,8 +312,7 @@ metrics:
 | --- | --- | --- |
 | `passed` | 所有硬检查通过且任务正确闭环 | 是 |
 | `failed` | 产品或 Agent 执行后未通过硬检查 | 是 |
-| `timeout` | 达到任务硬超时 | 是，按失败处理 |
-| `cancelled_by_policy` | 达到安全策略或无进展循环防护并被取消 | 是，按失败处理 |
+| `cancelled_by_policy` | 达到安全策略边界并被取消 | 是，按失败处理 |
 | `infra_error` | 端口、磁盘、Runner 崩溃等非产品错误 | 否，修复后重跑 |
 | `provider_error` | 外部 Provider 持续不可用或限流 | 单独报告，默认不进入模型能力分母 |
 | `invalid_task` | 基线已通过、评分歧义或参考实现失败 | 否 |
@@ -358,7 +353,7 @@ metrics:
 | 指标 | 定义 |
 | --- | --- |
 | `phase_completion_rate` | 正确完成的阶段数 / 计划阶段数 |
-| `closure_rate` | 在预算内主动结束且最终成功的运行数 / 有效运行数 |
+| `closure_rate` | 主动结束且最终成功的运行数 / 有效运行数 |
 | `plan_completion_accuracy` | 标记 completed 且对应硬检查通过的步骤数 / 标记 completed 的步骤数 |
 | `restart_recovery_rate` | 重启后完整恢复线程、消息、计划、审批和事件的任务比例 |
 | `continuation_success_rate` | 权限审批 continuation 后正确续接的次数 / continuation 总数 |

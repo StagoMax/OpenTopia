@@ -89,7 +89,6 @@ pub struct SubagentScope {
 pub struct SubagentSchedulerConfig {
     pub max_concurrency_per_parent: usize,
     pub max_depth: u8,
-    pub timeout: Option<Duration>,
 }
 
 impl Default for SubagentSchedulerConfig {
@@ -97,7 +96,6 @@ impl Default for SubagentSchedulerConfig {
         Self {
             max_concurrency_per_parent: 4,
             max_depth: 2,
-            timeout: None,
         }
     }
 }
@@ -453,28 +451,11 @@ impl SubagentScheduler {
             .executor
             .execute(run, input, control.cancellation.child_token());
         tokio::pin!(execution);
-        if let Some(timeout_duration) = self.inner.config.timeout {
-            let timeout = tokio::time::sleep(timeout_duration);
-            tokio::pin!(timeout);
-            tokio::select! {
-                _ = control.cancellation.cancelled() => {
-                    self.finish(&control, SubagentRunStatus::Cancelled, None, None);
-                }
-                _ = &mut timeout => {
-                    control.cancellation.cancel();
-                    let run_id = control.run.lock().expect("subagent run mutex poisoned").id;
-                    self.cancel_parent(run_id);
-                    self.finish(&control, SubagentRunStatus::TimedOut, None, Some("subagent execution timed out".to_string()));
-                }
-                result = &mut execution => self.finish_execution_result(&control, result),
+        tokio::select! {
+            _ = control.cancellation.cancelled() => {
+                self.finish(&control, SubagentRunStatus::Cancelled, None, None);
             }
-        } else {
-            tokio::select! {
-                _ = control.cancellation.cancelled() => {
-                    self.finish(&control, SubagentRunStatus::Cancelled, None, None);
-                }
-                result = &mut execution => self.finish_execution_result(&control, result),
-            }
+            result = &mut execution => self.finish_execution_result(&control, result),
         }
         drop(permit);
     }
@@ -581,11 +562,7 @@ mod tests {
         }
     }
 
-    fn scheduler(
-        max: usize,
-        delay: Duration,
-        timeout: Duration,
-    ) -> (SubagentScheduler, Arc<TestExecutor>) {
+    fn scheduler(max: usize, delay: Duration) -> (SubagentScheduler, Arc<TestExecutor>) {
         let executor = Arc::new(TestExecutor {
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -596,7 +573,6 @@ mod tests {
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: max,
                 max_depth: 2,
-                timeout: Some(timeout),
             },
             executor.clone(),
             Arc::new(NoopSubagentObserver),
@@ -614,11 +590,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_scheduler_has_no_execution_timeout() {
-        assert_eq!(SubagentSchedulerConfig::default().timeout, None);
-    }
-
     fn owning_scope(run: &SubagentRun) -> SubagentScope {
         SubagentScope {
             thread_id: run.parent_thread_id,
@@ -629,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn queues_fairly_and_enforces_parent_concurrency() {
-        let (scheduler, executor) = scheduler(2, Duration::from_millis(40), Duration::from_secs(2));
+        let (scheduler, executor) = scheduler(2, Duration::from_millis(40));
         let parent = Uuid::new_v4();
         let runs = (0..5)
             .map(|index| {
@@ -653,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_is_delivered_and_wait_returns_result() {
-        let (scheduler, _) = scheduler(1, Duration::from_millis(40), Duration::from_secs(2));
+        let (scheduler, _) = scheduler(1, Duration::from_millis(40));
         let run = scheduler.spawn(request(Uuid::new_v4(), "reader")).unwrap();
         scheduler
             .send_input(run.id, "follow-up".to_string())
@@ -668,7 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_operations_hide_runs_from_other_threads() {
-        let (scheduler, _) = scheduler(1, Duration::from_secs(5), Duration::from_secs(10));
+        let (scheduler, _) = scheduler(1, Duration::from_secs(5));
         let run = scheduler.spawn(request(Uuid::new_v4(), "private")).unwrap();
         let cross_thread_scope = SubagentScope {
             thread_id: Uuid::new_v4(),
@@ -695,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_operations_require_direct_parent_and_depth() {
-        let (scheduler, _) = scheduler(1, Duration::from_secs(5), Duration::from_secs(10));
+        let (scheduler, _) = scheduler(1, Duration::from_secs(5));
         let run = scheduler
             .spawn(request(Uuid::new_v4(), "direct-child"))
             .unwrap();
@@ -731,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn supports_single_and_parent_cancellation() {
-        let (scheduler, _) = scheduler(2, Duration::from_secs(5), Duration::from_secs(10));
+        let (scheduler, _) = scheduler(2, Duration::from_secs(5));
         let parent = Uuid::new_v4();
         let one = scheduler.spawn(request(parent, "one")).unwrap();
         let two = scheduler.spawn(request(parent, "two")).unwrap();
@@ -767,8 +738,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn times_out_and_rejects_excessive_depth() {
-        let (scheduler, _) = scheduler(1, Duration::from_secs(5), Duration::from_millis(25));
+    async fn long_running_execution_completes_and_excessive_depth_is_rejected() {
+        let (scheduler, _) = scheduler(1, Duration::from_millis(100));
         let run = scheduler.spawn(request(Uuid::new_v4(), "slow")).unwrap();
         assert_eq!(
             scheduler
@@ -776,7 +747,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status,
-            SubagentRunStatus::TimedOut
+            SubagentRunStatus::Completed
         );
         let mut deep = request(Uuid::new_v4(), "deep");
         deep.depth = 3;
@@ -788,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_has_its_own_timeout_and_terminal_runs_reject_input() {
-        let (scheduler, _) = scheduler(1, Duration::from_millis(100), Duration::from_secs(2));
+        let (scheduler, _) = scheduler(1, Duration::from_millis(100));
         let run = scheduler.spawn(request(Uuid::new_v4(), "wait")).unwrap();
         assert!(matches!(
             scheduler.wait(run.id, Duration::from_millis(5)).await,

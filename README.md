@@ -234,15 +234,13 @@ or run the deterministic two-phase long-horizon evaluation without printing the 
   -EnvFile "J:\Project\信贷审核助手\.env" `
   -Profile AUDIT_COPILOT_LLM `
   -ExpectedModel glm-5.2 `
-  -TaskManifest scripts\fixtures\long-horizon\task.json `
-  -TurnTimeoutSeconds 300
+  -TaskManifest scripts\fixtures\long-horizon\task.json
 
 .\scripts\evaluate-long-horizon-suite.ps1 `
   -EnvFile "J:\Project\信贷审核助手\.env" `
   -Profile AUDIT_COPILOT_LLM `
   -ExpectedModel glm-5.2 `
-  -Repetitions 1 `
-  -TurnTimeoutSeconds 300
+  -Repetitions 1
 ```
 
 The latest methodology, closure design, and three-task result are documented in

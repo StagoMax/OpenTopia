@@ -10,6 +10,7 @@ pub enum ProviderKind {
     Mock,
     #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible,
+    OpenAiResponses,
 }
 
 impl ProviderKind {
@@ -17,6 +18,7 @@ impl ProviderKind {
         match self {
             Self::Mock => "mock",
             Self::OpenAiCompatible => "openai_compatible",
+            Self::OpenAiResponses => "openai_responses",
         }
     }
 }
@@ -36,6 +38,12 @@ pub struct ProviderSettings {
     pub context_window_tokens: usize,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub store_responses: bool,
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
     pub api_key_source: String,
     pub api_key_configured: bool,
     pub health_status: Option<String>,
@@ -52,6 +60,9 @@ impl Default for ProviderSettings {
             max_output_tokens: None,
             context_window_tokens: default_provider_context_window_tokens(),
             reasoning_effort: None,
+            store_responses: false,
+            parallel_tool_calls: false,
+            prompt_cache_key: None,
             api_key_source: "OPENTOPIA_API_KEY".to_string(),
             api_key_configured: false,
             health_status: None,
@@ -513,6 +524,29 @@ mod tests {
         assert_eq!(provider.max_output_tokens, None);
         assert_eq!(provider.context_window_tokens, 128_000);
         assert_eq!(provider.reasoning_effort, None);
+        assert!(!provider.store_responses);
+        assert!(!provider.parallel_tool_calls);
+        assert_eq!(provider.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn responses_provider_settings_round_trip_state_and_cache_options() {
+        let mut provider = ProviderSettings::default();
+        provider.kind = ProviderKind::OpenAiResponses;
+        provider.store_responses = true;
+        provider.parallel_tool_calls = true;
+        provider.prompt_cache_key = Some("workspace-cache".to_string());
+
+        let json = serde_json::to_value(&provider).unwrap();
+        let restored: ProviderSettings = serde_json::from_value(json).unwrap();
+
+        assert_eq!(restored.kind, ProviderKind::OpenAiResponses);
+        assert!(restored.store_responses);
+        assert!(restored.parallel_tool_calls);
+        assert_eq!(
+            restored.prompt_cache_key.as_deref(),
+            Some("workspace-cache")
+        );
     }
 
     #[test]

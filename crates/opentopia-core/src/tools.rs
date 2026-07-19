@@ -2628,7 +2628,6 @@ mod tests {
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: 1,
                 max_depth: 2,
-                timeout: Some(Duration::from_secs(10)),
             },
             Arc::new(PendingExecutor),
             Arc::new(NoopSubagentObserver),
@@ -3106,7 +3105,6 @@ mod tests {
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: 2,
                 max_depth: 2,
-                timeout: Some(Duration::from_secs(10)),
             },
             Arc::new(ImmediateExecutor),
             Arc::new(NoopSubagentObserver),

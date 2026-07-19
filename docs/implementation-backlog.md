@@ -122,8 +122,8 @@ Future refinement:
 - Support separate safeStorage keys per provider profile instead of one active provider key.
 - Bound and incrementally summarize compacted tool history for strict compatible
   gateways; the current fallback is correct but can produce high cumulative token cost.
-- Add a phase-completion controller and repeated-tool budget. The 2026-07-16 GLM-5.2
-  evaluation passed the library grader but timed out before closing Phase 1.
+- Replace ad hoc completion prompting with an explicit turn-state protocol and provider-native
+  compaction while preserving unrestricted long-running execution.
 
 Acceptance:
 
@@ -190,7 +190,7 @@ Implemented:
 - Codex-compatible `SKILL.md` discovery under workspace/user skill roots, YAML metadata,
   allowlisted IDs, five Skills per Turn, and 128 KiB aggregate instruction limit.
 - Subagent scheduler and real AgentCore executor with inherited workspace/provider/policy/sandbox,
-  four concurrent children per parent, depth two, no default execution timeout, typed events, SQLite
+  four concurrent children per parent, depth two, no scheduler execution deadline, typed events, SQLite
   persistence/restart recovery, model-callable tools, HTTP controls, and desktop status/actions.
 
 Future refinement:
