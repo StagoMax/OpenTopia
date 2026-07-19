@@ -1,4 +1,8 @@
 use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
+use crate::guardian::{
+    GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext,
+    GuardianReviewSessionManager, GuardianReviewStatus,
+};
 use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
@@ -9,7 +13,7 @@ use crate::model_context::{
     CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
     ModelContextItem,
 };
-use crate::policy::{BasicPolicyEngine, PermissionMode};
+use crate::policy::{approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode};
 use crate::provider::{
     redact_model_observation, MockProvider, ModelConversationMessage, ModelConversationRole,
     ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, OpenAiCompatibleProvider,
@@ -165,6 +169,7 @@ impl ContextBudget {
 #[derive(Clone)]
 pub struct AgentCore {
     provider: Arc<dyn ModelProvider>,
+    guardian: GuardianReviewSessionManager,
     tools: ToolRegistry,
     pub mcp_host: Option<McpExtensionHost>,
     sandbox_config: LocalSandboxConfig,
@@ -176,8 +181,10 @@ pub struct AgentCore {
 
 impl Default for AgentCore {
     fn default() -> Self {
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider);
         Self {
-            provider: Arc::new(MockProvider),
+            guardian: GuardianReviewSessionManager::new(Arc::clone(&provider)),
+            provider,
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
             sandbox_config: LocalSandboxConfig::from_env(),
@@ -194,7 +201,11 @@ impl AgentCore {
         let provider: Arc<dyn ModelProvider> = OpenAiCompatibleProvider::from_env()
             .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
             .unwrap_or_else(|| Arc::new(MockProvider));
+        let guardian_provider: Arc<dyn ModelProvider> = OpenAiCompatibleProvider::from_env()
+            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider));
         Self {
+            guardian: GuardianReviewSessionManager::new(guardian_provider),
             provider,
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
@@ -217,7 +228,17 @@ impl AgentCore {
                 .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
                 .unwrap_or_else(|| Arc::new(MockProvider)),
         };
+        let guardian_provider: Arc<dyn ModelProvider> = match active.kind {
+            ProviderKind::Mock => Arc::new(MockProvider),
+            ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(active)
+                .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
+            ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(active)
+                .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
+        };
         Self {
+            guardian: GuardianReviewSessionManager::new(guardian_provider),
             provider,
             tools: ToolRegistry::with_builtins(),
             mcp_host: None,
@@ -231,6 +252,7 @@ impl AgentCore {
 
     pub fn new(provider: Arc<dyn ModelProvider>, tools: ToolRegistry) -> Self {
         Self {
+            guardian: GuardianReviewSessionManager::new(Arc::clone(&provider)),
             provider,
             tools,
             mcp_host: None,
@@ -244,6 +266,11 @@ impl AgentCore {
 
     pub fn with_sandbox_config(mut self, sandbox_config: LocalSandboxConfig) -> Self {
         self.sandbox_config = sandbox_config;
+        self
+    }
+
+    pub fn with_guardian_provider(mut self, provider: Arc<dyn ModelProvider>) -> Self {
+        self.guardian = GuardianReviewSessionManager::new(provider);
         self
     }
 
@@ -460,56 +487,19 @@ impl AgentCore {
                     .ok_or_else(|| anyhow::anyhow!("provider continuation has no pending call"))?;
                 pending_tool_calls.remove(0);
                 if approved {
-                    let approved_sandbox = approved_sandbox_config_for_call(
-                        &self.sandbox_config,
-                        &continuation.workspace_root,
-                        &pending,
-                    );
-                    let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
-                        continuation.workspace_root.clone(),
-                        continuation.permission_mode,
-                        &approved_sandbox,
-                    ));
-                    let mut ctx = ToolContext::local_with_sandbox_config(
-                        continuation.workspace_root.clone(),
-                        policy,
-                        approved_sandbox,
-                    );
-                    ctx.store = store.clone();
-                    ctx.thread_id = Some(continuation.thread_id);
-                    ctx.cancel = cancellation.clone();
-                    ctx.approval_granted = true;
-                    self.apply_subagent_context(&mut ctx, continuation.user_message_id);
-                    let result = match self
-                        .execute_provider_tool_call(&pending, ctx, &mut events)
-                        .await
-                    {
-                        Ok(mut result) => {
-                            if let Some(metadata) = result.metadata.as_object_mut() {
-                                metadata.insert("approvalGranted".to_string(), json!(true));
-                                metadata.insert("sandboxEscalation".to_string(), json!("scoped"));
-                            }
-                            result
-                        }
-                        Err(err) if err.to_string().contains("approval required") => {
-                            let output = format!(
-                                "The approved tool call remained blocked by the configured sandbox: {err}"
-                            );
-                            ProviderToolResult {
-                                call_id: pending.id.clone(),
-                                name: pending.name.clone(),
-                                output: output.clone(),
-                                content: vec![ModelContentPart::text(output)],
-                                is_error: true,
-                                metadata: json!({
-                                    "approvalGranted": true,
-                                    "sandboxEscalation": "denied",
-                                    "sandboxEscalationDenied": true,
-                                }),
-                            }
-                        }
-                        Err(err) => return Err(err),
-                    };
+                    let result = self
+                        .execute_scoped_approved_call(
+                            &pending,
+                            &continuation.workspace_root,
+                            continuation.permission_mode,
+                            store.clone(),
+                            cancellation.clone(),
+                            continuation.thread_id,
+                            continuation.user_message_id,
+                            "user",
+                            &mut events,
+                        )
+                        .await?;
                     provider_tool_results.push(result);
                 } else {
                     provider_tool_results.push(ProviderToolResult {
@@ -615,17 +605,117 @@ impl AgentCore {
                             ));
                         }
                     }
-                    Err(err) if err.to_string().contains("approval required") => {
-                        let reason = err.to_string();
+                    Err(err) if approval_required(&err).is_some() => {
+                        let reason = approval_required(&err)
+                            .expect("approval error guard")
+                            .reason()
+                            .to_string();
+                        if permission_mode.approvals_reviewer() == ApprovalsReviewer::AutoReview {
+                            let action = GuardianApprovalAction::from_provider_call(
+                                &provider_call,
+                                &workspace_root,
+                            );
+                            let request = GuardianApprovalRequest::new(
+                                thread_id,
+                                user_message_id,
+                                reason.clone(),
+                                action,
+                            );
+                            let action_summary = request.action.event_summary();
+                            events.push(AgentEventPayload::AutomaticApprovalReviewStarted {
+                                review_id: request.review_id,
+                                target_item_id: provider_call.id.clone(),
+                                action: action_summary.clone(),
+                            });
+                            let review = self
+                                .guardian
+                                .review(
+                                    &request,
+                                    GuardianReviewContext {
+                                        conversation: &conversation,
+                                        current_user_message: &model_user_message,
+                                        tool_calls: &provider_tool_calls,
+                                        tool_results: &provider_tool_results,
+                                        workspace_root: &workspace_root,
+                                        sandbox_config: &self.sandbox_config,
+                                    },
+                                    cancellation.as_ref(),
+                                )
+                                .await;
+                            let risk_level =
+                                review.assessment.as_ref().map(|value| value.risk_level);
+                            let user_authorization = review
+                                .assessment
+                                .as_ref()
+                                .map(|value| value.user_authorization);
+                            events.push(AgentEventPayload::AutomaticApprovalReviewCompleted {
+                                review_id: request.review_id,
+                                target_item_id: provider_call.id.clone(),
+                                status: review.status,
+                                risk_level,
+                                user_authorization,
+                                rationale: review.rationale.clone(),
+                                action: action_summary,
+                            });
+                            if review.status == GuardianReviewStatus::Aborted {
+                                anyhow::bail!("cancelled");
+                            }
+                            if let Some(message) = review.interrupt_turn {
+                                events.push(AgentEventPayload::AutoReviewInterruptionWarning {
+                                    message: message.clone(),
+                                });
+                                anyhow::bail!(message);
+                            }
+
+                            let result = if review.approved() {
+                                self.execute_scoped_approved_call(
+                                    &provider_call,
+                                    &workspace_root,
+                                    permission_mode,
+                                    store.clone(),
+                                    cancellation.clone(),
+                                    thread_id,
+                                    user_message_id,
+                                    "auto_review",
+                                    events,
+                                )
+                                .await?
+                            } else {
+                                let output = format!(
+                                    "This action was rejected due to unacceptable risk.\nReason: {}\nThe agent must not attempt the same outcome through a workaround, indirect execution, or policy circumvention. Proceed only with a materially safer alternative, or ask the user for explicit approval after explaining the concrete risk.",
+                                    review.rationale
+                                );
+                                ProviderToolResult {
+                                    call_id: provider_call.id.clone(),
+                                    name: provider_call.name.clone(),
+                                    output: output.clone(),
+                                    content: vec![ModelContentPart::text(output)],
+                                    is_error: true,
+                                    metadata: json!({
+                                        "approvalReview": "denied",
+                                        "approvalReviewStatus": review.status,
+                                        "approvalReviewRationale": review.rationale,
+                                    }),
+                                }
+                            };
+                            if let Some(ref mut budget) = budget {
+                                budget
+                                    .record_tokens(ContextBudget::estimate_tokens(&result.output));
+                            }
+                            provider_tool_results.push(result);
+                            pending_tool_calls.remove(0);
+                            continue;
+                        }
+
                         let approval_id = Uuid::new_v4();
                         events.push(AgentEventPayload::ApprovalRequested {
                             approval_id,
-                            reason: reason.clone(),
+                            reason: format!("approval required: {reason}"),
                             action: provider_tool_approval_action(&provider_call),
                         });
                         events.push(AgentEventPayload::TurnSuspended {
                             approval_id,
-                            reason,
+                            reason: format!("approval required: {reason}"),
                         });
                         return Ok(AgentTurnResult {
                             events: std::mem::replace(events, TurnEvents::new(None)).into_vec(),
@@ -821,6 +911,67 @@ impl AgentCore {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_scoped_approved_call(
+        &self,
+        call: &ProviderToolCall,
+        workspace_root: &Path,
+        permission_mode: PermissionMode,
+        store: Option<Arc<dyn SessionStore>>,
+        cancellation: Option<CancellationToken>,
+        thread_id: Uuid,
+        fallback_turn_id: Uuid,
+        approval_source: &str,
+        events: &mut TurnEvents,
+    ) -> anyhow::Result<ProviderToolResult> {
+        let approved_sandbox =
+            approved_sandbox_config_for_call(&self.sandbox_config, workspace_root, call);
+        let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+            workspace_root.to_path_buf(),
+            permission_mode,
+            &approved_sandbox,
+        ));
+        let mut ctx = ToolContext::local_with_sandbox_config(
+            workspace_root.to_path_buf(),
+            policy,
+            approved_sandbox,
+        );
+        ctx.store = store;
+        ctx.thread_id = Some(thread_id);
+        ctx.cancel = cancellation;
+        ctx.approval_granted = true;
+        self.apply_subagent_context(&mut ctx, fallback_turn_id);
+        match self.execute_provider_tool_call(call, ctx, events).await {
+            Ok(mut result) => {
+                if let Some(metadata) = result.metadata.as_object_mut() {
+                    metadata.insert("approvalGranted".to_string(), json!(true));
+                    metadata.insert("approvalSource".to_string(), json!(approval_source));
+                    metadata.insert("sandboxEscalation".to_string(), json!("scoped"));
+                }
+                Ok(result)
+            }
+            Err(error) if approval_required(&error).is_some() => {
+                let output = format!(
+                    "The approved tool call remained blocked by the configured sandbox: {error}"
+                );
+                Ok(ProviderToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: output.clone(),
+                    content: vec![ModelContentPart::text(output)],
+                    is_error: true,
+                    metadata: json!({
+                        "approvalGranted": true,
+                        "approvalSource": approval_source,
+                        "sandboxEscalation": "denied",
+                        "sandboxEscalationDenied": true,
+                    }),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn execute_provider_tool_call(
         &self,
         provider_call: &ProviderToolCall,
@@ -850,7 +1001,7 @@ impl AgentCore {
                     metadata: result.metadata,
                 })
             }
-            Err(err) if err.to_string().contains("approval required") => Err(err),
+            Err(err) if approval_required(&err).is_some() => Err(err),
             Err(err) if err.to_string().contains("cancelled") => Err(err),
             Err(err) => Ok(ProviderToolResult {
                 call_id: provider_call.id.clone(),
@@ -948,7 +1099,7 @@ fn insert_approval_execution_metadata(
     if !approval_granted {
         return;
     }
-    let denied = error.is_some_and(|error| error.to_string().contains("approval required"));
+    let denied = error.is_some_and(|error| approval_required(error).is_some());
     if let Some(object) = metadata.as_object_mut() {
         object.insert("approvalGranted".to_string(), json!(true));
         object.insert(
@@ -1276,6 +1427,7 @@ fn build_model_request(
         context_items,
         previous_response_items,
         prompt_cache_key: model_context.prompt_cache_key.clone(),
+        final_output_json_schema: None,
     }
 }
 
@@ -1404,6 +1556,9 @@ fn approved_sandbox_config_for_call(
     };
 
     match call.name.as_str() {
+        "shell" | "apply_patch" => {
+            config = LocalSandboxConfig::danger_full_access();
+        }
         "list_files" | "read_file" | "search" => {
             if let Some(path) = path("path") {
                 config.grant_read_path(path);
@@ -2284,7 +2439,7 @@ mod tests {
                     user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
-                    permission_mode: PermissionMode::Auto,
+                    permission_mode: PermissionMode::Approve,
                     context_budget: None,
                     store: None,
                     cancellation: None,
@@ -2392,7 +2547,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn approved_shell_command_cannot_disable_the_os_sandbox() {
+    async fn approved_shell_command_uses_a_one_shot_sandbox_escape() {
         let workspace = test_workspace("approved-shell-remains-sandboxed");
         let outside = std::env::current_dir()
             .expect("current directory")
@@ -2430,7 +2585,7 @@ mod tests {
                     user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
-                    permission_mode: PermissionMode::Auto,
+                    permission_mode: PermissionMode::Approve,
                     context_budget: None,
                     store: None,
                     cancellation: None,
@@ -2448,28 +2603,19 @@ mod tests {
         let resumed = agent
             .resume_turn_streaming(continuation, true, None, None, None)
             .await
-            .expect("approved call returns the sandbox denial to the model");
+            .expect("approved call executes once outside the sandbox");
 
         assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
-        assert!(!outside.exists());
+        assert!(outside.exists());
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[1].tool_results[0]
                 .metadata
-                .get("sandboxEscalationDenied")
-                .and_then(Value::as_bool),
-            Some(true)
+                .get("approvalSource")
+                .and_then(Value::as_str),
+            Some("user")
         );
-        assert!(resumed.events.iter().any(|event| matches!(
-            event,
-            AgentEventPayload::ToolCallFinished { result }
-                if result
-                    .metadata
-                    .get("sandboxEscalationDenied")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-        )));
         let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(workspace);
     }
@@ -2589,6 +2735,139 @@ mod tests {
                 .get("approvalDenied")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn auto_review_approves_and_executes_the_exact_scoped_call() {
+        let workspace = test_workspace("auto-review-approved");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_auto_write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": ".codex/auto-approved.txt",
+                        "content": "reviewed once"
+                    }),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+            },
+            ModelResponse::text("The reviewed write completed."),
+        ]));
+        let reviewer = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
+            r#"{"risk_level":"low","user_authorization":"high","outcome":"allow","rationale":"The user explicitly requested this narrow local write."}"#,
+        )]));
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins())
+            .with_guardian_provider(reviewer);
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Write the exact protected test file.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::Auto,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("auto-reviewed turn completes");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert_eq!(
+            fs::read_to_string(workspace.join(".codex/auto-approved.txt")).unwrap(),
+            "reviewed once"
+        );
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::AutomaticApprovalReviewCompleted {
+                status: GuardianReviewStatus::Approved,
+                ..
+            }
+        )));
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEventPayload::ApprovalRequested { .. })));
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn auto_review_denial_is_returned_to_the_main_model_without_execution() {
+        let workspace = test_workspace("auto-review-denied");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_auto_denied".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": ".codex/auto-denied.txt",
+                        "content": "must not exist"
+                    }),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+            },
+            ModelResponse::text("I stopped after the reviewer denied the action."),
+        ]));
+        let reviewer = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
+            r#"{"risk_level":"high","user_authorization":"unknown","outcome":"deny","rationale":"The protected metadata write was not authorized by the user."}"#,
+        )]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
+            .with_guardian_provider(reviewer);
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Inspect the repository.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::Auto,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("review denial is returned to the model");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert!(!workspace.join(".codex/auto-denied.txt").exists());
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::AutomaticApprovalReviewCompleted {
+                status: GuardianReviewStatus::Denied,
+                rationale,
+                ..
+            } if rationale.contains("not authorized")
+        )));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].tool_results[0]
+                .metadata
+                .get("approvalReview")
+                .and_then(Value::as_str),
+            Some("denied")
         );
         let _ = fs::remove_dir_all(workspace);
     }

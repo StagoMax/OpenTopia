@@ -4,6 +4,7 @@ pub mod context_sources;
 pub mod desktop_browser;
 pub mod execution;
 pub mod git_workflow;
+pub mod guardian;
 pub mod instructions;
 pub mod mcp;
 pub mod mcp_host;
@@ -47,6 +48,11 @@ pub use git_workflow::{
     GitWorkflowActionKind, GitWorkflowError, GitWorkflowRequest, GitWorkflowResult,
     ListBranchesRequest, PushRequest, SwitchBranchRequest, WorktreeTarget,
 };
+pub use guardian::{
+    GuardianApprovalAction, GuardianApprovalRequest, GuardianAssessment, GuardianAssessmentOutcome,
+    GuardianReviewResult, GuardianReviewSessionManager, GuardianReviewStatus, GuardianRiskLevel,
+    GuardianUserAuthorization,
+};
 pub use instructions::{
     resolve_instruction_documents, InstructionDocument, InstructionResolution, InstructionScope,
 };
@@ -69,8 +75,9 @@ pub use model_context::{
     WorldStateSkill, WorldStateSnapshot,
 };
 pub use policy::{
-    BasicPolicyEngine, CommandPolicyRule, CommandRuleMatch, NetworkPolicyConfig, PermissionMode,
-    PolicyConfig, PolicyDecision, PolicyEngine, PolicyRuleEffect, ToolPermissionDescriptor,
+    approval_required, ApprovalPolicy, ApprovalRequired, ApprovalsReviewer, BasicPolicyEngine,
+    CommandPolicyRule, CommandRuleMatch, NetworkPolicyConfig, PermissionMode, PolicyConfig,
+    PolicyDecision, PolicyEngine, PolicyRuleEffect, ToolPermissionDescriptor,
 };
 pub use preview::{
     decode_preview_id, encode_preview_id, preview_spreadsheet_range, preview_workbook,

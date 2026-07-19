@@ -1,4 +1,5 @@
 use crate::context_sources::{ContextSourceKind, LoadedContextSource};
+use crate::guardian::{GuardianReviewStatus, GuardianRiskLevel, GuardianUserAuthorization};
 use crate::model_context::{ModelContextItem, ThreadContextSnapshot, TurnContextSnapshot};
 use crate::skills::LoadedSkill;
 use crate::subagents::SubagentRun;
@@ -835,6 +836,23 @@ pub enum AgentEventPayload {
         reason: String,
         action: String,
     },
+    AutomaticApprovalReviewStarted {
+        review_id: Uuid,
+        target_item_id: String,
+        action: Value,
+    },
+    AutomaticApprovalReviewCompleted {
+        review_id: Uuid,
+        target_item_id: String,
+        status: GuardianReviewStatus,
+        risk_level: Option<GuardianRiskLevel>,
+        user_authorization: Option<GuardianUserAuthorization>,
+        rationale: String,
+        action: Value,
+    },
+    AutoReviewInterruptionWarning {
+        message: String,
+    },
     ContextCompacted {
         summary: ContextSummary,
     },
@@ -880,6 +898,9 @@ impl AgentEventPayload {
             Self::AssistantMessage { .. } => "assistant_message",
             Self::FileChanged { .. } => "file_changed",
             Self::ApprovalRequested { .. } => "approval_requested",
+            Self::AutomaticApprovalReviewStarted { .. } => "automatic_approval_review_started",
+            Self::AutomaticApprovalReviewCompleted { .. } => "automatic_approval_review_completed",
+            Self::AutoReviewInterruptionWarning { .. } => "auto_review_interruption_warning",
             Self::ContextCompacted { .. } => "context_compacted",
             Self::TokenUsage { .. } => "token_usage",
             Self::SubagentUpdated { .. } => "subagent_updated",

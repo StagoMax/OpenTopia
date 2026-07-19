@@ -58,6 +58,8 @@ pub struct ModelRequest {
     pub previous_response_items: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_output_json_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +351,16 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    pub(crate) fn for_guardian(mut self) -> Self {
+        self.temperature = 0.0;
+        self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
+        if self.reasoning_effort.is_some() {
+            self.reasoning_effort = Some("low".to_string());
+        }
+        self.parallel_tool_calls = false;
+        self
+    }
+
     fn prepare_chat_request(
         &self,
         request_id: Uuid,
@@ -384,6 +396,16 @@ impl OpenAiCompatibleProvider {
             .filter(|value| !value.is_empty())
         {
             payload["prompt_cache_key"] = json!(prompt_cache_key);
+        }
+        if let Some(schema) = request.final_output_json_schema.as_ref() {
+            payload["response_format"] = json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "guardian_assessment",
+                    "strict": true,
+                    "schema": schema,
+                }
+            });
         }
 
         Ok(PreparedProviderRequest {
@@ -542,6 +564,16 @@ impl OpenAiResponsesProvider {
         Some(provider)
     }
 
+    pub(crate) fn for_guardian(mut self) -> Self {
+        self.temperature = 0.0;
+        self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
+        if self.reasoning_effort.is_some() {
+            self.reasoning_effort = Some("low".to_string());
+        }
+        self.parallel_tool_calls = false;
+        self
+    }
+
     fn prepare_responses_request(
         &self,
         request_id: Uuid,
@@ -581,6 +613,16 @@ impl OpenAiResponsesProvider {
             .filter(|value| !value.is_empty())
         {
             payload["prompt_cache_key"] = json!(prompt_cache_key);
+        }
+        if let Some(schema) = request.final_output_json_schema.as_ref() {
+            payload["text"] = json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": "guardian_assessment",
+                    "strict": true,
+                    "schema": schema,
+                }
+            });
         }
 
         Ok(PreparedProviderRequest {
@@ -2052,7 +2094,41 @@ mod tests {
             context_items: Vec::new(),
             previous_response_items: Vec::new(),
             prompt_cache_key: None,
+            final_output_json_schema: None,
         }
+    }
+
+    #[test]
+    fn chat_provider_maps_final_output_schema_to_strict_json_schema() {
+        let provider =
+            OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+        let mut request = model_request();
+        request.final_output_json_schema = Some(json!({
+            "type": "object",
+            "properties": { "outcome": { "type": "string" } },
+            "required": ["outcome"]
+        }));
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        assert_eq!(prepared.body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            prepared.body["response_format"]["json_schema"]["strict"],
+            true
+        );
+    }
+
+    #[test]
+    fn responses_provider_maps_final_output_schema_to_text_format() {
+        let provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+        let mut request = model_request();
+        request.final_output_json_schema = Some(json!({
+            "type": "object",
+            "properties": { "outcome": { "type": "string" } },
+            "required": ["outcome"]
+        }));
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        assert_eq!(prepared.body["text"]["format"]["type"], "json_schema");
+        assert_eq!(prepared.body["text"]["format"]["strict"], true);
     }
 
     #[test]

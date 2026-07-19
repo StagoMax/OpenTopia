@@ -668,6 +668,7 @@ export type ModelRequestSnapshot = {
   contextItems?: ModelContextItem[];
   previousResponseItems?: unknown[];
   promptCacheKey?: string | null;
+  finalOutputJsonSchema?: unknown | null;
 };
 
 export type ModelContextItem = {
@@ -793,6 +794,23 @@ export type AgentEventPayload =
       reason: string;
       action: string;
     }
+  | {
+      type: "automatic_approval_review_started";
+      review_id: string;
+      target_item_id: string;
+      action: unknown;
+    }
+  | {
+      type: "automatic_approval_review_completed";
+      review_id: string;
+      target_item_id: string;
+      status: "in_progress" | "approved" | "denied" | "timed_out" | "aborted";
+      risk_level?: "low" | "medium" | "high" | "critical" | null;
+      user_authorization?: "unknown" | "low" | "medium" | "high" | null;
+      rationale: string;
+      action: unknown;
+    }
+  | { type: "auto_review_interruption_warning"; message: string }
   | { type: "context_compacted"; summary: ContextSummary }
   | {
       type: "token_usage";

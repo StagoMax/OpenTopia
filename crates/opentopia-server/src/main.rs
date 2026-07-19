@@ -4657,6 +4657,7 @@ async fn generate_context_summary(
         context_items: Vec::new(),
         previous_response_items: Vec::new(),
         prompt_cache_key: None,
+        final_output_json_schema: None,
     };
     let request_id = Uuid::new_v4();
     let request_snapshot = serde_json::to_value(&request)

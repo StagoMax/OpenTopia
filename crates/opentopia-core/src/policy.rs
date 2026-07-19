@@ -14,6 +14,62 @@ pub enum PermissionMode {
     FullAccess,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    OnRequest,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalsReviewer {
+    User,
+    AutoReview,
+}
+
+impl PermissionMode {
+    pub fn approval_policy(self) -> ApprovalPolicy {
+        match self {
+            Self::FullAccess => ApprovalPolicy::Never,
+            Self::Chat | Self::ReadOnly | Self::Auto | Self::Approve => ApprovalPolicy::OnRequest,
+        }
+    }
+
+    pub fn approvals_reviewer(self) -> ApprovalsReviewer {
+        match self {
+            Self::Auto => ApprovalsReviewer::AutoReview,
+            Self::Chat | Self::ReadOnly | Self::Approve | Self::FullAccess => {
+                ApprovalsReviewer::User
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("approval required: {reason}")]
+pub struct ApprovalRequired {
+    reason: String,
+}
+
+impl ApprovalRequired {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+pub fn approval_required(error: &anyhow::Error) -> Option<&ApprovalRequired> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ApprovalRequired>())
+}
+
 impl FromStr for PermissionMode {
     type Err = anyhow::Error;
 
@@ -133,7 +189,7 @@ pub struct NetworkPolicyConfig {
 impl Default for NetworkPolicyConfig {
     fn default() -> Self {
         Self {
-            default_effect: PolicyRuleEffect::Allow,
+            default_effect: PolicyRuleEffect::Ask,
             allowed_hosts: Vec::new(),
         }
     }
@@ -513,6 +569,9 @@ impl PolicyEngine for BasicPolicyEngine {
                 reason: "Network host cannot be empty.".to_string(),
             };
         }
+        if host.eq_ignore_ascii_case("browser-interaction") && self.mode != PermissionMode::Chat {
+            return PolicyDecision::Allow;
+        }
 
         if self
             .config
@@ -524,16 +583,17 @@ impl PolicyEngine for BasicPolicyEngine {
             return PolicyDecision::Allow;
         }
 
-        if self.mode == PermissionMode::Approve {
-            return PolicyDecision::Ask {
-                reason: format!("Network access requires approval: {host}"),
-            };
+        match self.mode {
+            PermissionMode::Chat => PolicyDecision::Deny {
+                reason: "Chat mode does not allow network access.".to_string(),
+            },
+            PermissionMode::FullAccess => PolicyDecision::Allow,
+            PermissionMode::ReadOnly | PermissionMode::Auto | PermissionMode::Approve => self
+                .config
+                .network
+                .default_effect
+                .to_decision(format!("Network access requires approval: {host}")),
         }
-
-        self.config
-            .network
-            .default_effect
-            .to_decision(format!("Network access requires approval: {host}"))
     }
 }
 
@@ -565,6 +625,45 @@ mod tests {
     use super::*;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn execution_presets_separate_approval_policy_from_reviewer() {
+        assert_eq!(
+            PermissionMode::Approve.approval_policy(),
+            ApprovalPolicy::OnRequest
+        );
+        assert_eq!(
+            PermissionMode::Approve.approvals_reviewer(),
+            ApprovalsReviewer::User
+        );
+        assert_eq!(
+            PermissionMode::Auto.approval_policy(),
+            ApprovalPolicy::OnRequest
+        );
+        assert_eq!(
+            PermissionMode::Auto.approvals_reviewer(),
+            ApprovalsReviewer::AutoReview
+        );
+        assert_eq!(
+            PermissionMode::FullAccess.approval_policy(),
+            ApprovalPolicy::Never
+        );
+    }
+
+    #[test]
+    fn auto_and_user_review_share_the_same_network_boundary() {
+        let workspace = std::env::temp_dir().join(format!("opentopia-network-{}", Uuid::new_v4()));
+        let auto = BasicPolicyEngine::new(workspace.clone(), PermissionMode::Auto);
+        let user = BasicPolicyEngine::new(workspace, PermissionMode::Approve);
+        assert!(matches!(
+            auto.inspect_network("example.com"),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            user.inspect_network("example.com"),
+            PolicyDecision::Ask { .. }
+        ));
+    }
 
     fn policy(mode: PermissionMode) -> BasicPolicyEngine {
         BasicPolicyEngine::new(PathBuf::from("."), mode)

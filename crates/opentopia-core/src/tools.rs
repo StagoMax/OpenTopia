@@ -13,7 +13,7 @@ use crate::model::{
     ApprovalStatus, ModelContentPart, TaskPlan, TaskPlanStep, TaskPlanStepStatus, ToolCall,
     ToolResult,
 };
-use crate::policy::{PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
+use crate::policy::{ApprovalRequired, PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
 use crate::sandbox::LocalSandboxConfig;
 use crate::skills::{discover_skills, load_selected_skills};
 use crate::spreadsheet::{
@@ -117,7 +117,7 @@ fn enforce_policy_decision(decision: PolicyDecision, approval_granted: bool) -> 
         PolicyDecision::Allow => Ok(()),
         PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
         PolicyDecision::Ask { .. } if approval_granted => Ok(()),
-        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+        PolicyDecision::Ask { reason } => Err(ApprovalRequired::new(reason).into()),
     }
 }
 
@@ -1119,7 +1119,10 @@ fn inspect_browser_url(ctx: &ToolContext, raw_url: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!("approval required: Browser access to the new domain `{host}` requires approval.")
+    Err(ApprovalRequired::new(format!(
+        "Browser access to the new domain `{host}` requires approval."
+    ))
+    .into())
 }
 
 fn inspect_browser_interaction(ctx: &ToolContext) -> anyhow::Result<()> {
@@ -1897,10 +1900,11 @@ impl Tool for ShellTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.success && looks_like_sandbox_denial(&stderr) {
-            anyhow::bail!(
-                "approval required: command was blocked by the sandbox: {}",
+            return Err(ApprovalRequired::new(format!(
+                "Command was blocked by the sandbox: {}",
                 truncate(&stderr, 2_000)
-            );
+            ))
+            .into());
         }
         let full_combined = format!(
             "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
@@ -2054,10 +2058,11 @@ impl Tool for ApplyPatchTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.success && looks_like_sandbox_denial(&stderr) {
-            anyhow::bail!(
-                "approval required: patch was blocked by the sandbox: {}",
+            return Err(ApprovalRequired::new(format!(
+                "Patch was blocked by the sandbox: {}",
                 truncate(&stderr, 2_000)
-            );
+            ))
+            .into());
         }
         if !output.success {
             anyhow::bail!(

@@ -1056,6 +1056,46 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         action: payload.action,
         createdAt: event.createdAt,
       });
+    } else if (payload.type === "automatic_approval_review_started") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: "Auto-review",
+        summary: "Reviewing requested access",
+        detail: {
+          reviewId: payload.review_id,
+          targetItemId: payload.target_item_id,
+          action: payload.action,
+        },
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "automatic_approval_review_completed") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: `Auto-review ${payload.status.replace("_", " ")}`,
+        summary: [payload.risk_level, payload.rationale]
+          .filter(Boolean)
+          .join(" / "),
+        detail: {
+          reviewId: payload.review_id,
+          targetItemId: payload.target_item_id,
+          riskLevel: payload.risk_level,
+          userAuthorization: payload.user_authorization,
+          rationale: payload.rationale,
+          action: payload.action,
+        },
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "auto_review_interruption_warning") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: "Auto-review interrupted the turn",
+        summary: payload.message,
+        detail: payload,
+        createdAt: event.createdAt,
+      });
     } else if (payload.type === "context_compacted") {
       primitives.push({
         kind: "context",
