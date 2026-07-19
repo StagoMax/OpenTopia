@@ -116,7 +116,7 @@ export function RightContextRail({
   onGitChanged,
 }: RightContextRailProps) {
   const [subagentDialogOpen, setSubagentDialogOpen] = useState(false);
-  const [subagentName, setSubagentName] = useState("Worker");
+  const [subagentName, setSubagentName] = useState("worker");
   const [subagentInput, setSubagentInput] = useState("");
   const [isSpawningSubagent, setIsSpawningSubagent] = useState(false);
   const [subagentError, setSubagentError] = useState<string | null>(null);
@@ -433,7 +433,9 @@ export function RightContextRail({
                 名称
                 <input
                   value={subagentName}
-                  maxLength={80}
+                  maxLength={64}
+                  pattern="[a-z0-9_]+"
+                  title="使用小写字母、数字和下划线"
                   onChange={(event) => setSubagentName(event.target.value)}
                 />
               </label>
@@ -896,7 +898,7 @@ function collectSubagents(
   if (runs.length) {
     return runs.map((run) => ({
       id: run.id,
-      label: run.name,
+      label: `${run.agentPath} · ${run.agentType}`,
       status: subagentStatusLabel(run.status),
       createdAt: run.createdAt,
     }));

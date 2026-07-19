@@ -10,6 +10,7 @@ pub enum ProviderKind {
     Mock,
     #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible,
+    #[serde(rename = "openai_responses", alias = "open_ai_responses")]
     OpenAiResponses,
 }
 
@@ -538,6 +539,7 @@ mod tests {
         provider.prompt_cache_key = Some("workspace-cache".to_string());
 
         let json = serde_json::to_value(&provider).unwrap();
+        assert_eq!(json["kind"], "openai_responses");
         let restored: ProviderSettings = serde_json::from_value(json).unwrap();
 
         assert_eq!(restored.kind, ProviderKind::OpenAiResponses);
@@ -547,6 +549,12 @@ mod tests {
             restored.prompt_cache_key.as_deref(),
             Some("workspace-cache")
         );
+    }
+
+    #[test]
+    fn responses_provider_accepts_legacy_kind_spelling() {
+        let kind: ProviderKind = serde_json::from_str("\"open_ai_responses\"").unwrap();
+        assert_eq!(kind, ProviderKind::OpenAiResponses);
     }
 
     #[test]

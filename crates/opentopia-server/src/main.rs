@@ -16,24 +16,25 @@ use opentopia_core::{
     browser_domain_is_approved, build_local_sandbox_command, content_fingerprint,
     default_agent_model_context, discover_skills, execute_git_workflow, load_context_sources,
     load_selected_skills, redact_model_observation, resolve_instruction_documents,
-    world_state_item, AgentContextBudget, AgentContinuation, AgentCore, AgentEvent,
-    AgentEventPayload, AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus,
-    Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserDownloadRequest, BrowserNavigateRequest,
-    BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId,
-    BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, ChangedFile,
-    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
-    ContextSourcePolicy, ContextSourceRef, ContextSummary, DesktopBrowserRuntime, ExecRequest,
-    ExecutionContext, ExperienceMode, GitWorkflowAction, GitWorkflowRequest, LoadedSkill,
-    LocalBrowserRuntime, LocalExecutionEnvironment, McpCallResult, McpServerConfig,
-    McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole, ModelContentPart,
-    ModelContextItem, ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
+    world_state_catalog_item, world_state_item, AgentContextBudget, AgentContinuation, AgentCore,
+    AgentEvent, AgentEventPayload, AgentProfileRegistry, AgentTurnInput, AgentTurnOutcome,
+    AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata, BasicPolicyEngine,
+    BrowserDownloadRequest, BrowserNavigateRequest, BrowserOutput, BrowserRuntime,
+    BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserTypeRequest,
+    BrowserWaitCondition, BrowserWaitRequest, ChangedFile, CompiledModelContext, ContextCacheScope,
+    ContextItemKind, ContextRole, ContextSensitivity, ContextSourcePolicy, ContextSourceRef,
+    ContextSummary, DesktopBrowserRuntime, ExecRequest, ExecutionContext, ExperienceMode,
+    GitWorkflowAction, GitWorkflowRequest, LoadedSkill, LocalBrowserRuntime,
+    LocalExecutionEnvironment, McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor,
+    Message, MessagePart, MessageRole, ModelContentPart, ModelContextItem,
+    ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
     OpenAiCompatibleProvider, OpenAiResponsesProvider, PermissionMode, PolicyDecision,
     PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest,
     PreviewTarget, PreviewWorkbook, ProviderHealth, ProviderHealthCheck, ProviderKind,
     ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit, SandboxDescriptor,
     SandboxSettings, SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest,
     SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver, SubagentRun,
-    SubagentScheduler, SubagentSchedulerConfig, TaskPlan, TerminalCommandHistory,
+    SubagentScheduler, SubagentSchedulerConfig, SubagentScope, TaskPlan, TerminalCommandHistory,
     TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer, ToolCall,
     ToolPermissionDescriptor, ToolResult, TurnContextSnapshot, TurnRecord, TurnStatus,
     WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
@@ -136,6 +137,11 @@ async fn main() -> anyhow::Result<()> {
             store: store.clone(),
         }),
     );
+    for run in store.list_all_subagent_runs()? {
+        if let Err(error) = subagents.restore(run.clone()) {
+            warn!(run_id = %run.id, ?error, "failed to restore persisted agent identity");
+        }
+    }
     agent
         .write()
         .expect("agent lock poisoned")
@@ -469,21 +475,43 @@ impl SubagentExecutor for ServerSubagentExecutor {
             .store
             .get_thread(run.parent_thread_id)?
             .ok_or_else(|| anyhow::anyhow!("parent thread no longer exists"))?;
-        let mut conversation = Vec::new();
-        let mut prompt = run.input.clone();
+        let registry = AgentProfileRegistry::load(&thread.workspace_root);
+        for warning in registry.warnings() {
+            warn!(agent_path = %run.agent_path, warning, "agent profile warning");
+        }
+        let profile = registry
+            .get(&run.agent_type)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown agent_type `{}`", run.agent_type))?;
+        let mut conversation = self
+            .store
+            .load_subagent_conversation(run.id)?
+            .unwrap_or(forked_agent_conversation(&self.store, &run)?);
+        let mut prompt = run.last_task_message.clone();
         loop {
             while let Ok(extra) = input.try_recv() {
                 prompt.push_str("\n\nAdditional parent input:\n");
                 prompt.push_str(&extra);
             }
-            let settings = self
+            let mut settings = self
                 .settings
                 .read()
                 .expect("settings lock poisoned")
                 .clone();
             let mut agent = self.agent.read().expect("agent lock poisoned").clone();
+            if profile.model.is_some() || profile.model_reasoning_effort.is_some() {
+                let provider = settings.active_provider_mut();
+                if let Some(model) = profile.model.as_deref() {
+                    provider.model = model.to_string();
+                }
+                if let Some(reasoning_effort) = profile.model_reasoning_effort.as_deref() {
+                    provider.reasoning_effort = Some(reasoning_effort.to_string());
+                }
+                agent.set_provider_from_settings(&settings);
+            }
+            agent.apply_agent_profile(&profile);
             agent.set_mcp_host(self.mcp_host.clone());
-            agent.set_subagent_context(run.id, run.depth);
+            agent.set_subagent_identity(run.id, run.depth, run.agent_path.clone());
             sync_thread_mcp_tools(
                 &self.store,
                 &self.mcp_host,
@@ -525,6 +553,8 @@ impl SubagentExecutor for ServerSubagentExecutor {
                 content: last_result.clone(),
                 content_parts: Vec::new(),
             });
+            self.store
+                .save_subagent_conversation(run.id, &conversation)?;
 
             let follow_up = match timeout(Duration::from_millis(25), input.recv()).await {
                 Ok(Some(follow_up)) => follow_up,
@@ -533,6 +563,34 @@ impl SubagentExecutor for ServerSubagentExecutor {
             prompt = follow_up;
         }
     }
+}
+
+fn forked_agent_conversation(
+    store: &SqliteSessionStore,
+    run: &SubagentRun,
+) -> anyhow::Result<Vec<ModelConversationMessage>> {
+    if run.fork_turns == "none" {
+        return Ok(Vec::new());
+    }
+    let messages = store.list_messages(run.parent_thread_id)?;
+    let start = if run.fork_turns == "all" {
+        0
+    } else {
+        let turns = run.fork_turns.parse::<usize>().unwrap_or(0);
+        let user_indexes = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| (message.role == MessageRole::User).then_some(index))
+            .collect::<Vec<_>>();
+        user_indexes
+            .get(user_indexes.len().saturating_sub(turns))
+            .copied()
+            .unwrap_or(0)
+    };
+    Ok(messages[start..]
+        .iter()
+        .filter_map(model_conversation_message)
+        .collect())
 }
 
 fn subagent_result_text(events: &[AgentEventPayload]) -> String {
@@ -1456,19 +1514,31 @@ async fn spawn_subagent_run(
     Path(thread_id): Path<Uuid>,
     Json(request): Json<SpawnSubagentRunRequest>,
 ) -> Result<Json<SubagentRun>, ApiError> {
-    ensure_thread(&state, thread_id)?;
+    let thread = ensure_thread(&state, thread_id)?;
     let latest_turn = state.turns.status(thread_id)?;
     let parent_turn_id = request
         .parent_turn_id
         .or_else(|| latest_turn.map(|turn| turn.turn_id))
         .unwrap_or_else(Uuid::new_v4);
+    let agent_type = request.agent_type.unwrap_or_else(|| "default".to_string());
+    if AgentProfileRegistry::load(&thread.workspace_root)
+        .get(&agent_type)
+        .is_none()
+    {
+        return Err(ApiError::bad_request(format!(
+            "unknown agent_type `{agent_type}`"
+        )));
+    }
     let run = state
         .subagents
         .spawn(SpawnSubagentRequest {
             parent_thread_id: thread_id,
             parent_turn_id,
+            parent_agent_path: "/root".to_string(),
             name: request.name,
+            agent_type,
             input: request.input,
+            fork_turns: request.fork_turns.unwrap_or_else(|| "all".to_string()),
             depth: request.depth.unwrap_or(1),
         })
         .map_err(subagent_api_error)?;
@@ -1480,11 +1550,27 @@ async fn send_subagent_input(
     Path((thread_id, run_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<SubagentInputRequest>,
 ) -> Result<StatusCode, ApiError> {
-    ensure_live_subagent(&state, thread_id, run_id)?;
-    state
-        .subagents
-        .send_input(run_id, request.input)
-        .map_err(subagent_api_error)?;
+    let run = ensure_live_subagent(&state, thread_id, run_id)?;
+    if run.status.is_terminal() {
+        state
+            .subagents
+            .followup_task_scoped(
+                SubagentScope {
+                    thread_id,
+                    parent_turn_id: run.parent_turn_id,
+                    depth: 0,
+                    agent_path: "/root".to_string(),
+                },
+                &run_id.to_string(),
+                request.input,
+            )
+            .map_err(subagent_api_error)?;
+    } else {
+        state
+            .subagents
+            .send_input(run_id, request.input)
+            .map_err(subagent_api_error)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4111,21 +4197,6 @@ async fn build_turn_model_context(
                 "bytes": document.bytes,
             }))
         }));
-    context.items.extend(selected_skills.iter().map(|skill| {
-        ModelContextItem::text(
-            ContextItemKind::Skill,
-            ContextRole::Developer,
-            skill.descriptor.path.display().to_string(),
-            skill.render_for_model(),
-            ContextCacheScope::Turn,
-            ContextSensitivity::Workspace,
-        )
-        .with_metadata(json!({
-            "skillId": skill.descriptor.id,
-            "name": skill.descriptor.name,
-            "truncated": skill.truncated,
-        }))
-    }));
     context.items.push(ModelContextItem::text(
         ContextItemKind::Environment,
         ContextRole::Developer,
@@ -4207,6 +4278,22 @@ async fn build_turn_model_context(
         }),
     };
     let world_state_hash = world_state.content_hash();
+    context.items.push(world_state_catalog_item(&world_state));
+    context.items.extend(selected_skills.iter().map(|skill| {
+        ModelContextItem::text(
+            ContextItemKind::Skill,
+            ContextRole::Developer,
+            skill.descriptor.path.display().to_string(),
+            skill.render_for_model(),
+            ContextCacheScope::Turn,
+            ContextSensitivity::Workspace,
+        )
+        .with_metadata(json!({
+            "skillId": skill.descriptor.id,
+            "name": skill.descriptor.name,
+            "truncated": skill.truncated,
+        }))
+    }));
     context.items.push(world_state_item(&world_state));
     let active = settings.active_provider();
     context.prompt_cache_key = active.prompt_cache_key.clone().or_else(|| {
@@ -5442,6 +5529,8 @@ struct CancelAgentTurnRequest {
 struct SpawnSubagentRunRequest {
     name: String,
     input: String,
+    agent_type: Option<String>,
+    fork_turns: Option<String>,
     parent_turn_id: Option<Uuid>,
     depth: Option<u8>,
 }

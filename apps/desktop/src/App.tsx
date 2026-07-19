@@ -1321,6 +1321,8 @@ export function App() {
       await client.spawnSubagent(activeThread.id, {
         name,
         input,
+        agentType: "default",
+        forkTurns: "all",
         parentTurnId: activeTurnId ?? undefined,
         depth: 1,
       });

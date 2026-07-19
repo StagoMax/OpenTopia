@@ -830,8 +830,13 @@ export type SubagentRun = {
   id: string;
   parentThreadId: string;
   parentTurnId: string;
+  agentPath: string;
+  parentAgentPath: string;
   name: string;
+  agentType: string;
   input: string;
+  forkTurns: string;
+  lastTaskMessage: string;
   depth: number;
   status: SubagentRunStatus;
   result?: string | null;

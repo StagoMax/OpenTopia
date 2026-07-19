@@ -800,7 +800,7 @@ function SubagentActivity({ run, now }: { run: SubagentRun; now: number }) {
         <span className="activity-group-icon" aria-hidden="true">
           <Bot size={13} />
         </span>
-        <span>子智能体：{run.name}</span>
+        <span>Agent：{run.agentPath || run.name}</span>
         <small className="activity-group-count">
           {subagentStatusLabel(run.status)}
           {timing ? ` · ${timing}` : ""}

@@ -1,3 +1,4 @@
+use crate::agent_profiles::AgentProfile;
 use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
 use crate::guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext,
@@ -30,7 +31,7 @@ use crate::tools::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -177,6 +178,10 @@ pub struct AgentCore {
     subagents: Option<SubagentScheduler>,
     subagent_depth: u8,
     subagent_parent_turn_id: Option<Uuid>,
+    agent_path: String,
+    additional_developer_instructions: Option<String>,
+    allowed_tools: Option<HashSet<String>>,
+    denied_tools: HashSet<String>,
 }
 
 impl Default for AgentCore {
@@ -192,6 +197,10 @@ impl Default for AgentCore {
             subagents: None,
             subagent_depth: 0,
             subagent_parent_turn_id: None,
+            agent_path: "/root".to_string(),
+            additional_developer_instructions: None,
+            allowed_tools: None,
+            denied_tools: HashSet::new(),
         }
     }
 }
@@ -214,6 +223,10 @@ impl AgentCore {
             subagents: None,
             subagent_depth: 0,
             subagent_parent_turn_id: None,
+            agent_path: "/root".to_string(),
+            additional_developer_instructions: None,
+            allowed_tools: None,
+            denied_tools: HashSet::new(),
         }
     }
 
@@ -247,6 +260,10 @@ impl AgentCore {
             subagents: None,
             subagent_depth: 0,
             subagent_parent_turn_id: None,
+            agent_path: "/root".to_string(),
+            additional_developer_instructions: None,
+            allowed_tools: None,
+            denied_tools: HashSet::new(),
         }
     }
 
@@ -261,6 +278,10 @@ impl AgentCore {
             subagents: None,
             subagent_depth: 0,
             subagent_parent_turn_id: None,
+            agent_path: "/root".to_string(),
+            additional_developer_instructions: None,
+            allowed_tools: None,
+            denied_tools: HashSet::new(),
         }
     }
 
@@ -289,12 +310,77 @@ impl AgentCore {
     pub fn set_subagent_context(&mut self, parent_turn_id: Uuid, depth: u8) {
         self.subagent_parent_turn_id = Some(parent_turn_id);
         self.subagent_depth = depth;
+        if depth == 0 {
+            self.agent_path = "/root".to_string();
+        }
+    }
+
+    pub fn set_subagent_identity(
+        &mut self,
+        parent_turn_id: Uuid,
+        depth: u8,
+        agent_path: impl Into<String>,
+    ) {
+        self.subagent_parent_turn_id = Some(parent_turn_id);
+        self.subagent_depth = depth;
+        self.agent_path = agent_path.into();
+    }
+
+    pub fn apply_agent_profile(&mut self, profile: &AgentProfile) {
+        self.additional_developer_instructions =
+            Some(profile.developer_instructions.trim().to_string());
+        if let Some(profile_allowed) = profile
+            .allowed_tools
+            .as_ref()
+            .map(|tools| tools.iter().cloned().collect::<HashSet<_>>())
+        {
+            self.allowed_tools = Some(match self.allowed_tools.take() {
+                Some(parent_allowed) => parent_allowed
+                    .intersection(&profile_allowed)
+                    .cloned()
+                    .collect(),
+                None => profile_allowed,
+            });
+        }
+        self.denied_tools
+            .extend(profile.denied_tools.iter().cloned());
+        if let Some(requested) = profile.sandbox_mode {
+            let current = self.sandbox_config.sandbox_mode;
+            if sandbox_rank(requested) <= sandbox_rank(current) {
+                self.sandbox_config = self.sandbox_config.clone().with_sandbox_mode(requested);
+            }
+        }
+    }
+
+    pub fn set_provider_from_settings(&mut self, settings: &AppSettings) {
+        let active = settings.active_provider();
+        let provider: Arc<dyn ModelProvider> = match active.kind {
+            ProviderKind::Mock => Arc::new(MockProvider),
+            ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(active)
+                .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
+            ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(active)
+                .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
+        };
+        let guardian_provider: Arc<dyn ModelProvider> = match active.kind {
+            ProviderKind::Mock => Arc::new(MockProvider),
+            ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(active)
+                .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
+            ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(active)
+                .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
+        };
+        self.provider = provider;
+        self.guardian = GuardianReviewSessionManager::new(guardian_provider);
     }
 
     fn apply_subagent_context(&self, context: &mut ToolContext, fallback_turn_id: Uuid) {
         context.subagents = self.subagents.clone();
         context.parent_turn_id = Some(self.subagent_parent_turn_id.unwrap_or(fallback_turn_id));
         context.subagent_depth = self.subagent_depth;
+        context.agent_path = self.agent_path.clone();
         context.browser = Some(self.browser.clone());
     }
 
@@ -399,9 +485,25 @@ impl AgentCore {
 
         let model_user_message =
             provider_user_message(&input.content, input.context_summary.as_deref());
-        let model_context = model_context.unwrap_or_else(|| {
+        let mut model_context = model_context.unwrap_or_else(|| {
             default_agent_model_context(&input.workspace_root, &self.sandbox_config)
         });
+        if let Some(instructions) = self
+            .additional_developer_instructions
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            model_context.items.push(ModelContextItem::text(
+                ContextItemKind::DeveloperInstructions,
+                ContextRole::Developer,
+                format!("opentopia:agent_profile:{}", self.agent_path),
+                instructions,
+                ContextCacheScope::Thread,
+                ContextSensitivity::Workspace,
+            ));
+            model_context.prompt_cache_key =
+                Some(format!("opentopia-{}", model_context.content_hash()));
+        }
         let tool_candidates = self.provider_tool_candidates();
         let response = self
             .complete_model(
@@ -901,6 +1003,7 @@ impl AgentCore {
             .list()
             .into_iter()
             .filter(|name| subagents_available || !is_subagent_tool(name))
+            .filter(|name| self.tool_is_allowed(name))
             .filter_map(|name| {
                 self.tools.get(&name).map(|tool| ProviderToolCandidate {
                     name,
@@ -909,6 +1012,15 @@ impl AgentCore {
                 })
             })
             .collect()
+    }
+
+    fn tool_is_allowed(&self, name: &str) -> bool {
+        !self.denied_tools.contains(name)
+            && self
+                .allowed_tools
+                .as_ref()
+                .map(|allowed| allowed.contains(name))
+                .unwrap_or(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1029,6 +1141,25 @@ impl AgentCore {
         let name = call.name.clone();
         let approval_granted = ctx.approval_granted;
         events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
+        if !self.tool_is_allowed(&name) {
+            let err = anyhow::anyhow!("{name} is disabled by the active agent profile");
+            let mut metadata = json!({
+                "toolName": &name,
+                "success": false,
+                "error": err.to_string()
+            });
+            insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
+            merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
+            events.push(AgentEventPayload::ToolCallFinished {
+                result: ToolResult {
+                    call_id: call.id,
+                    output: err.to_string(),
+                    content: vec![ModelContentPart::text(err.to_string())],
+                    metadata,
+                },
+            });
+            return Err(err);
+        }
         let tool = match self.tools.get(&name) {
             Some(tool) => tool,
             None => {
@@ -1337,7 +1468,7 @@ pub fn default_agent_model_context(
 }
 
 fn base_agent_instructions() -> &'static str {
-    "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, and when the task is complete. The harness provides capabilities, policy boundaries, isolation, and observability; it does not prescribe a workflow. Use tools only when they materially help. For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. After successful verification, finish with one final action: update_plan with current_scope_complete set to true and concrete verification evidence, or call complete_task with a concise summary, concrete verification evidence, and any deliberately deferred work. Do not perform more investigation after that final action. Delegate independent work with spawn_agent when useful, then use wait_agents to collect parallel results before synthesizing the final answer. Inspect every child status and error; a terminal child is not necessarily a successful child.\n\nThe runtime imposes no task-level elapsed-time or total tool-round limit. Continue autonomously until the task reaches a truthful terminal state, the user cancels it, a real permission boundary requires approval, or an unrecoverable error occurs. Tool history is compacted automatically near the context-window boundary."
+    "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, whether another agent would help, and when the task is complete. The harness provides capabilities, communication bridges, policy boundaries, isolation, scheduling, and observability; it does not prescribe a workflow or task graph. Use tools only when they materially help. For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. After successful verification, finish with one final action: update_plan with current_scope_complete set to true and concrete verification evidence, or call complete_task with a concise summary, concrete verification evidence, and any deliberately deferred work. Do not perform more investigation after that final action.\n\nYou may create agents for concrete work that benefits from an independent context. Choose the task boundary, agent_type, and history fork yourself. Use spawn_agent to create a stable agent identity, send_message for queued peer communication, followup_task to start another turn on an existing agent, interrupt_agent to stop only its current turn, list_agents to inspect the task tree, and wait_agent or wait_agents when synchronization is actually needed. Agents in the same root task may communicate directly by UUID or canonical /root/... path. Prefer independent scopes and disjoint write ownership when parallelizing; if work is dependent, sequence it or pass the dependency explicitly through messages. Inspect every child status and error; terminal does not necessarily mean successful.\n\nThe runtime imposes no task-level elapsed-time or total tool-round limit. Continue autonomously until the task reaches a truthful terminal state, the user cancels it, a real permission boundary requires approval, or an unrecoverable error occurs. Tool history is compacted automatically near the context-window boundary."
 }
 
 #[cfg(test)]
@@ -1463,8 +1594,24 @@ fn workspace_scope_instruction(
 fn is_subagent_tool(name: &str) -> bool {
     matches!(
         name,
-        "spawn_agent" | "send_input" | "cancel_agent" | "wait_agent" | "wait_agents"
+        "spawn_agent"
+            | "send_message"
+            | "followup_task"
+            | "interrupt_agent"
+            | "list_agents"
+            | "send_input"
+            | "cancel_agent"
+            | "wait_agent"
+            | "wait_agents"
     )
+}
+
+fn sandbox_rank(mode: SandboxMode) -> u8 {
+    match mode {
+        SandboxMode::ReadOnly => 0,
+        SandboxMode::WorkspaceWrite => 1,
+        SandboxMode::DangerFullAccess => 2,
+    }
 }
 
 fn provider_user_message(user_content: &str, context_summary: Option<&str>) -> String {

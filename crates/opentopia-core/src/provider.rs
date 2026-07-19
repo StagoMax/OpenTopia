@@ -1,5 +1,5 @@
 use crate::model::ModelContentPart;
-use crate::model_context::ModelContextItem;
+use crate::model_context::{CompiledModelContext, ContextRole, ModelContextItem};
 use crate::settings::{ProviderHealthCheck, ProviderKind, ProviderSettings};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -434,7 +434,9 @@ impl OpenAiCompatibleProvider {
             .json(&prepared.body)
             .send()
             .await?;
-        if response.status().as_u16() == 400 && !prepared.logical_request.tool_results.is_empty() {
+        if response.status().as_u16() == 400
+            && chat_request_has_compatibility_fallback(&prepared.logical_request)
+        {
             let rejected_body = response.text().await?;
             attempt = 2;
             prepared.body["messages"] =
@@ -442,7 +444,7 @@ impl OpenAiCompatibleProvider {
             on_transport(ProviderTransportEvent::Retry {
                 attempt,
                 reason: truncate_observation_text(&format!(
-                    "provider rejected structured tool history with HTTP 400: {rejected_body}"
+                    "provider rejected native developer messages or structured tool history with HTTP 400: {rejected_body}"
                 )),
                 body: redact_transport_value(&prepared.body),
             })?;
@@ -582,13 +584,16 @@ impl OpenAiResponsesProvider {
         let endpoint = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let mut payload = json!({
             "model": self.model,
-            "instructions": request.system_prompt,
             "input": responses_input(&request),
             "stream": true,
             "store": self.store_responses,
             "parallel_tool_calls": self.parallel_tool_calls,
             "temperature": self.temperature,
         });
+        let system_instructions = responses_system_instructions(&request);
+        if !system_instructions.trim().is_empty() {
+            payload["instructions"] = json!(system_instructions);
+        }
         if let Some(max_output_tokens) = self.max_output_tokens {
             payload["max_output_tokens"] = json!(max_output_tokens);
         }
@@ -1200,11 +1205,50 @@ fn strip_env_quotes(value: &str) -> &str {
     value
 }
 
+fn instruction_messages(request: &ModelRequest) -> Vec<(ContextRole, String)> {
+    if request.context_items.is_empty() {
+        return vec![(ContextRole::System, request.system_prompt.clone())];
+    }
+    CompiledModelContext {
+        items: request.context_items.clone(),
+        prompt_cache_key: request.prompt_cache_key.clone(),
+    }
+    .instruction_messages()
+}
+
+fn openai_instruction_messages(request: &ModelRequest) -> Vec<Value> {
+    instruction_messages(request)
+        .into_iter()
+        .map(|(role, content)| {
+            json!({
+                "role": match role {
+                    ContextRole::System => "system",
+                    ContextRole::Developer => "developer",
+                    _ => unreachable!("instruction messages contain only system/developer roles"),
+                },
+                "content": content,
+            })
+        })
+        .collect()
+}
+
+fn responses_system_instructions(request: &ModelRequest) -> String {
+    instruction_messages(request)
+        .into_iter()
+        .filter_map(|(role, content)| (role == ContextRole::System).then_some(content))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn chat_request_has_compatibility_fallback(request: &ModelRequest) -> bool {
+    !request.tool_results.is_empty()
+        || instruction_messages(request)
+            .iter()
+            .any(|(role, _)| *role == ContextRole::Developer)
+}
+
 fn openai_messages(request: &ModelRequest) -> Vec<Value> {
-    let mut messages = vec![json!({
-        "role": "system",
-        "content": &request.system_prompt
-    })];
+    let mut messages = openai_instruction_messages(request);
 
     messages.extend(request.conversation.iter().map(|message| {
         json!({
@@ -1286,13 +1330,15 @@ fn openai_compatibility_messages(request: &ModelRequest) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
-    messages.push(json!({
-        "role": "user",
-        "content": format!(
-            "Continue the original task using this authoritative completed tool history. Do not repeat completed calls unless needed:\n{}",
-            Value::Array(history)
-        )
-    }));
+    if !history.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": format!(
+                "Continue the original task using this authoritative completed tool history. Do not repeat completed calls unless needed:\n{}",
+                Value::Array(history)
+            )
+        }));
+    }
     messages
 }
 
@@ -1336,20 +1382,27 @@ fn responses_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
 }
 
 fn responses_input(request: &ModelRequest) -> Vec<Value> {
-    let mut input = request
-        .conversation
-        .iter()
-        .map(|message| {
-            json!({
-                "role": openai_conversation_role(message.role),
-                "content": responses_message_content(
-                    message.role,
-                    &message.content,
-                    &message.content_parts,
-                ),
+    let mut input = instruction_messages(request)
+        .into_iter()
+        .filter_map(|(role, content)| {
+            (role == ContextRole::Developer).then(|| {
+                json!({
+                    "role": "developer",
+                    "content": content,
+                })
             })
         })
         .collect::<Vec<_>>();
+    input.extend(request.conversation.iter().map(|message| {
+        json!({
+            "role": openai_conversation_role(message.role),
+            "content": responses_message_content(
+                message.role,
+                &message.content,
+                &message.content_parts,
+            ),
+        })
+    }));
     input.push(json!({
         "role": "user",
         "content": responses_message_content(
@@ -2098,6 +2151,38 @@ mod tests {
         }
     }
 
+    fn layered_model_request() -> ModelRequest {
+        let mut request = model_request();
+        request.system_prompt = "legacy combined system and developer text".to_string();
+        request.context_items = vec![
+            ModelContextItem::text(
+                crate::model_context::ContextItemKind::BaseInstructions,
+                ContextRole::System,
+                "opentopia:base",
+                "base instructions",
+                crate::model_context::ContextCacheScope::Stable,
+                crate::model_context::ContextSensitivity::Public,
+            ),
+            ModelContextItem::text(
+                crate::model_context::ContextItemKind::Environment,
+                ContextRole::Developer,
+                "opentopia:environment",
+                "developer environment",
+                crate::model_context::ContextCacheScope::Turn,
+                crate::model_context::ContextSensitivity::Workspace,
+            ),
+            ModelContextItem::text(
+                crate::model_context::ContextItemKind::User,
+                ContextRole::User,
+                "current_user_message",
+                "must not be duplicated",
+                crate::model_context::ContextCacheScope::Turn,
+                crate::model_context::ContextSensitivity::Workspace,
+            ),
+        ];
+        request
+    }
+
     #[test]
     fn chat_provider_maps_final_output_schema_to_strict_json_schema() {
         let provider =
@@ -2253,6 +2338,61 @@ mod tests {
         assert_eq!(messages[4]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[5]["role"], "tool");
         assert_eq!(messages[5]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn chat_messages_preserve_native_context_roles() {
+        let request = layered_model_request();
+
+        let messages = openai_messages(&request);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "base instructions");
+        assert_eq!(messages[1]["role"], "developer");
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("developer environment"));
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "current");
+        assert!(!messages
+            .iter()
+            .any(|message| message.to_string().contains("must not be duplicated")));
+    }
+
+    #[test]
+    fn responses_split_system_instructions_from_developer_input() {
+        let provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+        let prepared = provider
+            .prepare(Uuid::nil(), layered_model_request())
+            .unwrap();
+
+        assert_eq!(prepared.body["instructions"], "base instructions");
+        assert_eq!(prepared.body["input"][0]["role"], "developer");
+        assert!(prepared.body["input"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("developer environment"));
+        assert_eq!(prepared.body["input"][1]["role"], "user");
+        assert_eq!(prepared.body["input"][1]["content"], "current");
+    }
+
+    #[test]
+    fn compatibility_fallback_flattens_developer_context_without_empty_history() {
+        let request = layered_model_request();
+
+        assert!(chat_request_has_compatibility_fallback(&request));
+        let messages = openai_compatibility_messages(&request);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(
+            messages[0]["content"],
+            "legacy combined system and developer text"
+        );
+        assert_eq!(messages[1]["role"], "user");
     }
 
     #[test]
@@ -2724,6 +2864,87 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn chat_provider_retries_without_developer_role_after_http_400() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let first_request = read_http_request(&mut first_socket).await;
+            let rejected = r#"{"error":"unsupported developer role"}"#;
+            first_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        rejected.len(),
+                        rejected
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first_socket.shutdown().await.unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let second_request = read_http_request(&mut second_socket).await;
+            second_socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"compatible\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            second_socket.shutdown().await.unwrap();
+            request_tx.send((first_request, second_request)).unwrap();
+        });
+        let provider =
+            OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+        let prepared = provider
+            .prepare(Uuid::nil(), layered_model_request())
+            .unwrap();
+        let mut transport = Vec::new();
+
+        let response = provider
+            .stream_prepared(prepared, &mut |_| Ok(()), &mut |event| {
+                transport.push(event);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let (first_request, second_request) = request_rx.await.unwrap();
+        let first: Value =
+            serde_json::from_str(first_request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let second: Value =
+            serde_json::from_str(second_request.split_once("\r\n\r\n").unwrap().1).unwrap();
+
+        assert_eq!(response.text, "compatible");
+        assert!(first["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "developer"));
+        assert!(!second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "developer"));
+        assert_eq!(
+            second["messages"][0]["content"],
+            "legacy combined system and developer text"
+        );
+        assert!(transport
+            .iter()
+            .any(|event| matches!(event, ProviderTransportEvent::Retry { attempt: 2, .. })));
     }
 
     #[test]

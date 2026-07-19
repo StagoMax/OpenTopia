@@ -528,7 +528,7 @@ fn guardian_policy_prompt() -> String {
     let prompt = BUNDLED_GUARDIAN_POLICY_TEMPLATE
         .replace("{{ tenant_policy_config }}", BUNDLED_GUARDIAN_POLICY.trim());
     format!(
-        "{prompt}\n\nYou may use read-only tool checks to gather additional context. Your final message must be strict JSON. For low-risk actions return {{\"outcome\":\"allow\"}}. Otherwise return risk_level, user_authorization, outcome, and rationale."
+        "{prompt}\n\nYou may use read-only tool checks to gather additional context. Your final message must be strict JSON. For low-risk actions {{\"outcome\":\"allow\"}} is sufficient when the provider permits omitted properties; if its schema requires every property, use null for the other values. Otherwise return risk_level, user_authorization, outcome, and rationale."
     )
 }
 
@@ -538,20 +538,20 @@ fn guardian_output_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "risk_level": {
-                "type": "string",
-                "enum": ["low", "medium", "high", "critical"]
+                "type": ["string", "null"],
+                "enum": ["low", "medium", "high", "critical", null]
             },
             "user_authorization": {
-                "type": "string",
-                "enum": ["unknown", "low", "medium", "high"]
+                "type": ["string", "null"],
+                "enum": ["unknown", "low", "medium", "high", null]
             },
             "outcome": {
                 "type": "string",
                 "enum": ["allow", "deny"]
             },
-            "rationale": { "type": "string" }
+            "rationale": { "type": ["string", "null"] }
         },
-        "required": ["outcome"]
+        "required": ["risk_level", "user_authorization", "outcome", "rationale"]
     })
 }
 
@@ -1029,6 +1029,30 @@ mod tests {
         let assessment = parse_guardian_assessment(r#"{"outcome":"allow"}"#).unwrap();
         assert_eq!(assessment.risk_level, GuardianRiskLevel::Low);
         assert_eq!(assessment.outcome, GuardianAssessmentOutcome::Allow);
+    }
+
+    #[test]
+    fn output_schema_is_compatible_with_strict_structured_outputs() {
+        let schema = guardian_output_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), properties.len());
+        for name in properties.keys() {
+            assert!(required
+                .iter()
+                .any(|value| value.as_str() == Some(name.as_str())));
+        }
+        assert!(schema["properties"]["risk_level"]["type"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "null"));
+
+        let assessment = parse_guardian_assessment(
+            r#"{"risk_level":null,"user_authorization":null,"outcome":"allow","rationale":null}"#,
+        )
+        .unwrap();
+        assert_eq!(assessment.risk_level, GuardianRiskLevel::Low);
     }
 
     #[test]
