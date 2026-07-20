@@ -101,7 +101,7 @@ pub use sandbox::{
 };
 pub use settings::{
     AppSettings, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
-    SandboxEnforcement, SandboxSettings,
+    RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
 };
 pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,

@@ -439,12 +439,23 @@ impl OpenAiCompatibleProvider {
         {
             let rejected_body = response.text().await?;
             attempt = 2;
-            prepared.body["messages"] =
-                json!(openai_compatibility_messages(&prepared.logical_request));
+            let mut changes = Vec::new();
+            if prepared.logical_request.final_output_json_schema.is_some() {
+                if let Some(body) = prepared.body.as_object_mut() {
+                    body.remove("response_format");
+                }
+                changes.push("structured response format");
+            }
+            if chat_request_needs_message_compatibility_fallback(&prepared.logical_request) {
+                prepared.body["messages"] =
+                    json!(openai_compatibility_messages(&prepared.logical_request));
+                changes.push("native developer messages or structured tool history");
+            }
             on_transport(ProviderTransportEvent::Retry {
                 attempt,
                 reason: truncate_observation_text(&format!(
-                    "provider rejected native developer messages or structured tool history with HTTP 400: {rejected_body}"
+                    "provider rejected {} with HTTP 400: {rejected_body}",
+                    changes.join(" and ")
                 )),
                 body: redact_transport_value(&prepared.body),
             })?;
@@ -1240,11 +1251,16 @@ fn responses_system_instructions(request: &ModelRequest) -> String {
         .join("\n\n")
 }
 
-fn chat_request_has_compatibility_fallback(request: &ModelRequest) -> bool {
+fn chat_request_needs_message_compatibility_fallback(request: &ModelRequest) -> bool {
     !request.tool_results.is_empty()
         || instruction_messages(request)
             .iter()
             .any(|(role, _)| *role == ContextRole::Developer)
+}
+
+fn chat_request_has_compatibility_fallback(request: &ModelRequest) -> bool {
+    request.final_output_json_schema.is_some()
+        || chat_request_needs_message_compatibility_fallback(request)
 }
 
 fn openai_messages(request: &ModelRequest) -> Vec<Value> {
@@ -2942,6 +2958,81 @@ mod tests {
             second["messages"][0]["content"],
             "legacy combined system and developer text"
         );
+        assert!(transport
+            .iter()
+            .any(|event| matches!(event, ProviderTransportEvent::Retry { attempt: 2, .. })));
+    }
+
+    #[tokio::test]
+    async fn chat_provider_retries_without_unsupported_response_format_after_http_400() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let first_request = read_http_request(&mut first_socket).await;
+            let rejected = r#"{"error":"unsupported response_format"}"#;
+            first_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        rejected.len(),
+                        rejected
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first_socket.shutdown().await.unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let second_request = read_http_request(&mut second_socket).await;
+            second_socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"outcome\\\":\\\"allow\\\"}\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            second_socket.shutdown().await.unwrap();
+            request_tx.send((first_request, second_request)).unwrap();
+        });
+        let provider =
+            OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+        let mut request = model_request();
+        request.final_output_json_schema = Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "outcome": { "type": "string" } },
+            "required": ["outcome"]
+        }));
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        let mut transport = Vec::new();
+
+        let response = provider
+            .stream_prepared(prepared, &mut |_| Ok(()), &mut |event| {
+                transport.push(event);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let (first_request, second_request) = request_rx.await.unwrap();
+        let first: Value =
+            serde_json::from_str(first_request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let second: Value =
+            serde_json::from_str(second_request.split_once("\r\n\r\n").unwrap().1).unwrap();
+
+        assert_eq!(response.text, r#"{"outcome":"allow"}"#);
+        assert!(first.get("response_format").is_some());
+        assert!(second.get("response_format").is_none());
+        assert_eq!(first["messages"], second["messages"]);
         assert!(transport
             .iter()
             .any(|event| matches!(event, ProviderTransportEvent::Retry { attempt: 2, .. })));

@@ -2542,6 +2542,7 @@ function SettingsPanel({
         storeResponses: false,
         parallelToolCalls: false,
         promptCacheKey: null,
+        rolloutBudget: null,
         apiKeySource: "OPENTOPIA_API_KEY",
         apiKeyConfigured: false,
         healthStatus: null,
@@ -2954,6 +2955,95 @@ function SettingsPanel({
                         }
                       />
                     </label>
+                    <label>
+                      <span>Rollout token budget</span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(editingProvider.rolloutBudget)}
+                        onChange={(event) =>
+                          updateProvider(
+                            editingProvider.id,
+                            "rolloutBudget",
+                            event.target.checked
+                              ? {
+                                  limitTokens: 100000,
+                                  samplingTokenWeight: 1,
+                                  prefillTokenWeight: 1,
+                                }
+                              : null,
+                          )
+                        }
+                      />
+                    </label>
+                    {editingProvider.rolloutBudget ? (
+                      <>
+                        <label>
+                          Weighted token limit
+                          <input
+                            type="number"
+                            min="1"
+                            step="1000"
+                            value={editingProvider.rolloutBudget.limitTokens}
+                            onChange={(event) =>
+                              updateProvider(
+                                editingProvider.id,
+                                "rolloutBudget",
+                                {
+                                  ...editingProvider.rolloutBudget!,
+                                  limitTokens: Number(event.target.value),
+                                },
+                              )
+                            }
+                          />
+                        </label>
+                        <label>
+                          Output token weight
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.1"
+                            value={
+                              editingProvider.rolloutBudget.samplingTokenWeight
+                            }
+                            onChange={(event) =>
+                              updateProvider(
+                                editingProvider.id,
+                                "rolloutBudget",
+                                {
+                                  ...editingProvider.rolloutBudget!,
+                                  samplingTokenWeight: Number(
+                                    event.target.value,
+                                  ),
+                                },
+                              )
+                            }
+                          />
+                        </label>
+                        <label>
+                          Uncached input weight
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.1"
+                            value={
+                              editingProvider.rolloutBudget.prefillTokenWeight
+                            }
+                            onChange={(event) =>
+                              updateProvider(
+                                editingProvider.id,
+                                "rolloutBudget",
+                                {
+                                  ...editingProvider.rolloutBudget!,
+                                  prefillTokenWeight: Number(
+                                    event.target.value,
+                                  ),
+                                },
+                              )
+                            }
+                          />
+                        </label>
+                      </>
+                    ) : null}
                     <label>
                       <span>Parallel tool calls</span>
                       <input

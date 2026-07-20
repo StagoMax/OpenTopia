@@ -119,9 +119,16 @@ export type ProviderSettings = {
   storeResponses: boolean;
   parallelToolCalls: boolean;
   promptCacheKey?: string | null;
+  rolloutBudget?: RolloutBudgetSettings | null;
   apiKeySource: string;
   apiKeyConfigured: boolean;
   healthStatus?: string | null;
+};
+
+export type RolloutBudgetSettings = {
+  limitTokens: number;
+  samplingTokenWeight: number;
+  prefillTokenWeight: number;
 };
 
 export type ProviderHealth = {

@@ -31,14 +31,14 @@ use opentopia_core::{
     OpenAiCompatibleProvider, OpenAiResponsesProvider, PermissionMode, PolicyDecision,
     PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest,
     PreviewTarget, PreviewWorkbook, ProviderHealth, ProviderHealthCheck, ProviderKind,
-    ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit, SandboxDescriptor,
-    SandboxSettings, SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest,
-    SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver, SubagentRun,
-    SubagentScheduler, SubagentSchedulerConfig, SubagentScope, TaskPlan, TerminalCommandHistory,
-    TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer, ToolCall,
-    ToolPermissionDescriptor, ToolResult, TurnContextSnapshot, TurnRecord, TurnStatus,
-    WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
+    ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit,
+    RolloutBudgetSettings, SandboxDescriptor, SandboxSettings, SessionStore, SkillDescriptor,
+    SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError, SubagentExecutor,
+    SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig, SubagentScope,
+    TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot,
+    ThreadMcpServer, ToolCall, ToolPermissionDescriptor, ToolResult, TurnContextSnapshot,
+    TurnRecord, TurnStatus, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,
+    WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
     MAX_PREVIEW_CONTENT_BYTES,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -4626,6 +4626,9 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
                 "context window must be at least 4096 tokens",
             ));
         }
+        if let Some(rollout_budget) = &provider.rollout_budget {
+            rollout_budget.validate().map_err(ApiError::bad_request)?;
+        }
         if let Some(effort) = provider.reasoning_effort.as_deref() {
             if ![
                 "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
@@ -6011,6 +6014,15 @@ mod tests {
 
         provider.temperature = 3.0;
         let error = validate_provider_settings(&[provider]).expect_err("reject temperature");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let mut provider = ProviderSettings::default();
+        provider.rollout_budget = Some(RolloutBudgetSettings {
+            limit_tokens: 0,
+            sampling_token_weight: 1.0,
+            prefill_token_weight: 1.0,
+        });
+        let error = validate_provider_settings(&[provider]).expect_err("reject rollout budget");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 

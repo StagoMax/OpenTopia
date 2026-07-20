@@ -7,8 +7,7 @@ use crate::guardian::{
 use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    AgentEventPayload, Message, MessageRole, ModelContentPart, TaskPlan, TaskPlanStepStatus,
-    ToolCall, ToolResult,
+    AgentEventPayload, Message, MessageRole, ModelContentPart, TaskPlan, ToolCall, ToolResult,
 };
 use crate::model_context::{
     CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
@@ -17,12 +16,12 @@ use crate::model_context::{
 use crate::policy::{approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode};
 use crate::provider::{
     redact_model_observation, MockProvider, ModelConversationMessage, ModelConversationRole,
-    ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, OpenAiCompatibleProvider,
-    OpenAiResponsesProvider, ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
-    ProviderTransportEvent,
+    ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
+    OpenAiCompatibleProvider, OpenAiResponsesProvider, ProviderToolCall, ProviderToolCandidate,
+    ProviderToolResult, ProviderTransportEvent,
 };
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
-use crate::settings::{AppSettings, ProviderKind};
+use crate::settings::{AppSettings, ProviderKind, RolloutBudgetSettings};
 use crate::store::SessionStore;
 use crate::subagents::SubagentScheduler;
 use crate::tools::{
@@ -68,6 +67,8 @@ pub struct AgentContinuation {
     pub conversation: Vec<ModelConversationMessage>,
     pub permission_mode: PermissionMode,
     pub context_budget: Option<ContextBudget>,
+    #[serde(default)]
+    pub rollout_budget: Option<RolloutBudget>,
     #[serde(default)]
     pub model_context: CompiledModelContext,
     pub state: AgentContinuationState,
@@ -167,6 +168,60 @@ impl ContextBudget {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutBudget {
+    settings: RolloutBudgetSettings,
+    weighted_tokens_used: f64,
+    delivered_reminders: u8,
+}
+
+impl RolloutBudget {
+    fn new(settings: RolloutBudgetSettings) -> Self {
+        Self {
+            settings,
+            weighted_tokens_used: 0.0,
+            delivered_reminders: 0,
+        }
+    }
+
+    fn record_usage(&mut self, usage: &ModelUsage) {
+        let cached_input = usage.cached_input_tokens.unwrap_or_default();
+        let uncached_input = usage.input_tokens.saturating_sub(cached_input);
+        self.weighted_tokens_used += usage.output_tokens as f64
+            * self.settings.sampling_token_weight
+            + uncached_input as f64 * self.settings.prefill_token_weight;
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.weighted_tokens_used >= self.settings.limit_tokens as f64
+    }
+
+    fn remaining_tokens(&self) -> u64 {
+        (self.settings.limit_tokens as f64 - self.weighted_tokens_used)
+            .max(0.0)
+            .floor() as u64
+    }
+
+    fn take_reminder(&mut self) -> Option<String> {
+        let remaining = self.remaining_tokens();
+        let reminder_level = if remaining <= self.settings.limit_tokens / 10 {
+            2
+        } else if remaining <= self.settings.limit_tokens / 4 {
+            1
+        } else {
+            0
+        };
+        if reminder_level == 0 || reminder_level <= self.delivered_reminders {
+            return None;
+        }
+        self.delivered_reminders = reminder_level;
+        Some(format!(
+            "[Rollout budget]\nApproximately {remaining} weighted tokens remain in this turn. Keep the original goal in view, prioritize the highest-value remaining work, and avoid unnecessary tool calls."
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentCore {
     provider: Arc<dyn ModelProvider>,
@@ -182,6 +237,7 @@ pub struct AgentCore {
     additional_developer_instructions: Option<String>,
     allowed_tools: Option<HashSet<String>>,
     denied_tools: HashSet<String>,
+    rollout_budget_settings: Option<RolloutBudgetSettings>,
 }
 
 impl Default for AgentCore {
@@ -201,12 +257,14 @@ impl Default for AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            rollout_budget_settings: None,
         }
     }
 }
 
 impl AgentCore {
     pub fn from_env() -> Self {
+        let provider_settings = crate::settings::ProviderSettings::from_env();
         let provider: Arc<dyn ModelProvider> = OpenAiCompatibleProvider::from_env()
             .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
             .unwrap_or_else(|| Arc::new(MockProvider));
@@ -227,6 +285,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            rollout_budget_settings: provider_settings.rollout_budget,
         }
     }
 
@@ -264,6 +323,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            rollout_budget_settings: active.rollout_budget.clone(),
         }
     }
 
@@ -282,6 +342,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            rollout_budget_settings: None,
         }
     }
 
@@ -292,6 +353,11 @@ impl AgentCore {
 
     pub fn with_guardian_provider(mut self, provider: Arc<dyn ModelProvider>) -> Self {
         self.guardian = GuardianReviewSessionManager::new(provider);
+        self
+    }
+
+    pub fn with_rollout_budget_settings(mut self, settings: RolloutBudgetSettings) -> Self {
+        self.rollout_budget_settings = Some(settings);
         self
     }
 
@@ -374,6 +440,7 @@ impl AgentCore {
         };
         self.provider = provider;
         self.guardian = GuardianReviewSessionManager::new(guardian_provider);
+        self.rollout_budget_settings = active.rollout_budget.clone();
     }
 
     fn apply_subagent_context(&self, context: &mut ToolContext, fallback_turn_id: Uuid) {
@@ -473,6 +540,7 @@ impl AgentCore {
     ) -> anyhow::Result<AgentTurnResult> {
         let mut events = TurnEvents::new(sender);
         let mut budget = input.context_budget;
+        let mut rollout_budget = self.rollout_budget_settings.clone().map(RolloutBudget::new);
 
         events.push(AgentEventPayload::TurnStarted {
             user_message_id: input.user_message_id,
@@ -524,6 +592,7 @@ impl AgentCore {
         if let Some(ref mut budget) = budget {
             budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
         }
+        record_rollout_usage(&mut rollout_budget, response.usage.as_ref());
         if response.tool_calls.is_empty() {
             return Ok(finalize_provider_turn(
                 input.thread_id,
@@ -543,6 +612,7 @@ impl AgentCore {
             input.conversation,
             input.permission_mode,
             budget,
+            rollout_budget,
             model_context,
             input.store,
             input.cancellation,
@@ -615,6 +685,7 @@ impl AgentCore {
                 }
 
                 let mut context_budget = continuation.context_budget;
+                let rollout_budget = continuation.rollout_budget;
                 if let Some(ref mut budget) = context_budget {
                     if let Some(result) = provider_tool_results.last() {
                         budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
@@ -629,6 +700,7 @@ impl AgentCore {
                     continuation.conversation,
                     continuation.permission_mode,
                     context_budget,
+                    rollout_budget,
                     continuation.model_context,
                     store,
                     cancellation,
@@ -657,6 +729,7 @@ impl AgentCore {
         mut conversation: Vec<ModelConversationMessage>,
         permission_mode: PermissionMode,
         mut budget: Option<ContextBudget>,
+        mut rollout_budget: Option<RolloutBudget>,
         model_context: CompiledModelContext,
         store: Option<Arc<dyn SessionStore>>,
         cancellation: Option<CancellationToken>,
@@ -691,21 +764,11 @@ impl AgentCore {
                     .await
                 {
                     Ok(result) => {
-                        let completion_output = explicit_task_completion_output(&result);
                         if let Some(ref mut budget) = budget {
                             budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
                         }
                         provider_tool_results.push(result);
                         pending_tool_calls.remove(0);
-                        if let Some(output) = completion_output {
-                            return Ok(finalize_provider_turn(
-                                thread_id,
-                                ModelResponse::text(output),
-                                provider_tool_results,
-                                budget,
-                                std::mem::replace(events, TurnEvents::new(None)),
-                            ));
-                        }
                     }
                     Err(err) if approval_required(&err).is_some() => {
                         let reason = approval_required(&err)
@@ -831,6 +894,7 @@ impl AgentCore {
                                     conversation,
                                     permission_mode,
                                     context_budget: budget,
+                                    rollout_budget,
                                     model_context,
                                     state: AgentContinuationState::Provider {
                                         model_user_message,
@@ -850,6 +914,7 @@ impl AgentCore {
                 }
             }
 
+            apply_rollout_budget(&mut rollout_budget, &mut conversation)?;
             compact_completed_tool_history(
                 &mut conversation,
                 &mut provider_tool_calls,
@@ -876,6 +941,7 @@ impl AgentCore {
             if let Some(ref mut budget) = budget {
                 budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
             }
+            record_rollout_usage(&mut rollout_budget, response.usage.as_ref());
 
             if response.tool_calls.is_empty() {
                 return Ok(finalize_provider_turn(
@@ -1298,56 +1364,30 @@ fn canonical_json_string(value: &Value) -> String {
     serde_json::to_string(&canonicalize(value)).unwrap_or_else(|_| "null".to_string())
 }
 
-fn explicit_task_completion_output(result: &ProviderToolResult) -> Option<String> {
-    if result.is_error {
-        return None;
+fn record_rollout_usage(budget: &mut Option<RolloutBudget>, usage: Option<&ModelUsage>) {
+    if let (Some(budget), Some(usage)) = (budget.as_mut(), usage) {
+        budget.record_usage(usage);
     }
-    if result.metadata.get("taskCompletion").is_some() {
-        return Some(result.output.clone());
-    }
-    if result.name != "update_plan"
-        || result
-            .metadata
-            .get("currentScopeComplete")
-            .and_then(Value::as_bool)
-            != Some(true)
-    {
-        return None;
-    }
+}
 
-    let plan: TaskPlan = serde_json::from_value(result.metadata.get("taskPlan")?.clone()).ok()?;
-    let completed = plan
-        .steps
-        .iter()
-        .filter(|step| step.status == TaskPlanStepStatus::Completed)
-        .count();
-    let pending = plan
-        .steps
-        .iter()
-        .filter(|step| step.status == TaskPlanStepStatus::Pending)
-        .count();
-    let verification = result
-        .metadata
-        .get("verification")?
-        .as_array()?
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    if completed == 0 || verification.is_empty() {
-        return None;
+fn apply_rollout_budget(
+    budget: &mut Option<RolloutBudget>,
+    conversation: &mut Vec<ModelConversationMessage>,
+) -> anyhow::Result<()> {
+    let Some(budget) = budget.as_mut() else {
+        return Ok(());
+    };
+    if budget.is_exhausted() {
+        anyhow::bail!("shared rollout token budget exhausted");
     }
-
-    let mut output = format!(
-        "Current requested scope completed with {completed}/{} plan steps completed.\n\nVerification:\n- {}",
-        plan.steps.len(),
-        verification.join("\n- ")
-    );
-    if pending > 0 {
-        output.push_str(&format!(
-            "\n\nRemaining work:\n- {pending} plan step(s) explicitly deferred to a later phase."
-        ));
+    if let Some(reminder) = budget.take_reminder() {
+        conversation.push(ModelConversationMessage {
+            role: ModelConversationRole::System,
+            content: reminder,
+            content_parts: Vec::new(),
+        });
     }
-    Some(output)
+    Ok(())
 }
 
 fn compact_completed_tool_history(
@@ -1468,7 +1508,7 @@ pub fn default_agent_model_context(
 }
 
 fn base_agent_instructions() -> &'static str {
-    "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, whether another agent would help, and when the task is complete. The harness provides capabilities, communication bridges, policy boundaries, isolation, scheduling, and observability; it does not prescribe a workflow or task graph. Use tools only when they materially help. For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. After successful verification, finish with one final action: update_plan with current_scope_complete set to true and concrete verification evidence, or call complete_task with a concise summary, concrete verification evidence, and any deliberately deferred work. Do not perform more investigation after that final action.\n\nYou may create agents for concrete work that benefits from an independent context. Choose the task boundary, agent_type, and history fork yourself. Use spawn_agent to create a stable agent identity, send_message for queued peer communication, followup_task to start another turn on an existing agent, interrupt_agent to stop only its current turn, list_agents to inspect the task tree, and wait_agent or wait_agents when synchronization is actually needed. Agents in the same root task may communicate directly by UUID or canonical /root/... path. Prefer independent scopes and disjoint write ownership when parallelizing; if work is dependent, sequence it or pass the dependency explicitly through messages. Inspect every child status and error; terminal does not necessarily mean successful.\n\nThe runtime imposes no task-level elapsed-time or total tool-round limit. Continue autonomously until the task reaches a truthful terminal state, the user cancels it, a real permission boundary requires approval, or an unrecoverable error occurs. Tool history is compacted automatically near the context-window boundary."
+    "You are OpenTopia, a tool-using AI agent. Decide for yourself whether to observe, which available tools to call, how to validate their results, whether another agent would help, and when the task is complete. The harness provides capabilities, communication bridges, policy boundaries, isolation, scheduling, and observability; it does not prescribe a workflow or task graph. Use tools only when they materially help. For non-trivial multi-step work, use update_plan as durable task memory and keep it current. Complete every step in the current requested scope before claiming completion; steps explicitly deferred by the user to a later phase may remain pending. When the requested work is resolved, return a concise final answer with no further tool calls. A tool call, including update_plan or complete_task, never ends the turn by itself; its result is returned to you for the next decision.\n\nYou may create agents for concrete work that benefits from an independent context. Choose the task boundary, agent_type, and history fork yourself. Use spawn_agent to create a stable agent identity, send_message for queued peer communication, followup_task to start another turn on an existing agent, interrupt_agent to stop only its current turn, list_agents to inspect the task tree, and wait_agent or wait_agents when synchronization is actually needed. Agents in the same root task may communicate directly by UUID or canonical /root/... path. Prefer independent scopes and disjoint write ownership when parallelizing; if work is dependent, sequence it or pass the dependency explicitly through messages. Inspect every child status and error; terminal does not necessarily mean successful.\n\nThe runtime imposes no task-level elapsed-time or total tool-round limit. Continue autonomously until the model returns a final answer with no pending tool work, the user cancels the turn, a real permission boundary requires approval, an unrecoverable error occurs, or a configured rollout token budget is exhausted. Tool history is compacted automatically near the context-window boundary."
 }
 
 #[cfg(test)]
@@ -1818,7 +1858,7 @@ pub struct AgentTurnInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::MessagePart;
+    use crate::model::{MessagePart, TaskPlanStepStatus};
     use crate::settings::ProviderHealthCheck;
     use std::collections::VecDeque;
     use std::fs;
@@ -2018,23 +2058,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_task_finishes_without_an_extra_provider_round() {
+    async fn complete_task_result_returns_to_the_model_before_final_output() {
         let workspace = test_workspace("complete-task");
-        let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse {
-            text: String::new(),
-            tool_calls: vec![ProviderToolCall {
-                id: "call_complete".to_string(),
-                name: "complete_task".to_string(),
-                arguments: json!({
-                    "summary": "Implemented and verified the requested scope.",
-                    "verification": ["cargo test passed"],
-                    "remaining_work": []
-                }),
-            }],
-            usage: None,
-            response_id: None,
-            provider_items: Vec::new(),
-        }]));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_complete".to_string(),
+                    name: "complete_task".to_string(),
+                    arguments: json!({
+                        "summary": "Implemented and verified the requested scope.",
+                        "verification": ["cargo test passed"],
+                        "remaining_work": []
+                    }),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+            },
+            ModelResponse::text("Implemented and verified the requested scope. cargo test passed."),
+        ]));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
 
         let result = agent
@@ -2058,7 +2101,9 @@ mod tests {
             .expect("explicit completion succeeds");
 
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
-        assert_eq!(provider.requests().len(), 1);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].tool_results[0].call_id, "call_complete");
         assert!(assistant_text(&result.events).contains("Implemented and verified"));
         assert!(assistant_text(&result.events).contains("cargo test passed"));
         assert!(result.events.iter().any(|event| matches!(
@@ -2066,6 +2111,123 @@ mod tests {
             AgentEventPayload::ToolCallFinished { result }
                 if result.metadata.get("taskCompletion").is_some()
         )));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn rollout_budget_stops_before_another_provider_round() {
+        let workspace = test_workspace("rollout-budget-exhausted");
+        let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ProviderToolCall {
+                id: "call_list".to_string(),
+                name: "list_files".to_string(),
+                arguments: json!({ "path": "." }),
+            }],
+            usage: Some(ModelUsage {
+                input_tokens: 20,
+                output_tokens: 80,
+                total_tokens: 100,
+                cached_input_tokens: None,
+                reasoning_tokens: None,
+            }),
+            response_id: None,
+            provider_items: Vec::new(),
+        }]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
+            .with_rollout_budget_settings(RolloutBudgetSettings {
+                limit_tokens: 100,
+                sampling_token_weight: 1.0,
+                prefill_token_weight: 1.0,
+            });
+
+        let error = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Inspect the workspace.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("exhausted budget stops the rollout");
+
+        assert!(error
+            .to_string()
+            .contains("shared rollout token budget exhausted"));
+        assert_eq!(provider.requests().len(), 1);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn rollout_budget_reminder_is_injected_before_final_provider_round() {
+        let workspace = test_workspace("rollout-budget-reminder");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_list".to_string(),
+                    name: "list_files".to_string(),
+                    arguments: json!({ "path": "." }),
+                }],
+                usage: Some(ModelUsage {
+                    input_tokens: 0,
+                    output_tokens: 80,
+                    total_tokens: 80,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                }),
+                response_id: None,
+                provider_items: Vec::new(),
+            },
+            ModelResponse::text("Workspace inspection is complete."),
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
+            .with_rollout_budget_settings(RolloutBudgetSettings {
+                limit_tokens: 100,
+                sampling_token_weight: 1.0,
+                prefill_token_weight: 1.0,
+            });
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Inspect the workspace.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("budget reminder leaves enough room for final output");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .conversation
+            .iter()
+            .any(|message| message.content.contains("[Rollout budget]")
+                && message.content.contains("20 weighted tokens")));
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -2109,6 +2271,9 @@ mod tests {
                 response_id: None,
                 provider_items: Vec::new(),
             },
+            ModelResponse::text(
+                "Current requested scope completed; later session work remains explicitly deferred.",
+            ),
         ]));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
 
@@ -2133,7 +2298,7 @@ mod tests {
             .expect("verified plan completion succeeds");
 
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
-        assert_eq!(provider.requests().len(), 2);
+        assert_eq!(provider.requests().len(), 3);
         assert!(assistant_text(&result.events).contains("Current requested scope completed"));
         assert!(assistant_text(&result.events).contains("explicitly deferred"));
 
@@ -2220,6 +2385,9 @@ mod tests {
                 response_id: None,
                 provider_items: Vec::new(),
             },
+            ModelResponse::text(
+                "Current requested scope completed; the CLI work remains explicitly deferred.",
+            ),
         ]));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
 
@@ -2245,7 +2413,7 @@ mod tests {
 
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
         let requests = provider.requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert!(requests[3]
             .tool_candidates
             .iter()

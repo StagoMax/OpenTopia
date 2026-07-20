@@ -71,6 +71,10 @@ Optional provider configuration:
 $env:OPENAI_API_KEY="sk-..."
 $env:OPENTOPIA_MODEL="gpt-4.1-mini"
 $env:OPENTOPIA_OPENAI_BASE_URL="https://api.openai.com/v1"
+# Optional Codex-style per-Turn rollout budget. Omit to leave it disabled.
+$env:OPENTOPIA_ROLLOUT_TOKEN_LIMIT="100000"
+$env:OPENTOPIA_ROLLOUT_OUTPUT_WEIGHT="1.0"
+$env:OPENTOPIA_ROLLOUT_INPUT_WEIGHT="1.0"
 cargo run -p opentopia-server -- --permission auto
 ```
 
