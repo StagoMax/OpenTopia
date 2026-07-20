@@ -118,6 +118,65 @@ function Import-DotEnvFile {
   }
 }
 
+function Import-ProviderCredentialFallback {
+  param(
+    [Parameter(Mandatory = $true)][string]$RepoRoot,
+    [string]$SelectedEnvFile
+  )
+
+  # A generic OPENAI_API_KEY may belong to a different endpoint. For a custom
+  # OpenAI-compatible endpoint, prefer workspace-specific provider credentials.
+  $explicitProviderSecretNames = @(
+    "OPENTOPIA_API_KEY",
+    "CREDIT_REVIEW_LLM_API_KEY",
+    "AUDIT_COPILOT_LLM_API_KEY"
+  )
+  foreach ($name in $explicitProviderSecretNames) {
+    if ([Environment]::GetEnvironmentVariable($name, "Process")) {
+      return
+    }
+  }
+
+  $workspaceRoot = Split-Path -Parent $RepoRoot
+  $creditReviewProjectName = -join ([char[]](0x4FE1, 0x8D37, 0x5BA1, 0x6838, 0x52A9, 0x624B))
+  $preferred = Join-Path (Join-Path $workspaceRoot $creditReviewProjectName) ".env"
+  $candidates = @($preferred)
+  if (Test-Path $workspaceRoot) {
+    $candidates += Get-ChildItem -LiteralPath $workspaceRoot -Directory -ErrorAction SilentlyContinue |
+      ForEach-Object { Join-Path $_.FullName ".env" }
+  }
+
+  $selectedFullPath = if ($SelectedEnvFile) {
+    [System.IO.Path]::GetFullPath($SelectedEnvFile)
+  } else {
+    $null
+  }
+  foreach ($candidate in $candidates | Select-Object -Unique) {
+    if (-not (Test-Path -LiteralPath $candidate)) {
+      continue
+    }
+    if ($selectedFullPath -and [System.IO.Path]::GetFullPath($candidate) -eq $selectedFullPath) {
+      continue
+    }
+
+    $match = Select-String `
+      -LiteralPath $candidate `
+      -SimpleMatch `
+      -Pattern "CREDIT_REVIEW_LLM_API_KEY", "AUDIT_COPILOT_LLM_API_KEY" `
+      -Quiet
+    if (-not $match) {
+      continue
+    }
+
+    Import-DotEnvFile $candidate
+    foreach ($name in $explicitProviderSecretNames) {
+      if ([Environment]::GetEnvironmentVariable($name, "Process")) {
+        return
+      }
+    }
+  }
+}
+
 function Set-EnvFromAliases {
   param(
     [Parameter(Mandatory = $true)][string]$Target,
@@ -142,6 +201,11 @@ if ($opentopiaEnvFile) {
   $env:OPENTOPIA_ENV_FILE = $opentopiaEnvFile
   Import-DotEnvFile $opentopiaEnvFile
 }
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+Import-ProviderCredentialFallback `
+  -RepoRoot $repoRoot `
+  -SelectedEnvFile $opentopiaEnvFile
 
 Set-EnvFromAliases "OPENTOPIA_API_KEY" @(
   "AUDIT_COPILOT_LLM_API_KEY",

@@ -1,3 +1,4 @@
+use crate::policy::ApprovalRequired;
 use crate::sandbox::{
     build_local_sandbox_command, is_protected_metadata_path, sandbox_permission_profile,
     ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy, OsSandboxPlatform,
@@ -463,10 +464,11 @@ impl LocalExecutionEnvironment {
                 .sandbox_config
                 .is_approved_write_path(&resolved_candidate)
         {
-            anyhow::bail!(
-                "approval required: write to protected workspace metadata: {}",
+            return Err(ApprovalRequired::new(format!(
+                "Write to protected workspace metadata: {}",
                 path.display()
-            );
+            ))
+            .into());
         }
         Ok(candidate)
     }

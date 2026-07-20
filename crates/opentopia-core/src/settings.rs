@@ -10,6 +10,7 @@ pub enum ProviderKind {
     Mock,
     #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible,
+    #[serde(rename = "openai_responses", alias = "open_ai_responses")]
     OpenAiResponses,
 }
 
@@ -44,6 +45,8 @@ pub struct ProviderSettings {
     pub parallel_tool_calls: bool,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub rollout_budget: Option<RolloutBudgetSettings>,
     pub api_key_source: String,
     pub api_key_configured: bool,
     pub health_status: Option<String>,
@@ -63,10 +66,39 @@ impl Default for ProviderSettings {
             store_responses: false,
             parallel_tool_calls: false,
             prompt_cache_key: None,
+            rollout_budget: None,
             api_key_source: "OPENTOPIA_API_KEY".to_string(),
             api_key_configured: false,
             health_status: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutBudgetSettings {
+    pub limit_tokens: u64,
+    #[serde(default = "default_rollout_sampling_token_weight")]
+    pub sampling_token_weight: f64,
+    #[serde(default = "default_rollout_prefill_token_weight")]
+    pub prefill_token_weight: f64,
+}
+
+impl RolloutBudgetSettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.limit_tokens == 0 {
+            return Err("rollout budget limitTokens must be greater than zero");
+        }
+        if !self.sampling_token_weight.is_finite() || self.sampling_token_weight < 0.0 {
+            return Err("rollout budget samplingTokenWeight must be finite and non-negative");
+        }
+        if !self.prefill_token_weight.is_finite() || self.prefill_token_weight < 0.0 {
+            return Err("rollout budget prefillTokenWeight must be finite and non-negative");
+        }
+        if self.sampling_token_weight == 0.0 && self.prefill_token_weight == 0.0 {
+            return Err("rollout budget requires at least one positive token weight");
+        }
+        Ok(())
     }
 }
 
@@ -99,6 +131,27 @@ impl ProviderSettings {
             settings.api_key_source = source;
             settings.api_key_configured = true;
         }
+        if let Some(limit_tokens) = std::env::var("OPENTOPIA_ROLLOUT_TOKEN_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            let sampling_token_weight = std::env::var("OPENTOPIA_ROLLOUT_OUTPUT_WEIGHT")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_else(default_rollout_sampling_token_weight);
+            let prefill_token_weight = std::env::var("OPENTOPIA_ROLLOUT_INPUT_WEIGHT")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_else(default_rollout_prefill_token_weight);
+            let rollout_budget = RolloutBudgetSettings {
+                limit_tokens,
+                sampling_token_weight,
+                prefill_token_weight,
+            };
+            if rollout_budget.validate().is_ok() {
+                settings.rollout_budget = Some(rollout_budget);
+            }
+        }
         settings
     }
 }
@@ -109,6 +162,14 @@ fn default_provider_temperature() -> f64 {
 
 fn default_provider_context_window_tokens() -> usize {
     128_000
+}
+
+fn default_rollout_sampling_token_weight() -> f64 {
+    1.0
+}
+
+fn default_rollout_prefill_token_weight() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -527,6 +588,7 @@ mod tests {
         assert!(!provider.store_responses);
         assert!(!provider.parallel_tool_calls);
         assert_eq!(provider.prompt_cache_key, None);
+        assert_eq!(provider.rollout_budget, None);
     }
 
     #[test]
@@ -536,8 +598,14 @@ mod tests {
         provider.store_responses = true;
         provider.parallel_tool_calls = true;
         provider.prompt_cache_key = Some("workspace-cache".to_string());
+        provider.rollout_budget = Some(RolloutBudgetSettings {
+            limit_tokens: 120_000,
+            sampling_token_weight: 1.0,
+            prefill_token_weight: 0.25,
+        });
 
         let json = serde_json::to_value(&provider).unwrap();
+        assert_eq!(json["kind"], "openai_responses");
         let restored: ProviderSettings = serde_json::from_value(json).unwrap();
 
         assert_eq!(restored.kind, ProviderKind::OpenAiResponses);
@@ -547,6 +615,37 @@ mod tests {
             restored.prompt_cache_key.as_deref(),
             Some("workspace-cache")
         );
+        assert_eq!(restored.rollout_budget, provider.rollout_budget);
+        assert!(restored
+            .rollout_budget
+            .as_ref()
+            .expect("rollout budget")
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn rollout_budget_rejects_unbounded_or_invalid_accounting() {
+        let mut budget = RolloutBudgetSettings {
+            limit_tokens: 0,
+            sampling_token_weight: 1.0,
+            prefill_token_weight: 1.0,
+        };
+        assert!(budget.validate().is_err());
+
+        budget.limit_tokens = 100;
+        budget.sampling_token_weight = 0.0;
+        budget.prefill_token_weight = 0.0;
+        assert!(budget.validate().is_err());
+
+        budget.prefill_token_weight = f64::NAN;
+        assert!(budget.validate().is_err());
+    }
+
+    #[test]
+    fn responses_provider_accepts_legacy_kind_spelling() {
+        let kind: ProviderKind = serde_json::from_str("\"open_ai_responses\"").unwrap();
+        assert_eq!(kind, ProviderKind::OpenAiResponses);
     }
 
     #[test]

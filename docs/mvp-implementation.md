@@ -256,7 +256,7 @@ interrupted. Provider SSE text is forwarded and persisted incrementally, with su
 history replay and sequence deduplication.
 
 Approval suspension persists the provider conversation, completed tool results,
-pending calls, round number, original permission mode, and context budget. Allow
+pending calls, original permission mode, context budget, and rollout budget. Allow
 grants full access only to the exact pending call. Deny returns a structured tool
 error to the model and continues that same turn.
 
@@ -265,6 +265,13 @@ latest durable summary. `OPENTOPIA_CONTEXT_WINDOW_TOKENS` defaults to `128000`;
 automatic LLM compaction triggers at
 `OPENTOPIA_CONTEXT_COMPACT_THRESHOLD_PERCENT` (default `80`) before history is
 trimmed to its bounded input budget.
+
+The tool loop ends only when the Provider returns an assistant response without
+tool calls. `update_plan` and `complete_task` return ordinary tool results and do
+not terminate a Turn. An optional weighted rollout budget can be configured with
+`OPENTOPIA_ROLLOUT_TOKEN_LIMIT`, `OPENTOPIA_ROLLOUT_OUTPUT_WEIGHT`, and
+`OPENTOPIA_ROLLOUT_INPUT_WEIGHT`; the same fields are available in desktop
+Provider settings.
 
 ## Design Boundaries
 

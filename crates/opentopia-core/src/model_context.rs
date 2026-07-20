@@ -147,28 +147,47 @@ pub struct CompiledModelContext {
 }
 
 impl CompiledModelContext {
-    pub fn instructions(&self) -> String {
-        let mut rendered = Vec::new();
-        for item in self.items.iter().filter(|item| {
-            matches!(item.role, ContextRole::System | ContextRole::Developer)
-                && !matches!(item.kind, ContextItemKind::Summary)
-        }) {
-            let content = item.text_content();
-            if content.trim().is_empty() {
-                continue;
-            }
-            if item.kind == ContextItemKind::BaseInstructions {
-                rendered.push(content);
-            } else {
-                rendered.push(format!(
-                    "<context kind=\"{}\" source=\"{}\">\n{}\n</context>",
-                    item.kind.as_str(),
-                    escape_attribute(&item.source),
+    pub fn instruction_messages(&self) -> Vec<(ContextRole, String)> {
+        self.items
+            .iter()
+            .filter(|item| {
+                matches!(item.role, ContextRole::System | ContextRole::Developer)
+                    && !matches!(item.kind, ContextItemKind::Summary)
+            })
+            .filter_map(|item| {
+                let content = item.text_content();
+                if content.trim().is_empty() {
+                    return None;
+                }
+                let rendered = if item.kind == ContextItemKind::BaseInstructions {
                     content
-                ));
-            }
-        }
-        rendered.join("\n\n")
+                } else {
+                    format!(
+                        "<context kind=\"{}\" source=\"{}\">\n{}\n</context>",
+                        item.kind.as_str(),
+                        escape_attribute(&item.source),
+                        content
+                    )
+                };
+                Some((item.role, rendered))
+            })
+            .collect()
+    }
+
+    pub fn instructions_for_role(&self, role: ContextRole) -> String {
+        self.instruction_messages()
+            .into_iter()
+            .filter_map(|(item_role, content)| (item_role == role).then_some(content))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    pub fn instructions(&self) -> String {
+        self.instruction_messages()
+            .into_iter()
+            .map(|(_, content)| content)
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     pub fn content_hash(&self) -> String {
@@ -266,6 +285,48 @@ impl WorldStateSnapshot {
     pub fn render_for_model(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
     }
+
+    pub fn skill_catalog_hash(&self) -> String {
+        content_fingerprint(
+            serde_json::to_vec(&self.skill_catalog)
+                .unwrap_or_default()
+                .as_slice(),
+        )
+    }
+
+    pub fn render_skill_catalog_for_model(&self) -> String {
+        let skills = self
+            .skill_catalog
+            .iter()
+            .map(|skill| {
+                json!({
+                    "id": skill.id,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "scope": skill.scope,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&json!({ "skills": skills }))
+            .unwrap_or_else(|_| "{\"skills\":[]}".to_string())
+    }
+
+    pub fn render_dynamic_for_model(&self) -> String {
+        serde_json::to_string(&json!({
+            "cwd": self.cwd,
+            "workspaceRoots": self.workspace_roots,
+            "currentDate": self.current_date,
+            "timezone": self.timezone,
+            "platform": self.platform,
+            "gitBranch": self.git_branch,
+            "gitStatus": self.git_status,
+            "skillCount": self.skill_catalog.len(),
+            "toolCount": self.tool_count,
+            "mcpToolCount": self.mcp_tool_count,
+            "metadata": self.metadata,
+        }))
+        .unwrap_or_else(|_| "{}".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -338,11 +399,31 @@ pub fn world_state_item(world_state: &WorldStateSnapshot) -> ModelContextItem {
         ContextItemKind::WorldState,
         ContextRole::Developer,
         "opentopia:world_state",
-        world_state.render_for_model(),
+        world_state.render_dynamic_for_model(),
         ContextCacheScope::Turn,
         ContextSensitivity::Workspace,
     )
-    .with_metadata(json!({ "worldStateHash": world_state.content_hash() }))
+    .with_metadata(json!({
+        "worldStateHash": world_state.content_hash(),
+        "skillCatalogHash": world_state.skill_catalog_hash(),
+        "toolCatalogHash": world_state.tool_catalog_hash,
+    }))
+}
+
+pub fn world_state_catalog_item(world_state: &WorldStateSnapshot) -> ModelContextItem {
+    ModelContextItem::text(
+        ContextItemKind::Skill,
+        ContextRole::Developer,
+        "opentopia:skill_catalog",
+        world_state.render_skill_catalog_for_model(),
+        ContextCacheScope::Thread,
+        ContextSensitivity::Workspace,
+    )
+    .with_metadata(json!({
+        "catalog": true,
+        "skillCatalogHash": world_state.skill_catalog_hash(),
+        "skillCount": world_state.skill_catalog.len(),
+    }))
 }
 
 fn escape_attribute(value: &str) -> String {
@@ -414,5 +495,89 @@ mod tests {
 
         assert!(context.instructions().contains("base text"));
         assert!(!context.instructions().contains("do not duplicate me"));
+    }
+
+    #[test]
+    fn instruction_messages_preserve_system_and_developer_roles() {
+        let context = CompiledModelContext {
+            items: vec![
+                ModelContextItem::text(
+                    ContextItemKind::BaseInstructions,
+                    ContextRole::System,
+                    "base",
+                    "base text",
+                    ContextCacheScope::Stable,
+                    ContextSensitivity::Public,
+                ),
+                ModelContextItem::text(
+                    ContextItemKind::Environment,
+                    ContextRole::Developer,
+                    "runtime",
+                    "developer text",
+                    ContextCacheScope::Turn,
+                    ContextSensitivity::Workspace,
+                ),
+                ModelContextItem::text(
+                    ContextItemKind::User,
+                    ContextRole::User,
+                    "user",
+                    "user text",
+                    ContextCacheScope::Turn,
+                    ContextSensitivity::Workspace,
+                ),
+            ],
+            prompt_cache_key: None,
+        };
+
+        let messages = context.instruction_messages();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], (ContextRole::System, "base text".to_string()));
+        assert_eq!(messages[1].0, ContextRole::Developer);
+        assert!(messages[1].1.contains("developer text"));
+        assert_eq!(
+            context.instructions_for_role(ContextRole::System),
+            "base text"
+        );
+        assert!(!context
+            .instructions_for_role(ContextRole::Developer)
+            .contains("user text"));
+    }
+
+    #[test]
+    fn world_state_splits_stable_skill_catalog_from_dynamic_turn_state() {
+        let state = WorldStateSnapshot {
+            cwd: PathBuf::from("C:/workspace"),
+            workspace_roots: vec![PathBuf::from("C:/workspace")],
+            current_date: "2026-07-19".to_string(),
+            timezone: "+08:00".to_string(),
+            platform: "windows-x86_64".to_string(),
+            git_branch: Some("main".to_string()),
+            git_status: Some("## main".to_string()),
+            skill_catalog: vec![WorldStateSkill {
+                id: "review".to_string(),
+                name: "Review".to_string(),
+                description: "A deliberately distinctive skill description".to_string(),
+                scope: "workspace".to_string(),
+                content_hash: "skill-hash".to_string(),
+            }],
+            tool_count: 18,
+            mcp_tool_count: 2,
+            tool_catalog_hash: "tool-hash".to_string(),
+            metadata: json!({ "selectedSkillIds": [] }),
+        };
+
+        let catalog = world_state_catalog_item(&state);
+        let dynamic = world_state_item(&state);
+        let catalog_text = catalog.text_content();
+        let dynamic_text = dynamic.text_content();
+
+        assert_eq!(catalog.cache_scope, ContextCacheScope::Thread);
+        assert_eq!(dynamic.cache_scope, ContextCacheScope::Turn);
+        assert!(catalog_text.contains("distinctive skill description"));
+        assert!(!catalog_text.contains("skill-hash"));
+        assert!(!dynamic_text.contains("distinctive skill description"));
+        assert!(dynamic_text.contains("\"skillCount\":1"));
+        assert_eq!(dynamic.metadata["toolCatalogHash"], "tool-hash");
     }
 }

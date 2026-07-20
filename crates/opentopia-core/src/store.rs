@@ -5,6 +5,7 @@ use crate::model::{
     Project, TerminalCommandHistory, TerminalCommandStatus, Thread, ToolResult, TurnRecord,
     TurnStatus,
 };
+use crate::provider::ModelConversationMessage;
 use crate::settings::AppSettings;
 use crate::subagents::{SubagentRun, SubagentRunStatus};
 use anyhow::Context;
@@ -114,6 +115,16 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     fn upsert_subagent_run(&self, run: &SubagentRun) -> anyhow::Result<()>;
     fn get_subagent_run(&self, run_id: Uuid) -> anyhow::Result<Option<SubagentRun>>;
     fn list_subagent_runs(&self, thread_id: Uuid) -> anyhow::Result<Vec<SubagentRun>>;
+    fn list_all_subagent_runs(&self) -> anyhow::Result<Vec<SubagentRun>>;
+    fn save_subagent_conversation(
+        &self,
+        run_id: Uuid,
+        conversation: &[ModelConversationMessage],
+    ) -> anyhow::Result<()>;
+    fn load_subagent_conversation(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<Vec<ModelConversationMessage>>>;
     fn fail_interrupted_subagent_runs(&self) -> anyhow::Result<usize>;
     fn insert_approval(&self, approval: Approval) -> anyhow::Result<Approval>;
     fn get_approval(&self, approval_id: Uuid) -> anyhow::Result<Option<Approval>>;
@@ -380,8 +391,13 @@ impl SqliteSessionStore {
                 id TEXT PRIMARY KEY,
                 parent_thread_id TEXT NOT NULL,
                 parent_turn_id TEXT NOT NULL,
+                agent_path TEXT NOT NULL DEFAULT '',
+                parent_agent_path TEXT NOT NULL DEFAULT '/root',
                 name TEXT NOT NULL,
+                agent_type TEXT NOT NULL DEFAULT 'default',
                 input TEXT NOT NULL,
+                fork_turns TEXT NOT NULL DEFAULT 'all',
+                last_task_message TEXT NOT NULL DEFAULT '',
                 depth INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 result TEXT,
@@ -391,6 +407,13 @@ impl SqliteSessionStore {
                 completed_at TEXT,
                 CHECK(status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'timed_out')),
                 FOREIGN KEY(parent_thread_id) REFERENCES threads(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS subagent_conversations (
+                run_id TEXT PRIMARY KEY,
+                conversation_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES subagent_runs(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS approval_continuations (
@@ -488,6 +511,28 @@ impl SqliteSessionStore {
                 [],
             )?;
         }
+        for (column, definition) in [
+            ("agent_path", "TEXT NOT NULL DEFAULT ''"),
+            ("parent_agent_path", "TEXT NOT NULL DEFAULT '/root'"),
+            ("agent_type", "TEXT NOT NULL DEFAULT 'default'"),
+            ("fork_turns", "TEXT NOT NULL DEFAULT 'all'"),
+            ("last_task_message", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !table_has_column(&conn, "subagent_runs", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE subagent_runs ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        conn.execute(
+            "UPDATE subagent_runs SET agent_path = '/root/' || id WHERE agent_path = ''",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE subagent_runs SET last_task_message = input WHERE last_task_message = ''",
+            [],
+        )?;
         conn.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_threads_project_updated
@@ -1420,10 +1465,13 @@ impl SessionStore for SqliteSessionStore {
         conn.execute(
             r#"
             INSERT INTO subagent_runs (
-                id, parent_thread_id, parent_turn_id, name, input, depth, status,
+                id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
+                name, agent_type, input, fork_turns, last_task_message, depth, status,
                 result, error, created_at, started_at, completed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ON CONFLICT(id) DO UPDATE SET
+                parent_turn_id = excluded.parent_turn_id,
+                last_task_message = excluded.last_task_message,
                 status = excluded.status,
                 result = excluded.result,
                 error = excluded.error,
@@ -1434,8 +1482,13 @@ impl SessionStore for SqliteSessionStore {
                 run.id.to_string(),
                 run.parent_thread_id.to_string(),
                 run.parent_turn_id.to_string(),
+                &run.agent_path,
+                &run.parent_agent_path,
                 &run.name,
+                &run.agent_type,
                 &run.input,
+                &run.fork_turns,
+                &run.last_task_message,
                 i64::from(run.depth),
                 run.status.as_str(),
                 run.result.as_deref(),
@@ -1454,7 +1507,8 @@ impl SessionStore for SqliteSessionStore {
         Ok(conn
             .query_row(
                 r#"
-                SELECT id, parent_thread_id, parent_turn_id, name, input, depth, status,
+                SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
+                       name, agent_type, input, fork_turns, last_task_message, depth, status,
                        result, error, created_at, started_at, completed_at
                 FROM subagent_runs
                 WHERE id = ?1
@@ -1469,7 +1523,8 @@ impl SessionStore for SqliteSessionStore {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let mut statement = conn.prepare(
             r#"
-            SELECT id, parent_thread_id, parent_turn_id, name, input, depth, status,
+            SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
+                   name, agent_type, input, fork_turns, last_task_message, depth, status,
                    result, error, created_at, started_at, completed_at
             FROM subagent_runs
             WHERE parent_thread_id = ?1
@@ -1478,6 +1533,61 @@ impl SessionStore for SqliteSessionStore {
         )?;
         let rows = statement.query_map(params![thread_id.to_string()], map_subagent_run)?;
         collect_rows(rows)
+    }
+
+    fn list_all_subagent_runs(&self) -> anyhow::Result<Vec<SubagentRun>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut statement = conn.prepare(
+            r#"
+            SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
+                   name, agent_type, input, fork_turns, last_task_message, depth, status,
+                   result, error, created_at, started_at, completed_at
+            FROM subagent_runs
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = statement.query_map([], map_subagent_run)?;
+        collect_rows(rows)
+    }
+
+    fn save_subagent_conversation(
+        &self,
+        run_id: Uuid,
+        conversation: &[ModelConversationMessage],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO subagent_conversations (run_id, conversation_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(run_id) DO UPDATE SET
+                conversation_json = excluded.conversation_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                run_id.to_string(),
+                serde_json::to_string(conversation)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_subagent_conversation(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<Vec<ModelConversationMessage>>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let value = conn
+            .query_row(
+                "SELECT conversation_json FROM subagent_conversations WHERE run_id = ?1",
+                params![run_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
     }
 
     fn fail_interrupted_subagent_runs(&self) -> anyhow::Result<usize> {
@@ -2175,14 +2285,14 @@ fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
 }
 
 fn map_subagent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentRun> {
-    let depth_value: i64 = row.get(5)?;
+    let depth_value: i64 = row.get(10)?;
     let depth = u8::try_from(depth_value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(10, Type::Integer, Box::new(error))
     })?;
-    let status_value: String = row.get(6)?;
+    let status_value: String = row.get(11)?;
     let status = SubagentRunStatus::parse(&status_value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
-            6,
+            11,
             Type::Text,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2190,24 +2300,29 @@ fn map_subagent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentRun> {
             )),
         )
     })?;
-    let started_at: Option<String> = row.get(10)?;
-    let completed_at: Option<String> = row.get(11)?;
+    let started_at: Option<String> = row.get(15)?;
+    let completed_at: Option<String> = row.get(16)?;
     Ok(SubagentRun {
         id: parse_uuid(row.get(0)?, 0)?,
         parent_thread_id: parse_uuid(row.get(1)?, 1)?,
         parent_turn_id: parse_uuid(row.get(2)?, 2)?,
-        name: row.get(3)?,
-        input: row.get(4)?,
+        agent_path: row.get(3)?,
+        parent_agent_path: row.get(4)?,
+        name: row.get(5)?,
+        agent_type: row.get(6)?,
+        input: row.get(7)?,
+        fork_turns: row.get(8)?,
+        last_task_message: row.get(9)?,
         depth,
         status,
-        result: row.get(7)?,
-        error: row.get(8)?,
-        created_at: parse_datetime(row.get(9)?, 9)?,
+        result: row.get(12)?,
+        error: row.get(13)?,
+        created_at: parse_datetime(row.get(14)?, 14)?,
         started_at: started_at
-            .map(|value| parse_datetime(value, 10))
+            .map(|value| parse_datetime(value, 15))
             .transpose()?,
         completed_at: completed_at
-            .map(|value| parse_datetime(value, 11))
+            .map(|value| parse_datetime(value, 16))
             .transpose()?,
     })
 }
@@ -2819,8 +2934,13 @@ mod tests {
             id: Uuid::new_v4(),
             parent_thread_id: thread.id,
             parent_turn_id: Uuid::new_v4(),
+            agent_path: "/root/reviewer".to_string(),
+            parent_agent_path: "/root".to_string(),
             name: "reviewer".to_string(),
+            agent_type: "default".to_string(),
             input: "review changes".to_string(),
+            fork_turns: "all".to_string(),
+            last_task_message: "review changes".to_string(),
             depth: 1,
             status: SubagentRunStatus::Running,
             result: None,
@@ -2830,6 +2950,18 @@ mod tests {
             completed_at: None,
         };
         store.upsert_subagent_run(&run).expect("persist run");
+        let conversation = vec![ModelConversationMessage {
+            role: crate::provider::ModelConversationRole::User,
+            content: "continue".to_string(),
+            content_parts: Vec::new(),
+        }];
+        store
+            .save_subagent_conversation(run.id, &conversation)
+            .expect("persist agent conversation");
+        assert_eq!(
+            store.load_subagent_conversation(run.id).unwrap().unwrap(),
+            conversation
+        );
         assert_eq!(
             store.get_subagent_run(run.id).unwrap().unwrap().status,
             SubagentRunStatus::Running

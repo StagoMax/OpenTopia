@@ -7,11 +7,11 @@
   "publicTestFile": "test/contract.test.js",
   "phase1": {
     "graderPhase": "library",
-    "prompt": "This is phase 1 of a controlled two-session coding evaluation. Read SPEC.md and the existing code. Use update_plan to create a durable plan with at least four concrete steps covering both sessions. In this phase, implement and verify parseWorkspace, buildReleaseWaves, and renderReleasePlan in src/planner.js. Run npm test. Do not modify SPEC.md or files under test/. Leave the CLI/session-2 work pending in the plan. In the final plan update, set current_scope_complete to true and include the successful npm test as verification."
+    "prompt": "This is phase 1 of a controlled two-session coding evaluation. Read SPEC.md and the existing code. Use update_plan to create a durable plan with at least four concrete steps covering both sessions. In this phase, implement and verify parseWorkspace, buildReleaseWaves, and renderReleasePlan in src/planner.js. Run npm test. Do not modify SPEC.md or files under test/. Leave the CLI/session-2 work pending in the plan. In the final plan update, set current_scope_complete to true and include the successful npm test as verification. After that tool result returns, provide a concise final answer with no further tool calls."
   },
   "phase2": {
     "graderPhase": "full",
-    "prompt": "Continue the dependency release planner after the server restart. Recover the durable plan, prior messages, workspace, and git diff. Implement the remaining CLI contract in src/cli.js, repair incomplete graph behavior, and run npm test. Do not modify SPEC.md or files under test/. After npm test passes, finish with one final update_plan call that marks every step completed, sets current_scope_complete to true, and includes the successful npm test in verification. Do not claim completion unless tests pass."
+    "prompt": "Continue the dependency release planner after the server restart. Recover the durable plan, prior messages, workspace, and git diff. Implement the remaining CLI contract in src/cli.js, repair incomplete graph behavior, and run npm test. Do not modify SPEC.md or files under test/. After npm test passes, use update_plan to mark every step completed, set current_scope_complete to true, and include the successful npm test in verification. After that tool result returns, provide a concise final answer with no further tool calls. Do not claim completion unless tests pass."
   },
   "process": {
     "minPlanUpdates": 2,

@@ -1,9 +1,11 @@
 pub mod agent;
+pub mod agent_profiles;
 pub mod browser;
 pub mod context_sources;
 pub mod desktop_browser;
 pub mod execution;
 pub mod git_workflow;
+pub mod guardian;
 pub mod instructions;
 pub mod mcp;
 pub mod mcp_host;
@@ -25,6 +27,7 @@ pub use agent::{
     default_agent_model_context, AgentContinuation, AgentCore, AgentEventSender, AgentTurnInput,
     AgentTurnOutcome, AgentTurnResult, ContextBudget as AgentContextBudget,
 };
+pub use agent_profiles::{AgentProfile, AgentProfileRegistry};
 pub use browser::{
     BrowserContent, BrowserDownload, BrowserDownloadRequest, BrowserError, BrowserNavigateRequest,
     BrowserNavigation, BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector,
@@ -47,6 +50,11 @@ pub use git_workflow::{
     GitWorkflowActionKind, GitWorkflowError, GitWorkflowRequest, GitWorkflowResult,
     ListBranchesRequest, PushRequest, SwitchBranchRequest, WorktreeTarget,
 };
+pub use guardian::{
+    GuardianApprovalAction, GuardianApprovalRequest, GuardianAssessment, GuardianAssessmentOutcome,
+    GuardianReviewResult, GuardianReviewSessionManager, GuardianReviewStatus, GuardianRiskLevel,
+    GuardianUserAuthorization,
+};
 pub use instructions::{
     resolve_instruction_documents, InstructionDocument, InstructionResolution, InstructionScope,
 };
@@ -63,14 +71,15 @@ pub use model::{
     ToolResult, TurnRecord, TurnStatus,
 };
 pub use model_context::{
-    content_fingerprint, estimate_tokens as estimate_model_context_tokens, world_state_item,
-    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
-    InstructionSnapshotRef, ModelContextItem, ThreadContextSnapshot, TurnContextSnapshot,
-    WorldStateSkill, WorldStateSnapshot,
+    content_fingerprint, estimate_tokens as estimate_model_context_tokens,
+    world_state_catalog_item, world_state_item, CompiledModelContext, ContextCacheScope,
+    ContextItemKind, ContextRole, ContextSensitivity, InstructionSnapshotRef, ModelContextItem,
+    ThreadContextSnapshot, TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
 };
 pub use policy::{
-    BasicPolicyEngine, CommandPolicyRule, CommandRuleMatch, NetworkPolicyConfig, PermissionMode,
-    PolicyConfig, PolicyDecision, PolicyEngine, PolicyRuleEffect, ToolPermissionDescriptor,
+    approval_required, ApprovalPolicy, ApprovalRequired, ApprovalsReviewer, BasicPolicyEngine,
+    CommandPolicyRule, CommandRuleMatch, NetworkPolicyConfig, PermissionMode, PolicyConfig,
+    PolicyDecision, PolicyEngine, PolicyRuleEffect, ToolPermissionDescriptor,
 };
 pub use preview::{
     decode_preview_id, encode_preview_id, preview_spreadsheet_range, preview_workbook,
@@ -92,7 +101,7 @@ pub use sandbox::{
 };
 pub use settings::{
     AppSettings, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
-    SandboxEnforcement, SandboxSettings,
+    RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
 };
 pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,
@@ -109,8 +118,10 @@ pub use store::{
     normalize_workspace_key, ContextBudget, SessionStore, SqliteSessionStore, StoreError,
 };
 pub use subagents::{
+    AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDelivery, AgentWaitActivity,
     NoopSubagentObserver, SpawnSubagentRequest, SubagentError, SubagentEvent, SubagentExecutor,
     SubagentObserver, SubagentRun, SubagentRunStatus, SubagentScheduler, SubagentSchedulerConfig,
+    SubagentScope,
 };
 pub use tools::{
     browser_domain_approval_action, browser_domain_from_approval_action, browser_domain_from_url,

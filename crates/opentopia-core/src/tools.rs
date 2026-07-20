@@ -1,3 +1,4 @@
+use crate::agent_profiles::AgentProfileRegistry;
 use crate::browser::{
     BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest, BrowserRuntime,
     BrowserSelector, BrowserSessionId, BrowserTypeRequest, BrowserWaitCondition,
@@ -13,7 +14,7 @@ use crate::model::{
     ApprovalStatus, ModelContentPart, TaskPlan, TaskPlanStep, TaskPlanStepStatus, ToolCall,
     ToolResult,
 };
-use crate::policy::{PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
+use crate::policy::{ApprovalRequired, PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
 use crate::sandbox::LocalSandboxConfig;
 use crate::skills::{discover_skills, load_selected_skills};
 use crate::spreadsheet::{
@@ -47,6 +48,7 @@ pub struct ToolContext {
     pub subagents: Option<SubagentScheduler>,
     pub parent_turn_id: Option<Uuid>,
     pub subagent_depth: u8,
+    pub agent_path: String,
     pub browser: Option<Arc<dyn BrowserRuntime>>,
     /// Set only while replaying a tool call that the user explicitly approved.
     /// Browser navigation uses this as a one-time fallback when a caller does not have a
@@ -78,6 +80,7 @@ impl ToolContext {
             subagents: None,
             parent_turn_id: None,
             subagent_depth: 0,
+            agent_path: "/root".to_string(),
             browser: None,
             approval_granted: false,
         }
@@ -98,6 +101,7 @@ impl ToolContext {
             subagents: None,
             parent_turn_id: None,
             subagent_depth: 0,
+            agent_path: "/root".to_string(),
             browser: None,
             approval_granted: false,
         }
@@ -117,7 +121,7 @@ fn enforce_policy_decision(decision: PolicyDecision, approval_granted: bool) -> 
         PolicyDecision::Allow => Ok(()),
         PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
         PolicyDecision::Ask { .. } if approval_granted => Ok(()),
-        PolicyDecision::Ask { reason } => anyhow::bail!("approval required: {reason}"),
+        PolicyDecision::Ask { reason } => Err(ApprovalRequired::new(reason).into()),
     }
 }
 
@@ -145,6 +149,10 @@ impl ToolRegistry {
         tools.insert("git_diff".to_string(), Arc::new(GitDiffTool));
         tools.insert("apply_patch".to_string(), Arc::new(ApplyPatchTool));
         tools.insert("spawn_agent".to_string(), Arc::new(SpawnAgentTool));
+        tools.insert("send_message".to_string(), Arc::new(SendAgentMessageTool));
+        tools.insert("followup_task".to_string(), Arc::new(FollowupAgentTaskTool));
+        tools.insert("interrupt_agent".to_string(), Arc::new(InterruptAgentTool));
+        tools.insert("list_agents".to_string(), Arc::new(ListAgentsTool));
         tools.insert("send_input".to_string(), Arc::new(SendAgentInputTool));
         tools.insert("cancel_agent".to_string(), Arc::new(CancelAgentTool));
         tools.insert("wait_agent".to_string(), Arc::new(WaitAgentTool));
@@ -1119,7 +1127,10 @@ fn inspect_browser_url(ctx: &ToolContext, raw_url: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!("approval required: Browser access to the new domain `{host}` requires approval.")
+    Err(ApprovalRequired::new(format!(
+        "Browser access to the new domain `{host}` requires approval."
+    ))
+    .into())
 }
 
 fn inspect_browser_interaction(ctx: &ToolContext) -> anyhow::Result<()> {
@@ -1191,17 +1202,21 @@ impl Tool for SpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Start a bounded child agent that inherits the current workspace, provider, permissions, and sandbox."
+        "Create an independently running child agent thread. The child inherits the current workspace and security boundary; use an agent_type profile to specialize it."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "Short worker name." },
-                "input": { "type": "string", "description": "Concrete task for the child agent." }
+                "task_name": { "type": "string", "description": "Stable lowercase task name used in the canonical agent path." },
+                "message": { "type": "string", "description": "Concrete initial task for the child agent." },
+                "fork_turns": { "type": ["string", "integer"], "description": "Parent history to copy: none, all, or a positive number of turns." },
+                "agent_type": { "type": "string", "description": "Built-in or project agent profile name. Defaults to default." },
+                "name": { "type": "string", "description": "Deprecated alias for task_name." },
+                "input": { "type": "string", "description": "Deprecated alias for message." }
             },
-            "required": ["name", "input"],
+            "required": ["task_name", "message"],
             "additionalProperties": false
         })
     }
@@ -1217,13 +1232,40 @@ impl Tool for SpawnAgentTool {
         let parent_turn_id = ctx
             .parent_turn_id
             .context("subagent parent turn is unavailable")?;
-        let name = required_string(&call.input, "name")?;
-        let input = required_string(&call.input, "input")?;
+        let name = string_alias(&call.input, "task_name", "name")?;
+        let input = string_alias(&call.input, "message", "input")?;
+        let fork_turns = call
+            .input
+            .get("fork_turns")
+            .map(|value| match value {
+                Value::String(value) => Ok(value.clone()),
+                Value::Number(value) => Ok(value.to_string()),
+                _ => {
+                    anyhow::bail!("spawn_agent fork_turns must be none, all, or a positive integer")
+                }
+            })
+            .transpose()?
+            .unwrap_or_else(|| "all".to_string());
+        let agent_type = call
+            .input
+            .get("agent_type")
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_string();
+        let profiles = AgentProfileRegistry::load(&ctx.workspace_root);
+        if profiles.get(&agent_type).is_none() {
+            anyhow::bail!(
+                "unknown agent_type `{agent_type}`; call list_agents to inspect available profiles"
+            );
+        }
         let run = scheduler.spawn(SpawnSubagentRequest {
             parent_thread_id: thread_id,
             parent_turn_id,
+            parent_agent_path: ctx.agent_path.clone(),
             name,
+            agent_type,
             input,
+            fork_turns,
             depth: ctx.subagent_depth.saturating_add(1),
         })?;
         Ok(ToolResult {
@@ -1233,9 +1275,180 @@ impl Tool for SpawnAgentTool {
             metadata: json!({
                 "toolName": self.name(),
                 "runId": run.id,
+                "agentPath": run.agent_path,
                 "status": run.status,
                 "success": true
             }),
+        })
+    }
+}
+
+pub struct SendAgentMessageTool;
+
+#[async_trait]
+impl Tool for SendAgentMessageTool {
+    fn name(&self) -> &str {
+        "send_message"
+    }
+
+    fn description(&self) -> &str {
+        "Queue a message for any visible agent in the current task tree. This does not start a new turn when the target is idle."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "string", "description": "Agent UUID, canonical path, or direct child task name." },
+                "message": { "type": "string", "description": "Message to deliver." }
+            },
+            "required": ["target", "message"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = subagent_scheduler(&ctx)?;
+        let delivery = scheduler.send_message_scoped(
+            subagent_scope(&ctx)?,
+            &required_string(&call.input, "target")?,
+            required_string(&call.input, "message")?,
+        )?;
+        Ok(ToolResult {
+            call_id: call.id,
+            output: serde_json::to_string(&delivery)?,
+            content: Vec::new(),
+            metadata: json!({
+                "toolName": self.name(),
+                "runId": delivery.target_id,
+                "agentPath": delivery.agent_path,
+                "queued": delivery.queued,
+                "success": true
+            }),
+        })
+    }
+}
+
+pub struct FollowupAgentTaskTool;
+
+#[async_trait]
+impl Tool for FollowupAgentTaskTool {
+    fn name(&self) -> &str {
+        "followup_task"
+    }
+
+    fn description(&self) -> &str {
+        "Give an existing agent a follow-up task, starting a new turn when it is idle or delivering at the next boundary when it is active."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "string", "description": "Agent UUID, canonical path, or direct child task name." },
+                "message": { "type": "string", "description": "Follow-up task." }
+            },
+            "required": ["target", "message"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = subagent_scheduler(&ctx)?;
+        let run = scheduler.followup_task_scoped(
+            subagent_scope(&ctx)?,
+            &required_string(&call.input, "target")?,
+            required_string(&call.input, "message")?,
+        )?;
+        Ok(agent_tool_result(
+            call.id,
+            self.name(),
+            &run,
+            format!("Follow-up delivered to {}.", run.agent_path),
+        ))
+    }
+}
+
+pub struct InterruptAgentTool;
+
+#[async_trait]
+impl Tool for InterruptAgentTool {
+    fn name(&self) -> &str {
+        "interrupt_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Interrupt an agent's current turn. The agent identity remains available for a later followup_task."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "string", "description": "Agent UUID, canonical path, or direct child task name." }
+            },
+            "required": ["target"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = subagent_scheduler(&ctx)?;
+        let run = scheduler.resolve_scoped(
+            subagent_scope(&ctx)?,
+            &required_string(&call.input, "target")?,
+        )?;
+        scheduler.cancel_scoped(subagent_scope(&ctx)?, run.id)?;
+        Ok(agent_tool_result(
+            call.id,
+            self.name(),
+            &run,
+            format!("Interrupt requested for {}.", run.agent_path),
+        ))
+    }
+}
+
+pub struct ListAgentsTool;
+
+#[async_trait]
+impl Tool for ListAgentsTool {
+    fn name(&self) -> &str {
+        "list_agents"
+    }
+
+    fn description(&self) -> &str {
+        "List visible agents in the current root task tree with their canonical paths, profiles, status, and latest task."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path_prefix": { "type": "string", "description": "Optional canonical path prefix." }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let scheduler = subagent_scheduler(&ctx)?;
+        let runs = scheduler.list_scoped(
+            subagent_scope(&ctx)?,
+            call.input.get("path_prefix").and_then(Value::as_str),
+        );
+        let run_count = runs.len();
+        let profiles = AgentProfileRegistry::load(&ctx.workspace_root);
+        let value = json!({
+            "agents": runs,
+            "availableAgentTypes": profiles.list(),
+            "profileWarnings": profiles.warnings()
+        });
+        let output = serde_json::to_string_pretty(&value)?;
+        Ok(ToolResult {
+            call_id: call.id,
+            output,
+            content: vec![ModelContentPart::json(value)],
+            metadata: json!({ "toolName": self.name(), "count": run_count, "success": true }),
         })
     }
 }
@@ -1330,17 +1543,18 @@ impl Tool for WaitAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Wait for a child agent to finish and return its persisted status and result."
+        "Wait for agent mailbox activity. With target/runId, wait for that agent's current turn; without one, return the next terminal update in the visible task tree."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "runId": { "type": "string", "description": "Child run UUID." },
-                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 120000 }
+                "target": { "type": "string", "description": "Optional agent UUID or canonical path." },
+                "runId": { "type": "string", "description": "Deprecated target UUID alias." },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000 },
+                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 120000, "description": "Deprecated alias for timeout_ms." }
             },
-            "required": ["runId"],
             "additionalProperties": false
         })
     }
@@ -1350,30 +1564,53 @@ impl Tool for WaitAgentTool {
             .subagents
             .as_ref()
             .context("subagent runtime is unavailable")?;
-        let run_id = required_uuid(&call.input, "runId")?;
         let timeout_ms = call
             .input
-            .get("timeoutMs")
+            .get("timeout_ms")
+            .or_else(|| call.input.get("timeoutMs"))
             .and_then(Value::as_u64)
             .unwrap_or(30_000)
             .clamp(1, 120_000);
-        let run = scheduler
-            .wait_scoped(
-                subagent_scope(&ctx)?,
-                run_id,
-                Duration::from_millis(timeout_ms),
-            )
+        let scope = subagent_scope(&ctx)?;
+        if let Some(target) = call
+            .input
+            .get("target")
+            .or_else(|| call.input.get("runId"))
+            .and_then(Value::as_str)
+        {
+            let run = scheduler.resolve_scoped(scope.clone(), target)?;
+            let run = scheduler
+                .wait_scoped(scope, run.id, Duration::from_millis(timeout_ms))
+                .await?;
+            return Ok(ToolResult {
+                call_id: call.id,
+                output: serde_json::to_string(&run)?,
+                content: Vec::new(),
+                metadata: json!({
+                    "toolName": self.name(),
+                    "runId": run.id,
+                    "agentPath": run.agent_path,
+                    "status": run.status,
+                    "terminal": run.status.is_terminal(),
+                    "success": run.status == SubagentRunStatus::Completed
+                }),
+            });
+        }
+        let activity = scheduler
+            .wait_for_activity_scoped(scope, Duration::from_millis(timeout_ms))
             .await?;
+        let update_count = activity.agents.len();
+        let message_count = activity.messages.len();
+        let value = serde_json::to_value(activity)?;
         Ok(ToolResult {
             call_id: call.id,
-            output: serde_json::to_string(&run)?,
-            content: Vec::new(),
+            output: serde_json::to_string_pretty(&value)?,
+            content: vec![ModelContentPart::json(value)],
             metadata: json!({
                 "toolName": self.name(),
-                "runId": run_id,
-                "status": run.status,
-                "terminal": run.status.is_terminal(),
-                "success": run.status == SubagentRunStatus::Completed
+                "updateCount": update_count,
+                "messageCount": message_count,
+                "success": true
             }),
         })
     }
@@ -1446,7 +1683,7 @@ impl Tool for WaitAgentsTool {
         let scope = subagent_scope(&ctx)?;
         let waits = run_ids
             .iter()
-            .map(|run_id| scheduler.wait_scoped(scope, *run_id, timeout));
+            .map(|run_id| scheduler.wait_scoped(scope.clone(), *run_id, timeout));
         let outcomes = futures_util::future::join_all(waits).await;
         let runs = run_ids
             .iter()
@@ -1474,8 +1711,10 @@ impl Tool for WaitAgentsTool {
         let all_succeeded = runs
             .iter()
             .all(|run| run.get("success").and_then(Value::as_bool) == Some(true));
+        let messages = scheduler.drain_mailbox_scoped(&scope);
         let value = json!({
             "runs": runs,
+            "messages": messages,
             "allTerminal": all_terminal,
             "allSucceeded": all_succeeded
         });
@@ -1503,7 +1742,45 @@ fn subagent_scope(ctx: &ToolContext) -> anyhow::Result<SubagentScope> {
             .parent_turn_id
             .context("subagent parent turn is unavailable")?,
         depth: ctx.subagent_depth,
+        agent_path: ctx.agent_path.clone(),
     })
+}
+
+fn subagent_scheduler(ctx: &ToolContext) -> anyhow::Result<&SubagentScheduler> {
+    ctx.subagents
+        .as_ref()
+        .context("subagent runtime is unavailable")
+}
+
+fn agent_tool_result(
+    call_id: Uuid,
+    tool_name: &str,
+    run: &crate::subagents::SubagentRun,
+    output: String,
+) -> ToolResult {
+    ToolResult {
+        call_id,
+        output,
+        content: Vec::new(),
+        metadata: json!({
+            "toolName": tool_name,
+            "runId": run.id,
+            "agentPath": run.agent_path,
+            "status": run.status,
+            "success": true
+        }),
+    }
+}
+
+fn string_alias(input: &Value, primary: &str, alias: &str) -> anyhow::Result<String> {
+    input
+        .get(primary)
+        .or_else(|| input.get(alias))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("{primary} must be a non-empty string"))
 }
 
 fn required_string(input: &Value, key: &str) -> anyhow::Result<String> {
@@ -1897,10 +2174,11 @@ impl Tool for ShellTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.success && looks_like_sandbox_denial(&stderr) {
-            anyhow::bail!(
-                "approval required: command was blocked by the sandbox: {}",
+            return Err(ApprovalRequired::new(format!(
+                "Command was blocked by the sandbox: {}",
                 truncate(&stderr, 2_000)
-            );
+            ))
+            .into());
         }
         let full_combined = format!(
             "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
@@ -2054,10 +2332,11 @@ impl Tool for ApplyPatchTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.success && looks_like_sandbox_denial(&stderr) {
-            anyhow::bail!(
-                "approval required: patch was blocked by the sandbox: {}",
+            return Err(ApprovalRequired::new(format!(
+                "Patch was blocked by the sandbox: {}",
                 truncate(&stderr, 2_000)
-            );
+            ))
+            .into());
         }
         if !output.success {
             anyhow::bail!(
@@ -2627,6 +2906,7 @@ mod tests {
         SubagentScheduler::new(
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: 1,
+                max_threads: 6,
                 max_depth: 2,
             },
             Arc::new(PendingExecutor),
@@ -2935,7 +3215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_subagent_tools_enforce_thread_and_parent_scope() {
+    async fn model_agent_tools_isolate_root_tasks_and_allow_same_tree_peers() {
         let scheduler = test_scheduler();
         let target_thread = Uuid::new_v4();
         let target_parent = Uuid::new_v4();
@@ -2943,8 +3223,11 @@ mod tests {
             .spawn(SpawnSubagentRequest {
                 parent_thread_id: target_thread,
                 parent_turn_id: target_parent,
+                parent_agent_path: "/root".to_string(),
                 name: "owned".to_string(),
+                agent_type: "default".to_string(),
                 input: "work".to_string(),
+                fork_turns: "all".to_string(),
                 depth: 1,
             })
             .unwrap();
@@ -2959,17 +3242,15 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("subagent run not found"));
 
-        let wrong_parent = tool_context(scheduler.clone(), target_thread, Uuid::new_v4());
-        let error = WaitAgentTool
+        scheduler.cancel(run.id).unwrap();
+        let peer = tool_context(scheduler.clone(), target_thread, Uuid::new_v4());
+        WaitAgentTool
             .execute(
-                ToolCall::new("wait_agent", json!({ "runId": run.id, "timeoutMs": 5 })),
-                wrong_parent,
+                ToolCall::new("wait_agent", json!({ "runId": run.id, "timeoutMs": 1_000 })),
+                peer,
             )
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("subagent run not found"));
-
-        scheduler.cancel(run.id).unwrap();
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3104,6 +3385,7 @@ mod tests {
         let scheduler = SubagentScheduler::new(
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: 2,
+                max_threads: 6,
                 max_depth: 2,
             },
             Arc::new(ImmediateExecutor),
@@ -3115,8 +3397,11 @@ mod tests {
             .spawn(SpawnSubagentRequest {
                 parent_thread_id: thread_id,
                 parent_turn_id,
+                parent_agent_path: "/root".to_string(),
                 name: "first".to_string(),
+                agent_type: "default".to_string(),
                 input: "alpha".to_string(),
+                fork_turns: "all".to_string(),
                 depth: 1,
             })
             .unwrap();
@@ -3124,8 +3409,11 @@ mod tests {
             .spawn(SpawnSubagentRequest {
                 parent_thread_id: thread_id,
                 parent_turn_id,
+                parent_agent_path: "/root".to_string(),
                 name: "second".to_string(),
+                agent_type: "default".to_string(),
                 input: "beta".to_string(),
+                fork_turns: "all".to_string(),
                 depth: 1,
             })
             .unwrap();

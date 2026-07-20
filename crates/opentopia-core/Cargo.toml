@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tokio.workspace = true
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 tokio-util.workspace = true

@@ -274,6 +274,8 @@ export class ApiClient {
     input: {
       name: string;
       input: string;
+      agentType?: string;
+      forkTurns?: string;
       parentTurnId?: string;
       depth?: number;
     },

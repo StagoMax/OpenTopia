@@ -58,8 +58,18 @@ pub struct SubagentRun {
     pub id: Uuid,
     pub parent_thread_id: Uuid,
     pub parent_turn_id: Uuid,
+    /// Stable canonical identity inside the root task tree (for example `/root/research`).
+    pub agent_path: String,
+    /// Canonical path of the agent that created this agent.
+    pub parent_agent_path: String,
     pub name: String,
+    /// Agent profile selected from the built-ins or `.codex/agents/*.toml`.
+    pub agent_type: String,
     pub input: String,
+    /// `none`, `all`, or a positive decimal number of parent turns.
+    pub fork_turns: String,
+    /// Most recent task message, including a follow-up that restarted an idle agent.
+    pub last_task_message: String,
     pub depth: u8,
     pub status: SubagentRunStatus,
     pub result: Option<String>,
@@ -73,29 +83,35 @@ pub struct SubagentRun {
 pub struct SpawnSubagentRequest {
     pub parent_thread_id: Uuid,
     pub parent_turn_id: Uuid,
+    pub parent_agent_path: String,
     pub name: String,
+    pub agent_type: String,
     pub input: String,
+    pub fork_turns: String,
     pub depth: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentScope {
     pub thread_id: Uuid,
     pub parent_turn_id: Uuid,
     pub depth: u8,
+    pub agent_path: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct SubagentSchedulerConfig {
     pub max_concurrency_per_parent: usize,
+    pub max_threads: usize,
     pub max_depth: u8,
 }
 
 impl Default for SubagentSchedulerConfig {
     fn default() -> Self {
         Self {
-            max_concurrency_per_parent: 4,
-            max_depth: 2,
+            max_concurrency_per_parent: 6,
+            max_threads: 6,
+            max_depth: 1,
         }
     }
 }
@@ -106,18 +122,60 @@ pub struct SubagentEvent {
     pub run: SubagentRun,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMailboxMessageKind {
+    Message,
+    Completion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMailboxMessage {
+    pub from_agent_path: String,
+    pub to_agent_path: String,
+    pub kind: AgentMailboxMessageKind,
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessageDelivery {
+    pub target_id: Option<Uuid>,
+    pub agent_path: String,
+    pub queued: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentWaitActivity {
+    pub agents: Vec<SubagentRun>,
+    pub messages: Vec<AgentMailboxMessage>,
+}
+
 #[derive(Debug, Error)]
 pub enum SubagentError {
     #[error("subagent name cannot be empty")]
     EmptyName,
     #[error("subagent input cannot be empty")]
     EmptyInput,
+    #[error("invalid agent task name `{0}`; use lowercase letters, digits, and underscores")]
+    InvalidTaskName(String),
+    #[error("invalid fork_turns `{0}`; expected `none`, `all`, or a positive integer")]
+    InvalidForkTurns(String),
+    #[error("agent path already exists: {0}")]
+    DuplicatePath(String),
+    #[error("agent thread limit reached for root task (maximum {maximum})")]
+    MaximumThreads { maximum: usize },
     #[error("subagent depth {actual} exceeds maximum {maximum}")]
     MaximumDepth { actual: u8, maximum: u8 },
     #[error("subagent run not found: {0}")]
     NotFound(Uuid),
     #[error("subagent run is already terminal: {0}")]
     AlreadyTerminal(Uuid),
+    #[error("cannot restore an active subagent run: {0}")]
+    CannotRestoreActive(Uuid),
     #[error("subagent input channel is closed: {0}")]
     InputClosed(Uuid),
     #[error("timed out waiting for subagent run: {0}")]
@@ -157,8 +215,11 @@ struct SchedulerInner {
     executor: Arc<dyn SubagentExecutor>,
     observer: Arc<dyn SubagentObserver>,
     runs: Mutex<HashMap<Uuid, Arc<RunControl>>>,
+    queued_messages: Mutex<HashMap<Uuid, Vec<String>>>,
     groups: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
     events: broadcast::Sender<SubagentEvent>,
+    mailboxes: Mutex<HashMap<(Uuid, String), Vec<AgentMailboxMessage>>>,
+    mailbox_events: broadcast::Sender<(Uuid, AgentMailboxMessage)>,
 }
 
 #[derive(Clone)]
@@ -173,20 +234,57 @@ impl SubagentScheduler {
         observer: Arc<dyn SubagentObserver>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
+        let (mailbox_events, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(SchedulerInner {
                 config,
                 executor,
                 observer,
                 runs: Mutex::new(HashMap::new()),
+                queued_messages: Mutex::new(HashMap::new()),
                 groups: Mutex::new(HashMap::new()),
                 events,
+                mailboxes: Mutex::new(HashMap::new()),
+                mailbox_events,
             }),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SubagentEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// Re-register a persisted, non-running agent identity after process restart.
+    pub fn restore(&self, run: SubagentRun) -> Result<(), SubagentError> {
+        if !run.status.is_terminal() {
+            return Err(SubagentError::CannotRestoreActive(run.id));
+        }
+        let (input, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let (updates, _) = watch::channel(run.clone());
+        let control = Arc::new(RunControl {
+            run: Mutex::new(run.clone()),
+            cancellation: CancellationToken::new(),
+            input,
+            updates,
+        });
+        let mut controls = self
+            .inner
+            .runs
+            .lock()
+            .expect("subagent runs mutex poisoned");
+        if controls.contains_key(&run.id) {
+            return Ok(());
+        }
+        if controls.values().any(|existing| {
+            let existing = existing.run.lock().expect("subagent run mutex poisoned");
+            existing.parent_thread_id == run.parent_thread_id
+                && existing.agent_path == run.agent_path
+        }) {
+            return Err(SubagentError::DuplicatePath(run.agent_path));
+        }
+        controls.insert(run.id, control);
+        Ok(())
     }
 
     pub fn spawn(&self, request: SpawnSubagentRequest) -> Result<SubagentRun, SubagentError> {
@@ -198,6 +296,10 @@ impl SubagentScheduler {
         if input_text.is_empty() {
             return Err(SubagentError::EmptyInput);
         }
+        if !is_valid_task_name(&name) {
+            return Err(SubagentError::InvalidTaskName(name));
+        }
+        let fork_turns = normalize_fork_turns(&request.fork_turns)?;
         if request.depth > self.inner.config.max_depth {
             return Err(SubagentError::MaximumDepth {
                 actual: request.depth,
@@ -205,12 +307,19 @@ impl SubagentScheduler {
             });
         }
 
+        let parent_agent_path = normalize_agent_path(&request.parent_agent_path);
+        let agent_path = format!("{parent_agent_path}/{name}");
         let run = SubagentRun {
             id: Uuid::new_v4(),
             parent_thread_id: request.parent_thread_id,
             parent_turn_id: request.parent_turn_id,
+            agent_path,
+            parent_agent_path,
             name,
+            agent_type: normalize_agent_type(&request.agent_type),
             input: input_text,
+            fork_turns,
+            last_task_message: request.input.trim().to_string(),
             depth: request.depth,
             status: SubagentRunStatus::Queued,
             result: None,
@@ -227,11 +336,34 @@ impl SubagentScheduler {
             input: input_tx,
             updates,
         });
-        self.inner
-            .runs
-            .lock()
-            .expect("subagent runs mutex poisoned")
-            .insert(run.id, control.clone());
+        {
+            let mut controls = self
+                .inner
+                .runs
+                .lock()
+                .expect("subagent runs mutex poisoned");
+            if controls.values().any(|control| {
+                let existing = control.run.lock().expect("subagent run mutex poisoned");
+                existing.parent_thread_id == run.parent_thread_id
+                    && existing.agent_path == run.agent_path
+            }) {
+                return Err(SubagentError::DuplicatePath(run.agent_path.clone()));
+            }
+            let active = controls
+                .values()
+                .filter(|control| {
+                    let existing = control.run.lock().expect("subagent run mutex poisoned");
+                    existing.parent_thread_id == run.parent_thread_id
+                        && !existing.status.is_terminal()
+                })
+                .count();
+            if active >= self.inner.config.max_threads.max(1) {
+                return Err(SubagentError::MaximumThreads {
+                    maximum: self.inner.config.max_threads.max(1),
+                });
+            }
+            controls.insert(run.id, control.clone());
+        }
         self.publish(&run);
 
         let scheduler = self.clone();
@@ -275,6 +407,41 @@ impl SubagentScheduler {
         runs
     }
 
+    pub fn list_scoped(&self, scope: SubagentScope, path_prefix: Option<&str>) -> Vec<SubagentRun> {
+        let prefix = path_prefix.map(normalize_agent_path);
+        self.list_for_thread(scope.thread_id)
+            .into_iter()
+            .filter(|run| {
+                prefix
+                    .as_ref()
+                    .map(|prefix| run.agent_path.starts_with(prefix))
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    pub fn resolve_scoped(
+        &self,
+        scope: SubagentScope,
+        target: &str,
+    ) -> Result<SubagentRun, SubagentError> {
+        let target = target.trim();
+        let run = Uuid::parse_str(target)
+            .ok()
+            .and_then(|id| self.get(id))
+            .or_else(|| {
+                let path = resolve_target_path(&scope.agent_path, target);
+                self.list_for_thread(scope.thread_id)
+                    .into_iter()
+                    .find(|run| run.agent_path == path)
+            })
+            .ok_or_else(|| SubagentError::NotFound(Uuid::nil()))?;
+        if run.parent_thread_id != scope.thread_id {
+            return Err(SubagentError::NotFound(run.id));
+        }
+        Ok(run)
+    }
+
     pub fn send_input(&self, run_id: Uuid, input: String) -> Result<(), SubagentError> {
         let control = self
             .control(run_id)
@@ -305,6 +472,124 @@ impl SubagentScheduler {
     ) -> Result<(), SubagentError> {
         self.ensure_visible(scope, run_id)?;
         self.send_input(run_id, input)
+    }
+
+    /// Queue a message for an agent without starting a new turn when the agent is idle.
+    pub fn send_message_scoped(
+        &self,
+        scope: SubagentScope,
+        target: &str,
+        message: String,
+    ) -> Result<AgentMessageDelivery, SubagentError> {
+        if message.trim().is_empty() {
+            return Err(SubagentError::EmptyInput);
+        }
+        let target_path = resolve_target_path(&scope.agent_path, target);
+        if target_path == "/root" {
+            self.queue_root_message(
+                scope.thread_id,
+                AgentMailboxMessage {
+                    from_agent_path: scope.agent_path,
+                    to_agent_path: target_path.clone(),
+                    kind: AgentMailboxMessageKind::Message,
+                    message,
+                    created_at: Utc::now(),
+                },
+            );
+            return Ok(AgentMessageDelivery {
+                target_id: None,
+                agent_path: target_path,
+                queued: true,
+            });
+        }
+        let run = self.resolve_scoped(scope.clone(), &target_path)?;
+        let mut queued = false;
+        let rendered = render_agent_message(&scope.agent_path, &message);
+        if run.status.is_terminal() {
+            self.inner
+                .queued_messages
+                .lock()
+                .expect("subagent mailbox mutex poisoned")
+                .entry(run.id)
+                .or_default()
+                .push(rendered);
+            queued = true;
+        } else {
+            match self.send_input(run.id, rendered.clone()) {
+                Ok(()) => {}
+                Err(SubagentError::InputClosed(_) | SubagentError::AlreadyTerminal(_)) => {
+                    self.inner
+                        .queued_messages
+                        .lock()
+                        .expect("subagent mailbox mutex poisoned")
+                        .entry(run.id)
+                        .or_default()
+                        .push(rendered);
+                    queued = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(AgentMessageDelivery {
+            target_id: Some(run.id),
+            agent_path: run.agent_path,
+            queued,
+        })
+    }
+
+    /// Deliver a task and start a fresh turn if the target agent is idle.
+    pub fn followup_task_scoped(
+        &self,
+        scope: SubagentScope,
+        target: &str,
+        message: String,
+    ) -> Result<SubagentRun, SubagentError> {
+        if message.trim().is_empty() {
+            return Err(SubagentError::EmptyInput);
+        }
+        let current = self.resolve_scoped(scope.clone(), target)?;
+        if !current.status.is_terminal() {
+            self.send_input(current.id, message.clone())?;
+            return Ok(self.get(current.id).expect("active agent disappeared"));
+        }
+
+        let mut run = current;
+        run.parent_turn_id = scope.parent_turn_id;
+        run.last_task_message = message.clone();
+        run.status = SubagentRunStatus::Queued;
+        run.result = None;
+        run.error = None;
+        run.started_at = None;
+        run.completed_at = None;
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let pending = self
+            .inner
+            .queued_messages
+            .lock()
+            .expect("subagent mailbox mutex poisoned")
+            .remove(&run.id)
+            .unwrap_or_default();
+        for queued in pending {
+            let _ = input_tx.send(queued);
+        }
+        let (updates, _) = watch::channel(run.clone());
+        let control = Arc::new(RunControl {
+            run: Mutex::new(run.clone()),
+            cancellation: CancellationToken::new(),
+            input: input_tx,
+            updates,
+        });
+        self.inner
+            .runs
+            .lock()
+            .expect("subagent runs mutex poisoned")
+            .insert(run.id, control.clone());
+        self.publish(&run);
+        let scheduler = self.clone();
+        tokio::spawn(async move {
+            scheduler.execute(control, input_rx).await;
+        });
+        Ok(run)
     }
 
     pub fn cancel(&self, run_id: Uuid) -> Result<(), SubagentError> {
@@ -397,13 +682,86 @@ impl SubagentScheduler {
         self.wait(run_id, timeout).await
     }
 
+    pub async fn wait_for_activity_scoped(
+        &self,
+        scope: SubagentScope,
+        timeout: Duration,
+    ) -> Result<AgentWaitActivity, SubagentError> {
+        let mut events = self.subscribe();
+        let mut mailbox_events = self.inner.mailbox_events.subscribe();
+        let messages = self.drain_mailbox(scope.thread_id, &scope.agent_path);
+        if !messages.is_empty() {
+            return Ok(AgentWaitActivity {
+                agents: Vec::new(),
+                messages,
+            });
+        }
+        let snapshot = self.list_scoped(scope.clone(), None);
+        if snapshot.iter().all(|run| run.status.is_terminal()) {
+            return Ok(AgentWaitActivity {
+                agents: snapshot,
+                messages: Vec::new(),
+            });
+        }
+        let future = async {
+            loop {
+                tokio::select! {
+                    event = mailbox_events.recv() => match event {
+                        Ok((thread_id, message))
+                            if thread_id == scope.thread_id
+                                && message.to_agent_path == normalize_agent_path(&scope.agent_path) =>
+                        {
+                            return AgentWaitActivity {
+                                agents: Vec::new(),
+                                messages: self.drain_mailbox(scope.thread_id, &scope.agent_path),
+                            };
+                        }
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {}
+                    },
+                    event = events.recv() => match event {
+                        Ok(event)
+                            if event.run.parent_thread_id == scope.thread_id
+                                && event.run.status.is_terminal() =>
+                        {
+                            return AgentWaitActivity {
+                                agents: vec![event.run],
+                                messages: self.drain_mailbox(scope.thread_id, &scope.agent_path),
+                            };
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let current = self.list_scoped(scope.clone(), None);
+                            if current.iter().any(|run| run.status.is_terminal()) {
+                                return AgentWaitActivity {
+                                    agents: current,
+                                    messages: self.drain_mailbox(scope.thread_id, &scope.agent_path),
+                                };
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return AgentWaitActivity {
+                                agents: Vec::new(),
+                                messages: self.drain_mailbox(scope.thread_id, &scope.agent_path),
+                            };
+                        }
+                    },
+                }
+            }
+        };
+        tokio::time::timeout(timeout, future)
+            .await
+            .map_err(|_| SubagentError::WaitTimedOut(Uuid::nil()))
+    }
+
+    pub fn drain_mailbox_scoped(&self, scope: &SubagentScope) -> Vec<AgentMailboxMessage> {
+        self.drain_mailbox(scope.thread_id, &scope.agent_path)
+    }
+
     fn ensure_visible(&self, scope: SubagentScope, run_id: Uuid) -> Result<(), SubagentError> {
         let run = self.get(run_id).ok_or(SubagentError::NotFound(run_id))?;
-        let is_direct_child = run.parent_thread_id == scope.thread_id
-            && run.parent_turn_id == scope.parent_turn_id
-            && run.depth == scope.depth.saturating_add(1);
-        if !is_direct_child {
-            // Do not disclose whether a UUID belongs to another thread or parent turn.
+        if run.parent_thread_id != scope.thread_id {
+            // Do not disclose whether a UUID belongs to another root task.
             return Err(SubagentError::NotFound(run_id));
         }
         Ok(())
@@ -509,11 +867,71 @@ impl SubagentScheduler {
         };
         control.updates.send_replace(run.clone());
         self.publish(&run);
+        self.deliver_mailbox_message(
+            run.parent_thread_id,
+            AgentMailboxMessage {
+                from_agent_path: run.agent_path.clone(),
+                to_agent_path: run.parent_agent_path.clone(),
+                kind: AgentMailboxMessageKind::Completion,
+                message: serde_json::to_string(&serde_json::json!({
+                    "agentPath": run.agent_path,
+                    "status": run.status,
+                    "result": run.result,
+                    "error": run.error,
+                }))
+                .unwrap_or_else(|_| "agent turn completed".to_string()),
+                created_at: Utc::now(),
+            },
+        );
     }
 
     fn publish(&self, run: &SubagentRun) {
         self.inner.observer.on_update(run);
         let _ = self.inner.events.send(SubagentEvent { run: run.clone() });
+    }
+
+    fn queue_root_message(&self, thread_id: Uuid, message: AgentMailboxMessage) {
+        self.inner
+            .mailboxes
+            .lock()
+            .expect("agent mailboxes mutex poisoned")
+            .entry((thread_id, message.to_agent_path.clone()))
+            .or_default()
+            .push(message.clone());
+        let _ = self.inner.mailbox_events.send((thread_id, message));
+    }
+
+    fn deliver_mailbox_message(&self, thread_id: Uuid, message: AgentMailboxMessage) {
+        if normalize_agent_path(&message.to_agent_path) == "/root" {
+            self.queue_root_message(thread_id, message);
+            return;
+        }
+        let target = self
+            .list_for_thread(thread_id)
+            .into_iter()
+            .find(|run| run.agent_path == message.to_agent_path);
+        let Some(target) = target else {
+            return;
+        };
+        let rendered = render_agent_message(&message.from_agent_path, &message.message);
+        if target.status.is_terminal() || self.send_input(target.id, rendered.clone()).is_err() {
+            self.inner
+                .queued_messages
+                .lock()
+                .expect("subagent mailbox mutex poisoned")
+                .entry(target.id)
+                .or_default()
+                .push(rendered);
+        }
+    }
+
+    fn drain_mailbox(&self, thread_id: Uuid, agent_path: &str) -> Vec<AgentMailboxMessage> {
+        self.inner
+            .mailboxes
+            .lock()
+            .expect("agent mailboxes mutex poisoned")
+            .remove(&(thread_id, normalize_agent_path(agent_path)))
+            .unwrap_or_default()
     }
 
     fn control(&self, run_id: Uuid) -> Option<Arc<RunControl>> {
@@ -523,6 +941,62 @@ impl SubagentScheduler {
             .expect("subagent runs mutex poisoned")
             .get(&run_id)
             .cloned()
+    }
+}
+
+fn normalize_agent_path(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        "/root".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn resolve_target_path(current_agent_path: &str, target: &str) -> String {
+    let target = target.trim();
+    if Uuid::parse_str(target).is_ok() {
+        target.to_string()
+    } else if target.starts_with('/') {
+        normalize_agent_path(target)
+    } else {
+        format!("{}/{}", normalize_agent_path(current_agent_path), target)
+    }
+}
+
+fn render_agent_message(from_agent_path: &str, message: &str) -> String {
+    format!(
+        "Message from {}:\n{}",
+        normalize_agent_path(from_agent_path),
+        message.trim()
+    )
+}
+
+fn normalize_agent_type(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        "default".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn is_valid_task_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn normalize_fork_turns(value: &str) -> Result<String, SubagentError> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "none" | "all") || value.parse::<u16>().is_ok_and(|turns| turns > 0)
+    {
+        Ok(value)
+    } else {
+        Err(SubagentError::InvalidForkTurns(value))
     }
 }
 
@@ -572,6 +1046,7 @@ mod tests {
         let scheduler = SubagentScheduler::new(
             SubagentSchedulerConfig {
                 max_concurrency_per_parent: max,
+                max_threads: 16,
                 max_depth: 2,
             },
             executor.clone(),
@@ -584,8 +1059,11 @@ mod tests {
         SpawnSubagentRequest {
             parent_thread_id: Uuid::new_v4(),
             parent_turn_id: parent,
+            parent_agent_path: "/root".to_string(),
             name: name.to_string(),
+            agent_type: "default".to_string(),
             input: "work".to_string(),
+            fork_turns: "all".to_string(),
             depth: 1,
         }
     }
@@ -595,6 +1073,7 @@ mod tests {
             thread_id: run.parent_thread_id,
             parent_turn_id: run.parent_turn_id,
             depth: run.depth - 1,
+            agent_path: run.parent_agent_path.clone(),
         }
     }
 
@@ -605,7 +1084,7 @@ mod tests {
         let runs = (0..5)
             .map(|index| {
                 scheduler
-                    .spawn(request(parent, &format!("run-{index}")))
+                    .spawn(request(parent, &format!("run_{index}")))
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -638,6 +1117,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_agent_can_receive_queued_messages_and_run_a_followup_turn() {
+        let (scheduler, _) = scheduler(1, Duration::from_millis(20));
+        let first = scheduler
+            .spawn(request(Uuid::new_v4(), "reusable"))
+            .unwrap();
+        let completed = scheduler
+            .wait(first.id, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(completed.status, SubagentRunStatus::Completed);
+
+        let scope = owning_scope(&completed);
+        scheduler
+            .send_message_scoped(scope.clone(), &completed.agent_path, "queued".to_string())
+            .unwrap();
+        let restarted = scheduler
+            .followup_task_scoped(scope, &completed.agent_path, "continue".to_string())
+            .unwrap();
+        assert_eq!(restarted.id, completed.id);
+        assert_eq!(restarted.last_task_message, "continue");
+        let finished = scheduler
+            .wait(restarted.id, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(finished.status, SubagentRunStatus::Completed);
+        assert_eq!(
+            finished.result.as_deref(),
+            Some("reusable:Message from /root:\nqueued")
+        );
+    }
+
+    #[tokio::test]
+    async fn root_mailbox_receives_direct_messages_and_completion_notifications() {
+        let (scheduler, _) = scheduler(1, Duration::from_millis(20));
+        let run = scheduler
+            .spawn(request(Uuid::new_v4(), "reporter"))
+            .unwrap();
+        let completed = scheduler
+            .wait(run.id, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let child_scope = SubagentScope {
+            thread_id: completed.parent_thread_id,
+            parent_turn_id: completed.id,
+            depth: completed.depth,
+            agent_path: completed.agent_path.clone(),
+        };
+        scheduler
+            .send_message_scoped(child_scope, "/root", "evidence".to_string())
+            .unwrap();
+
+        let activity = scheduler
+            .wait_for_activity_scoped(owning_scope(&completed), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(activity
+            .messages
+            .iter()
+            .any(|message| message.kind == AgentMailboxMessageKind::Completion));
+        assert!(activity.messages.iter().any(|message| {
+            message.kind == AgentMailboxMessageKind::Message && message.message == "evidence"
+        }));
+    }
+
+    #[tokio::test]
     async fn scoped_operations_hide_runs_from_other_threads() {
         let (scheduler, _) = scheduler(1, Duration::from_secs(5));
         let run = scheduler.spawn(request(Uuid::new_v4(), "private")).unwrap();
@@ -647,11 +1191,11 @@ mod tests {
         };
 
         assert!(matches!(
-            scheduler.send_input_scoped(cross_thread_scope, run.id, "intrude".to_string()),
+            scheduler.send_input_scoped(cross_thread_scope.clone(), run.id, "intrude".to_string()),
             Err(SubagentError::NotFound(id)) if id == run.id
         ));
         assert!(matches!(
-            scheduler.cancel_scoped(cross_thread_scope, run.id),
+            scheduler.cancel_scoped(cross_thread_scope.clone(), run.id),
             Err(SubagentError::NotFound(id)) if id == run.id
         ));
         assert!(matches!(
@@ -665,10 +1209,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_operations_require_direct_parent_and_depth() {
+    async fn scoped_operations_allow_peer_communication_inside_the_same_root_task() {
         let (scheduler, _) = scheduler(1, Duration::from_secs(5));
         let run = scheduler
-            .spawn(request(Uuid::new_v4(), "direct-child"))
+            .spawn(request(Uuid::new_v4(), "direct_child"))
             .unwrap();
         let wrong_parent_scope = SubagentScope {
             parent_turn_id: Uuid::new_v4(),
@@ -679,25 +1223,10 @@ mod tests {
             ..owning_scope(&run)
         };
 
-        assert!(matches!(
-            scheduler.send_input_scoped(wrong_parent_scope, run.id, "intrude".to_string()),
-            Err(SubagentError::NotFound(id)) if id == run.id
-        ));
-        assert!(matches!(
-            scheduler.cancel_scoped(wrong_depth_scope, run.id),
-            Err(SubagentError::NotFound(id)) if id == run.id
-        ));
-        assert!(matches!(
-            scheduler
-                .wait_scoped(wrong_parent_scope, run.id, Duration::from_millis(5))
-                .await,
-            Err(SubagentError::NotFound(id)) if id == run.id
-        ));
-
         scheduler
-            .send_input_scoped(owning_scope(&run), run.id, "allowed".to_string())
+            .send_input_scoped(wrong_parent_scope, run.id, "peer message".to_string())
             .unwrap();
-        scheduler.cancel_scoped(owning_scope(&run), run.id).unwrap();
+        scheduler.cancel_scoped(wrong_depth_scope, run.id).unwrap();
     }
 
     #[tokio::test]
@@ -708,6 +1237,7 @@ mod tests {
         let two = scheduler.spawn(request(parent, "two")).unwrap();
         let mut nested_request = request(one.id, "nested");
         nested_request.depth = 2;
+        nested_request.parent_agent_path = one.agent_path.clone();
         let nested = scheduler.spawn(nested_request).unwrap();
         scheduler.cancel(one.id).unwrap();
         assert_eq!(scheduler.cancel_parent(parent), 3);
