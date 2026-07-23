@@ -4,6 +4,7 @@ const {
   WebContentsView,
   dialog,
   ipcMain,
+  Notification,
   safeStorage,
   shell,
 } = require("electron");
@@ -38,6 +39,9 @@ const providerSecretStorageKey = "provider-api-key";
 const providerSecretStoragePrefix = `${providerSecretStorageKey}:`;
 const keyringProviderApiKeySourceId = `keyring:${providerSecretStorageKey}`;
 const keyringProviderApiKeyEnvName = "OPENTOPIA_API_KEY";
+const webSearchSecretStorageKey = "web-search-api-key";
+const keyringWebSearchApiKeySourceId = `keyring:${webSearchSecretStorageKey}`;
+const keyringWebSearchApiKeyEnvName = "OPENTOPIA_WEB_SEARCH_API_KEY";
 
 const maxRecentWorkspaces = 12;
 const maxContextSourceFiles = 20;
@@ -45,6 +49,10 @@ const maxContextSourceBytes = 25 * 1024 * 1024;
 const recentWorkspacesFile = "recent-workspaces.json";
 const openRequestHistoryLimit = 50;
 const openRequestHistory = [];
+const maxSystemNotificationTitleLength = 120;
+const maxSystemNotificationBodyLength = 1_000;
+const maxRetainedSystemNotifications = 20;
+const activeSystemNotifications = new Set();
 const providerSecretEnvNames = [
   "OPENTOPIA_API_KEY",
   "OPENAI_API_KEY",
@@ -607,6 +615,55 @@ function decryptSecretEntry(entry) {
   }
 }
 
+function webSearchApiKeySecretEntry() {
+  return readSecretStore().secrets[webSearchSecretStorageKey] || null;
+}
+
+function webSearchKeyringMetadata() {
+  const encryptionAvailable = safeStorage.isEncryptionAvailable();
+  const apiKeyConfigured = Boolean(webSearchApiKeySecretEntry()?.encryptedHex);
+  return {
+    available: encryptionAvailable,
+    encryptionAvailable,
+    storageBackend: selectedSafeStorageBackend(),
+    storagePath: secretsPath(),
+    apiKeyConfigured,
+    apiKeySourceId: keyringWebSearchApiKeySourceId,
+    envTarget: keyringWebSearchApiKeyEnvName,
+    status: !encryptionAvailable
+      ? apiKeyConfigured
+        ? "configured_unavailable"
+        : "unavailable"
+      : apiKeyConfigured
+        ? "available"
+        : "not_configured",
+  };
+}
+
+function setWebSearchKeyringSecret(value) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("Encryption not available on this system");
+  }
+  const secretValue = String(value || "").trim();
+  if (!secretValue) throw new Error("Web search API key cannot be empty");
+  const store = readSecretStore();
+  store.secrets[webSearchSecretStorageKey] = {
+    kind: "safeStorage",
+    envTarget: keyringWebSearchApiKeyEnvName,
+    encryptedHex: safeStorage.encryptString(secretValue).toString("hex"),
+    updatedAt: new Date().toISOString(),
+  };
+  writeSecretStore(store);
+  return webSearchKeyringMetadata();
+}
+
+function deleteWebSearchKeyringSecret() {
+  const store = readSecretStore();
+  delete store.secrets[webSearchSecretStorageKey];
+  writeSecretStore(store);
+  return webSearchKeyringMetadata();
+}
+
 function injectKeyringProviderApiKey(env) {
   const value = readProviderApiKeySecret();
   // Legacy single-key storage is a fallback only. New user-entered credentials
@@ -626,6 +683,11 @@ function injectKeyringProviderApiKey(env) {
     }
     const providerValue = decryptSecretEntry(entry);
     if (providerValue) env[envTarget] = providerValue;
+  }
+
+  const webSearchValue = decryptSecretEntry(webSearchApiKeySecretEntry());
+  if (webSearchValue) {
+    env[keyringWebSearchApiKeyEnvName] = webSearchValue;
   }
 }
 
@@ -1101,6 +1163,51 @@ function focusMainWindow() {
   return true;
 }
 
+function sanitizeSystemNotificationText(value, label, maxLength, singleLine) {
+  if (typeof value !== "string") {
+    throw new TypeError(`${label} must be a string`);
+  }
+
+  let sanitized = value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g, "");
+  sanitized = singleLine
+    ? sanitized.replace(/\s+/g, " ").trim()
+    : sanitized.trim();
+
+  if (!sanitized) throw new Error(`${label} cannot be empty`);
+  if (sanitized.length > maxLength) {
+    throw new RangeError(`${label} cannot exceed ${maxLength} characters`);
+  }
+  return sanitized;
+}
+
+function normalizeSystemNotificationOptions(options) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("Notification options must be an object");
+  }
+  if (options.silent !== undefined && typeof options.silent !== "boolean") {
+    throw new TypeError("Notification silent must be a boolean");
+  }
+
+  return {
+    title: sanitizeSystemNotificationText(
+      options.title,
+      "Notification title",
+      maxSystemNotificationTitleLength,
+      true,
+    ),
+    body: sanitizeSystemNotificationText(
+      options.body,
+      "Notification body",
+      maxSystemNotificationBodyLength,
+      false,
+    ),
+    silent: options.silent === true,
+  };
+}
+
 function recentWorkspacesPath() {
   return path.join(app.getPath("userData"), recentWorkspacesFile);
 }
@@ -1547,6 +1654,7 @@ function listSecretSources() {
     status: "available",
   }));
   const keyring = keyringMetadata();
+  const webSearchKeyring = webSearchKeyringMetadata();
   const providerKeySources = Object.keys(readSecretStore().secrets)
     .filter((key) => key.startsWith(providerSecretStoragePrefix))
     .flatMap((key) => {
@@ -1586,6 +1694,7 @@ function listSecretSources() {
   return {
     activeProviderKeySource,
     keyring,
+    webSearchKeyring,
     sources: [
       ...envSources,
       {
@@ -1603,6 +1712,20 @@ function listSecretSources() {
         envTarget: keyring.envTarget,
       },
       ...providerKeySources,
+      {
+        id: webSearchKeyring.apiKeySourceId,
+        kind: "keyring",
+        label: "Web search API key",
+        envName: webSearchKeyring.envTarget,
+        configured: webSearchKeyring.apiKeyConfigured,
+        readableByRenderer: false,
+        storesValue: true,
+        status: webSearchKeyring.status,
+        available: webSearchKeyring.available,
+        storageBackend: webSearchKeyring.storageBackend,
+        storagePath: webSearchKeyring.storagePath,
+        envTarget: webSearchKeyring.envTarget,
+      },
     ],
     notes: [
       "Renderer receives metadata only. Secret values stay in env/keyring-capable main process paths.",
@@ -1664,6 +1787,35 @@ function registerIpc() {
     openRequestHistory.map((request) => ({ ...request })),
   );
 
+  ipcMain.handle("platform:show-system-notification", (event, options) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) {
+      throw new Error(
+        "System notifications are available only to the main window",
+      );
+    }
+
+    const notificationOptions = normalizeSystemNotificationOptions(options);
+    if (!Notification.isSupported()) return false;
+
+    const notification = new Notification(notificationOptions);
+    activeSystemNotifications.add(notification);
+    if (activeSystemNotifications.size > maxRetainedSystemNotifications) {
+      activeSystemNotifications.delete(
+        activeSystemNotifications.values().next().value,
+      );
+    }
+    notification.once("click", () => {
+      activeSystemNotifications.delete(notification);
+      if (!focusMainWindow() && app.isReady()) createMainWindow();
+    });
+    notification.once("failed", (_event, error) => {
+      activeSystemNotifications.delete(notification);
+      logConsole("warn", "notification.show.failed", { error });
+    });
+    notification.show();
+    return true;
+  });
+
   ipcMain.handle("secrets:list-sources", () => listSecretSources());
 
   ipcMain.handle("secrets:set", async (_event, key, value) => {
@@ -1680,6 +1832,10 @@ function registerIpc() {
 
   ipcMain.handle("secrets:get-provider-key-metadata", (_event, providerId) =>
     providerKeyringMetadata(providerId),
+  );
+
+  ipcMain.handle("secrets:get-web-search-key-metadata", () =>
+    webSearchKeyringMetadata(),
   );
 
   ipcMain.handle(
@@ -1703,6 +1859,28 @@ function registerIpc() {
       providerId: metadata.providerId,
       sourceId: metadata.providerApiKeySourceId,
       configured: metadata.providerApiKeyConfigured,
+      status: metadata.status,
+    });
+    await restartManagedBackend();
+    return metadata;
+  });
+
+  ipcMain.handle("secrets:set-web-search-key", async (_event, value) => {
+    const metadata = setWebSearchKeyringSecret(value);
+    writeLog("info", "secrets.web-search.set", {
+      sourceId: metadata.apiKeySourceId,
+      configured: metadata.apiKeyConfigured,
+      status: metadata.status,
+    });
+    await restartManagedBackend();
+    return metadata;
+  });
+
+  ipcMain.handle("secrets:delete-web-search-key", async () => {
+    const metadata = deleteWebSearchKeyringSecret();
+    writeLog("info", "secrets.web-search.delete", {
+      sourceId: metadata.apiKeySourceId,
+      configured: metadata.apiKeyConfigured,
       status: metadata.status,
     });
     await restartManagedBackend();
@@ -1895,6 +2073,35 @@ function registerIpc() {
     return {
       canceled: false,
       files: result.filePaths.map(contextSourceMetadata),
+    };
+  });
+
+  ipcMain.handle("plugins:select-directory", async (event, options = {}) => {
+    let defaultPath;
+    if (typeof options?.defaultPath === "string" && options.defaultPath) {
+      try {
+        defaultPath = normalizeComparablePath(options.defaultPath);
+      } catch {
+        defaultPath = undefined;
+      }
+    }
+
+    const owner = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+    const dialogOptions = {
+      title: "Install local plugin",
+      defaultPath,
+      properties: ["openDirectory"],
+      message: "Select a folder containing .codex-plugin/plugin.json",
+    };
+    const result = owner
+      ? await dialog.showOpenDialog(owner, dialogOptions)
+      : await dialog.showOpenDialog(dialogOptions);
+    if (result.canceled || result.filePaths.length === 0) {
+      return { canceled: true };
+    }
+    return {
+      canceled: false,
+      path: normalizeComparablePath(result.filePaths[0]),
     };
   });
 

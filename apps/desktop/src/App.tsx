@@ -22,6 +22,7 @@ import {
   BriefcaseBusiness,
   Check,
   ChevronDown,
+  Circle,
   CircleHelp,
   Cloud,
   Clock3,
@@ -37,14 +38,17 @@ import {
   Globe2,
   Hand,
   Laptop,
+  ListTodo,
   Loader2,
   Menu,
+  Monitor,
   MessageCircle,
   MoreHorizontal,
   PanelRight,
   PanelLeftClose,
   PanelLeftOpen,
   Paperclip,
+  Pause,
   Pencil,
   Pin,
   Plug,
@@ -57,10 +61,13 @@ import {
   ShieldCheck,
   Square,
   SquarePen,
+  Target,
   Table2,
   TerminalSquare,
   Trash2,
+  WandSparkles,
   X,
+  Zap,
 } from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
@@ -71,33 +78,55 @@ import {
 } from "./components/ApprovalDialog";
 import { PreviewHost } from "./components/PreviewHost";
 import { RightContextRail } from "./components/RightContextRail";
-import { TurnActivityTimeline } from "./components/TurnActivityTimeline";
+import { SettingsPanel as RedesignedSettingsPanel } from "./components/SettingsPanel";
+import { SkillCreatorDialog } from "./components/SkillCreatorDialog";
+import {
+  TurnActivityTimeline,
+  TurnChangeCard,
+} from "./components/TurnActivityTimeline";
 import { WebPreviewSurface } from "./components/WebPreviewSurface";
+import { ComputerPanel } from "./components/ComputerPanel";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
 import {
+  deleteWebSearchApiKey,
   deleteProviderApiKey,
   getRecentWorkspaces,
   listSecretSources,
   loadPlatformInfo,
   openPath,
   selectContextFiles,
+  selectPluginDirectory,
   selectWorkspace,
   setProviderApiKey,
+  setWebSearchApiKey,
+  showSystemNotification,
 } from "./platform";
+import {
+  playCompletionChime,
+  readTaskNotificationPreferences,
+  shouldDeliverTaskNotification,
+  writeTaskNotificationPreferences,
+} from "./taskNotifications";
 import type {
   AgentEvent,
   AppSettings,
   ArtifactContent,
   ArtifactDescriptor,
+  CollaborationMode,
   ContextStatus,
   ContextSourceFile,
+  CreateSkillInput,
   ExperienceMode,
+  GenerateSkillInput,
+  GoalSnapshot,
+  GoalStatus,
   McpServerInput,
   McpServerView,
   Message,
   MessagePart,
   KeyringMetadata,
   PlatformInfo,
+  PluginView,
   Project,
   ProviderHealth,
   ProviderHealthCheckResult,
@@ -109,10 +138,15 @@ import type {
   SecretSources,
   SkillDescriptor,
   SubagentRun,
+  TaskPlan,
   TerminalEvent,
   TerminalSession,
   Thread,
   ThreadMcpServerView,
+  TurnChangeSet,
+  TurnFileDiffPreview,
+  WebSearchKeyringMetadata,
+  TurnUndoPreview,
   WorkspaceDiff,
   WorkspaceDiffHunk,
   WorkspaceDiffHunkAction,
@@ -123,7 +157,7 @@ import type {
 
 type ServerStatus = "checking" | "online" | "offline";
 
-type ToolTabKind = WorkbenchTab | "browser" | "preview";
+type ToolTabKind = WorkbenchTab | "browser" | "computer" | "preview";
 
 type ToolTab = {
   id: string;
@@ -166,8 +200,17 @@ type WorkspaceResizeDrag = {
   max: number;
 };
 
+type TurnUndoDialogState = {
+  turnId: string;
+  preview: TurnUndoPreview | null;
+  loading: boolean;
+  applying: boolean;
+  error: string | null;
+};
+
 const workspaceLayoutStorageKey = "opentopia.workspace-layout.v1";
 const experienceModeStorageKey = "opentopia.experience-mode.v1";
+const collaborationModeStorageKey = "opentopia.collaboration-mode.v1";
 const workspaceThreePaneBreakpoint = 1120;
 const workspaceLeftMin = 200;
 const workspaceLeftMax = 420;
@@ -181,6 +224,73 @@ function readExperienceMode(): ExperienceMode {
   } catch {
     return "code";
   }
+}
+
+function readCollaborationMode(): CollaborationMode {
+  if (typeof window === "undefined") return "default";
+  try {
+    const value = window.localStorage.getItem(collaborationModeStorageKey);
+    return value === "plan" || value === "goal" ? value : "default";
+  } catch {
+    return "default";
+  }
+}
+
+function reusableGoalId(
+  mode: CollaborationMode,
+  snapshot: GoalSnapshot | null,
+): string | undefined {
+  if (!snapshot || mode === "default") return undefined;
+  if (["completed", "cancelled", "failed"].includes(snapshot.goal.status)) {
+    return undefined;
+  }
+  if (mode === "goal") return snapshot.goal.id;
+  return ["draft", "ready", "paused", "blocked"].includes(snapshot.goal.status)
+    ? snapshot.goal.id
+    : undefined;
+}
+
+function goalSnapshotAsTaskPlan(snapshot: GoalSnapshot): TaskPlan | null {
+  if (snapshot.tasks.length === 0) return null;
+  return {
+    planRevision: snapshot.goal.planRevision,
+    goalId: snapshot.goal.id,
+    steps: snapshot.tasks.map((task) => ({
+      id: task.stepId,
+      title: task.title,
+      status:
+        task.status === "running"
+          ? "in_progress"
+          : task.status === "succeeded"
+            ? "completed"
+            : task.status === "failed"
+              ? "blocked"
+              : task.status,
+      statusReason: task.statusReason,
+      dependencies: task.dependencies,
+      acceptanceCriteria: task.acceptanceCriteria,
+      evidence: task.evidence,
+    })),
+  };
+}
+
+function resolveComposerTaskPlan(
+  events: AgentEvent[],
+  snapshot: GoalSnapshot | null,
+): TaskPlan | null {
+  const latestPlanEvent = [...events]
+    .sort((left, right) => right.seq - left.seq)
+    .find((event) => event.payload.type === "plan_updated");
+  const latestPlan =
+    latestPlanEvent?.payload.type === "plan_updated"
+      ? latestPlanEvent.payload.plan
+      : null;
+  const goalPlan = snapshot ? goalSnapshotAsTaskPlan(snapshot) : null;
+
+  if (goalPlan && (!latestPlan || latestPlan.goalId === goalPlan.goalId)) {
+    return goalPlan;
+  }
+  return latestPlan ?? goalPlan;
 }
 
 function readWorkspaceLayoutPreferences(): WorkspaceLayoutPreferences {
@@ -288,6 +398,18 @@ function useDismissiblePopover(open: boolean, onClose: () => void) {
   return containerRef;
 }
 
+function emptyContextUsage(): ContextStatus["usage"] {
+  return {
+    modelRequests: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    compactions: 0,
+    warnings: 0,
+  };
+}
+
 export function App() {
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
   const [client, setClient] = useState<ApiClient | null>(null);
@@ -299,6 +421,11 @@ export function App() {
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [experienceMode, setExperienceMode] =
     useState<ExperienceMode>(readExperienceMode);
+  const [collaborationMode, setCollaborationMode] = useState<CollaborationMode>(
+    readCollaborationMode,
+  );
+  const [goalSnapshot, setGoalSnapshot] = useState<GoalSnapshot | null>(null);
+  const [goalAction, setGoalAction] = useState<GoalStatus | "run" | null>(null);
   const [selectedWorkspaceRoot, setSelectedWorkspaceRoot] = useState<
     string | null
   >(null);
@@ -316,8 +443,10 @@ export function App() {
   const [contextSources, setContextSources] = useState<ContextSourceFile[]>([]);
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [skillCreatorOpen, setSkillCreatorOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [queuedMessageCount, setQueuedMessageCount] = useState(0);
   const [cancellingTurnId, setCancellingTurnId] = useState<string | null>(null);
   const [pendingApprovalIds, setPendingApprovalIds] = useState<string[]>([]);
   const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(
@@ -328,6 +457,8 @@ export function App() {
   >(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [taskNotificationPreferences, setTaskNotificationPreferences] =
+    useState(readTaskNotificationPreferences);
   const [providerHealth, setProviderHealth] = useState<ProviderHealth[]>([]);
   const [providerTest, setProviderTest] = useState<{
     providerId: string;
@@ -351,6 +482,7 @@ export function App() {
   );
   const [sandbox, setSandbox] = useState<SandboxDescriptor | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServerView[]>([]);
+  const [plugins, setPlugins] = useState<PluginView[]>([]);
   const [threadMcpServers, setThreadMcpServers] = useState<
     ThreadMcpServerView[]
   >([]);
@@ -370,6 +502,8 @@ export function App() {
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
   const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
+  const [turnUndoDialog, setTurnUndoDialog] =
+    useState<TurnUndoDialogState | null>(null);
   const [workspaceLayoutPreferences, setWorkspaceLayoutPreferences] =
     useState<WorkspaceLayoutPreferences>(readWorkspaceLayoutPreferences);
   const [workspaceWidth, setWorkspaceWidth] = useState(() =>
@@ -384,6 +518,8 @@ export function App() {
     value: number;
   } | null>(null);
   const workspaceResizeFrameRef = useRef<number | null>(null);
+  const taskNotificationPreferencesRef = useRef(taskNotificationPreferences);
+  const ingestedEventIdsRef = useRef(new Set<string>());
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -418,6 +554,15 @@ export function App() {
     [events, pendingApprovalIds],
   );
   const activeApproval = pendingApprovalQueue[0]?.payload ?? null;
+  const composerTaskPlan = useMemo(
+    () => resolveComposerTaskPlan(events, goalSnapshot),
+    [events, goalSnapshot],
+  );
+
+  useEffect(() => {
+    setQueuedMessageCount(0);
+    setTurnUndoDialog(null);
+  }, [activeThreadId]);
 
   useEffect(() => {
     if (!activeApproval) return;
@@ -485,6 +630,22 @@ export function App() {
     }
   }, [experienceMode]);
 
+  useEffect(() => {
+    taskNotificationPreferencesRef.current = taskNotificationPreferences;
+    writeTaskNotificationPreferences(taskNotificationPreferences);
+  }, [taskNotificationPreferences]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        collaborationModeStorageKey,
+        collaborationMode,
+      );
+    } catch {
+      // Mode persistence is best-effort when storage is unavailable.
+    }
+  }, [collaborationMode]);
+
   useEffect(
     () => () => {
       if (workspaceResizeFrameRef.current !== null) {
@@ -513,87 +674,154 @@ export function App() {
     };
   }, [client, currentWorkspaceRoot]);
 
-  const ingestEvent = useCallback((event: AgentEvent) => {
-    setEvents((current) => {
-      if (current.some((item) => item.id === event.id)) return current;
-      return [...current, event].sort((a, b) => a.seq - b.seq);
-    });
-
-    if (event.payload.type === "assistant_message") {
-      const assistantMessage = event.payload.message;
-      setMessages((current) => {
-        if (current.some((message) => message.id === assistantMessage.id))
-          return current;
-        return [...current, assistantMessage];
+  useEffect(() => {
+    if (!client) return;
+    let cancelled = false;
+    void client
+      .listPlugins({
+        workspaceRoot: currentWorkspaceRoot,
+        threadId: activeThreadId,
+      })
+      .then((available) => {
+        if (!cancelled) setPlugins(available);
+      })
+      .catch(() => {
+        if (!cancelled) setPlugins([]);
       });
-    }
+    return () => {
+      cancelled = true;
+    };
+  }, [activeThreadId, client, currentWorkspaceRoot]);
 
-    if (event.payload.type === "approval_requested") {
-      const approvalId = event.payload.approval_id;
-      setApprovalDecisionError(null);
-      setConversationCollapsed(false);
-      setPendingApprovalIds((current) =>
-        current.includes(approvalId) ? current : [...current, approvalId],
-      );
-    }
+  const deliverTaskCompletionNotification = useCallback(
+    (summary: string, force = false) => {
+      const preferences = taskNotificationPreferencesRef.current;
+      if (!preferences.enabled) return;
+      if (
+        !force &&
+        !shouldDeliverTaskNotification(preferences, document.hasFocus())
+      ) {
+        return;
+      }
 
-    if (event.payload.type === "error") {
-      setActionError(
-        `Agent 请求失败：${friendlyProviderError(event.payload.message)}`,
-      );
-    }
+      if (preferences.completionSound) playCompletionChime();
+      if (preferences.systemNotification) {
+        const body =
+          summary.replace(/\s+/g, " ").trim().slice(0, 260) ||
+          "OpenTopia 已完成当前任务。";
+        void showSystemNotification({
+          title: "任务已完成",
+          body,
+          silent: true,
+        }).catch(() => {
+          // Notification delivery is best-effort and must not affect the turn.
+        });
+      }
+    },
+    [],
+  );
 
-    if (event.payload.type === "turn_started" && event.turnId) {
-      setActiveTurnId(event.turnId);
-      setCancellingTurnId(null);
-    } else if (
-      event.payload.type === "turn_finished" ||
-      event.payload.type === "turn_suspended" ||
-      event.payload.type === "turn_cancelled" ||
-      event.payload.type === "error"
-    ) {
-      setActiveTurnId((current) =>
-        !event.turnId || current === event.turnId ? null : current,
-      );
-      setCancellingTurnId((current) =>
-        !event.turnId || current === event.turnId ? null : current,
-      );
-    }
+  const ingestEvent = useCallback(
+    (event: AgentEvent) => {
+      if (ingestedEventIdsRef.current.has(event.id)) return;
+      ingestedEventIdsRef.current.add(event.id);
+      if (ingestedEventIdsRef.current.size > 4096) {
+        const oldestId = ingestedEventIdsRef.current.values().next().value;
+        if (oldestId) ingestedEventIdsRef.current.delete(oldestId);
+      }
 
-    if (event.payload.type === "tool_call_finished") {
-      const refs = collectArtifactReferences(
-        event.payload.result.metadata,
-        event.payload.result.output,
-      );
-      if (refs.length > 0) {
-        setArtifacts((current) =>
-          mergeArtifactDescriptors(current, refs, event),
+      setEvents((current) => {
+        if (current.some((item) => item.id === event.id)) return current;
+        return [...current, event].sort((a, b) => a.seq - b.seq);
+      });
+
+      if (event.payload.type === "assistant_message") {
+        const assistantMessage = event.payload.message;
+        setMessages((current) => {
+          if (current.some((message) => message.id === assistantMessage.id))
+            return current;
+          return [...current, assistantMessage];
+        });
+      }
+
+      if (event.payload.type === "goal_updated") {
+        setGoalSnapshot(event.payload.snapshot);
+      }
+
+      if (event.payload.type === "approval_requested") {
+        const approvalId = event.payload.approval_id;
+        setApprovalDecisionError(null);
+        setConversationCollapsed(false);
+        setPendingApprovalIds((current) =>
+          current.includes(approvalId) ? current : [...current, approvalId],
         );
       }
-    }
 
-    if (event.payload.type === "context_compacted") {
-      const latestSummary = event.payload.summary;
-      setContextStatus((current) => ({
-        budget: current?.budget ?? {
-          totalTokens: 128000,
-          usedTokens: 0,
-          messageCount: 0,
-          estimatedUsage: 0,
-        },
-        latestSummary,
-      }));
-    }
+      if (event.payload.type === "error") {
+        setActionError(
+          `Agent 请求失败：${friendlyProviderError(event.payload.message)}`,
+        );
+      }
 
-    if (event.payload.type === "subagent_updated") {
-      const run = event.payload.run;
-      setSubagentRuns((current) =>
-        [run, ...current.filter((item) => item.id !== run.id)].sort(
-          (left, right) => right.createdAt.localeCompare(left.createdAt),
-        ),
-      );
-    }
-  }, []);
+      if (event.payload.type === "turn_started" && event.turnId) {
+        setActiveTurnId(event.turnId);
+        setCancellingTurnId(null);
+        setQueuedMessageCount((current) => Math.max(0, current - 1));
+      } else if (
+        event.payload.type === "turn_finished" ||
+        event.payload.type === "turn_suspended" ||
+        event.payload.type === "turn_cancelled" ||
+        event.payload.type === "error"
+      ) {
+        setActiveTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+        setCancellingTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+      }
+
+      if (event.payload.type === "turn_finished") {
+        deliverTaskCompletionNotification(event.payload.summary);
+      }
+
+      if (event.payload.type === "tool_call_finished") {
+        const refs = collectArtifactReferences(
+          event.payload.result.metadata,
+          event.payload.result.output,
+        );
+        if (refs.length > 0) {
+          setArtifacts((current) =>
+            mergeArtifactDescriptors(current, refs, event),
+          );
+        }
+      }
+
+      if (event.payload.type === "context_compacted") {
+        const latestSummary = event.payload.summary;
+        setContextStatus((current) => ({
+          budget: current?.budget ?? {
+            totalTokens: 128000,
+            usedTokens: 0,
+            messageCount: 0,
+            estimatedUsage: 0,
+          },
+          latestSummary,
+          usage: current?.usage ?? emptyContextUsage(),
+        }));
+      }
+
+      if (event.payload.type === "subagent_updated") {
+        const run = event.payload.run;
+        setSubagentRuns((current) =>
+          [run, ...current.filter((item) => item.id !== run.id)].sort(
+            (left, right) => right.createdAt.localeCompare(left.createdAt),
+          ),
+        );
+      }
+    },
+    [deliverTaskCompletionNotification],
+  );
 
   const ingestTerminalEvent = useCallback((event: TerminalEvent) => {
     setTerminalEvents((current) => {
@@ -725,6 +953,7 @@ export function App() {
     setApprovalDecisionError(null);
     setActiveTurnId(null);
     setCancellingTurnId(null);
+    setGoalSnapshot(null);
     if (!client || !activeThreadId) return;
     let cancelled = false;
     let source: StreamHandle | null = null;
@@ -736,12 +965,14 @@ export function App() {
         turnStatus,
         pendingApprovals,
         loadedSubagents,
+        loadedGoal,
       ] = await Promise.all([
         client.listMessages(activeThreadId),
         client.listEvents(activeThreadId),
         client.getTurnStatus(activeThreadId),
         client.listPendingApprovals(activeThreadId),
         client.listSubagents(activeThreadId),
+        client.getGoal(activeThreadId),
       ]);
       if (cancelled) return;
       setMessages(loadedMessages);
@@ -755,6 +986,7 @@ export function App() {
         pendingApprovals.map((approval) => approval.approvalId),
       );
       setSubagentRuns(loadedSubagents);
+      setGoalSnapshot(loadedGoal);
       const since = loadedEvents.at(-1)?.seq;
       source = client.openEventStream(activeThreadId, since, ingestEvent);
     })().catch((error) => {
@@ -1210,6 +1442,74 @@ export function App() {
     await refreshMcpState();
   }
 
+  async function refreshPluginState() {
+    if (!client) return;
+    const [availablePlugins, availableSkills, servers, bindings] =
+      await Promise.all([
+        client.listPlugins({
+          workspaceRoot: currentWorkspaceRoot,
+          threadId: activeThread?.id,
+        }),
+        client.listSkills(currentWorkspaceRoot),
+        client.listMcpServers(),
+        activeThread
+          ? client.listThreadMcpServers(activeThread.id)
+          : Promise.resolve([]),
+      ]);
+    setPlugins(availablePlugins);
+    setSkills(availableSkills);
+    setMcpServers(servers);
+    setThreadMcpServers(bindings);
+    const availableIds = new Set(availableSkills.map((skill) => skill.id));
+    setSelectedSkillIds((current) =>
+      current.filter((id) => availableIds.has(id)),
+    );
+  }
+
+  async function installLocalPlugin() {
+    if (!client) throw new Error("OpenTopia API is unavailable.");
+    const selection = await selectPluginDirectory({
+      defaultPath: currentWorkspaceRoot ?? undefined,
+    });
+    if (selection.canceled) return;
+    await client.installPlugin(selection.path);
+    await refreshPluginState();
+  }
+
+  async function uninstallLocalPlugin(pluginId: string) {
+    if (!client) throw new Error("OpenTopia API is unavailable.");
+    await client.uninstallPlugin(pluginId, currentWorkspaceRoot);
+    await refreshPluginState();
+  }
+
+  async function toggleThreadPlugin(pluginId: string, enabled: boolean) {
+    if (!client || !activeThread) {
+      throw new Error("Open a task before enabling plugin tools.");
+    }
+    await client.setThreadPlugin(activeThread.id, pluginId, enabled);
+    await refreshPluginState();
+  }
+
+  function usePluginSkills(pluginId: string, enabled: boolean) {
+    const plugin = plugins.find((item) => item.plugin.id === pluginId);
+    if (!plugin) return;
+    if (!enabled) {
+      setSelectedSkillIds((current) =>
+        current.filter((id) => !plugin.skillIds.includes(id)),
+      );
+      return;
+    }
+    const next = [...selectedSkillIds];
+    for (const skillId of plugin.skillIds) {
+      if (next.length >= 5) break;
+      if (!next.includes(skillId)) next.push(skillId);
+    }
+    if (plugin.skillIds.some((id) => !next.includes(id))) {
+      setActionError("每轮最多选择 5 个 Skills；已添加当前可用的插件 Skills。");
+    }
+    setSelectedSkillIds(next);
+  }
+
   async function saveSettings(input: {
     providers?: ProviderSettings[];
     activeProviderId?: string;
@@ -1219,6 +1519,7 @@ export function App() {
     apiKeySource?: string;
     permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
     sandbox?: AppSettings["sandbox"];
+    webSearch?: AppSettings["webSearch"];
   }) {
     if (!client) return;
     setIsSavingSettings(true);
@@ -1312,6 +1613,34 @@ export function App() {
       }
       return current.length >= 5 ? current : [...current, skillId];
     });
+  }
+
+  async function generateSkillDraft(input: GenerateSkillInput) {
+    if (!client) throw new Error("服务尚未连接");
+    return client.generateSkill(input);
+  }
+
+  async function createSkill(input: CreateSkillInput) {
+    if (!client) throw new Error("服务尚未连接");
+    return client.createSkill(input);
+  }
+
+  function addCreatedSkill(skill: SkillDescriptor) {
+    setSkills((current) =>
+      [...current.filter((item) => item.id !== skill.id), skill].sort(
+        (left, right) =>
+          (left.scope === right.scope
+            ? 0
+            : left.scope === "workspace"
+              ? -1
+              : 1) || left.name.localeCompare(right.name),
+      ),
+    );
+    setSelectedSkillIds((current) =>
+      current.includes(skill.id) || current.length >= 5
+        ? current
+        : [...current, skill.id],
+    );
   }
 
   async function spawnSubagent(name: string, input: string) {
@@ -1425,6 +1754,7 @@ export function App() {
           initialPrompt?.trim() ?? "",
           contextSources.map((source) => source.path),
           selectedSkillIds,
+          collaborationMode,
         );
         setMessages([message]);
         if (turnId) setActiveTurnId(turnId);
@@ -1514,7 +1844,6 @@ export function App() {
         contextSources.length === 0 &&
         selectedSkillIds.length === 0) ||
       isSending ||
-      activeTurnId ||
       activeApproval
     )
       return;
@@ -1537,14 +1866,17 @@ export function App() {
         setComposer("");
         return;
       }
-      const { message, turnId } = await client.sendMessage(
+      const { message, turnId, queued } = await client.sendMessage(
         activeThread.id,
         composer.trim(),
         contextSources.map((source) => source.path),
         selectedSkillIds,
+        collaborationMode,
+        reusableGoalId(collaborationMode, goalSnapshot),
       );
       setMessages((current) => [...current, message]);
       if (turnId) setActiveTurnId(turnId);
+      if (queued) setQueuedMessageCount((current) => current + 1);
       setComposer("");
       setContextSources([]);
       setSelectedSkillIds([]);
@@ -1586,6 +1918,62 @@ export function App() {
     } catch (error) {
       setCancellingTurnId(null);
       setActionError(`中断执行失败：${errorMessage(error)}`);
+    }
+  }
+
+  async function runGoal() {
+    if (!client || !activeThread || !goalSnapshot || activeTurnId) return;
+    const goalId = goalSnapshot.goal.id;
+    setGoalAction("run");
+    setActionError(null);
+    try {
+      let snapshot = goalSnapshot;
+      if (snapshot.goal.status !== "active") {
+        snapshot = await client.updateGoalStatus(
+          activeThread.id,
+          goalId,
+          "active",
+        );
+        setGoalSnapshot(snapshot);
+      }
+      setCollaborationMode("goal");
+      const { message, turnId, queued } = await client.sendMessage(
+        activeThread.id,
+        "继续执行已确认的目标计划，直到完成或出现明确阻塞。",
+        [],
+        [],
+        "goal",
+        goalId,
+      );
+      setMessages((current) => [...current, message]);
+      if (turnId) setActiveTurnId(turnId);
+      if (queued) setQueuedMessageCount((current) => current + 1);
+    } catch (error) {
+      setActionError(`无法启动目标：${errorMessage(error)}`);
+    } finally {
+      setGoalAction(null);
+    }
+  }
+
+  async function changeGoalStatus(status: "paused" | "cancelled") {
+    if (!client || !activeThread || !goalSnapshot) return;
+    setGoalAction(status);
+    setActionError(null);
+    try {
+      if (activeTurnId) {
+        const result = await client.cancelTurn(activeThread.id, activeTurnId);
+        if (!result.cancelled) throw new Error(result.message);
+      }
+      const snapshot = await client.updateGoalStatus(
+        activeThread.id,
+        goalSnapshot.goal.id,
+        status,
+      );
+      setGoalSnapshot(snapshot);
+    } catch (error) {
+      setActionError(`无法更新目标：${errorMessage(error)}`);
+    } finally {
+      setGoalAction(null);
     }
   }
 
@@ -1693,6 +2081,7 @@ export function App() {
           estimatedUsage: 0,
         },
         latestSummary: summary,
+        usage: current?.usage ?? emptyContextUsage(),
       }));
     } catch (error) {
       setWorkbenchError(error instanceof Error ? error.message : String(error));
@@ -1732,6 +2121,104 @@ export function App() {
       setWorkbenchError(error instanceof Error ? error.message : String(error));
     } finally {
       setRevertingDiffPath(null);
+    }
+  }
+
+  async function openTurnUndo(turnId: string) {
+    if (!client || !activeThread) return;
+    const threadId = activeThread.id;
+    setTurnUndoDialog({
+      turnId,
+      preview: null,
+      loading: true,
+      applying: false,
+      error: null,
+    });
+    try {
+      const preview = await client.previewTurnUndo(threadId, turnId);
+      setTurnUndoDialog((current) =>
+        current?.turnId === turnId
+          ? { ...current, preview, loading: false }
+          : current,
+      );
+    } catch (error) {
+      setTurnUndoDialog((current) =>
+        current?.turnId === turnId
+          ? {
+              ...current,
+              loading: false,
+              error: error instanceof Error ? error.message : String(error),
+            }
+          : current,
+      );
+    }
+  }
+
+  async function confirmTurnUndo() {
+    if (
+      !client ||
+      !activeThread ||
+      !turnUndoDialog?.preview?.canUndo ||
+      turnUndoDialog.applying
+    ) {
+      return;
+    }
+
+    const threadId = activeThread.id;
+    const turnId = turnUndoDialog.turnId;
+    setTurnUndoDialog((current) =>
+      current ? { ...current, applying: true, error: null } : current,
+    );
+    try {
+      const result = await client.undoTurnChanges(threadId, turnId);
+      if (!result.applied) {
+        setTurnUndoDialog((current) =>
+          current?.turnId === turnId
+            ? { ...current, preview: result.preview, applying: false }
+            : current,
+        );
+        return;
+      }
+
+      setEvents((current) => [
+        ...current.map((event) =>
+          event.turnId === turnId &&
+          event.payload.type === "turn_changes_recorded"
+            ? {
+                ...event,
+                payload: {
+                  ...event.payload,
+                  change_set: result.changeSet,
+                },
+              }
+            : event,
+        ),
+        {
+          id: `local-turn-undo-${Date.now()}`,
+          threadId,
+          turnId,
+          seq: Number.MAX_SAFE_INTEGER,
+          createdAt: new Date().toISOString(),
+          payload: {
+            type: "turn_undo_completed",
+            target_turn_id: turnId,
+            files_changed: result.filesChanged,
+          },
+        },
+      ]);
+      setTurnUndoDialog(null);
+      setFilePreview(null);
+      await refreshWorkbench();
+    } catch (error) {
+      setTurnUndoDialog((current) =>
+        current?.turnId === turnId
+          ? {
+              ...current,
+              applying: false,
+              error: error instanceof Error ? error.message : String(error),
+            }
+          : current,
+      );
     }
   }
 
@@ -1810,6 +2297,40 @@ export function App() {
     setServerError(null);
     try {
       const metadata = await deleteProviderApiKey(providerId);
+      setSecretSources(await listSecretSources());
+      return metadata;
+    } catch (error) {
+      setServerError(error instanceof Error ? error.message : String(error));
+      return null;
+    } finally {
+      setIsSavingSecret(false);
+    }
+  }
+
+  async function storeWebSearchApiKey(
+    value: string,
+  ): Promise<WebSearchKeyringMetadata | null> {
+    if (isSavingSecret) return null;
+    setIsSavingSecret(true);
+    setServerError(null);
+    try {
+      const metadata = await setWebSearchApiKey(value);
+      setSecretSources(await listSecretSources());
+      return metadata;
+    } catch (error) {
+      setServerError(error instanceof Error ? error.message : String(error));
+      return null;
+    } finally {
+      setIsSavingSecret(false);
+    }
+  }
+
+  async function removeWebSearchApiKey(): Promise<WebSearchKeyringMetadata | null> {
+    if (isSavingSecret) return null;
+    setIsSavingSecret(true);
+    setServerError(null);
+    try {
+      const metadata = await deleteWebSearchApiKey();
       setSecretSources(await listSecretSources());
       return metadata;
     } catch (error) {
@@ -2087,15 +2608,46 @@ export function App() {
             />
           ) : activeThread ? (
             <>
+              {goalSnapshot ? (
+                <GoalStrip
+                  snapshot={goalSnapshot}
+                  isRunning={Boolean(activeTurnId)}
+                  action={goalAction}
+                  onRun={() => void runGoal()}
+                  onPause={() => void changeGoalStatus("paused")}
+                  onCancel={() => void changeGoalStatus("cancelled")}
+                />
+              ) : null}
               <MessageList
                 messages={messages}
                 events={events}
                 activeTurnId={activeTurnId}
+                undoingTurnId={
+                  turnUndoDialog?.loading || turnUndoDialog?.applying
+                    ? turnUndoDialog.turnId
+                    : null
+                }
                 threadId={activeThread.id}
                 artifacts={artifacts}
                 onOpenArtifact={(artifactId) =>
                   void openArtifact(activeThread.id, artifactId)
                 }
+                onUndoTurn={(turnId) => void openTurnUndo(turnId)}
+                onReviewChanges={() => {
+                  openToolTab("diff");
+                  void refreshWorkbench();
+                }}
+                onLoadTurnFilePreview={(turnId, path, offset) => {
+                  if (!client) {
+                    return Promise.reject(new Error("服务尚未连接"));
+                  }
+                  return client.getTurnFileDiffPreview(
+                    activeThread.id,
+                    turnId,
+                    path,
+                    offset,
+                  );
+                }}
               />
               {activeApproval ? (
                 <ApprovalDialog
@@ -2114,17 +2666,20 @@ export function App() {
               ) : (
                 <Composer
                   value={composer}
+                  taskPlan={composerTaskPlan}
                   isSending={isSending}
                   isRunning={Boolean(activeTurnId)}
                   isCancelling={
                     Boolean(activeTurnId) && cancellingTurnId === activeTurnId
                   }
+                  queuedMessageCount={queuedMessageCount}
                   model={
                     settings?.providers.find(
                       (provider) => provider.id === settings.activeProviderId,
                     )?.model ?? "Model"
                   }
                   permissionMode={settings?.permissionMode ?? "auto"}
+                  collaborationMode={collaborationMode}
                   sandboxMode={
                     settings?.sandbox.sandboxMode ?? "workspace-write"
                   }
@@ -2142,10 +2697,12 @@ export function App() {
                   onPickWorkspace={() => void chooseWorkspace()}
                   onSelectProject={selectProject}
                   onChangePermissionMode={changeExecutionPreset}
+                  onChangeCollaborationMode={setCollaborationMode}
                   onChangeSandboxMode={changeSandboxMode}
                   onAddContextSources={() => void addContextSources()}
                   onRemoveContextSource={removeContextSource}
                   onToggleSkill={toggleSkill}
+                  onCreateSkill={() => setSkillCreatorOpen(true)}
                 />
               )}
             </>
@@ -2161,6 +2718,7 @@ export function App() {
                 )?.model ?? "Model"
               }
               permissionMode={settings?.permissionMode ?? "auto"}
+              collaborationMode={collaborationMode}
               sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
               contextSources={contextSources}
               skills={skills}
@@ -2174,10 +2732,12 @@ export function App() {
               onSelectProject={selectProject}
               onOpenTool={openToolTab}
               onChangePermissionMode={changeExecutionPreset}
+              onChangeCollaborationMode={setCollaborationMode}
               onChangeSandboxMode={changeSandboxMode}
               onAddContextSources={() => void addContextSources()}
               onRemoveContextSource={removeContextSource}
               onToggleSkill={toggleSkill}
+              onCreateSkill={() => setSkillCreatorOpen(true)}
               onSubmit={() => void createThread(composer)}
             />
           )}
@@ -2223,6 +2783,8 @@ export function App() {
           filePreview={filePreview}
           workspaceDiff={workspaceDiff}
           sandbox={sandbox}
+          plugins={plugins}
+          selectedSkillIds={selectedSkillIds}
           mcpServers={mcpServers}
           threadMcpServers={threadMcpServers}
           workbenchError={workbenchError}
@@ -2245,6 +2807,10 @@ export function App() {
           onUpdateMcpServer={updateMcpServer}
           onRestartMcpServer={restartMcpServer}
           onDeleteMcpServer={deleteMcpServer}
+          onInstallPlugin={installLocalPlugin}
+          onUninstallPlugin={uninstallLocalPlugin}
+          onToggleThreadPlugin={toggleThreadPlugin}
+          onUsePluginSkills={usePluginSkills}
           onOpenWorkspace={(workspaceRoot) =>
             void openWorkspaceRoot(workspaceRoot)
           }
@@ -2279,20 +2845,30 @@ export function App() {
         />
       </main>
       {settingsOpen && (
-        <SettingsPanel
+        <RedesignedSettingsPanel
           platform={platform}
           settings={settings}
           providerHealth={providerHealth}
           providerTest={providerTest}
           secretSources={secretSources}
+          notificationPreferences={taskNotificationPreferences}
           isSaving={isSavingSettings}
           isSavingSecret={isSavingSecret}
-          onSave={(input) => void saveSettings(input)}
+          onSave={saveSettings}
           onTestProvider={(providerId, providers) =>
             void testProviderConnection(providerId, providers)
           }
           onStoreProviderApiKey={storeProviderApiKey}
           onDeleteProviderApiKey={removeProviderApiKey}
+          onStoreWebSearchApiKey={storeWebSearchApiKey}
+          onDeleteWebSearchApiKey={removeWebSearchApiKey}
+          onNotificationPreferencesChange={setTaskNotificationPreferences}
+          onTestNotification={() =>
+            deliverTaskCompletionNotification(
+              "测试成功：OpenTopia 可以在任务完成时提醒你。",
+              true,
+            )
+          }
           onOpenLogs={() => {
             setSettingsOpen(false);
             setLogViewerOpen(true);
@@ -2301,6 +2877,16 @@ export function App() {
         />
       )}
       {logViewerOpen && <LogViewer onClose={() => setLogViewerOpen(false)} />}
+      {skillCreatorOpen && (
+        <SkillCreatorDialog
+          workspaceRoot={currentWorkspaceRoot}
+          projectName={activeProject?.name ?? draftProject?.name ?? null}
+          onGenerate={generateSkillDraft}
+          onCreate={createSkill}
+          onCreated={addCreatedSkill}
+          onClose={() => setSkillCreatorOpen(false)}
+        />
+      )}
       {renameTarget && (
         <RenameDialog
           target={renameTarget}
@@ -2308,8 +2894,170 @@ export function App() {
           onClose={() => setRenameTarget(null)}
         />
       )}
+      {turnUndoDialog && (
+        <TurnUndoDialog
+          state={turnUndoDialog}
+          onConfirm={() => void confirmTurnUndo()}
+          onClose={() => {
+            if (!turnUndoDialog.applying) setTurnUndoDialog(null);
+          }}
+        />
+      )}
     </div>
   );
+}
+
+function TurnUndoDialog({
+  state,
+  onConfirm,
+  onClose,
+}: {
+  state: TurnUndoDialogState;
+  onConfirm(): void;
+  onClose(): void;
+}) {
+  const { preview } = state;
+  const files = preview?.changeSet.files ?? [];
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !state.applying) onClose();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose, state.applying]);
+
+  return (
+    <div
+      className="modal-backdrop project-modal-backdrop"
+      role="presentation"
+      onClick={() => {
+        if (!state.applying) onClose();
+      }}
+    >
+      <section
+        className="turn-undo-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="turn-undo-dialog-title"
+        aria-describedby="turn-undo-dialog-description"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <h2 id="turn-undo-dialog-title">撤销本轮修改</h2>
+            <p id="turn-undo-dialog-description">
+              使用当前工作区与该轮修改前后的快照进行三方合并。
+            </p>
+          </div>
+          <button
+            className="icon-button small"
+            type="button"
+            autoFocus
+            aria-label="关闭撤销对话框"
+            disabled={state.applying}
+            onClick={onClose}
+          >
+            <X size={14} />
+          </button>
+        </header>
+
+        {state.loading ? (
+          <div className="turn-undo-loading" role="status">
+            <Loader2 className="spin" size={16} />
+            <span>正在检查当前文件与历史快照…</span>
+          </div>
+        ) : state.error ? (
+          <div className="turn-undo-alert" role="alert">
+            <AlertCircle size={16} />
+            <span>{state.error}</span>
+          </div>
+        ) : preview ? (
+          <>
+            <div className="turn-undo-overview">
+              <strong>{preview.changeSet.files.length} 个文件</strong>
+              <span className="file-change-additions">
+                +{preview.changeSet.additions}
+              </span>
+              <span className="file-change-deletions">
+                -{preview.changeSet.deletions}
+              </span>
+            </div>
+
+            {preview.conflicts.length > 0 ? (
+              <div className="turn-undo-conflicts" role="alert">
+                <strong>无法自动撤销</strong>
+                <p>以下内容与该轮之后的修改发生冲突，工作区尚未更改。</p>
+                <ul>
+                  {preview.conflicts.map((conflict, index) => (
+                    <li key={`${conflict.path ?? conflict.kind}-${index}`}>
+                      <span>{conflict.path ?? "工作区"}</span>
+                      <small>{conflict.reason}</small>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="turn-undo-file-list" aria-label="将撤销的文件">
+                {files.map((file, index) => {
+                  const path = file.newPath ?? file.oldPath ?? "未知文件";
+                  return (
+                    <div key={`${file.kind}-${path}-${index}`}>
+                      <span className="turn-undo-file-kind">
+                        {turnFileChangeLabel(file.kind)}
+                      </span>
+                      <span title={path}>{path}</span>
+                      <small>
+                        <span className="file-change-additions">
+                          +{file.additions ?? 0}
+                        </span>{" "}
+                        <span className="file-change-deletions">
+                          -{file.deletions ?? 0}
+                        </span>
+                      </small>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        ) : null}
+
+        <footer>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={state.applying}
+            onClick={onClose}
+          >
+            取消
+          </button>
+          {preview?.canUndo && (
+            <button
+              className="turn-undo-confirm"
+              type="button"
+              disabled={state.applying}
+              onClick={onConfirm}
+            >
+              {state.applying ? (
+                <Loader2 className="spin" size={14} />
+              ) : (
+                <RotateCcw size={14} />
+              )}
+              {state.applying ? "正在撤销" : "确认撤销"}
+            </button>
+          )}
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function turnFileChangeLabel(kind: string) {
+  if (kind === "added") return "新增";
+  if (kind === "deleted") return "删除";
+  if (kind === "renamed") return "重命名";
+  return "修改";
 }
 
 function RenameDialog({
@@ -2442,6 +3190,8 @@ function SettingsPanel({
   onTestProvider,
   onStoreProviderApiKey,
   onDeleteProviderApiKey,
+  onStoreWebSearchApiKey,
+  onDeleteWebSearchApiKey,
   onOpenLogs,
   onClose,
 }: {
@@ -2465,6 +3215,7 @@ function SettingsPanel({
     apiKeySource?: string;
     permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
     sandbox?: AppSettings["sandbox"];
+    webSearch?: AppSettings["webSearch"];
   }): void;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
   onStoreProviderApiKey(
@@ -2472,6 +3223,10 @@ function SettingsPanel({
     value: string,
   ): Promise<KeyringMetadata | null>;
   onDeleteProviderApiKey(providerId: string): Promise<KeyringMetadata | null>;
+  onStoreWebSearchApiKey(
+    value: string,
+  ): Promise<WebSearchKeyringMetadata | null>;
+  onDeleteWebSearchApiKey(): Promise<WebSearchKeyringMetadata | null>;
   onOpenLogs(): void;
   onClose(): void;
 }) {
@@ -2499,9 +3254,23 @@ function SettingsPanel({
     },
   );
   const [providerApiKey, setProviderApiKey] = useState("");
+  const [webSearch, setWebSearch] = useState<AppSettings["webSearch"]>(
+    settings?.webSearch ?? {
+      mode: "disabled",
+      endpoint: "",
+      apiKeySource: "OPENTOPIA_WEB_SEARCH_API_KEY",
+      apiKeyConfigured: false,
+      maxResults: 5,
+    },
+  );
+  const [webSearchApiKey, setWebSearchApiKey] = useState("");
 
   const editingProvider =
     providers.find((p) => p.id === editingProviderId) ?? providers[0] ?? null;
+  const activeProvider =
+    providers.find((provider) => provider.id === activeProviderId) ??
+    providers[0] ??
+    null;
 
   useEffect(() => {
     if (settings) {
@@ -2509,6 +3278,7 @@ function SettingsPanel({
       setActiveProviderId(settings.activeProviderId);
       setPermissionMode(settings.permissionMode);
       setSandboxSettings(settings.sandbox);
+      setWebSearch(settings.webSearch);
     }
   }, [settings]);
 
@@ -2542,6 +3312,8 @@ function SettingsPanel({
         storeResponses: false,
         parallelToolCalls: false,
         promptCacheKey: null,
+        promptCachePolicy: null,
+        responsesCompactionThresholdTokens: null,
         rolloutBudget: null,
         apiKeySource: "OPENTOPIA_API_KEY",
         apiKeyConfigured: false,
@@ -2591,6 +3363,7 @@ function SettingsPanel({
               activeProviderId,
               permissionMode,
               sandbox: sandboxSettings,
+              webSearch,
             });
           }}
         >
@@ -2743,6 +3516,205 @@ function SettingsPanel({
                 OS sandbox enforcement is disabled. Commands can access the full
                 system and network allowed by the current user account.
               </p>
+            )}
+          </div>
+
+          <div className="settings-web-search-section">
+            <div className="settings-providers-header">
+              <h3>
+                <Globe2 size={16} aria-hidden="true" />
+                Web search
+              </h3>
+              <span>
+                {webSearch.mode === "disabled"
+                  ? "Off"
+                  : webSearch.mode === "provider_native"
+                    ? "Provider hosted"
+                    : "Custom API"}
+              </span>
+            </div>
+            <div
+              className="settings-web-search-modes"
+              role="radiogroup"
+              aria-label="Web search mode"
+            >
+              <label>
+                <input
+                  type="radio"
+                  name="web-search-mode"
+                  value="disabled"
+                  checked={webSearch.mode === "disabled"}
+                  onChange={() =>
+                    setWebSearch((current) => ({
+                      ...current,
+                      mode: "disabled",
+                    }))
+                  }
+                />
+                <span>Disabled</span>
+              </label>
+              <label
+                title={
+                  activeProvider?.kind === "openai_responses"
+                    ? "Use the active Responses provider hosted web_search tool"
+                    : "Select an OpenAI Responses provider first"
+                }
+              >
+                <input
+                  type="radio"
+                  name="web-search-mode"
+                  value="provider_native"
+                  checked={webSearch.mode === "provider_native"}
+                  disabled={activeProvider?.kind !== "openai_responses"}
+                  onChange={() =>
+                    setWebSearch((current) => ({
+                      ...current,
+                      mode: "provider_native",
+                    }))
+                  }
+                />
+                <span>Provider native</span>
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="web-search-mode"
+                  value="custom_api"
+                  checked={webSearch.mode === "custom_api"}
+                  onChange={() =>
+                    setWebSearch((current) => ({
+                      ...current,
+                      mode: "custom_api",
+                    }))
+                  }
+                />
+                <span>Custom API</span>
+              </label>
+            </div>
+            {webSearch.mode === "provider_native" &&
+              activeProvider?.kind !== "openai_responses" && (
+                <p className="settings-security-warning" role="status">
+                  <AlertCircle size={14} aria-hidden="true" />
+                  Provider-native search requires an active OpenAI Responses
+                  provider.
+                </p>
+              )}
+            {webSearch.mode === "custom_api" && (
+              <div className="settings-web-search-custom">
+                <div className="settings-web-search-grid">
+                  <label>
+                    Search endpoint
+                    <input
+                      type="url"
+                      required
+                      value={webSearch.endpoint}
+                      placeholder="https://search.example.com/v1/search"
+                      title='POST {"query": string, "maxResults": number}; return {"results": [{"title": string, "url": string, "snippet": string}]}'
+                      onChange={(event) =>
+                        setWebSearch((current) => ({
+                          ...current,
+                          endpoint: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    Maximum results
+                    <input
+                      type="number"
+                      min={1}
+                      max={10}
+                      required
+                      value={webSearch.maxResults}
+                      onChange={(event) =>
+                        setWebSearch((current) => ({
+                          ...current,
+                          maxResults: Math.min(
+                            10,
+                            Math.max(1, Number(event.target.value) || 1),
+                          ),
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+                <div className="settings-provider-key-reference">
+                  Credential reference: <code>{webSearch.apiKeySource}</code>
+                </div>
+                {platform?.platform === "desktop" &&
+                  secretSources?.webSearchKeyring && (
+                    <div className="settings-secret-section">
+                      <label>
+                        Search API key
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          value={webSearchApiKey}
+                          disabled={
+                            !secretSources.webSearchKeyring.encryptionAvailable
+                          }
+                          onChange={(event) =>
+                            setWebSearchApiKey(event.target.value)
+                          }
+                        />
+                      </label>
+                      <div className="settings-provider-actions">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={
+                            isSavingSecret ||
+                            !secretSources.webSearchKeyring
+                              .encryptionAvailable ||
+                            !webSearchApiKey.trim()
+                          }
+                          onClick={() => {
+                            void onStoreWebSearchApiKey(webSearchApiKey).then(
+                              (metadata) => {
+                                if (!metadata) return;
+                                const nextWebSearch = {
+                                  ...webSearch,
+                                  apiKeySource: metadata.envTarget,
+                                  apiKeyConfigured: true,
+                                };
+                                setWebSearch(nextWebSearch);
+                                setWebSearchApiKey("");
+                                onSave({ webSearch: nextWebSearch });
+                              },
+                            );
+                          }}
+                        >
+                          Store key
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={
+                            isSavingSecret || !webSearch.apiKeyConfigured
+                          }
+                          onClick={() => {
+                            void onDeleteWebSearchApiKey().then((metadata) => {
+                              if (!metadata) return;
+                              const nextWebSearch = {
+                                ...webSearch,
+                                apiKeyConfigured: false,
+                              };
+                              setWebSearch(nextWebSearch);
+                              onSave({ webSearch: nextWebSearch });
+                            });
+                          }}
+                        >
+                          Remove key
+                        </button>
+                        <span className="settings-provider-test-result">
+                          {webSearch.apiKeyConfigured
+                            ? "Encrypted in safeStorage and active"
+                            : secretSources.webSearchKeyring.status}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+              </div>
             )}
           </div>
 
@@ -2955,6 +3927,56 @@ function SettingsPanel({
                         }
                       />
                     </label>
+                    {editingProvider.kind === "openai_responses" && (
+                      <>
+                        <label>
+                          Prompt cache policy
+                          <select
+                            value={editingProvider.promptCachePolicy ?? ""}
+                            onChange={(event) =>
+                              updateProvider(
+                                editingProvider.id,
+                                "promptCachePolicy",
+                                (event.target.value || null) as NonNullable<
+                                  ProviderSettings["promptCachePolicy"]
+                                > | null,
+                              )
+                            }
+                          >
+                            <option value="">Automatic</option>
+                            <option value="explicit_30m">
+                              Explicit breakpoints (30m)
+                            </option>
+                            <option value="legacy_in_memory">
+                              Legacy in-memory
+                            </option>
+                            <option value="legacy_24h">Legacy 24h</option>
+                          </select>
+                        </label>
+                        <label>
+                          Native compaction threshold
+                          <input
+                            type="number"
+                            min="4096"
+                            step="1024"
+                            value={
+                              editingProvider.responsesCompactionThresholdTokens ??
+                              ""
+                            }
+                            placeholder="Disabled"
+                            onChange={(event) =>
+                              updateProvider(
+                                editingProvider.id,
+                                "responsesCompactionThresholdTokens",
+                                event.target.value
+                                  ? Number(event.target.value)
+                                  : null,
+                              )
+                            }
+                          />
+                        </label>
+                      </>
+                    )}
                     <label>
                       <span>Rollout token budget</span>
                       <input
@@ -3060,7 +4082,7 @@ function SettingsPanel({
                     </label>
                     {editingProvider.kind === "openai_responses" && (
                       <label>
-                        <span>Store Responses state</span>
+                        <span>Stateful response continuation</span>
                         <input
                           type="checkbox"
                           checked={editingProvider.storeResponses}
@@ -3428,10 +4450,10 @@ function Sidebar({
             <span>已安排</span>
             <small>未实现</small>
           </button>
-          <button onClick={onOpenExtensions} title="管理 MCP 扩展">
+          <button onClick={onOpenExtensions} title="管理插件">
             <Plug size={15} />
             <span>插件</span>
-            <small>MCP</small>
+            <small>插件</small>
           </button>
           <button disabled title="拉取请求 · 未实现">
             <GitPullRequest size={15} />
@@ -4082,21 +5104,202 @@ function ThreadHeader({
   );
 }
 
+function GoalStrip({
+  snapshot,
+  isRunning,
+  action,
+  onRun,
+  onPause,
+  onCancel,
+}: {
+  snapshot: GoalSnapshot;
+  isRunning: boolean;
+  action: GoalStatus | "run" | null;
+  onRun(): void;
+  onPause(): void;
+  onCancel(): void;
+}) {
+  const completed = snapshot.tasks.filter(
+    (task) => task.status === "succeeded",
+  ).length;
+  const resolved = snapshot.tasks.filter((task) =>
+    ["succeeded", "deferred", "blocked", "cancelled", "failed"].includes(
+      task.status,
+    ),
+  ).length;
+  const total = snapshot.tasks.length;
+  const progress = total ? Math.round((completed / total) * 100) : 0;
+  const succeededIds = new Set(
+    snapshot.tasks
+      .filter((task) => task.status === "succeeded")
+      .map((task) => task.stepId),
+  );
+  let currentTaskIndex = snapshot.tasks.findIndex(
+    (task) => task.status === "running",
+  );
+  if (currentTaskIndex < 0) {
+    currentTaskIndex = snapshot.tasks.findIndex(
+      (task) =>
+        task.status === "pending" &&
+        task.dependencies.every((dependency) => succeededIds.has(dependency)),
+    );
+  }
+  const terminal = ["completed", "cancelled", "failed"].includes(
+    snapshot.goal.status,
+  );
+  const canRun =
+    !isRunning &&
+    ["ready", "active", "paused", "blocked"].includes(snapshot.goal.status);
+  return (
+    <section className={`goal-strip is-${snapshot.goal.status}`}>
+      <details open>
+        <summary>
+          <span className="goal-strip-icon" aria-hidden="true">
+            <Target size={15} />
+          </span>
+          <span className="goal-strip-objective">
+            {snapshot.goal.objective}
+          </span>
+          <span className={`goal-status is-${snapshot.goal.status}`}>
+            {goalStatusLabel(snapshot.goal.status)}
+          </span>
+          {total ? (
+            <span className="goal-count">
+              {currentTaskIndex >= 0
+                ? `第 ${currentTaskIndex + 1}/${total} 步`
+                : `${resolved}/${total} 已处理`}
+            </span>
+          ) : null}
+        </summary>
+        <div className="goal-strip-body">
+          <div
+            className="goal-progress"
+            role="progressbar"
+            aria-label="目标进度"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={progress}
+          >
+            <span style={{ width: `${progress}%` }} />
+          </div>
+          {snapshot.tasks.length ? (
+            <ol className="goal-task-list">
+              {snapshot.tasks.map((task) => (
+                <li className={`is-${task.status}`} key={task.stepId}>
+                  <span className="goal-task-state" aria-hidden="true" />
+                  <span className="goal-task-content">
+                    <span>{task.title}</span>
+                    {task.statusReason ? (
+                      <small>{task.statusReason}</small>
+                    ) : null}
+                  </span>
+                  {task.attemptCount ? (
+                    <small className="goal-task-attempts">
+                      {task.attemptCount}x
+                    </small>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+          ) : null}
+          {!terminal ? (
+            <div className="goal-actions">
+              {canRun ? (
+                <button
+                  type="button"
+                  disabled={Boolean(action)}
+                  onClick={onRun}
+                >
+                  {action === "run" ? (
+                    <Loader2 size={14} className="spin" />
+                  ) : (
+                    <Zap size={14} />
+                  )}
+                  <span>
+                    {snapshot.goal.status === "ready" ? "启动" : "继续"}
+                  </span>
+                </button>
+              ) : null}
+              {snapshot.goal.status === "active" && isRunning ? (
+                <button
+                  type="button"
+                  disabled={Boolean(action)}
+                  onClick={onPause}
+                >
+                  {action === "paused" ? (
+                    <Loader2 size={14} className="spin" />
+                  ) : (
+                    <Pause size={14} />
+                  )}
+                  <span>暂停</span>
+                </button>
+              ) : null}
+              <button
+                className="goal-cancel-button"
+                type="button"
+                title="取消目标"
+                aria-label="取消目标"
+                disabled={Boolean(action)}
+                onClick={onCancel}
+              >
+                {action === "cancelled" ? (
+                  <Loader2 size={14} className="spin" />
+                ) : (
+                  <X size={14} />
+                )}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </details>
+    </section>
+  );
+}
+
+function goalStatusLabel(status: GoalStatus): string {
+  const labels: Record<GoalStatus, string> = {
+    draft: "规划中",
+    ready: "待启动",
+    active: "执行中",
+    paused: "已暂停",
+    completed: "已完成",
+    blocked: "受阻",
+    cancelled: "已取消",
+    failed: "失败",
+  };
+  return labels[status];
+}
+
 function MessageList({
   messages,
   events,
   activeTurnId,
+  undoingTurnId,
   threadId,
   artifacts,
   onOpenArtifact,
+  onUndoTurn,
+  onReviewChanges,
+  onLoadTurnFilePreview,
 }: {
   messages: Message[];
   events: AgentEvent[];
   activeTurnId: string | null;
+  undoingTurnId: string | null;
   threadId: string;
   artifacts: ArtifactDescriptor[];
   onOpenArtifact(artifactId: string): void;
+  onUndoTurn(turnId: string): void;
+  onReviewChanges(): void;
+  onLoadTurnFilePreview(
+    turnId: string,
+    path: string,
+    offset?: number,
+  ): Promise<TurnFileDiffPreview>;
 }) {
+  const visibleMessages = messages.filter(
+    (message) => message.role === "user" || message.role === "assistant",
+  );
   const streamingText = activeTurnId
     ? events
         .filter(
@@ -4110,7 +5313,10 @@ function MessageList({
         .join("")
     : "";
   const eventsByTurn = new Map<string, AgentEvent[]>();
-  const turnIdByUserMessage = new Map<string, string>();
+  const turnIdsByUserMessage = new Map<string, string[]>();
+  const turnIdsByAssistantMessage = new Map<string, string[]>();
+  const changeSetsByTurn = new Map<string, TurnChangeSet>();
+  const revertedTurnIds = new Set<string>();
   for (const event of events) {
     if (event.turnId) {
       const current = eventsByTurn.get(event.turnId) ?? [];
@@ -4118,30 +5324,74 @@ function MessageList({
       eventsByTurn.set(event.turnId, current);
     }
     if (event.turnId && event.payload.type === "turn_started") {
-      turnIdByUserMessage.set(event.payload.user_message_id, event.turnId);
+      const turnIds =
+        turnIdsByUserMessage.get(event.payload.user_message_id) ?? [];
+      if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
+      turnIdsByUserMessage.set(event.payload.user_message_id, turnIds);
+    }
+    if (event.turnId && event.payload.type === "assistant_message") {
+      const turnIds =
+        turnIdsByAssistantMessage.get(event.payload.message.id) ?? [];
+      if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
+      turnIdsByAssistantMessage.set(event.payload.message.id, turnIds);
+    }
+    if (event.turnId && event.payload.type === "turn_changes_recorded") {
+      changeSetsByTurn.set(event.turnId, event.payload.change_set);
+      if (event.payload.change_set.revertedAt) {
+        revertedTurnIds.add(event.turnId);
+      }
+    }
+    if (event.payload.type === "turn_undo_completed") {
+      revertedTurnIds.add(event.payload.target_turn_id);
     }
   }
-  const anchoredTurnIds = new Set(turnIdByUserMessage.values());
+  const anchoredTurnIds = new Set(
+    [...turnIdsByUserMessage.values()].flatMap((turnIds) => turnIds),
+  );
   const orphanTurnErrors = events.filter(
     (event) =>
       event.payload.type === "error" &&
       (!event.turnId || !anchoredTurnIds.has(event.turnId)),
   );
+  const turnsWithAssistantCards = new Set(
+    [...turnIdsByAssistantMessage.values()].flatMap((turnIds) => turnIds),
+  );
+  const renderTurnChangeCard = (turnId: string) => {
+    const changeSet = changeSetsByTurn.get(turnId);
+    if (!changeSet) return null;
+    return (
+      <TurnChangeCard
+        key={`turn-change-card-${turnId}`}
+        changeSet={changeSet}
+        isWorkspaceBusy={Boolean(activeTurnId)}
+        isUndoing={undoingTurnId === turnId}
+        isReverted={revertedTurnIds.has(turnId)}
+        onUndo={() => onUndoTurn(turnId)}
+        onReview={onReviewChanges}
+        onLoadFilePreview={(path, offset) =>
+          onLoadTurnFilePreview(turnId, path, offset)
+        }
+      />
+    );
+  };
   return (
     <div className="message-list">
-      {messages.length === 0 ? (
+      {visibleMessages.length === 0 ? (
         <div className="empty-thread">
           <Bot size={42} />
           <h2>等待第一个任务指令</h2>
           <p>当前任务尚未产生消息。</p>
         </div>
       ) : (
-        messages.map((message) => {
-          const turnId =
+        visibleMessages.map((message) => {
+          const turnIds =
             message.role === "user"
-              ? turnIdByUserMessage.get(message.id)
-              : undefined;
-          const turnEvents = turnId ? (eventsByTurn.get(turnId) ?? []) : [];
+              ? (turnIdsByUserMessage.get(message.id) ?? [])
+              : [];
+          const resultTurnIds =
+            message.role === "assistant"
+              ? (turnIdsByAssistantMessage.get(message.id) ?? [])
+              : [];
           return (
             <Fragment key={message.id}>
               <MessageBubble
@@ -4150,13 +5400,18 @@ function MessageList({
                 artifacts={artifacts}
                 onOpenArtifact={onOpenArtifact}
               />
-              {turnId && (
-                <TurnActivityTimeline
-                  events={turnEvents}
-                  isActive={activeTurnId === turnId}
-                  formatError={friendlyProviderError}
-                />
-              )}
+              {turnIds.map((turnId) => (
+                <Fragment key={turnId}>
+                  <TurnActivityTimeline
+                    events={eventsByTurn.get(turnId) ?? []}
+                    isActive={activeTurnId === turnId}
+                    formatError={friendlyProviderError}
+                  />
+                  {!turnsWithAssistantCards.has(turnId) &&
+                    renderTurnChangeCard(turnId)}
+                </Fragment>
+              ))}
+              {resultTurnIds.map(renderTurnChangeCard)}
             </Fragment>
           );
         })
@@ -4271,6 +5526,7 @@ function MessagePartView({
       </button>
     );
   }
+  if (part.type === "turn_context") return null;
   if (part.type === "tool_call")
     return <pre>{JSON.stringify(part.call, null, 2)}</pre>;
   return (
@@ -4328,13 +5584,114 @@ function MessageArtifactLinks({
   );
 }
 
+function ComposerTaskPlan({ plan }: { plan: TaskPlan }) {
+  const [expanded, setExpanded] = useState(false);
+  const completedIds = useMemo(
+    () =>
+      new Set(
+        plan.steps
+          .filter((step) => step.status === "completed")
+          .map((step) => step.id),
+      ),
+    [plan.steps],
+  );
+  const currentStepIndex = useMemo(() => {
+    const inProgressIndex = plan.steps.findIndex(
+      (step) => step.status === "in_progress",
+    );
+    if (inProgressIndex >= 0) return inProgressIndex;
+    return plan.steps.findIndex(
+      (step) =>
+        step.status === "pending" &&
+        step.dependencies.every((dependency) => completedIds.has(dependency)),
+    );
+  }, [completedIds, plan.steps]);
+  const resolvedCount = plan.steps.filter((step) =>
+    ["completed", "deferred", "blocked", "cancelled"].includes(step.status),
+  ).length;
+  const currentStep =
+    currentStepIndex >= 0 ? plan.steps[currentStepIndex] : undefined;
+  const progressLabel = currentStep
+    ? `第 ${currentStepIndex + 1}/${plan.steps.length} 步`
+    : `${resolvedCount}/${plan.steps.length} 已处理`;
+
+  useEffect(() => {
+    setExpanded(false);
+  }, [plan.goalId]);
+
+  if (plan.steps.length === 0) return null;
+
+  return (
+    <section className={`composer-plan ${expanded ? "is-expanded" : ""}`}>
+      <button
+        className="composer-plan-summary"
+        type="button"
+        aria-expanded={expanded}
+        aria-controls="composer-plan-steps"
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <ListTodo size={15} aria-hidden="true" />
+        <span className="composer-plan-current">
+          {currentStep?.title || currentStep?.step || "任务清单"}
+        </span>
+        <span className="composer-plan-count">{progressLabel}</span>
+        <ChevronDown
+          className="composer-plan-chevron"
+          size={14}
+          aria-hidden="true"
+        />
+      </button>
+      {expanded ? (
+        <div className="composer-plan-body" id="composer-plan-steps">
+          <ol className="composer-plan-list">
+            {plan.steps.map((step, index) => (
+              <li
+                className={`is-${step.status} ${index === currentStepIndex ? "is-current" : ""}`}
+                data-status={step.status}
+                key={step.id}
+              >
+                <span className="composer-plan-step-icon" aria-hidden="true">
+                  <ComposerPlanStepIcon status={step.status} />
+                </span>
+                <span className="composer-plan-step-copy">
+                  <span>{step.title || step.step || step.id}</span>
+                  {step.statusReason ? <small>{step.statusReason}</small> : null}
+                </span>
+                {index === currentStepIndex ? (
+                  <span className="composer-plan-step-marker">当前</span>
+                ) : null}
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ComposerPlanStepIcon({
+  status,
+}: {
+  status: TaskPlan["steps"][number]["status"];
+}) {
+  if (status === "completed") return <Check size={13} />;
+  if (status === "in_progress") return <Loader2 size={13} className="spin" />;
+  if (status === "blocked") return <AlertCircle size={13} />;
+  if (status === "cancelled") return <X size={13} />;
+  if (status === "deferred") return <Clock3 size={13} />;
+  return <Circle size={11} />;
+}
+
 function Composer({
   value,
+  taskPlan,
   isSending,
   isRunning,
   isCancelling,
+  queuedMessageCount = 0,
   model,
   permissionMode,
+  collaborationMode,
   sandboxMode,
   contextSources,
   skills,
@@ -4352,17 +5709,22 @@ function Composer({
   onSelectProject,
   onChangeLaunchMode,
   onChangePermissionMode,
+  onChangeCollaborationMode,
   onChangeSandboxMode,
   onAddContextSources,
   onRemoveContextSource,
   onToggleSkill,
+  onCreateSkill,
 }: {
   value: string;
+  taskPlan?: TaskPlan | null;
   isSending: boolean;
   isRunning: boolean;
   isCancelling: boolean;
+  queuedMessageCount?: number;
   model: string;
   permissionMode: AppSettings["permissionMode"];
+  collaborationMode: CollaborationMode;
   sandboxMode: AppSettings["sandbox"]["sandboxMode"];
   contextSources: ContextSourceFile[];
   skills: SkillDescriptor[];
@@ -4380,15 +5742,18 @@ function Composer({
   onSelectProject(projectId: string): void;
   onChangeLaunchMode?(mode: NewTaskLaunchMode): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
+  onChangeCollaborationMode(mode: CollaborationMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onAddContextSources(): void;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
+  onCreateSkill(): void;
 }) {
   const [openMenu, setOpenMenu] = useState<
     | "actions"
     | "skills"
     | "permission"
+    | "collaboration"
     | "model"
     | "workspace"
     | "environment"
@@ -4399,10 +5764,12 @@ function Composer({
   );
 
   return (
-    <div
-      className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""}`}
-      ref={popoverRef}
-    >
+    <div className="composer-shell">
+      {taskPlan ? <ComposerTaskPlan plan={taskPlan} /> : null}
+      <div
+        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""}`}
+        ref={popoverRef}
+      >
       {(workspaceRoot || projectName) && (
         <div className="composer-context">
           <div className="composer-menu-wrap">
@@ -4751,6 +6118,17 @@ function Composer({
                 <strong>Skills</strong>
                 <span>最多为当前 Turn 选择 5 个</span>
               </div>
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onCreateSkill();
+                  setOpenMenu(null);
+                }}
+              >
+                <WandSparkles size={13} />
+                <span>使用 AI 创建</span>
+              </button>
+              <div className="tool-popover-separator" />
               {skills.length ? (
                 skills.map((skill) => {
                   const selected = selectedSkillIds.includes(skill.id);
@@ -4783,6 +6161,54 @@ function Composer({
                 <ArrowLeft size={13} />
                 <span>返回</span>
               </button>
+            </div>
+          )}
+        </div>
+        <div className="composer-menu-wrap">
+          <button
+            className={`composer-collaboration-mode is-${collaborationMode}`}
+            type="button"
+            aria-label="选择协作模式"
+            aria-expanded={openMenu === "collaboration"}
+            onClick={() =>
+              setOpenMenu((current) =>
+                current === "collaboration" ? null : "collaboration",
+              )
+            }
+          >
+            {collaborationMode === "default" ? (
+              <Zap size={14} aria-hidden="true" />
+            ) : collaborationMode === "plan" ? (
+              <ListTodo size={14} aria-hidden="true" />
+            ) : (
+              <Target size={14} aria-hidden="true" />
+            )}
+            <span>{collaborationModeLabel(collaborationMode)}</span>
+            <ChevronDown size={11} aria-hidden="true" />
+          </button>
+          {openMenu === "collaboration" && (
+            <div className="tool-popover collaboration-popover" role="menu">
+              {collaborationModeOptions.map((option) => {
+                const Icon = option.icon;
+                const selected = collaborationMode === option.value;
+                return (
+                  <button
+                    className={selected ? "active" : ""}
+                    disabled={isRunning || isSending}
+                    key={option.value}
+                    role="menuitemradio"
+                    aria-checked={selected}
+                    onClick={() => {
+                      onChangeCollaborationMode(option.value);
+                      setOpenMenu(null);
+                    }}
+                  >
+                    <Icon size={15} aria-hidden="true" />
+                    <span>{option.label}</span>
+                    {selected ? <Check size={14} aria-hidden="true" /> : null}
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
@@ -4862,6 +6288,11 @@ function Composer({
             </div>
           )}
         </div>
+        {queuedMessageCount > 0 ? (
+          <span className="composer-queue-status">
+            {queuedMessageCount} queued
+          </span>
+        ) : null}
       </div>
       <button
         className={`send-button${isRunning ? " is-running" : ""}`}
@@ -4908,8 +6339,24 @@ function Composer({
           <ArrowUp size={18} strokeWidth={2.25} aria-hidden="true" />
         )}
       </button>
+      </div>
     </div>
   );
+}
+
+const collaborationModeOptions: Array<{
+  value: CollaborationMode;
+  label: string;
+  icon: typeof Zap;
+}> = [
+  { value: "default", label: "执行", icon: Zap },
+  { value: "plan", label: "规划", icon: ListTodo },
+  { value: "goal", label: "目标", icon: Target },
+];
+
+function collaborationModeLabel(mode: CollaborationMode): string {
+  return collaborationModeOptions.find((option) => option.value === mode)!
+    .label;
 }
 
 const permissionModeOptions: Array<{
@@ -4987,6 +6434,8 @@ function RightPanel({
   filePreview,
   workspaceDiff,
   sandbox,
+  plugins,
+  selectedSkillIds,
   mcpServers,
   threadMcpServers,
   workbenchError,
@@ -5007,6 +6456,10 @@ function RightPanel({
   onUpdateMcpServer,
   onRestartMcpServer,
   onDeleteMcpServer,
+  onInstallPlugin,
+  onUninstallPlugin,
+  onToggleThreadPlugin,
+  onUsePluginSkills,
   onOpenWorkspace,
   onEnsureTerminalSession,
   onWriteTerminalSession,
@@ -5040,6 +6493,8 @@ function RightPanel({
   filePreview: WorkspaceFilePreview | null;
   workspaceDiff: WorkspaceDiff | null;
   sandbox: SandboxDescriptor | null;
+  plugins: PluginView[];
+  selectedSkillIds: string[];
   mcpServers: McpServerView[];
   threadMcpServers: ThreadMcpServerView[];
   workbenchError: string | null;
@@ -5060,6 +6515,10 @@ function RightPanel({
   onUpdateMcpServer(serverId: string, input: McpServerInput): Promise<void>;
   onRestartMcpServer(serverId: string): Promise<void>;
   onDeleteMcpServer(serverId: string): Promise<void>;
+  onInstallPlugin(): Promise<void>;
+  onUninstallPlugin(pluginId: string): Promise<void>;
+  onToggleThreadPlugin(pluginId: string, enabled: boolean): Promise<void>;
+  onUsePluginSkills(pluginId: string, enabled: boolean): void;
   onOpenWorkspace(workspaceRoot: string): void;
   onEnsureTerminalSession(threadId: string): Promise<TerminalSession>;
   onWriteTerminalSession(
@@ -5106,6 +6565,8 @@ function RightPanel({
       filePreview={filePreview}
       workspaceDiff={workspaceDiff}
       sandbox={sandbox}
+      plugins={plugins}
+      selectedSkillIds={selectedSkillIds}
       mcpServers={mcpServers}
       threadMcpServers={threadMcpServers}
       workbenchError={workbenchError}
@@ -5125,6 +6586,10 @@ function RightPanel({
       onUpdateMcpServer={onUpdateMcpServer}
       onRestartMcpServer={onRestartMcpServer}
       onDeleteMcpServer={onDeleteMcpServer}
+      onInstallPlugin={onInstallPlugin}
+      onUninstallPlugin={onUninstallPlugin}
+      onToggleThreadPlugin={onToggleThreadPlugin}
+      onUsePluginSkills={onUsePluginSkills}
       onOpenPath={onOpenWorkspace}
       onEnsureTerminalSession={onEnsureTerminalSession}
       onWriteTerminalSession={onWriteTerminalSession}
@@ -5160,6 +6625,8 @@ function RightPanel({
               decidingApprovalId={decidingApprovalId}
               onDecideApproval={onDecideApproval}
             />
+          ) : activeToolTab.kind === "computer" ? (
+            <ComputerPanel client={client} threadId={thread?.id ?? null} />
           ) : activeToolTab.kind === "preview" &&
             activeToolTab.previewTarget ? (
             <PreviewHost
@@ -5314,6 +6781,7 @@ function NewTaskState({
   projects,
   model,
   permissionMode,
+  collaborationMode,
   sandboxMode,
   contextSources,
   skills,
@@ -5327,10 +6795,12 @@ function NewTaskState({
   onSelectProject,
   onOpenTool,
   onChangePermissionMode,
+  onChangeCollaborationMode,
   onChangeSandboxMode,
   onAddContextSources,
   onRemoveContextSource,
   onToggleSkill,
+  onCreateSkill,
   onSubmit,
 }: {
   value: string;
@@ -5339,6 +6809,7 @@ function NewTaskState({
   projects: Project[];
   model: string;
   permissionMode: AppSettings["permissionMode"];
+  collaborationMode: CollaborationMode;
   sandboxMode: AppSettings["sandbox"]["sandboxMode"];
   contextSources: ContextSourceFile[];
   skills: SkillDescriptor[];
@@ -5352,10 +6823,12 @@ function NewTaskState({
   onSelectProject(projectId: string): void;
   onOpenTool(kind: ToolTabKind): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
+  onChangeCollaborationMode(mode: CollaborationMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onAddContextSources(): void;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
+  onCreateSkill(): void;
   onSubmit(): void;
 }) {
   const suggestions =
@@ -5446,6 +6919,7 @@ function NewTaskState({
         isCancelling={false}
         model={model}
         permissionMode={permissionMode}
+        collaborationMode={collaborationMode}
         sandboxMode={sandboxMode}
         contextSources={contextSources}
         skills={skills}
@@ -5464,10 +6938,12 @@ function NewTaskState({
         onSelectProject={onSelectProject}
         onChangeLaunchMode={onChangeLaunchMode}
         onChangePermissionMode={onChangePermissionMode}
+        onChangeCollaborationMode={onChangeCollaborationMode}
         onChangeSandboxMode={onChangeSandboxMode}
         onAddContextSources={onAddContextSources}
         onRemoveContextSource={onRemoveContextSource}
         onToggleSkill={onToggleSkill}
+        onCreateSkill={onCreateSkill}
       />
     </>
   );
@@ -5846,6 +7322,7 @@ const toolTabKinds: ToolTabKind[] = [
   "extensions",
   "sandbox",
   "browser",
+  "computer",
 ];
 
 function toolTabTitle(kind: ToolTabKind): string {
@@ -5857,11 +7334,13 @@ function toolTabTitle(kind: ToolTabKind): string {
     case "diff":
       return "审查";
     case "extensions":
-      return "MCP";
+      return "Plugins";
     case "sandbox":
       return "沙箱";
     case "browser":
       return "浏览器";
+    case "computer":
+      return "电脑";
     case "preview":
       return "预览";
   }
@@ -5881,6 +7360,8 @@ function toolTabIcon(kind: ToolTabKind): typeof Folder {
       return Box;
     case "browser":
       return Globe2;
+    case "computer":
+      return Monitor;
     case "preview":
       return FileCode2;
   }

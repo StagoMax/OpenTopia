@@ -75,6 +75,34 @@ impl ExperienceMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationMode {
+    #[default]
+    Default,
+    Plan,
+    Goal,
+}
+
+impl CollaborationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+            Self::Goal => "goal",
+        }
+    }
+
+    pub fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "default" => Ok(Self::Default),
+            "plan" => Ok(Self::Plan),
+            "goal" => Ok(Self::Goal),
+            other => anyhow::bail!("unknown collaboration mode: {other}"),
+        }
+    }
+}
+
 impl Thread {
     pub fn new(title: impl Into<String>, workspace_root: PathBuf) -> Self {
         Self::new_with_mode(title, workspace_root, ExperienceMode::Code)
@@ -173,13 +201,32 @@ impl Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagePart {
-    Text { text: String },
-    ToolCall { call: ToolCall },
-    ToolResult { result: ToolResult },
-    FileRef { path: PathBuf },
-    SourceRef { source: ContextSourceRef },
-    SkillRef { skill: SkillRef },
-    Error { message: String },
+    Text {
+        text: String,
+    },
+    ToolCall {
+        call: ToolCall,
+    },
+    ToolResult {
+        result: ToolResult,
+    },
+    FileRef {
+        path: PathBuf,
+    },
+    SourceRef {
+        source: ContextSourceRef,
+    },
+    SkillRef {
+        skill: SkillRef,
+    },
+    TurnContext {
+        collaboration_mode: CollaborationMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_id: Option<Uuid>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +393,9 @@ pub enum TaskPlanStepStatus {
     Pending,
     InProgress,
     Completed,
+    Deferred,
+    Blocked,
+    Cancelled,
 }
 
 impl TaskPlanStepStatus {
@@ -354,42 +404,381 @@ impl TaskPlanStepStatus {
             Self::Pending => "[ ]",
             Self::InProgress => "[>]",
             Self::Completed => "[x]",
+            Self::Deferred => "[-]",
+            Self::Blocked => "[!]",
+            Self::Cancelled => "[/]",
         }
+    }
+
+    pub fn is_actionable(self) -> bool {
+        matches!(self, Self::Pending | Self::InProgress)
+    }
+
+    pub fn is_resolved(self) -> bool {
+        !self.is_actionable()
+    }
+
+    pub fn requires_status_reason(self) -> bool {
+        matches!(self, Self::Deferred | Self::Blocked | Self::Cancelled)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPlanStep {
-    pub step: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(alias = "step")]
+    pub title: String,
     pub status: TaskPlanStepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPlan {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub explanation: Option<String>,
+    #[serde(default)]
+    pub plan_revision: u64,
+    #[serde(default)]
+    pub goal_id: String,
+    #[serde(
+        default,
+        alias = "explanation",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub change_reason: Option<String>,
     pub steps: Vec<TaskPlanStep>,
 }
 
 impl TaskPlan {
+    pub fn normalize_legacy(mut self) -> Self {
+        if self.goal_id.trim().is_empty() {
+            self.goal_id = "legacy-plan".to_string();
+        }
+        for index in 0..self.steps.len() {
+            if !self.steps[index].id.trim().is_empty() {
+                continue;
+            }
+            let mut suffix = index + 1;
+            loop {
+                let candidate = format!("legacy-step-{suffix}");
+                if !self.steps.iter().any(|step| step.id == candidate) {
+                    self.steps[index].id = candidate;
+                    break;
+                }
+                suffix += 1;
+            }
+        }
+        self
+    }
+
     pub fn is_active(&self) -> bool {
+        self.steps.iter().any(|step| {
+            !matches!(
+                step.status,
+                TaskPlanStepStatus::Completed | TaskPlanStepStatus::Cancelled
+            )
+        })
+    }
+
+    pub fn has_actionable_steps(&self) -> bool {
+        self.steps.iter().any(|step| step.status.is_actionable())
+    }
+
+    pub fn next_runnable_step(&self) -> Option<&TaskPlanStep> {
         self.steps
             .iter()
-            .any(|step| step.status != TaskPlanStepStatus::Completed)
+            .find(|step| step.status == TaskPlanStepStatus::InProgress)
+            .or_else(|| {
+                self.steps.iter().find(|step| {
+                    step.status == TaskPlanStepStatus::Pending
+                        && step.dependencies.iter().all(|dependency| {
+                            self.steps.iter().any(|candidate| {
+                                candidate.id == *dependency
+                                    && candidate.status == TaskPlanStepStatus::Completed
+                            })
+                        })
+                })
+            })
     }
 
     pub fn render_for_model(&self) -> String {
-        let mut lines = Vec::new();
-        if let Some(explanation) = self.explanation.as_deref() {
-            lines.push(explanation.to_string());
+        let plan = self.clone().normalize_legacy();
+        let mut lines = vec![format!(
+            "Goal: {} (plan revision {})",
+            plan.goal_id, plan.plan_revision
+        )];
+        if let Some(change_reason) = plan.change_reason.as_deref() {
+            lines.push(format!("Last change: {change_reason}"));
         }
-        lines.extend(
-            self.steps
-                .iter()
-                .map(|step| format!("{} {}", step.status.marker(), step.step)),
-        );
+        for step in &plan.steps {
+            lines.push(format!(
+                "{} {}: {}",
+                step.status.marker(),
+                step.id,
+                step.title
+            ));
+            if let Some(reason) = step.status_reason.as_deref() {
+                lines.push(format!("  Status reason: {reason}"));
+            }
+            if !step.dependencies.is_empty() {
+                lines.push(format!("  Depends on: {}", step.dependencies.join(", ")));
+            }
+            for criterion in &step.acceptance_criteria {
+                lines.push(format!("  Acceptance: {criterion}"));
+            }
+            for evidence in &step.evidence {
+                lines.push(format!("  Evidence: {evidence}"));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Draft,
+    Ready,
+    Active,
+    Paused,
+    Completed,
+    Blocked,
+    Cancelled,
+    Failed,
+}
+
+impl GoalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Ready => "ready",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "draft" => Ok(Self::Draft),
+            "ready" => Ok(Self::Ready),
+            "active" => Ok(Self::Active),
+            "paused" => Ok(Self::Paused),
+            "completed" => Ok(Self::Completed),
+            "blocked" => Ok(Self::Blocked),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            other => anyhow::bail!("unknown goal status: {other}"),
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalTaskStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Deferred,
+    Blocked,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalAttemptStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Interrupted,
+}
+
+impl GoalAttemptStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
+            other => anyhow::bail!("unknown goal attempt status: {other}"),
+        }
+    }
+}
+
+impl GoalTaskStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Deferred => "deferred",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "deferred" => Ok(Self::Deferred),
+            "blocked" => Ok(Self::Blocked),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            other => anyhow::bail!("unknown goal task status: {other}"),
+        }
+    }
+
+    pub fn is_resolved(self) -> bool {
+        !matches!(self, Self::Pending | Self::Running)
+    }
+}
+
+impl From<TaskPlanStepStatus> for GoalTaskStatus {
+    fn from(value: TaskPlanStepStatus) -> Self {
+        match value {
+            TaskPlanStepStatus::Pending => Self::Pending,
+            TaskPlanStepStatus::InProgress => Self::Running,
+            TaskPlanStepStatus::Completed => Self::Succeeded,
+            TaskPlanStepStatus::Deferred => Self::Deferred,
+            TaskPlanStepStatus::Blocked => Self::Blocked,
+            TaskPlanStepStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalRecord {
+    pub id: Uuid,
+    pub thread_id: Uuid,
+    pub objective: String,
+    pub status: GoalStatus,
+    pub plan_revision: u64,
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub version: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl GoalRecord {
+    pub fn new(
+        thread_id: Uuid,
+        objective: impl Into<String>,
+        status: GoalStatus,
+        token_budget: Option<u64>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            thread_id,
+            objective: objective.into(),
+            status,
+            plan_revision: 0,
+            token_budget,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            version: 1,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalTask {
+    pub goal_id: Uuid,
+    pub step_id: String,
+    pub ordinal: usize,
+    pub title: String,
+    pub status: GoalTaskStatus,
+    pub status_reason: Option<String>,
+    pub dependencies: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub evidence: Vec<String>,
+    pub attempt_count: u32,
+    pub max_attempts: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalTaskAttempt {
+    pub id: Uuid,
+    pub goal_id: Uuid,
+    pub step_id: String,
+    pub turn_id: Uuid,
+    pub attempt_no: u32,
+    pub status: GoalAttemptStatus,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub evidence: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalSnapshot {
+    pub goal: GoalRecord,
+    pub tasks: Vec<GoalTask>,
+    pub attempts: Vec<GoalTaskAttempt>,
+}
+
+impl GoalSnapshot {
+    pub fn completed_tasks(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == GoalTaskStatus::Succeeded)
+            .count()
+    }
+
+    pub fn render_for_model(&self) -> String {
+        let mut lines = vec![
+            format!("Goal id: {}", self.goal.id),
+            format!("Objective: {}", self.goal.objective),
+            format!("Status: {}", self.goal.status.as_str()),
+            format!("Plan revision: {}", self.goal.plan_revision),
+        ];
+        for task in &self.tasks {
+            lines.push(format!(
+                "- {} [{}]: {}",
+                task.step_id,
+                task.status.as_str(),
+                task.title
+            ));
+        }
         lines.join("\n")
     }
 }
@@ -677,6 +1066,114 @@ impl TurnRecord {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TurnChangeSetStatus {
+    Capturing,
+    Ready,
+    Empty,
+    Failed,
+}
+
+impl TurnChangeSetStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Capturing => "capturing",
+            Self::Ready => "ready",
+            Self::Empty => "empty",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "capturing" => Ok(Self::Capturing),
+            "ready" => Ok(Self::Ready),
+            "empty" => Ok(Self::Empty),
+            "failed" => Ok(Self::Failed),
+            other => anyhow::bail!("unknown turn change-set status: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFileChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnFileChange {
+    pub kind: TurnFileChangeKind,
+    pub old_path: Option<PathBuf>,
+    pub new_path: Option<PathBuf>,
+    pub before_oid: Option<String>,
+    pub after_oid: Option<String>,
+    pub before_mode: Option<String>,
+    pub after_mode: Option<String>,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub binary: bool,
+}
+
+impl TurnFileChange {
+    pub fn display_path(&self) -> Option<&PathBuf> {
+        self.new_path.as_ref().or(self.old_path.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnChangeSet {
+    pub turn_id: Uuid,
+    pub thread_id: Uuid,
+    pub workspace_root: PathBuf,
+    pub repo_root: Option<PathBuf>,
+    pub workspace_prefix: Option<PathBuf>,
+    pub before_tree: Option<String>,
+    pub after_tree: Option<String>,
+    pub status: TurnChangeSetStatus,
+    pub files: Vec<TurnFileChange>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub finalized_at: Option<DateTime<Utc>>,
+    pub reverted_at: Option<DateTime<Utc>>,
+}
+
+impl TurnChangeSet {
+    pub fn capturing(turn_id: Uuid, thread_id: Uuid, workspace_root: PathBuf) -> Self {
+        Self {
+            turn_id,
+            thread_id,
+            workspace_root,
+            repo_root: None,
+            workspace_prefix: None,
+            before_tree: None,
+            after_tree: None,
+            status: TurnChangeSetStatus::Capturing,
+            files: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            error: None,
+            created_at: Utc::now(),
+            finalized_at: None,
+            reverted_at: None,
+        }
+    }
+
+    pub fn is_undoable(&self) -> bool {
+        self.status == TurnChangeSetStatus::Ready
+            && !self.files.is_empty()
+            && self.reverted_at.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TerminalCommandStatus {
     Finished,
     Failed,
@@ -824,12 +1321,22 @@ pub enum AgentEventPayload {
     PlanUpdated {
         plan: TaskPlan,
     },
+    GoalUpdated {
+        snapshot: GoalSnapshot,
+    },
     AssistantMessage {
         message: Message,
     },
     FileChanged {
         path: PathBuf,
         summary: String,
+    },
+    TurnChangesRecorded {
+        change_set: TurnChangeSet,
+    },
+    TurnUndoCompleted {
+        target_turn_id: Uuid,
+        files_changed: usize,
     },
     ApprovalRequested {
         approval_id: Uuid,
@@ -856,10 +1363,20 @@ pub enum AgentEventPayload {
     ContextCompacted {
         summary: ContextSummary,
     },
+    ContextWarning {
+        stage: String,
+        message: String,
+    },
     TokenUsage {
         input_tokens: usize,
         output_tokens: usize,
         total_tokens: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_input_tokens: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_tokens: Option<usize>,
     },
     SubagentUpdated {
         run: SubagentRun,
@@ -895,13 +1412,17 @@ impl AgentEventPayload {
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallFinished { .. } => "tool_call_finished",
             Self::PlanUpdated { .. } => "plan_updated",
+            Self::GoalUpdated { .. } => "goal_updated",
             Self::AssistantMessage { .. } => "assistant_message",
             Self::FileChanged { .. } => "file_changed",
+            Self::TurnChangesRecorded { .. } => "turn_changes_recorded",
+            Self::TurnUndoCompleted { .. } => "turn_undo_completed",
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::AutomaticApprovalReviewStarted { .. } => "automatic_approval_review_started",
             Self::AutomaticApprovalReviewCompleted { .. } => "automatic_approval_review_completed",
             Self::AutoReviewInterruptionWarning { .. } => "auto_review_interruption_warning",
             Self::ContextCompacted { .. } => "context_compacted",
+            Self::ContextWarning { .. } => "context_warning",
             Self::TokenUsage { .. } => "token_usage",
             Self::SubagentUpdated { .. } => "subagent_updated",
             Self::TurnFinished { .. } => "turn_finished",
@@ -986,5 +1507,75 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn legacy_task_plans_gain_stable_fields_when_restored() {
+        let legacy: TaskPlan = serde_json::from_value(json!({
+            "explanation": "Continue the existing work",
+            "steps": [
+                { "step": "Inspect the repository", "status": "in_progress" },
+                { "step": "Implement the fix", "status": "pending" }
+            ]
+        }))
+        .unwrap();
+
+        let restored = legacy.normalize_legacy();
+        assert_eq!(restored.plan_revision, 0);
+        assert_eq!(restored.goal_id, "legacy-plan");
+        assert_eq!(
+            restored.change_reason.as_deref(),
+            Some("Continue the existing work")
+        );
+        assert_eq!(restored.steps[0].id, "legacy-step-1");
+        assert_eq!(restored.steps[0].title, "Inspect the repository");
+        assert!(restored.steps[0].dependencies.is_empty());
+        assert!(restored
+            .render_for_model()
+            .contains("[>] legacy-step-1: Inspect the repository"));
+    }
+
+    #[test]
+    fn task_plan_selects_the_next_dependency_ready_step() {
+        let plan: TaskPlan = serde_json::from_value(json!({
+            "planRevision": 4,
+            "goalId": "ordered-work",
+            "steps": [
+                {
+                    "id": "inspect",
+                    "title": "Inspect",
+                    "status": "completed",
+                    "evidence": ["Inspection finished"]
+                },
+                {
+                    "id": "implement",
+                    "title": "Implement",
+                    "status": "pending",
+                    "dependencies": ["inspect"]
+                },
+                {
+                    "id": "verify",
+                    "title": "Verify",
+                    "status": "pending",
+                    "dependencies": ["implement"]
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert!(plan.is_active());
+        assert_eq!(
+            plan.next_runnable_step().map(|step| step.id.as_str()),
+            Some("implement")
+        );
+
+        let mut deferred_plan = plan.clone();
+        deferred_plan.steps[1].status = TaskPlanStepStatus::Deferred;
+        deferred_plan.steps[1].status_reason = Some("Continue next session".to_string());
+        deferred_plan.steps[2].status = TaskPlanStepStatus::Cancelled;
+        deferred_plan.steps[2].status_reason = Some("No longer required".to_string());
+        assert!(deferred_plan.is_active());
+        assert!(!deferred_plan.has_actionable_steps());
+        assert!(deferred_plan.next_runnable_step().is_none());
     }
 }

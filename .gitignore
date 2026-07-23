@@ -1,4 +1,6 @@
 target/
+/target-dev-*/
+/target-plan-tests/
 node_modules/
 dist/
 dist-electron/

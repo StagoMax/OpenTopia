@@ -1,8 +1,13 @@
 # OpenTopia 文件上下文、Browser Use 与 Computer Use 底层实现设计
 
-> 状态：技术设计草案  
-> 日期：2026-07-18  
-> 范围：本地 Electron 桌面端、Rust AgentCore、MCP 扩展层和 OpenAI-compatible Provider  
+> 状态：技术设计草案（第二次底层复核）
+>
+> 初稿：2026-07-18
+>
+> 最近复核：2026-07-22
+>
+> 范围：本地 Electron 桌面端、Rust AgentCore、MCP 扩展层和 OpenAI-compatible Provider
+>
 > 说明：本文明确区分“当前已经实现的能力”和“建议新增的能力”。设计内容不等同于已交付功能。
 
 ## 1. 目标与边界
@@ -180,7 +185,28 @@ sequenceDiagram
 - profile partition 按启动 nonce 和 session 派生；
 - 导航只允许 HTTP/HTTPS，并进入域名审批链。
 
-### 3.3 当前多模态工具结果链路
+### 3.3 当前多模态工具结果与 Provider 链路
+
+OpenTopia 当前已有两个 Provider adapter：
+
+| Provider                   | Endpoint            | 工具协议                                 | 图片协议                     |
+| -------------------------- | ------------------- | ---------------------------------------- | ---------------------------- |
+| `OpenAiCompatibleProvider` | `/chat/completions` | `tool_calls` / role=`tool`               | companion user `image_url`   |
+| `OpenAiResponsesProvider`  | `/responses`        | `function_call` / `function_call_output` | companion user `input_image` |
+
+这里的“已经支持 Responses API”不等于“已经支持 Responses API 的原生 Computer Use 工具”。当前 `responses_tools` 会把全部 `ProviderToolCandidate` 固定编码成：
+
+```json
+{
+  "type": "function",
+  "name": "browser",
+  "description": "...",
+  "parameters": {},
+  "strict": false
+}
+```
+
+当前流式解析器只把 `function_call` 转成 `ProviderToolCall`。`computer_call`、`computer_call_output`、pending safety checks 和 Computer 专用动作事件还没有进入 OpenTopia 的 provider-neutral 模型。
 
 Browser screenshot 会依次经过：
 
@@ -189,8 +215,8 @@ BrowserContent::Image
   -> browser_output_to_tool_result
   -> ModelContentPart::Image
   -> ProviderToolResult.content
-  -> openai_tool_image_companion
-  -> Chat Completions image_url data URL
+  -> Chat Completions: openai_tool_image_companion -> image_url data URL
+  -> Responses: responses_tool_image_companion -> input_image data URL
 ```
 
 MCP 图片结果也已被保留：
@@ -202,7 +228,7 @@ MCP content { type: "image", mimeType, data(base64) }
   -> 同一 Provider 多模态链路
 ```
 
-因此，从数据协议看，OpenTopia 已具备接入截图型 Computer Use MCP server 的关键基础。
+因此，从数据协议看，OpenTopia 已具备接入截图型 Computer Use MCP server 的关键基础；但如果要使用 OpenAI 原生 `computer` tool，还需要扩展 Provider 工具类型、输出项解析和 continuation 协议，不能只切换 Provider kind。
 
 ## 4. 文件上下文的底层实现
 
@@ -320,6 +346,70 @@ Agent 工具：
   "truncated": false
 }
 ```
+
+### 4.4 写入时的版本冲突与 Monaco edit
+
+让 Agent “看到未保存 buffer”后，写入协议也必须升级。否则 Agent 读的是 Monaco version 73，却通过文件工具直接覆盖磁盘 version 70，最终造成编辑器内容和磁盘内容分叉。
+
+建议统一版本前置条件：
+
+```rust
+pub struct DocumentVersion {
+    pub path: PathBuf,
+    pub disk_sha256: Option<String>,
+    pub disk_modified_at_ns: Option<u128>,
+    pub editor_model_version: Option<u64>,
+    pub editor_content_sha256: Option<String>,
+    pub dirty: bool,
+}
+```
+
+写入分两条明确路径：
+
+```text
+文件未在编辑器打开或 buffer 不 dirty
+  -> write_file(expected_disk_sha256)
+  -> 原子临时文件 + rename/replace
+  -> 文件 watcher 通知 Monaco reload
+
+buffer dirty
+  -> apply_editor_edits(expected_model_version, edits[])
+  -> Monaco executeEdits / WorkspaceEdit
+  -> modelVersion 增加
+  -> 是否保存由用户或显式 save 动作决定
+```
+
+不能在 dirty buffer 存在时静默调用磁盘 `write_file`。服务端或工具层应返回：
+
+```json
+{
+  "code": "dirty_editor_conflict",
+  "path": "src/App.tsx",
+  "diskSha256": "...",
+  "editorModelVersion": 73,
+  "allowedRecovery": [
+    "apply_editor_edits",
+    "refresh_and_replan",
+    "ask_user_to_save"
+  ]
+}
+```
+
+`apply_editor_edits` 使用 LSP/Monaco range，而不是整文件字符串替换：
+
+```ts
+type EditorEdit = {
+  range: {
+    startLine: number;
+    startColumn: number;
+    endLine: number;
+    endColumn: number;
+  };
+  text: string;
+};
+```
+
+执行前检查 `expectedModelVersion`，全部 edit 作为一个 undo stop 应用，执行后返回新的 modelVersion 和内容哈希。这样用户可以用一次 Undo 撤销 Agent 修改，也能避免 Agent 与用户同时编辑时的 lost update。
 
 ## 5. Browser Use 的底层原理
 
@@ -439,6 +529,70 @@ interface BrowserDriver {
 - `StagehandDriver`：在 Playwright 之上提供 `observe/extract/act`。
 
 OpenTopia 应继续拥有 Agent loop。Stagehand 只能作为执行/观察辅助，不能再启动一套独立的任务规划 Agent。
+
+### 5.5 `node_ref` 的生成、解析与失效
+
+`node_ref` 不是 CSS selector，也不应是可跨导航复用的数据库 ID。它是 host 为一次 document epoch 建立的短期 capability。建议 host 内部维护：
+
+```ts
+type BrowserNodeBinding = {
+  nodeRef: string;
+  sessionId: string;
+  observationId: string;
+  documentId: string;
+  frameId: string;
+  backendNodeId?: number;
+  loaderId?: string;
+  boundsAtObservation?: Rect;
+  fingerprint: {
+    role?: string;
+    name?: string;
+    tagName?: string;
+    inputType?: string;
+  };
+  expiresAt: number;
+};
+```
+
+生成流程：
+
+1. 通过 `Page.getFrameTree` 建立 frame 拓扑。
+2. 对每个可访问 frame 获取 DOM/AX 数据；跨域 iframe 通过对应 CDP session 获取，不能从父页面 JavaScript 强行穿透同源策略。
+3. 将 `frameId + backendNodeId + document epoch` 放入 host 内存映射。
+4. 对模型只暴露随机 `node_ref` 和必要语义，不暴露可伪造的内部句柄。
+5. 页面导航、frame detach、renderer crash、session close 或 TTL 到期时整体失效。
+
+执行 `click(node_ref)` 前至少做以下检查：
+
+```text
+binding.session_id == current_session
+binding.observation_id == action.observation_id
+binding.document_id == current_document_id
+frame 仍 attached
+backend node 仍可解析
+节点语义 fingerprint 没有发生高风险变化
+最新 box 与观察时 box 的偏移/面积变化在阈值内
+节点可见、未被禁用、命中点未被其他元素遮挡
+```
+
+满足后再用最新 box 中心点发送 CDP trusted input。任何一项失败都返回 `stale_observation`，并携带可机器判断的 `reason`，例如 `document_changed`、`node_detached`、`bounds_changed` 或 `occluded`。
+
+动作回执应区分“输入已送达”和“用户目标已经成立”：
+
+```json
+{
+  "actionId": "act_01...",
+  "observationId": "obs_01...",
+  "status": "dispatched",
+  "backend": "cdp_input",
+  "target": { "nodeRef": "node_42" },
+  "navigationStarted": false,
+  "domChanged": true,
+  "nextObservationRequired": true
+}
+```
+
+`status=dispatched` 只说明底层动作被执行，不说明登录、提交或下载已经成功；成功与否必须由下一次观察或显式业务断言确认。
 
 ## 6. Computer Use 的底层原理
 
@@ -591,6 +745,62 @@ pub enum ComputerTarget {
 - 多显示器可包含负坐标原点。
 - 100%、125%、150% DPI 下逻辑坐标与物理像素不同。
 
+#### 坐标换算不能靠单个 DPI 比例
+
+Computer action 中的坐标应定义为“观察截图像素坐标”，而不是 CSS 像素、DIP 或当前桌面绝对坐标。假设观察时截图大小为 `image_width x image_height`，截图对应的窗口客户区物理矩形为 `capture_rect`，则：
+
+```text
+x_screen_physical = capture_rect.left
+                  + round(x_image * capture_rect.width / image_width)
+
+y_screen_physical = capture_rect.top
+                  + round(y_image * capture_rect.height / image_height)
+```
+
+执行前必须重新读取窗口矩形。如果窗口位置、客户区尺寸、显示器或 DPI awareness context 已改变，就不能套用旧公式，应返回 stale。对于 `SendInput` 的绝对鼠标坐标，还要映射到整个虚拟桌面的 `0..65535` 范围：
+
+```text
+x_sendinput = round((x_screen_physical - virtual_left)  * 65535
+                    / (virtual_width - 1))
+y_sendinput = round((y_screen_physical - virtual_top) * 65535
+                    / (virtual_height - 1))
+```
+
+这里必须使用 `SM_XVIRTUALSCREEN`、`SM_YVIRTUALSCREEN`、`SM_CXVIRTUALSCREEN`、`SM_CYVIRTUALSCREEN`，不能假设主显示器原点为 `(0, 0)`。
+
+#### 截图与 UIA tree 的一致性
+
+截图和 UIA tree 不是操作系统提供的原子快照。建议为一次 observe 记录：
+
+```rust
+pub struct CaptureClock {
+    pub screenshot_qpc: u64,
+    pub uia_started_qpc: u64,
+    pub uia_finished_qpc: u64,
+    pub window_bounds_before: Rect,
+    pub window_bounds_after: Rect,
+}
+```
+
+如果 UIA 枚举期间窗口移动、前台窗口改变，或者 screenshot 与 UIA 完成时间偏差超过阈值，该 observation 应标记为 `unstable=true`，只允许重新观察，不允许直接执行高风险动作。`frame_id` 可由 session、窗口身份、单调序号、截图摘要和 bounds 摘要共同生成，但它的作用是版本关联，不是安全哈希证明。
+
+UIA `RuntimeId` 也不是永久 ID。`element_ref` 应保存在 session 内存中，并绑定：
+
+```text
+process_id + HWND + UIA RuntimeId + ControlType + Name fingerprint
+```
+
+窗口重建、进程重启、控件树 StructureChanged 或 observation TTL 到期后全部失效。
+
+#### 输入注入与用户抢占
+
+- 普通文本优先使用 UIA `ValuePattern::SetValue`。
+- 必须模拟键盘时，Unicode 文本使用 `SendInput + KEYEVENTF_UNICODE`；快捷键使用 scan code/virtual key 序列。
+- 剪贴板粘贴只能作为显式 fallback，因为它会覆盖用户剪贴板并可能泄露敏感数据；若使用，必须保存、恢复、清零临时内容并记录失败路径。
+- `SetForegroundWindow` 可能被 Windows 前台激活规则拒绝，执行器必须验证 `GetForegroundWindow()`，不能假设调用成功。
+- 动作批执行期间通过鼠标位置、前台窗口、`GetLastInputInfo` 或输入 hook 检测用户抢占。一旦发现真实用户输入，立即取消剩余动作并重新观察。
+- 对密码框、secure edit 和标记为敏感的输入，不返回 value，不持久化文本，也不使用剪贴板 fallback。
+
 ### 6.5 macOS 与 Linux 适配边界
 
 macOS：
@@ -718,6 +928,61 @@ fn inspect_computer_action(
 - 处理 UAC；
 - 点击发送、支付或删除。
 
+### 8.5 MCP stdio 上实际传输的内容
+
+MCP 在这一层解决的是“如何发现和调用外部工具”，不是 Computer Use 的权限模型。以 stdio transport 为例，OpenTopia host 向 driver 发送 JSON-RPC 请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 41,
+  "method": "tools/call",
+  "params": {
+    "name": "screenshot",
+    "arguments": {
+      "windowId": "hwnd:00000000000A1234"
+    }
+  }
+}
+```
+
+driver 可返回文字、图片和结构化元数据：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 41,
+  "result": {
+    "content": [
+      {
+        "type": "image",
+        "mimeType": "image/png",
+        "data": "<base64>"
+      },
+      {
+        "type": "text",
+        "text": "captured window hwnd:..."
+      }
+    ],
+    "structuredContent": {
+      "windowId": "hwnd:00000000000A1234",
+      "width": 1200,
+      "height": 800,
+      "frameId": "frame_01..."
+    },
+    "isError": false
+  }
+}
+```
+
+`McpExtensionHost` 负责进程、stdio 和 JSON-RPC correlation；`McpToolWrapper` 负责把 MCP content 转成 `ModelContentPart`。策略判断必须发生在 `tools/call` 发出之前。不能因为 driver 返回了一个名为 `click` 的工具，就让 driver 自己决定哪些窗口可点。
+
+还需防止三个常见协议问题：
+
+1. **stdout 污染**：driver 的普通日志必须写 stderr，stdout 只传 transport frame，否则 JSON-RPC decoder 会失步。
+2. **大图膨胀**：base64 会增加约三分之一体积；host 应在解码前限制 JSON frame，在解码后再次限制二进制大小和像素数。
+3. **进程复用越权**：同一个 driver 进程处理多个 thread 时，每次调用仍需携带并验证 OpenTopia session/window capability；仅靠 MCP connection 身份不足以隔离 thread。
+
 ## 9. 原生 ComputerRuntime 的长期形态
 
 MCP 原型验证后，可在 `opentopia-core` 增加一等 runtime：
@@ -755,7 +1020,11 @@ pub trait ComputerRuntime: Send + Sync {
 ```text
 crates/opentopia-core/src/computer.rs
 crates/opentopia-core/src/desktop_computer.rs
-apps/desktop/electron/computer-host.cjs
+crates/opentopia-computer-host/src/main.rs
+crates/opentopia-computer-host/src/platform/windows.rs
+crates/opentopia-computer-host/src/platform/macos.rs
+crates/opentopia-computer-host/src/platform/linux.rs
+apps/desktop/electron/computer-host.cjs       # 仅负责 sidecar 生命周期/bootstrap
 apps/desktop/src/components/ComputerPanel.tsx
 ```
 
@@ -775,35 +1044,209 @@ computer.close
 
 和 BrowserRuntime 一样，Computer session 应从 thread ID 派生，但额外绑定获批的窗口集合。
 
+### 9.1 特权进程边界与 IPC
+
+Computer host 拥有截图和输入注入权限，安全级别高于普通 renderer。推荐进程边界：
+
+```mermaid
+flowchart LR
+    Renderer["Electron renderer"] -->|thread UI intent| Server["opentopia-server"]
+    Server --> Core["AgentCore + PolicyEngine"]
+    Core -->|authorized request| Broker["Computer broker"]
+    Broker --> Adapter["Windows/macOS/Linux adapter"]
+    Adapter --> OS["OS capture / accessibility / input"]
+    OS --> Adapter
+    Adapter -->|observation + receipt| Broker
+    Broker --> Core
+```
+
+关键约束：
+
+- renderer 不能直接获得 broker token、named-pipe handle 或任意输入注入 IPC。
+- Electron main 只负责生命周期和本地授权 UI；真正的 action 仍必须经过 Rust policy。
+- 第一版可复用当前 authenticated loopback broker 模式；Windows 长期更适合使用带当前用户 SID DACL 的 named pipe，macOS 可用 XPC/Unix socket，Linux 可用 Unix domain socket。
+- broker 在启动时由父进程传入一次性随机 bootstrap secret，建立连接后派生短期 session key；secret 不写日志、不进命令行参数。
+- broker 必须验证单调 `sequence`，拒绝 replay、乱序和已撤销 session。
+
+建议控制报文：
+
+```rust
+pub struct ComputerBrokerRequest<T> {
+    pub protocol_version: u16,
+    pub request_id: Uuid,
+    pub session_id: ComputerSessionId,
+    pub sequence: u64,
+    pub capability: String,
+    pub operation: String,
+    pub body: T,
+}
+
+pub struct ComputerBrokerResponse<T> {
+    pub request_id: Uuid,
+    pub sequence: u64,
+    pub status: BrokerStatus,
+    pub body: Option<T>,
+    pub error: Option<ComputerErrorPayload>,
+}
+```
+
+capability 至少绑定：
+
+```text
+thread_id
+computer_session_id
+process identity
+window identity
+allowed action classes
+issued_at / expires_at
+maximum sequence
+random nonce
+```
+
+如果使用自定义 framed IPC，建议使用 `u32 little-endian length + UTF-8 JSON header + binary attachments`。截图不要无限制内联到 JSON：header 只声明 attachment 的 `content_type`、长度和 SHA-256，接收方先校验限额再分配内存。loopback HTTP 版本则应继续使用 Bearer token、固定路径、禁用 proxy/redirect，并为 header/body/response 分别设上限。
+
+### 9.2 Computer session 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created
+    Created --> Bound: approve window capability
+    Bound --> Observed: observe(frame N)
+    Observed --> Authorized: policy allows action on frame N
+    Authorized --> Executed: broker dispatches action
+    Executed --> Observed: observe(frame N+1)
+    Observed --> Bound: observation expires/stales
+    Bound --> Revoked: user revokes/window closes/process changes
+    Created --> Closed
+    Bound --> Closed
+    Observed --> Closed
+    Authorized --> Revoked: user input or target mismatch
+    Executed --> Revoked: secure desktop/session lock
+    Revoked --> Closed
+```
+
+只有 `Authorized` 状态可以调用输入 backend。审批记录不能直接把 session 永久置为 Authorized；每个动作仍要绑定 observation 和 sequence。窗口所属进程重启时，即使标题和路径相同，也必须重新绑定，因为 PID、creation time 和窗口句柄的组合已经改变。
+
 ## 10. Provider 层选择
 
-### 10.1 近期：继续使用自定义 function tools
+### 10.1 当前：两个 Provider 都使用自定义 function tool
 
-当前 Provider 调用 `/chat/completions`，Browser/Computer 动作都可继续作为普通 function tool。截图通过 `ModelContentPart::Image` 以 companion user message 返回。
+OpenTopia 已实现 Chat Completions 和 Responses 两个 adapter。Browser 以及近期新增的 Computer Use 都可以先继续作为普通 function tool：
 
-优点：
+```text
+Model -> function_call(name="computer", arguments={...})
+OpenTopia -> policy -> ComputerRuntime.perform(...)
+OpenTopia -> function_call_output(JSON receipt)
+OpenTopia -> companion input_image(screenshot)
+```
 
-- 不要求立即重写 Provider；
-- 兼容多个 OpenAI-compatible endpoint；
-- 与现有审批 continuation 一致。
+这条路径的优点：
 
-需要控制图片历史：当前多轮工具历史可能重复携带旧截图。建议只保留：
+- 复用现有 `ProviderToolCandidate`、`ProviderToolCall` 和审批 continuation；
+- Chat Completions 与 Responses 都能使用；
+- OpenAI-compatible endpoint 不需要实现专用 Computer tool；
+- MCP screenshot 已能通过 `ModelContentPart::Image` 到达两种 provider。
+
+局限是模型只能从 OpenTopia 的 JSON schema 学习动作协议，无法直接利用 Provider 内建 Computer tool 的专用训练、safety checks 和事件语义。
+
+图片历史必须受控。当前多轮工具历史可能重复携带旧截图，建议只保留：
 
 - 最新完整截图；
 - 上一帧缩略图或差异摘要；
 - 关键动作回执；
 - 已完成旧帧的文本化摘要。
 
-### 10.2 长期：增加 Responses API Computer Use provider
+### 10.2 当前 Responses adapter 的精确边界
 
-可增加单独的 Provider 实现，原生解析：
+当前 `OpenAiResponsesProvider` 已具备：
+
+- `POST /responses` 与 SSE streaming；
+- `instructions` 和 typed `input`；
+- `previous_response_id` continuation；
+- `function_call` / `function_call_output`；
+- `input_image`；
+- response provider items 保存；
+- stateful store、reasoning encrypted content、prompt cache 和 context compaction 选项。
+
+但以下三处仍是 function-only：
 
 ```text
-computer_call.actions[]
-computer_call_output
+responses_tools()                 所有候选工具硬编码为 type=function
+ResponsesStreamAccumulator       只把 function_call 放进 tool_calls
+extract_provider_tool_calls()    只解析 function_call
 ```
 
-但 Provider 迁移不能替代本地 ComputerRuntime。OpenAI 只返回动作意图，截图捕获、输入执行、安全审批和新截图仍由 OpenTopia 负责。
+所以仅把 provider 设置为 `openai_responses`，不会自动获得原生 Computer Use。
+
+### 10.3 原生 Responses Computer Use 需要的 provider-neutral 类型
+
+不要把 `computer_call` 伪装成普通 `ProviderToolCall { name, arguments }`。它有不同的 continuation output 和 safety metadata，应扩展为 tagged enum：
+
+```rust
+pub enum ProviderActionRequest {
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    ComputerCall {
+        call_id: String,
+        provider_item_id: Option<String>,
+        actions: Vec<ProviderComputerAction>,
+        pending_safety_checks: Vec<ProviderSafetyCheck>,
+    },
+}
+
+pub enum ProviderActionOutput {
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+    ComputerCallOutput {
+        call_id: String,
+        screenshot: ModelContentPart,
+        current_url: Option<String>,
+        acknowledged_safety_checks: Vec<String>,
+    },
+}
+```
+
+具体 Provider 版本可能返回单个 action 或 action batch；adapter 应在边界处归一化成 `Vec<ProviderComputerAction>`，不要让 AgentCore 依赖远端 JSON 的偶然形状。
+
+工具定义也要从“全部是 function”升级：
+
+```rust
+pub enum ProviderToolDefinition {
+    Function(ProviderToolCandidate),
+    Computer {
+        environment: ComputerEnvironment,
+        display_width: u32,
+        display_height: u32,
+    },
+}
+```
+
+这里的 display size 必须与实际返回给模型的截图坐标系一致。如果 host 把 4K 窗口缩放成 1440 px 再发送，就要让动作解析和坐标转换明确使用这张 1440 px 观察图，而不是原始屏幕尺寸。
+
+### 10.4 原生 Computer continuation 顺序
+
+一次 `computer_call` 的处理顺序必须固定：
+
+```text
+1. Provider stream 收到 computer_call
+2. 解析全部 action 和 pending safety checks
+3. AgentCore 逐动作执行本地 policy
+4. 有待确认项 -> 暂停 Turn，持久化 continuation cursor，但不执行动作
+5. 获批 -> 绑定当前 observation/frame，按顺序执行
+6. 任一动作 stale/失败 -> 停止剩余 batch
+7. 捕获新 observation
+8. 发送 computer_call_output + screenshot
+9. 继续同一 response chain
+```
+
+不能先执行动作再补做 pending safety check。也不能把 Provider 的 safety check 当作唯一安全层：本地 policy 仍要检查窗口、进程、输入内容、文件上传、发送/支付/删除等业务语义。
+
+Provider 迁移始终不能替代本地 `ComputerRuntime`。远端只生成动作意图；截图捕获、输入执行、窗口绑定、安全审批、动作回执和新截图仍由 OpenTopia 负责。
 
 ## 11. 安全模型
 
@@ -992,6 +1435,7 @@ Accessibility/UIA tree：最大 256 KiB
 - `TurnUiContext`；
 - Monaco active path、selection、dirty、modelVersion；
 - `get_active_context` 和 `read_open_file`；
+- `apply_editor_edits(expectedModelVersion)` 与 dirty-buffer 冲突保护；
 - Turn 开始时冻结 UI context revision。
 
 验收：Agent 能准确区分磁盘内容和未保存 buffer。
@@ -1038,7 +1482,8 @@ Accessibility/UIA tree：最大 256 KiB
 
 交付：
 
-- 可选 Responses API Computer Use provider；
+- 在现有 `OpenAiResponsesProvider` 中增加原生 Computer tool/action/output adapter；
+- provider-neutral `ProviderActionRequest` / `ProviderActionOutput`；
 - macOS adapter；
 - Linux 能力探测和显式降级；
 - 轨迹压缩和评测集。
@@ -1049,13 +1494,15 @@ Accessibility/UIA tree：最大 256 KiB
 | -------------------------------------------------- | ---------------------------------------------------- |
 | `apps/desktop/src/App.tsx`                         | 收集 active surface/editor/browser metadata          |
 | `apps/desktop/src/components/MonacoEditorImpl.tsx` | 上报 modelVersion、selection、dirty buffer           |
-| `apps/desktop/electron/preload.cjs`                | 暴露受限 context/computer IPC                        |
+| `apps/desktop/electron/preload.cjs`                | 暴露受限 context、授权 UI 和只读状态 IPC             |
 | `apps/desktop/electron/browser-host.cjs`           | AX Tree、node ref、observation ID、stale check       |
+| `apps/desktop/electron/computer-host.cjs`          | sidecar 启停、bootstrap secret、崩溃恢复             |
 | `crates/opentopia-server/src/main.rs`              | UI context endpoints、Computer routes/runtime wiring |
+| `crates/opentopia-computer-host/`                  | 特权 broker、framed IPC 和跨平台 adapter             |
 | `crates/opentopia-core/src/model.rs`               | UI/Computer observation 与事件模型                   |
-| `crates/opentopia-core/src/tools.rs`               | `get_active_context`、`read_open_file`、`computer`   |
+| `crates/opentopia-core/src/tools.rs`               | context/read/edit tools 与 `computer`                |
 | `crates/opentopia-core/src/policy.rs`              | `inspect_computer_action` 与窗口级审批               |
-| `crates/opentopia-core/src/provider.rs`            | 截图历史限额；未来 Responses adapter                 |
+| `crates/opentopia-core/src/provider.rs`            | Computer tool/call/output；截图历史限额              |
 | `crates/opentopia-core/src/store.rs`               | 仅持久化动作回执和脱敏元数据                         |
 | `crates/opentopia-core/src/mcp.rs`                 | per-tool permission override 或 adapter metadata     |
 

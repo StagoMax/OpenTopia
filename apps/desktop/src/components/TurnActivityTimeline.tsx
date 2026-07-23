@@ -7,10 +7,15 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Clock3,
+  Code2,
+  FileDiff,
+  FileSearch,
   FileText,
   Globe2,
   Loader2,
+  RotateCcw,
   Send,
   Table2,
   TerminalSquare,
@@ -24,6 +29,9 @@ import type {
   TaskPlan,
   ToolCall,
   ToolResult,
+  TurnChangeSet,
+  TurnFileDiffPreview,
+  TurnFileChange,
 } from "../types";
 import "./TurnActivityTimeline.css";
 
@@ -124,6 +132,25 @@ type ActivityEntry =
 
 type ActivityState = "running" | "complete" | "waiting" | "cancelled" | "error";
 
+const defaultVisibleTurnFiles = 3;
+const defaultVisibleDiffLines = 120;
+
+type TurnFilePreviewState = {
+  key: string;
+  loading: boolean;
+  loadingMore: boolean;
+  error: string | null;
+  preview: TurnFileDiffPreview | null;
+  visibleLines: number;
+};
+
+type TurnDiffLine = {
+  kind: "context" | "added" | "deleted" | "hunk" | "meta";
+  text: string;
+  oldLine: number | null;
+  newLine: number | null;
+};
+
 export function TurnActivityTimeline({
   events,
   isActive,
@@ -168,7 +195,14 @@ export function TurnActivityTimeline({
       (entry) => entry.kind === "subagent" || entry.kind === "model-request",
     ).length;
 
-  if (!isActive && entries.length === 0) return null;
+  const changeSetEvent = [...events]
+    .reverse()
+    .find((event) => event.payload.type === "turn_changes_recorded");
+  const changeSet =
+    changeSetEvent?.payload.type === "turn_changes_recorded"
+      ? changeSetEvent.payload.change_set
+      : null;
+  if (!isActive && entries.length === 0 && !changeSet) return null;
 
   const terminalSummary = [...events]
     .reverse()
@@ -199,6 +233,9 @@ export function TurnActivityTimeline({
               isActive,
             })}
             {turnTiming ? ` · ${turnTiming}` : ""}
+            {changeSet?.status === "ready"
+              ? ` · ${changeSet.files.length} 个文件 +${changeSet.additions} -${changeSet.deletions}`
+              : ""}
           </small>
         </span>
         <span className="turn-activity-chevron" aria-hidden="true">
@@ -223,11 +260,557 @@ export function TurnActivityTimeline({
               formatError={formatError}
             />
           ))}
+          {changeSet?.status === "failed" && changeSet.error && (
+            <div className="turn-change-set-warning" role="status">
+              <AlertCircle size={13} />
+              <span>未能记录本轮文件快照：{changeSet.error}</span>
+            </div>
+          )}
           {summary && <p className="turn-activity-footer">{summary}</p>}
         </div>
       )}
     </section>
   );
+}
+
+export function TurnChangeCard({
+  changeSet,
+  isWorkspaceBusy = false,
+  isUndoing = false,
+  isReverted = false,
+  onUndo,
+  onReview,
+  onLoadFilePreview,
+}: {
+  changeSet: TurnChangeSet;
+  isWorkspaceBusy?: boolean;
+  isUndoing?: boolean;
+  isReverted?: boolean;
+  onUndo?(): void;
+  onReview?(): void;
+  onLoadFilePreview?(
+    path: string,
+    offset?: number,
+  ): Promise<TurnFileDiffPreview>;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const [filePreviewState, setFilePreviewState] =
+    useState<TurnFilePreviewState | null>(null);
+
+  useEffect(() => {
+    setShowAll(false);
+    setFilePreviewState(null);
+  }, [changeSet.finalizedAt, changeSet.turnId]);
+
+  if (changeSet.status !== "ready" || changeSet.files.length === 0) {
+    return null;
+  }
+
+  const remaining = Math.max(
+    0,
+    changeSet.files.length - defaultVisibleTurnFiles,
+  );
+  const visibleFiles = showAll
+    ? changeSet.files
+    : changeSet.files.slice(0, defaultVisibleTurnFiles);
+  const undoTitle = isWorkspaceBusy
+    ? "轮次完成后可撤销"
+    : isReverted
+      ? "本轮修改已撤销"
+      : "预览并撤销本轮文件修改";
+
+  const loadFilePreview = (
+    file: TurnFileChange,
+    offset = 0,
+    loadingMore = false,
+  ) => {
+    const key = turnChangeFileKey(file);
+    const path = turnChangeFileRequestPath(file);
+    if (!onLoadFilePreview || !path || file.binary) return;
+    setFilePreviewState((current) => ({
+      key,
+      loading: !loadingMore,
+      loadingMore,
+      error: null,
+      preview: loadingMore ? (current?.preview ?? null) : null,
+      visibleLines: loadingMore
+        ? (current?.visibleLines ?? defaultVisibleDiffLines)
+        : defaultVisibleDiffLines,
+    }));
+    void onLoadFilePreview(path, offset)
+      .then((preview) => {
+        setFilePreviewState((current) => {
+          if (current?.key !== key) return current;
+          const combinedPreview =
+            loadingMore && current.preview
+              ? {
+                  ...preview,
+                  diff: current.preview.diff + preview.diff,
+                  offset: 0,
+                }
+              : preview;
+          return {
+            key,
+            loading: false,
+            loadingMore: false,
+            error: null,
+            preview: combinedPreview,
+            visibleLines: loadingMore
+              ? current.visibleLines + defaultVisibleDiffLines
+              : defaultVisibleDiffLines,
+          };
+        });
+      })
+      .catch((error: unknown) => {
+        setFilePreviewState((current) =>
+          current?.key === key
+            ? {
+                ...current,
+                loading: false,
+                loadingMore: false,
+                error: turnFilePreviewError(error),
+              }
+            : current,
+        );
+      });
+  };
+
+  const toggleFilePreview = (file: TurnFileChange) => {
+    const key = turnChangeFileKey(file);
+    if (filePreviewState?.key === key) {
+      setFilePreviewState(null);
+      return;
+    }
+    if (file.binary) {
+      setFilePreviewState({
+        key,
+        loading: false,
+        loadingMore: false,
+        error: null,
+        preview: null,
+        visibleLines: defaultVisibleDiffLines,
+      });
+      return;
+    }
+    loadFilePreview(file);
+  };
+
+  return (
+    <article
+      className="turn-change-card"
+      data-reverted={isReverted || undefined}
+      aria-label={`本轮修改了 ${changeSet.files.length} 个文件`}
+    >
+      <header className="turn-change-card-header">
+        <span className="turn-change-card-icon" aria-hidden="true">
+          <FileDiff size={18} />
+        </span>
+        <div className="turn-change-card-title">
+          <strong>
+            {isReverted ? "已撤销" : "已修改"} {changeSet.files.length} 个文件
+          </strong>
+          <span
+            aria-label={`增加 ${changeSet.additions} 行，删除 ${changeSet.deletions} 行`}
+          >
+            <span className="file-change-additions">
+              +{changeSet.additions}
+            </span>{" "}
+            <span className="file-change-deletions">
+              -{changeSet.deletions}
+            </span>
+          </span>
+        </div>
+        <div className="turn-change-card-actions">
+          {onUndo && (
+            <button
+              className="turn-change-card-action undo"
+              type="button"
+              disabled={isWorkspaceBusy || isUndoing || isReverted}
+              aria-label={isReverted ? "本轮修改已撤销" : "撤销本轮文件修改"}
+              title={undoTitle}
+              onClick={onUndo}
+            >
+              {isUndoing ? (
+                <Loader2 className="spin" size={14} aria-hidden="true" />
+              ) : (
+                <RotateCcw size={14} aria-hidden="true" />
+              )}
+              <span>
+                {isReverted ? "已撤销" : isUndoing ? "检查中" : "撤销"}
+              </span>
+            </button>
+          )}
+          {onReview && (
+            <button
+              className="turn-change-card-action review"
+              type="button"
+              disabled={isWorkspaceBusy || isReverted}
+              aria-label="打开差异审核"
+              title={
+                isWorkspaceBusy
+                  ? "轮次完成后可审核"
+                  : isReverted
+                    ? "本轮修改已撤销"
+                    : "在差异面板中审核当前工作区"
+              }
+              onClick={onReview}
+            >
+              <FileSearch size={14} aria-hidden="true" />
+              <span>审核</span>
+            </button>
+          )}
+        </div>
+      </header>
+
+      <div
+        className="turn-change-card-files"
+        role="list"
+        aria-label="本轮文件变更"
+      >
+        {visibleFiles.map((file, index) => (
+          <TurnChangeFileRow
+            key={turnChangeFileKey(file)}
+            file={file}
+            previewId={`turn-file-preview-${changeSet.turnId}-${index}`}
+            previewState={
+              filePreviewState?.key === turnChangeFileKey(file)
+                ? filePreviewState
+                : null
+            }
+            canPreview={file.binary || Boolean(onLoadFilePreview)}
+            onToggle={() => toggleFilePreview(file)}
+            onRetry={() => loadFilePreview(file)}
+            onShowMoreLines={() =>
+              setFilePreviewState((current) =>
+                current?.key === turnChangeFileKey(file)
+                  ? {
+                      ...current,
+                      visibleLines:
+                        current.visibleLines + defaultVisibleDiffLines,
+                    }
+                  : current,
+              )
+            }
+            onLoadMore={() => {
+              const nextOffset = filePreviewState?.preview?.nextOffset;
+              if (nextOffset !== null && nextOffset !== undefined) {
+                loadFilePreview(file, nextOffset, true);
+              }
+            }}
+          />
+        ))}
+      </div>
+
+      {remaining > 0 && (
+        <button
+          className="turn-change-card-more"
+          type="button"
+          aria-expanded={showAll}
+          onClick={() => {
+            setShowAll((current) => !current);
+            setFilePreviewState(null);
+          }}
+        >
+          <span>{showAll ? "收起文件列表" : `再显示 ${remaining} 个文件`}</span>
+          {showAll ? (
+            <ChevronUp size={15} aria-hidden="true" />
+          ) : (
+            <ChevronDown size={15} aria-hidden="true" />
+          )}
+        </button>
+      )}
+    </article>
+  );
+}
+
+function TurnChangeFileRow({
+  file,
+  previewId,
+  previewState,
+  canPreview,
+  onToggle,
+  onRetry,
+  onShowMoreLines,
+  onLoadMore,
+}: {
+  file: TurnFileChange;
+  previewId: string;
+  previewState: TurnFilePreviewState | null;
+  canPreview: boolean;
+  onToggle(): void;
+  onRetry(): void;
+  onShowMoreLines(): void;
+  onLoadMore(): void;
+}) {
+  const path = turnChangeFilePath(file);
+  const kind = turnChangeKind(file.kind);
+  const additions = file.additions ?? 0;
+  const deletions = file.deletions ?? 0;
+  const expanded = Boolean(previewState);
+
+  return (
+    <div
+      className="turn-change-card-file"
+      data-expanded={expanded || undefined}
+      role="listitem"
+    >
+      <button
+        className="turn-change-card-file-button"
+        type="button"
+        disabled={!canPreview}
+        aria-expanded={expanded}
+        aria-controls={canPreview ? previewId : undefined}
+        aria-label={`${expanded ? "收起" : "预览"} ${path} 的代码差异`}
+        onClick={onToggle}
+      >
+        <span
+          className="turn-change-card-file-kind"
+          data-kind={file.kind}
+          title={kind.label}
+          aria-label={kind.label}
+        >
+          {kind.code}
+        </span>
+        <span className="turn-change-card-file-path" title={path}>
+          {path}
+        </span>
+        {file.binary ? (
+          <span className="turn-change-card-file-binary">二进制</span>
+        ) : (
+          <span
+            className="turn-change-card-file-stats"
+            aria-label={`增加 ${additions} 行，删除 ${deletions} 行`}
+          >
+            <span className="file-change-additions">+{additions}</span>
+            <span className="file-change-deletions">-{deletions}</span>
+          </span>
+        )}
+        <ChevronRight
+          className="turn-change-card-file-chevron"
+          size={15}
+          aria-hidden="true"
+        />
+      </button>
+      {previewState && (
+        <TurnChangeFilePreview
+          id={previewId}
+          file={file}
+          state={previewState}
+          onRetry={onRetry}
+          onShowMoreLines={onShowMoreLines}
+          onLoadMore={onLoadMore}
+        />
+      )}
+    </div>
+  );
+}
+
+function TurnChangeFilePreview({
+  id,
+  file,
+  state,
+  onRetry,
+  onShowMoreLines,
+  onLoadMore,
+}: {
+  id: string;
+  file: TurnFileChange;
+  state: TurnFilePreviewState;
+  onRetry(): void;
+  onShowMoreLines(): void;
+  onLoadMore(): void;
+}) {
+  if (file.binary) {
+    return (
+      <div className="turn-change-card-preview-message" id={id} role="status">
+        <Code2 size={15} aria-hidden="true" />
+        <span>这是二进制文件，没有可显示的文本代码差异。</span>
+      </div>
+    );
+  }
+
+  if (state.loading && !state.preview) {
+    return (
+      <div className="turn-change-card-preview-message" id={id} role="status">
+        <Loader2 className="spin" size={15} aria-hidden="true" />
+        <span>正在加载历史代码差异...</span>
+      </div>
+    );
+  }
+
+  if (state.error) {
+    return (
+      <div
+        className="turn-change-card-preview-message error"
+        id={id}
+        role="alert"
+      >
+        <AlertCircle size={15} aria-hidden="true" />
+        <span>{state.error}</span>
+        <button type="button" onClick={onRetry}>
+          重试
+        </button>
+      </div>
+    );
+  }
+
+  const preview = state.preview;
+  if (!preview) return null;
+  const lines = parseTurnDiffLines(preview.diff);
+  const visibleLines = lines.slice(0, state.visibleLines);
+  const hiddenLines = Math.max(0, lines.length - visibleLines.length);
+  const canLoadNextPage =
+    preview.nextOffset !== null && preview.nextOffset !== undefined;
+  const path = turnChangeFilePath(file);
+  const loadedBytes = utf8ByteLength(preview.diff);
+
+  return (
+    <section
+      className="turn-change-card-preview"
+      id={id}
+      aria-label={`${path} 的代码差异预览`}
+    >
+      <header className="turn-change-card-preview-header">
+        <code title={path}>{path}</code>
+        <span>
+          {canLoadNextPage
+            ? `已加载 ${formatPreviewBytes(loadedBytes)} / ${formatPreviewBytes(preview.totalBytes)}`
+            : `共 ${formatPreviewBytes(preview.totalBytes)}`}
+        </span>
+      </header>
+      {visibleLines.length > 0 ? (
+        <div
+          className="turn-change-card-preview-code"
+          role="table"
+          tabIndex={0}
+          aria-label="统一差异代码"
+        >
+          {visibleLines.map((line, index) => (
+            <div
+              className="turn-change-card-preview-line"
+              data-kind={line.kind}
+              role="row"
+              key={`${index}:${line.oldLine ?? ""}:${line.newLine ?? ""}`}
+            >
+              <span className="turn-change-card-preview-number" role="cell">
+                {line.oldLine ?? ""}
+              </span>
+              <span className="turn-change-card-preview-number" role="cell">
+                {line.newLine ?? ""}
+              </span>
+              <code role="cell">{line.text || " "}</code>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="turn-change-card-preview-message compact" role="status">
+          该文件只有模式或元数据变化，没有文本代码差异。
+        </div>
+      )}
+      {(hiddenLines > 0 || canLoadNextPage) && (
+        <footer className="turn-change-card-preview-footer">
+          <span>
+            已显示 {visibleLines.length} 行
+            {hiddenLines > 0 ? `，还有 ${hiddenLines} 行已加载` : ""}
+          </span>
+          <button
+            type="button"
+            disabled={state.loadingMore}
+            onClick={hiddenLines > 0 ? onShowMoreLines : onLoadMore}
+          >
+            {state.loadingMore && (
+              <Loader2 className="spin" size={13} aria-hidden="true" />
+            )}
+            {state.loadingMore
+              ? "加载中"
+              : hiddenLines > 0
+                ? `再显示 ${Math.min(defaultVisibleDiffLines, hiddenLines)} 行`
+                : "加载后续差异"}
+          </button>
+        </footer>
+      )}
+    </section>
+  );
+}
+
+function parseTurnDiffLines(diff: string): TurnDiffLine[] {
+  const sourceLines = diff.replace(/\r\n/g, "\n").split("\n");
+  if (sourceLines.at(-1) === "") sourceLines.pop();
+  let oldLine = 0;
+  let newLine = 0;
+
+  return sourceLines.map((text) => {
+    const hunk = text.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      return { kind: "hunk", text, oldLine: null, newLine: null };
+    }
+    if (text.startsWith("+") && !text.startsWith("+++")) {
+      const line = newLine;
+      newLine += 1;
+      return { kind: "added", text, oldLine: null, newLine: line };
+    }
+    if (text.startsWith("-") && !text.startsWith("---")) {
+      const line = oldLine;
+      oldLine += 1;
+      return { kind: "deleted", text, oldLine: line, newLine: null };
+    }
+    if (text.startsWith(" ")) {
+      const line = {
+        kind: "context" as const,
+        text,
+        oldLine,
+        newLine,
+      };
+      oldLine += 1;
+      newLine += 1;
+      return line;
+    }
+    return { kind: "meta", text, oldLine: null, newLine: null };
+  });
+}
+
+function turnChangeFileKey(file: TurnFileChange) {
+  return `${file.kind}:${file.oldPath ?? ""}:${file.newPath ?? ""}`;
+}
+
+function turnChangeFileRequestPath(file: TurnFileChange) {
+  return file.newPath ?? file.oldPath ?? null;
+}
+
+function turnFilePreviewError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    const parsed = JSON.parse(message) as { error?: string };
+    return parsed.error || message;
+  } catch {
+    return message || "代码差异加载失败，请重试。";
+  }
+}
+
+function utf8ByteLength(value: string) {
+  return new TextEncoder().encode(value).length;
+}
+
+function formatPreviewBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function turnChangeFilePath(file: TurnFileChange) {
+  if (file.kind === "renamed" && file.oldPath && file.newPath) {
+    return `${file.oldPath} → ${file.newPath}`;
+  }
+  return file.newPath ?? file.oldPath ?? "未知文件";
+}
+
+function turnChangeKind(kind: TurnFileChange["kind"]) {
+  if (kind === "added") return { code: "A", label: "新增" };
+  if (kind === "deleted") return { code: "D", label: "删除" };
+  if (kind === "renamed") return { code: "R", label: "重命名" };
+  return { code: "M", label: "修改" };
 }
 
 function ActivityEntryView({
@@ -708,21 +1291,39 @@ function PlanActivity({
   isActive: boolean;
   now: number;
 }) {
-  const completed = plan.steps.filter(
-    (step) => step.status === "completed",
+  const resolved = plan.steps.filter((step) =>
+    ["completed", "deferred", "blocked", "cancelled"].includes(step.status),
   ).length;
   const running = plan.steps.some((step) => step.status === "in_progress");
+  const actionable = plan.steps.some(
+    (step) => step.status === "pending" || step.status === "in_progress",
+  );
+  const completedIds = new Set(
+    plan.steps
+      .filter((step) => step.status === "completed")
+      .map((step) => step.id),
+  );
+  let currentStepIndex = plan.steps.findIndex(
+    (step) => step.status === "in_progress",
+  );
+  if (currentStepIndex < 0) {
+    currentStepIndex = plan.steps.findIndex(
+      (step) =>
+        step.status === "pending" &&
+        step.dependencies.every((dependency) => completedIds.has(dependency)),
+    );
+  }
   const timing = formatActivityTiming(
     startedAt,
     finishedAt,
     running && isActive,
     now,
   );
-  const [expanded, setExpanded] = useState(defaultExpanded || running);
+  const [expanded, setExpanded] = useState(defaultExpanded || actionable);
   return (
     <div
       className="activity-group"
-      data-state={running ? "running" : "complete"}
+      data-state={actionable ? "running" : "complete"}
     >
       <button
         className="activity-group-header"
@@ -735,16 +1336,21 @@ function PlanActivity({
         </span>
         <span>执行计划</span>
         <small className="activity-group-count">
-          {completed}/{plan.steps.length}
+          {currentStepIndex >= 0
+            ? `第 ${currentStepIndex + 1}/${plan.steps.length} 步`
+            : `${resolved}/${plan.steps.length} 已处理`}
           {timing ? ` · ${timing}` : ""}
         </small>
         {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
       </button>
       {expanded && (
         <div className="activity-plan">
-          {plan.explanation && <p>{plan.explanation}</p>}
+          {(plan.changeReason || plan.explanation) && (
+            <p>{plan.changeReason || plan.explanation}</p>
+          )}
           <ol>
             {plan.steps.map((step, index) => {
+              const title = step.title || step.step || step.id;
               const stepTiming = formatPlanStepTiming(
                 stepTimings[index],
                 step.status,
@@ -752,19 +1358,31 @@ function PlanActivity({
                 now,
               );
               return (
-                <li key={`${index}-${step.step}`} data-status={step.status}>
+                <li
+                  key={step.id || `${index}-${title}`}
+                  data-status={step.status}
+                >
                   <span aria-hidden="true">
                     {step.status === "completed" ? (
                       <Check size={12} />
                     ) : step.status === "in_progress" ? (
                       <Loader2 size={12} className="spin" />
+                    ) : step.status === "blocked" ? (
+                      <AlertCircle size={12} />
+                    ) : step.status === "cancelled" ? (
+                      <X size={12} />
+                    ) : step.status === "deferred" ? (
+                      <Clock3 size={12} />
                     ) : (
                       <span className="activity-plan-dot" />
                     )}
                   </span>
-                  <span>
-                    {step.step}
-                    {stepTiming ? ` · ${stepTiming}` : ""}
+                  <span className="activity-plan-step-body">
+                    <span>
+                      {title}
+                      {stepTiming ? ` · ${stepTiming}` : ""}
+                    </span>
+                    {step.statusReason && <small>{step.statusReason}</small>}
                   </span>
                 </li>
               );
@@ -1102,6 +1720,51 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         seq: event.seq,
         createdAt: event.createdAt,
       });
+    } else if (payload.type === "context_warning") {
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: "Context warning",
+        summary: payload.message,
+        detail: payload,
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "token_usage") {
+      const cacheMetrics = [
+        payload.cached_input_tokens != null
+          ? `${payload.cached_input_tokens.toLocaleString()} cached`
+          : null,
+        payload.cache_write_tokens != null
+          ? `${payload.cache_write_tokens.toLocaleString()} cache write`
+          : null,
+        payload.reasoning_tokens != null
+          ? `${payload.reasoning_tokens.toLocaleString()} reasoning`
+          : null,
+      ].filter((value): value is string => value !== null);
+      primitives.push({
+        kind: "observability",
+        seq: event.seq,
+        title: "Token usage",
+        summary: [
+          `${payload.total_tokens.toLocaleString()} total`,
+          ...cacheMetrics,
+        ].join(" / "),
+        detail: {
+          inputTokens: payload.input_tokens,
+          outputTokens: payload.output_tokens,
+          totalTokens: payload.total_tokens,
+          ...(payload.cached_input_tokens != null && {
+            cachedInputTokens: payload.cached_input_tokens,
+          }),
+          ...(payload.cache_write_tokens != null && {
+            cacheWriteTokens: payload.cache_write_tokens,
+          }),
+          ...(payload.reasoning_tokens != null && {
+            reasoningTokens: payload.reasoning_tokens,
+          }),
+        },
+        createdAt: event.createdAt,
+      });
     } else if (payload.type === "error") {
       primitives.push({
         kind: "error",
@@ -1214,7 +1877,9 @@ function buildPlanStepTimings(
       if (event.payload.type !== "plan_updated") continue;
       const snapshotStep =
         event.payload.plan.steps.find(
-          (step) => step.step === latestStep.step,
+          (step) =>
+            (step.id && step.id === latestStep.id) ||
+            (step.title || step.step) === (latestStep.title || latestStep.step),
         ) ?? event.payload.plan.steps[stepIndex];
       if (!snapshotStep) continue;
 

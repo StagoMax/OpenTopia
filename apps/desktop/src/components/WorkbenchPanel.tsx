@@ -18,15 +18,20 @@ import {
   FolderOpen,
   GitBranch,
   Pencil,
+  PackagePlus,
   Plus,
   Puzzle,
   RefreshCw,
   RotateCcw,
   Save,
+  Search,
+  Settings2,
   ShieldAlert,
   Square,
   TerminalSquare,
   Trash2,
+  Workflow,
+  Wrench,
   X,
   XCircle,
 } from "lucide-react";
@@ -39,6 +44,7 @@ import type {
   McpServerInput,
   McpServerView,
   Message,
+  PluginView,
   SandboxDescriptor,
   TerminalEvent,
   TerminalSession,
@@ -71,6 +77,8 @@ type WorkbenchPanelProps = {
   filePreview: WorkspaceFilePreview | null;
   workspaceDiff: WorkspaceDiff | null;
   sandbox: SandboxDescriptor | null;
+  plugins: PluginView[];
+  selectedSkillIds: string[];
   mcpServers: McpServerView[];
   threadMcpServers: ThreadMcpServerView[];
   workbenchError: string | null;
@@ -90,6 +98,10 @@ type WorkbenchPanelProps = {
   onUpdateMcpServer(serverId: string, input: McpServerInput): Promise<void>;
   onRestartMcpServer(serverId: string): Promise<void>;
   onDeleteMcpServer(serverId: string): Promise<void>;
+  onInstallPlugin(): Promise<void>;
+  onUninstallPlugin(pluginId: string): Promise<void>;
+  onToggleThreadPlugin(pluginId: string, enabled: boolean): Promise<void>;
+  onUsePluginSkills(pluginId: string, enabled: boolean): void;
   onOpenPath(targetPath: string): void;
   onEnsureTerminalSession(threadId: string): Promise<TerminalSession>;
   onWriteTerminalSession(
@@ -122,7 +134,7 @@ const tabs: Array<{
   { id: "files", label: "Files", icon: Folder },
   { id: "diff", label: "Diff", icon: GitBranch },
   { id: "terminal", label: "Terminal", icon: TerminalSquare },
-  { id: "extensions", label: "Extensions", icon: Puzzle },
+  { id: "extensions", label: "Plugins", icon: Puzzle },
   { id: "sandbox", label: "Sandbox", icon: Box },
 ];
 
@@ -138,6 +150,8 @@ export function WorkbenchPanel({
   filePreview,
   workspaceDiff,
   sandbox,
+  plugins,
+  selectedSkillIds,
   mcpServers,
   threadMcpServers,
   workbenchError,
@@ -157,6 +171,10 @@ export function WorkbenchPanel({
   onUpdateMcpServer,
   onRestartMcpServer,
   onDeleteMcpServer,
+  onInstallPlugin,
+  onUninstallPlugin,
+  onToggleThreadPlugin,
+  onUsePluginSkills,
   onOpenPath,
   onEnsureTerminalSession,
   onWriteTerminalSession,
@@ -219,6 +237,8 @@ export function WorkbenchPanel({
       {activeTab === "extensions" && (
         <ExtensionsView
           hasThread={Boolean(thread)}
+          plugins={plugins}
+          selectedSkillIds={selectedSkillIds}
           mcpServers={mcpServers}
           threadMcpServers={threadMcpServers}
           onToggleThreadMcp={onToggleThreadMcp}
@@ -226,6 +246,11 @@ export function WorkbenchPanel({
           onUpdateMcpServer={onUpdateMcpServer}
           onRestartMcpServer={onRestartMcpServer}
           onDeleteMcpServer={onDeleteMcpServer}
+          onInstallPlugin={onInstallPlugin}
+          onUninstallPlugin={onUninstallPlugin}
+          onToggleThreadPlugin={onToggleThreadPlugin}
+          onUsePluginSkills={onUsePluginSkills}
+          onOpenPath={onOpenPath}
         />
       )}
       {activeTab === "sandbox" && <SandboxView sandbox={sandbox} />}
@@ -368,6 +393,7 @@ function ContextCard({
   const budget = contextStatus?.budget;
   const usage = budget?.estimatedUsage ?? 0;
   const latestSummary = contextStatus?.latestSummary;
+  const providerUsage = contextStatus?.usage;
 
   return (
     <section className="panel-card context-card">
@@ -385,6 +411,21 @@ function ContextCard({
           <span style={{ width: `${Math.min(usage, 100)}%` }} />
         </div>
       )}
+      {providerUsage && providerUsage.modelRequests > 0 ? (
+        <div className="context-budget-row">
+          <span>{providerUsage.modelRequests} requests</span>
+          <span>{formatNumber(providerUsage.cachedInputTokens)} cached</span>
+          {providerUsage.cacheWriteTokens > 0 ? (
+            <span>{formatNumber(providerUsage.cacheWriteTokens)} written</span>
+          ) : null}
+          {providerUsage.compactions > 0 ? (
+            <span>{providerUsage.compactions} compactions</span>
+          ) : null}
+          {providerUsage.warnings > 0 ? (
+            <span>{providerUsage.warnings} warnings</span>
+          ) : null}
+        </div>
+      ) : null}
       {latestSummary ? (
         <details className="context-summary">
           <summary>
@@ -1199,6 +1240,330 @@ function lines(value: string): string[] {
 
 function ExtensionsView({
   hasThread,
+  plugins,
+  selectedSkillIds,
+  mcpServers,
+  threadMcpServers,
+  onToggleThreadMcp,
+  onCreateMcpServer,
+  onUpdateMcpServer,
+  onRestartMcpServer,
+  onDeleteMcpServer,
+  onInstallPlugin,
+  onUninstallPlugin,
+  onToggleThreadPlugin,
+  onUsePluginSkills,
+  onOpenPath,
+}: {
+  hasThread: boolean;
+  plugins: PluginView[];
+  selectedSkillIds: string[];
+  mcpServers: McpServerView[];
+  threadMcpServers: ThreadMcpServerView[];
+  onToggleThreadMcp(serverId: string, enabled: boolean): void;
+  onCreateMcpServer(input: McpServerInput): Promise<void>;
+  onUpdateMcpServer(serverId: string, input: McpServerInput): Promise<void>;
+  onRestartMcpServer(serverId: string): Promise<void>;
+  onDeleteMcpServer(serverId: string): Promise<void>;
+  onInstallPlugin(): Promise<void>;
+  onUninstallPlugin(pluginId: string): Promise<void>;
+  onToggleThreadPlugin(pluginId: string, enabled: boolean): Promise<void>;
+  onUsePluginSkills(pluginId: string, enabled: boolean): void;
+  onOpenPath(targetPath: string): void;
+}) {
+  const [view, setView] = useState<"plugins" | "mcp">("plugins");
+  const [query, setQuery] = useState("");
+  const [scope, setScope] = useState<"all" | PluginView["plugin"]["scope"]>(
+    "all",
+  );
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredPlugins = useMemo(
+    () =>
+      plugins.filter(({ plugin }) => {
+        if (scope !== "all" && plugin.scope !== scope) return false;
+        if (!normalizedQuery) return true;
+        return `${plugin.displayName} ${plugin.name} ${plugin.description} ${plugin.author} ${plugin.category}`
+          .toLocaleLowerCase()
+          .includes(normalizedQuery);
+      }),
+    [normalizedQuery, plugins, scope],
+  );
+  const activeCount = plugins.filter(
+    (plugin) =>
+      plugin.threadEnabled ||
+      plugin.skillIds.some((id) => selectedSkillIds.includes(id)),
+  ).length;
+
+  async function run(key: string, action: () => Promise<void>) {
+    setBusyKey(key);
+    setError(null);
+    try {
+      await action();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function removePlugin(view: PluginView) {
+    if (
+      !window.confirm(
+        `Remove "${view.plugin.displayName}" from OpenTopia? The original source folder is not changed.`,
+      )
+    ) {
+      return;
+    }
+    await run(`remove:${view.plugin.id}`, () =>
+      onUninstallPlugin(view.plugin.id),
+    );
+  }
+
+  return (
+    <div className="extensions-view plugins-browser">
+      <div className="plugin-browser-header">
+        <div className="plugin-view-switch" role="tablist" aria-label="Plugin view">
+          <button
+            className={view === "plugins" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={view === "plugins"}
+            onClick={() => setView("plugins")}
+          >
+            <Puzzle size={14} />
+            Plugins
+          </button>
+          <button
+            className={view === "mcp" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={view === "mcp"}
+            onClick={() => setView("mcp")}
+          >
+            <Settings2 size={14} />
+            MCP servers
+          </button>
+        </div>
+        {view === "plugins" && (
+          <button
+            className="secondary-button compact plugin-install-button"
+            type="button"
+            disabled={busyKey !== null}
+            onClick={() => void run("install", onInstallPlugin)}
+          >
+            <PackagePlus size={14} />
+            {busyKey === "install" ? "Installing" : "Add local"}
+          </button>
+        )}
+      </div>
+
+      {view === "plugins" ? (
+        <>
+          <div className="plugin-directory-controls">
+            <label className="plugin-search">
+              <span className="sr-only">Search plugins</span>
+              <Search size={14} />
+              <input
+                value={query}
+                placeholder="Search installed plugins"
+                onChange={(event) => setQuery(event.target.value)}
+              />
+              {query && (
+                <button
+                  type="button"
+                  title="Clear search"
+                  aria-label="Clear plugin search"
+                  onClick={() => setQuery("")}
+                >
+                  <X size={13} />
+                </button>
+              )}
+            </label>
+            <label className="plugin-scope-filter">
+              <span className="sr-only">Plugin source</span>
+              <select
+                value={scope}
+                onChange={(event) =>
+                  setScope(event.target.value as typeof scope)
+                }
+              >
+                <option value="all">All sources</option>
+                <option value="workspace">Project</option>
+                <option value="user">OpenTopia</option>
+                <option value="codex">Codex</option>
+              </select>
+            </label>
+          </div>
+          <div className="plugin-summary">
+            <span>{plugins.length} installed</span>
+            <span>{activeCount} in this turn</span>
+            <span>{filteredPlugins.length} shown</span>
+          </div>
+          {error && (
+            <p className="workspace-error" role="alert">
+              {error}
+            </p>
+          )}
+          <div className="plugin-directory" aria-live="polite">
+            {filteredPlugins.length ? (
+              filteredPlugins.map((item) => {
+                const plugin = item.plugin;
+                const skillsSelected =
+                  item.skillIds.length > 0 &&
+                  item.skillIds.every((id) => selectedSkillIds.includes(id));
+                const busy = busyKey?.endsWith(plugin.id) ?? false;
+                return (
+                  <article
+                    className={`plugin-entry ${item.compatible ? "" : "is-incompatible"}`}
+                    key={plugin.id}
+                    style={{ borderLeftColor: plugin.brandColor ?? undefined }}
+                  >
+                    <div className="plugin-entry-heading">
+                      <span className="plugin-monogram" aria-hidden="true">
+                        {plugin.displayName.slice(0, 1).toLocaleUpperCase()}
+                      </span>
+                      <div className="plugin-entry-title">
+                        <strong>{plugin.displayName}</strong>
+                        <span>{plugin.description || plugin.name}</span>
+                      </div>
+                      <span className={`plugin-source is-${plugin.scope}`}>
+                        {plugin.scope === "workspace"
+                          ? "Project"
+                          : plugin.scope === "codex"
+                            ? "Codex"
+                            : "OpenTopia"}
+                      </span>
+                    </div>
+                    <div className="plugin-capabilities" aria-label="Capabilities">
+                      {plugin.skillCount > 0 && (
+                        <span>
+                          <Workflow size={12} /> {plugin.skillCount} Skills
+                        </span>
+                      )}
+                      {plugin.mcpServerCount > 0 && (
+                        <span>
+                          <Wrench size={12} /> {plugin.supportedMcpServerCount}/
+                          {plugin.mcpServerCount} MCP
+                        </span>
+                      )}
+                      {plugin.hasApps && <span>App</span>}
+                      {plugin.version && <span>v{plugin.version}</span>}
+                      {plugin.category && <span>{plugin.category}</span>}
+                    </div>
+                    {plugin.issues.length > 0 && (
+                      <details className="plugin-issues">
+                        <summary>
+                          <ShieldAlert size={13} />
+                          {item.compatible ? "Limited support" : "Not available"}
+                        </summary>
+                        <ul>
+                          {plugin.issues.map((issue) => (
+                            <li key={issue}>{issue}</li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                    <div className="plugin-entry-actions">
+                      <div className="plugin-primary-actions">
+                        {item.skillIds.length > 0 && (
+                          <button
+                            className={`secondary-button compact ${skillsSelected ? "is-selected" : ""}`}
+                            type="button"
+                            aria-pressed={skillsSelected}
+                            onClick={() =>
+                              onUsePluginSkills(plugin.id, !skillsSelected)
+                            }
+                          >
+                            {skillsSelected ? <Check size={13} /> : <Plus size={13} />}
+                            {skillsSelected ? "Skills added" : "Use Skills"}
+                          </button>
+                        )}
+                        {plugin.supportedMcpServerCount > 0 && (
+                          <label
+                            className="plugin-task-toggle"
+                            title={
+                              hasThread
+                                ? "Enable all supported MCP tools for this task"
+                                : "Open a task to enable MCP tools"
+                            }
+                          >
+                            <input
+                              type="checkbox"
+                              checked={item.threadEnabled}
+                              disabled={!hasThread || busy}
+                              onChange={(event) =>
+                                void run(`toggle:${plugin.id}`, () =>
+                                  onToggleThreadPlugin(
+                                    plugin.id,
+                                    event.target.checked,
+                                  ),
+                                )
+                              }
+                            />
+                            <span>Task tools</span>
+                          </label>
+                        )}
+                      </div>
+                      <div className="plugin-secondary-actions">
+                        <button
+                          className="icon-button"
+                          type="button"
+                          title="Open plugin folder"
+                          aria-label={`Open ${plugin.displayName} folder`}
+                          onClick={() => onOpenPath(plugin.path)}
+                        >
+                          <FolderOpen size={14} />
+                        </button>
+                        {plugin.managed && (
+                          <button
+                            className="icon-button danger"
+                            type="button"
+                            title="Remove plugin"
+                            aria-label={`Remove ${plugin.displayName}`}
+                            disabled={busyKey !== null}
+                            onClick={() => void removePlugin(item)}
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </article>
+                );
+              })
+            ) : (
+              <div className="workbench-empty-state plugin-empty-state">
+                <Puzzle size={22} />
+                <strong>{plugins.length ? "No plugins match" : "No plugins installed"}</strong>
+                <span>
+                  {plugins.length
+                    ? "Try another search or source."
+                    : "Add a local Codex-compatible plugin folder."}
+                </span>
+              </div>
+            )}
+          </div>
+        </>
+      ) : (
+        <McpServersView
+          hasThread={hasThread}
+          mcpServers={mcpServers}
+          threadMcpServers={threadMcpServers}
+          onToggleThreadMcp={onToggleThreadMcp}
+          onCreateMcpServer={onCreateMcpServer}
+          onUpdateMcpServer={onUpdateMcpServer}
+          onRestartMcpServer={onRestartMcpServer}
+          onDeleteMcpServer={onDeleteMcpServer}
+        />
+      )}
+    </div>
+  );
+}
+
+function McpServersView({
+  hasThread,
   mcpServers,
   threadMcpServers,
   onToggleThreadMcp,
@@ -1861,7 +2226,10 @@ function buildTerminalRows(events: AgentEvent[]): TerminalRow[] {
             label: "task plan updated",
             time,
             body: event.payload.plan.steps
-              .map((item) => `[${item.status}] ${item.step}`)
+              .map(
+                (item) =>
+                  `[${item.status}] ${item.title || item.step || item.id}`,
+              )
               .join("\n"),
             artifacts: [],
           };

@@ -17,6 +17,12 @@ export type PlatformInfo = {
   };
 };
 
+export type SystemNotificationOptions = {
+  title: string;
+  body: string;
+  silent?: boolean;
+};
+
 export type RecentWorkspace = {
   workspaceRoot: string;
   name: string;
@@ -44,6 +50,9 @@ export type ContextSourcePickResult =
   | { canceled: true; files: [] }
   | { canceled: false; files: ContextSourceFile[] };
 
+export type PluginDirectoryPickResult =
+  { canceled: true } | { canceled: false; path: string };
+
 export type BrowserContent =
   | { type: "text"; text: string; truncated: boolean }
   | { type: "json"; value: unknown }
@@ -61,7 +70,42 @@ export type BrowserOutput = {
   metadata: unknown;
 };
 
+export type ScreenRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type ComputerWindowTarget = {
+  windowId: string;
+  processId: number;
+  title: string;
+  executable?: string | null;
+  bounds: ScreenRect;
+  isForeground: boolean;
+};
+
+export type ComputerScreenshot = {
+  mimeType: string;
+  bytes: number[];
+};
+
+export type ComputerObservation = {
+  observationId: string;
+  sessionId: string;
+  target: ComputerWindowTarget;
+  captureRect: ScreenRect;
+  imageWidth: number;
+  imageHeight: number;
+  screenshot?: ComputerScreenshot | null;
+  accessibilityTree?: unknown | null;
+  unstable: boolean;
+  capturedAt: string;
+};
+
 export type ExperienceMode = "work" | "code";
+export type CollaborationMode = "default" | "plan" | "goal";
 
 export type Thread = {
   id: string;
@@ -95,7 +139,18 @@ export type AppSettings = {
   permissionMode: PermissionMode;
   defaultWorkspaceRoot?: string | null;
   sandbox: SandboxSettings;
+  webSearch: WebSearchSettings;
   updatedAt: string;
+};
+
+export type WebSearchMode = "disabled" | "provider_native" | "custom_api";
+
+export type WebSearchSettings = {
+  mode: WebSearchMode;
+  endpoint: string;
+  apiKeySource: string;
+  apiKeyConfigured: boolean;
+  maxResults: number;
 };
 
 export type SandboxSettings = {
@@ -119,6 +174,8 @@ export type ProviderSettings = {
   storeResponses: boolean;
   parallelToolCalls: boolean;
   promptCacheKey?: string | null;
+  promptCachePolicy?: "explicit_30m" | "legacy_in_memory" | "legacy_24h" | null;
+  responsesCompactionThresholdTokens?: number | null;
   rolloutBudget?: RolloutBudgetSettings | null;
   apiKeySource: string;
   apiKeyConfigured: boolean;
@@ -184,9 +241,21 @@ export type KeyringMetadata = {
   status: string;
 };
 
+export type WebSearchKeyringMetadata = {
+  available: boolean;
+  encryptionAvailable: boolean;
+  storageBackend?: string | null;
+  storagePath?: string;
+  apiKeyConfigured: boolean;
+  apiKeySourceId: string;
+  envTarget: string;
+  status: string;
+};
+
 export type SecretSources = {
   activeProviderKeySource: string | null;
   keyring?: KeyringMetadata;
+  webSearchKeyring?: WebSearchKeyringMetadata;
   sources: SecretSource[];
   notes: string[];
 };
@@ -254,6 +323,86 @@ export type WorkspaceDiff = {
   truncated: boolean;
   stagedTruncated?: boolean;
   unstagedTruncated?: boolean;
+};
+
+export type TurnChangeSetStatus = "capturing" | "ready" | "empty" | "failed";
+
+export type TurnFileChangeKind = "added" | "modified" | "deleted" | "renamed";
+
+export type TurnFileChange = {
+  kind: TurnFileChangeKind;
+  oldPath?: string | null;
+  newPath?: string | null;
+  beforeOid?: string | null;
+  afterOid?: string | null;
+  beforeMode?: string | null;
+  afterMode?: string | null;
+  additions?: number | null;
+  deletions?: number | null;
+  binary: boolean;
+};
+
+export type TurnChangeSet = {
+  turnId: string;
+  threadId: string;
+  workspaceRoot: string;
+  repoRoot?: string | null;
+  workspacePrefix?: string | null;
+  beforeTree?: string | null;
+  afterTree?: string | null;
+  status: TurnChangeSetStatus;
+  files: TurnFileChange[];
+  additions: number;
+  deletions: number;
+  error?: string | null;
+  createdAt: string;
+  finalizedAt?: string | null;
+  revertedAt?: string | null;
+};
+
+export type TurnFileDiffPreview = {
+  turnId: string;
+  path: string;
+  oldPath?: string | null;
+  newPath?: string | null;
+  binary: boolean;
+  diff: string;
+  offset: number;
+  nextOffset?: number | null;
+  totalBytes: number;
+};
+
+export type TurnUndoConflictKind =
+  | "unavailable"
+  | "already_reverted"
+  | "workspace_changed"
+  | "merge_conflict"
+  | "binary_changed"
+  | "path_conflict"
+  | "unsupported_file_type"
+  | "too_large";
+
+export type TurnUndoConflict = {
+  path?: string | null;
+  kind: TurnUndoConflictKind;
+  reason: string;
+};
+
+export type TurnUndoPreview = {
+  turnId: string;
+  canUndo: boolean;
+  filesToChange: number;
+  additions: number;
+  deletions: number;
+  conflicts: TurnUndoConflict[];
+  changeSet: TurnChangeSet;
+};
+
+export type TurnUndoResult = {
+  applied: boolean;
+  filesChanged: number;
+  preview: TurnUndoPreview;
+  changeSet: TurnChangeSet;
 };
 
 export type GitWorkflowActionKind =
@@ -387,6 +536,15 @@ export type ContextSummary = {
 export type ContextStatus = {
   budget: ContextBudget;
   latestSummary?: ContextSummary | null;
+  usage: {
+    modelRequests: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    cacheWriteTokens: number;
+    reasoningTokens: number;
+    compactions: number;
+    warnings: number;
+  };
 };
 
 export type ArtifactDescriptor = {
@@ -512,6 +670,8 @@ export type McpServerConfig = {
   envKeys: string[];
   timeoutMs: number;
   enabled: boolean;
+  pluginId?: string;
+  pluginServerName?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -581,6 +741,11 @@ export type MessagePart =
   | { type: "file_ref"; path: string }
   | { type: "source_ref"; source: ContextSourceRef }
   | { type: "skill_ref"; skill: SkillRef }
+  | {
+      type: "turn_context";
+      collaboration_mode: CollaborationMode;
+      goal_id?: string | null;
+    }
   | { type: "error"; message: string };
 
 export type ContextSourceRef = {
@@ -593,12 +758,88 @@ export type ContextSourceRef = {
   truncated: boolean;
 };
 
+export type SkillScope = "workspace" | "user";
+
 export type SkillDescriptor = {
   id: string;
   name: string;
   description: string;
   path: string;
-  scope: "workspace" | "user";
+  scope: SkillScope;
+  pluginId?: string;
+};
+
+export type PluginDescriptor = {
+  id: string;
+  name: string;
+  displayName: string;
+  version: string;
+  description: string;
+  longDescription: string;
+  author: string;
+  category: string;
+  path: string;
+  manifestPath: string;
+  scope: "workspace" | "user" | "codex";
+  managed: boolean;
+  skillRoot?: string;
+  skillCount: number;
+  mcpServerCount: number;
+  supportedMcpServerCount: number;
+  hasApps: boolean;
+  capabilities: string[];
+  brandColor?: string;
+  websiteUrl?: string;
+  issues: string[];
+};
+
+export type PluginView = {
+  plugin: PluginDescriptor;
+  skillIds: string[];
+  mcpServers: McpServerView[];
+  threadEnabled: boolean;
+  compatible: boolean;
+};
+
+export type SkillResourceDraft = {
+  path: string;
+  content: string;
+};
+
+export type SkillDraft = {
+  name: string;
+  description: string;
+  instructions: string;
+  displayName: string;
+  shortDescription: string;
+  defaultPrompt: string;
+  resources: SkillResourceDraft[];
+};
+
+export type SkillDraftPreview = {
+  draft: SkillDraft;
+  skillMd: string;
+  openaiYaml: string;
+  targetPath: string;
+  targetExists: boolean;
+  files: string[];
+};
+
+export type GenerateSkillInput = {
+  prompt: string;
+  scope: SkillScope;
+  workspaceRoot?: string | null;
+};
+
+export type CreateSkillInput = {
+  draft: SkillDraft;
+  scope: SkillScope;
+  workspaceRoot?: string | null;
+};
+
+export type CreatedSkill = {
+  skill: SkillDescriptor;
+  files: string[];
 };
 
 export type SkillRef = {
@@ -622,16 +863,102 @@ export type ToolResult = {
   metadata: unknown;
 };
 
-export type TaskPlanStepStatus = "pending" | "in_progress" | "completed";
+export type TaskPlanStepStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "deferred"
+  | "blocked"
+  | "cancelled";
 
 export type TaskPlanStep = {
-  step: string;
+  id: string;
+  title: string;
+  step?: string;
   status: TaskPlanStepStatus;
+  statusReason?: string | null;
+  dependencies: string[];
+  acceptanceCriteria: string[];
+  evidence: string[];
 };
 
 export type TaskPlan = {
+  planRevision: number;
+  goalId: string;
+  changeReason?: string | null;
   explanation?: string | null;
   steps: TaskPlanStep[];
+};
+
+export type GoalStatus =
+  | "draft"
+  | "ready"
+  | "active"
+  | "paused"
+  | "completed"
+  | "blocked"
+  | "cancelled"
+  | "failed";
+
+export type GoalTaskStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "deferred"
+  | "blocked"
+  | "cancelled"
+  | "failed";
+
+export type GoalAttemptStatus =
+  "running" | "succeeded" | "failed" | "interrupted";
+
+export type GoalRecord = {
+  id: string;
+  threadId: string;
+  objective: string;
+  status: GoalStatus;
+  planRevision: number;
+  tokenBudget?: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+};
+
+export type GoalTask = {
+  goalId: string;
+  stepId: string;
+  ordinal: number;
+  title: string;
+  status: GoalTaskStatus;
+  statusReason?: string | null;
+  dependencies: string[];
+  acceptanceCriteria: string[];
+  evidence: string[];
+  attemptCount: number;
+  maxAttempts: number;
+  updatedAt: string;
+};
+
+export type GoalTaskAttempt = {
+  id: string;
+  goalId: string;
+  stepId: string;
+  turnId: string;
+  attemptNo: number;
+  status: GoalAttemptStatus;
+  startedAt: string;
+  finishedAt?: string | null;
+  evidence: string[];
+  error?: string | null;
+};
+
+export type GoalSnapshot = {
+  goal: GoalRecord;
+  tasks: GoalTask[];
+  attempts: GoalTaskAttempt[];
 };
 
 export type ModelContentPart =
@@ -792,8 +1119,15 @@ export type AgentEventPayload =
   | { type: "tool_call_started"; call: ToolCall }
   | { type: "tool_call_finished"; result: ToolResult }
   | { type: "plan_updated"; plan: TaskPlan }
+  | { type: "goal_updated"; snapshot: GoalSnapshot }
   | { type: "assistant_message"; message: Message }
   | { type: "file_changed"; path: string; summary: string }
+  | { type: "turn_changes_recorded"; change_set: TurnChangeSet }
+  | {
+      type: "turn_undo_completed";
+      target_turn_id: string;
+      files_changed: number;
+    }
   | { type: "subagent_updated"; run: SubagentRun }
   | {
       type: "approval_requested";
@@ -819,11 +1153,15 @@ export type AgentEventPayload =
     }
   | { type: "auto_review_interruption_warning"; message: string }
   | { type: "context_compacted"; summary: ContextSummary }
+  | { type: "context_warning"; stage: string; message: string }
   | {
       type: "token_usage";
       input_tokens: number;
       output_tokens: number;
       total_tokens: number;
+      cached_input_tokens?: number | null;
+      cache_write_tokens?: number | null;
+      reasoning_tokens?: number | null;
     }
   | { type: "turn_finished"; summary: string }
   | { type: "turn_suspended"; approval_id: string; reason: string }
@@ -883,12 +1221,18 @@ declare global {
       getPlatformInfo(): Promise<PlatformInfo>;
       openExternal(url: string): Promise<void>;
       openPath(targetPath: string): Promise<{ path: string }>;
+      showSystemNotification(
+        options: SystemNotificationOptions,
+      ): Promise<boolean>;
       selectWorkspace(options?: {
         defaultPath?: string;
       }): Promise<WorkspacePickResult>;
       selectContextFiles(options?: {
         defaultPath?: string;
       }): Promise<ContextSourcePickResult>;
+      selectPluginDirectory(options?: {
+        defaultPath?: string;
+      }): Promise<PluginDirectoryPickResult>;
       getRecentWorkspaces(): Promise<RecentWorkspace[]>;
       saveRecentWorkspace(workspaceRoot: string): Promise<RecentWorkspace[]>;
       removeRecentWorkspace(workspaceRoot: string): Promise<RecentWorkspace[]>;
@@ -902,6 +1246,9 @@ declare global {
         value: string,
       ): Promise<KeyringMetadata>;
       deleteProviderApiKey(providerId: string): Promise<KeyringMetadata>;
+      getWebSearchApiKeyMetadata(): Promise<WebSearchKeyringMetadata>;
+      setWebSearchApiKey(value: string): Promise<WebSearchKeyringMetadata>;
+      deleteWebSearchApiKey(): Promise<WebSearchKeyringMetadata>;
       listLogFiles(): Promise<LogFileInfo[]>;
       readLogFile(
         path: string,

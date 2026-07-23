@@ -58,6 +58,18 @@ pub enum ContextCacheScope {
     None,
 }
 
+impl ContextCacheScope {
+    const fn sort_order(self) -> u8 {
+        match self {
+            Self::Stable => 0,
+            Self::Thread => 1,
+            Self::Turn => 2,
+            Self::Round => 3,
+            Self::None => 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextSensitivity {
@@ -147,9 +159,19 @@ pub struct CompiledModelContext {
 }
 
 impl CompiledModelContext {
+    pub fn ordered_items(&self) -> Vec<&ModelContextItem> {
+        let mut items = self.items.iter().enumerate().collect::<Vec<_>>();
+        items.sort_by_key(|(index, item)| (item.cache_scope.sort_order(), *index));
+        items.into_iter().map(|(_, item)| item).collect()
+    }
+
+    pub fn sort_items(&mut self) {
+        self.items.sort_by_key(|item| item.cache_scope.sort_order());
+    }
+
     pub fn instruction_messages(&self) -> Vec<(ContextRole, String)> {
-        self.items
-            .iter()
+        self.ordered_items()
+            .into_iter()
             .filter(|item| {
                 matches!(item.role, ContextRole::System | ContextRole::Developer)
                     && !matches!(item.kind, ContextItemKind::Summary)
@@ -192,7 +214,7 @@ impl CompiledModelContext {
 
     pub fn content_hash(&self) -> String {
         let mut bytes = Vec::new();
-        for item in &self.items {
+        for item in self.ordered_items() {
             bytes.extend_from_slice(item.kind.as_str().as_bytes());
             bytes.push(0);
             bytes.extend_from_slice(item.content_hash.as_bytes());
@@ -202,7 +224,10 @@ impl CompiledModelContext {
     }
 
     pub fn token_estimate(&self) -> usize {
-        self.items.iter().map(|item| item.token_estimate).sum()
+        self.ordered_items()
+            .into_iter()
+            .map(|item| item.token_estimate)
+            .sum()
     }
 }
 
@@ -391,7 +416,19 @@ pub fn content_fingerprint(bytes: &[u8]) -> String {
 }
 
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    let mut estimate = 0usize;
+    let mut ascii_run = 0usize;
+    for character in text.chars() {
+        if character.is_ascii() {
+            ascii_run += 1;
+            continue;
+        }
+
+        estimate += (ascii_run + 3) / 4;
+        ascii_run = 0;
+        estimate += if character.len_utf8() == 4 { 2 } else { 1 };
+    }
+    estimate + (ascii_run + 3) / 4
 }
 
 pub fn world_state_item(world_state: &WorldStateSnapshot) -> ModelContextItem {
@@ -439,7 +476,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_hash_is_stable_and_order_sensitive() {
+    fn context_hash_is_stable_and_order_sensitive_within_a_scope() {
         let first = ModelContextItem::text(
             ContextItemKind::BaseInstructions,
             ContextRole::System,
@@ -449,11 +486,11 @@ mod tests {
             ContextSensitivity::Public,
         );
         let second = ModelContextItem::text(
-            ContextItemKind::Environment,
+            ContextItemKind::DeveloperInstructions,
             ContextRole::Developer,
-            "environment",
+            "developer",
             "two",
-            ContextCacheScope::Turn,
+            ContextCacheScope::Stable,
             ContextSensitivity::Workspace,
         );
         let left = CompiledModelContext {
@@ -467,6 +504,107 @@ mod tests {
 
         assert_eq!(left.content_hash(), left.content_hash());
         assert_ne!(left.content_hash(), right.content_hash());
+    }
+
+    #[test]
+    fn token_estimate_is_conservative_for_non_ascii_text() {
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("hello world"), 3);
+        assert_eq!(estimate_tokens("\u{4f60}\u{597d}\u{4e16}\u{754c}"), 4);
+        assert_eq!(estimate_tokens("a\u{4f60}b\u{597d}"), 4);
+        assert_eq!(estimate_tokens("\u{1f680}"), 2);
+    }
+
+    #[test]
+    fn compiled_context_orders_cache_scopes_and_preserves_in_scope_order() {
+        fn item(source: &str, scope: ContextCacheScope) -> ModelContextItem {
+            ModelContextItem::text(
+                ContextItemKind::DeveloperInstructions,
+                ContextRole::Developer,
+                source,
+                source,
+                scope,
+                ContextSensitivity::Workspace,
+            )
+        }
+
+        let mut context = CompiledModelContext {
+            items: vec![
+                item("turn-first", ContextCacheScope::Turn),
+                item("stable-first", ContextCacheScope::Stable),
+                item("none-first", ContextCacheScope::None),
+                item("thread-first", ContextCacheScope::Thread),
+                item("round-first", ContextCacheScope::Round),
+                item("stable-second", ContextCacheScope::Stable),
+                item("turn-second", ContextCacheScope::Turn),
+            ],
+            prompt_cache_key: None,
+        };
+
+        let sources = context
+            .ordered_items()
+            .into_iter()
+            .map(|item| item.source.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            vec![
+                "stable-first",
+                "stable-second",
+                "thread-first",
+                "turn-first",
+                "turn-second",
+                "round-first",
+                "none-first",
+            ]
+        );
+
+        let expected_hash = context.content_hash();
+        context.sort_items();
+        assert_eq!(context.content_hash(), expected_hash);
+        assert_eq!(context.items[0].source, "stable-first");
+        assert_eq!(context.items[1].source, "stable-second");
+    }
+
+    #[test]
+    fn instruction_messages_use_cache_scope_order() {
+        let context = CompiledModelContext {
+            items: vec![
+                ModelContextItem::text(
+                    ContextItemKind::Environment,
+                    ContextRole::Developer,
+                    "turn",
+                    "turn text",
+                    ContextCacheScope::Turn,
+                    ContextSensitivity::Workspace,
+                ),
+                ModelContextItem::text(
+                    ContextItemKind::BaseInstructions,
+                    ContextRole::System,
+                    "base",
+                    "stable text",
+                    ContextCacheScope::Stable,
+                    ContextSensitivity::Public,
+                ),
+                ModelContextItem::text(
+                    ContextItemKind::RepositoryInstructions,
+                    ContextRole::Developer,
+                    "repository",
+                    "thread text",
+                    ContextCacheScope::Thread,
+                    ContextSensitivity::Workspace,
+                ),
+            ],
+            prompt_cache_key: None,
+        };
+
+        let messages = context.instruction_messages();
+        assert_eq!(
+            messages[0],
+            (ContextRole::System, "stable text".to_string())
+        );
+        assert!(messages[1].1.contains("thread text"));
+        assert!(messages[2].1.contains("turn text"));
     }
 
     #[test]

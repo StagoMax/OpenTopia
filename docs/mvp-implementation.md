@@ -35,6 +35,9 @@ Implemented:
 - `McpStdioClient` with full stdio process lifecycle: spawn, initialize, list_tools, call_tool, shutdown, timeout handling, stderr logging, and JSON-RPC message parsing.
 - `McpExtensionHost` with tool schema caching, public-name routing, and duplicate detection.
 - Descriptor/annotation-aware MCP policy checks using permission labels such as `read`, `write`, `network`, `secret`, `destructive`, and `unknown`.
+- Codex-compatible plugin discovery from project, OpenTopia user, and Codex cache roots;
+  plugin Skills are namespaced as `plugin-name:Skill`, while supported stdio MCP
+  servers retain plugin ownership and explicit environment allowlists.
 
 The agent loop currently:
 
@@ -43,7 +46,7 @@ The agent loop currently:
 3. Executes deterministic local tool commands when the user uses slash commands.
 4. Otherwise calls the configured OpenAI-compatible provider, falling back to the mock provider.
 5. Parses provider `tool_calls`, executes built-in or enabled MCP tools through policy checks, and returns tool results to the provider until the provider reaches a terminal response.
-6. Emits tool start/finish events and automatically compacts older completed tool history near the context-window boundary without imposing a task-level round or elapsed-time limit.
+6. Emits tool start/finish events, automatically compacts older completed tool history near the context-window boundary, reviews progress after 90-round main-model segments, and enforces a hard 270-round ceiling.
 7. Emits an assistant message and `turn_finished`.
 
 ### Rust Server
@@ -66,6 +69,12 @@ Implemented:
 - `PATCH /api/projects/{project_id}`
 - `DELETE /api/projects/{project_id}`
 - `GET /api/skills?workspaceRoot=...`
+- `POST /api/skills/generate`
+- `POST /api/skills`
+- `GET /api/plugins?workspaceRoot=...&threadId=...`
+- `POST /api/plugins/install`
+- `POST /api/plugins/uninstall`
+- `PUT /api/threads/{thread_id}/plugins`
 - `GET /api/threads/{thread_id}/messages`
 - `POST /api/threads/{thread_id}/messages`
 - `GET /api/threads/{thread_id}/events`
@@ -171,6 +180,12 @@ Implemented:
 - Explicit file/image/document source selection through Electron, server-side canonicalization,
   sensitive/type/size limits, message-persisted references, bounded text context, and right-rail recovery.
 - Turn-scoped Codex-compatible Skills discovery/selection and bounded `SKILL.md` injection.
+- Plugin directory with local-folder installation, project/OpenTopia/Codex source filters,
+  capability and compatibility status, bounded Skill selection, managed-copy removal,
+  and per-Thread plugin MCP enablement.
+- Natural-language Skill authoring with strict structured model output, editable desktop preview,
+  project/user scope selection, server-side validation, conflict protection, and atomic creation of
+  `SKILL.md`, `agents/openai.yaml`, and optional text resources.
 - Real persistent subagents with AgentCore execution, concurrency/depth controls, no scheduler
   execution deadline,
   recursive cancellation, model-callable lifecycle tools, concurrent `wait_agents`, HTTP
@@ -256,7 +271,8 @@ interrupted. Provider SSE text is forwarded and persisted incrementally, with su
 history replay and sequence deduplication.
 
 Approval suspension persists the provider conversation, completed tool results,
-pending calls, original permission mode, context budget, and rollout budget. Allow
+pending calls, original permission mode, context budget, rollout budget, completed
+main-model rounds, and rollout-review count. Allow
 grants full access only to the exact pending call. Deny returns a structured tool
 error to the model and continues that same turn.
 
@@ -266,9 +282,12 @@ automatic LLM compaction triggers at
 `OPENTOPIA_CONTEXT_COMPACT_THRESHOLD_PERCENT` (default `80`) before history is
 trimmed to its bounded input budget.
 
-The tool loop ends only when the Provider returns an assistant response without
-tool calls. `update_plan` and `complete_task` return ordinary tool results and do
-not terminate a Turn. An optional weighted rollout budget can be configured with
+The tool loop normally ends when the Provider returns a valid non-empty final assistant
+response without tool calls. If tool work is still requested after 90 or 180 main-model
+rounds, the existing guardian reviewer must approve another segment; after round 270 it
+must stop and no round 271 is started. Reviewer calls and tool calls do not count as main-model
+rounds. `update_plan` and `complete_task` return ordinary tool results and do not terminate a
+Turn. An optional weighted rollout budget can stop a turn earlier and can be configured with
 `OPENTOPIA_ROLLOUT_TOKEN_LIMIT`, `OPENTOPIA_ROLLOUT_OUTPUT_WEIGHT`, and
 `OPENTOPIA_ROLLOUT_INPUT_WEIGHT`; the same fields are available in desktop
 Provider settings.
@@ -285,6 +304,8 @@ The current MVP intentionally does not yet include:
 - Multiple named PTY sessions and shell selection; one long-lived PTY per thread is implemented.
 - Product-specific GitHub/Linear/Jira/document connectors beyond the MCP host. Linear/Jira are
   explicitly deferred under the current product focus.
+- HTTP/OAuth plugin MCP transports and plugin App bridges. They are detected and shown as
+  limited support; only stdio MCP servers are executable in the current runtime.
 - PDF/Office extraction into model context and Office editing beyond the existing XLSX tool.
   In-app PDF rendering and XLSX workbook/range preview are implemented; document resources do
   not yet become model context automatically.

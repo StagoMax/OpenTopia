@@ -34,9 +34,13 @@ contextBridge.exposeInMainWorld("opentopia", {
   openExternal: (url) => ipcRenderer.invoke("platform:open-external", url),
   openPath: (targetPath) =>
     ipcRenderer.invoke("platform:open-path", targetPath),
+  showSystemNotification: (options) =>
+    ipcRenderer.invoke("platform:show-system-notification", options),
   selectWorkspace: (options) => ipcRenderer.invoke("workspace:select", options),
   selectContextFiles: (options) =>
     ipcRenderer.invoke("context:select-files", options),
+  selectPluginDirectory: (options) =>
+    ipcRenderer.invoke("plugins:select-directory", options),
   getRecentWorkspaces: () => ipcRenderer.invoke("workspace:get-recent"),
   saveRecentWorkspace: (workspaceRoot) =>
     ipcRenderer.invoke("workspace:save-recent", workspaceRoot),
@@ -52,6 +56,12 @@ contextBridge.exposeInMainWorld("opentopia", {
     ipcRenderer.invoke("secrets:set-provider-key", providerId, value),
   deleteProviderApiKey: (providerId) =>
     ipcRenderer.invoke("secrets:delete-provider-key", providerId),
+  getWebSearchApiKeyMetadata: () =>
+    ipcRenderer.invoke("secrets:get-web-search-key-metadata"),
+  setWebSearchApiKey: (value) =>
+    ipcRenderer.invoke("secrets:set-web-search-key", value),
+  deleteWebSearchApiKey: () =>
+    ipcRenderer.invoke("secrets:delete-web-search-key"),
   listLogFiles: () => ipcRenderer.invoke("logs:list"),
   readLogFile: (path, offset, limit) =>
     ipcRenderer.invoke("logs:read", path, offset, limit),

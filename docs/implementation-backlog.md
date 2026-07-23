@@ -189,6 +189,11 @@ Implemented:
   and 512 KiB aggregate text injection limits.
 - Codex-compatible `SKILL.md` discovery under workspace/user skill roots, YAML metadata,
   allowlisted IDs, five Skills per Turn, and 128 KiB aggregate instruction limit.
+- Natural-language Skill draft generation through the active model provider with strict JSON
+  Schema, one automatic repair attempt, and an editable three-step desktop workflow.
+- Validated project/user Skill persistence with generated `SKILL.md` and `agents/openai.yaml`,
+  bounded optional resources, traversal/symlink boundary checks, conflict rejection, and atomic
+  directory commit.
 - Subagent scheduler and real AgentCore executor with inherited workspace/provider/policy/sandbox,
   four concurrent children per parent, depth two, no scheduler execution deadline, typed events, SQLite
   persistence/restart recovery, model-callable tools, HTTP controls, and desktop status/actions.
