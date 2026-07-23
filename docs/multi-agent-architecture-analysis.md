@@ -214,6 +214,21 @@ sequenceDiagram
 
 每个 Agent 回合进入终态时，Runtime 还会自动向 `parent_agent_path` 投递 `completion` mailbox 消息。父 Agent 无需轮询每个 UUID；`wait_agent` 可以在消息到达或 Agent 终止时被唤醒。子 Agent 也可以显式向 `/root` 发送中间证据。
 
+### 4.6 父 Agent 完成门禁
+
+父 Agent 的模型请求不会被异步消息强行修改；Runtime 在模型准备结束当前回合时执行一次协调检查：
+
+1. 读取发给当前 Agent 的未读 mailbox 消息；
+2. 检查当前 Agent 路径下仍处于 `queued` 或 `running` 的后代；
+3. 如果两者都为空，接受最终响应；
+4. 否则拒绝这次结束候选，将结构化 `runtime_finalization_guard` 结果返回模型，由模型决定调用 `wait_agent`、`interrupt_agent` 或继续协调。这个统一门禁还会检查待决工具/审批、`in_progress` 计划和已声明的验证要求。
+
+`completion` 消息先写入 mailbox，再公开 Agent 终态，避免父 Agent 在“终态已可见、结果尚未入队”的窗口中错误结束。带目标的 `wait_agent(target)` 返回该 Agent 当前回合结果时，也会同时取走来自该 Agent 的 mailbox 消息，表示父 Agent 已确认这批信息，防止完成门禁再次重复投递。
+
+门禁对 mailbox 使用两阶段确认：先把消息快照送入模型请求，只有请求成功返回后才确认并删除这一批；如果模型请求失败，原消息仍留在 mailbox。确认过程只删除快照中的消息，期间新到达的消息不会被误标为已读。
+
+门禁不替模型判断哪些结果重要，也不自动取消工作。它只保证父 Agent 不会在存在未读协调信息或仍活跃后代时静默结束。连续三次忽略门禁会使当前回合失败，而不是无限消耗模型调用。
+
 ## 5. 如何避免 Agent 工作依赖
 
 “避免依赖”不是禁止任务有先后关系，而是避免隐式、不可见、同时写共享状态的依赖。

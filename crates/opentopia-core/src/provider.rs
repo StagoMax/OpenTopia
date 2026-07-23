@@ -1,6 +1,8 @@
 use crate::model::ModelContentPart;
-use crate::model_context::{CompiledModelContext, ContextRole, ModelContextItem};
-use crate::settings::{ProviderHealthCheck, ProviderKind, ProviderSettings};
+use crate::model_context::{
+    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ModelContextItem,
+};
+use crate::settings::{PromptCachePolicy, ProviderHealthCheck, ProviderKind, ProviderSettings};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -56,6 +58,15 @@ pub struct ModelRequest {
     pub context_items: Vec<ModelContextItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previous_response_items: Vec<Value>,
+    /// Continue a stored Responses API chain. The logical request still carries
+    /// the complete replay context so the adapter can recover if this cursor is
+    /// unknown or expired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// Branch-specific developer instructions are emitted after inherited
+    /// conversation history so sibling agents retain an identical prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +85,8 @@ pub struct ModelResponse {
     pub response_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_items: Vec<Value>,
+    #[serde(default)]
+    pub finish_reason: ModelFinishReason,
 }
 
 impl ModelResponse {
@@ -84,8 +97,100 @@ impl ModelResponse {
             usage: None,
             response_id: None,
             provider_items: Vec::new(),
+            finish_reason: ModelFinishReason::Stop,
         }
     }
+
+    pub fn decision(&self) -> ModelDecision {
+        if let Some(reason) = self.finish_reason.incomplete_reason() {
+            return ModelDecision::Incomplete(reason);
+        }
+        if !self.tool_calls.is_empty() {
+            return ModelDecision::Act(self.tool_calls.clone());
+        }
+        if self.finish_reason == ModelFinishReason::ToolCalls {
+            return ModelDecision::Incomplete(IncompleteReason::ProviderProtocol(
+                "provider reported tool_calls but returned no tool call".to_string(),
+            ));
+        }
+        let text = self.text.trim();
+        if text.is_empty() {
+            ModelDecision::Incomplete(IncompleteReason::EmptyResponse)
+        } else {
+            ModelDecision::Final(text.to_string())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "reason", rename_all = "snake_case")]
+pub enum ModelFinishReason {
+    Stop,
+    ToolCalls,
+    Completed,
+    Length,
+    ContentFilter,
+    Incomplete(String),
+    StreamInterrupted,
+}
+
+impl Default for ModelFinishReason {
+    fn default() -> Self {
+        Self::StreamInterrupted
+    }
+}
+
+impl ModelFinishReason {
+    fn incomplete_reason(&self) -> Option<IncompleteReason> {
+        match self {
+            Self::Stop | Self::ToolCalls | Self::Completed => None,
+            Self::Length => Some(IncompleteReason::OutputTokenLimit),
+            Self::ContentFilter => Some(IncompleteReason::ContentFilter),
+            Self::Incomplete(reason) => Some(IncompleteReason::Provider(reason.clone())),
+            Self::StreamInterrupted => Some(IncompleteReason::StreamInterrupted),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "detail", rename_all = "snake_case")]
+pub enum IncompleteReason {
+    OutputTokenLimit,
+    ContentFilter,
+    EmptyResponse,
+    StreamInterrupted,
+    Provider(String),
+    ProviderProtocol(String),
+}
+
+impl std::fmt::Display for IncompleteReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutputTokenLimit => formatter.write_str("output token limit reached"),
+            Self::ContentFilter => formatter.write_str("response stopped by content filter"),
+            Self::EmptyResponse => {
+                formatter.write_str("provider returned an empty assistant response")
+            }
+            Self::StreamInterrupted => {
+                formatter.write_str("provider stream ended before a terminal event")
+            }
+            Self::Provider(reason) => write!(
+                formatter,
+                "provider reported an incomplete response: {reason}"
+            ),
+            Self::ProviderProtocol(reason) => {
+                write!(formatter, "provider completion protocol error: {reason}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "decision", content = "value", rename_all = "snake_case")]
+pub enum ModelDecision {
+    Act(Vec<ProviderToolCall>),
+    Final(String),
+    Incomplete(IncompleteReason),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +201,8 @@ pub struct ModelUsage {
     pub total_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
 }
@@ -515,9 +622,6 @@ impl OpenAiCompatibleProvider {
         }
 
         let response = accumulator.finish()?;
-        if response.text.is_empty() && response.tool_calls.is_empty() {
-            anyhow::bail!("provider returned an empty streaming response");
-        }
         on_transport(ProviderTransportEvent::Response {
             attempt,
             status: Some(status.as_u16()),
@@ -540,6 +644,28 @@ pub struct OpenAiResponsesProvider {
     store_responses: bool,
     parallel_tool_calls: bool,
     prompt_cache_key: Option<String>,
+    prompt_cache_policy: Option<PromptCachePolicy>,
+    compaction_threshold_tokens: Option<u32>,
+    native_web_search: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("provider request failed ({status}): {body}")]
+struct ResponsesRequestError {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl ResponsesRequestError {
+    fn invalid_previous_response(&self, response_id: &str) -> bool {
+        if !matches!(self.status.as_u16(), 400 | 404) {
+            return false;
+        }
+        let body = self.body.to_ascii_lowercase();
+        body.contains("previous_response_id")
+            || body.contains("previous response")
+            || body.contains(&response_id.to_ascii_lowercase())
+    }
 }
 
 impl OpenAiResponsesProvider {
@@ -559,6 +685,9 @@ impl OpenAiResponsesProvider {
             store_responses: false,
             parallel_tool_calls: false,
             prompt_cache_key: None,
+            prompt_cache_policy: None,
+            compaction_threshold_tokens: None,
+            native_web_search: false,
         }
     }
 
@@ -574,6 +703,8 @@ impl OpenAiResponsesProvider {
         provider.store_responses = settings.store_responses;
         provider.parallel_tool_calls = settings.parallel_tool_calls;
         provider.prompt_cache_key = settings.prompt_cache_key.clone();
+        provider.prompt_cache_policy = settings.prompt_cache_policy;
+        provider.compaction_threshold_tokens = settings.responses_compaction_threshold_tokens;
         Some(provider)
     }
 
@@ -584,6 +715,12 @@ impl OpenAiResponsesProvider {
             self.reasoning_effort = Some("low".to_string());
         }
         self.parallel_tool_calls = false;
+        self.native_web_search = false;
+        self
+    }
+
+    pub(crate) fn with_native_web_search(mut self, enabled: bool) -> Self {
+        self.native_web_search = enabled;
         self
     }
 
@@ -605,6 +742,13 @@ impl OpenAiResponsesProvider {
         if !system_instructions.trim().is_empty() {
             payload["instructions"] = json!(system_instructions);
         }
+        if let Some(previous_response_id) = request
+            .previous_response_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            payload["previous_response_id"] = json!(previous_response_id);
+        }
         if let Some(max_output_tokens) = self.max_output_tokens {
             payload["max_output_tokens"] = json!(max_output_tokens);
         }
@@ -618,8 +762,12 @@ impl OpenAiResponsesProvider {
                 payload["include"] = json!(["reasoning.encrypted_content"]);
             }
         }
-        if !request.tool_candidates.is_empty() {
-            payload["tools"] = json!(responses_tools(&request.tool_candidates));
+        let mut tools = responses_tools(&request.tool_candidates);
+        if self.native_web_search {
+            tools.push(json!({ "type": "web_search" }));
+        }
+        if !tools.is_empty() {
+            payload["tools"] = json!(tools);
             payload["tool_choice"] = json!("auto");
         }
         if let Some(prompt_cache_key) = request
@@ -629,6 +777,28 @@ impl OpenAiResponsesProvider {
             .filter(|value| !value.is_empty())
         {
             payload["prompt_cache_key"] = json!(prompt_cache_key);
+        }
+        match self.prompt_cache_policy {
+            Some(PromptCachePolicy::Explicit30m) => {
+                payload["prompt_cache_options"] = json!({
+                    "mode": "explicit",
+                    "ttl": "30m",
+                });
+                add_responses_prompt_cache_breakpoint(&mut payload["input"], &request);
+            }
+            Some(PromptCachePolicy::LegacyInMemory) => {
+                payload["prompt_cache_retention"] = json!("in_memory");
+            }
+            Some(PromptCachePolicy::Legacy24h) => {
+                payload["prompt_cache_retention"] = json!("24h");
+            }
+            None => {}
+        }
+        if let Some(threshold) = self.compaction_threshold_tokens.filter(|value| *value > 0) {
+            payload["context_management"] = json!([{
+                "type": "compaction",
+                "compact_threshold": threshold,
+            }]);
         }
         if let Some(schema) = request.final_output_json_schema.as_ref() {
             payload["text"] = json!({
@@ -655,6 +825,7 @@ impl OpenAiResponsesProvider {
     async fn execute_responses_request(
         &self,
         prepared: PreparedProviderRequest,
+        attempt: usize,
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
@@ -670,12 +841,12 @@ impl OpenAiResponsesProvider {
         if !status.is_success() {
             let body = response.text().await?;
             on_transport(ProviderTransportEvent::Response {
-                attempt: 1,
+                attempt,
                 status: Some(status.as_u16()),
                 response_id: None,
                 body: json!({ "error": truncate_observation_text(&body) }),
             })?;
-            anyhow::bail!("provider request failed ({status}): {body}");
+            return Err(ResponsesRequestError { status, body }.into());
         }
 
         let mut decoder = SseDecoder::default();
@@ -699,11 +870,8 @@ impl OpenAiResponsesProvider {
             }
         }
         let response = accumulator.finish()?;
-        if response.text.is_empty() && response.tool_calls.is_empty() {
-            anyhow::bail!("Responses API returned an empty streaming response");
-        }
         on_transport(ProviderTransportEvent::Response {
-            attempt: 1,
+            attempt,
             status: Some(status.as_u16()),
             response_id: response.response_id.clone(),
             body: model_response_observation(&response),
@@ -779,6 +947,7 @@ struct OpenAiStreamAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, StreamingToolCall>,
     usage: Option<ModelUsage>,
+    finish_reason: Option<ModelFinishReason>,
 }
 
 impl OpenAiStreamAccumulator {
@@ -794,6 +963,13 @@ impl OpenAiStreamAccumulator {
         if let Some(usage) = parse_model_usage(event.get("usage")) {
             self.usage = Some(usage.clone());
             on_delta(ModelStreamDelta::Usage { usage })?;
+        }
+
+        if let Some(reason) = event
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = Some(chat_finish_reason(reason));
         }
 
         let Some(delta) = event.pointer("/choices/0/delta") else {
@@ -868,6 +1044,9 @@ impl OpenAiStreamAccumulator {
             usage: self.usage,
             response_id: None,
             provider_items: Vec::new(),
+            finish_reason: self
+                .finish_reason
+                .unwrap_or(ModelFinishReason::StreamInterrupted),
         })
     }
 }
@@ -880,6 +1059,7 @@ struct ResponsesStreamAccumulator {
     usage: Option<ModelUsage>,
     response_id: Option<String>,
     completed_response: Option<Value>,
+    finish_reason: Option<ModelFinishReason>,
 }
 
 impl ResponsesStreamAccumulator {
@@ -976,9 +1156,17 @@ impl ResponsesStreamAccumulator {
                     self.tool_calls.entry(index).or_default().arguments = arguments.to_string();
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 if let Some(response) = event.get("response") {
                     self.completed_response = Some(response.clone());
+                    self.finish_reason = Some(if event_type == "response.completed" {
+                        responses_finish_reason(response, ModelFinishReason::Completed)
+                    } else {
+                        responses_finish_reason(
+                            response,
+                            ModelFinishReason::Incomplete("response.incomplete".to_string()),
+                        )
+                    });
                 }
             }
             _ => {}
@@ -1047,7 +1235,33 @@ impl ResponsesStreamAccumulator {
             usage: self.usage,
             response_id: self.response_id,
             provider_items: self.provider_items.into_values().collect(),
+            finish_reason: self
+                .finish_reason
+                .unwrap_or(ModelFinishReason::StreamInterrupted),
         })
+    }
+}
+
+fn chat_finish_reason(reason: &str) -> ModelFinishReason {
+    match reason {
+        "stop" | "end_turn" => ModelFinishReason::Stop,
+        "tool_calls" | "function_call" => ModelFinishReason::ToolCalls,
+        "length" | "max_tokens" | "max_output_tokens" => ModelFinishReason::Length,
+        "content_filter" => ModelFinishReason::ContentFilter,
+        other => ModelFinishReason::Incomplete(other.to_string()),
+    }
+}
+
+fn responses_finish_reason(response: &Value, fallback: ModelFinishReason) -> ModelFinishReason {
+    match response.get("status").and_then(Value::as_str) {
+        Some("completed") => ModelFinishReason::Completed,
+        Some("incomplete") => response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .map(chat_finish_reason)
+            .unwrap_or_else(|| ModelFinishReason::Incomplete("response incomplete".to_string())),
+        Some(status) => ModelFinishReason::Incomplete(status.to_string()),
+        None => fallback,
     }
 }
 
@@ -1272,6 +1486,16 @@ fn openai_messages(request: &ModelRequest) -> Vec<Value> {
             "content": openai_message_content(&message.content, &message.content_parts)
         })
     }));
+    if let Some(instructions) = request
+        .branch_developer_instructions
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        messages.push(json!({
+            "role": "developer",
+            "content": instructions,
+        }));
+    }
     messages.push(json!({
         "role": "user",
         "content": openai_message_content(&request.user_message, &request.user_content)
@@ -1317,6 +1541,16 @@ fn openai_compatibility_messages(request: &ModelRequest) -> Vec<Value> {
             "content": openai_message_content(&message.content, &message.content_parts)
         })
     }));
+    if let Some(instructions) = request
+        .branch_developer_instructions
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        messages.push(json!({
+            "role": "system",
+            "content": instructions,
+        }));
+    }
     messages.push(json!({
         "role": "user",
         "content": openai_message_content(&request.user_message, &request.user_content)
@@ -1398,27 +1632,42 @@ fn responses_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
 }
 
 fn responses_input(request: &ModelRequest) -> Vec<Value> {
-    let mut input = instruction_messages(request)
-        .into_iter()
-        .filter_map(|(role, content)| {
-            (role == ContextRole::Developer).then(|| {
-                json!({
-                    "role": "developer",
-                    "content": content,
-                })
+    let replay_full_prefix = request.previous_response_id.is_none();
+    let mut input = Vec::new();
+    if replay_full_prefix {
+        input.extend(
+            instruction_messages(request)
+                .into_iter()
+                .filter_map(|(role, content)| {
+                    (role == ContextRole::Developer).then(|| {
+                        json!({
+                            "role": "developer",
+                            "content": content,
+                        })
+                    })
+                }),
+        );
+        input.extend(request.conversation.iter().map(|message| {
+            json!({
+                "role": openai_conversation_role(message.role),
+                "content": responses_message_content(
+                    message.role,
+                    &message.content,
+                    &message.content_parts,
+                ),
             })
-        })
-        .collect::<Vec<_>>();
-    input.extend(request.conversation.iter().map(|message| {
-        json!({
-            "role": openai_conversation_role(message.role),
-            "content": responses_message_content(
-                message.role,
-                &message.content,
-                &message.content_parts,
-            ),
-        })
-    }));
+        }));
+        if let Some(instructions) = request
+            .branch_developer_instructions
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            input.push(json!({
+                "role": "developer",
+                "content": instructions,
+            }));
+        }
+    }
     input.push(json!({
         "role": "user",
         "content": responses_message_content(
@@ -1451,6 +1700,107 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
         input.push(companion);
     }
     input
+}
+
+fn add_responses_prompt_cache_breakpoint(input: &mut Value, request: &ModelRequest) {
+    if request.context_items.is_empty() {
+        return;
+    }
+
+    let compiled = CompiledModelContext {
+        items: request.context_items.clone(),
+        prompt_cache_key: request.prompt_cache_key.clone(),
+    };
+    let breakpoint_index = compiled
+        .ordered_items()
+        .into_iter()
+        .filter(|item| {
+            item.role == ContextRole::Developer
+                && item.kind != ContextItemKind::Summary
+                && !item.text_content().trim().is_empty()
+        })
+        .enumerate()
+        .filter_map(|(index, item)| {
+            matches!(
+                item.cache_scope,
+                ContextCacheScope::Stable | ContextCacheScope::Thread
+            )
+            .then_some(index)
+        })
+        .last();
+    let Some(items) = input.as_array_mut() else {
+        return;
+    };
+    if request.previous_response_id.is_none() {
+        if let Some(index) = breakpoint_index {
+            if let Some(message) = items.get_mut(index) {
+                mark_responses_message_cache_breakpoint(message);
+            }
+        }
+    }
+
+    let replay_full_prefix = request.previous_response_id.is_none();
+    let developer_count = if replay_full_prefix {
+        instruction_messages(request)
+            .into_iter()
+            .filter(|(role, _)| *role == ContextRole::Developer)
+            .count()
+    } else {
+        0
+    };
+    let replayed_conversation_count = if replay_full_prefix {
+        request.conversation.len()
+    } else {
+        0
+    };
+    let has_branch_instructions = replay_full_prefix
+        && request
+            .branch_developer_instructions
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+
+    if has_branch_instructions && replayed_conversation_count > 0 {
+        let inherited_prefix_end = developer_count + replayed_conversation_count - 1;
+        if let Some(message) = items.get_mut(inherited_prefix_end) {
+            mark_responses_message_cache_breakpoint(message);
+        }
+    }
+
+    let current_user_index =
+        developer_count + replayed_conversation_count + usize::from(has_branch_instructions);
+    if let Some(message) = items.get_mut(current_user_index) {
+        mark_responses_message_cache_breakpoint(message);
+    }
+}
+
+fn mark_responses_message_cache_breakpoint(message: &mut Value) {
+    let content_type = if message.get("role").and_then(Value::as_str) == Some("assistant") {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    let Some(content) = message.get_mut("content") else {
+        return;
+    };
+    if let Some(text) = content.as_str().map(str::to_string) {
+        *content = json!([{
+            "type": content_type,
+            "text": text,
+            "prompt_cache_breakpoint": { "mode": "explicit" },
+        }]);
+        return;
+    }
+    let Some(parts) = content.as_array_mut() else {
+        return;
+    };
+    if let Some(part) = parts.iter_mut().rev().find(|part| {
+        matches!(
+            part.get("type").and_then(Value::as_str),
+            Some("input_text") | Some("output_text")
+        )
+    }) {
+        part["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
+    }
 }
 
 fn responses_message_content(
@@ -1732,6 +2082,7 @@ fn model_response_observation(response: &ModelResponse) -> Value {
         "responseId": response.response_id,
         "textChars": response.text.len(),
         "toolCalls": response.tool_calls,
+        "finishReason": response.finish_reason,
         "usage": response.usage,
         "providerItems": redact_transport_value(&Value::Array(response.provider_items.clone())),
     })
@@ -1749,6 +2100,11 @@ fn parse_model_response_body(body: &Value) -> anyhow::Result<ModelResponse> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
+        finish_reason: body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .map(chat_finish_reason)
+            .unwrap_or_else(|| responses_finish_reason(body, ModelFinishReason::StreamInterrupted)),
     })
 }
 
@@ -1773,6 +2129,12 @@ fn parse_model_usage(value: Option<&Value>) -> Option<ModelUsage> {
         .or_else(|| usage.get("input_tokens_details"))
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64);
+    let cache_write_tokens = usage
+        .get("prompt_tokens_details")
+        .or_else(|| usage.get("input_tokens_details"))
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_write_tokens").and_then(Value::as_u64));
     let reasoning_tokens = usage
         .get("completion_tokens_details")
         .or_else(|| usage.get("output_tokens_details"))
@@ -1784,6 +2146,7 @@ fn parse_model_usage(value: Option<&Value>) -> Option<ModelUsage> {
         output_tokens,
         total_tokens,
         cached_input_tokens,
+        cache_write_tokens,
         reasoning_tokens,
     })
 }
@@ -1814,11 +2177,8 @@ fn extract_response_text(body: &Value) -> String {
         }
     }
 
-    if let Some(text) = body.get("output_text").and_then(Value::as_str) {
-        return text.to_string();
-    }
-
-    body.get("output")
+    let responses_text = body
+        .get("output")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -1830,9 +2190,142 @@ fn extract_response_text(body: &Value) -> String {
                 .flatten()
         })
         .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter_map(render_responses_output_text_part)
         .collect::<Vec<_>>()
-        .join("")
+        .join("");
+    if !responses_text.is_empty() {
+        return responses_text;
+    }
+
+    body.get("output_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn render_responses_output_text_part(part: &Value) -> Option<String> {
+    let text = part.get("text").and_then(Value::as_str)?;
+    let annotations = part
+        .get("annotations")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    Some(apply_url_citations(text, annotations))
+}
+
+fn apply_url_citations(text: &str, annotations: &[Value]) -> String {
+    let mut ranges = Vec::new();
+    let mut fallback_sources = Vec::new();
+    for annotation in annotations {
+        if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+            continue;
+        }
+        let citation = annotation.get("url_citation").unwrap_or(annotation);
+        let Some(url) = citation.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            continue;
+        }
+        let title = citation
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Source")
+            .to_string();
+        match (
+            citation.get("start_index").and_then(Value::as_u64),
+            citation.get("end_index").and_then(Value::as_u64),
+        ) {
+            (Some(start), Some(end)) if start < end => {
+                ranges.push((start as usize, end as usize, url.to_string(), title));
+            }
+            _ => fallback_sources.push((url.to_string(), title)),
+        }
+    }
+    if ranges.is_empty() && fallback_sources.is_empty() {
+        return text.to_string();
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut char_boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    char_boundaries.push(text.len());
+    ranges.sort_by_key(|(start, _, _, _)| std::cmp::Reverse(*start));
+    let mut rendered = text.to_string();
+    let mut upper_bound = char_boundaries.len().saturating_sub(1);
+    for (mut start, mut end, url, title) in ranges {
+        while start < end && chars.get(start).is_some_and(|value| value.is_whitespace()) {
+            start += 1;
+        }
+        while end > start
+            && chars
+                .get(end.saturating_sub(1))
+                .is_some_and(|value| value.is_whitespace())
+        {
+            end -= 1;
+        }
+        while end < chars.len()
+            && chars[end].is_alphanumeric()
+            && chars
+                .get(end.saturating_sub(1))
+                .is_some_and(|value| value.is_alphanumeric())
+        {
+            end += 1;
+        }
+        if end > upper_bound || start >= end {
+            fallback_sources.push((url, title));
+            continue;
+        }
+        let byte_start = char_boundaries[start];
+        let byte_end = char_boundaries[end];
+        let label = text[byte_start..byte_end].trim();
+        let label = if label.is_empty() {
+            title.as_str()
+        } else {
+            label
+        };
+        rendered.replace_range(
+            byte_start..byte_end,
+            &format!(
+                "[{}]({})",
+                escape_markdown_link_label(label),
+                escape_markdown_link_url(&url)
+            ),
+        );
+        upper_bound = start;
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let fallback_sources = fallback_sources
+        .into_iter()
+        .filter(|(url, _)| seen.insert(url.clone()))
+        .collect::<Vec<_>>();
+    if !fallback_sources.is_empty() {
+        rendered.push_str("\n\nSources:\n");
+        for (url, title) in fallback_sources {
+            rendered.push_str(&format!(
+                "- [{}]({})\n",
+                escape_markdown_link_label(&title),
+                escape_markdown_link_url(&url)
+            ));
+        }
+        rendered.pop();
+    }
+    rendered
+}
+
+fn escape_markdown_link_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn escape_markdown_link_url(value: &str) -> String {
+    value.replace(' ', "%20").replace(')', "%29")
 }
 
 fn extract_provider_tool_calls(body: &Value) -> anyhow::Result<Vec<ProviderToolCall>> {
@@ -2081,8 +2574,32 @@ impl ModelProvider for OpenAiResponsesProvider {
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
-        self.execute_responses_request(prepared, on_delta, on_transport)
+        let previous_response_id = prepared.logical_request.previous_response_id.clone();
+        match self
+            .execute_responses_request(prepared.clone(), 1, on_delta, on_transport)
             .await
+        {
+            Err(error)
+                if previous_response_id.as_deref().is_some_and(|response_id| {
+                    error
+                        .downcast_ref::<ResponsesRequestError>()
+                        .is_some_and(|error| error.invalid_previous_response(response_id))
+                }) =>
+            {
+                let mut replay = prepared.logical_request;
+                replay.previous_response_id = None;
+                let replay = self.prepare_responses_request(prepared.request_id, replay)?;
+                on_transport(ProviderTransportEvent::Retry {
+                    attempt: 2,
+                    reason: "stored response cursor unavailable; replaying canonical local context"
+                        .to_string(),
+                    body: replay.observation_body.clone(),
+                })?;
+                self.execute_responses_request(replay, 2, on_delta, on_transport)
+                    .await
+            }
+            result => result,
+        }
     }
 
     async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
@@ -2162,9 +2679,90 @@ mod tests {
             tool_results: Vec::new(),
             context_items: Vec::new(),
             previous_response_items: Vec::new(),
+            previous_response_id: None,
+            branch_developer_instructions: None,
             prompt_cache_key: None,
             final_output_json_schema: None,
         }
+    }
+
+    #[test]
+    fn model_decision_requires_normal_completion_non_empty_text_and_no_tools() {
+        assert_eq!(
+            ModelResponse::text("final response").decision(),
+            ModelDecision::Final("final response".to_string())
+        );
+
+        let empty = ModelResponse::text("   ");
+        assert_eq!(
+            empty.decision(),
+            ModelDecision::Incomplete(IncompleteReason::EmptyResponse)
+        );
+
+        let truncated = ModelResponse {
+            text: "partial response".to_string(),
+            finish_reason: ModelFinishReason::Length,
+            ..ModelResponse::text("")
+        };
+        assert_eq!(
+            truncated.decision(),
+            ModelDecision::Incomplete(IncompleteReason::OutputTokenLimit)
+        );
+    }
+
+    #[test]
+    fn chat_stream_retains_length_finish_reason() {
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        accumulator
+            .apply(
+                &json!({ "choices": [{ "delta": { "content": "partial" } }] }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                &json!({ "choices": [{ "delta": {}, "finish_reason": "length" }] }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+
+        let response = accumulator.finish().unwrap();
+        assert_eq!(response.finish_reason, ModelFinishReason::Length);
+        assert_eq!(
+            response.decision(),
+            ModelDecision::Incomplete(IncompleteReason::OutputTokenLimit)
+        );
+    }
+
+    #[test]
+    fn responses_stream_retains_incomplete_and_interrupted_states() {
+        let mut incomplete = ResponsesStreamAccumulator::default();
+        incomplete
+            .apply(
+                &json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp_incomplete",
+                        "status": "incomplete",
+                        "incomplete_details": { "reason": "max_output_tokens" },
+                        "output_text": "partial"
+                    }
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        let incomplete = incomplete.finish().unwrap();
+        assert_eq!(incomplete.finish_reason, ModelFinishReason::Length);
+        assert_eq!(
+            incomplete.decision(),
+            ModelDecision::Incomplete(IncompleteReason::OutputTokenLimit)
+        );
+
+        let interrupted = ResponsesStreamAccumulator::default().finish().unwrap();
+        assert_eq!(
+            interrupted.decision(),
+            ModelDecision::Incomplete(IncompleteReason::StreamInterrupted)
+        );
     }
 
     fn layered_model_request() -> ModelRequest {
@@ -2233,6 +2831,25 @@ mod tests {
     }
 
     #[test]
+    fn responses_provider_adds_native_web_search_alongside_function_tools() {
+        let provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test")
+                .with_native_web_search(true);
+        let mut request = model_request();
+        request.tool_candidates.push(ProviderToolCandidate {
+            name: "read_file".to_string(),
+            description: "Read a workspace file".to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        });
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        let tools = prepared.body["tools"].as_array().expect("tools array");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[1], json!({ "type": "web_search" }));
+        assert_eq!(prepared.body["tool_choice"], "auto");
+    }
+
+    #[test]
     fn parses_openai_chat_tool_calls() {
         let body = json!({
             "choices": [{
@@ -2252,7 +2869,10 @@ mod tests {
                 "prompt_tokens": 41,
                 "completion_tokens": 7,
                 "total_tokens": 48,
-                "prompt_tokens_details": { "cached_tokens": 12 },
+                "prompt_tokens_details": {
+                    "cached_tokens": 12,
+                    "cache_write_tokens": 29
+                },
                 "completion_tokens_details": { "reasoning_tokens": 3 }
             }
         });
@@ -2275,6 +2895,7 @@ mod tests {
                 output_tokens: 7,
                 total_tokens: 48,
                 cached_input_tokens: Some(12),
+                cache_write_tokens: Some(29),
                 reasoning_tokens: Some(3),
             })
         );
@@ -2301,6 +2922,32 @@ mod tests {
                 name: "search".to_string(),
                 arguments: json!({ "query": "AgentCore", "path": "crates" }),
             }]
+        );
+    }
+
+    #[test]
+    fn responses_web_search_citations_become_clickable_markdown_links() {
+        let body = json!({
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "OpenTopia source",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "start_index": 9,
+                        "end_index": 15,
+                        "url": "https://example.test/source",
+                        "title": "Example source"
+                    }]
+                }]
+            }]
+        });
+
+        let response = parse_model_response_body(&body).expect("response parses");
+        assert_eq!(
+            response.text,
+            "OpenTopia [source](https://example.test/source)"
         );
     }
 
@@ -2393,6 +3040,105 @@ mod tests {
             .contains("developer environment"));
         assert_eq!(prepared.body["input"][1]["role"], "user");
         assert_eq!(prepared.body["input"][1]["content"], "current");
+    }
+
+    #[test]
+    fn responses_explicit_cache_marks_last_reusable_developer_prefix() {
+        let mut provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+        provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
+        let mut request = layered_model_request();
+        request.context_items.push(ModelContextItem::text(
+            crate::model_context::ContextItemKind::RepositoryInstructions,
+            ContextRole::Developer,
+            "AGENTS.md",
+            "stable repository instructions",
+            ContextCacheScope::Thread,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+
+        assert_eq!(prepared.body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(prepared.body["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(
+            prepared.body["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert!(prepared.body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("stable repository instructions"));
+        assert_eq!(
+            prepared.body["input"][2]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+    }
+
+    #[test]
+    fn responses_stateful_request_sends_only_incremental_input() {
+        let provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+        let mut request = layered_model_request();
+        request.conversation = vec![ModelConversationMessage {
+            role: ModelConversationRole::User,
+            content: "already stored".to_string(),
+            content_parts: Vec::new(),
+        }];
+        request.previous_response_id = Some("resp_parent".to_string());
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+
+        assert_eq!(prepared.body["previous_response_id"], "resp_parent");
+        assert_eq!(prepared.body["input"].as_array().unwrap().len(), 1);
+        assert!(!prepared.body["input"]
+            .to_string()
+            .contains("already stored"));
+        assert!(!prepared.body["input"]
+            .to_string()
+            .contains("developer environment"));
+        assert_eq!(prepared.body["input"][0]["content"], "current");
+    }
+
+    #[test]
+    fn responses_branch_marks_inherited_history_as_a_shared_prefix() {
+        let mut provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+        provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
+        let mut request = layered_model_request();
+        request.conversation = vec![ModelConversationMessage {
+            role: ModelConversationRole::User,
+            content: "parent fork point".to_string(),
+            content_parts: Vec::new(),
+        }];
+        request.branch_developer_instructions = Some("review this branch".to_string());
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+
+        assert_eq!(prepared.body["input"][1]["role"], "user");
+        assert_eq!(
+            prepared.body["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(prepared.body["input"][2]["role"], "developer");
+        assert_eq!(prepared.body["input"][3]["role"], "user");
+    }
+
+    #[test]
+    fn responses_maps_legacy_cache_retention_and_native_compaction() {
+        let mut provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+        provider.prompt_cache_policy = Some(PromptCachePolicy::Legacy24h);
+        provider.compaction_threshold_tokens = Some(96_000);
+
+        let prepared = provider.prepare(Uuid::nil(), model_request()).unwrap();
+
+        assert_eq!(prepared.body["prompt_cache_retention"], "24h");
+        assert!(prepared.body.get("prompt_cache_options").is_none());
+        assert_eq!(
+            prepared.body["context_management"],
+            json!([{"type": "compaction", "compact_threshold": 96_000}])
+        );
     }
 
     #[test]
@@ -2684,6 +3430,7 @@ mod tests {
                 output_tokens: 5,
                 total_tokens: 25,
                 cached_input_tokens: None,
+                cache_write_tokens: None,
                 reasoning_tokens: None,
             })
         );
@@ -2714,6 +3461,7 @@ mod tests {
                         output_tokens: 5,
                         total_tokens: 25,
                         cached_input_tokens: None,
+                        cache_write_tokens: None,
                         reasoning_tokens: None,
                     }
                 }
@@ -3103,7 +3851,7 @@ mod tests {
                         "data: {\"type\":\"response.output_item.added\",\"response_id\":\"resp_123\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n",
                         "data: {\"type\":\"response.function_call_arguments.delta\",\"response_id\":\"resp_123\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}\n\n",
                         "data: {\"type\":\"response.output_item.done\",\"response_id\":\"resp_123\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}}\n\n",
-                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}],\"usage\":{\"input_tokens\":20,\"output_tokens\":5,\"total_tokens\":25}}}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}],\"usage\":{\"input_tokens\":20,\"output_tokens\":5,\"total_tokens\":25,\"input_tokens_details\":{\"cached_tokens\":12,\"cache_write_tokens\":8}}}}\n\n",
                         "data: [DONE]\n\n"
                     )
                     .as_bytes(),
@@ -3162,7 +3910,10 @@ mod tests {
             json!({ "path": "Cargo.toml" })
         );
         assert_eq!(response.provider_items.len(), 1);
-        assert_eq!(response.usage.unwrap().total_tokens, 25);
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.total_tokens, 25);
+        assert_eq!(usage.cached_input_tokens, Some(12));
+        assert_eq!(usage.cache_write_tokens, Some(8));
         assert!(matches!(
             transport.as_slice(),
             [ProviderTransportEvent::Response {
@@ -3171,6 +3922,86 @@ mod tests {
                 ..
             }] if response_id == "resp_123"
         ));
+    }
+
+    #[tokio::test]
+    async fn responses_provider_replays_local_context_when_state_cursor_is_missing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let first_request = read_http_request(&mut first_socket).await;
+            let rejected = r#"{"error":{"message":"previous_response_id resp_missing was not found","param":"previous_response_id"}}"#;
+            first_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        rejected.len(),
+                        rejected
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first_socket.shutdown().await.unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let second_request = read_http_request(&mut second_socket).await;
+            second_socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_replayed\",\"output_text\":\"replayed locally\",\"output\":[]}}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            second_socket.shutdown().await.unwrap();
+            request_tx.send((first_request, second_request)).unwrap();
+        });
+        let mut provider =
+            OpenAiResponsesProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+        provider.store_responses = true;
+        let mut request = layered_model_request();
+        request.conversation = vec![ModelConversationMessage {
+            role: ModelConversationRole::User,
+            content: "canonical local history".to_string(),
+            content_parts: Vec::new(),
+        }];
+        request.previous_response_id = Some("resp_missing".to_string());
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        let mut transport = Vec::new();
+
+        let response = provider
+            .stream_prepared(prepared, &mut |_| Ok(()), &mut |event| {
+                transport.push(event);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let (first_request, second_request) = request_rx.await.unwrap();
+        let first: Value =
+            serde_json::from_str(first_request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let second: Value =
+            serde_json::from_str(second_request.split_once("\r\n\r\n").unwrap().1).unwrap();
+
+        assert_eq!(response.text, "replayed locally");
+        assert_eq!(response.response_id.as_deref(), Some("resp_replayed"));
+        assert_eq!(first["previous_response_id"], "resp_missing");
+        assert_eq!(first["input"].as_array().unwrap().len(), 1);
+        assert!(second.get("previous_response_id").is_none());
+        assert!(second["input"]
+            .to_string()
+            .contains("canonical local history"));
+        assert!(transport
+            .iter()
+            .any(|event| matches!(event, ProviderTransportEvent::Retry { attempt: 2, .. })));
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {

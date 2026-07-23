@@ -1,3 +1,4 @@
+use crate::computer::{ComputerAction, ComputerPolicyContext, WindowTarget};
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -289,6 +290,23 @@ pub trait PolicyEngine: Send + Sync {
     }
     fn inspect_network(&self, _host: &str) -> PolicyDecision {
         PolicyDecision::Allow
+    }
+
+    /// Desktop capabilities are never inferred from window content. The default is deliberately
+    /// interactive so an implementation must opt in to a scoped, auditable computer policy.
+    fn inspect_computer_action(
+        &self,
+        target: &WindowTarget,
+        action: &ComputerAction,
+        _context: &ComputerPolicyContext,
+    ) -> PolicyDecision {
+        PolicyDecision::Ask {
+            reason: format!(
+                "Computer action `{}` on window `{}` requires approval.",
+                action.kind(),
+                target.title
+            ),
+        }
     }
 }
 

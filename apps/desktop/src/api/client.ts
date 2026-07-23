@@ -4,20 +4,29 @@ import type {
   ArtifactContent,
   ArtifactDescriptor,
   BrowserOutput,
+  CollaborationMode,
+  ComputerObservation,
+  ComputerWindowTarget,
   ContextStatus,
   ContextSummary,
+  CreatedSkill,
+  CreateSkillInput,
   DiffFileActionResult,
   ExperienceMode,
   GitBranchInfo,
   GitStatusSummary,
   GitWorkflowAction,
   GitWorkflowResponse,
+  GoalSnapshot,
+  GoalStatus,
+  GenerateSkillInput,
   McpCallResult,
   McpServerInput,
   McpServerStatus,
   McpServerView,
   Message,
   PermissionMode,
+  PluginView,
   PreviewDescriptor,
   PreviewTarget,
   Project,
@@ -27,12 +36,17 @@ import type {
   ProviderSettings,
   SandboxDescriptor,
   SkillDescriptor,
+  SkillDraftPreview,
   SpreadsheetPreview,
   SpreadsheetPreviewRange,
   SubagentRun,
   TerminalCancelResponse,
   TerminalEvent,
   TerminalStartResponse,
+  TurnChangeSet,
+  TurnFileDiffPreview,
+  TurnUndoPreview,
+  TurnUndoResult,
   TerminalSession,
   Thread,
   TurnCancelResult,
@@ -131,6 +145,7 @@ export class ApiClient {
     defaultWorkspaceRoot?: string;
     clearDefaultWorkspaceRoot?: boolean;
     sandbox?: AppSettings["sandbox"];
+    webSearch?: AppSettings["webSearch"];
   }): Promise<AppSettings> {
     return this.patch("/api/settings", input);
   }
@@ -143,6 +158,51 @@ export class ApiClient {
     return this.get(
       `/api/skills${queryString({ workspaceRoot: workspaceRoot ?? undefined })}`,
     );
+  }
+
+  async listPlugins(input?: {
+    workspaceRoot?: string | null;
+    threadId?: string | null;
+  }): Promise<PluginView[]> {
+    return this.get(
+      `/api/plugins${queryString({
+        workspaceRoot: input?.workspaceRoot ?? undefined,
+        threadId: input?.threadId ?? undefined,
+      })}`,
+    );
+  }
+
+  async installPlugin(path: string): Promise<PluginView> {
+    return this.post("/api/plugins/install", { path });
+  }
+
+  async uninstallPlugin(
+    pluginId: string,
+    workspaceRoot?: string | null,
+  ): Promise<void> {
+    await this.post("/api/plugins/uninstall", {
+      pluginId,
+      workspaceRoot: workspaceRoot ?? undefined,
+    });
+  }
+
+  async setThreadPlugin(
+    threadId: string,
+    pluginId: string,
+    enabled: boolean,
+  ): Promise<PluginView> {
+    return this.put(`/api/threads/${threadId}/plugins`, {
+      pluginId,
+      enabled,
+    });
+  }
+
+  async generateSkill(input: GenerateSkillInput): Promise<SkillDraftPreview> {
+    return this.post("/api/skills/generate", input);
+  }
+
+  async createSkill(input: CreateSkillInput): Promise<CreatedSkill> {
+    return this.post("/api/skills", input);
   }
 
   async testProviderConnection(
@@ -221,20 +281,46 @@ export class ApiClient {
     content: string,
     sourcePaths: string[] = [],
     skillIds: string[] = [],
-  ): Promise<{ message: Message; turnId: string | null }> {
+    collaborationMode: CollaborationMode = "default",
+    goalId?: string,
+  ): Promise<{
+    message: Message;
+    turnId: string | null;
+    queued: boolean;
+  }> {
     const response = await fetch(
       `${this.baseUrl}/api/threads/${threadId}/messages`,
       {
         method: "POST",
         headers: this.authHeaders(true),
-        body: JSON.stringify({ content, sourcePaths, skillIds }),
+        body: JSON.stringify({
+          content,
+          sourcePaths,
+          skillIds,
+          collaborationMode,
+          goalId,
+        }),
       },
     );
     const turnId = response.headers.get("x-opentopia-turn-id");
+    const queued = response.headers.get("x-opentopia-queued") === "true";
     return {
       message: await parseResponse<Message>(response),
       turnId,
+      queued,
     };
+  }
+
+  async getGoal(threadId: string): Promise<GoalSnapshot | null> {
+    return this.get(`/api/threads/${threadId}/goal`);
+  }
+
+  async updateGoalStatus(
+    threadId: string,
+    goalId: string,
+    status: GoalStatus,
+  ): Promise<GoalSnapshot> {
+    return this.patch(`/api/threads/${threadId}/goal/${goalId}`, { status });
   }
 
   async runBrowserCommand(
@@ -259,6 +345,21 @@ export class ApiClient {
     },
   ): Promise<BrowserOutput> {
     return this.post(`/api/threads/${threadId}/browser`, input);
+  }
+
+  async listComputerWindows(threadId: string): Promise<ComputerWindowTarget[]> {
+    return this.get(`/api/threads/${threadId}/computer/windows`);
+  }
+
+  async observeComputerWindow(
+    threadId: string,
+    windowId: string,
+  ): Promise<ComputerObservation> {
+    return this.post(`/api/threads/${threadId}/computer/observe`, { windowId });
+  }
+
+  async closeComputerSession(threadId: string): Promise<void> {
+    await this.post(`/api/threads/${threadId}/computer/session`, {});
   }
 
   async getTurnStatus(threadId: string): Promise<TurnStatus | null> {
@@ -423,6 +524,46 @@ export class ApiClient {
 
   async getWorkspaceDiff(threadId: string): Promise<WorkspaceDiff> {
     return this.get(`/api/threads/${threadId}/workspace/diff`);
+  }
+
+  async getTurnChanges(
+    threadId: string,
+    turnId: string,
+  ): Promise<TurnChangeSet> {
+    return this.get(`/api/threads/${threadId}/turns/${turnId}/changes`);
+  }
+
+  async getTurnFileDiffPreview(
+    threadId: string,
+    turnId: string,
+    path: string,
+    offset = 0,
+  ): Promise<TurnFileDiffPreview> {
+    return this.get(
+      `/api/threads/${threadId}/turns/${turnId}/changes/preview${queryString({
+        path,
+        offset,
+      })}`,
+    );
+  }
+
+  async previewTurnUndo(
+    threadId: string,
+    turnId: string,
+  ): Promise<TurnUndoPreview> {
+    return this.post(
+      `/api/threads/${threadId}/turns/${turnId}/undo/preview`,
+      {},
+    );
+  }
+
+  async undoTurnChanges(
+    threadId: string,
+    turnId: string,
+  ): Promise<TurnUndoResult> {
+    return this.post(`/api/threads/${threadId}/turns/${turnId}/undo`, {
+      confirm: true,
+    });
   }
 
   async runGitWorkflow(

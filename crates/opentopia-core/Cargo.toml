@@ -25,3 +25,5 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+png.workspace = true
+windows-sys.workspace = true

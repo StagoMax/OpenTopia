@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
                     conversation: Vec::new(),
                     permission_mode: args.permission,
                     context_budget: None,
+                    provider_cursor: None,
                     store: Some(store.clone() as Arc<dyn SessionStore>),
                     cancellation: None,
                 })

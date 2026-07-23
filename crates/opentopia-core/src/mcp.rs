@@ -16,6 +16,10 @@ pub struct McpServerConfig {
     pub env_keys: Vec<String>,
     pub timeout_ms: u64,
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_server_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -32,6 +36,8 @@ impl McpServerConfig {
             env_keys: Vec::new(),
             timeout_ms: 30_000,
             enabled: true,
+            plugin_id: None,
+            plugin_server_name: None,
             created_at: now,
             updated_at: now,
         }

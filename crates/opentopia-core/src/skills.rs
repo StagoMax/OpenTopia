@@ -1,3 +1,4 @@
+use crate::plugins::{discover_plugins, PluginScope};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -20,6 +21,8 @@ pub struct SkillDescriptor {
     pub description: String,
     pub path: PathBuf,
     pub scope: SkillScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,7 +91,35 @@ pub fn discover_skills(workspace_root: Option<&Path>) -> Vec<SkillDescriptor> {
     let mut descriptors = Vec::new();
     let mut seen = HashSet::new();
     for (root, scope) in roots {
-        collect_skill_files(&root, &root, scope, 0, &mut seen, &mut descriptors);
+        collect_skill_files(
+            &root,
+            &root,
+            scope,
+            None,
+            None,
+            0,
+            &mut seen,
+            &mut descriptors,
+        );
+    }
+    for plugin in discover_plugins(workspace_root) {
+        let Some(skill_root) = plugin.skill_root.as_deref() else {
+            continue;
+        };
+        let scope = match plugin.scope {
+            PluginScope::Workspace => SkillScope::Workspace,
+            PluginScope::User | PluginScope::Codex => SkillScope::User,
+        };
+        collect_skill_files(
+            skill_root,
+            skill_root,
+            scope,
+            Some(&plugin.id),
+            Some(&plugin.name),
+            0,
+            &mut seen,
+            &mut descriptors,
+        );
     }
     descriptors.sort_by(|left, right| {
         scope_rank(left.scope)
@@ -141,6 +172,8 @@ fn collect_skill_files(
     root: &Path,
     directory: &Path,
     scope: SkillScope,
+    plugin_id: Option<&str>,
+    plugin_name: Option<&str>,
     depth: usize,
     seen: &mut HashSet<String>,
     output: &mut Vec<SkillDescriptor>,
@@ -162,7 +195,16 @@ fn collect_skill_files(
             continue;
         }
         if file_type.is_dir() {
-            collect_skill_files(root, &path, scope, depth + 1, seen, output);
+            collect_skill_files(
+                root,
+                &path,
+                scope,
+                plugin_id,
+                plugin_name,
+                depth + 1,
+                seen,
+                output,
+            );
             continue;
         }
         if !file_type.is_file() || !entry.file_name().eq_ignore_ascii_case("SKILL.md") {
@@ -183,7 +225,13 @@ fn collect_skill_files(
         if !seen.insert(id.clone()) {
             continue;
         }
-        if let Ok(descriptor) = descriptor_from_file(id, canonical, scope) {
+        if let Ok(descriptor) = descriptor_from_file(
+            id,
+            canonical,
+            scope,
+            plugin_id.map(ToOwned::to_owned),
+            plugin_name,
+        ) {
             output.push(descriptor);
         }
     }
@@ -193,6 +241,8 @@ fn descriptor_from_file(
     id: String,
     path: PathBuf,
     scope: SkillScope,
+    plugin_id: Option<String>,
+    plugin_name: Option<&str>,
 ) -> Result<SkillDescriptor, SkillError> {
     let (bytes, _) = read_skill_file(&path, MAX_SKILL_DISCOVERY_BYTES)?;
     let text = String::from_utf8_lossy(&bytes);
@@ -203,17 +253,31 @@ fn descriptor_from_file(
         .and_then(|name| name.to_str())
         .unwrap_or("Skill")
         .to_string();
-    let name = metadata
+    let mut name = metadata
         .name
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(fallback_name);
+    if let Some(plugin_name) = plugin_name {
+        name = format!("{plugin_name}:{name}");
+    }
     Ok(SkillDescriptor {
         id,
         name,
         description: metadata.description.unwrap_or_default(),
         path,
         scope,
+        plugin_id,
     })
+}
+
+pub(crate) fn descriptor_for_skill_file(
+    path: PathBuf,
+    scope: SkillScope,
+) -> Result<SkillDescriptor, SkillError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| SkillError::Read(path.display().to_string()))?;
+    descriptor_from_file(skill_id(scope, &canonical), canonical, scope, None, None)
 }
 
 fn read_skill_file(path: &Path, read_limit: usize) -> Result<(Vec<u8>, bool), SkillError> {
@@ -357,6 +421,35 @@ mod tests {
     }
 
     #[test]
+    fn discovers_plugin_skills_with_a_namespaced_name() {
+        let dir = TestDir::new();
+        let plugin_root = dir.0.join(".opentopia/plugins/review-kit");
+        fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
+        fs::create_dir_all(plugin_root.join("skills/review")).unwrap();
+        fs::write(
+            plugin_root.join(".codex-plugin/plugin.json"),
+            r#"{"name":"review-kit","skills":"./skills"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_root.join("skills/review/SKILL.md"),
+            "---\nname: Review\ndescription: Review changes\n---\nInstructions\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills(Some(&dir.0));
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "review-kit:Review")
+            .expect("plugin Skill should be discovered");
+        assert!(skill
+            .plugin_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("workspace:")));
+        assert_eq!(skill.scope, SkillScope::Workspace);
+    }
+
+    #[test]
     fn rejects_excessive_skill_selection() {
         let ids = (0..=MAX_SKILLS_PER_TURN)
             .map(|index| index.to_string())
@@ -379,7 +472,9 @@ mod tests {
             descriptor_from_file(
                 "workspace:oversized".to_string(),
                 path,
-                SkillScope::Workspace
+                SkillScope::Workspace,
+                None,
+                None,
             ),
             Err(SkillError::TooLarge {
                 actual,

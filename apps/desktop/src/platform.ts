@@ -3,8 +3,11 @@ import type {
   KeyringMetadata,
   LogFileInfo,
   PlatformInfo,
+  PluginDirectoryPickResult,
   RecentWorkspace,
   SecretSources,
+  WebSearchKeyringMetadata,
+  SystemNotificationOptions,
   WorkspacePickResult,
 } from "./types";
 
@@ -18,6 +21,15 @@ const unavailableKeyring = {
   providerApiKeyConfigured: false,
   providerApiKeySourceId: "keyring:provider-api-key",
   envTarget: "OPENTOPIA_API_KEY",
+  status: "unavailable",
+};
+const unavailableWebSearchKeyring: WebSearchKeyringMetadata = {
+  available: false,
+  encryptionAvailable: false,
+  storageBackend: null,
+  apiKeyConfigured: false,
+  apiKeySourceId: "keyring:web-search-api-key",
+  envTarget: "OPENTOPIA_WEB_SEARCH_API_KEY",
   status: "unavailable",
 };
 
@@ -56,6 +68,13 @@ export async function selectContextFiles(options?: {
   return { canceled: true, files: [] };
 }
 
+export async function selectPluginDirectory(options?: {
+  defaultPath?: string;
+}): Promise<PluginDirectoryPickResult> {
+  if (window.opentopia) return window.opentopia.selectPluginDirectory(options);
+  return { canceled: true };
+}
+
 export async function openPath(targetPath: string): Promise<void> {
   if (!window.opentopia) return;
   await window.opentopia.openPath(targetPath);
@@ -67,6 +86,28 @@ export async function openExternal(url: string): Promise<void> {
     return;
   }
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+export async function showSystemNotification(
+  options: SystemNotificationOptions,
+): Promise<boolean> {
+  if (window.opentopia?.showSystemNotification) {
+    return window.opentopia.showSystemNotification(options);
+  }
+
+  if (!("Notification" in window)) return false;
+  if (Notification.permission === "default") {
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") return false;
+  } else if (Notification.permission !== "granted") {
+    return false;
+  }
+
+  new Notification(options.title, {
+    body: options.body,
+    silent: options.silent,
+  });
+  return true;
 }
 
 export async function getRecentWorkspaces(): Promise<RecentWorkspace[]> {
@@ -121,6 +162,7 @@ export async function listSecretSources(): Promise<SecretSources> {
   return {
     activeProviderKeySource: null,
     keyring: unavailableKeyring,
+    webSearchKeyring: unavailableWebSearchKeyring,
     sources: [],
     notes: ["Secret metadata is available only in the desktop app."],
   };
@@ -159,6 +201,29 @@ export async function deleteProviderApiKey(
     return window.opentopia.deleteProviderApiKey(providerId);
   }
   throw new Error("Provider credential storage is not available in web mode");
+}
+
+export async function getWebSearchApiKeyMetadata(): Promise<WebSearchKeyringMetadata> {
+  if (window.opentopia?.getWebSearchApiKeyMetadata) {
+    return window.opentopia.getWebSearchApiKeyMetadata();
+  }
+  throw new Error("Web search credential storage is not available in web mode");
+}
+
+export async function setWebSearchApiKey(
+  value: string,
+): Promise<WebSearchKeyringMetadata> {
+  if (window.opentopia?.setWebSearchApiKey) {
+    return window.opentopia.setWebSearchApiKey(value);
+  }
+  throw new Error("Web search credential storage is not available in web mode");
+}
+
+export async function deleteWebSearchApiKey(): Promise<WebSearchKeyringMetadata> {
+  if (window.opentopia?.deleteWebSearchApiKey) {
+    return window.opentopia.deleteWebSearchApiKey();
+  }
+  throw new Error("Web search credential storage is not available in web mode");
 }
 
 export async function listLogFiles(): Promise<LogFileInfo[]> {

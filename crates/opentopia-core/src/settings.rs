@@ -14,6 +14,53 @@ pub enum ProviderKind {
     OpenAiResponses,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchMode {
+    #[default]
+    Disabled,
+    ProviderNative,
+    CustomApi,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchSettings {
+    #[serde(default)]
+    pub mode: WebSearchMode,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default = "default_web_search_api_key_source")]
+    pub api_key_source: String,
+    #[serde(default)]
+    pub api_key_configured: bool,
+    #[serde(default = "default_web_search_max_results")]
+    pub max_results: u8,
+}
+
+impl Default for WebSearchSettings {
+    fn default() -> Self {
+        Self {
+            mode: WebSearchMode::Disabled,
+            endpoint: String::new(),
+            api_key_source: default_web_search_api_key_source(),
+            api_key_configured: false,
+            max_results: default_web_search_max_results(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCachePolicy {
+    /// GPT-5.6 and later: cache only prefixes ending at explicit breakpoints.
+    Explicit30m,
+    /// Earlier models: keep the prompt cache in volatile memory.
+    LegacyInMemory,
+    /// Earlier models that support extended retention.
+    Legacy24h,
+}
+
 impl ProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -46,6 +93,10 @@ pub struct ProviderSettings {
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
     #[serde(default)]
+    pub prompt_cache_policy: Option<PromptCachePolicy>,
+    #[serde(default)]
+    pub responses_compaction_threshold_tokens: Option<u32>,
+    #[serde(default)]
     pub rollout_budget: Option<RolloutBudgetSettings>,
     pub api_key_source: String,
     pub api_key_configured: bool,
@@ -66,6 +117,8 @@ impl Default for ProviderSettings {
             store_responses: false,
             parallel_tool_calls: false,
             prompt_cache_key: None,
+            prompt_cache_policy: None,
+            responses_compaction_threshold_tokens: None,
             rollout_budget: None,
             api_key_source: "OPENTOPIA_API_KEY".to_string(),
             api_key_configured: false,
@@ -162,6 +215,14 @@ fn default_provider_temperature() -> f64 {
 
 fn default_provider_context_window_tokens() -> usize {
     128_000
+}
+
+fn default_web_search_api_key_source() -> String {
+    "OPENTOPIA_WEB_SEARCH_API_KEY".to_string()
+}
+
+fn default_web_search_max_results() -> u8 {
+    5
 }
 
 fn default_rollout_sampling_token_weight() -> f64 {
@@ -368,6 +429,8 @@ pub struct AppSettings {
     pub default_workspace_root: Option<PathBuf>,
     #[serde(default)]
     pub sandbox: SandboxSettings,
+    #[serde(default)]
+    pub web_search: WebSearchSettings,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -380,6 +443,7 @@ impl AppSettings {
             permission_mode,
             default_workspace_root: None,
             sandbox: SandboxSettings::from_env(),
+            web_search: WebSearchSettings::default(),
             updated_at: Utc::now(),
         }
     }
@@ -407,6 +471,8 @@ impl AppSettings {
             provider.api_key_configured =
                 std::env::var(&provider.api_key_source).is_ok_and(|value| !value.is_empty());
         }
+        self.web_search.api_key_configured =
+            std::env::var(&self.web_search.api_key_source).is_ok_and(|value| !value.is_empty());
         self.updated_at = Utc::now();
     }
 }
@@ -588,6 +654,8 @@ mod tests {
         assert!(!provider.store_responses);
         assert!(!provider.parallel_tool_calls);
         assert_eq!(provider.prompt_cache_key, None);
+        assert_eq!(provider.prompt_cache_policy, None);
+        assert_eq!(provider.responses_compaction_threshold_tokens, None);
         assert_eq!(provider.rollout_budget, None);
     }
 
@@ -598,6 +666,8 @@ mod tests {
         provider.store_responses = true;
         provider.parallel_tool_calls = true;
         provider.prompt_cache_key = Some("workspace-cache".to_string());
+        provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
+        provider.responses_compaction_threshold_tokens = Some(96_000);
         provider.rollout_budget = Some(RolloutBudgetSettings {
             limit_tokens: 120_000,
             sampling_token_weight: 1.0,
@@ -615,6 +685,11 @@ mod tests {
             restored.prompt_cache_key.as_deref(),
             Some("workspace-cache")
         );
+        assert_eq!(
+            restored.prompt_cache_policy,
+            Some(PromptCachePolicy::Explicit30m)
+        );
+        assert_eq!(restored.responses_compaction_threshold_tokens, Some(96_000));
         assert_eq!(restored.rollout_budget, provider.rollout_budget);
         assert!(restored
             .rollout_budget
@@ -646,6 +721,35 @@ mod tests {
     fn responses_provider_accepts_legacy_kind_spelling() {
         let kind: ProviderKind = serde_json::from_str("\"open_ai_responses\"").unwrap();
         assert_eq!(kind, ProviderKind::OpenAiResponses);
+    }
+
+    #[test]
+    fn legacy_app_settings_default_web_search_to_disabled() {
+        let settings = AppSettings::from_env(PermissionMode::Auto);
+        let mut value = serde_json::to_value(settings).expect("serialize settings");
+        value
+            .as_object_mut()
+            .expect("settings object")
+            .remove("webSearch");
+
+        let restored: AppSettings = serde_json::from_value(value).expect("restore settings");
+        assert_eq!(restored.web_search, WebSearchSettings::default());
+    }
+
+    #[test]
+    fn web_search_settings_round_trip_custom_api_configuration() {
+        let settings = WebSearchSettings {
+            mode: WebSearchMode::CustomApi,
+            endpoint: "https://search.example.test/v1/search".to_string(),
+            api_key_source: "CUSTOM_SEARCH_KEY".to_string(),
+            api_key_configured: true,
+            max_results: 8,
+        };
+
+        let json = serde_json::to_string(&settings).expect("serialize web search settings");
+        let restored: WebSearchSettings =
+            serde_json::from_str(&json).expect("restore web search settings");
+        assert_eq!(restored, settings);
     }
 
     #[test]

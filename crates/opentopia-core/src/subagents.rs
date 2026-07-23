@@ -1,3 +1,5 @@
+use crate::model_context::CompiledModelContext;
+use crate::provider::ModelConversationMessage;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -52,7 +54,7 @@ impl SubagentRunStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentRun {
     pub id: Uuid,
@@ -77,6 +79,13 @@ pub struct SubagentRun {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Frozen at spawn time and intentionally omitted from task-list payloads.
+    #[serde(skip)]
+    pub initial_conversation: Vec<ModelConversationMessage>,
+    /// The parent's compiled instructions at the fork point. Child-specific
+    /// profile instructions are appended later as a branch suffix.
+    #[serde(skip)]
+    pub initial_model_context: Option<CompiledModelContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +98,8 @@ pub struct SpawnSubagentRequest {
     pub input: String,
     pub fork_turns: String,
     pub depth: u8,
+    pub initial_conversation: Vec<ModelConversationMessage>,
+    pub initial_model_context: Option<CompiledModelContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +338,8 @@ impl SubagentScheduler {
             created_at: Utc::now(),
             started_at: None,
             completed_at: None,
+            initial_conversation: request.initial_conversation,
+            initial_model_context: request.initial_model_context,
         };
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (updates, _) = watch::channel(run.clone());
@@ -420,6 +433,15 @@ impl SubagentScheduler {
             .collect()
     }
 
+    pub fn list_descendants_scoped(&self, scope: &SubagentScope) -> Vec<SubagentRun> {
+        let parent_path = normalize_agent_path(&scope.agent_path);
+        let descendant_prefix = format!("{}/", parent_path.trim_end_matches('/'));
+        self.list_for_thread(scope.thread_id)
+            .into_iter()
+            .filter(|run| run.agent_path.starts_with(&descendant_prefix))
+            .collect()
+    }
+
     pub fn resolve_scoped(
         &self,
         scope: SubagentScope,
@@ -486,7 +508,7 @@ impl SubagentScheduler {
         }
         let target_path = resolve_target_path(&scope.agent_path, target);
         if target_path == "/root" {
-            self.queue_root_message(
+            self.queue_mailbox_message(
                 scope.thread_id,
                 AgentMailboxMessage {
                     from_agent_path: scope.agent_path,
@@ -758,6 +780,63 @@ impl SubagentScheduler {
         self.drain_mailbox(scope.thread_id, &scope.agent_path)
     }
 
+    pub fn mailbox_snapshot_scoped(&self, scope: &SubagentScope) -> Vec<AgentMailboxMessage> {
+        self.inner
+            .mailboxes
+            .lock()
+            .expect("agent mailboxes mutex poisoned")
+            .get(&(scope.thread_id, normalize_agent_path(&scope.agent_path)))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn acknowledge_mailbox_scoped(
+        &self,
+        scope: &SubagentScope,
+        delivered: &[AgentMailboxMessage],
+    ) {
+        if delivered.is_empty() {
+            return;
+        }
+        let key = (scope.thread_id, normalize_agent_path(&scope.agent_path));
+        let mut mailboxes = self
+            .inner
+            .mailboxes
+            .lock()
+            .expect("agent mailboxes mutex poisoned");
+        let Some(messages) = mailboxes.get_mut(&key) else {
+            return;
+        };
+        messages.retain(|message| !delivered.contains(message));
+        if messages.is_empty() {
+            mailboxes.remove(&key);
+        }
+    }
+
+    pub fn drain_mailbox_from_scoped(
+        &self,
+        scope: &SubagentScope,
+        from_agent_path: &str,
+    ) -> Vec<AgentMailboxMessage> {
+        let key = (scope.thread_id, normalize_agent_path(&scope.agent_path));
+        let from_agent_path = normalize_agent_path(from_agent_path);
+        let mut mailboxes = self
+            .inner
+            .mailboxes
+            .lock()
+            .expect("agent mailboxes mutex poisoned");
+        let Some(messages) = mailboxes.remove(&key) else {
+            return Vec::new();
+        };
+        let (matching, remaining): (Vec<_>, Vec<_>) = messages
+            .into_iter()
+            .partition(|message| normalize_agent_path(&message.from_agent_path) == from_agent_path);
+        if !remaining.is_empty() {
+            mailboxes.insert(key, remaining);
+        }
+        matching
+    }
+
     fn ensure_visible(&self, scope: SubagentScope, run_id: Uuid) -> Result<(), SubagentError> {
         let run = self.get(run_id).ok_or(SubagentError::NotFound(run_id))?;
         if run.parent_thread_id != scope.thread_id {
@@ -863,26 +942,26 @@ impl SubagentScheduler {
             run.result = result;
             run.error = error;
             run.completed_at = Some(Utc::now());
+            self.queue_mailbox_message(
+                run.parent_thread_id,
+                AgentMailboxMessage {
+                    from_agent_path: run.agent_path.clone(),
+                    to_agent_path: run.parent_agent_path.clone(),
+                    kind: AgentMailboxMessageKind::Completion,
+                    message: serde_json::to_string(&serde_json::json!({
+                        "agentPath": run.agent_path,
+                        "status": run.status,
+                        "result": run.result,
+                        "error": run.error,
+                    }))
+                    .unwrap_or_else(|_| "agent turn completed".to_string()),
+                    created_at: Utc::now(),
+                },
+            );
             run.clone()
         };
         control.updates.send_replace(run.clone());
         self.publish(&run);
-        self.deliver_mailbox_message(
-            run.parent_thread_id,
-            AgentMailboxMessage {
-                from_agent_path: run.agent_path.clone(),
-                to_agent_path: run.parent_agent_path.clone(),
-                kind: AgentMailboxMessageKind::Completion,
-                message: serde_json::to_string(&serde_json::json!({
-                    "agentPath": run.agent_path,
-                    "status": run.status,
-                    "result": run.result,
-                    "error": run.error,
-                }))
-                .unwrap_or_else(|_| "agent turn completed".to_string()),
-                created_at: Utc::now(),
-            },
-        );
     }
 
     fn publish(&self, run: &SubagentRun) {
@@ -890,7 +969,7 @@ impl SubagentScheduler {
         let _ = self.inner.events.send(SubagentEvent { run: run.clone() });
     }
 
-    fn queue_root_message(&self, thread_id: Uuid, message: AgentMailboxMessage) {
+    fn queue_mailbox_message(&self, thread_id: Uuid, message: AgentMailboxMessage) {
         self.inner
             .mailboxes
             .lock()
@@ -899,30 +978,6 @@ impl SubagentScheduler {
             .or_default()
             .push(message.clone());
         let _ = self.inner.mailbox_events.send((thread_id, message));
-    }
-
-    fn deliver_mailbox_message(&self, thread_id: Uuid, message: AgentMailboxMessage) {
-        if normalize_agent_path(&message.to_agent_path) == "/root" {
-            self.queue_root_message(thread_id, message);
-            return;
-        }
-        let target = self
-            .list_for_thread(thread_id)
-            .into_iter()
-            .find(|run| run.agent_path == message.to_agent_path);
-        let Some(target) = target else {
-            return;
-        };
-        let rendered = render_agent_message(&message.from_agent_path, &message.message);
-        if target.status.is_terminal() || self.send_input(target.id, rendered.clone()).is_err() {
-            self.inner
-                .queued_messages
-                .lock()
-                .expect("subagent mailbox mutex poisoned")
-                .entry(target.id)
-                .or_default()
-                .push(rendered);
-        }
     }
 
     fn drain_mailbox(&self, thread_id: Uuid, agent_path: &str) -> Vec<AgentMailboxMessage> {
@@ -1065,6 +1120,8 @@ mod tests {
             input: "work".to_string(),
             fork_turns: "all".to_string(),
             depth: 1,
+            initial_conversation: Vec::new(),
+            initial_model_context: None,
         }
     }
 
@@ -1075,6 +1132,33 @@ mod tests {
             depth: run.depth - 1,
             agent_path: run.parent_agent_path.clone(),
         }
+    }
+
+    #[test]
+    fn mailbox_acknowledgement_preserves_messages_after_the_delivered_snapshot() {
+        let (scheduler, _) = scheduler(1, Duration::from_millis(20));
+        let scope = SubagentScope {
+            thread_id: Uuid::new_v4(),
+            parent_turn_id: Uuid::new_v4(),
+            depth: 0,
+            agent_path: "/root".to_string(),
+        };
+        let message = |text: &str| AgentMailboxMessage {
+            from_agent_path: "/root/worker".to_string(),
+            to_agent_path: "/root".to_string(),
+            kind: AgentMailboxMessageKind::Message,
+            message: text.to_string(),
+            created_at: Utc::now(),
+        };
+        scheduler.queue_mailbox_message(scope.thread_id, message("delivered"));
+        let delivered = scheduler.mailbox_snapshot_scoped(&scope);
+        scheduler.queue_mailbox_message(scope.thread_id, message("arrived later"));
+
+        scheduler.acknowledge_mailbox_scoped(&scope, &delivered);
+
+        let remaining = scheduler.mailbox_snapshot_scoped(&scope);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].message, "arrived later");
     }
 
     #[tokio::test]
