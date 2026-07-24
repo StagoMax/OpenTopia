@@ -33,7 +33,6 @@ import type {
   ProviderKind,
   ProviderSettings,
   SecretSources,
-  WebSearchKeyringMetadata,
 } from "../types";
 
 type SettingsTab = "general" | "providers" | "permissions" | "advanced";
@@ -43,7 +42,6 @@ export type SettingsSaveInput = {
   activeProviderId?: string;
   permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
   sandbox?: AppSettings["sandbox"];
-  webSearch?: AppSettings["webSearch"];
 };
 
 type SettingsPanelProps = {
@@ -59,17 +57,13 @@ type SettingsPanelProps = {
   notificationPreferences: TaskNotificationPreferences;
   isSaving: boolean;
   isSavingSecret: boolean;
-  onSave(input: SettingsSaveInput): Promise<void>;
+  onSave(input: SettingsSaveInput): Promise<boolean>;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
   onStoreProviderApiKey(
     providerId: string,
     value: string,
   ): Promise<KeyringMetadata | null>;
   onDeleteProviderApiKey(providerId: string): Promise<KeyringMetadata | null>;
-  onStoreWebSearchApiKey(
-    value: string,
-  ): Promise<WebSearchKeyringMetadata | null>;
-  onDeleteWebSearchApiKey(): Promise<WebSearchKeyringMetadata | null>;
   onNotificationPreferencesChange(
     preferences: TaskNotificationPreferences,
   ): void;
@@ -128,8 +122,6 @@ export function SettingsPanel({
   onTestProvider,
   onStoreProviderApiKey,
   onDeleteProviderApiKey,
-  onStoreWebSearchApiKey,
-  onDeleteWebSearchApiKey,
   onNotificationPreferencesChange,
   onTestNotification,
   onOpenLogs,
@@ -160,16 +152,6 @@ export function SettingsPanel({
       readPaths: [],
     },
   );
-  const [webSearch, setWebSearch] = useState<AppSettings["webSearch"]>(
-    settings?.webSearch ?? {
-      mode: "disabled",
-      endpoint: "",
-      apiKeySource: "OPENTOPIA_WEB_SEARCH_API_KEY",
-      apiKeyConfigured: false,
-      maxResults: 5,
-    },
-  );
-  const [webSearchApiKey, setWebSearchApiKey] = useState("");
   const [pendingApiKeys, setPendingApiKeys] = useState<Record<string, string>>(
     {},
   );
@@ -200,13 +182,11 @@ export function SettingsPanel({
     );
     setPermissionMode(settings.permissionMode);
     setSandboxSettings(settings.sandbox);
-    setWebSearch(settings.webSearch);
     baselineRef.current = settingsSnapshot(
       settings.providers,
       settings.activeProviderId,
       settings.permissionMode,
       settings.sandbox,
-      settings.webSearch,
     );
   }, [settings]);
 
@@ -219,7 +199,6 @@ export function SettingsPanel({
     activeProviderId,
     permissionMode,
     sandboxSettings,
-    webSearch,
   );
   const isDirty =
     Object.values(pendingApiKeys).some(Boolean) ||
@@ -330,7 +309,6 @@ export function SettingsPanel({
     setIsApplyingSave(true);
     try {
       let nextProviders = providers;
-      let nextWebSearch = webSearch;
       for (const [providerId, apiKey] of Object.entries(pendingApiKeys)) {
         if (!apiKey.trim()) continue;
         const metadata = await onStoreProviderApiKey(providerId, apiKey);
@@ -350,35 +328,23 @@ export function SettingsPanel({
             : provider,
         );
       }
-      if (webSearchApiKey.trim()) {
-        const metadata = await onStoreWebSearchApiKey(webSearchApiKey);
-        if (!metadata) {
-          setStatusMessage("无法安全保存网页搜索密钥，请检查系统密钥存储。");
-          return;
-        }
-        nextWebSearch = {
-          ...webSearch,
-          apiKeySource: metadata.envTarget,
-          apiKeyConfigured: true,
-        };
-        setWebSearch(nextWebSearch);
-      }
       setProviders(nextProviders);
-      await onSave({
+      const didSave = await onSave({
         providers: nextProviders,
         activeProviderId,
         permissionMode,
         sandbox: sandboxSettings,
-        webSearch: nextWebSearch,
       });
+      if (!didSave) {
+        setStatusMessage("保存设置失败，请检查连接后重试。");
+        return;
+      }
       setPendingApiKeys({});
-      setWebSearchApiKey("");
       baselineRef.current = settingsSnapshot(
         nextProviders,
         activeProviderId,
         permissionMode,
         sandboxSettings,
-        nextWebSearch,
       );
       setStatusMessage("设置已保存。");
     } finally {
@@ -542,25 +508,8 @@ export function SettingsPanel({
             {activeTab === "advanced" ? (
               <AdvancedSettings
                 providers={providers}
-                activeProviderId={activeProviderId}
                 providerHealth={providerHealth}
                 providerTest={providerTest}
-                webSearch={webSearch}
-                webSearchApiKey={webSearchApiKey}
-                secretSources={secretSources}
-                saving={saving}
-                onWebSearchChange={setWebSearch}
-                onWebSearchApiKeyChange={setWebSearchApiKey}
-                onDeleteWebSearchApiKey={async () => {
-                  const metadata = await onDeleteWebSearchApiKey();
-                  if (!metadata) return;
-                  setWebSearch((current) => ({
-                    ...current,
-                    apiKeyConfigured: false,
-                  }));
-                  setWebSearchApiKey("");
-                  setStatusMessage("已移除网页搜索密钥。");
-                }}
                 onTestProvider={onTestProvider}
                 onOpenLogs={onOpenLogs}
               />
@@ -768,6 +717,8 @@ function ProviderSettingsView({
   onDeleteProviderApiKey(providerId: string): Promise<void>;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
 }) {
+  const usesCodexAppServer = editingProvider?.kind === "codex_app_server";
+
   return (
     <SettingsPage
       title="模型与 API"
@@ -861,92 +812,129 @@ function ProviderSettingsView({
                 <span>供应商类型</span>
                 <select
                   value={editingProvider.kind}
-                  onChange={(event) =>
-                    onUpdateProvider(
-                      editingProvider.id,
-                      "kind",
-                      event.target.value as ProviderKind,
-                    )
-                  }
+                  onChange={(event) => {
+                    const kind = event.target.value as ProviderKind;
+                    onUpdateProvider(editingProvider.id, "kind", kind);
+                    if (kind === "codex_app_server") {
+                      onUpdateProvider(editingProvider.id, "model", "");
+                    } else if (!editingProvider.model.trim()) {
+                      onUpdateProvider(
+                        editingProvider.id,
+                        "model",
+                        "gpt-4.1-mini",
+                      );
+                    }
+                  }}
                 >
                   <option value="openai_compatible">OpenAI Compatible</option>
                   <option value="openai_responses">OpenAI Responses</option>
+                  <option value="codex_app_server">Codex App Server (local)</option>
                   <option value="mock">Mock</option>
                 </select>
               </label>
-              <label>
-                <span>模型</span>
-                <input
-                  value={editingProvider.model}
-                  required
-                  onChange={(event) =>
-                    onUpdateProvider(
-                      editingProvider.id,
-                      "model",
-                      event.target.value,
-                    )
-                  }
-                />
-              </label>
-              <label className="settings-field-wide">
-                <span>Base URL</span>
-                <input
-                  type="url"
-                  value={editingProvider.baseUrl}
-                  required
-                  spellCheck={false}
-                  onChange={(event) =>
-                    onUpdateProvider(
-                      editingProvider.id,
-                      "baseUrl",
-                      event.target.value,
-                    )
-                  }
-                />
-              </label>
-              <label className="settings-field-wide">
-                <span>API 密钥</span>
-                <div className="settings-secret-input">
-                  <KeyRound size={15} aria-hidden="true" />
+              {!usesCodexAppServer ? (
+                <label>
+                  <span>模型</span>
                   <input
-                    type={showApiKey ? "text" : "password"}
-                    autoComplete="off"
-                    value={pendingApiKey}
-                    disabled={
-                      platform?.platform === "desktop" &&
-                      secretSources?.keyring &&
-                      !secretSources.keyring.encryptionAvailable
-                    }
-                    placeholder={
-                      editingProvider.apiKeyConfigured
-                        ? "已加密保存，输入新密钥可替换"
-                        : "输入密钥，保存时写入系统安全存储"
-                    }
+                    value={editingProvider.model}
+                    required
                     onChange={(event) =>
-                      onPendingApiKeyChange(
+                      onUpdateProvider(
                         editingProvider.id,
+                        "model",
                         event.target.value,
                       )
                     }
                   />
-                  <button
-                    type="button"
-                    aria-label={showApiKey ? "隐藏 API 密钥" : "显示 API 密钥"}
-                    title={showApiKey ? "隐藏密钥" : "显示密钥"}
-                    onClick={onToggleApiKeyVisibility}
-                  >
-                    {showApiKey ? <EyeOff size={15} /> : <Eye size={15} />}
-                  </button>
+                </label>
+              ) : null}
+              {usesCodexAppServer ? (
+                <div className="settings-field-wide settings-provider-local-note" role="status">
+                  使用本机已安装的 Codex 及其模型配置处理本地附件；不需要 Base URL、API 密钥、模型名或图片服务器。
                 </div>
-                <small>
-                  {editingProvider.apiKeyConfigured
-                    ? "密钥已加密保存；界面不会回显原文。"
-                    : "密钥不会写入普通设置文件。"}
-                </small>
-              </label>
+              ) : (
+                <>
+                  <label className="settings-field-wide">
+                    <span>Base URL</span>
+                    <input
+                      type="url"
+                      value={editingProvider.baseUrl}
+                      required
+                      spellCheck={false}
+                      onChange={(event) =>
+                        onUpdateProvider(
+                          editingProvider.id,
+                          "baseUrl",
+                          event.target.value,
+                        )
+                      }
+                    />
+                  </label>
+                  <label className="settings-field-wide">
+                    <span>API 密钥</span>
+                    <div className="settings-secret-input">
+                      <KeyRound size={15} aria-hidden="true" />
+                      <input
+                        type={showApiKey ? "text" : "password"}
+                        autoComplete="off"
+                        value={pendingApiKey}
+                        disabled={
+                          platform?.platform === "desktop" &&
+                          secretSources?.keyring &&
+                          !secretSources.keyring.encryptionAvailable
+                        }
+                        placeholder={
+                          editingProvider.apiKeyConfigured
+                            ? "已加密保存，输入新密钥可替换"
+                            : "输入密钥，保存时写入系统安全存储"
+                        }
+                        onChange={(event) =>
+                          onPendingApiKeyChange(
+                            editingProvider.id,
+                            event.target.value,
+                          )
+                        }
+                      />
+                      <button
+                        type="button"
+                        aria-label={showApiKey ? "隐藏 API 密钥" : "显示 API 密钥"}
+                        title={showApiKey ? "隐藏密钥" : "显示密钥"}
+                        onClick={onToggleApiKeyVisibility}
+                      >
+                        {showApiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                      </button>
+                    </div>
+                    <small>
+                      {editingProvider.apiKeyConfigured
+                        ? "密钥已加密保存；界面不会回显原文。"
+                        : "密钥不会写入普通设置文件。"}
+                    </small>
+                  </label>
+                </>
+              )}
             </div>
 
-            <details className="settings-advanced-fields">
+            <div className="settings-toggle-stack">
+              <SettingsRow
+                title="支持视觉输入"
+                description="关闭后，带图片的请求会在发送前明确拒绝。"
+                control={
+                  <Switch
+                    label="支持视觉输入"
+                    checked={editingProvider.supportsVision}
+                    onChange={(checked) =>
+                      onUpdateProvider(
+                        editingProvider.id,
+                        "supportsVision",
+                        checked,
+                      )
+                    }
+                  />
+                }
+              />
+            </div>
+
+            {!usesCodexAppServer ? <details className="settings-advanced-fields">
               <summary>模型高级参数</summary>
               <div className="settings-form-grid">
                 <label>
@@ -1121,14 +1109,14 @@ function ProviderSettingsView({
                   />
                 ) : null}
               </div>
-            </details>
+            </details> : null}
 
             <div className="settings-provider-footer">
               <div className="settings-provider-health-status">
                 {providerStatusChips(editingProvider, providerHealth)}
               </div>
               <div className="settings-provider-actions">
-                {editingProvider.apiKeyConfigured ? (
+                {!usesCodexAppServer && editingProvider.apiKeyConfigured ? (
                   <button
                     type="button"
                     className="secondary-button danger-text"
@@ -1329,161 +1317,19 @@ function PermissionSettings({
 
 function AdvancedSettings({
   providers,
-  activeProviderId,
   providerHealth,
   providerTest,
-  webSearch,
-  webSearchApiKey,
-  secretSources,
-  saving,
-  onWebSearchChange,
-  onWebSearchApiKeyChange,
-  onDeleteWebSearchApiKey,
   onTestProvider,
   onOpenLogs,
 }: {
   providers: ProviderSettings[];
-  activeProviderId: string;
   providerHealth: ProviderHealth[];
   providerTest: SettingsPanelProps["providerTest"];
-  webSearch: AppSettings["webSearch"];
-  webSearchApiKey: string;
-  secretSources: SecretSources | null;
-  saving: boolean;
-  onWebSearchChange(settings: AppSettings["webSearch"]): void;
-  onWebSearchApiKeyChange(apiKey: string): void;
-  onDeleteWebSearchApiKey(): Promise<void>;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
   onOpenLogs(): void;
 }) {
-  const activeProvider =
-    providers.find((provider) => provider.id === activeProviderId) ?? null;
   return (
     <SettingsPage title="高级" description="检查模型连接状态并打开诊断信息。">
-      <SettingsGroup title="网页搜索">
-        <div
-          className="settings-web-search-modes"
-          role="radiogroup"
-          aria-label="网页搜索模式"
-        >
-          {(
-            [
-              ["disabled", "关闭", "不提供网页搜索工具。"],
-              ["provider_native", "供应商原生", "使用 Responses 网页搜索。"],
-              ["custom_api", "自定义 API", "连接兼容的搜索端点。"],
-            ] as const
-          ).map(([mode, label, description]) => {
-            const disabled =
-              mode === "provider_native" &&
-              !providers.some(
-                (provider) => provider.kind === "openai_responses",
-              );
-            return (
-              <label
-                key={mode}
-                className={webSearch.mode === mode ? "active" : ""}
-                title={
-                  disabled ? "需要先配置 OpenAI Responses 供应商" : undefined
-                }
-              >
-                <input
-                  type="radio"
-                  name="web-search-mode"
-                  value={mode}
-                  checked={webSearch.mode === mode}
-                  disabled={disabled}
-                  onChange={() => onWebSearchChange({ ...webSearch, mode })}
-                />
-                <span>
-                  <strong>{label}</strong>
-                  <small>{description}</small>
-                </span>
-              </label>
-            );
-          })}
-        </div>
-        {webSearch.mode === "custom_api" ? (
-          <div className="settings-web-search-custom">
-            <div className="settings-form-grid">
-              <label className="settings-field-wide">
-                <span>搜索端点</span>
-                <input
-                  type="url"
-                  required
-                  value={webSearch.endpoint}
-                  placeholder="https://search.example.com/v1/search"
-                  onChange={(event) =>
-                    onWebSearchChange({
-                      ...webSearch,
-                      endpoint: event.target.value,
-                    })
-                  }
-                />
-              </label>
-              <label>
-                <span>最大结果数</span>
-                <input
-                  type="number"
-                  min="1"
-                  max="10"
-                  value={webSearch.maxResults}
-                  onChange={(event) =>
-                    onWebSearchChange({
-                      ...webSearch,
-                      maxResults: Math.min(
-                        10,
-                        Math.max(1, Number(event.target.value) || 1),
-                      ),
-                    })
-                  }
-                />
-              </label>
-              <label className="settings-field-wide">
-                <span>搜索 API 密钥</span>
-                <div className="settings-secret-input">
-                  <KeyRound size={15} aria-hidden="true" />
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={webSearchApiKey}
-                    disabled={
-                      Boolean(secretSources?.webSearchKeyring) &&
-                      !secretSources?.webSearchKeyring?.encryptionAvailable
-                    }
-                    placeholder={
-                      webSearch.apiKeyConfigured
-                        ? "已加密保存，输入新密钥可替换"
-                        : "保存时写入系统安全存储"
-                    }
-                    onChange={(event) =>
-                      onWebSearchApiKeyChange(event.target.value)
-                    }
-                  />
-                </div>
-              </label>
-            </div>
-            {webSearch.apiKeyConfigured ? (
-              <div className="settings-group-actions">
-                <button
-                  type="button"
-                  className="secondary-button danger-text"
-                  disabled={saving}
-                  onClick={() => void onDeleteWebSearchApiKey()}
-                >
-                  移除搜索密钥
-                </button>
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-        {webSearch.mode === "provider_native" &&
-        activeProvider?.kind !== "openai_responses" ? (
-          <div className="settings-warning-notice" role="status">
-            <Shield size={16} />
-            请将一个 OpenAI Responses 供应商设为默认模型。
-          </div>
-        ) : null}
-      </SettingsGroup>
       <SettingsGroup title="供应商连接">
         {providers.map((provider) => {
           const health = providerHealth.find((item) => item.id === provider.id);
@@ -1796,6 +1642,7 @@ function createProviderSettings(
     promptCachePolicy: null,
     responsesCompactionThresholdTokens: null,
     rolloutBudget: null,
+    supportsVision: true,
     apiKeySource: "OPENTOPIA_API_KEY",
     apiKeyConfigured: false,
     healthStatus: null,
@@ -1825,14 +1672,12 @@ function settingsSnapshot(
   activeProviderId: string,
   permissionMode: AppSettings["permissionMode"],
   sandbox: AppSettings["sandbox"],
-  webSearch: AppSettings["webSearch"],
 ): string {
   return JSON.stringify({
     providers,
     activeProviderId,
     permissionMode,
     sandbox,
-    webSearch,
   });
 }
 
@@ -1863,6 +1708,7 @@ function parsePathList(value: string): string[] {
 }
 
 function providerKindLabel(kind: ProviderKind): string {
+  if (kind === "codex_app_server") return "Codex App Server";
   if (kind === "openai_responses") return "OpenAI Responses";
   if (kind === "openai_compatible") return "OpenAI Compatible";
   return "Mock";
@@ -1876,8 +1722,14 @@ function providerStatusChips(
   return (
     <>
       <span>{providerHealth?.status ?? "状态未知"}</span>
-      <span>{provider.apiKeyConfigured ? "密钥已配置" : "未配置密钥"}</span>
-      <span>{providerHealth?.usingMock ? "Mock" : "远程模型"}</span>
+      <span>
+        {provider.kind === "codex_app_server"
+          ? "本地 Codex"
+          : provider.apiKeyConfigured
+            ? "密钥已配置"
+            : "未配置密钥"}
+      </span>
+      <span>{providerHealth?.usingMock ? "Mock" : "模型"}</span>
     </>
   );
 }

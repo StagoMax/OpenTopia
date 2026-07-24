@@ -14,6 +14,8 @@ import { openPath } from "../platform";
 import type {
   AgentEvent,
   BrowserContent,
+  BrowserNode,
+  BrowserObservation,
   BrowserOutput,
   ModelContentPart,
   ToolResult,
@@ -21,7 +23,7 @@ import type {
 
 type BrowserAction =
   | "navigate"
-  | "snapshot"
+  | "observe"
   | "screenshot"
   | "click"
   | "type"
@@ -44,7 +46,7 @@ export function BrowserPanel({
   onDecideApproval(approvalId: string, approved: boolean): void;
 }) {
   const [url, setUrl] = useState("");
-  const [selector, setSelector] = useState("");
+  const [selectedNodeRef, setSelectedNodeRef] = useState("");
   const [text, setText] = useState("");
   const [output, setOutput] = useState<BrowserOutput | null>(null);
   const [isRunning, setIsRunning] = useState(false);
@@ -93,6 +95,7 @@ export function BrowserPanel({
     manualEventBarrierRef.current = null;
     handledBrowserEventIdRef.current = null;
     setUrl("");
+    setSelectedNodeRef("");
     setOutput(null);
     setError(null);
     setIsRunning(false);
@@ -148,6 +151,23 @@ export function BrowserPanel({
     () => output?.contents.filter((content) => content.type === "file") ?? [],
     [output],
   );
+  const observation = useMemo(
+    () => browserObservationFromOutput(output),
+    [output],
+  );
+  const selectedNode = useMemo(
+    () =>
+      observation?.nodes.find((node) => node.nodeRef === selectedNodeRef) ??
+      null,
+    [observation, selectedNodeRef],
+  );
+  useEffect(() => {
+    setSelectedNodeRef((current) =>
+      observation?.nodes.some((node) => node.nodeRef === current)
+        ? current
+        : (observation?.nodes[0]?.nodeRef ?? ""),
+    );
+  }, [observation]);
   const pendingBrowserApproval = useMemo(
     () =>
       [...events]
@@ -172,8 +192,14 @@ export function BrowserPanel({
       const next = await client.runBrowserCommand(threadId, {
         action,
         url: action === "navigate" || action === "download" ? url : undefined,
-        selector:
-          action === "click" || action === "type" ? selector : undefined,
+        observationId:
+          action === "click" || action === "type"
+            ? observation?.observationId
+            : undefined,
+        nodeRef:
+          action === "click" || action === "type"
+            ? selectedNode?.nodeRef
+            : undefined,
         text: action === "type" ? text : undefined,
       });
       if (
@@ -254,8 +280,8 @@ export function BrowserPanel({
           aria-label="Page snapshot"
           className="icon-button small"
           disabled={disabled}
-          onClick={() => void run("snapshot")}
-          title="Page snapshot"
+          onClick={() => void run("observe")}
+          title="Observe page"
           type="button"
         >
           <RefreshCw size={14} />
@@ -293,19 +319,28 @@ export function BrowserPanel({
       </div>
 
       <div className="browser-selector-row">
-        <input
-          aria-label="CSS selector"
-          placeholder="CSS selector"
-          spellCheck={false}
-          value={selector}
-          onChange={(event) => setSelector(event.target.value)}
-        />
+        <select
+          aria-label="Observed browser element"
+          disabled={disabled || !observation || observation.nodes.length === 0}
+          value={selectedNodeRef}
+          onChange={(event) => setSelectedNodeRef(event.target.value)}
+        >
+          {observation?.nodes.length ? (
+            observation.nodes.map((node) => (
+              <option key={node.nodeRef} value={node.nodeRef}>
+                {nodeLabel(node)}
+              </option>
+            ))
+          ) : (
+            <option value="">Observe page to select an element</option>
+          )}
+        </select>
         <button
-          aria-label="Click selected element"
+          aria-label="Click observed element"
           className="icon-button small"
-          disabled={disabled || !selector.trim()}
+          disabled={disabled || !selectedNode}
           onClick={() => void run("click")}
-          title="Click selected element"
+          title="Click observed element"
           type="button"
         >
           <MousePointer2 size={14} />
@@ -319,11 +354,11 @@ export function BrowserPanel({
           onChange={(event) => setText(event.target.value)}
         />
         <button
-          aria-label="Type into selected element"
+          aria-label="Type into observed element"
           className="icon-button small"
-          disabled={disabled || !selector.trim() || !text.length}
+          disabled={disabled || !selectedNode?.editable || !text.length}
           onClick={() => void run("type")}
-          title="Type into selected element"
+          title="Type into observed element"
           type="button"
         >
           <Keyboard size={14} />
@@ -476,6 +511,73 @@ function browserResourcePath(uri: string): string {
   } catch {
     return uri;
   }
+}
+
+function browserObservationFromOutput(
+  output: BrowserOutput | null,
+): BrowserObservation | null {
+  if (!output) return null;
+  for (const content of output.contents) {
+    if (content.type !== "json") continue;
+    const value = asRecord(content.value);
+    if (
+      typeof value?.observationId !== "string" ||
+      typeof value.url !== "string" ||
+      !Array.isArray(value.nodes)
+    ) {
+      continue;
+    }
+    const nodes = value.nodes
+      .map(browserNodeFromValue)
+      .filter((node): node is BrowserNode => node !== null);
+    return {
+      observationId: value.observationId,
+      url: value.url,
+      title: typeof value.title === "string" ? value.title : "",
+      text: typeof value.text === "string" ? value.text : "",
+      textTruncated: value.textTruncated === true,
+      nodes,
+    };
+  }
+  return null;
+}
+
+function browserNodeFromValue(value: unknown): BrowserNode | null {
+  const node = asRecord(value);
+  const bounds = asRecord(node?.bounds);
+  if (
+    typeof node?.nodeRef !== "string" ||
+    typeof node.role !== "string" ||
+    typeof node.name !== "string" ||
+    typeof node.tagName !== "string" ||
+    typeof bounds?.x !== "number" ||
+    typeof bounds.y !== "number" ||
+    typeof bounds.width !== "number" ||
+    typeof bounds.height !== "number" ||
+    typeof node.editable !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    nodeRef: node.nodeRef,
+    role: node.role,
+    name: node.name,
+    tagName: node.tagName,
+    bounds: {
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+    },
+    href: typeof node.href === "string" ? node.href : null,
+    formAction: typeof node.formAction === "string" ? node.formAction : null,
+    editable: node.editable,
+  };
+}
+
+function nodeLabel(node: BrowserNode): string {
+  const name = node.name.trim();
+  return name ? `${node.role}: ${name}` : node.role || node.tagName;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

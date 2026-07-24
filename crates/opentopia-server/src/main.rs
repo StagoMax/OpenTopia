@@ -14,39 +14,37 @@ use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
     browser_domain_approval_action, browser_domain_from_approval_action, browser_domain_from_url,
     browser_domain_is_approved, build_local_sandbox_command, content_fingerprint,
-    create_skill_from_draft, default_agent_model_context, discover_plugins, discover_skills,
-    execute_git_workflow, install_plugin, load_context_sources, load_plugin_mcp_servers,
-    load_selected_skills, parse_skill_draft_response, preview_skill_draft,
-    redact_model_observation, resolve_instruction_documents, skill_authoring_system_prompt,
-    skill_draft_json_schema, uninstall_plugin, validate_skill_generation_prompt,
+    default_agent_model_context, discover_plugins, discover_skills, execute_git_workflow,
+    install_plugin, load_context_sources, load_plugin_mcp_servers, load_selected_skills,
+    redact_model_observation, resolve_instruction_documents, uninstall_plugin,
     world_state_catalog_item, world_state_item, AgentContextBudget, AgentContinuation, AgentCore,
     AgentEvent, AgentEventPayload, AgentProfileRegistry, AgentTurnInput, AgentTurnOutcome,
     AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata, BasicPolicyEngine,
-    BrowserDownloadRequest, BrowserNavigateRequest, BrowserOutput, BrowserRuntime,
-    BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserTypeRequest,
-    BrowserWaitCondition, BrowserWaitRequest, ChangedFile, CollaborationMode, CompiledModelContext,
-    ComputerRuntime, ComputerRuntimeConfig, ComputerSessionId, ContextCacheScope, ContextItemKind,
-    ContextRole, ContextSensitivity, ContextSourcePolicy, ContextSourceRef, ContextSummary,
-    CreatedSkill, DesktopBrowserRuntime, ExecRequest, ExecutionContext, ExperienceMode,
-    GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill,
-    LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment, McpCallResult,
-    McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole,
-    ModelContentPart, ModelContextItem, ModelConversationMessage, ModelConversationRole,
-    ModelDecision, ModelProvider, ModelRequest, ObserveOptions, OpenAiCompatibleProvider,
-    OpenAiResponsesProvider, PermissionMode, PluginDescriptor, PluginError, PolicyDecision,
-    PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest,
-    PreviewTarget, PreviewWorkbook, ProviderConversationCursor, ProviderConversationState,
-    ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent,
-    ResolvedPreview, ResourceLimit, SandboxDescriptor, SandboxSettings, SessionStore,
-    SkillAuthoringError, SkillDescriptor, SkillDraft, SkillDraftPreview, SkillRef, SkillScope,
-    SpawnSubagentRequest, SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver,
-    SubagentRun, SubagentScheduler, SubagentSchedulerConfig, SubagentScope, TaskPlan,
-    TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer,
-    ToolCall, ToolPermissionDescriptor, ToolResult, TurnChangeSet, TurnChangeSetStatus,
-    TurnContextSnapshot, TurnRecord, TurnStatus, WebSearchMode, WebSearchSettings, WorkspaceDiff,
-    WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
-    MAX_PREVIEW_CONTENT_BYTES,
+    BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
+    BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
+    BrowserObserveOptions, BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector,
+    BrowserSessionId, BrowserWaitCondition, BrowserWaitRequest, ChangedFile,
+    CodexAppServerProvider, CollaborationMode, CompiledModelContext, ComputerRuntime,
+    ComputerRuntimeConfig, ComputerSessionId, ContextCacheScope, ContextItemKind, ContextRole,
+    ContextSensitivity, ContextSourcePolicy, ContextSourceRef, ContextSummary,
+    DesktopBrowserRuntime, ExecRequest, ExecutionContext, ExperienceMode, GitWorkflowAction,
+    GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill, LocalBrowserRuntime,
+    LocalComputerRuntime, LocalExecutionEnvironment, McpCallResult, McpServerConfig,
+    McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole, ModelContentPart,
+    ModelContextItem, ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
+    ObserveOptions, OpenAiCompatibleProvider, OpenAiResponsesProvider, PermissionMode,
+    PluginDescriptor, PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError,
+    PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderConversationCursor,
+    ProviderConversationState, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
+    ProviderTransportEvent, ResolvedPreview, ResourceLimit, SandboxDescriptor, SandboxSettings,
+    SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
+    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
+    SubagentScope, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot,
+    ThreadMcpServer, ToolCall, ToolPermissionDescriptor, ToolResult, TurnChangeSet,
+    TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus, UserInputRecord,
+    UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff, WorkspaceDiffHunk,
+    WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
+    WorldStateSkill, WorldStateSnapshot, MAX_PREVIEW_CONTENT_BYTES,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -302,8 +300,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/settings", get(get_settings).patch(update_settings))
-        .route("/api/skills", get(list_skills).post(create_skill))
-        .route("/api/skills/generate", post(generate_skill_draft))
+        .route("/api/skills", get(list_skills))
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/install", post(install_local_plugin))
         .route("/api/plugins/uninstall", post(uninstall_local_plugin))
@@ -468,6 +465,14 @@ fn build_router(state: AppState) -> Router {
             post(decide_approval),
         )
         .route(
+            "/api/threads/:thread_id/user-input",
+            get(list_user_input_requests),
+        )
+        .route(
+            "/api/threads/:thread_id/user-input/:request_id/response",
+            post(respond_to_user_input),
+        )
+        .route(
             "/api/mcp/servers",
             get(list_mcp_servers).post(create_mcp_server),
         )
@@ -627,9 +632,12 @@ impl SubagentExecutor for ServerSubagentExecutor {
                 &result,
             )?;
             let result = result?;
-            if matches!(result.outcome, AgentTurnOutcome::Suspended { .. }) {
+            if matches!(
+                result.outcome,
+                AgentTurnOutcome::Suspended { .. } | AgentTurnOutcome::AwaitingInput { .. }
+            ) {
                 anyhow::bail!(
-                    "subagent requires approval; the parent must perform this action directly"
+                    "subagent requires user interaction; the parent must perform this action directly"
                 );
             }
             let last_result = subagent_result_text(&result.events);
@@ -1129,11 +1137,6 @@ async fn update_settings(
     if let Some(sandbox) = request.sandbox {
         settings.sandbox = sandbox;
     }
-    if let Some(web_search) = request.web_search {
-        validate_web_search_settings(&web_search)?;
-        settings.web_search = web_search;
-    }
-
     let settings = state.store.save_settings(settings)?;
     {
         let mut settings_guard = state.settings.write().expect("settings lock poisoned");
@@ -1409,182 +1412,6 @@ fn short_plugin_identity(plugin_id: &str) -> String {
     format!("{hash:08x}").chars().take(8).collect()
 }
 
-async fn generate_skill_draft(
-    State(state): State<AppState>,
-    Json(request): Json<GenerateSkillRequest>,
-) -> Result<Json<SkillDraftPreview>, ApiError> {
-    let prompt =
-        validate_skill_generation_prompt(&request.prompt).map_err(skill_authoring_bad_request)?;
-    let workspace_root = resolve_skill_workspace(&state, request.scope, request.workspace_root)?;
-    let settings = current_settings(&state);
-    let mut active = settings.active_provider().clone();
-    if active.kind == ProviderKind::Mock {
-        return Err(ApiError::bad_request(
-            "natural-language Skill generation requires a configured model provider",
-        ));
-    }
-    active.temperature = active.temperature.min(0.3);
-    active.max_output_tokens = Some(
-        active
-            .max_output_tokens
-            .unwrap_or(8_192)
-            .clamp(2_048, 8_192),
-    );
-    let provider: Box<dyn ModelProvider> = match active.kind {
-        ProviderKind::Mock => None,
-        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-    }
-    .ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "provider '{}' has no configured API key",
-            active.id
-        ))
-    })?;
-
-    let preview = generate_skill_preview(
-        provider.as_ref(),
-        &prompt,
-        request.scope,
-        workspace_root.as_deref(),
-    )
-    .await?;
-    Ok(Json(preview))
-}
-
-async fn generate_skill_preview(
-    provider: &dyn ModelProvider,
-    prompt: &str,
-    scope: SkillScope,
-    workspace_root: Option<&FsPath>,
-) -> Result<SkillDraftPreview, ApiError> {
-    let original_message = format!("Create a Skill from this request:\n\n{prompt}");
-    let mut conversation = Vec::new();
-    let mut user_message = original_message.clone();
-    let mut last_error = String::new();
-    for attempt in 0..2 {
-        let response = timeout(
-            Duration::from_secs(90),
-            provider.complete(ModelRequest {
-                system_prompt: skill_authoring_system_prompt().to_string(),
-                conversation: conversation.clone(),
-                user_message: user_message.clone(),
-                user_content: Vec::new(),
-                tool_candidates: Vec::new(),
-                previous_tool_calls: Vec::new(),
-                tool_results: Vec::new(),
-                context_items: Vec::new(),
-                previous_response_items: Vec::new(),
-                previous_response_id: None,
-                branch_developer_instructions: None,
-                prompt_cache_key: Some("skill-authoring-v1".to_string()),
-                final_output_json_schema: Some(skill_draft_json_schema()),
-            }),
-        )
-        .await
-        .map_err(|_| ApiError::gateway_timeout("Skill generation timed out"))?
-        .map_err(|error| ApiError::bad_gateway(format!("Skill generation failed: {error}")))?;
-        let response_text = match response.decision() {
-            ModelDecision::Final(text) => text,
-            ModelDecision::Incomplete(reason) => {
-                last_error = format!("provider returned an incomplete response: {reason}");
-                if attempt == 1 {
-                    break;
-                }
-                String::new()
-            }
-            ModelDecision::Act(_) => {
-                last_error = "provider returned an unexpected tool call".to_string();
-                if attempt == 1 {
-                    break;
-                }
-                String::new()
-            }
-        };
-        if !response_text.is_empty() {
-            match parse_skill_draft_response(&response_text) {
-                Ok(draft) => {
-                    return preview_skill_draft(draft, scope, workspace_root)
-                        .map_err(skill_authoring_bad_request);
-                }
-                Err(error) => {
-                    last_error = error.to_string();
-                }
-            }
-        }
-        if attempt == 0 {
-            conversation.push(ModelConversationMessage {
-                role: ModelConversationRole::User,
-                content: original_message.clone(),
-                content_parts: Vec::new(),
-            });
-            conversation.push(ModelConversationMessage {
-                role: ModelConversationRole::Assistant,
-                content: response_text,
-                content_parts: Vec::new(),
-            });
-            user_message = format!(
-                "The previous draft was invalid: {last_error}\nReturn a corrected draft as JSON only."
-            );
-        }
-    }
-    Err(ApiError::bad_gateway(format!(
-        "model could not produce a valid Skill draft: {last_error}"
-    )))
-}
-
-async fn create_skill(
-    State(state): State<AppState>,
-    Json(request): Json<CreateSkillRequest>,
-) -> Result<Json<CreatedSkill>, ApiError> {
-    let workspace_root = resolve_skill_workspace(&state, request.scope, request.workspace_root)?;
-    let created = create_skill_from_draft(request.draft, request.scope, workspace_root.as_deref())
-        .map_err(skill_authoring_api_error)?;
-    Ok(Json(created))
-}
-
-fn resolve_skill_workspace(
-    state: &AppState,
-    scope: SkillScope,
-    workspace_root: Option<PathBuf>,
-) -> Result<Option<PathBuf>, ApiError> {
-    if scope == SkillScope::Workspace {
-        let workspace_root = workspace_root.ok_or_else(|| {
-            ApiError::bad_request("workspaceRoot is required for a workspace Skill")
-        })?;
-        if state
-            .store
-            .find_project_by_workspace(&workspace_root)?
-            .is_none()
-        {
-            return Err(ApiError::bad_request(
-                "workspace is not registered as a project",
-            ));
-        }
-        Ok(Some(workspace_root))
-    } else {
-        Ok(None)
-    }
-}
-
-fn skill_authoring_bad_request(error: SkillAuthoringError) -> ApiError {
-    ApiError::bad_request(error.to_string())
-}
-
-fn skill_authoring_api_error(error: SkillAuthoringError) -> ApiError {
-    match error {
-        SkillAuthoringError::Conflict(_) => ApiError::conflict(error.to_string()),
-        SkillAuthoringError::InvalidRequest(_)
-        | SkillAuthoringError::InvalidDraft(_)
-        | SkillAuthoringError::InvalidModelOutput(_)
-        | SkillAuthoringError::RootUnavailable(_)
-        | SkillAuthoringError::UnsafeRoot(_) => ApiError::bad_request(error.to_string()),
-        SkillAuthoringError::Write(_) => ApiError::internal(error.to_string()),
-    }
-}
-
 async fn test_provider_connection(
     State(state): State<AppState>,
     Json(request): Json<ProviderTestRequest>,
@@ -1611,8 +1438,10 @@ async fn test_provider_connection(
         }
         ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(provider_settings)
             .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(provider_settings)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
     }
-    .ok_or_else(|| ApiError::bad_request("provider has no configured API key"))?;
+    .ok_or_else(|| ApiError::bad_request("provider is not configured"))?;
     let result = provider.check_health().await?;
     Ok(Json(result))
 }
@@ -1856,6 +1685,15 @@ async fn send_message(
             "resolve the pending approval before starting another turn",
         ));
     }
+    if !state
+        .store
+        .list_user_input_requests(thread_id, Some(UserInputStatus::Pending))?
+        .is_empty()
+    {
+        return Err(ApiError::conflict(
+            "answer the pending planning question before starting another turn",
+        ));
+    }
 
     let collaboration_mode = request.collaboration_mode;
     let goal_snapshot = resolve_message_goal(
@@ -2025,6 +1863,17 @@ fn launch_next_queued_turn(state: &AppState, thread_id: Uuid) {
         Ok(_) => {}
         Err(error) => {
             error!(?error, %thread_id, "failed to inspect approvals before queued turn");
+            return;
+        }
+    }
+    match state
+        .store
+        .list_user_input_requests(thread_id, Some(UserInputStatus::Pending))
+    {
+        Ok(requests) if !requests.is_empty() => return,
+        Ok(_) => {}
+        Err(error) => {
+            error!(?error, %thread_id, "failed to inspect pending user input before queued turn");
             return;
         }
     }
@@ -2314,13 +2163,187 @@ async fn decide_approval(
     }
     let run_state = state.clone();
     tokio::spawn(async move {
-        run_resumed_agent_turn(run_state, approval_id, continuation, request.approved, turn).await;
+        run_resumed_agent_turn(
+            run_state,
+            AgentResume::Approval {
+                approval_id,
+                approved: request.approved,
+            },
+            continuation,
+            turn,
+        )
+        .await;
     });
 
     Ok(Json(ApprovalDecisionResponse {
         accepted: true,
         executed: request.approved,
     }))
+}
+
+async fn list_user_input_requests(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Query(query): Query<UserInputQuery>,
+) -> Result<Json<Vec<UserInputRecord>>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    Ok(Json(
+        state
+            .store
+            .list_user_input_requests(thread_id, query.status)?,
+    ))
+}
+
+async fn respond_to_user_input(
+    State(state): State<AppState>,
+    Path((thread_id, request_id)): Path<(Uuid, Uuid)>,
+    Json(response): Json<UserInputResponse>,
+) -> Result<Json<UserInputResponseAccepted>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let pending = state
+        .store
+        .get_user_input_request(request_id)?
+        .ok_or_else(|| {
+            ApiError::not_found(format!("user input request not found: {request_id}"))
+        })?;
+    if pending.thread_id != thread_id {
+        return Err(ApiError::bad_request(
+            "user input request does not belong to this thread",
+        ));
+    }
+    if pending.status != UserInputStatus::Pending {
+        return Err(ApiError::conflict(format!(
+            "user input request already answered: {request_id}"
+        )));
+    }
+    let response = validate_user_input_response(&pending.request, response)?;
+    let continuation_value = state
+        .store
+        .get_user_input_continuation(request_id, thread_id)?
+        .ok_or_else(|| ApiError::conflict("user input continuation is not available"))?;
+    let continuation: AgentContinuation = serde_json::from_value(continuation_value)
+        .map_err(|error| ApiError::internal(format!("invalid user input continuation: {error}")))?;
+    let turn = state
+        .turns
+        .begin(thread_id, continuation.user_message_id)
+        .map_err(ApiError::from)?
+        .map_err(|active| {
+            ApiError::conflict(format!("thread already has active turn {}", active.turn_id))
+        })?;
+    if state
+        .store
+        .resolve_user_input_request(request_id, thread_id, &response)?
+        .is_none()
+    {
+        let message = format!("user input request is no longer pending: {request_id}");
+        finish_turn(
+            &state,
+            thread_id,
+            turn.turn_id,
+            TurnStatus::Failed,
+            Some(message.clone()),
+        );
+        return Err(ApiError::conflict(message));
+    }
+
+    let run_state = state.clone();
+    tokio::spawn(async move {
+        run_resumed_agent_turn(
+            run_state,
+            AgentResume::UserInput {
+                request_id,
+                response,
+            },
+            continuation,
+            turn,
+        )
+        .await;
+    });
+
+    Ok(Json(UserInputResponseAccepted {
+        accepted: true,
+        resumed: true,
+    }))
+}
+
+fn validate_user_input_response(
+    request: &UserInputRequest,
+    response: UserInputResponse,
+) -> Result<UserInputResponse, ApiError> {
+    if response.answers.len() != request.questions.len() {
+        return Err(ApiError::bad_request(
+            "every planning question requires exactly one answer",
+        ));
+    }
+    let mut answers_by_question = HashMap::new();
+    for mut answer in response.answers {
+        answer.question_id = answer.question_id.trim().to_string();
+        if answer.question_id.is_empty()
+            || answers_by_question
+                .insert(answer.question_id.clone(), answer)
+                .is_some()
+        {
+            return Err(ApiError::bad_request(
+                "user input response contains a missing or duplicate question id",
+            ));
+        }
+    }
+
+    let mut answers = Vec::with_capacity(request.questions.len());
+    for question in &request.questions {
+        let mut answer = answers_by_question
+            .remove(&question.id)
+            .ok_or_else(|| ApiError::bad_request(format!("missing answer for {}", question.id)))?;
+        answer.option_id = answer
+            .option_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        answer.custom_text = answer
+            .custom_text
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        match (&answer.option_id, &answer.custom_text) {
+            (Some(option_id), None) => {
+                if !question
+                    .options
+                    .iter()
+                    .any(|option| option.id == *option_id)
+                {
+                    return Err(ApiError::bad_request(format!(
+                        "unknown option {option_id} for question {}",
+                        question.id
+                    )));
+                }
+            }
+            (None, Some(custom_text)) => {
+                if !question.allow_custom {
+                    return Err(ApiError::bad_request(format!(
+                        "question {} does not allow a custom answer",
+                        question.id
+                    )));
+                }
+                if custom_text.chars().count() > 1_000 {
+                    return Err(ApiError::bad_request(format!(
+                        "custom answer for {} exceeds 1000 characters",
+                        question.id
+                    )));
+                }
+            }
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "question {} requires either one option or one custom answer",
+                    question.id
+                )));
+            }
+        }
+        answers.push(answer);
+    }
+    if !answers_by_question.is_empty() {
+        return Err(ApiError::bad_request(
+            "user input response contains an unknown question id",
+        ));
+    }
+    Ok(UserInputResponse { answers })
 }
 
 async fn get_turn_status(
@@ -3139,36 +3162,67 @@ async fn run_browser_command(
             }
             state.browser.navigate(session, command).await
         }
-        "snapshot" => state.browser.snapshot(session).await,
+        "observe" => {
+            let observation = state
+                .browser
+                .observe(
+                    session,
+                    BrowserObserveOptions {
+                        include_screenshot: request.include_screenshot.unwrap_or(false),
+                    },
+                )
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            return Ok(Json(browser_observation_output(observation, None)));
+        }
         "screenshot" => state.browser.screenshot(session).await,
         "click" => {
             inspect_browser_interaction_policy(&policy)?;
-            state
+            let observation_id = browser_observation_required(request.observation_id)?;
+            let node_ref = browser_node_required(request.node_ref)?;
+            let target = state
                 .browser
-                .click(
-                    session,
-                    BrowserSelector::new(browser_required(&request.selector, "selector")?)
-                        .map_err(|error| ApiError::bad_request(error.to_string()))?,
-                )
+                .observation_node(session, observation_id, node_ref)
                 .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            if let Some(url) = target.href.as_deref() {
+                inspect_browser_url_policy(&state, thread_id, &policy, url)?;
+            }
+            let receipt = state
+                .browser
+                .perform(session, observation_id, node_ref, BrowserAction::Click)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            let observation = state
+                .browser
+                .observe(session, BrowserObserveOptions::default())
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            return Ok(Json(browser_observation_output(observation, Some(receipt))));
         }
         "type" => {
             inspect_browser_interaction_policy(&policy)?;
-            state
+            let observation_id = browser_observation_required(request.observation_id)?;
+            let node_ref = browser_node_required(request.node_ref)?;
+            let receipt = state
                 .browser
-                .type_text(
+                .perform(
                     session,
-                    BrowserTypeRequest {
-                        selector: BrowserSelector::new(browser_required(
-                            &request.selector,
-                            "selector",
-                        )?)
-                        .map_err(|error| ApiError::bad_request(error.to_string()))?,
+                    observation_id,
+                    node_ref,
+                    BrowserAction::Type {
                         text: browser_required(&request.text, "text")?.to_string(),
                         clear_first: request.clear_first.unwrap_or(true),
                     },
                 )
                 .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            let observation = state
+                .browser
+                .observe(session, BrowserObserveOptions::default())
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            return Ok(Json(browser_observation_output(observation, Some(receipt))));
         }
         "wait" => {
             let condition = match request.condition.as_deref().unwrap_or("document_complete") {
@@ -3241,6 +3295,55 @@ fn browser_required<'a>(value: &'a Option<String>, field: &str) -> Result<&'a st
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request(format!("browser {field} is required")))
+}
+
+fn browser_observation_required(
+    value: Option<BrowserObservationId>,
+) -> Result<BrowserObservationId, ApiError> {
+    value.ok_or_else(|| ApiError::bad_request("browser observationId is required"))
+}
+
+fn browser_node_required(value: Option<BrowserNodeRef>) -> Result<BrowserNodeRef, ApiError> {
+    value.ok_or_else(|| ApiError::bad_request("browser nodeRef is required"))
+}
+
+fn browser_observation_output(
+    observation: BrowserObservation,
+    receipt: Option<BrowserActionReceipt>,
+) -> BrowserOutput {
+    // Transport the screenshot only as an image content block. Keeping it out of the
+    // structured observation prevents the direct browser API from duplicating PNG bytes.
+    let mut response_observation = observation;
+    let screenshot = response_observation.screenshot.take();
+    let mut contents = vec![
+        BrowserContent::Text {
+            text: response_observation.text.clone(),
+            truncated: response_observation.text_truncated,
+        },
+        BrowserContent::Json {
+            value: serde_json::to_value(&response_observation).unwrap_or(Value::Null),
+        },
+    ];
+    if let Some(screenshot) = screenshot {
+        contents.push(BrowserContent::Image {
+            mime_type: screenshot.mime_type,
+            bytes: screenshot.bytes,
+        });
+    }
+    if let Some(receipt) = &receipt {
+        contents.push(BrowserContent::Json {
+            value: serde_json::to_value(receipt).unwrap_or(Value::Null),
+        });
+    }
+    BrowserOutput {
+        url: Some(response_observation.url.clone()),
+        contents,
+        metadata: json!({
+            "action": receipt.as_ref().map(|value| value.action.as_str()).unwrap_or("observe"),
+            "observation": response_observation,
+            "receipt": receipt,
+        }),
+    }
 }
 
 fn inspect_browser_url_policy(
@@ -5137,11 +5240,21 @@ async fn run_new_agent_turn(
     finish_turn(&state, thread_id, turn_id, status, turn_error);
 }
 
+enum AgentResume {
+    Approval {
+        approval_id: Uuid,
+        approved: bool,
+    },
+    UserInput {
+        request_id: Uuid,
+        response: UserInputResponse,
+    },
+}
+
 async fn run_resumed_agent_turn(
     state: AppState,
-    approval_id: Uuid,
+    resume: AgentResume,
     continuation: AgentContinuation,
-    approved: bool,
     turn: TurnHandle,
 ) {
     let thread_id = continuation.thread_id;
@@ -5184,13 +5297,40 @@ async fn run_resumed_agent_turn(
     agent.set_subagent_context(turn_id, 0);
     sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
-    let future = agent.resume_turn_streaming(
-        continuation,
-        approved,
-        Some(state.store.clone()),
-        Some(turn.cancel.clone()),
-        Some(sender),
-    );
+    let resolved_approval_id = match &resume {
+        AgentResume::Approval { approval_id, .. } => Some(*approval_id),
+        AgentResume::UserInput { .. } => None,
+    };
+    let future = async {
+        match resume {
+            AgentResume::Approval { approved, .. } => {
+                agent
+                    .resume_turn_streaming(
+                        continuation,
+                        approved,
+                        Some(state.store.clone()),
+                        Some(turn.cancel.clone()),
+                        Some(sender),
+                    )
+                    .await
+            }
+            AgentResume::UserInput {
+                request_id,
+                response,
+            } => {
+                agent
+                    .resume_turn_with_user_input_streaming(
+                        continuation,
+                        request_id,
+                        response,
+                        Some(state.store.clone()),
+                        Some(turn.cancel.clone()),
+                        Some(sender),
+                    )
+                    .await
+            }
+        }
+    };
     tokio::pin!(future);
     let mut deferred_approval_events = Vec::new();
 
@@ -5255,7 +5395,7 @@ async fn run_resumed_agent_turn(
         publish_payload(&state, thread_id, Some(turn_id), payload);
     }
     let (mut status, mut turn_error) =
-        finish_agent_result(&state, thread_id, turn_id, result, Some(approval_id));
+        finish_agent_result(&state, thread_id, turn_id, result, resolved_approval_id);
     if let Some(error) = approval_persistence
         .err()
         .or_else(|| continuation_persistence.err())
@@ -5294,8 +5434,15 @@ fn finish_agent_result(
     let (mut status, mut turn_error) = match result {
         Ok(result) => match result.outcome {
             AgentTurnOutcome::Completed => (TurnStatus::Succeeded, None),
+            AgentTurnOutcome::Partial { reason } => {
+                (TurnStatus::Failed, Some(format!("partial: {reason}")))
+            }
+            AgentTurnOutcome::Blocked { reason } => {
+                (TurnStatus::Failed, Some(format!("blocked: {reason}")))
+            }
             AgentTurnOutcome::Stopped { reason } => (TurnStatus::Failed, Some(reason)),
             AgentTurnOutcome::Suspended { .. } => (TurnStatus::WaitingApproval, None),
+            AgentTurnOutcome::AwaitingInput { .. } => (TurnStatus::WaitingApproval, None),
         },
         Err(err) => {
             let message = err.to_string();
@@ -5395,18 +5542,35 @@ fn persist_suspended_continuation(
     let Ok(result) = result else {
         return Ok(());
     };
-    let AgentTurnOutcome::Suspended {
-        approval_id,
-        continuation,
-    } = &result.outcome
-    else {
-        return Ok(());
-    };
-    let value = serde_json::to_value(continuation)?;
-    state
-        .store
-        .put_approval_continuation(*approval_id, thread_id, value)
-        .with_context(|| format!("failed to persist approval continuation {approval_id}"))
+    match &result.outcome {
+        AgentTurnOutcome::Suspended {
+            approval_id,
+            continuation,
+        } => {
+            let value = serde_json::to_value(continuation)?;
+            state
+                .store
+                .put_approval_continuation(*approval_id, thread_id, value)
+                .with_context(|| format!("failed to persist approval continuation {approval_id}"))
+        }
+        AgentTurnOutcome::AwaitingInput {
+            request,
+            continuation,
+        } => {
+            let value = serde_json::to_value(continuation)?;
+            state
+                .store
+                .put_user_input_request(thread_id, request, value)
+                .with_context(|| {
+                    format!(
+                        "failed to persist user input continuation {}",
+                        request.request_id
+                    )
+                })?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn persist_and_publish_payload(
@@ -5502,7 +5666,10 @@ fn persist_and_publish_payload(
 fn is_approval_boundary(payload: &AgentEventPayload) -> bool {
     matches!(
         payload,
-        AgentEventPayload::ApprovalRequested { .. } | AgentEventPayload::TurnSuspended { .. }
+        AgentEventPayload::ApprovalRequested { .. }
+            | AgentEventPayload::TurnSuspended { .. }
+            | AgentEventPayload::UserInputRequested { .. }
+            | AgentEventPayload::TurnAwaitingInput { .. }
     )
 }
 
@@ -6181,15 +6348,17 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
                 "provider IDs may contain only letters, numbers, dots, underscores, and hyphens",
             ));
         }
-        let base_url = reqwest::Url::parse(provider.base_url.trim()).map_err(|_| {
-            ApiError::bad_request(format!("invalid provider base URL: {}", provider.base_url))
-        })?;
-        if !matches!(base_url.scheme(), "http" | "https") {
-            return Err(ApiError::bad_request(
-                "provider base URL must use HTTP or HTTPS",
-            ));
+        if provider.kind != ProviderKind::CodexAppServer {
+            let base_url = reqwest::Url::parse(provider.base_url.trim()).map_err(|_| {
+                ApiError::bad_request(format!("invalid provider base URL: {}", provider.base_url))
+            })?;
+            if !matches!(base_url.scheme(), "http" | "https") {
+                return Err(ApiError::bad_request(
+                    "provider base URL must use HTTP or HTTPS",
+                ));
+            }
         }
-        if provider.model.trim().is_empty() {
+        if provider.kind != ProviderKind::CodexAppServer && provider.model.trim().is_empty() {
             return Err(ApiError::bad_request("provider model cannot be empty"));
         }
         if !provider.temperature.is_finite() || !(0.0..=2.0).contains(&provider.temperature) {
@@ -6235,44 +6404,6 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
                 "prompt cache key must be at most 256 characters",
             ));
         }
-    }
-    Ok(())
-}
-
-fn validate_web_search_settings(settings: &WebSearchSettings) -> Result<(), ApiError> {
-    if !(1..=10).contains(&settings.max_results) {
-        return Err(ApiError::bad_request(
-            "web search maxResults must be between 1 and 10",
-        ));
-    }
-    if settings.api_key_source.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "web search apiKeySource cannot be empty",
-        ));
-    }
-    if settings.mode != WebSearchMode::CustomApi {
-        return Ok(());
-    }
-    let endpoint = settings.endpoint.trim();
-    if endpoint.is_empty() {
-        return Err(ApiError::bad_request(
-            "custom web search requires an endpoint",
-        ));
-    }
-    let endpoint = reqwest::Url::parse(endpoint)
-        .map_err(|_| ApiError::bad_request("invalid custom web search endpoint"))?;
-    if !matches!(endpoint.scheme(), "http" | "https") {
-        return Err(ApiError::bad_request(
-            "custom web search endpoint must use HTTP or HTTPS",
-        ));
-    }
-    if endpoint.host_str().is_none()
-        || !endpoint.username().is_empty()
-        || endpoint.password().is_some()
-    {
-        return Err(ApiError::bad_request(
-            "custom web search endpoint must include a host and cannot embed credentials",
-        ));
     }
     Ok(())
 }
@@ -6402,6 +6533,8 @@ async fn generate_context_summary(
         ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(&active)
             .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
         ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(&active)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(&active)
             .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
     }
     .ok_or_else(|| {
@@ -7144,7 +7277,6 @@ struct SettingsPatchRequest {
     default_workspace_root: Option<PathBuf>,
     clear_default_workspace_root: Option<bool>,
     sandbox: Option<SandboxSettings>,
-    web_search: Option<WebSearchSettings>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7184,22 +7316,6 @@ struct UninstallPluginRequest {
 struct ThreadPluginRequest {
     plugin_id: String,
     enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GenerateSkillRequest {
-    prompt: String,
-    scope: SkillScope,
-    workspace_root: Option<PathBuf>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateSkillRequest {
-    draft: SkillDraft,
-    scope: SkillScope,
-    workspace_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7303,8 +7419,11 @@ struct BrowserCommandRequest {
     action: String,
     url: Option<String>,
     selector: Option<String>,
+    observation_id: Option<BrowserObservationId>,
+    node_ref: Option<BrowserNodeRef>,
     text: Option<String>,
     clear_first: Option<bool>,
+    include_screenshot: Option<bool>,
     condition: Option<String>,
     timeout_ms: Option<u64>,
     expected_filename: Option<String>,
@@ -7366,9 +7485,21 @@ struct ApprovalDecisionResponse {
     executed: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserInputResponseAccepted {
+    accepted: bool,
+    resumed: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct ApprovalQuery {
     status: Option<ApprovalStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserInputQuery {
+    status: Option<UserInputStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7846,85 +7977,6 @@ mod tests {
         );
     }
 
-    struct ScriptedSkillProvider {
-        responses: Mutex<Vec<opentopia_core::ModelResponse>>,
-        requests: Mutex<Vec<ModelRequest>>,
-    }
-
-    impl ScriptedSkillProvider {
-        fn new(responses: Vec<opentopia_core::ModelResponse>) -> Self {
-            Self {
-                responses: Mutex::new(responses),
-                requests: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl ModelProvider for ScriptedSkillProvider {
-        async fn complete(
-            &self,
-            request: ModelRequest,
-        ) -> anyhow::Result<opentopia_core::ModelResponse> {
-            self.requests.lock().unwrap().push(request);
-            let mut responses = self.responses.lock().unwrap();
-            if responses.is_empty() {
-                anyhow::bail!("no scripted Skill response")
-            }
-            Ok(responses.remove(0))
-        }
-
-        async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
-            Ok(ProviderHealthCheck {
-                reachable: true,
-                latency_ms: Some(0),
-                model_available: true,
-                error: None,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn skill_generation_retries_invalid_json_with_schema_and_returns_preview() {
-        let valid = json!({
-            "name": "review-api",
-            "description": "Review HTTP APIs. Use for endpoint compatibility reviews.",
-            "instructions": "# Review API\n\nInspect contracts before implementation.",
-            "displayName": "Review API",
-            "shortDescription": "Review API contracts and compatibility",
-            "defaultPrompt": "Use $review-api to review this endpoint.",
-            "resources": []
-        })
-        .to_string();
-        let provider = ScriptedSkillProvider::new(vec![
-            opentopia_core::ModelResponse::text("not json"),
-            opentopia_core::ModelResponse::text(valid),
-        ]);
-        let workspace = std::env::temp_dir().join(format!(
-            "opentopia-server-skill-preview-{}",
-            Uuid::new_v4().simple()
-        ));
-
-        let preview = generate_skill_preview(
-            &provider,
-            "Review API compatibility",
-            SkillScope::Workspace,
-            Some(&workspace),
-        )
-        .await
-        .expect("generate preview");
-
-        assert_eq!(preview.draft.name, "review-api");
-        assert!(preview.skill_md.contains("name: \"review-api\""));
-        let requests = provider.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].final_output_json_schema.is_some());
-        assert_eq!(requests[1].conversation.len(), 2);
-        assert!(requests[1]
-            .user_message
-            .contains("previous draft was invalid"));
-    }
-
     #[test]
     fn token_estimate_is_conservative_for_non_ascii_text() {
         assert_eq!(estimate_tokens("abcd"), 1);
@@ -8045,27 +8097,6 @@ mod tests {
             prefill_token_weight: 1.0,
         });
         let error = validate_provider_settings(&[provider]).expect_err("reject rollout budget");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn web_search_settings_validate_custom_endpoint_and_limits() {
-        let mut settings = WebSearchSettings {
-            mode: WebSearchMode::CustomApi,
-            endpoint: "https://search.example.test/v1/search".to_string(),
-            api_key_source: "OPENTOPIA_WEB_SEARCH_API_KEY".to_string(),
-            api_key_configured: false,
-            max_results: 5,
-        };
-        validate_web_search_settings(&settings).expect("valid search settings");
-
-        settings.endpoint = "file:///tmp/results.json".to_string();
-        let error = validate_web_search_settings(&settings).expect_err("reject file endpoint");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-
-        settings.endpoint = "https://search.example.test/v1/search".to_string();
-        settings.max_results = 0;
-        let error = validate_web_search_settings(&settings).expect_err("reject result limit");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 

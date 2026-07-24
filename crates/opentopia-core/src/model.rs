@@ -966,6 +966,89 @@ pub struct Approval {
     pub decided_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputOption {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<UserInputOption>,
+    #[serde(default = "default_true")]
+    pub allow_custom: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputRequest {
+    pub request_id: Uuid,
+    pub questions: Vec<UserInputQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputAnswer {
+    pub question_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputResponse {
+    pub answers: Vec<UserInputAnswer>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserInputStatus {
+    Pending,
+    Answered,
+}
+
+impl UserInputStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Answered => "answered",
+        }
+    }
+
+    pub fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "answered" => Ok(Self::Answered),
+            other => anyhow::bail!("unknown user input status: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputRecord {
+    pub thread_id: Uuid,
+    pub request: UserInputRequest,
+    pub status: UserInputStatus,
+    pub response: Option<UserInputResponse>,
+    pub created_at: DateTime<Utc>,
+    pub answered_at: Option<DateTime<Utc>>,
+}
+
 impl Approval {
     pub fn pending(
         approval_id: Uuid,
@@ -1324,6 +1407,9 @@ pub enum AgentEventPayload {
     GoalUpdated {
         snapshot: GoalSnapshot,
     },
+    UserInputRequested {
+        request: UserInputRequest,
+    },
     AssistantMessage {
         message: Message,
     },
@@ -1388,6 +1474,9 @@ pub enum AgentEventPayload {
         approval_id: Uuid,
         reason: String,
     },
+    TurnAwaitingInput {
+        request_id: Uuid,
+    },
     TurnCancelled {
         reason: String,
     },
@@ -1413,6 +1502,7 @@ impl AgentEventPayload {
             Self::ToolCallFinished { .. } => "tool_call_finished",
             Self::PlanUpdated { .. } => "plan_updated",
             Self::GoalUpdated { .. } => "goal_updated",
+            Self::UserInputRequested { .. } => "user_input_requested",
             Self::AssistantMessage { .. } => "assistant_message",
             Self::FileChanged { .. } => "file_changed",
             Self::TurnChangesRecorded { .. } => "turn_changes_recorded",
@@ -1427,6 +1517,7 @@ impl AgentEventPayload {
             Self::SubagentUpdated { .. } => "subagent_updated",
             Self::TurnFinished { .. } => "turn_finished",
             Self::TurnSuspended { .. } => "turn_suspended",
+            Self::TurnAwaitingInput { .. } => "turn_awaiting_input",
             Self::TurnCancelled { .. } => "turn_cancelled",
             Self::Error { .. } => "error",
         }

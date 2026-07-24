@@ -3,13 +3,19 @@ use crate::model_context::{
     CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ModelContextItem,
 };
 use crate::settings::{PromptCachePolicy, ProviderHealthCheck, ProviderKind, ProviderSettings};
+use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -376,6 +382,7 @@ pub struct OpenAiCompatibleProvider {
     reasoning_effort: Option<String>,
     parallel_tool_calls: bool,
     prompt_cache_key: Option<String>,
+    supports_vision: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -394,6 +401,7 @@ impl OpenAiCompatibleProvider {
             reasoning_effort: None,
             parallel_tool_calls: false,
             prompt_cache_key: None,
+            supports_vision: true,
         }
     }
 
@@ -455,6 +463,7 @@ impl OpenAiCompatibleProvider {
         self.reasoning_effort = settings.reasoning_effort.clone();
         self.parallel_tool_calls = settings.parallel_tool_calls;
         self.prompt_cache_key = settings.prompt_cache_key.clone();
+        self.supports_vision = settings.supports_vision;
         self
     }
 
@@ -473,6 +482,7 @@ impl OpenAiCompatibleProvider {
         request_id: Uuid,
         request: ModelRequest,
     ) -> anyhow::Result<PreparedProviderRequest> {
+        ensure_visual_input_supported(&request, self.supports_vision)?;
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut payload = json!({
             "model": self.model,
@@ -647,6 +657,7 @@ pub struct OpenAiResponsesProvider {
     prompt_cache_policy: Option<PromptCachePolicy>,
     compaction_threshold_tokens: Option<u32>,
     native_web_search: bool,
+    supports_vision: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -655,6 +666,8 @@ struct ResponsesRequestError {
     status: reqwest::StatusCode,
     body: String,
 }
+
+const NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION: &str = "When web search is needed, prefer the provider's built-in web search tool. Use a supplied search tool only if built-in search is unavailable, fails, or the required source exists only through that tool. Do not run both for the same query unless fallback is necessary.";
 
 impl ResponsesRequestError {
     fn invalid_previous_response(&self, response_id: &str) -> bool {
@@ -687,7 +700,8 @@ impl OpenAiResponsesProvider {
             prompt_cache_key: None,
             prompt_cache_policy: None,
             compaction_threshold_tokens: None,
-            native_web_search: false,
+            native_web_search: true,
+            supports_vision: true,
         }
     }
 
@@ -705,6 +719,7 @@ impl OpenAiResponsesProvider {
         provider.prompt_cache_key = settings.prompt_cache_key.clone();
         provider.prompt_cache_policy = settings.prompt_cache_policy;
         provider.compaction_threshold_tokens = settings.responses_compaction_threshold_tokens;
+        provider.supports_vision = settings.supports_vision;
         Some(provider)
     }
 
@@ -719,16 +734,12 @@ impl OpenAiResponsesProvider {
         self
     }
 
-    pub(crate) fn with_native_web_search(mut self, enabled: bool) -> Self {
-        self.native_web_search = enabled;
-        self
-    }
-
     fn prepare_responses_request(
         &self,
         request_id: Uuid,
         request: ModelRequest,
     ) -> anyhow::Result<PreparedProviderRequest> {
+        ensure_visual_input_supported(&request, self.supports_vision)?;
         let endpoint = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let mut payload = json!({
             "model": self.model,
@@ -738,7 +749,13 @@ impl OpenAiResponsesProvider {
             "parallel_tool_calls": self.parallel_tool_calls,
             "temperature": self.temperature,
         });
-        let system_instructions = responses_system_instructions(&request);
+        let mut system_instructions = responses_system_instructions(&request);
+        if self.native_web_search {
+            if !system_instructions.trim().is_empty() {
+                system_instructions.push_str("\n\n");
+            }
+            system_instructions.push_str(NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION);
+        }
         if !system_instructions.trim().is_empty() {
             payload["instructions"] = json!(system_instructions);
         }
@@ -762,10 +779,11 @@ impl OpenAiResponsesProvider {
                 payload["include"] = json!(["reasoning.encrypted_content"]);
             }
         }
-        let mut tools = responses_tools(&request.tool_candidates);
+        let mut tools = Vec::new();
         if self.native_web_search {
             tools.push(json!({ "type": "web_search" }));
         }
+        tools.extend(responses_tools(&request.tool_candidates));
         if !tools.is_empty() {
             payload["tools"] = json!(tools);
             payload["tool_choice"] = json!("auto");
@@ -1326,6 +1344,33 @@ fn provider_api_key(settings: &ProviderSettings) -> Option<String> {
                 "OPENAI_API_KEY",
             ])
         })
+}
+
+fn ensure_visual_input_supported(
+    request: &ModelRequest,
+    supports_vision: bool,
+) -> anyhow::Result<()> {
+    if !supports_vision && request_has_image_input(request) {
+        anyhow::bail!(
+            "this provider is marked as not supporting visual input; enable supportsVision before attaching images"
+        );
+    }
+    Ok(())
+}
+
+fn request_has_image_input(request: &ModelRequest) -> bool {
+    request
+        .conversation
+        .iter()
+        .flat_map(|message| message.content_parts.iter())
+        .chain(request.user_content.iter())
+        .chain(
+            request
+                .tool_results
+                .iter()
+                .flat_map(|result| result.content.iter()),
+        )
+        .any(|part| matches!(part, ModelContentPart::Image { .. }))
 }
 
 impl ProviderEnv {
@@ -2639,6 +2684,714 @@ impl ModelProvider for OpenAiResponsesProvider {
     }
 }
 
+/// A local adapter for the Codex App Server protocol.
+///
+/// Images stay generic until this boundary. They are materialized into a
+/// private temporary file and referenced through the documented `localImage`
+/// input, allowing Codex to use its own attachment/upload path without an
+/// OpenTopia-hosted asset server.
+pub struct CodexAppServerProvider {
+    supports_vision: bool,
+    native_web_search: bool,
+    sessions: Mutex<HashMap<String, CodexAppServerSession>>,
+}
+
+struct CodexAppServerSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    attachment_paths: Vec<PathBuf>,
+    thread_id: String,
+    turn_id: String,
+    assistant_text: String,
+    received_agent_delta: bool,
+    final_message_item_ids: HashSet<String>,
+    pending_tool_call: Option<CodexDynamicToolCall>,
+}
+
+struct CodexDynamicToolCall {
+    rpc_id: Value,
+    call_id: String,
+    name: String,
+    arguments: Value,
+}
+
+enum CodexDriveResult {
+    ToolCall(CodexDynamicToolCall),
+    Completed(String),
+}
+
+impl CodexAppServerProvider {
+    pub fn from_settings(settings: &ProviderSettings) -> Option<Self> {
+        (settings.kind == ProviderKind::CodexAppServer).then(|| Self {
+            supports_vision: settings.supports_vision,
+            native_web_search: true,
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn for_guardian(mut self) -> Self {
+        self.native_web_search = false;
+        self
+    }
+
+    async fn start_session(&self, request: &ModelRequest) -> anyhow::Result<CodexAppServerSession> {
+        ensure_visual_input_supported(request, self.supports_vision)?;
+
+        let mut command = codex_app_server_command();
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().context(
+            "failed to start the local Codex App Server; install Codex or add it to PATH",
+        )?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("Codex App Server did not expose stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Codex App Server did not expose stdout")?;
+        let mut session = CodexAppServerSession {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+            attachment_paths: Vec::new(),
+            thread_id: String::new(),
+            turn_id: String::new(),
+            assistant_text: String::new(),
+            received_agent_delta: false,
+            final_message_item_ids: HashSet::new(),
+            pending_tool_call: None,
+        };
+
+        if let Err(error) = self.initialize_and_start(&mut session, request).await {
+            session.cleanup().await;
+            return Err(error);
+        }
+        Ok(session)
+    }
+
+    async fn initialize_and_start(
+        &self,
+        session: &mut CodexAppServerSession,
+        request: &ModelRequest,
+    ) -> anyhow::Result<()> {
+        codex_write_rpc(
+            &mut session.stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": { "name": "OpenTopia", "version": env!("CARGO_PKG_VERSION") },
+                    "capabilities": { "experimentalApi": true }
+                }
+            }),
+        )
+        .await?;
+        codex_wait_for_response(&mut session.stdout, 1).await?;
+
+        let cwd = std::env::current_dir()
+            .context("failed to resolve current directory for Codex App Server")?;
+        let mut thread_params = json!({
+            "cwd": cwd,
+            "sandbox": "read-only",
+            "approvalPolicy": "never",
+            "ephemeral": true,
+            "environments": [],
+            "developerInstructions": codex_developer_instructions(
+                request,
+                self.native_web_search,
+            ),
+        });
+        if !request.tool_candidates.is_empty() {
+            thread_params["dynamicTools"] = json!(codex_dynamic_tools(&request.tool_candidates));
+        }
+        codex_write_rpc(
+            &mut session.stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "thread/start",
+                "params": thread_params,
+            }),
+        )
+        .await?;
+        let thread_response = codex_wait_for_response(&mut session.stdout, 2).await?;
+        session.thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .context("Codex App Server thread/start response omitted thread.id")?
+            .to_string();
+
+        let input = codex_turn_input(request, &mut session.attachment_paths)?;
+        codex_write_rpc(
+            &mut session.stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "turn/start",
+                "params": { "threadId": session.thread_id, "input": input },
+            }),
+        )
+        .await?;
+        let turn_response = codex_wait_for_response(&mut session.stdout, 3).await?;
+        session.turn_id = turn_response
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .context("Codex App Server turn/start response omitted turn.id")?
+            .to_string();
+        Ok(())
+    }
+
+    async fn resume_session(
+        &self,
+        session: &mut CodexAppServerSession,
+        results: &[ProviderToolResult],
+    ) -> anyhow::Result<()> {
+        let pending = session
+            .pending_tool_call
+            .take()
+            .context("Codex App Server session has no pending dynamic tool call")?;
+        let result = results
+            .iter()
+            .find(|result| result.call_id == pending.call_id)
+            .context("OpenTopia did not return the pending Codex dynamic tool result")?;
+
+        let mut content_items = vec![json!({
+            "type": "inputText",
+            "text": provider_tool_result_content(result),
+        })];
+        for part in &result.content {
+            if let ModelContentPart::Image { content_type, data } = part {
+                content_items.push(json!({
+                    "type": "inputImage",
+                    "imageUrl": format!("data:{content_type};base64,{}", encode_base64(&data)),
+                }));
+            }
+        }
+        codex_write_rpc(
+            &mut session.stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": pending.rpc_id,
+                "result": {
+                    "success": !result.is_error,
+                    "contentItems": content_items,
+                }
+            }),
+        )
+        .await
+    }
+
+    async fn drive_session(
+        &self,
+        session: &mut CodexAppServerSession,
+    ) -> anyhow::Result<CodexDriveResult> {
+        tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                let event = codex_next_event(&mut session.stdout).await?;
+                let Some(method) = event.get("method").and_then(Value::as_str) else {
+                    continue;
+                };
+                let params = event.get("params").cloned().unwrap_or(Value::Null);
+                match method {
+                    "item/started" => {
+                        if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
+                            && params.pointer("/item/type").and_then(Value::as_str)
+                                == Some("agentMessage")
+                            && params.pointer("/item/phase").and_then(Value::as_str)
+                                == Some("final_answer")
+                        {
+                            if let Some(item_id) =
+                                params.pointer("/item/id").and_then(Value::as_str)
+                            {
+                                session.final_message_item_ids.insert(item_id.to_string());
+                            }
+                        }
+                    }
+                    "item/agentMessage/delta" | "agentMessage/delta" => {
+                        if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
+                            && params
+                                .get("itemId")
+                                .and_then(Value::as_str)
+                                .is_some_and(|item_id| {
+                                    session.final_message_item_ids.contains(item_id)
+                                })
+                        {
+                            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                                session.assistant_text.push_str(delta);
+                                session.received_agent_delta = true;
+                            }
+                        }
+                    }
+                    "item/completed" => {
+                        if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
+                            && !session.received_agent_delta
+                            && params
+                                .pointer("/item/id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|item_id| {
+                                    session.final_message_item_ids.contains(item_id)
+                                })
+                        {
+                            session.assistant_text.push_str(&codex_item_text(
+                                params.get("item").unwrap_or(&Value::Null),
+                            ));
+                        }
+                    }
+                    "item/tool/call" => {
+                        let call = codex_dynamic_tool_call(&event)?;
+                        if call.call_id.is_empty() || call.name.is_empty() {
+                            anyhow::bail!(
+                                "Codex App Server returned an incomplete dynamic tool call"
+                            );
+                        }
+                        return Ok(CodexDriveResult::ToolCall(call));
+                    }
+                    "turn/completed" => {
+                        if params.pointer("/turn/id").and_then(Value::as_str)
+                            != Some(&session.turn_id)
+                        {
+                            continue;
+                        }
+                        let status = params
+                            .pointer("/turn/status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("completed");
+                        if status != "completed" {
+                            let detail = params
+                                .pointer("/turn/error/message")
+                                .and_then(Value::as_str)
+                                .unwrap_or(status);
+                            anyhow::bail!("Codex App Server turn failed: {detail}");
+                        }
+                        return Ok(CodexDriveResult::Completed(session.assistant_text.clone()));
+                    }
+                    "error" => {
+                        let error = params.get("error").unwrap_or(&Value::Null);
+                        let will_retry = params
+                            .get("willRetry")
+                            .and_then(Value::as_bool)
+                            // Older App Server builds nested this field in the error payload.
+                            .or_else(|| error.get("willRetry").and_then(Value::as_bool))
+                            .unwrap_or(false);
+                        if !will_retry {
+                            let detail = error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex App Server reported an error");
+                            anyhow::bail!("Codex App Server error: {detail}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Codex App Server turn timed out after five minutes"))?
+    }
+
+    async fn complete_request(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        let previous_response_id = request.previous_response_id.clone();
+        let mut session = match previous_response_id.as_deref() {
+            Some(response_id) => self.sessions.lock().await.remove(response_id),
+            None => None,
+        }
+        .unwrap_or(self.start_session(&request).await?);
+
+        let outcome = async {
+            if previous_response_id.is_some() && session.pending_tool_call.is_some() {
+                self.resume_session(&mut session, &request.tool_results)
+                    .await?;
+            }
+            self.drive_session(&mut session).await
+        }
+        .await;
+
+        match outcome {
+            Ok(CodexDriveResult::ToolCall(call)) => {
+                let session_id = Uuid::new_v4().to_string();
+                let response = ModelResponse {
+                    text: String::new(),
+                    tool_calls: vec![ProviderToolCall {
+                        id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    }],
+                    usage: None,
+                    response_id: Some(session_id.clone()),
+                    provider_items: Vec::new(),
+                    finish_reason: ModelFinishReason::ToolCalls,
+                };
+                session.pending_tool_call = Some(call);
+                self.sessions.lock().await.insert(session_id, session);
+                Ok(response)
+            }
+            Ok(CodexDriveResult::Completed(text)) => {
+                session.cleanup().await;
+                if text.trim().is_empty() {
+                    anyhow::bail!("Codex App Server completed without an assistant message");
+                }
+                Ok(ModelResponse::text(text))
+            }
+            Err(error) => {
+                session.cleanup().await;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl CodexAppServerSession {
+    async fn cleanup(&mut self) {
+        let _ = self.stdin.shutdown().await;
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+        for path in self.attachment_paths.drain(..) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for CodexAppServerProvider {
+    async fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        self.complete_request(request).await
+    }
+
+    async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
+        let start = std::time::Instant::now();
+        let mut command = codex_app_server_command();
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .context("failed to start the local Codex App Server")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("Codex App Server did not expose stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Codex App Server did not expose stdout")?;
+        let mut stdout = BufReader::new(stdout).lines();
+        let health = async {
+            codex_write_rpc(
+                &mut stdin,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": { "name": "OpenTopia", "version": env!("CARGO_PKG_VERSION") },
+                        "capabilities": { "experimentalApi": true }
+                    }
+                }),
+            )
+            .await?;
+            codex_wait_for_response(&mut stdout, 1).await
+        }
+        .await;
+        let _ = stdin.shutdown().await;
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        health?;
+        Ok(ProviderHealthCheck {
+            reachable: true,
+            latency_ms: Some(start.elapsed().as_millis() as u64),
+            model_available: true,
+            error: None,
+        })
+    }
+}
+
+fn codex_app_server_command() -> Command {
+    #[cfg(windows)]
+    {
+        if let Some(candidate) = latest_codex_desktop_binary() {
+            let mut command = Command::new(candidate);
+            command.arg("app-server");
+            return command;
+        }
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            let candidate = PathBuf::from(app_data).join("npm").join("codex.cmd");
+            if candidate.is_file() {
+                let mut command = Command::new("cmd.exe");
+                command.args(["/d", "/s", "/c"]);
+                command.arg(format!("\"\"{}\" app-server\"", candidate.display()));
+                return command;
+            }
+        }
+    }
+    let mut command = Command::new(OsString::from("codex"));
+    command.arg("app-server");
+    command
+}
+
+#[cfg(windows)]
+fn latest_codex_desktop_binary() -> Option<PathBuf> {
+    let bin_root = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+        .join("OpenAI")
+        .join("Codex")
+        .join("bin");
+    let mut candidates = vec![bin_root.join("codex.exe")];
+    if let Ok(entries) = std::fs::read_dir(&bin_root) {
+        candidates.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join("codex.exe")),
+        );
+    }
+    candidates
+        .into_iter()
+        .filter(|path| path.is_file())
+        .max_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })
+}
+
+async fn codex_write_rpc(stdin: &mut ChildStdin, value: Value) -> anyhow::Result<()> {
+    let mut line = serde_json::to_vec(&value)?;
+    line.push(b'\n');
+    stdin.write_all(&line).await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn codex_next_event(stdout: &mut Lines<BufReader<ChildStdout>>) -> anyhow::Result<Value> {
+    let line = stdout
+        .next_line()
+        .await?
+        .context("Codex App Server closed its output stream")?;
+    serde_json::from_str(&line).context("Codex App Server emitted malformed JSON-RPC output")
+}
+
+async fn codex_wait_for_response(
+    stdout: &mut Lines<BufReader<ChildStdout>>,
+    response_id: u64,
+) -> anyhow::Result<Value> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let event = codex_next_event(stdout).await?;
+            if event.get("id").and_then(Value::as_u64) != Some(response_id) {
+                continue;
+            }
+            if let Some(error) = event.get("error") {
+                anyhow::bail!("Codex App Server request failed: {error}");
+            }
+            return event
+                .get("result")
+                .cloned()
+                .context("Codex App Server response omitted result");
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Codex App Server did not respond within 30 seconds"))?
+}
+
+fn codex_dynamic_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "type": "function",
+                "name": candidate.name,
+                "description": candidate.description,
+                "inputSchema": candidate.input_schema,
+            })
+        })
+        .collect()
+}
+
+fn codex_developer_instructions(request: &ModelRequest, native_web_search: bool) -> String {
+    let mut sections = instruction_messages(request)
+        .into_iter()
+        .map(|(_, content)| content)
+        .filter(|content| !content.trim().is_empty())
+        .collect::<Vec<_>>();
+    if let Some(instructions) = request
+        .branch_developer_instructions
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        sections.push(instructions.to_string());
+    }
+    sections.push(if native_web_search && request.tool_candidates.is_empty() {
+        "You are executing inside OpenTopia. Respond directly. You may use the built-in web search tool when current external information is needed; do not invoke other built-in tools."
+            .to_string()
+    } else if native_web_search {
+        "You are executing inside OpenTopia. Use only the supplied OpenTopia dynamic tools and the built-in web search tool; do not invoke other built-in tools."
+            .to_string()
+    } else if request.tool_candidates.is_empty() {
+        "You are executing inside OpenTopia. Respond directly and do not invoke built-in tools."
+            .to_string()
+    } else {
+        "You are executing inside OpenTopia. Use only the supplied OpenTopia dynamic tools; do not invoke built-in tools."
+            .to_string()
+    });
+    if native_web_search {
+        sections.push(NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION.to_string());
+    }
+    sections.join("\n\n")
+}
+
+fn codex_turn_input(
+    request: &ModelRequest,
+    attachment_paths: &mut Vec<PathBuf>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut input = vec![json!({ "type": "text", "text": codex_request_text(request) })];
+    for part in request
+        .conversation
+        .iter()
+        .flat_map(|message| message.content_parts.iter())
+        .chain(request.user_content.iter())
+        .chain(
+            request
+                .tool_results
+                .iter()
+                .flat_map(|result| result.content.iter()),
+        )
+    {
+        if let ModelContentPart::Image { content_type, data } = part {
+            let path = materialize_codex_image(content_type, data)?;
+            input.push(json!({
+                "type": "localImage",
+                "path": path,
+                "detail": "original",
+            }));
+            attachment_paths.push(path);
+        }
+    }
+    Ok(input)
+}
+
+fn codex_request_text(request: &ModelRequest) -> String {
+    let mut sections = Vec::new();
+    for message in &request.conversation {
+        let role = match message.role {
+            ModelConversationRole::System => "System",
+            ModelConversationRole::User => "User",
+            ModelConversationRole::Assistant => "Assistant",
+        };
+        let mut content = message.content.clone();
+        append_codex_part_text(&mut content, &message.content_parts);
+        if !content.trim().is_empty() {
+            sections.push(format!("{role}:\n{content}"));
+        }
+    }
+    let mut current_user = request.user_message.clone();
+    append_codex_part_text(&mut current_user, &request.user_content);
+    sections.push(format!("Current user request:\n{current_user}"));
+    if !request.tool_results.is_empty() {
+        sections.push(format!(
+            "Completed OpenTopia tool results:\n{}",
+            request
+                .tool_results
+                .iter()
+                .map(provider_tool_result_content)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    sections.join("\n\n")
+}
+
+fn append_codex_part_text(output: &mut String, parts: &[ModelContentPart]) {
+    for part in parts {
+        let rendered = match part {
+            ModelContentPart::Text { text } => text.clone(),
+            ModelContentPart::Json { value } => value.to_string(),
+            ModelContentPart::Image { content_type, .. } => {
+                format!("[Attached image: {content_type}]")
+            }
+            ModelContentPart::Resource {
+                uri,
+                content_type,
+                name,
+            } => resource_fallback_text(uri, content_type.as_deref(), name.as_deref()),
+        };
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&rendered);
+    }
+}
+
+fn materialize_codex_image(content_type: &str, data: &[u8]) -> anyhow::Result<PathBuf> {
+    let extension = match content_type.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/avif" => "avif",
+        _ => "img",
+    };
+    let directory = std::env::temp_dir().join("opentopia-codex-attachments");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{}.{}", Uuid::new_v4(), extension));
+    std::fs::write(&path, data)?;
+    path.canonicalize()
+        .with_context(|| format!("failed to resolve Codex attachment {}", path.display()))
+}
+
+fn codex_dynamic_tool_call(event: &Value) -> anyhow::Result<CodexDynamicToolCall> {
+    let params = event
+        .get("params")
+        .context("Codex dynamic tool call omitted params")?;
+    let name = params
+        .get("tool")
+        .and_then(Value::as_str)
+        .or_else(|| params.pointer("/tool/name").and_then(Value::as_str))
+        .context("Codex dynamic tool call omitted tool name")?
+        .to_string();
+    let arguments = match params.get("arguments") {
+        Some(Value::String(value)) => {
+            serde_json::from_str(&value).unwrap_or_else(|_| Value::String(value.clone()))
+        }
+        Some(value) => value.clone(),
+        None => json!({}),
+    };
+    Ok(CodexDynamicToolCall {
+        rpc_id: event
+            .get("id")
+            .cloned()
+            .context("Codex dynamic tool call omitted request id")?,
+        call_id: params
+            .get("callId")
+            .and_then(Value::as_str)
+            .context("Codex dynamic tool call omitted callId")?
+            .to_string(),
+        name,
+        arguments,
+    })
+}
+
+fn codex_item_text(item: &Value) -> String {
+    if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+        return String::new();
+    }
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<String>()
+}
+
 #[derive(Debug, Default)]
 pub struct MockProvider;
 
@@ -2684,6 +3437,81 @@ mod tests {
             prompt_cache_key: None,
             final_output_json_schema: None,
         }
+    }
+
+    #[test]
+    fn codex_turn_input_materializes_generic_image_as_local_attachment() {
+        let mut request = model_request();
+        request.user_content = vec![
+            ModelContentPart::text("inspect this"),
+            ModelContentPart::image("image/png", vec![0x89, b'P', b'N', b'G']),
+        ];
+        let mut paths = Vec::new();
+
+        let input = codex_turn_input(&request, &mut paths).expect("build Codex local input");
+
+        assert_eq!(input[0]["type"], "text");
+        assert!(input[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Attached image"));
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(input[1]["detail"], "original");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert_eq!(
+            std::fs::read(&paths[0]).unwrap(),
+            vec![0x89, b'P', b'N', b'G']
+        );
+
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn visual_input_requires_the_declared_model_capability() {
+        let mut request = model_request();
+        request.user_content = vec![ModelContentPart::image("image/png", vec![1])];
+
+        let error = ensure_visual_input_supported(&request, false).unwrap_err();
+
+        assert!(error.to_string().contains("supportsVision"));
+    }
+
+    #[test]
+    fn codex_dynamic_tool_call_keeps_the_protocol_call_id() {
+        let call = codex_dynamic_tool_call(&json!({
+            "jsonrpc": "2.0",
+            "id": "rpc-17",
+            "method": "item/tool/call",
+            "params": {
+                "callId": "tool-42",
+                "tool": "browser_observe",
+                "arguments": "{\"includeScreenshot\":true}"
+            }
+        }))
+        .expect("parse dynamic tool call");
+
+        assert_eq!(call.call_id, "tool-42");
+        assert_eq!(call.name, "browser_observe");
+        assert_eq!(call.arguments["includeScreenshot"], true);
+        assert_eq!(call.rpc_id, "rpc-17");
+    }
+
+    #[test]
+    fn codex_item_text_reads_the_app_server_agent_message_shape() {
+        let text = codex_item_text(&json!({
+            "type": "agentMessage",
+            "id": "msg-1",
+            "phase": "final_answer",
+            "text": "final answer"
+        }));
+
+        assert_eq!(text, "final answer");
     }
 
     #[test]
@@ -2831,22 +3659,59 @@ mod tests {
     }
 
     #[test]
-    fn responses_provider_adds_native_web_search_alongside_function_tools() {
+    fn responses_provider_prioritizes_native_web_search_over_supplied_search_tools() {
         let provider =
-            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test")
-                .with_native_web_search(true);
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
         let mut request = model_request();
         request.tool_candidates.push(ProviderToolCandidate {
-            name: "read_file".to_string(),
-            description: "Read a workspace file".to_string(),
+            name: "mcp_search".to_string(),
+            description: "Search the web through an MCP server".to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
         });
 
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
         let tools = prepared.body["tools"].as_array().expect("tools array");
-        assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[1], json!({ "type": "web_search" }));
+        assert_eq!(tools[0], json!({ "type": "web_search" }));
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["name"], "mcp_search");
         assert_eq!(prepared.body["tool_choice"], "auto");
+        assert!(prepared.body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains(NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION));
+    }
+
+    #[test]
+    fn responses_guardian_requests_do_not_receive_native_web_search() {
+        let provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test")
+                .for_guardian();
+
+        let prepared = provider.prepare(Uuid::nil(), model_request()).unwrap();
+        let has_web_search = prepared.body["tools"].as_array().map_or(false, |tools| {
+            tools.iter().any(|tool| tool["type"] == "web_search")
+        });
+
+        assert!(!has_web_search);
+    }
+
+    #[test]
+    fn codex_app_server_allows_native_web_search_only_for_normal_agent_requests() {
+        let mut settings = ProviderSettings::default();
+        settings.kind = ProviderKind::CodexAppServer;
+        let provider = CodexAppServerProvider::from_settings(&settings).unwrap();
+
+        let normal_instructions =
+            codex_developer_instructions(&model_request(), provider.native_web_search);
+        assert!(normal_instructions.contains("built-in web search tool"));
+        assert!(normal_instructions.contains("do not invoke other built-in tools"));
+        assert!(normal_instructions.contains(NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION));
+
+        let guardian = provider.for_guardian();
+        let guardian_instructions =
+            codex_developer_instructions(&model_request(), guardian.native_web_search);
+        assert!(!guardian_instructions.contains("web search"));
+        assert!(guardian_instructions.contains("do not invoke built-in tools"));
     }
 
     #[test]
@@ -3032,7 +3897,9 @@ mod tests {
             .prepare(Uuid::nil(), layered_model_request())
             .unwrap();
 
-        assert_eq!(prepared.body["instructions"], "base instructions");
+        let instructions = prepared.body["instructions"].as_str().unwrap();
+        assert!(instructions.starts_with("base instructions"));
+        assert!(instructions.contains(NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION));
         assert_eq!(prepared.body["input"][0]["role"], "developer");
         assert!(prepared.body["input"][0]["content"]
             .as_str()
@@ -3900,8 +4767,9 @@ mod tests {
 
         assert_eq!(payload["stream"], true);
         assert_eq!(payload["store"], false);
-        assert_eq!(payload["tools"][0]["name"], "read_file");
-        assert!(payload["tools"][0].get("function").is_none());
+        assert_eq!(payload["tools"][0], json!({ "type": "web_search" }));
+        assert_eq!(payload["tools"][1]["name"], "read_file");
+        assert!(payload["tools"][1].get("function").is_none());
         assert_eq!(payload["input"][0]["content"][1]["type"], "input_image");
         assert_eq!(response.response_id.as_deref(), Some("resp_123"));
         assert_eq!(response.tool_calls[0].id, "call_1");

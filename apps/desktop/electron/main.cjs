@@ -39,9 +39,6 @@ const providerSecretStorageKey = "provider-api-key";
 const providerSecretStoragePrefix = `${providerSecretStorageKey}:`;
 const keyringProviderApiKeySourceId = `keyring:${providerSecretStorageKey}`;
 const keyringProviderApiKeyEnvName = "OPENTOPIA_API_KEY";
-const webSearchSecretStorageKey = "web-search-api-key";
-const keyringWebSearchApiKeySourceId = `keyring:${webSearchSecretStorageKey}`;
-const keyringWebSearchApiKeyEnvName = "OPENTOPIA_WEB_SEARCH_API_KEY";
 
 const maxRecentWorkspaces = 12;
 const maxContextSourceFiles = 20;
@@ -615,55 +612,6 @@ function decryptSecretEntry(entry) {
   }
 }
 
-function webSearchApiKeySecretEntry() {
-  return readSecretStore().secrets[webSearchSecretStorageKey] || null;
-}
-
-function webSearchKeyringMetadata() {
-  const encryptionAvailable = safeStorage.isEncryptionAvailable();
-  const apiKeyConfigured = Boolean(webSearchApiKeySecretEntry()?.encryptedHex);
-  return {
-    available: encryptionAvailable,
-    encryptionAvailable,
-    storageBackend: selectedSafeStorageBackend(),
-    storagePath: secretsPath(),
-    apiKeyConfigured,
-    apiKeySourceId: keyringWebSearchApiKeySourceId,
-    envTarget: keyringWebSearchApiKeyEnvName,
-    status: !encryptionAvailable
-      ? apiKeyConfigured
-        ? "configured_unavailable"
-        : "unavailable"
-      : apiKeyConfigured
-        ? "available"
-        : "not_configured",
-  };
-}
-
-function setWebSearchKeyringSecret(value) {
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error("Encryption not available on this system");
-  }
-  const secretValue = String(value || "").trim();
-  if (!secretValue) throw new Error("Web search API key cannot be empty");
-  const store = readSecretStore();
-  store.secrets[webSearchSecretStorageKey] = {
-    kind: "safeStorage",
-    envTarget: keyringWebSearchApiKeyEnvName,
-    encryptedHex: safeStorage.encryptString(secretValue).toString("hex"),
-    updatedAt: new Date().toISOString(),
-  };
-  writeSecretStore(store);
-  return webSearchKeyringMetadata();
-}
-
-function deleteWebSearchKeyringSecret() {
-  const store = readSecretStore();
-  delete store.secrets[webSearchSecretStorageKey];
-  writeSecretStore(store);
-  return webSearchKeyringMetadata();
-}
-
 function injectKeyringProviderApiKey(env) {
   const value = readProviderApiKeySecret();
   // Legacy single-key storage is a fallback only. New user-entered credentials
@@ -683,11 +631,6 @@ function injectKeyringProviderApiKey(env) {
     }
     const providerValue = decryptSecretEntry(entry);
     if (providerValue) env[envTarget] = providerValue;
-  }
-
-  const webSearchValue = decryptSecretEntry(webSearchApiKeySecretEntry());
-  if (webSearchValue) {
-    env[keyringWebSearchApiKeyEnvName] = webSearchValue;
   }
 }
 
@@ -1654,7 +1597,6 @@ function listSecretSources() {
     status: "available",
   }));
   const keyring = keyringMetadata();
-  const webSearchKeyring = webSearchKeyringMetadata();
   const providerKeySources = Object.keys(readSecretStore().secrets)
     .filter((key) => key.startsWith(providerSecretStoragePrefix))
     .flatMap((key) => {
@@ -1694,7 +1636,6 @@ function listSecretSources() {
   return {
     activeProviderKeySource,
     keyring,
-    webSearchKeyring,
     sources: [
       ...envSources,
       {
@@ -1712,20 +1653,6 @@ function listSecretSources() {
         envTarget: keyring.envTarget,
       },
       ...providerKeySources,
-      {
-        id: webSearchKeyring.apiKeySourceId,
-        kind: "keyring",
-        label: "Web search API key",
-        envName: webSearchKeyring.envTarget,
-        configured: webSearchKeyring.apiKeyConfigured,
-        readableByRenderer: false,
-        storesValue: true,
-        status: webSearchKeyring.status,
-        available: webSearchKeyring.available,
-        storageBackend: webSearchKeyring.storageBackend,
-        storagePath: webSearchKeyring.storagePath,
-        envTarget: webSearchKeyring.envTarget,
-      },
     ],
     notes: [
       "Renderer receives metadata only. Secret values stay in env/keyring-capable main process paths.",
@@ -1834,10 +1761,6 @@ function registerIpc() {
     providerKeyringMetadata(providerId),
   );
 
-  ipcMain.handle("secrets:get-web-search-key-metadata", () =>
-    webSearchKeyringMetadata(),
-  );
-
   ipcMain.handle(
     "secrets:set-provider-key",
     async (_event, providerId, value) => {
@@ -1859,28 +1782,6 @@ function registerIpc() {
       providerId: metadata.providerId,
       sourceId: metadata.providerApiKeySourceId,
       configured: metadata.providerApiKeyConfigured,
-      status: metadata.status,
-    });
-    await restartManagedBackend();
-    return metadata;
-  });
-
-  ipcMain.handle("secrets:set-web-search-key", async (_event, value) => {
-    const metadata = setWebSearchKeyringSecret(value);
-    writeLog("info", "secrets.web-search.set", {
-      sourceId: metadata.apiKeySourceId,
-      configured: metadata.apiKeyConfigured,
-      status: metadata.status,
-    });
-    await restartManagedBackend();
-    return metadata;
-  });
-
-  ipcMain.handle("secrets:delete-web-search-key", async () => {
-    const metadata = deleteWebSearchKeyringSecret();
-    writeLog("info", "secrets.web-search.delete", {
-      sourceId: metadata.apiKeySourceId,
-      configured: metadata.apiKeyConfigured,
       status: metadata.status,
     });
     await restartManagedBackend();

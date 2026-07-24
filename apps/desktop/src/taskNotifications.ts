@@ -67,37 +67,41 @@ export function shouldDeliverTaskNotification(
 
 export function playCompletionChime(): void {
   if (typeof window === "undefined") return;
-  const AudioContextConstructor =
-    window.AudioContext ??
-    (
-      window as typeof window & {
-        webkitAudioContext?: typeof AudioContext;
-      }
-    ).webkitAudioContext;
-  if (!AudioContextConstructor) return;
+  try {
+    const AudioContextConstructor =
+      window.AudioContext ??
+      (
+        window as typeof window & {
+          webkitAudioContext?: typeof AudioContext;
+        }
+      ).webkitAudioContext;
+    if (!AudioContextConstructor) return;
 
-  const context = new AudioContextConstructor();
-  const gain = context.createGain();
-  const first = context.createOscillator();
-  const second = context.createOscillator();
-  const start = context.currentTime;
+    const context = new AudioContextConstructor();
+    const gain = context.createGain();
+    const first = context.createOscillator();
+    const second = context.createOscillator();
+    const start = context.currentTime;
 
-  first.type = "sine";
-  first.frequency.setValueAtTime(659.25, start);
-  second.type = "sine";
-  second.frequency.setValueAtTime(880, start + 0.09);
-  gain.gain.setValueAtTime(0.0001, start);
-  gain.gain.exponentialRampToValueAtTime(0.08, start + 0.015);
-  gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.28);
+    first.type = "sine";
+    first.frequency.setValueAtTime(659.25, start);
+    second.type = "sine";
+    second.frequency.setValueAtTime(880, start + 0.09);
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.08, start + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.28);
 
-  first.connect(gain);
-  second.connect(gain);
-  gain.connect(context.destination);
-  first.start(start);
-  first.stop(start + 0.16);
-  second.start(start + 0.09);
-  second.stop(start + 0.28);
-  second.addEventListener("ended", () => {
-    void context.close();
-  });
+    first.connect(gain);
+    second.connect(gain);
+    gain.connect(context.destination);
+    first.start(start);
+    first.stop(start + 0.16);
+    second.start(start + 0.09);
+    second.stop(start + 0.28);
+    second.addEventListener("ended", () => {
+      void context.close().catch(() => undefined);
+    });
+  } catch {
+    // Audio feedback must never interrupt task event processing.
+  }
 }

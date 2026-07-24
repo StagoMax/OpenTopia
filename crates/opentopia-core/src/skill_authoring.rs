@@ -1,6 +1,5 @@
 use crate::skills::{descriptor_for_skill_file, SkillDescriptor, SkillScope};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -8,7 +7,6 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
-const MAX_PROMPT_CHARS: usize = 12_000;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 1_024;
 const MAX_INSTRUCTIONS_BYTES: usize = 64 * 1024;
@@ -61,8 +59,6 @@ pub enum SkillAuthoringError {
     InvalidRequest(String),
     #[error("generated skill draft is invalid: {0}")]
     InvalidDraft(String),
-    #[error("model did not return a valid skill draft: {0}")]
-    InvalidModelOutput(String),
     #[error("skill already exists: {0}")]
     Conflict(String),
     #[error("skill root is unavailable: {0}")]
@@ -71,114 +67,6 @@ pub enum SkillAuthoringError {
     UnsafeRoot(String),
     #[error("skill could not be written: {0}")]
     Write(String),
-}
-
-pub fn validate_skill_generation_prompt(prompt: &str) -> Result<String, SkillAuthoringError> {
-    let prompt = prompt.trim();
-    if prompt.is_empty() {
-        return Err(SkillAuthoringError::InvalidRequest(
-            "describe what the Skill should do".to_string(),
-        ));
-    }
-    if prompt.chars().count() > MAX_PROMPT_CHARS {
-        return Err(SkillAuthoringError::InvalidRequest(format!(
-            "description exceeds {MAX_PROMPT_CHARS} characters"
-        )));
-    }
-    Ok(prompt.to_string())
-}
-
-pub fn skill_authoring_system_prompt() -> &'static str {
-    r#"You create concise, production-ready Codex Skills from a user's natural-language request.
-Return only JSON matching the supplied schema.
-
-Requirements:
-- Use a short, action-oriented ASCII skill name in lowercase hyphen-case, at most 64 characters.
-- Put every trigger and 'when to use' condition in description, not in the body.
-- Write the instructions as imperative Markdown for another coding agent. Include only non-obvious workflow, constraints, validation, and resource routing. Keep it concise and below 500 lines.
-- Generate interface metadata for agents/openai.yaml. defaultPrompt must be one short sentence that explicitly mentions $<skill-name>.
-- Add resources only when they materially improve repeatability. Put detailed knowledge in references/, deterministic helpers in scripts/, and reusable text templates in assets/. Keep references one level from SKILL.md and mention when to read them.
-- Do not create README, changelog, installation, quick-reference, or other process documentation.
-- Resource paths must be relative, use forward slashes, and start with references/, scripts/, or assets/. Resource contents must be UTF-8 text.
-- Do not include SKILL.md or agents/openai.yaml in resources; the application creates them.
-- Never include secrets, credentials, machine-specific absolute paths, TODO placeholders, or claims that validation already ran."#
-}
-
-pub fn skill_draft_json_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "name",
-            "description",
-            "instructions",
-            "displayName",
-            "shortDescription",
-            "defaultPrompt",
-            "resources"
-        ],
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Lowercase ASCII hyphen-case skill folder name, at most 64 characters."
-            },
-            "description": {
-                "type": "string",
-                "description": "What the Skill does and the situations or user requests that should trigger it."
-            },
-            "instructions": {
-                "type": "string",
-                "description": "Concise imperative Markdown body for SKILL.md, including a useful H1 heading."
-            },
-            "displayName": {
-                "type": "string",
-                "description": "Human-facing title for the Skill."
-            },
-            "shortDescription": {
-                "type": "string",
-                "description": "Short human-facing UI summary, at most 64 characters."
-            },
-            "defaultPrompt": {
-                "type": "string",
-                "description": "One-sentence example prompt that explicitly mentions $<skill-name>."
-            },
-            "resources": {
-                "type": "array",
-                "maxItems": MAX_RESOURCE_FILES,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["path", "content"],
-                    "properties": {
-                        "path": { "type": "string" },
-                        "content": { "type": "string" }
-                    }
-                }
-            }
-        }
-    })
-}
-
-pub fn parse_skill_draft_response(response: &str) -> Result<SkillDraft, SkillAuthoringError> {
-    let response = response.trim();
-    if response.is_empty() {
-        return Err(SkillAuthoringError::InvalidModelOutput(
-            "provider returned empty text".to_string(),
-        ));
-    }
-    let parsed = serde_json::from_str::<SkillDraft>(response).or_else(|direct_error| {
-        let start = response.find('{');
-        let end = response.rfind('}');
-        match (start, end) {
-            (Some(start), Some(end)) if start < end => {
-                serde_json::from_str::<SkillDraft>(&response[start..=end])
-            }
-            _ => Err(direct_error),
-        }
-    });
-    let draft =
-        parsed.map_err(|error| SkillAuthoringError::InvalidModelOutput(error.to_string()))?;
-    validate_skill_draft(draft)
 }
 
 pub fn validate_skill_draft(mut draft: SkillDraft) -> Result<SkillDraft, SkillAuthoringError> {
@@ -256,8 +144,7 @@ pub fn preview_skill_draft(
     workspace_root: Option<&Path>,
 ) -> Result<SkillDraftPreview, SkillAuthoringError> {
     let draft = validate_skill_draft(draft)?;
-    let root = skill_write_root(scope, workspace_root)?;
-    let target_path = root.join(&draft.name);
+    let target_path = skill_target_path(scope, workspace_root, &draft.name)?;
     let target_exists = target_path.exists();
     let mut files = vec![
         PathBuf::from("SKILL.md"),
@@ -431,7 +318,7 @@ fn validate_resource_path(path: &str) -> Result<(), SkillAuthoringError> {
     Ok(())
 }
 
-fn skill_write_root(
+pub(crate) fn skill_write_root(
     scope: SkillScope,
     workspace_root: Option<&Path>,
 ) -> Result<PathBuf, SkillAuthoringError> {
@@ -458,6 +345,16 @@ fn skill_write_root(
                 })
         }
     }
+}
+
+pub(crate) fn skill_target_path(
+    scope: SkillScope,
+    workspace_root: Option<&Path>,
+    name: &str,
+) -> Result<PathBuf, SkillAuthoringError> {
+    let name = name.trim().to_ascii_lowercase();
+    validate_skill_name(&name)?;
+    Ok(skill_write_root(scope, workspace_root)?.join(name))
 }
 
 fn render_skill_md(draft: &SkillDraft) -> String {
@@ -537,13 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_structured_output_wrapped_in_prose() {
-        let json = serde_json::to_string(&draft()).unwrap();
-        let parsed = parse_skill_draft_response(&format!("Draft:\n{json}\nDone.")).unwrap();
-        assert_eq!(parsed.name, "review-api");
-    }
-
-    #[test]
     fn rejects_resource_traversal_and_missing_explicit_prompt_name() {
         let mut unsafe_draft = draft();
         unsafe_draft.resources[0].path = "references/../secret.md".to_string();
@@ -556,6 +446,11 @@ mod tests {
         ambiguous.default_prompt = "Review this API.".to_string();
         assert!(matches!(
             validate_skill_draft(ambiguous),
+            Err(SkillAuthoringError::InvalidDraft(_))
+        ));
+
+        assert!(matches!(
+            skill_target_path(SkillScope::Workspace, Some(Path::new(".")), "../escaped"),
             Err(SkillAuthoringError::InvalidDraft(_))
         ));
     }
@@ -591,16 +486,5 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".opentopia-skill-")));
-    }
-
-    #[test]
-    fn schema_requires_every_top_level_property() {
-        let schema = skill_draft_json_schema();
-        let properties = schema["properties"].as_object().unwrap();
-        let required = schema["required"].as_array().unwrap();
-        assert_eq!(properties.len(), required.len());
-        for key in properties.keys() {
-            assert!(required.iter().any(|value| value.as_str() == Some(key)));
-        }
     }
 }

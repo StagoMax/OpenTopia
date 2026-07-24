@@ -70,6 +70,33 @@ export type BrowserOutput = {
   metadata: unknown;
 };
 
+export type BrowserRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type BrowserNode = {
+  nodeRef: string;
+  role: string;
+  name: string;
+  tagName: string;
+  bounds: BrowserRect;
+  href?: string | null;
+  formAction?: string | null;
+  editable: boolean;
+};
+
+export type BrowserObservation = {
+  observationId: string;
+  url: string;
+  title: string;
+  text: string;
+  textTruncated: boolean;
+  nodes: BrowserNode[];
+};
+
 export type ScreenRect = {
   x: number;
   y: number;
@@ -131,7 +158,11 @@ export type Project = {
 export type PermissionMode =
   "chat" | "read_only" | "auto" | "approve" | "full_access";
 
-export type ProviderKind = "mock" | "openai_compatible" | "openai_responses";
+export type ProviderKind =
+  | "mock"
+  | "openai_compatible"
+  | "openai_responses"
+  | "codex_app_server";
 
 export type AppSettings = {
   providers: ProviderSettings[];
@@ -139,18 +170,7 @@ export type AppSettings = {
   permissionMode: PermissionMode;
   defaultWorkspaceRoot?: string | null;
   sandbox: SandboxSettings;
-  webSearch: WebSearchSettings;
   updatedAt: string;
-};
-
-export type WebSearchMode = "disabled" | "provider_native" | "custom_api";
-
-export type WebSearchSettings = {
-  mode: WebSearchMode;
-  endpoint: string;
-  apiKeySource: string;
-  apiKeyConfigured: boolean;
-  maxResults: number;
 };
 
 export type SandboxSettings = {
@@ -177,6 +197,7 @@ export type ProviderSettings = {
   promptCachePolicy?: "explicit_30m" | "legacy_in_memory" | "legacy_24h" | null;
   responsesCompactionThresholdTokens?: number | null;
   rolloutBudget?: RolloutBudgetSettings | null;
+  supportsVision: boolean;
   apiKeySource: string;
   apiKeyConfigured: boolean;
   healthStatus?: string | null;
@@ -241,21 +262,9 @@ export type KeyringMetadata = {
   status: string;
 };
 
-export type WebSearchKeyringMetadata = {
-  available: boolean;
-  encryptionAvailable: boolean;
-  storageBackend?: string | null;
-  storagePath?: string;
-  apiKeyConfigured: boolean;
-  apiKeySourceId: string;
-  envTarget: string;
-  status: string;
-};
-
 export type SecretSources = {
   activeProviderKeySource: string | null;
   keyring?: KeyringMetadata;
-  webSearchKeyring?: WebSearchKeyringMetadata;
   sources: SecretSource[];
   notes: string[];
 };
@@ -801,47 +810,6 @@ export type PluginView = {
   compatible: boolean;
 };
 
-export type SkillResourceDraft = {
-  path: string;
-  content: string;
-};
-
-export type SkillDraft = {
-  name: string;
-  description: string;
-  instructions: string;
-  displayName: string;
-  shortDescription: string;
-  defaultPrompt: string;
-  resources: SkillResourceDraft[];
-};
-
-export type SkillDraftPreview = {
-  draft: SkillDraft;
-  skillMd: string;
-  openaiYaml: string;
-  targetPath: string;
-  targetExists: boolean;
-  files: string[];
-};
-
-export type GenerateSkillInput = {
-  prompt: string;
-  scope: SkillScope;
-  workspaceRoot?: string | null;
-};
-
-export type CreateSkillInput = {
-  draft: SkillDraft;
-  scope: SkillScope;
-  workspaceRoot?: string | null;
-};
-
-export type CreatedSkill = {
-  skill: SkillDescriptor;
-  files: string[];
-};
-
 export type SkillRef = {
   id: string;
   name: string;
@@ -1069,6 +1037,45 @@ export type AgentEvent = {
   payload: AgentEventPayload;
 };
 
+export type UserInputOption = {
+  id: string;
+  label: string;
+  description: string;
+  recommended: boolean;
+};
+
+export type UserInputQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  options: UserInputOption[];
+  allowCustom: boolean;
+};
+
+export type UserInputRequest = {
+  requestId: string;
+  questions: UserInputQuestion[];
+};
+
+export type UserInputAnswer = {
+  questionId: string;
+  optionId?: string;
+  customText?: string;
+};
+
+export type UserInputResponse = {
+  answers: UserInputAnswer[];
+};
+
+export type UserInputRecord = {
+  threadId: string;
+  request: UserInputRequest;
+  status: "pending" | "answered";
+  response?: UserInputResponse | null;
+  createdAt: string;
+  answeredAt?: string | null;
+};
+
 export type AgentEventPayload =
   | { type: "thread_context_snapshot"; snapshot: ThreadContextSnapshot }
   | { type: "turn_context_snapshot"; snapshot: TurnContextSnapshot }
@@ -1120,6 +1127,7 @@ export type AgentEventPayload =
   | { type: "tool_call_finished"; result: ToolResult }
   | { type: "plan_updated"; plan: TaskPlan }
   | { type: "goal_updated"; snapshot: GoalSnapshot }
+  | { type: "user_input_requested"; request: UserInputRequest }
   | { type: "assistant_message"; message: Message }
   | { type: "file_changed"; path: string; summary: string }
   | { type: "turn_changes_recorded"; change_set: TurnChangeSet }
@@ -1165,6 +1173,7 @@ export type AgentEventPayload =
     }
   | { type: "turn_finished"; summary: string }
   | { type: "turn_suspended"; approval_id: string; reason: string }
+  | { type: "turn_awaiting_input"; request_id: string }
   | { type: "turn_cancelled"; reason: string }
   | { type: "error"; message: string };
 
@@ -1246,9 +1255,6 @@ declare global {
         value: string,
       ): Promise<KeyringMetadata>;
       deleteProviderApiKey(providerId: string): Promise<KeyringMetadata>;
-      getWebSearchApiKeyMetadata(): Promise<WebSearchKeyringMetadata>;
-      setWebSearchApiKey(value: string): Promise<WebSearchKeyringMetadata>;
-      deleteWebSearchApiKey(): Promise<WebSearchKeyringMetadata>;
       listLogFiles(): Promise<LogFileInfo[]>;
       readLogFile(
         path: string,

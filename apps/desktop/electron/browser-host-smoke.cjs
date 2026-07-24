@@ -12,6 +12,26 @@ function listen(server) {
   });
 }
 
+async function runStep(name, operation, timeoutMs = 15_000) {
+  process.stderr.write(`[browser-host-smoke] ${name}\n`);
+  let timeout;
+  try {
+    const result = await Promise.race([
+      operation(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${name} timed out after ${timeoutMs} ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+    process.stderr.write(`[browser-host-smoke] ${name}: ok\n`);
+    return result;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function main() {
   await app.whenReady();
   const pageServer = http.createServer((request, response) => {
@@ -41,23 +61,42 @@ async function main() {
     const address = pageServer.address();
     const url = `http://127.0.0.1:${address.port}/`;
     const sessionId = "00000000-0000-4000-8000-000000000001";
-    await host.executeAction({ sessionId, action: "navigate", url });
-    await host.executeAction({
+    const executeAction = (name, request) =>
+      runStep(name, () => host.executeAction(request));
+    await executeAction("navigate", { sessionId, action: "navigate", url });
+    const observation = await executeAction("observe", {
       sessionId,
-      action: "type",
-      selector: "#name",
+      action: "observe",
+    });
+    const input = observation.nodes.find(
+      (node) => node.tagName === "input" && node.editable,
+    );
+    const button = observation.nodes.find(
+      (node) => node.role === "button" && node.name === "Apply",
+    );
+    if (!input || !button) {
+      throw new Error("browser observation did not expose expected node refs");
+    }
+    await executeAction("type observed input", {
+      sessionId,
+      action: "perform",
+      observationId: observation.observationId,
+      nodeRef: input.nodeRef,
+      operation: "type",
       text: "after",
     });
-    await host.executeAction({
+    await executeAction("click observed button", {
       sessionId,
-      action: "click",
-      selector: "#apply",
+      action: "perform",
+      observationId: observation.observationId,
+      nodeRef: button.nodeRef,
+      operation: "click",
     });
-    const snapshot = await host.executeAction({
+    const snapshot = await executeAction("snapshot", {
       sessionId,
       action: "snapshot",
     });
-    const screenshot = await host.executeAction({
+    const screenshot = await executeAction("screenshot", {
       sessionId,
       action: "screenshot",
     });
@@ -73,7 +112,7 @@ async function main() {
 
     let redirectBlocked = false;
     try {
-      await host.executeAction({
+      await executeAction("cross-host redirect", {
         sessionId,
         action: "navigate",
         url: `${url}redirect`,
@@ -84,7 +123,7 @@ async function main() {
     if (!redirectBlocked)
       throw new Error("cross-host redirect was not blocked");
 
-    const broker = await host.startBroker();
+    const broker = await runStep("start broker", () => host.startBroker());
     const unauthorized = await fetch(`${broker.url}/health`);
     const healthy = await fetch(`${broker.url}/health`, {
       headers: { Authorization: `Bearer ${broker.token}` },
@@ -93,7 +132,7 @@ async function main() {
       throw new Error("browser broker authentication smoke failed");
     }
 
-    await host.executeAction({ sessionId, action: "close" });
+    await executeAction("close session", { sessionId, action: "close" });
     process.stdout.write(
       `${JSON.stringify({
         snapshot: text.text.trim(),
@@ -111,8 +150,12 @@ async function main() {
 }
 
 main()
-  .then(() => app.exit(0))
+  .then(() => {
+    app.exit(0);
+    process.exit(0);
+  })
   .catch((error) => {
     console.error(error);
     app.exit(1);
+    process.exit(1);
   });
