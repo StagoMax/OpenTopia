@@ -31,6 +31,9 @@ const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_WAIT_MS = 30_000;
 const DEFAULT_WAIT_MS = 10_000;
 const MAX_INTERACTIVE_ELEMENTS = 500;
+const MAX_OBSERVATIONS_PER_SESSION = 12;
+const OBSERVATION_TTL_MS = 120_000;
+const MAX_NODE_POSITION_DRIFT = 24;
 const DEFAULT_BACKGROUND_BOUNDS = Object.freeze({
   x: 0,
   y: 0,
@@ -515,6 +518,7 @@ function createDesktopBrowserHost(options) {
       activeDownloadItem: null,
       allowedNavigationHosts: new Set(),
       lastError: null,
+      observations: new Map(),
       queue: Promise.resolve(),
     };
     sessions.set(normalized, entry);
@@ -621,17 +625,25 @@ function createDesktopBrowserHost(options) {
         const candidates = Array.from(document.querySelectorAll(
           "a[href],button,input,textarea,select,[role=button],[role=link],[contenteditable=true],[tabindex]"
         )).slice(0, elementLimit);
-        const interactiveElements = candidates.map((element) => ({
-          selector: selectorFor(element),
-          tag: element.localName,
-          type: element.getAttribute("type"),
-          role: element.getAttribute("role"),
-          text: truncate(element.innerText || element.value || element.getAttribute("aria-label") || "", 2048).value,
-          aria_label: element.getAttribute("aria-label"),
-          placeholder: element.getAttribute("placeholder"),
-          href: element.href || null,
-          disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true")
-        }));
+        const roleFor = (element) => element.getAttribute("role") || ({
+          a: "link", button: "button", textarea: "textbox", select: "combobox",
+          input: element.type === "checkbox" ? "checkbox" : element.type === "radio" ? "radio" : "textbox"
+        })[element.localName] || element.localName;
+        const interactiveElements = candidates
+          .filter((element) => !element.disabled && element.getClientRects().length)
+          .map((element) => {
+            const rect = element.getBoundingClientRect();
+            return {
+              selector: selectorFor(element),
+              tagName: element.localName,
+              role: roleFor(element),
+              name: truncate(element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("placeholder") || "", 2048).value,
+              href: element.href || null,
+              formAction: element.getAttribute("formaction") || (element.form && element.form.getAttribute("action")) || null,
+              editable: Boolean(element.isContentEditable || (["input", "textarea", "select"].includes(element.localName) && !element.readOnly)),
+              bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+            };
+          });
         const body = truncate(document.body ? document.body.innerText : "", byteLimit);
         return {
           url: document.location.href,
@@ -668,6 +680,168 @@ function createDesktopBrowserHost(options) {
         ),
       },
     );
+  }
+
+  function staleObservation(reason) {
+    return new BrowserHostError("stale_observation", reason, 409);
+  }
+
+  function pruneObservations(entry) {
+    const now = Date.now();
+    for (const [id, observation] of entry.observations) {
+      if (now - observation.capturedAt > OBSERVATION_TTL_MS) {
+        entry.observations.delete(id);
+      }
+    }
+    while (entry.observations.size > MAX_OBSERVATIONS_PER_SESSION) {
+      entry.observations.delete(entry.observations.keys().next().value);
+    }
+  }
+
+  function snapshotValue(output) {
+    return output.contents.find((content) => content?.type === "json")?.value;
+  }
+
+  async function observe(entry, includeScreenshot) {
+    const output = await snapshot(entry);
+    const snapshotValueResult = snapshotValue(output);
+    if (!snapshotValueResult || typeof snapshotValueResult !== "object") {
+      throw new BrowserHostError(
+        "observation_failed",
+        "Browser snapshot did not include structured page data.",
+        500,
+      );
+    }
+    const observationId = crypto.randomUUID();
+    const nodes = [];
+    const bindings = new Map();
+    for (const raw of snapshotValueResult.interactiveElements || []) {
+      if (!raw || typeof raw.selector !== "string") continue;
+      const nodeRef = crypto.randomUUID();
+      const node = {
+        nodeRef,
+        role: String(raw.role || raw.tagName || "element"),
+        name: String(raw.name || ""),
+        tagName: String(raw.tagName || ""),
+        bounds: raw.bounds || { x: 0, y: 0, width: 0, height: 0 },
+        href: typeof raw.href === "string" ? raw.href : null,
+        formAction: typeof raw.formAction === "string" ? raw.formAction : null,
+        editable: Boolean(raw.editable),
+      };
+      nodes.push(node);
+      bindings.set(nodeRef, { node, selector: raw.selector });
+    }
+    entry.observations.set(observationId, {
+      capturedAt: Date.now(),
+      url: String(snapshotValueResult.url || entry.view.webContents.getURL()),
+      nodes: bindings,
+    });
+    pruneObservations(entry);
+    let screenshotValue = null;
+    if (includeScreenshot) {
+      const screenshotOutput = await screenshot(entry);
+      const image = screenshotOutput.contents.find(
+        (content) => content?.type === "image",
+      );
+      if (image) {
+        screenshotValue = {
+          mimeType: image.mime_type,
+          bytes: image.bytes,
+        };
+      }
+    }
+    return {
+      observationId,
+      url: String(snapshotValueResult.url || entry.view.webContents.getURL()),
+      title: String(snapshotValueResult.title || entry.view.webContents.getTitle()),
+      text: String(snapshotValueResult.text || ""),
+      textTruncated: Boolean(snapshotValueResult.textTruncated),
+      nodes,
+      screenshot: screenshotValue,
+    };
+  }
+
+  function observedNode(entry, rawObservationId, rawNodeRef) {
+    if (typeof rawObservationId !== "string" || typeof rawNodeRef !== "string") {
+      throw new BrowserHostError(
+        "invalid_observation",
+        "observationId and nodeRef are required.",
+      );
+    }
+    pruneObservations(entry);
+    const observation = entry.observations.get(rawObservationId);
+    if (!observation) {
+      throw staleObservation("The observation is missing or expired.");
+    }
+    const node = observation.nodes.get(rawNodeRef);
+    if (!node) {
+      throw staleObservation("The node does not belong to this observation.");
+    }
+    return { observation, binding: node };
+  }
+
+  function nodesMatch(expected, current) {
+    const bounds = expected.bounds || {};
+    const currentBounds = current.bounds || {};
+    return (
+      expected.role === current.role &&
+      expected.name === current.name &&
+      expected.tagName === current.tagName &&
+      expected.href === current.href &&
+      expected.formAction === current.formAction &&
+      expected.editable === current.editable &&
+      Math.abs(Number(bounds.x) - Number(currentBounds.x)) <= MAX_NODE_POSITION_DRIFT &&
+      Math.abs(Number(bounds.y) - Number(currentBounds.y)) <= MAX_NODE_POSITION_DRIFT &&
+      Math.abs(Number(bounds.width) - Number(currentBounds.width)) <= MAX_NODE_POSITION_DRIFT &&
+      Math.abs(Number(bounds.height) - Number(currentBounds.height)) <= MAX_NODE_POSITION_DRIFT
+    );
+  }
+
+  async function perform(entry, request) {
+    const { observation, binding } = observedNode(
+      entry,
+      request.observationId,
+      request.nodeRef,
+    );
+    const webContents = entry.view.webContents;
+    if (webContents.getURL() !== observation.url) {
+      throw staleObservation("The page URL changed after the observation.");
+    }
+    const output = await snapshot(entry);
+    const current = snapshotValue(output)?.interactiveElements?.find(
+      (node) => node?.selector === binding.selector,
+    );
+    if (!current) {
+      throw staleObservation("The observed element no longer exists.");
+    }
+    const currentNode = {
+      ...current,
+      nodeRef: binding.node.nodeRef,
+      href: typeof current.href === "string" ? current.href : null,
+      formAction: typeof current.formAction === "string" ? current.formAction : null,
+      editable: Boolean(current.editable),
+    };
+    if (!nodesMatch(binding.node, currentNode)) {
+      throw staleObservation("The observed element changed or moved.");
+    }
+    if (request.operation === "click") {
+      await click(entry, binding.selector);
+    } else if (request.operation === "type") {
+      if (!currentNode.editable) {
+        throw staleObservation("The observed element is no longer editable.");
+      }
+      await typeText(entry, binding.selector, request.text);
+    } else {
+      throw new BrowserHostError("invalid_action", "operation must be click or type.");
+    }
+    return {
+      observationId: request.observationId,
+      nodeRef: request.nodeRef,
+      action: request.operation,
+      target: currentNode,
+      url: webContents.getURL(),
+      title: webContents.getTitle(),
+    };
   }
 
   async function withDebugger(webContents, operation) {
@@ -1083,9 +1257,10 @@ function createDesktopBrowserHost(options) {
     const supported = new Set([
       "navigate",
       "snapshot",
+      "observe",
+      "observation_node",
       "screenshot",
-      "click",
-      "type",
+      "perform",
       "wait",
       "download",
       "close",
@@ -1115,12 +1290,15 @@ function createDesktopBrowserHost(options) {
           return navigate(entry, request.url, parseWaitOptions(request));
         case "snapshot":
           return snapshot(entry);
+        case "observe":
+          return observe(entry, Boolean(request.includeScreenshot));
+        case "observation_node":
+          return observedNode(entry, request.observationId, request.nodeRef)
+            .binding.node;
         case "screenshot":
           return screenshot(entry);
-        case "click":
-          return click(entry, request.selector);
-        case "type":
-          return typeText(entry, request.selector, request.text);
+        case "perform":
+          return perform(entry, request);
         case "wait":
           return waitFor(entry, request);
         case "download":

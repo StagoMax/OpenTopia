@@ -56,6 +56,7 @@ impl AgentProfile {
             denied_tools: vec![
                 "write_file".to_string(),
                 "apply_patch".to_string(),
+                "create_skill".to_string(),
                 "spreadsheet".to_string(),
             ],
             ..Self::default_profile()

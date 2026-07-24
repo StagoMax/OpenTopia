@@ -842,7 +842,6 @@ code {
 
 .settings-providers-section,
 .settings-sandbox-section,
-.settings-web-search-section,
 .settings-provider-form,
 .settings-secret-section {
   display: grid;
@@ -853,80 +852,6 @@ code {
 .settings-sandbox-section {
   border-block: 1px solid #252d3a;
   padding-block: 14px;
-}
-
-.settings-web-search-section {
-  border-bottom: 1px solid #252d3a;
-  padding-bottom: 14px;
-}
-
-.settings-web-search-section h3 {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: 0;
-}
-
-.settings-web-search-modes {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
-}
-
-.settings-web-search-modes label {
-  position: relative;
-  display: flex;
-  min-width: 0;
-  min-height: 44px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid #303949;
-  border-radius: 8px;
-  background: #111620;
-  color: #aeb7ca;
-  cursor: pointer;
-  padding: 8px 10px;
-  text-align: center;
-}
-
-.settings-web-search-modes label:has(input:checked) {
-  border-color: #3b786c;
-  background: #172b29;
-  color: #eef1f7;
-}
-
-.settings-web-search-modes label:has(input:focus-visible) {
-  outline: 2px solid #4da18f;
-  outline-offset: 2px;
-}
-
-.settings-web-search-modes label:has(input:disabled) {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-
-.settings-web-search-modes input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-}
-
-.settings-web-search-modes span {
-  overflow-wrap: anywhere;
-  color: inherit;
-  font-weight: 600;
-}
-
-.settings-web-search-custom {
-  display: grid;
-  gap: 10px;
-}
-
-.settings-web-search-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(120px, 180px);
-  gap: 10px;
 }
 
 .settings-sandbox-grid {
@@ -3528,26 +3453,6 @@ button:disabled {
   background: #fafbfa;
 }
 
-.settings-web-search-section {
-  border-color: var(--border);
-}
-
-.settings-web-search-modes label {
-  border-color: var(--border);
-  background: #fafbfa;
-  color: var(--text-secondary);
-}
-
-.settings-web-search-modes label:has(input:checked) {
-  border-color: #86a9d6;
-  background: #eef5ff;
-  color: var(--text);
-}
-
-.settings-web-search-modes label:has(input:focus-visible) {
-  outline-color: var(--accent);
-}
-
 .settings-provider-item.active,
 .settings-provider-item.editing {
   border-color: #86a9d6;
@@ -4350,10 +4255,58 @@ button:disabled {
   left: 0;
 }
 
-.skills-popover {
-  max-height: min(560px, calc(100vh - 48px));
+.composer-actions-popover {
+  width: min(332px, calc(100vw - 24px));
+  max-height: min(620px, calc(100vh - 48px));
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+.composer-actions-section-label {
+  padding: 6px 8px 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.composer-actions-popover button.composer-mode-option,
+.composer-actions-popover button.composer-tool-option {
+  grid-template-columns: 18px minmax(0, 1fr) 16px;
+  min-height: 48px;
+  align-items: start;
+  gap: 8px;
+  padding: 7px 8px;
+}
+
+.composer-mode-option > svg:first-child,
+.composer-tool-option > svg:first-child {
+  margin-top: 2px;
+}
+
+.composer-action-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.composer-action-copy strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.composer-actions-popover button .composer-action-copy small {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.composer-mode-option.is-plan > svg:first-child {
+  color: #356cae;
+}
+
+.composer-mode-option.is-goal > svg:first-child {
+  color: #397348;
 }
 
 .permission-popover {
@@ -6551,6 +6504,16 @@ button:disabled {
   grid-column: 1 / -1;
 }
 
+.settings-provider-local-note {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .settings-form-grid label > small {
   color: var(--text-muted);
   font-size: 11px;
@@ -6757,63 +6720,6 @@ button:disabled {
   margin: 0 14px 14px;
 }
 
-.settings-web-search-modes {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-  padding: 10px;
-}
-
-.settings-web-search-modes > label {
-  display: grid;
-  min-width: 0;
-  min-height: 76px;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-content: start;
-  gap: 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 10px;
-  cursor: pointer;
-}
-
-.settings-web-search-modes > label.active {
-  border-color: #6f9ed6;
-  background: #edf4fc;
-}
-
-.settings-web-search-modes input {
-  margin: 3px 0 0;
-}
-
-.settings-web-search-modes span {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.settings-web-search-modes strong {
-  color: var(--text);
-  font-size: 12px;
-}
-
-.settings-web-search-modes small {
-  color: var(--text-secondary);
-  font-size: 10px;
-  line-height: 1.4;
-}
-
-.settings-web-search-custom {
-  display: grid;
-  gap: 10px;
-  border-top: 1px solid var(--border);
-  padding: 14px;
-}
-
-.settings-web-search-custom > .settings-form-grid {
-  padding: 0;
-}
-
 .settings-empty-state {
   display: grid;
   min-height: 180px;
@@ -6999,8 +6905,7 @@ button:disabled {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .settings-permission-options,
-  .settings-web-search-modes {
+  .settings-permission-options {
     grid-template-columns: 1fr;
   }
 }
@@ -7700,43 +7605,6 @@ button:disabled {
   width: 28px;
   padding: 0;
   color: #a24848;
-}
-
-.composer-collaboration-mode {
-  display: inline-flex;
-  min-height: 26px;
-  align-items: center;
-  gap: 4px;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text-secondary);
-  padding: 0 6px;
-  font-size: 11px;
-}
-
-.composer-collaboration-mode:hover {
-  background: var(--surface-hover);
-}
-
-.composer-collaboration-mode.is-plan {
-  color: #356cae;
-}
-
-.composer-collaboration-mode.is-goal {
-  color: #397348;
-}
-
-.collaboration-popover {
-  bottom: calc(100% + 6px);
-  left: 0;
-  width: 154px;
-  padding: 5px;
-}
-
-.collaboration-popover button {
-  grid-template-columns: 18px minmax(0, 1fr) 16px;
-  min-height: 32px;
 }
 
 @media (prefers-reduced-motion: reduce) {

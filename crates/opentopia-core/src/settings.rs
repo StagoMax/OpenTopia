@@ -12,42 +12,10 @@ pub enum ProviderKind {
     OpenAiCompatible,
     #[serde(rename = "openai_responses", alias = "open_ai_responses")]
     OpenAiResponses,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum WebSearchMode {
-    #[default]
-    Disabled,
-    ProviderNative,
-    CustomApi,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct WebSearchSettings {
-    #[serde(default)]
-    pub mode: WebSearchMode,
-    #[serde(default)]
-    pub endpoint: String,
-    #[serde(default = "default_web_search_api_key_source")]
-    pub api_key_source: String,
-    #[serde(default)]
-    pub api_key_configured: bool,
-    #[serde(default = "default_web_search_max_results")]
-    pub max_results: u8,
-}
-
-impl Default for WebSearchSettings {
-    fn default() -> Self {
-        Self {
-            mode: WebSearchMode::Disabled,
-            endpoint: String::new(),
-            api_key_source: default_web_search_api_key_source(),
-            api_key_configured: false,
-            max_results: default_web_search_max_results(),
-        }
-    }
+    /// Delegate model execution and local file attachments to an installed
+    /// Codex App Server instance.
+    #[serde(rename = "codex_app_server")]
+    CodexAppServer,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +35,7 @@ impl ProviderKind {
             Self::Mock => "mock",
             Self::OpenAiCompatible => "openai_compatible",
             Self::OpenAiResponses => "openai_responses",
+            Self::CodexAppServer => "codex_app_server",
         }
     }
 }
@@ -98,6 +67,10 @@ pub struct ProviderSettings {
     pub responses_compaction_threshold_tokens: Option<u32>,
     #[serde(default)]
     pub rollout_budget: Option<RolloutBudgetSettings>,
+    /// Whether the selected model accepts image inputs. This is the only
+    /// capability users need to declare; transport support is probed at use.
+    #[serde(default = "default_provider_supports_vision")]
+    pub supports_vision: bool,
     pub api_key_source: String,
     pub api_key_configured: bool,
     pub health_status: Option<String>,
@@ -120,6 +93,7 @@ impl Default for ProviderSettings {
             prompt_cache_policy: None,
             responses_compaction_threshold_tokens: None,
             rollout_budget: None,
+            supports_vision: default_provider_supports_vision(),
             api_key_source: "OPENTOPIA_API_KEY".to_string(),
             api_key_configured: false,
             health_status: None,
@@ -217,12 +191,8 @@ fn default_provider_context_window_tokens() -> usize {
     128_000
 }
 
-fn default_web_search_api_key_source() -> String {
-    "OPENTOPIA_WEB_SEARCH_API_KEY".to_string()
-}
-
-fn default_web_search_max_results() -> u8 {
-    5
+fn default_provider_supports_vision() -> bool {
+    true
 }
 
 fn default_rollout_sampling_token_weight() -> f64 {
@@ -429,8 +399,6 @@ pub struct AppSettings {
     pub default_workspace_root: Option<PathBuf>,
     #[serde(default)]
     pub sandbox: SandboxSettings,
-    #[serde(default)]
-    pub web_search: WebSearchSettings,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -443,7 +411,6 @@ impl AppSettings {
             permission_mode,
             default_workspace_root: None,
             sandbox: SandboxSettings::from_env(),
-            web_search: WebSearchSettings::default(),
             updated_at: Utc::now(),
         }
     }
@@ -468,11 +435,12 @@ impl AppSettings {
 
     pub fn touch(&mut self) {
         for provider in &mut self.providers {
-            provider.api_key_configured =
-                std::env::var(&provider.api_key_source).is_ok_and(|value| !value.is_empty());
+            provider.api_key_configured = if provider.kind == ProviderKind::CodexAppServer {
+                true
+            } else {
+                std::env::var(&provider.api_key_source).is_ok_and(|value| !value.is_empty())
+            };
         }
-        self.web_search.api_key_configured =
-            std::env::var(&self.web_search.api_key_source).is_ok_and(|value| !value.is_empty());
         self.updated_at = Utc::now();
     }
 }
@@ -492,10 +460,12 @@ pub struct ProviderHealth {
 
 impl ProviderHealth {
     pub fn from_settings(settings: &ProviderSettings) -> Self {
-        let api_key_configured = std::env::var(&settings.api_key_source)
-            .is_ok_and(|value| !value.is_empty())
+        let codex_app_server = settings.kind == ProviderKind::CodexAppServer;
+        let api_key_configured = codex_app_server
+            || std::env::var(&settings.api_key_source).is_ok_and(|value| !value.is_empty())
             || settings.api_key_configured;
-        let using_mock = settings.kind == ProviderKind::Mock || !api_key_configured;
+        let using_mock =
+            settings.kind == ProviderKind::Mock || (!codex_app_server && !api_key_configured);
         Self {
             id: settings.id.clone(),
             kind: settings.kind.clone(),
@@ -504,7 +474,9 @@ impl ProviderHealth {
             api_key_source: settings.api_key_source.clone(),
             api_key_configured,
             using_mock,
-            status: if using_mock {
+            status: if codex_app_server {
+                "local_codex".to_string()
+            } else if using_mock {
                 "mock_or_unconfigured".to_string()
             } else {
                 "configured".to_string()
@@ -724,32 +696,43 @@ mod tests {
     }
 
     #[test]
-    fn legacy_app_settings_default_web_search_to_disabled() {
-        let settings = AppSettings::from_env(PermissionMode::Auto);
-        let mut value = serde_json::to_value(settings).expect("serialize settings");
-        value
-            .as_object_mut()
-            .expect("settings object")
-            .remove("webSearch");
+    fn app_settings_ignore_legacy_web_search_configuration() {
+        let provider = ProviderSettings::default();
+        let settings = AppSettings {
+            providers: vec![provider.clone()],
+            active_provider_id: provider.id,
+            permission_mode: PermissionMode::Auto,
+            default_workspace_root: None,
+            sandbox: SandboxSettings::default(),
+            updated_at: Utc::now(),
+        };
+        let mut value = serde_json::to_value(settings).unwrap();
+        value["webSearch"] = serde_json::json!({
+            "mode": "custom_api",
+            "endpoint": "https://search.example.test",
+            "apiKeySource": "legacy",
+            "apiKeyConfigured": true,
+            "maxResults": 5
+        });
 
-        let restored: AppSettings = serde_json::from_value(value).expect("restore settings");
-        assert_eq!(restored.web_search, WebSearchSettings::default());
+        serde_json::from_value::<AppSettings>(value)
+            .expect("legacy web search settings should be ignored");
     }
 
     #[test]
-    fn web_search_settings_round_trip_custom_api_configuration() {
-        let settings = WebSearchSettings {
-            mode: WebSearchMode::CustomApi,
-            endpoint: "https://search.example.test/v1/search".to_string(),
-            api_key_source: "CUSTOM_SEARCH_KEY".to_string(),
-            api_key_configured: true,
-            max_results: 8,
-        };
+    fn codex_app_server_provider_needs_no_api_key_or_base_url() {
+        let mut provider = ProviderSettings::default();
+        provider.kind = ProviderKind::CodexAppServer;
+        provider.base_url.clear();
+        provider.model.clear();
+        provider.api_key_configured = false;
 
-        let json = serde_json::to_string(&settings).expect("serialize web search settings");
-        let restored: WebSearchSettings =
-            serde_json::from_str(&json).expect("restore web search settings");
-        assert_eq!(restored, settings);
+        let health = ProviderHealth::from_settings(&provider);
+
+        assert!(health.api_key_configured);
+        assert!(!health.using_mock);
+        assert_eq!(health.status, "local_codex");
+        assert!(provider.supports_vision);
     }
 
     #[test]

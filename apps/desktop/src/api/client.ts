@@ -9,8 +9,6 @@ import type {
   ComputerWindowTarget,
   ContextStatus,
   ContextSummary,
-  CreatedSkill,
-  CreateSkillInput,
   DiffFileActionResult,
   ExperienceMode,
   GitBranchInfo,
@@ -19,7 +17,6 @@ import type {
   GitWorkflowResponse,
   GoalSnapshot,
   GoalStatus,
-  GenerateSkillInput,
   McpCallResult,
   McpServerInput,
   McpServerStatus,
@@ -36,7 +33,6 @@ import type {
   ProviderSettings,
   SandboxDescriptor,
   SkillDescriptor,
-  SkillDraftPreview,
   SpreadsheetPreview,
   SpreadsheetPreviewRange,
   SubagentRun,
@@ -53,6 +49,8 @@ import type {
   TurnStatus,
   ThreadMcpServer,
   ThreadMcpServerView,
+  UserInputRecord,
+  UserInputResponse,
   WorkspaceDiff,
   WorkspaceDiffHunk,
   WorkspaceDiffHunkAction,
@@ -145,7 +143,6 @@ export class ApiClient {
     defaultWorkspaceRoot?: string;
     clearDefaultWorkspaceRoot?: boolean;
     sandbox?: AppSettings["sandbox"];
-    webSearch?: AppSettings["webSearch"];
   }): Promise<AppSettings> {
     return this.patch("/api/settings", input);
   }
@@ -195,14 +192,6 @@ export class ApiClient {
       pluginId,
       enabled,
     });
-  }
-
-  async generateSkill(input: GenerateSkillInput): Promise<SkillDraftPreview> {
-    return this.post("/api/skills/generate", input);
-  }
-
-  async createSkill(input: CreateSkillInput): Promise<CreatedSkill> {
-    return this.post("/api/skills", input);
   }
 
   async testProviderConnection(
@@ -328,7 +317,7 @@ export class ApiClient {
     input: {
       action:
         | "navigate"
-        | "snapshot"
+        | "observe"
         | "screenshot"
         | "click"
         | "type"
@@ -337,8 +326,11 @@ export class ApiClient {
         | "close";
       url?: string;
       selector?: string;
+      observationId?: string;
+      nodeRef?: string;
       text?: string;
       clearFirst?: boolean;
+      includeScreenshot?: boolean;
       condition?: "document_complete" | "selector" | "text";
       timeoutMs?: number;
       expectedFilename?: string;
@@ -502,6 +494,21 @@ export class ApiClient {
     threadId: string,
   ): Promise<Array<{ approvalId: string }>> {
     return this.get(`/api/threads/${threadId}/approvals?status=pending`);
+  }
+
+  async listPendingUserInput(threadId: string): Promise<UserInputRecord[]> {
+    return this.get(`/api/threads/${threadId}/user-input?status=pending`);
+  }
+
+  async respondToUserInput(
+    threadId: string,
+    requestId: string,
+    response: UserInputResponse,
+  ): Promise<{ accepted: boolean; resumed: boolean }> {
+    return this.post(
+      `/api/threads/${threadId}/user-input/${requestId}/response`,
+      response,
+    );
   }
 
   async listWorkspaceTree(

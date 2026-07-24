@@ -16,7 +16,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
@@ -31,6 +31,9 @@ const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
+const OBSERVATION_TTL: Duration = Duration::from_secs(120);
+const MAX_OBSERVATIONS_PER_SESSION: usize = 12;
+const MAX_NODE_POSITION_DRIFT: f64 = 24.0;
 
 /// An opaque ID that should normally be derived from a thread ID. A session gets its own browser
 /// process, user-data directory, cookie jar, cache, and download directory.
@@ -62,6 +65,135 @@ impl fmt::Display for BrowserSessionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+/// Opaque token for one point-in-time browser observation. It is valid only for a short period
+/// and only within the browser session that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BrowserObservationId(Uuid);
+
+impl BrowserObservationId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for BrowserObservationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Opaque reference to an interactive node in one `BrowserObservation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BrowserNodeRef(Uuid);
+
+impl BrowserNodeRef {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for BrowserNodeRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl BrowserRect {
+    fn materially_differs_from(&self, other: &Self) -> bool {
+        (self.x - other.x).abs() > MAX_NODE_POSITION_DRIFT
+            || (self.y - other.y).abs() > MAX_NODE_POSITION_DRIFT
+            || (self.width - other.width).abs() > MAX_NODE_POSITION_DRIFT
+            || (self.height - other.height).abs() > MAX_NODE_POSITION_DRIFT
+    }
+}
+
+impl BrowserNode {
+    fn matches_current(&self, current: &Self) -> bool {
+        self.role == current.role
+            && self.name == current.name
+            && self.tag_name == current.tag_name
+            && self.href == current.href
+            && self.form_action == current.form_action
+            && self.editable == current.editable
+            && !self.bounds.materially_differs_from(&current.bounds)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserNode {
+    pub node_ref: BrowserNodeRef,
+    pub role: String,
+    pub name: String,
+    pub tag_name: String,
+    pub bounds: BrowserRect,
+    pub href: Option<String>,
+    pub form_action: Option<String>,
+    pub editable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserScreenshot {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserObservation {
+    pub observation_id: BrowserObservationId,
+    pub url: String,
+    pub title: String,
+    pub text: String,
+    pub text_truncated: bool,
+    pub nodes: Vec<BrowserNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<BrowserScreenshot>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BrowserObserveOptions {
+    pub include_screenshot: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum BrowserAction {
+    Click,
+    Type { text: String, clear_first: bool },
+}
+
+impl BrowserAction {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::Type { .. } => "type",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserActionReceipt {
+    pub observation_id: BrowserObservationId,
+    pub node_ref: BrowserNodeRef,
+    pub action: String,
+    pub target: BrowserNode,
+    pub url: String,
+    pub title: String,
 }
 
 /// Configuration for a local Chrome or Edge process.
@@ -255,6 +387,8 @@ pub enum BrowserError {
     DisallowedScheme(String),
     #[error("Invalid CSS selector: {0}")]
     InvalidSelector(String),
+    #[error("stale_observation: {reason}")]
+    StaleObservation { reason: String },
     #[error("Browser startup timed out after {0:?}")]
     StartupTimeout(Duration),
     #[error("Browser operation timed out while waiting for {0}")]
@@ -295,18 +429,25 @@ pub trait BrowserRuntime: Send + Sync {
         session: BrowserSessionId,
         request: BrowserNavigateRequest,
     ) -> Result<BrowserOutput, BrowserError>;
-    async fn snapshot(&self, session: BrowserSessionId) -> Result<BrowserOutput, BrowserError>;
+    async fn observe(
+        &self,
+        session: BrowserSessionId,
+        options: BrowserObserveOptions,
+    ) -> Result<BrowserObservation, BrowserError>;
+    async fn observation_node(
+        &self,
+        session: BrowserSessionId,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+    ) -> Result<BrowserNode, BrowserError>;
+    async fn perform(
+        &self,
+        session: BrowserSessionId,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+        action: BrowserAction,
+    ) -> Result<BrowserActionReceipt, BrowserError>;
     async fn screenshot(&self, session: BrowserSessionId) -> Result<BrowserOutput, BrowserError>;
-    async fn click(
-        &self,
-        session: BrowserSessionId,
-        selector: BrowserSelector,
-    ) -> Result<BrowserOutput, BrowserError>;
-    async fn type_text(
-        &self,
-        session: BrowserSessionId,
-        request: BrowserTypeRequest,
-    ) -> Result<BrowserOutput, BrowserError>;
     async fn wait(
         &self,
         session: BrowserSessionId,
@@ -389,36 +530,43 @@ impl BrowserRuntime for LocalBrowserRuntime {
         runtime.navigate(request).await
     }
 
-    async fn snapshot(&self, session: BrowserSessionId) -> Result<BrowserOutput, BrowserError> {
+    async fn observe(
+        &self,
+        session: BrowserSessionId,
+        options: BrowserObserveOptions,
+    ) -> Result<BrowserObservation, BrowserError> {
         let runtime = self.session(session).await?;
         let mut runtime = runtime.lock().await;
-        runtime.snapshot().await
+        runtime.observe(options).await
+    }
+
+    async fn observation_node(
+        &self,
+        session: BrowserSessionId,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+    ) -> Result<BrowserNode, BrowserError> {
+        let runtime = self.session(session).await?;
+        let mut runtime = runtime.lock().await;
+        runtime.observation_node(observation_id, node_ref).await
+    }
+
+    async fn perform(
+        &self,
+        session: BrowserSessionId,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+        action: BrowserAction,
+    ) -> Result<BrowserActionReceipt, BrowserError> {
+        let runtime = self.session(session).await?;
+        let mut runtime = runtime.lock().await;
+        runtime.perform(observation_id, node_ref, action).await
     }
 
     async fn screenshot(&self, session: BrowserSessionId) -> Result<BrowserOutput, BrowserError> {
         let runtime = self.session(session).await?;
         let mut runtime = runtime.lock().await;
         runtime.screenshot().await
-    }
-
-    async fn click(
-        &self,
-        session: BrowserSessionId,
-        selector: BrowserSelector,
-    ) -> Result<BrowserOutput, BrowserError> {
-        let runtime = self.session(session).await?;
-        let mut runtime = runtime.lock().await;
-        runtime.click(&selector).await
-    }
-
-    async fn type_text(
-        &self,
-        session: BrowserSessionId,
-        request: BrowserTypeRequest,
-    ) -> Result<BrowserOutput, BrowserError> {
-        let runtime = self.session(session).await?;
-        let mut runtime = runtime.lock().await;
-        runtime.type_text(request).await
     }
 
     async fn wait(
@@ -471,6 +619,33 @@ struct LocalBrowserSession {
     max_snapshot_bytes: usize,
     max_screenshot_bytes: usize,
     retain_session_data: bool,
+    observations: HashMap<BrowserObservationId, LocalBrowserObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalBrowserObservation {
+    captured_at: Instant,
+    url: String,
+    nodes: HashMap<BrowserNodeRef, LocalBrowserNode>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalBrowserNode {
+    node: BrowserNode,
+    selector: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CapturedBrowserNode {
+    selector: String,
+    role: Option<String>,
+    name: Option<String>,
+    tag_name: String,
+    bounds: BrowserRect,
+    href: Option<String>,
+    form_action: Option<String>,
+    editable: bool,
 }
 
 impl LocalBrowserSession {
@@ -547,6 +722,7 @@ impl LocalBrowserSession {
                 max_snapshot_bytes: config.max_snapshot_bytes,
                 max_screenshot_bytes: config.max_screenshot_bytes,
                 retain_session_data: config.retain_session_data,
+                observations: HashMap::new(),
             }),
             Err(error) => {
                 let mut child = child;
@@ -600,7 +776,10 @@ impl LocalBrowserSession {
         Ok(output)
     }
 
-    async fn snapshot(&mut self) -> Result<BrowserOutput, BrowserError> {
+    async fn observe(
+        &mut self,
+        options: BrowserObserveOptions,
+    ) -> Result<BrowserObservation, BrowserError> {
         let url = self.current_url().await?;
         let title = self.current_title().await?;
         let text = self
@@ -608,33 +787,74 @@ impl LocalBrowserSession {
             .await?;
         let text = text.as_str().unwrap_or_default().to_string();
         let (text, text_truncated) = truncate_utf8(&text, self.max_snapshot_bytes);
-        let interactive_elements = self
-            .evaluate_value(INTERACTIVE_SNAPSHOT_SCRIPT)
-            .await
-            .unwrap_or_else(|_| json!([]));
-        let snapshot = BrowserSnapshot {
-            url: url.clone(),
-            title: title.clone(),
-            text: text.clone(),
-            text_truncated,
-            interactive_elements: interactive_elements.clone(),
+        let captures = self.capture_nodes().await?;
+        let observation_id = BrowserObservationId::new();
+        let mut stored_nodes = HashMap::new();
+        let nodes = captures
+            .into_iter()
+            .map(|capture| {
+                let node_ref = BrowserNodeRef::new();
+                let node = BrowserNode {
+                    node_ref,
+                    role: capture.role.unwrap_or_else(|| capture.tag_name.clone()),
+                    name: capture.name.unwrap_or_default(),
+                    tag_name: capture.tag_name,
+                    bounds: capture.bounds,
+                    href: capture.href,
+                    form_action: capture.form_action,
+                    editable: capture.editable,
+                };
+                stored_nodes.insert(
+                    node_ref,
+                    LocalBrowserNode {
+                        node: node.clone(),
+                        selector: capture.selector,
+                    },
+                );
+                node
+            })
+            .collect::<Vec<_>>();
+        self.prune_observations();
+        self.observations.insert(
+            observation_id,
+            LocalBrowserObservation {
+                captured_at: Instant::now(),
+                url: url.clone(),
+                nodes: stored_nodes,
+            },
+        );
+        let screenshot = if options.include_screenshot {
+            Some(BrowserScreenshot {
+                mime_type: "image/png".to_string(),
+                bytes: self.screenshot_bytes().await?,
+            })
+        } else {
+            None
         };
-        Ok(BrowserOutput {
-            url: Some(url),
-            contents: vec![
-                BrowserContent::Text {
-                    text,
-                    truncated: text_truncated,
-                },
-                BrowserContent::Json {
-                    value: serde_json::to_value(snapshot)?,
-                },
-            ],
-            metadata: json!({ "action": "snapshot", "title": title }),
+        Ok(BrowserObservation {
+            observation_id,
+            url,
+            title,
+            text,
+            text_truncated,
+            nodes,
+            screenshot,
         })
     }
 
     async fn screenshot(&mut self) -> Result<BrowserOutput, BrowserError> {
+        let bytes = self.screenshot_bytes().await?;
+        Ok(BrowserOutput {
+            url: Some(self.current_url().await?),
+            contents: vec![BrowserContent::Image {
+                mime_type: "image/png".to_string(),
+                bytes,
+            }],
+            metadata: json!({ "action": "screenshot" }),
+        })
+    }
+
+    async fn screenshot_bytes(&mut self) -> Result<Vec<u8>, BrowserError> {
         let result = self
             .page
             .command("Page.captureScreenshot", json!({ "format": "png" }))
@@ -651,18 +871,12 @@ impl LocalBrowserSession {
                 maximum: self.max_screenshot_bytes,
             });
         }
-        Ok(BrowserOutput {
-            url: Some(self.current_url().await?),
-            contents: vec![BrowserContent::Image {
-                mime_type: "image/png".to_string(),
-                bytes,
-            }],
-            metadata: json!({ "action": "screenshot" }),
-        })
+        Ok(bytes)
     }
 
-    async fn click(&mut self, selector: &BrowserSelector) -> Result<BrowserOutput, BrowserError> {
-        let node_id = self.find_node_id(selector).await?;
+    async fn click_selector(&mut self, raw_selector: &str) -> Result<(), BrowserError> {
+        let selector = BrowserSelector::new(raw_selector.to_string())?;
+        let node_id = self.find_node_id(&selector).await?;
         let model = self
             .page
             .command("DOM.getBoxModel", json!({ "nodeId": node_id }))
@@ -696,33 +910,153 @@ impl LocalBrowserSession {
                 json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1 }),
             )
             .await?;
-        self.page_output("click", json!({ "selector": selector.as_str() }))
-            .await
+        Ok(())
     }
 
-    async fn type_text(
+    async fn observation_node(
         &mut self,
-        request: BrowserTypeRequest,
-    ) -> Result<BrowserOutput, BrowserError> {
-        let node_id = self.find_node_id(&request.selector).await?;
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+    ) -> Result<BrowserNode, BrowserError> {
+        Ok(self.observed_node(observation_id, node_ref)?.node)
+    }
+
+    async fn perform(
+        &mut self,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+        action: BrowserAction,
+    ) -> Result<BrowserActionReceipt, BrowserError> {
+        let (observed_url, stored) = self.observed_node_with_url(observation_id, node_ref)?;
+        let current_url = self.current_url().await?;
+        if current_url != observed_url {
+            return Err(BrowserError::StaleObservation {
+                reason: "the page URL changed after the observation".to_string(),
+            });
+        }
+        let current = self
+            .capture_nodes()
+            .await?
+            .into_iter()
+            .find(|node| node.selector == stored.selector)
+            .map(|node| BrowserNode {
+                node_ref,
+                role: node.role.unwrap_or_else(|| node.tag_name.clone()),
+                name: node.name.unwrap_or_default(),
+                tag_name: node.tag_name,
+                bounds: node.bounds,
+                href: node.href,
+                form_action: node.form_action,
+                editable: node.editable,
+            })
+            .ok_or_else(|| BrowserError::StaleObservation {
+                reason: "the observed element no longer exists".to_string(),
+            })?;
+        if !stored.node.matches_current(&current) {
+            return Err(BrowserError::StaleObservation {
+                reason: "the observed element changed or moved".to_string(),
+            });
+        }
+
+        match &action {
+            BrowserAction::Click => self.click_selector(&stored.selector).await?,
+            BrowserAction::Type { text, clear_first } => {
+                if !current.editable {
+                    return Err(BrowserError::StaleObservation {
+                        reason: "the observed element is no longer editable".to_string(),
+                    });
+                }
+                self.type_selector(&stored.selector, text.clone(), *clear_first)
+                    .await?;
+            }
+        }
+        Ok(BrowserActionReceipt {
+            observation_id,
+            node_ref,
+            action: action.name().to_string(),
+            target: current,
+            url: self.current_url().await?,
+            title: self.current_title().await?,
+        })
+    }
+
+    fn prune_observations(&mut self) {
+        self.observations
+            .retain(|_, observation| observation.captured_at.elapsed() <= OBSERVATION_TTL);
+        if self.observations.len() <= MAX_OBSERVATIONS_PER_SESSION {
+            return;
+        }
+        let mut oldest = self
+            .observations
+            .iter()
+            .map(|(id, observation)| (*id, observation.captured_at))
+            .collect::<Vec<_>>();
+        oldest.sort_by_key(|(_, captured_at)| *captured_at);
+        for (id, _) in oldest.into_iter().take(
+            self.observations
+                .len()
+                .saturating_sub(MAX_OBSERVATIONS_PER_SESSION),
+        ) {
+            self.observations.remove(&id);
+        }
+    }
+
+    fn observed_node(
+        &mut self,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+    ) -> Result<LocalBrowserNode, BrowserError> {
+        Ok(self.observed_node_with_url(observation_id, node_ref)?.1)
+    }
+
+    fn observed_node_with_url(
+        &mut self,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+    ) -> Result<(String, LocalBrowserNode), BrowserError> {
+        self.prune_observations();
+        let observation = self.observations.get(&observation_id).ok_or_else(|| {
+            BrowserError::StaleObservation {
+                reason: "the observation is missing or expired".to_string(),
+            }
+        })?;
+        let node = observation.nodes.get(&node_ref).cloned().ok_or_else(|| {
+            BrowserError::StaleObservation {
+                reason: "the node does not belong to this observation".to_string(),
+            }
+        })?;
+        Ok((observation.url.clone(), node))
+    }
+
+    async fn capture_nodes(&mut self) -> Result<Vec<CapturedBrowserNode>, BrowserError> {
+        let value = self.evaluate_value(INTERACTIVE_SNAPSHOT_SCRIPT).await?;
+        serde_json::from_value(value).map_err(|error| {
+            BrowserError::Protocol(format!("browser observation nodes are invalid: {error}"))
+        })
+    }
+
+    async fn type_selector(
+        &mut self,
+        raw_selector: &str,
+        text: String,
+        clear_first: bool,
+    ) -> Result<(), BrowserError> {
+        let selector = BrowserSelector::new(raw_selector.to_string())?;
+        let node_id = self.find_node_id(&selector).await?;
         self.page
             .command("DOM.focus", json!({ "nodeId": node_id }))
             .await?;
-        if request.clear_first {
-            let selector = serde_json::to_string(request.selector.as_str())?;
+        if clear_first {
+            let selector = serde_json::to_string(selector.as_str())?;
             self.evaluate_value(&format!(
                 "(() => {{ const element = document.querySelector({selector}); if (!element) throw new Error('Element no longer exists'); if ('value' in element) {{ element.value = ''; element.dispatchEvent(new Event('input', {{ bubbles: true }})); element.dispatchEvent(new Event('change', {{ bubbles: true }})); }} else if (element.isContentEditable) {{ element.textContent = ''; }} }})()"
             ))
             .await?;
         }
         self.page
-            .command("Input.insertText", json!({ "text": request.text }))
+            .command("Input.insertText", json!({ "text": text }))
             .await?;
-        self.page_output(
-            "type",
-            json!({ "selector": request.selector.as_str(), "clearFirst": request.clear_first }),
-        )
-        .await
+        Ok(())
     }
 
     async fn wait(&mut self, request: BrowserWaitRequest) -> Result<BrowserOutput, BrowserError> {
@@ -1207,10 +1541,14 @@ fn discover_browser_executable(configured: Option<&Path>) -> Result<PathBuf, Bro
 const INTERACTIVE_SNAPSHOT_SCRIPT: &str = r#"
 (() => {
   const max = 200;
-  const text = (element) => (element.innerText || element.value || element.getAttribute('aria-label') || '')
+  const text = (element) => (element.innerText || element.value || element.getAttribute('aria-label') || element.getAttribute('placeholder') || '')
     .replace(/\s+/g, ' ').trim().slice(0, 240);
+  const role = (element) => element.getAttribute('role') || {
+    a: 'link', button: 'button', input: element.type === 'checkbox' ? 'checkbox' : element.type === 'radio' ? 'radio' : 'textbox',
+    textarea: 'textbox', select: 'combobox'
+  }[element.tagName.toLowerCase()] || element.tagName.toLowerCase();
   const cssPath = (element) => {
-    if (element.id) return `#${CSS.escape(element.id)}`;
+    if (element.id && window.CSS && CSS.escape) return `#${CSS.escape(element.id)}`;
     const parts = [];
     for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && node !== document.body; node = node.parentElement) {
       let part = node.tagName.toLowerCase();
@@ -1224,9 +1562,10 @@ const INTERACTIVE_SNAPSHOT_SCRIPT: &str = r#"
     .filter((element) => !element.disabled && element.getClientRects().length)
     .slice(0, max)
     .map((element) => ({
-      selector: cssPath(element), tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
-      text: text(element), ariaLabel: element.getAttribute('aria-label'), placeholder: element.getAttribute('placeholder'),
-      type: element.getAttribute('type'), href: element.href || null
+      selector: cssPath(element), tagName: element.tagName.toLowerCase(), role: role(element), name: text(element),
+      href: element.href || null, formAction: element.getAttribute('formaction') || (element.form && element.form.getAttribute('action')) || null,
+      editable: Boolean(element.isContentEditable || ['input', 'textarea', 'select'].includes(element.tagName.toLowerCase()) && !element.readOnly),
+      bounds: (() => { const rect = element.getBoundingClientRect(); return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; })()
     }));
 })()
 "#;
@@ -1321,16 +1660,16 @@ mod tests {
             .navigate(session, BrowserNavigateRequest::new(url))
             .await
             .unwrap();
-        let snapshot = runtime.snapshot(session).await.unwrap();
-        let text = snapshot
-            .contents
-            .iter()
-            .find_map(|content| match content {
-                BrowserContent::Text { text, .. } => Some(text),
-                _ => None,
-            })
+        let observation = runtime
+            .observe(session, BrowserObserveOptions::default())
+            .await
             .unwrap();
-        assert!(text.contains("Browser runtime works"));
+        assert!(observation.text.contains("Browser runtime works"));
+        let press = observation
+            .nodes
+            .iter()
+            .find(|node| node.name == "Press")
+            .expect("press button must be observable");
 
         let screenshot = runtime.screenshot(session).await.unwrap();
         assert!(matches!(
@@ -1339,14 +1678,42 @@ mod tests {
         ));
 
         runtime
-            .click(session, BrowserSelector::new("#press").unwrap())
+            .perform(
+                session,
+                observation.observation_id,
+                press.node_ref,
+                BrowserAction::Click,
+            )
             .await
             .unwrap();
+
+        assert!(matches!(
+            runtime
+                .perform(
+                    session,
+                    observation.observation_id,
+                    press.node_ref,
+                    BrowserAction::Click,
+                )
+                .await,
+            Err(BrowserError::StaleObservation { .. })
+        ));
+
+        let refreshed = runtime
+            .observe(session, BrowserObserveOptions::default())
+            .await
+            .unwrap();
+        let field = refreshed
+            .nodes
+            .iter()
+            .find(|node| node.tag_name == "input")
+            .expect("input must be observable");
         runtime
-            .type_text(
+            .perform(
                 session,
-                BrowserTypeRequest {
-                    selector: BrowserSelector::new("#field").unwrap(),
+                refreshed.observation_id,
+                field.node_ref,
+                BrowserAction::Type {
                     text: "OpenTopia".to_string(),
                     clear_first: true,
                 },

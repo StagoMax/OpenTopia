@@ -56,12 +56,6 @@ contextBridge.exposeInMainWorld("opentopia", {
     ipcRenderer.invoke("secrets:set-provider-key", providerId, value),
   deleteProviderApiKey: (providerId) =>
     ipcRenderer.invoke("secrets:delete-provider-key", providerId),
-  getWebSearchApiKeyMetadata: () =>
-    ipcRenderer.invoke("secrets:get-web-search-key-metadata"),
-  setWebSearchApiKey: (value) =>
-    ipcRenderer.invoke("secrets:set-web-search-key", value),
-  deleteWebSearchApiKey: () =>
-    ipcRenderer.invoke("secrets:delete-web-search-key"),
   listLogFiles: () => ipcRenderer.invoke("logs:list"),
   readLogFile: (path, offset, limit) =>
     ipcRenderer.invoke("logs:read", path, offset, limit),

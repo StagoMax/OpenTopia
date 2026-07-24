@@ -5,15 +5,16 @@
 //! Electron's `WebContentsView` to operate on the same session.
 
 use crate::{
-    BrowserDownloadRequest, BrowserError, BrowserNavigateRequest, BrowserOutput, BrowserRuntime,
-    BrowserSelector, BrowserSessionId, BrowserTypeRequest, BrowserWaitCondition,
+    BrowserAction, BrowserActionReceipt, BrowserDownloadRequest, BrowserError,
+    BrowserNavigateRequest, BrowserNode, BrowserNodeRef, BrowserObservation, BrowserObservationId,
+    BrowserObserveOptions, BrowserOutput, BrowserRuntime, BrowserSessionId, BrowserWaitCondition,
     BrowserWaitRequest,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH};
 use reqwest::{redirect, Client, Response, Url};
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -128,7 +129,10 @@ impl DesktopBrowserRuntime {
         Ok(())
     }
 
-    async fn execute(&self, request: BrokerRequest) -> Result<BrowserOutput, BrowserError> {
+    async fn execute<T: DeserializeOwned>(
+        &self,
+        request: BrokerRequest,
+    ) -> Result<T, BrowserError> {
         let endpoint = self.endpoint("v1/browser")?;
         let request = self
             .client
@@ -187,50 +191,90 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             selector,
             text,
             wait,
+            observation_id: None,
+            node_ref: None,
+            operation: None,
+            clear_first: None,
+            include_screenshot: None,
         })
         .await
     }
 
-    async fn snapshot(&self, session: BrowserSessionId) -> Result<BrowserOutput, BrowserError> {
-        self.execute(BrokerRequest::new(session, BrokerAction::Snapshot))
-            .await
+    async fn observe(
+        &self,
+        session: BrowserSessionId,
+        options: BrowserObserveOptions,
+    ) -> Result<BrowserObservation, BrowserError> {
+        self.execute(BrokerRequest {
+            session_id: session,
+            action: BrokerAction::Observe,
+            url: None,
+            selector: None,
+            text: None,
+            wait: None,
+            observation_id: None,
+            node_ref: None,
+            operation: None,
+            clear_first: None,
+            include_screenshot: Some(options.include_screenshot),
+        })
+        .await
+    }
+
+    async fn observation_node(
+        &self,
+        session: BrowserSessionId,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+    ) -> Result<BrowserNode, BrowserError> {
+        self.execute(BrokerRequest {
+            session_id: session,
+            action: BrokerAction::ObservationNode,
+            url: None,
+            selector: None,
+            text: None,
+            wait: None,
+            observation_id: Some(observation_id),
+            node_ref: Some(node_ref),
+            operation: None,
+            clear_first: None,
+            include_screenshot: None,
+        })
+        .await
+    }
+
+    async fn perform(
+        &self,
+        session: BrowserSessionId,
+        observation_id: BrowserObservationId,
+        node_ref: BrowserNodeRef,
+        action: BrowserAction,
+    ) -> Result<BrowserActionReceipt, BrowserError> {
+        let (operation, text, clear_first) = match action {
+            BrowserAction::Click => (BrokerOperation::Click, None, None),
+            BrowserAction::Type { text, clear_first } => {
+                (BrokerOperation::Type, Some(text), Some(clear_first))
+            }
+        };
+        self.execute(BrokerRequest {
+            session_id: session,
+            action: BrokerAction::Perform,
+            url: None,
+            selector: None,
+            text,
+            wait: None,
+            observation_id: Some(observation_id),
+            node_ref: Some(node_ref),
+            operation: Some(operation),
+            clear_first,
+            include_screenshot: None,
+        })
+        .await
     }
 
     async fn screenshot(&self, session: BrowserSessionId) -> Result<BrowserOutput, BrowserError> {
         self.execute(BrokerRequest::new(session, BrokerAction::Screenshot))
             .await
-    }
-
-    async fn click(
-        &self,
-        session: BrowserSessionId,
-        selector: BrowserSelector,
-    ) -> Result<BrowserOutput, BrowserError> {
-        self.execute(BrokerRequest {
-            session_id: session,
-            action: BrokerAction::Click,
-            url: None,
-            selector: Some(selector.as_str().to_string()),
-            text: None,
-            wait: None,
-        })
-        .await
-    }
-
-    async fn type_text(
-        &self,
-        session: BrowserSessionId,
-        request: BrowserTypeRequest,
-    ) -> Result<BrowserOutput, BrowserError> {
-        self.execute(BrokerRequest {
-            session_id: session,
-            action: BrokerAction::Type,
-            url: None,
-            selector: Some(request.selector.as_str().to_string()),
-            text: Some(request.text),
-            wait: None,
-        })
-        .await
     }
 
     async fn wait(
@@ -246,6 +290,11 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             selector,
             text,
             wait,
+            observation_id: None,
+            node_ref: None,
+            operation: None,
+            clear_first: None,
+            include_screenshot: None,
         })
         .await
     }
@@ -266,12 +315,17 @@ impl BrowserRuntime for DesktopBrowserRuntime {
                 timeout_ms: Some(duration_millis(timeout)),
                 poll_interval_ms: None,
             }),
+            observation_id: None,
+            node_ref: None,
+            operation: None,
+            clear_first: None,
+            include_screenshot: None,
         })
         .await
     }
 
     async fn close_session(&self, session: BrowserSessionId) -> Result<(), BrowserError> {
-        self.execute(BrokerRequest::new(session, BrokerAction::Close))
+        self.execute::<BrowserOutput>(BrokerRequest::new(session, BrokerAction::Close))
             .await?;
         Ok(())
     }
@@ -281,13 +335,20 @@ impl BrowserRuntime for DesktopBrowserRuntime {
 #[serde(rename_all = "snake_case")]
 enum BrokerAction {
     Navigate,
-    Snapshot,
+    Observe,
+    ObservationNode,
     Screenshot,
-    Click,
-    Type,
+    Perform,
     Wait,
     Download,
     Close,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BrokerOperation {
+    Click,
+    Type,
 }
 
 #[derive(Serialize)]
@@ -303,6 +364,16 @@ struct BrokerRequest {
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wait: Option<BrokerWait>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation_id: Option<BrowserObservationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_ref: Option<BrowserNodeRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<BrokerOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clear_first: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_screenshot: Option<bool>,
 }
 
 impl BrokerRequest {
@@ -314,6 +385,11 @@ impl BrokerRequest {
             selector: None,
             text: None,
             wait: None,
+            observation_id: None,
+            node_ref: None,
+            operation: None,
+            clear_first: None,
+            include_screenshot: None,
         }
     }
 }
@@ -469,6 +545,7 @@ fn sanitize_error_message(body: &[u8], token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BrowserSelector;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -637,7 +714,10 @@ mod tests {
         let (base_url, _) = spawn_broker(403, body, Duration::ZERO).await;
         let runtime = DesktopBrowserRuntime::new(&base_url, token).unwrap();
 
-        let error = runtime.snapshot(BrowserSessionId::new()).await.unwrap_err();
+        let error = runtime
+            .observe(BrowserSessionId::new(), BrowserObserveOptions::default())
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             BrowserError::BrokerRejected { status: 403, ref message }
@@ -656,7 +736,9 @@ mod tests {
         let runtime = DesktopBrowserRuntime::with_config(&base_url, "token", config).unwrap();
 
         assert!(matches!(
-            runtime.snapshot(BrowserSessionId::new()).await,
+            runtime
+                .observe(BrowserSessionId::new(), BrowserObserveOptions::default())
+                .await,
             Err(BrowserError::BrokerResponseTooLarge {
                 actual: 512,
                 maximum: 128
@@ -674,7 +756,9 @@ mod tests {
         let runtime = DesktopBrowserRuntime::with_config(&base_url, "token", config).unwrap();
 
         assert!(matches!(
-            runtime.snapshot(BrowserSessionId::new()).await,
+            runtime
+                .observe(BrowserSessionId::new(), BrowserObserveOptions::default())
+                .await,
             Err(BrowserError::Timeout(_))
         ));
     }

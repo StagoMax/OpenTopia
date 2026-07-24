@@ -6,7 +6,6 @@ import type {
   PluginDirectoryPickResult,
   RecentWorkspace,
   SecretSources,
-  WebSearchKeyringMetadata,
   SystemNotificationOptions,
   WorkspacePickResult,
 } from "./types";
@@ -23,16 +22,6 @@ const unavailableKeyring = {
   envTarget: "OPENTOPIA_API_KEY",
   status: "unavailable",
 };
-const unavailableWebSearchKeyring: WebSearchKeyringMetadata = {
-  available: false,
-  encryptionAvailable: false,
-  storageBackend: null,
-  apiKeyConfigured: false,
-  apiKeySourceId: "keyring:web-search-api-key",
-  envTarget: "OPENTOPIA_WEB_SEARCH_API_KEY",
-  status: "unavailable",
-};
-
 export async function loadPlatformInfo(): Promise<PlatformInfo> {
   const info = window.opentopia
     ? await window.opentopia.getPlatformInfo()
@@ -162,7 +151,6 @@ export async function listSecretSources(): Promise<SecretSources> {
   return {
     activeProviderKeySource: null,
     keyring: unavailableKeyring,
-    webSearchKeyring: unavailableWebSearchKeyring,
     sources: [],
     notes: ["Secret metadata is available only in the desktop app."],
   };
@@ -201,29 +189,6 @@ export async function deleteProviderApiKey(
     return window.opentopia.deleteProviderApiKey(providerId);
   }
   throw new Error("Provider credential storage is not available in web mode");
-}
-
-export async function getWebSearchApiKeyMetadata(): Promise<WebSearchKeyringMetadata> {
-  if (window.opentopia?.getWebSearchApiKeyMetadata) {
-    return window.opentopia.getWebSearchApiKeyMetadata();
-  }
-  throw new Error("Web search credential storage is not available in web mode");
-}
-
-export async function setWebSearchApiKey(
-  value: string,
-): Promise<WebSearchKeyringMetadata> {
-  if (window.opentopia?.setWebSearchApiKey) {
-    return window.opentopia.setWebSearchApiKey(value);
-  }
-  throw new Error("Web search credential storage is not available in web mode");
-}
-
-export async function deleteWebSearchApiKey(): Promise<WebSearchKeyringMetadata> {
-  if (window.opentopia?.deleteWebSearchApiKey) {
-    return window.opentopia.deleteWebSearchApiKey();
-  }
-  throw new Error("Web search credential storage is not available in web mode");
 }
 
 export async function listLogFiles(): Promise<LogFileInfo[]> {

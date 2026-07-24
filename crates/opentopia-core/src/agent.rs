@@ -10,7 +10,8 @@ use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
     AgentEventPayload, ApprovalStatus, CollaborationMode, GoalRecord, Message, MessageRole,
-    ModelContentPart, TaskPlan, TaskPlanStepStatus, ToolCall, ToolResult,
+    ModelContentPart, TaskPlan, TaskPlanStepStatus, ToolCall, ToolResult, UserInputRequest,
+    UserInputResponse,
 };
 use crate::model_context::{
     CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
@@ -18,13 +19,15 @@ use crate::model_context::{
 };
 use crate::policy::{approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode};
 use crate::provider::{
-    redact_model_observation, IncompleteReason, MockProvider, ModelConversationMessage,
-    ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider, OpenAiResponsesProvider,
+    redact_model_observation, CodexAppServerProvider, IncompleteReason, MockProvider,
+    ModelConversationMessage, ModelConversationRole, ModelDecision, ModelProvider, ModelRequest,
+    ModelResponse, ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider, OpenAiResponsesProvider,
     ProviderToolCall, ProviderToolCandidate, ProviderToolResult, ProviderTransportEvent,
 };
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
-use crate::settings::{AppSettings, ProviderKind, RolloutBudgetSettings, WebSearchMode};
+use crate::settings::{AppSettings, ProviderKind, RolloutBudgetSettings};
+use crate::skill_authoring::skill_target_path;
+use crate::skills::SkillScope;
 use crate::store::SessionStore;
 use crate::subagents::{SubagentScheduler, SubagentScope};
 use crate::tools::{
@@ -71,11 +74,21 @@ pub struct ProviderConversationCursor {
 #[derive(Debug, Clone)]
 pub enum AgentTurnOutcome {
     Completed,
+    Partial {
+        reason: String,
+    },
+    Blocked {
+        reason: String,
+    },
     Stopped {
         reason: String,
     },
     Suspended {
         approval_id: Uuid,
+        continuation: AgentContinuation,
+    },
+    AwaitingInput {
+        request: UserInputRequest,
         continuation: AgentContinuation,
     },
 }
@@ -348,14 +361,15 @@ impl AgentCore {
 
     pub fn from_settings(settings: &AppSettings) -> Self {
         let active = settings.active_provider();
-        let native_web_search = settings.web_search.mode == WebSearchMode::ProviderNative;
         let provider: Arc<dyn ModelProvider> = match active.kind {
             ProviderKind::Mock => Arc::new(MockProvider),
             ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(active)
                 .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
                 .unwrap_or_else(|| Arc::new(MockProvider)),
             ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(active)
-                .map(|provider| provider.with_native_web_search(native_web_search))
+                .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
+            ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(active)
                 .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
                 .unwrap_or_else(|| Arc::new(MockProvider)),
         };
@@ -367,13 +381,14 @@ impl AgentCore {
             ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(active)
                 .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
                 .unwrap_or_else(|| Arc::new(MockProvider)),
+            ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(active)
+                .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
         };
-        let mut tools = ToolRegistry::with_builtins();
-        tools.configure_web_search(&settings.web_search);
         Self {
             guardian: GuardianReviewSessionManager::new(guardian_provider),
             provider,
-            tools,
+            tools: ToolRegistry::with_builtins(),
             mcp_host: None,
             sandbox_config: settings.sandbox.to_local_sandbox_config(),
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
@@ -503,7 +518,8 @@ impl AgentCore {
                     r#"[Plan collaboration mode]
 You are planning goal {goal_id}: {objective}
 Investigate the workspace using only the tools exposed by the runtime. This mode is strictly read-only: do not execute commands, change files, open interactive browser sessions, or delegate work.
-When you have enough evidence, call set_plan exactly once with goal_id "{goal_id}", the current expected_revision, a complete dependency-aware DAG, and measurable acceptance criteria. Keep every step pending. Do not perform any step from the plan. Your final response should summarize the proposed plan and important risks or decisions."#,
+Before creating the plan, identify any unresolved choice that would materially change architecture, scope, product behavior, dependencies, or risk. If the user has not already made those choices, call request_user_input with one to three concise questions and concrete trade-off descriptions. Do not ask those questions in ordinary assistant text, do not invent a preference, and do not ask about trivial implementation details. After the user's structured answers return, continue investigating if needed.
+When the material decisions are resolved, call set_plan exactly once with goal_id "{goal_id}", the current expected_revision, a complete dependency-aware DAG, and measurable acceptance criteria. Keep every step pending. Do not perform any step from the plan. Your final response should summarize the proposed plan and important risks or decisions."#,
                     goal_id = goal.id,
                     objective = goal.objective,
                 ),
@@ -533,6 +549,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 "git_diff",
                 "list_skills",
                 "read_skill",
+                "request_user_input",
                 "set_plan",
             ]
             .into_iter()
@@ -550,14 +567,15 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
 
     pub fn set_provider_from_settings(&mut self, settings: &AppSettings) {
         let active = settings.active_provider();
-        let native_web_search = settings.web_search.mode == WebSearchMode::ProviderNative;
         let provider: Arc<dyn ModelProvider> = match active.kind {
             ProviderKind::Mock => Arc::new(MockProvider),
             ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(active)
                 .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
                 .unwrap_or_else(|| Arc::new(MockProvider)),
             ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(active)
-                .map(|provider| provider.with_native_web_search(native_web_search))
+                .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
+            ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(active)
                 .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
                 .unwrap_or_else(|| Arc::new(MockProvider)),
         };
@@ -569,10 +587,12 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(active)
                 .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
                 .unwrap_or_else(|| Arc::new(MockProvider)),
+            ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(active)
+                .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+                .unwrap_or_else(|| Arc::new(MockProvider)),
         };
         self.provider = provider;
         self.guardian = GuardianReviewSessionManager::new(guardian_provider);
-        self.tools.configure_web_search(&settings.web_search);
         self.rollout_budget_settings = active.rollout_budget.clone();
     }
 
@@ -1022,6 +1042,12 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                         )
                         .await;
                 }
+                let outcome = finalization_outcome(
+                    input.store.as_ref(),
+                    input.thread_id,
+                    &events,
+                    &provider_tool_results,
+                )?;
                 return Ok(finalize_provider_turn(
                     input.thread_id,
                     response,
@@ -1029,6 +1055,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     budget,
                     events,
                     provider_compatibility_hash,
+                    outcome,
                 ));
             }
             ModelDecision::Act(_) => {}
@@ -1164,6 +1191,95 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         }
     }
 
+    pub async fn resume_turn_with_user_input_streaming(
+        &self,
+        continuation: AgentContinuation,
+        request_id: Uuid,
+        response: UserInputResponse,
+        store: Option<Arc<dyn SessionStore>>,
+        cancellation: Option<CancellationToken>,
+        sender: Option<AgentEventSender>,
+    ) -> anyhow::Result<AgentTurnResult> {
+        let mut events = TurnEvents::new(sender);
+        events.push(AgentEventPayload::TurnStarted {
+            user_message_id: continuation.user_message_id,
+        });
+
+        match continuation.state {
+            AgentContinuationState::Provider {
+                model_user_message,
+                model_user_content,
+                tool_candidates,
+                provider_tool_calls,
+                mut provider_tool_results,
+                pending_tool_calls,
+                compacted_tool_history,
+                provider_response_items,
+                model_rounds,
+                rollout_reviews,
+                branch_developer_instructions,
+                provider_compatibility_hash,
+            } => {
+                let request_id_text = request_id.to_string();
+                let result = provider_tool_results
+                    .iter_mut()
+                    .rev()
+                    .find(|result| {
+                        result
+                            .metadata
+                            .get("userInputRequest")
+                            .and_then(|value| value.get("requestId"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == request_id_text)
+                    })
+                    .context("user input continuation does not contain the matching request")?;
+                let response_value = serde_json::to_value(&response)?;
+                result.output = serde_json::to_string_pretty(&response_value)?;
+                result.content = vec![ModelContentPart::json(response_value.clone())];
+                result.is_error = false;
+                if let Some(metadata) = result.metadata.as_object_mut() {
+                    metadata.insert("userInputResponse".to_string(), response_value);
+                    metadata.insert("waitingForUserInput".to_string(), json!(false));
+                }
+
+                let mut context_budget = continuation.context_budget;
+                let rollout_budget = continuation.rollout_budget;
+                if let Some(ref mut budget) = context_budget {
+                    budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
+                }
+
+                self.continue_provider_turn(
+                    continuation.thread_id,
+                    continuation.user_message_id,
+                    continuation.workspace_root,
+                    continuation.context_summary,
+                    continuation.conversation,
+                    continuation.permission_mode,
+                    context_budget,
+                    rollout_budget,
+                    model_rounds,
+                    rollout_reviews,
+                    continuation.model_context,
+                    store,
+                    cancellation,
+                    model_user_message,
+                    model_user_content,
+                    tool_candidates,
+                    provider_tool_calls,
+                    provider_tool_results,
+                    pending_tool_calls,
+                    compacted_tool_history,
+                    provider_response_items,
+                    branch_developer_instructions,
+                    provider_compatibility_hash,
+                    None,
+                    &mut events,
+                )
+                .await
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn continue_provider_turn(
         &self,
@@ -1223,11 +1339,59 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     .await
                 {
                     Ok(result) => {
+                        let user_input_request = result
+                            .metadata
+                            .get("userInputRequest")
+                            .cloned()
+                            .map(serde_json::from_value::<UserInputRequest>)
+                            .transpose()?;
                         if let Some(ref mut budget) = budget {
                             budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
                         }
                         provider_tool_results.push(result);
                         pending_tool_calls.remove(0);
+                        if let Some(request) = user_input_request {
+                            events.push(AgentEventPayload::UserInputRequested {
+                                request: request.clone(),
+                            });
+                            events.push(AgentEventPayload::TurnAwaitingInput {
+                                request_id: request.request_id,
+                            });
+                            return Ok(AgentTurnResult {
+                                events: std::mem::replace(events, TurnEvents::new(None)).into_vec(),
+                                outcome: AgentTurnOutcome::AwaitingInput {
+                                    request,
+                                    continuation: AgentContinuation {
+                                        thread_id,
+                                        user_message_id,
+                                        workspace_root,
+                                        context_summary,
+                                        conversation,
+                                        permission_mode,
+                                        context_budget: budget,
+                                        rollout_budget,
+                                        model_context,
+                                        collaboration_mode: self.collaboration_mode,
+                                        goal: self.goal.clone(),
+                                        state: AgentContinuationState::Provider {
+                                            model_user_message,
+                                            model_user_content,
+                                            tool_candidates,
+                                            provider_tool_calls,
+                                            provider_tool_results,
+                                            pending_tool_calls,
+                                            compacted_tool_history,
+                                            provider_response_items,
+                                            model_rounds,
+                                            rollout_reviews,
+                                            branch_developer_instructions,
+                                            provider_compatibility_hash,
+                                        },
+                                    },
+                                },
+                                provider_cursor: None,
+                            });
+                        }
                     }
                     Err(err) if approval_required(&err).is_some() => {
                         let reason = approval_required(&err)
@@ -1542,6 +1706,12 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                         completion_guard_delivery = intervention.agent_delivery;
                         continue;
                     }
+                    let outcome = finalization_outcome(
+                        store.as_ref(),
+                        thread_id,
+                        events,
+                        &provider_tool_results,
+                    )?;
                     return Ok(finalize_provider_turn(
                         thread_id,
                         response,
@@ -1549,6 +1719,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                         budget,
                         std::mem::replace(events, TurnEvents::new(None)),
                         provider_compatibility_hash,
+                        outcome,
                     ));
                 }
                 ModelDecision::Act(tool_calls) => {
@@ -1819,7 +1990,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
         let is_plan_control = matches!(
             name.as_str(),
-            "set_plan" | "update_plan" | "get_goal" | "complete_task"
+            "set_plan" | "update_plan" | "get_goal" | "complete_task" | "request_user_input"
         );
         if !is_plan_control
             && current_task_plan
@@ -1979,6 +2150,7 @@ fn finalize_provider_turn(
     mut budget: Option<ContextBudget>,
     mut events: TurnEvents,
     provider_compatibility_hash: String,
+    outcome: AgentTurnOutcome,
 ) -> AgentTurnResult {
     if let Some(ref mut budget) = budget {
         for warning in &budget.warnings {
@@ -2002,15 +2174,23 @@ fn finalize_provider_turn(
         message: assistant_message,
     });
     events.push(AgentEventPayload::TurnFinished {
-        summary: if provider_tool_results.is_empty() {
-            "Provider agent turn completed.".to_string()
-        } else {
-            "Provider tool loop completed.".to_string()
+        summary: match &outcome {
+            AgentTurnOutcome::Completed if provider_tool_results.is_empty() => {
+                "Provider agent turn completed.".to_string()
+            }
+            AgentTurnOutcome::Completed => "Provider tool loop completed.".to_string(),
+            AgentTurnOutcome::Partial { reason } => {
+                format!("Provider turn ended with partial completion: {reason}")
+            }
+            AgentTurnOutcome::Blocked { reason } => {
+                format!("Provider turn ended blocked: {reason}")
+            }
+            _ => unreachable!("provider finalization only emits terminal completion outcomes"),
         },
     });
     AgentTurnResult {
         events: events.into_vec(),
-        outcome: AgentTurnOutcome::Completed,
+        outcome,
         provider_cursor,
     }
 }
@@ -2057,6 +2237,80 @@ fn incomplete_model_response(reason: IncompleteReason, response: &ModelResponse)
         response.text.chars().count(),
         response.tool_calls.len()
     )
+}
+
+fn finalization_outcome(
+    store: Option<&Arc<dyn SessionStore>>,
+    thread_id: Uuid,
+    events: &TurnEvents,
+    provider_tool_results: &[ProviderToolResult],
+) -> anyhow::Result<AgentTurnOutcome> {
+    let plan = if let Some(plan) = latest_task_plan(events, provider_tool_results) {
+        Some(plan)
+    } else if let Some(store) = store {
+        latest_task_plan_from_store(store, thread_id)?
+    } else {
+        None
+    };
+
+    let describe_steps = |statuses: &[TaskPlanStepStatus]| {
+        plan.as_ref()
+            .into_iter()
+            .flat_map(|plan| plan.steps.iter())
+            .filter(|step| statuses.contains(&step.status))
+            .map(|step| match step.status_reason.as_deref() {
+                Some(reason) => format!("{} ({reason})", step.title),
+                None => step.title.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let blocked_steps = describe_steps(&[TaskPlanStepStatus::Blocked]);
+    if !blocked_steps.is_empty() {
+        return Ok(AgentTurnOutcome::Blocked {
+            reason: format!("blocked plan steps: {}", blocked_steps.join("; ")),
+        });
+    }
+
+    let resolved_without_completion =
+        describe_steps(&[TaskPlanStepStatus::Deferred, TaskPlanStepStatus::Cancelled]);
+    let current_scope_complete = provider_tool_results
+        .iter()
+        .rev()
+        .find_map(|result| {
+            result
+                .metadata
+                .get("currentScopeComplete")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false);
+    let remaining_work = provider_tool_results
+        .iter()
+        .filter_map(|result| result.metadata.pointer("/taskCompletion/remainingWork"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if (!current_scope_complete && !resolved_without_completion.is_empty())
+        || !remaining_work.is_empty()
+    {
+        let mut reasons = Vec::new();
+        if !current_scope_complete && !resolved_without_completion.is_empty() {
+            reasons.push(format!(
+                "steps resolved without completion: {}",
+                resolved_without_completion.join("; ")
+            ));
+        }
+        if !remaining_work.is_empty() {
+            reasons.push(format!("remaining work: {}", remaining_work.join("; ")));
+        }
+        return Ok(AgentTurnOutcome::Partial {
+            reason: reasons.join("; "),
+        });
+    }
+
+    Ok(AgentTurnOutcome::Completed)
 }
 
 fn latest_task_plan(
@@ -2619,6 +2873,19 @@ fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
                 .unwrap_or("");
             format!("/write {}\n{}", path, content)
         }
+        "create_skill" => {
+            let scope = call
+                .arguments
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            let name = call
+                .arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("skill");
+            format!("/create-skill {scope} {name}")
+        }
         "shell" => format!(
             "/run {}",
             call.arguments
@@ -2684,6 +2951,18 @@ fn approved_sandbox_config_for_call(
         "write_file" => {
             if let Some(path) = path("path") {
                 config.grant_write_path(path);
+            }
+        }
+        "create_skill" => {
+            let scope = match call.arguments.get("scope").and_then(Value::as_str) {
+                Some("workspace") => SkillScope::Workspace,
+                _ => SkillScope::User,
+            };
+            if let Some(name) = call.arguments.get("name").and_then(Value::as_str) {
+                let workspace = (scope == SkillScope::Workspace).then_some(workspace_root);
+                if let Ok(target) = skill_target_path(scope, workspace, name) {
+                    config.grant_write_path(target);
+                }
             }
         }
         "spreadsheet" => {
@@ -2798,10 +3077,12 @@ mod tests {
         assert!(tools.contains("read_file"));
         assert!(tools.contains("search"));
         assert!(tools.contains("git_diff"));
+        assert!(tools.contains("request_user_input"));
         assert!(tools.contains("set_plan"));
         assert!(!tools.contains("shell"));
         assert!(!tools.contains("write_file"));
         assert!(!tools.contains("apply_patch"));
+        assert!(!tools.contains("create_skill"));
         assert!(!tools.contains("browser"));
         assert!(!tools.contains("computer"));
         assert!(!tools.contains("spawn_agent"));
@@ -2861,6 +3142,137 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_suspends_for_structured_input_and_resumes_with_the_answer() {
+        let thread_id = Uuid::new_v4();
+        let goal = GoalRecord::new(
+            thread_id,
+            "Choose and plan a persistence architecture",
+            crate::model::GoalStatus::Draft,
+            None,
+        );
+        let goal_id = goal.id;
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "ask_storage".to_string(),
+                    name: "request_user_input".to_string(),
+                    arguments: json!({
+                        "questions": [{
+                            "id": "storage",
+                            "header": "Storage",
+                            "question": "Which persistence strategy should the plan use?",
+                            "options": [
+                                {
+                                    "id": "sqlite",
+                                    "label": "SQLite",
+                                    "description": "Persist across restarts.",
+                                    "recommended": true
+                                },
+                                {
+                                    "id": "memory",
+                                    "label": "In memory",
+                                    "description": "Keep state only for the process lifetime."
+                                }
+                            ]
+                        }]
+                    }),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "set_plan_after_answer".to_string(),
+                    name: "set_plan".to_string(),
+                    arguments: json!({
+                        "goal_id": goal_id,
+                        "expected_revision": 0,
+                        "change_reason": "Use the selected SQLite strategy",
+                        "steps": [{
+                            "id": "implement",
+                            "title": "Implement SQLite persistence",
+                            "dependencies": [],
+                            "acceptance_criteria": ["Persistence survives restart"]
+                        }]
+                    }),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            },
+            ModelResponse::text("The plan uses SQLite as selected."),
+        ]));
+        let workspace = test_workspace("plan-user-input");
+        let mut agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+        agent
+            .apply_collaboration_mode(CollaborationMode::Plan, Some(goal))
+            .expect("apply plan mode");
+
+        let initial = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id,
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Plan the persistence architecture.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    provider_cursor: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("initial plan turn");
+        let (request, continuation) = match initial.outcome {
+            AgentTurnOutcome::AwaitingInput {
+                request,
+                continuation,
+            } => (request, continuation),
+            other => panic!("expected user input suspension, got {other:?}"),
+        };
+        assert_eq!(request.questions[0].id, "storage");
+
+        let resumed = agent
+            .resume_turn_with_user_input_streaming(
+                continuation,
+                request.request_id,
+                UserInputResponse {
+                    answers: vec![crate::model::UserInputAnswer {
+                        question_id: "storage".to_string(),
+                        option_id: Some("sqlite".to_string()),
+                        custom_text: None,
+                    }],
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("resume plan turn");
+        assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
+        assert!(resumed
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEventPayload::PlanUpdated { .. })));
+        let requests = provider.requests();
+        assert!(requests[1].tool_results.iter().any(|result| {
+            result.name == "request_user_input" && result.output.contains("sqlite")
+        }));
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     struct BlockingSubagentExecutor;
@@ -3415,6 +3827,59 @@ mod tests {
         let _ = fs::remove_dir_all(workspace);
     }
 
+    #[test]
+    fn finalization_outcome_distinguishes_blocked_and_partial_completion() {
+        let thread_id = Uuid::new_v4();
+        let blocked_plan: TaskPlan = serde_json::from_value(json!({
+            "planRevision": 1,
+            "goalId": "terminal-outcomes",
+            "steps": [{
+                "id": "blocked-step",
+                "title": "Publish the result",
+                "status": "blocked",
+                "statusReason": "Required credentials are unavailable",
+                "dependencies": [],
+                "acceptanceCriteria": ["The result is published"],
+                "evidence": []
+            }]
+        }))
+        .unwrap();
+        let mut blocked_events = TurnEvents::new(None);
+        blocked_events.push(AgentEventPayload::PlanUpdated { plan: blocked_plan });
+
+        let blocked = finalization_outcome(None, thread_id, &blocked_events, &[]).unwrap();
+        assert!(matches!(
+            blocked,
+            AgentTurnOutcome::Blocked { reason }
+                if reason.contains("Publish the result")
+                    && reason.contains("Required credentials are unavailable")
+        ));
+
+        let partial_result = ProviderToolResult {
+            call_id: "complete_partial".to_string(),
+            name: "complete_task".to_string(),
+            output: "Implemented the available scope.".to_string(),
+            content: Vec::new(),
+            is_error: false,
+            metadata: json!({
+                "success": true,
+                "taskCompletion": {
+                    "summary": "Implemented the available scope.",
+                    "verification": ["Focused tests passed"],
+                    "remainingWork": ["Publish after credentials are provided"]
+                }
+            }),
+        };
+        let partial =
+            finalization_outcome(None, thread_id, &TurnEvents::new(None), &[partial_result])
+                .unwrap();
+        assert!(matches!(
+            partial,
+            AgentTurnOutcome::Partial { reason }
+                if reason.contains("Publish after credentials are provided")
+        ));
+    }
+
     #[tokio::test]
     async fn ordinary_tools_require_an_in_progress_plan_step() {
         let workspace = test_workspace("tool-plan-step-gate");
@@ -3695,6 +4160,77 @@ mod tests {
         assert!(requests[1].tool_results[0]
             .output
             .contains("hello from provider loop"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn model_can_summarize_the_conversation_into_a_skill_tool_call() {
+        let workspace = test_workspace("create-skill-tool-loop");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_create_skill".to_string(),
+                    name: "create_skill".to_string(),
+                    arguments: json!({
+                        "name": "summarize-workflow",
+                        "description": "Summarize a completed workflow into reusable instructions. Use when the user asks to preserve the current conversation as a Skill.",
+                        "instructions": "# Summarize a workflow\n\nExtract the reusable decisions and steps from the conversation. Remove task-specific details. Preserve validation criteria and report the resulting artifact.",
+                        "scope": "workspace"
+                    }),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::Stop,
+            },
+            ModelResponse::text(
+                "Created the `summarize-workflow` project Skill with reusable workflow instructions.",
+            ),
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let events = agent
+            .run_turn(AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Summarize what we just did and create it as a project Skill.".to_string(),
+                user_content: Vec::new(),
+                context_summary: Some(
+                    "The conversation established a repeatable implementation and validation workflow."
+                        .to_string(),
+                ),
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            })
+            .await
+            .expect("turn succeeds");
+
+        let skill_file = workspace.join(".agents/skills/summarize-workflow/SKILL.md");
+        assert!(skill_file.is_file());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallStarted { call } if call.name == "create_skill"
+        )));
+        assert!(assistant_text(&events).contains("Created the `summarize-workflow`"));
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let candidate = requests[0]
+            .tool_candidates
+            .iter()
+            .find(|candidate| candidate.name == "create_skill")
+            .expect("create_skill is exposed to the model");
+        assert!(candidate.description.contains("current conversation"));
+        assert!(requests[1].tool_results[0]
+            .output
+            .contains("Created Skill `summarize-workflow`"));
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -4974,7 +5510,13 @@ mod tests {
         let continuation = match result.outcome {
             AgentTurnOutcome::Suspended { continuation, .. } => continuation,
             AgentTurnOutcome::Completed => panic!("protected write should wait for approval"),
+            AgentTurnOutcome::Partial { .. } | AgentTurnOutcome::Blocked { .. } => {
+                panic!("protected write should not reach terminal finalization")
+            }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::AwaitingInput { .. } => {
+                panic!("turn should not wait for user input")
+            }
         };
 
         let resumed = agent
@@ -5054,7 +5596,13 @@ mod tests {
         let continuation = match result.outcome {
             AgentTurnOutcome::Suspended { continuation, .. } => continuation,
             AgentTurnOutcome::Completed => panic!("external write should wait for approval"),
+            AgentTurnOutcome::Partial { .. } | AgentTurnOutcome::Blocked { .. } => {
+                panic!("external write should not reach terminal finalization")
+            }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::AwaitingInput { .. } => {
+                panic!("turn should not wait for user input")
+            }
         };
 
         let resumed = agent
@@ -5127,7 +5675,13 @@ mod tests {
         let continuation = match result.outcome {
             AgentTurnOutcome::Suspended { continuation, .. } => continuation,
             AgentTurnOutcome::Completed => panic!("sandbox denial should wait for approval"),
+            AgentTurnOutcome::Partial { .. } | AgentTurnOutcome::Blocked { .. } => {
+                panic!("sandbox denial should not reach terminal finalization")
+            }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::AwaitingInput { .. } => {
+                panic!("turn should not wait for user input")
+            }
         };
 
         let resumed = agent
@@ -5195,7 +5749,13 @@ mod tests {
         let continuation = match result.outcome {
             AgentTurnOutcome::Suspended { continuation, .. } => continuation,
             AgentTurnOutcome::Completed => panic!("turn should wait for approval"),
+            AgentTurnOutcome::Partial { .. } | AgentTurnOutcome::Blocked { .. } => {
+                panic!("approval denial should not reach terminal finalization")
+            }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::AwaitingInput { .. } => {
+                panic!("turn should not wait for user input")
+            }
         };
 
         let resumed = agent
@@ -5252,7 +5812,13 @@ mod tests {
         let continuation = match result.outcome {
             AgentTurnOutcome::Suspended { continuation, .. } => continuation,
             AgentTurnOutcome::Completed => panic!("protected write should require approval"),
+            AgentTurnOutcome::Partial { .. } | AgentTurnOutcome::Blocked { .. } => {
+                panic!("protected write should not reach terminal finalization")
+            }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::AwaitingInput { .. } => {
+                panic!("turn should not wait for user input")
+            }
         };
 
         let resumed = agent

@@ -4,7 +4,8 @@ use crate::model::{
     ArtifactStorage, ArtifactStorageMetadata, ExperienceMode, GoalAttemptStatus, GoalRecord,
     GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart,
     MessageRole, Project, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, Thread,
-    ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord, TurnStatus,
+    ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord, TurnStatus, UserInputRecord,
+    UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::provider::ModelConversationMessage;
 use crate::settings::AppSettings;
@@ -208,6 +209,29 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         approval_id: Uuid,
         thread_id: Uuid,
     ) -> anyhow::Result<()>;
+    fn put_user_input_request(
+        &self,
+        thread_id: Uuid,
+        request: &UserInputRequest,
+        continuation: Value,
+    ) -> anyhow::Result<UserInputRecord>;
+    fn get_user_input_request(&self, request_id: Uuid) -> anyhow::Result<Option<UserInputRecord>>;
+    fn list_user_input_requests(
+        &self,
+        thread_id: Uuid,
+        status: Option<UserInputStatus>,
+    ) -> anyhow::Result<Vec<UserInputRecord>>;
+    fn get_user_input_continuation(
+        &self,
+        request_id: Uuid,
+        thread_id: Uuid,
+    ) -> anyhow::Result<Option<Value>>;
+    fn resolve_user_input_request(
+        &self,
+        request_id: Uuid,
+        thread_id: Uuid,
+        response: &UserInputResponse,
+    ) -> anyhow::Result<Option<UserInputRecord>>;
 
     fn insert_large_tool_output_artifact(
         &self,
@@ -605,6 +629,18 @@ impl SqliteSessionStore {
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS user_input_requests (
+                request_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'answered')),
+                response_json TEXT,
+                continuation_json TEXT,
+                created_at TEXT NOT NULL,
+                answered_at TEXT,
+                FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS app_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 settings_json TEXT NOT NULL,
@@ -685,6 +721,9 @@ impl SqliteSessionStore {
             CREATE INDEX IF NOT EXISTS idx_approvals_thread_status_created
                 ON approvals(thread_id, status, created_at);
 
+            CREATE INDEX IF NOT EXISTS idx_user_input_thread_status_created
+                ON user_input_requests(thread_id, status, created_at);
+
             CREATE INDEX IF NOT EXISTS idx_thread_mcp_servers_thread
                 ON thread_mcp_servers(thread_id, updated_at);
 
@@ -758,8 +797,8 @@ impl SqliteSessionStore {
         if schema_version < 1 {
             backfill_thread_projects(&mut conn)?;
         }
-        if schema_version < 6 {
-            conn.execute_batch("PRAGMA user_version = 6;")?;
+        if schema_version < 7 {
+            conn.execute_batch("PRAGMA user_version = 7;")?;
         }
         let recovered_at = Utc::now().to_rfc3339();
         conn.execute(
@@ -2625,6 +2664,151 @@ impl SessionStore for SqliteSessionStore {
         )?;
         Ok(())
     }
+
+    fn put_user_input_request(
+        &self,
+        thread_id: Uuid,
+        request: &UserInputRequest,
+        continuation: Value,
+    ) -> anyhow::Result<UserInputRecord> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let created_at = Utc::now();
+        conn.execute(
+            r#"
+            INSERT INTO user_input_requests (
+                request_id, thread_id, request_json, status, response_json,
+                continuation_json, created_at, answered_at
+            ) VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?5, NULL)
+            ON CONFLICT(request_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                request_json = excluded.request_json,
+                status = 'pending',
+                response_json = NULL,
+                continuation_json = excluded.continuation_json,
+                created_at = excluded.created_at,
+                answered_at = NULL
+            "#,
+            params![
+                request.request_id.to_string(),
+                thread_id.to_string(),
+                serde_json::to_string(request)?,
+                serde_json::to_string(&continuation)?,
+                created_at.to_rfc3339(),
+            ],
+        )?;
+        touch_thread(&conn, thread_id)?;
+        Ok(UserInputRecord {
+            thread_id,
+            request: request.clone(),
+            status: UserInputStatus::Pending,
+            response: None,
+            created_at,
+            answered_at: None,
+        })
+    }
+
+    fn get_user_input_request(&self, request_id: Uuid) -> anyhow::Result<Option<UserInputRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.query_row(
+            r#"
+            SELECT request_id, thread_id, request_json, status, response_json,
+                   created_at, answered_at
+            FROM user_input_requests
+            WHERE request_id = ?1
+            "#,
+            params![request_id.to_string()],
+            map_user_input_record,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn list_user_input_requests(
+        &self,
+        thread_id: Uuid,
+        status: Option<UserInputStatus>,
+    ) -> anyhow::Result<Vec<UserInputRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let select = r#"
+            SELECT request_id, thread_id, request_json, status, response_json,
+                   created_at, answered_at
+            FROM user_input_requests
+        "#;
+        let records = if let Some(status) = status {
+            let mut stmt = conn.prepare(&format!(
+                "{select} WHERE thread_id = ?1 AND status = ?2 ORDER BY created_at ASC"
+            ))?;
+            let records = collect_rows(stmt.query_map(
+                params![thread_id.to_string(), status.as_str()],
+                map_user_input_record,
+            )?)?;
+            records
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "{select} WHERE thread_id = ?1 ORDER BY created_at ASC"
+            ))?;
+            let records = collect_rows(
+                stmt.query_map(params![thread_id.to_string()], map_user_input_record)?,
+            )?;
+            records
+        };
+        Ok(records)
+    }
+
+    fn get_user_input_continuation(
+        &self,
+        request_id: Uuid,
+        thread_id: Uuid,
+    ) -> anyhow::Result<Option<Value>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let continuation = conn
+            .query_row(
+                r#"
+                SELECT continuation_json
+                FROM user_input_requests
+                WHERE request_id = ?1 AND thread_id = ?2 AND status = 'pending'
+                "#,
+                params![request_id.to_string(), thread_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        continuation
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    fn resolve_user_input_request(
+        &self,
+        request_id: Uuid,
+        thread_id: Uuid,
+        response: &UserInputResponse,
+    ) -> anyhow::Result<Option<UserInputRecord>> {
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let tx = conn.transaction()?;
+        let answered_at = Utc::now();
+        let changed = tx.execute(
+            r#"
+            UPDATE user_input_requests
+            SET status = 'answered', response_json = ?1, continuation_json = NULL,
+                answered_at = ?2
+            WHERE request_id = ?3 AND thread_id = ?4 AND status = 'pending'
+            "#,
+            params![
+                serde_json::to_string(response)?,
+                answered_at.to_rfc3339(),
+                request_id.to_string(),
+                thread_id.to_string(),
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        touch_thread(&tx, thread_id)?;
+        tx.commit()?;
+        drop(conn);
+        self.get_user_input_request(request_id)
+    }
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
@@ -3445,6 +3629,46 @@ fn map_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
     })
 }
 
+fn map_user_input_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserInputRecord> {
+    let request_id = parse_uuid(row.get(0)?, 0)?;
+    let thread_id = parse_uuid(row.get(1)?, 1)?;
+    let request_json: String = row.get(2)?;
+    let mut request: UserInputRequest = serde_json::from_str(&request_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
+    })?;
+    request.request_id = request_id;
+    let status_value: String = row.get(3)?;
+    let status = UserInputStatus::from_str(&status_value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            )),
+        )
+    })?;
+    let response_json: Option<String> = row.get(4)?;
+    let response = response_json
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error))
+            })
+        })
+        .transpose()?;
+    let answered_at: Option<String> = row.get(6)?;
+    Ok(UserInputRecord {
+        thread_id,
+        request,
+        status,
+        response,
+        created_at: parse_datetime(row.get(5)?, 5)?,
+        answered_at: answered_at
+            .map(|value| parse_datetime(value, 6))
+            .transpose()?,
+    })
+}
+
 fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerConfig> {
     let args_json: String = row.get(3)?;
     let env_keys_json: String = row.get(5)?;
@@ -3569,6 +3793,71 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    #[test]
+    fn user_input_request_persists_continuation_and_answer() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/user-input"))
+            .expect("create thread");
+        let request = UserInputRequest {
+            request_id: Uuid::new_v4(),
+            questions: vec![crate::model::UserInputQuestion {
+                id: "architecture".to_string(),
+                header: "Architecture".to_string(),
+                question: "Which architecture should be planned?".to_string(),
+                options: vec![
+                    crate::model::UserInputOption {
+                        id: "modular".to_string(),
+                        label: "Modular".to_string(),
+                        description: "Keep explicit boundaries.".to_string(),
+                        recommended: true,
+                    },
+                    crate::model::UserInputOption {
+                        id: "minimal".to_string(),
+                        label: "Minimal".to_string(),
+                        description: "Keep the change compact.".to_string(),
+                        recommended: false,
+                    },
+                ],
+                allow_custom: true,
+            }],
+        };
+        store
+            .put_user_input_request(thread.id, &request, serde_json::json!({"resume": true}))
+            .expect("persist request");
+
+        let pending = store
+            .list_user_input_requests(thread.id, Some(UserInputStatus::Pending))
+            .expect("list pending");
+        assert_eq!(pending.len(), 1);
+        assert!(store
+            .get_user_input_continuation(request.request_id, thread.id)
+            .expect("load continuation")
+            .is_some());
+
+        let response = UserInputResponse {
+            answers: vec![crate::model::UserInputAnswer {
+                question_id: "architecture".to_string(),
+                option_id: Some("modular".to_string()),
+                custom_text: None,
+            }],
+        };
+        let answered = store
+            .resolve_user_input_request(request.request_id, thread.id, &response)
+            .expect("resolve request")
+            .expect("request exists");
+        assert_eq!(answered.status, UserInputStatus::Answered);
+        assert_eq!(answered.response, Some(response));
+        assert!(store
+            .list_user_input_requests(thread.id, Some(UserInputStatus::Pending))
+            .expect("list pending after answer")
+            .is_empty());
+        assert!(store
+            .get_user_input_continuation(request.request_id, thread.id)
+            .expect("continuation cleared")
+            .is_none());
     }
 
     #[test]

@@ -65,7 +65,6 @@ import {
   Table2,
   TerminalSquare,
   Trash2,
-  WandSparkles,
   X,
   Zap,
 } from "lucide-react";
@@ -76,10 +75,10 @@ import {
   ApprovalDialog,
   type ApprovalRequest,
 } from "./components/ApprovalDialog";
+import { PlanChoiceCard } from "./components/PlanChoiceCard";
 import { PreviewHost } from "./components/PreviewHost";
 import { RightContextRail } from "./components/RightContextRail";
 import { SettingsPanel as RedesignedSettingsPanel } from "./components/SettingsPanel";
-import { SkillCreatorDialog } from "./components/SkillCreatorDialog";
 import {
   TurnActivityTimeline,
   TurnChangeCard,
@@ -88,7 +87,6 @@ import { WebPreviewSurface } from "./components/WebPreviewSurface";
 import { ComputerPanel } from "./components/ComputerPanel";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
 import {
-  deleteWebSearchApiKey,
   deleteProviderApiKey,
   getRecentWorkspaces,
   listSecretSources,
@@ -98,7 +96,6 @@ import {
   selectPluginDirectory,
   selectWorkspace,
   setProviderApiKey,
-  setWebSearchApiKey,
   showSystemNotification,
 } from "./platform";
 import {
@@ -115,9 +112,7 @@ import type {
   CollaborationMode,
   ContextStatus,
   ContextSourceFile,
-  CreateSkillInput,
   ExperienceMode,
-  GenerateSkillInput,
   GoalSnapshot,
   GoalStatus,
   McpServerInput,
@@ -145,8 +140,9 @@ import type {
   ThreadMcpServerView,
   TurnChangeSet,
   TurnFileDiffPreview,
-  WebSearchKeyringMetadata,
   TurnUndoPreview,
+  UserInputRecord,
+  UserInputResponse,
   WorkspaceDiff,
   WorkspaceDiffHunk,
   WorkspaceDiffHunkAction,
@@ -443,7 +439,7 @@ export function App() {
   const [contextSources, setContextSources] = useState<ContextSourceFile[]>([]);
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
-  const [skillCreatorOpen, setSkillCreatorOpen] = useState(false);
+  const [skillsRevision, setSkillsRevision] = useState(0);
   const [isSending, setIsSending] = useState(false);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const [queuedMessageCount, setQueuedMessageCount] = useState(0);
@@ -455,6 +451,13 @@ export function App() {
   const [approvalDecisionError, setApprovalDecisionError] = useState<
     string | null
   >(null);
+  const [pendingUserInput, setPendingUserInput] = useState<UserInputRecord[]>(
+    [],
+  );
+  const [submittingUserInputId, setSubmittingUserInputId] = useState<
+    string | null
+  >(null);
+  const [userInputError, setUserInputError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [taskNotificationPreferences, setTaskNotificationPreferences] =
@@ -554,6 +557,7 @@ export function App() {
     [events, pendingApprovalIds],
   );
   const activeApproval = pendingApprovalQueue[0]?.payload ?? null;
+  const activeUserInput = pendingUserInput[0] ?? null;
   const composerTaskPlan = useMemo(
     () => resolveComposerTaskPlan(events, goalSnapshot),
     [events, goalSnapshot],
@@ -575,6 +579,20 @@ export function App() {
         : current,
     );
   }, [activeApproval?.approval_id]);
+
+  useEffect(() => {
+    if (!activeUserInput) return;
+    setConversationCollapsed(false);
+    setActiveToolTabId(null);
+    setActionError((current) =>
+      current &&
+      /answer the pending planning question before starting another turn/i.test(
+        current,
+      )
+        ? null
+        : current,
+    );
+  }, [activeUserInput?.request.requestId]);
 
   const workspaceLayout = useMemo(
     () =>
@@ -672,7 +690,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [client, currentWorkspaceRoot]);
+  }, [client, currentWorkspaceRoot, skillsRevision]);
 
   useEffect(() => {
     if (!client) return;
@@ -757,6 +775,29 @@ export function App() {
         );
       }
 
+      if (event.payload.type === "user_input_requested") {
+        const request = event.payload.request;
+        setUserInputError(null);
+        setConversationCollapsed(false);
+        setPendingUserInput((current) =>
+          current.some(
+            (record) => record.request.requestId === request.requestId,
+          )
+            ? current
+            : [
+                ...current,
+                {
+                  threadId: event.threadId,
+                  request,
+                  status: "pending",
+                  response: null,
+                  createdAt: event.createdAt,
+                  answeredAt: null,
+                },
+              ],
+        );
+      }
+
       if (event.payload.type === "error") {
         setActionError(
           `Agent 请求失败：${friendlyProviderError(event.payload.message)}`,
@@ -770,6 +811,7 @@ export function App() {
       } else if (
         event.payload.type === "turn_finished" ||
         event.payload.type === "turn_suspended" ||
+        event.payload.type === "turn_awaiting_input" ||
         event.payload.type === "turn_cancelled" ||
         event.payload.type === "error"
       ) {
@@ -786,6 +828,13 @@ export function App() {
       }
 
       if (event.payload.type === "tool_call_finished") {
+        if (
+          isRecord(event.payload.result.metadata) &&
+          event.payload.result.metadata.toolName === "create_skill" &&
+          event.payload.result.metadata.success !== false
+        ) {
+          setSkillsRevision((current) => current + 1);
+        }
         const refs = collectArtifactReferences(
           event.payload.result.metadata,
           event.payload.result.output,
@@ -951,6 +1000,9 @@ export function App() {
     setPendingApprovalIds([]);
     setDecidingApprovalId(null);
     setApprovalDecisionError(null);
+    setPendingUserInput([]);
+    setSubmittingUserInputId(null);
+    setUserInputError(null);
     setActiveTurnId(null);
     setCancellingTurnId(null);
     setGoalSnapshot(null);
@@ -964,6 +1016,7 @@ export function App() {
         loadedEvents,
         turnStatus,
         pendingApprovals,
+        pendingPlanningInput,
         loadedSubagents,
         loadedGoal,
       ] = await Promise.all([
@@ -971,6 +1024,7 @@ export function App() {
         client.listEvents(activeThreadId),
         client.getTurnStatus(activeThreadId),
         client.listPendingApprovals(activeThreadId),
+        client.listPendingUserInput(activeThreadId),
         client.listSubagents(activeThreadId),
         client.getGoal(activeThreadId),
       ]);
@@ -985,6 +1039,7 @@ export function App() {
       setPendingApprovalIds(
         pendingApprovals.map((approval) => approval.approvalId),
       );
+      setPendingUserInput(pendingPlanningInput);
       setSubagentRuns(loadedSubagents);
       setGoalSnapshot(loadedGoal);
       const since = loadedEvents.at(-1)?.seq;
@@ -1519,17 +1574,18 @@ export function App() {
     apiKeySource?: string;
     permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
     sandbox?: AppSettings["sandbox"];
-    webSearch?: AppSettings["webSearch"];
   }) {
-    if (!client) return;
+    if (!client) return false;
     setIsSavingSettings(true);
     try {
       const updated = await client.updateSettings(input);
       setSettings(updated);
       setProviderHealth(await client.getProviderHealth());
       if (activeThread) setSandbox(await client.getSandbox(activeThread.id));
+      return true;
     } catch (error) {
       setActionError(`保存设置失败：${errorMessage(error)}`);
+      return false;
     } finally {
       setIsSavingSettings(false);
     }
@@ -1613,34 +1669,6 @@ export function App() {
       }
       return current.length >= 5 ? current : [...current, skillId];
     });
-  }
-
-  async function generateSkillDraft(input: GenerateSkillInput) {
-    if (!client) throw new Error("服务尚未连接");
-    return client.generateSkill(input);
-  }
-
-  async function createSkill(input: CreateSkillInput) {
-    if (!client) throw new Error("服务尚未连接");
-    return client.createSkill(input);
-  }
-
-  function addCreatedSkill(skill: SkillDescriptor) {
-    setSkills((current) =>
-      [...current.filter((item) => item.id !== skill.id), skill].sort(
-        (left, right) =>
-          (left.scope === right.scope
-            ? 0
-            : left.scope === "workspace"
-              ? -1
-              : 1) || left.name.localeCompare(right.name),
-      ),
-    );
-    setSelectedSkillIds((current) =>
-      current.includes(skill.id) || current.length >= 5
-        ? current
-        : [...current, skill.id],
-    );
   }
 
   async function spawnSubagent(name: string, input: string) {
@@ -1844,7 +1872,8 @@ export function App() {
         contextSources.length === 0 &&
         selectedSkillIds.length === 0) ||
       isSending ||
-      activeApproval
+      activeApproval ||
+      activeUserInput
     )
       return;
     const directCommand = parseDirectToolCommand(composer);
@@ -1999,6 +2028,32 @@ export function App() {
       );
     } finally {
       setDecidingApprovalId(null);
+    }
+  }
+
+  async function submitUserInput(
+    requestId: string,
+    response: UserInputResponse,
+  ) {
+    if (!client || !activeThread || submittingUserInputId) return;
+    setSubmittingUserInputId(requestId);
+    setUserInputError(null);
+    try {
+      const result = await client.respondToUserInput(
+        activeThread.id,
+        requestId,
+        response,
+      );
+      if (!result.accepted || !result.resumed) {
+        throw new Error("服务端未恢复规划，请重试。");
+      }
+      setPendingUserInput((current) =>
+        current.filter((record) => record.request.requestId !== requestId),
+      );
+    } catch (error) {
+      setUserInputError(`无法提交选择：${errorMessage(error)}`);
+    } finally {
+      setSubmittingUserInputId(null);
     }
   }
 
@@ -2307,40 +2362,6 @@ export function App() {
     }
   }
 
-  async function storeWebSearchApiKey(
-    value: string,
-  ): Promise<WebSearchKeyringMetadata | null> {
-    if (isSavingSecret) return null;
-    setIsSavingSecret(true);
-    setServerError(null);
-    try {
-      const metadata = await setWebSearchApiKey(value);
-      setSecretSources(await listSecretSources());
-      return metadata;
-    } catch (error) {
-      setServerError(error instanceof Error ? error.message : String(error));
-      return null;
-    } finally {
-      setIsSavingSecret(false);
-    }
-  }
-
-  async function removeWebSearchApiKey(): Promise<WebSearchKeyringMetadata | null> {
-    if (isSavingSecret) return null;
-    setIsSavingSecret(true);
-    setServerError(null);
-    try {
-      const metadata = await deleteWebSearchApiKey();
-      setSecretSources(await listSecretSources());
-      return metadata;
-    } catch (error) {
-      setServerError(error instanceof Error ? error.message : String(error));
-      return null;
-    } finally {
-      setIsSavingSecret(false);
-    }
-  }
-
   async function testProviderConnection(
     providerId: string,
     providerDrafts?: ProviderSettings[],
@@ -2582,7 +2603,13 @@ export function App() {
           onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
         />
         <section
-          className={`center-pane ${activeApproval ? "has-approval" : ""}`}
+          className={`center-pane ${
+            activeApproval
+              ? "has-approval"
+              : activeUserInput
+                ? "has-plan-choice"
+                : ""
+          }`}
           id="workspace-center-pane"
         >
           <ThreadHeader
@@ -2663,6 +2690,21 @@ export function App() {
                     void decideApproval(activeApproval.approval_id, approved)
                   }
                 />
+              ) : activeUserInput ? (
+                <PlanChoiceCard
+                  key={activeUserInput.request.requestId}
+                  request={activeUserInput.request}
+                  isSubmitting={
+                    submittingUserInputId === activeUserInput.request.requestId
+                  }
+                  error={userInputError}
+                  onSubmit={(response) =>
+                    void submitUserInput(
+                      activeUserInput.request.requestId,
+                      response,
+                    )
+                  }
+                />
               ) : (
                 <Composer
                   value={composer}
@@ -2693,7 +2735,6 @@ export function App() {
                   onChange={setComposer}
                   onSubmit={submitMessage}
                   onCancel={() => void cancelTurn()}
-                  onOpenTool={openToolTab}
                   onPickWorkspace={() => void chooseWorkspace()}
                   onSelectProject={selectProject}
                   onChangePermissionMode={changeExecutionPreset}
@@ -2702,7 +2743,6 @@ export function App() {
                   onAddContextSources={() => void addContextSources()}
                   onRemoveContextSource={removeContextSource}
                   onToggleSkill={toggleSkill}
-                  onCreateSkill={() => setSkillCreatorOpen(true)}
                 />
               )}
             </>
@@ -2730,14 +2770,12 @@ export function App() {
               onChangeLaunchMode={setNewTaskLaunchMode}
               onPickWorkspace={() => void chooseWorkspace(true)}
               onSelectProject={selectProject}
-              onOpenTool={openToolTab}
               onChangePermissionMode={changeExecutionPreset}
               onChangeCollaborationMode={setCollaborationMode}
               onChangeSandboxMode={changeSandboxMode}
               onAddContextSources={() => void addContextSources()}
               onRemoveContextSource={removeContextSource}
               onToggleSkill={toggleSkill}
-              onCreateSkill={() => setSkillCreatorOpen(true)}
               onSubmit={() => void createThread(composer)}
             />
           )}
@@ -2860,8 +2898,6 @@ export function App() {
           }
           onStoreProviderApiKey={storeProviderApiKey}
           onDeleteProviderApiKey={removeProviderApiKey}
-          onStoreWebSearchApiKey={storeWebSearchApiKey}
-          onDeleteWebSearchApiKey={removeWebSearchApiKey}
           onNotificationPreferencesChange={setTaskNotificationPreferences}
           onTestNotification={() =>
             deliverTaskCompletionNotification(
@@ -2877,16 +2913,6 @@ export function App() {
         />
       )}
       {logViewerOpen && <LogViewer onClose={() => setLogViewerOpen(false)} />}
-      {skillCreatorOpen && (
-        <SkillCreatorDialog
-          workspaceRoot={currentWorkspaceRoot}
-          projectName={activeProject?.name ?? draftProject?.name ?? null}
-          onGenerate={generateSkillDraft}
-          onCreate={createSkill}
-          onCreated={addCreatedSkill}
-          onClose={() => setSkillCreatorOpen(false)}
-        />
-      )}
       {renameTarget && (
         <RenameDialog
           target={renameTarget}
@@ -3190,8 +3216,6 @@ function SettingsPanel({
   onTestProvider,
   onStoreProviderApiKey,
   onDeleteProviderApiKey,
-  onStoreWebSearchApiKey,
-  onDeleteWebSearchApiKey,
   onOpenLogs,
   onClose,
 }: {
@@ -3215,7 +3239,6 @@ function SettingsPanel({
     apiKeySource?: string;
     permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
     sandbox?: AppSettings["sandbox"];
-    webSearch?: AppSettings["webSearch"];
   }): void;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
   onStoreProviderApiKey(
@@ -3223,10 +3246,6 @@ function SettingsPanel({
     value: string,
   ): Promise<KeyringMetadata | null>;
   onDeleteProviderApiKey(providerId: string): Promise<KeyringMetadata | null>;
-  onStoreWebSearchApiKey(
-    value: string,
-  ): Promise<WebSearchKeyringMetadata | null>;
-  onDeleteWebSearchApiKey(): Promise<WebSearchKeyringMetadata | null>;
   onOpenLogs(): void;
   onClose(): void;
 }) {
@@ -3254,31 +3273,15 @@ function SettingsPanel({
     },
   );
   const [providerApiKey, setProviderApiKey] = useState("");
-  const [webSearch, setWebSearch] = useState<AppSettings["webSearch"]>(
-    settings?.webSearch ?? {
-      mode: "disabled",
-      endpoint: "",
-      apiKeySource: "OPENTOPIA_WEB_SEARCH_API_KEY",
-      apiKeyConfigured: false,
-      maxResults: 5,
-    },
-  );
-  const [webSearchApiKey, setWebSearchApiKey] = useState("");
 
   const editingProvider =
     providers.find((p) => p.id === editingProviderId) ?? providers[0] ?? null;
-  const activeProvider =
-    providers.find((provider) => provider.id === activeProviderId) ??
-    providers[0] ??
-    null;
-
   useEffect(() => {
     if (settings) {
       setProviders(settings.providers);
       setActiveProviderId(settings.activeProviderId);
       setPermissionMode(settings.permissionMode);
       setSandboxSettings(settings.sandbox);
-      setWebSearch(settings.webSearch);
     }
   }, [settings]);
 
@@ -3315,6 +3318,7 @@ function SettingsPanel({
         promptCachePolicy: null,
         responsesCompactionThresholdTokens: null,
         rolloutBudget: null,
+        supportsVision: true,
         apiKeySource: "OPENTOPIA_API_KEY",
         apiKeyConfigured: false,
         healthStatus: null,
@@ -3363,7 +3367,6 @@ function SettingsPanel({
               activeProviderId,
               permissionMode,
               sandbox: sandboxSettings,
-              webSearch,
             });
           }}
         >
@@ -3516,205 +3519,6 @@ function SettingsPanel({
                 OS sandbox enforcement is disabled. Commands can access the full
                 system and network allowed by the current user account.
               </p>
-            )}
-          </div>
-
-          <div className="settings-web-search-section">
-            <div className="settings-providers-header">
-              <h3>
-                <Globe2 size={16} aria-hidden="true" />
-                Web search
-              </h3>
-              <span>
-                {webSearch.mode === "disabled"
-                  ? "Off"
-                  : webSearch.mode === "provider_native"
-                    ? "Provider hosted"
-                    : "Custom API"}
-              </span>
-            </div>
-            <div
-              className="settings-web-search-modes"
-              role="radiogroup"
-              aria-label="Web search mode"
-            >
-              <label>
-                <input
-                  type="radio"
-                  name="web-search-mode"
-                  value="disabled"
-                  checked={webSearch.mode === "disabled"}
-                  onChange={() =>
-                    setWebSearch((current) => ({
-                      ...current,
-                      mode: "disabled",
-                    }))
-                  }
-                />
-                <span>Disabled</span>
-              </label>
-              <label
-                title={
-                  activeProvider?.kind === "openai_responses"
-                    ? "Use the active Responses provider hosted web_search tool"
-                    : "Select an OpenAI Responses provider first"
-                }
-              >
-                <input
-                  type="radio"
-                  name="web-search-mode"
-                  value="provider_native"
-                  checked={webSearch.mode === "provider_native"}
-                  disabled={activeProvider?.kind !== "openai_responses"}
-                  onChange={() =>
-                    setWebSearch((current) => ({
-                      ...current,
-                      mode: "provider_native",
-                    }))
-                  }
-                />
-                <span>Provider native</span>
-              </label>
-              <label>
-                <input
-                  type="radio"
-                  name="web-search-mode"
-                  value="custom_api"
-                  checked={webSearch.mode === "custom_api"}
-                  onChange={() =>
-                    setWebSearch((current) => ({
-                      ...current,
-                      mode: "custom_api",
-                    }))
-                  }
-                />
-                <span>Custom API</span>
-              </label>
-            </div>
-            {webSearch.mode === "provider_native" &&
-              activeProvider?.kind !== "openai_responses" && (
-                <p className="settings-security-warning" role="status">
-                  <AlertCircle size={14} aria-hidden="true" />
-                  Provider-native search requires an active OpenAI Responses
-                  provider.
-                </p>
-              )}
-            {webSearch.mode === "custom_api" && (
-              <div className="settings-web-search-custom">
-                <div className="settings-web-search-grid">
-                  <label>
-                    Search endpoint
-                    <input
-                      type="url"
-                      required
-                      value={webSearch.endpoint}
-                      placeholder="https://search.example.com/v1/search"
-                      title='POST {"query": string, "maxResults": number}; return {"results": [{"title": string, "url": string, "snippet": string}]}'
-                      onChange={(event) =>
-                        setWebSearch((current) => ({
-                          ...current,
-                          endpoint: event.target.value,
-                        }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    Maximum results
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      required
-                      value={webSearch.maxResults}
-                      onChange={(event) =>
-                        setWebSearch((current) => ({
-                          ...current,
-                          maxResults: Math.min(
-                            10,
-                            Math.max(1, Number(event.target.value) || 1),
-                          ),
-                        }))
-                      }
-                    />
-                  </label>
-                </div>
-                <div className="settings-provider-key-reference">
-                  Credential reference: <code>{webSearch.apiKeySource}</code>
-                </div>
-                {platform?.platform === "desktop" &&
-                  secretSources?.webSearchKeyring && (
-                    <div className="settings-secret-section">
-                      <label>
-                        Search API key
-                        <input
-                          type="password"
-                          autoComplete="off"
-                          value={webSearchApiKey}
-                          disabled={
-                            !secretSources.webSearchKeyring.encryptionAvailable
-                          }
-                          onChange={(event) =>
-                            setWebSearchApiKey(event.target.value)
-                          }
-                        />
-                      </label>
-                      <div className="settings-provider-actions">
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          disabled={
-                            isSavingSecret ||
-                            !secretSources.webSearchKeyring
-                              .encryptionAvailable ||
-                            !webSearchApiKey.trim()
-                          }
-                          onClick={() => {
-                            void onStoreWebSearchApiKey(webSearchApiKey).then(
-                              (metadata) => {
-                                if (!metadata) return;
-                                const nextWebSearch = {
-                                  ...webSearch,
-                                  apiKeySource: metadata.envTarget,
-                                  apiKeyConfigured: true,
-                                };
-                                setWebSearch(nextWebSearch);
-                                setWebSearchApiKey("");
-                                onSave({ webSearch: nextWebSearch });
-                              },
-                            );
-                          }}
-                        >
-                          Store key
-                        </button>
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          disabled={
-                            isSavingSecret || !webSearch.apiKeyConfigured
-                          }
-                          onClick={() => {
-                            void onDeleteWebSearchApiKey().then((metadata) => {
-                              if (!metadata) return;
-                              const nextWebSearch = {
-                                ...webSearch,
-                                apiKeyConfigured: false,
-                              };
-                              setWebSearch(nextWebSearch);
-                              onSave({ webSearch: nextWebSearch });
-                            });
-                          }}
-                        >
-                          Remove key
-                        </button>
-                        <span className="settings-provider-test-result">
-                          {webSearch.apiKeyConfigured
-                            ? "Encrypted in safeStorage and active"
-                            : secretSources.webSearchKeyring.status}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-              </div>
             )}
           </div>
 
@@ -5655,7 +5459,9 @@ function ComposerTaskPlan({ plan }: { plan: TaskPlan }) {
                 </span>
                 <span className="composer-plan-step-copy">
                   <span>{step.title || step.step || step.id}</span>
-                  {step.statusReason ? <small>{step.statusReason}</small> : null}
+                  {step.statusReason ? (
+                    <small>{step.statusReason}</small>
+                  ) : null}
                 </span>
                 {index === currentStepIndex ? (
                   <span className="composer-plan-step-marker">当前</span>
@@ -5704,7 +5510,6 @@ function Composer({
   onChange,
   onSubmit,
   onCancel,
-  onOpenTool,
   onPickWorkspace,
   onSelectProject,
   onChangeLaunchMode,
@@ -5714,7 +5519,6 @@ function Composer({
   onAddContextSources,
   onRemoveContextSource,
   onToggleSkill,
-  onCreateSkill,
 }: {
   value: string;
   taskPlan?: TaskPlan | null;
@@ -5737,7 +5541,6 @@ function Composer({
   onChange(value: string): void;
   onSubmit(): void;
   onCancel(): void;
-  onOpenTool(kind: ToolTabKind): void;
   onPickWorkspace(): void;
   onSelectProject(projectId: string): void;
   onChangeLaunchMode?(mode: NewTaskLaunchMode): void;
@@ -5747,17 +5550,9 @@ function Composer({
   onAddContextSources(): void;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
-  onCreateSkill(): void;
 }) {
   const [openMenu, setOpenMenu] = useState<
-    | "actions"
-    | "skills"
-    | "permission"
-    | "collaboration"
-    | "model"
-    | "workspace"
-    | "environment"
-    | null
+    "actions" | "permission" | "model" | "workspace" | "environment" | null
   >(null);
   const popoverRef = useDismissiblePopover(Boolean(openMenu), () =>
     setOpenMenu(null),
@@ -5770,575 +5565,502 @@ function Composer({
         className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""}`}
         ref={popoverRef}
       >
-      {(workspaceRoot || projectName) && (
-        <div className="composer-context">
-          <div className="composer-menu-wrap">
-            <button
-              className="composer-context-button"
-              type="button"
-              title={workspaceRoot ?? projectName ?? "项目"}
-              aria-expanded={openMenu === "workspace"}
-              onClick={() =>
-                setOpenMenu((current) =>
-                  current === "workspace" ? null : "workspace",
-                )
-              }
-            >
-              <Folder size={12} />
-              <span>{projectName ?? workspaceName(workspaceRoot ?? "")}</span>
-              <ChevronDown size={11} />
-            </button>
-            {openMenu === "workspace" && (
-              <div className="tool-popover workspace-popover" role="menu">
-                <div className="tool-popover-note">
-                  <strong>选择工作区</strong>
-                  <span>当前任务将使用所选文件夹</span>
-                </div>
-                {projects
-                  .filter((project) => project.workspaceRoot)
-                  .map((project) => (
-                    <button
-                      key={project.id}
-                      role="menuitemradio"
-                      aria-checked={project.workspaceRoot === workspaceRoot}
-                      onClick={() => {
-                        onSelectProject(project.id);
-                        setOpenMenu(null);
-                      }}
-                    >
-                      {project.workspaceRoot === workspaceRoot ? (
-                        <Check size={13} />
-                      ) : (
-                        <Folder size={13} />
-                      )}
-                      <span>{project.name}</span>
-                    </button>
-                  ))}
-                <div className="tool-popover-separator" />
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onPickWorkspace();
-                    setOpenMenu(null);
-                  }}
-                >
-                  <FolderOpen size={14} />
-                  <span>选择其他文件夹</span>
-                </button>
-              </div>
-            )}
-          </div>
-          <div className="composer-menu-wrap">
-            {launchMode && onChangeLaunchMode ? (
-              <>
-                <button
-                  className="composer-context-button"
-                  type="button"
-                  aria-label="选择启动模式"
-                  aria-expanded={openMenu === "environment"}
-                  onClick={() =>
-                    setOpenMenu((current) =>
-                      current === "environment" ? null : "environment",
-                    )
-                  }
-                >
-                  {launchMode === "local" ? (
-                    <Laptop size={12} />
-                  ) : (
-                    <GitFork size={12} />
-                  )}
-                  <span>{newTaskLaunchModeLabel(launchMode)}</span>
-                  <ChevronDown size={11} />
-                </button>
-                {openMenu === "environment" && (
-                  <div className="tool-popover launch-mode-popover" role="menu">
-                    <div className="tool-popover-note">
-                      <strong>启动模式</strong>
-                      <span>选择新任务使用的工作区方式</span>
-                    </div>
-                    <button
-                      className={launchMode === "local" ? "active" : ""}
-                      role="menuitemradio"
-                      aria-checked={launchMode === "local"}
-                      onClick={() => {
-                        onChangeLaunchMode("local");
-                        setOpenMenu(null);
-                      }}
-                    >
-                      <Laptop size={14} />
-                      <span>在本地处理</span>
-                      {launchMode === "local" && <Check size={13} />}
-                    </button>
-                    <button
-                      className={launchMode === "new_worktree" ? "active" : ""}
-                      role="menuitemradio"
-                      aria-checked={launchMode === "new_worktree"}
-                      title="线程级工作树创建尚未接入"
-                      onClick={() => {
-                        onChangeLaunchMode("new_worktree");
-                        setOpenMenu(null);
-                      }}
-                    >
-                      <GitFork size={14} />
-                      <span>新工作树</span>
-                      <small>内部未实现</small>
-                    </button>
-                    <button
-                      disabled
-                      role="menuitem"
-                      title="云端任务执行尚未实现"
-                    >
-                      <Cloud size={14} />
-                      <span>发送至云端</span>
-                      <small>未实现</small>
-                    </button>
+        {(workspaceRoot || projectName) && (
+          <div className="composer-context">
+            <div className="composer-menu-wrap">
+              <button
+                className="composer-context-button"
+                type="button"
+                title={workspaceRoot ?? projectName ?? "项目"}
+                aria-expanded={openMenu === "workspace"}
+                onClick={() =>
+                  setOpenMenu((current) =>
+                    current === "workspace" ? null : "workspace",
+                  )
+                }
+              >
+                <Folder size={12} />
+                <span>{projectName ?? workspaceName(workspaceRoot ?? "")}</span>
+                <ChevronDown size={11} />
+              </button>
+              {openMenu === "workspace" && (
+                <div className="tool-popover workspace-popover" role="menu">
+                  <div className="tool-popover-note">
+                    <strong>选择工作区</strong>
+                    <span>当前任务将使用所选文件夹</span>
                   </div>
-                )}
-              </>
-            ) : (
-              <>
-                <button
-                  className="composer-context-button"
-                  type="button"
-                  aria-expanded={openMenu === "environment"}
-                  onClick={() =>
-                    setOpenMenu((current) =>
-                      current === "environment" ? null : "environment",
-                    )
-                  }
-                >
-                  <TerminalSquare size={12} />
-                  <span>{sandboxModeLabel(sandboxMode)}</span>
-                  <ChevronDown size={11} />
-                </button>
-                {openMenu === "environment" && (
-                  <div className="tool-popover environment-popover" role="menu">
-                    {sandboxModeOptions.map((option) => (
+                  {projects
+                    .filter((project) => project.workspaceRoot)
+                    .map((project) => (
                       <button
-                        className={sandboxMode === option.value ? "active" : ""}
-                        key={option.value}
+                        key={project.id}
                         role="menuitemradio"
-                        aria-checked={sandboxMode === option.value}
+                        aria-checked={project.workspaceRoot === workspaceRoot}
                         onClick={() => {
-                          onChangeSandboxMode(option.value);
+                          onSelectProject(project.id);
                           setOpenMenu(null);
                         }}
                       >
-                        {sandboxMode === option.value ? (
+                        {project.workspaceRoot === workspaceRoot ? (
                           <Check size={13} />
                         ) : (
-                          <span className="menu-icon-spacer" />
+                          <Folder size={13} />
                         )}
-                        <span>{option.label}</span>
-                        <small>{option.detail}</small>
+                        <span>{project.name}</span>
                       </button>
                     ))}
-                    <div className="tool-popover-separator" />
-                    <button disabled title="Git 工作树创建尚未实现">
-                      <GitFork size={14} />
-                      <span>新工作树</span>
-                      <small>未实现</small>
-                    </button>
-                    <button disabled title="远程执行环境尚未实现">
-                      <Cloud size={14} />
-                      <span>云环境</span>
-                      <small>未实现</small>
-                    </button>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-          <button
-            className="composer-context-button"
-            type="button"
-            disabled
-            title="分支读取尚未实现"
-          >
-            <GitBranch size={12} />
-            <span>分支未接入</span>
-          </button>
-        </div>
-      )}
-      {(contextSources.length > 0 || selectedSkillIds.length > 0) && (
-        <div className="composer-sources" aria-label="已添加来源">
-          {contextSources.map((source) => (
-            <span
-              className="composer-source"
-              key={source.path}
-              title={source.path}
+                  <div className="tool-popover-separator" />
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      onPickWorkspace();
+                      setOpenMenu(null);
+                    }}
+                  >
+                    <FolderOpen size={14} />
+                    <span>选择其他文件夹</span>
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="composer-menu-wrap">
+              {launchMode && onChangeLaunchMode ? (
+                <>
+                  <button
+                    className="composer-context-button"
+                    type="button"
+                    aria-label="选择启动模式"
+                    aria-expanded={openMenu === "environment"}
+                    onClick={() =>
+                      setOpenMenu((current) =>
+                        current === "environment" ? null : "environment",
+                      )
+                    }
+                  >
+                    {launchMode === "local" ? (
+                      <Laptop size={12} />
+                    ) : (
+                      <GitFork size={12} />
+                    )}
+                    <span>{newTaskLaunchModeLabel(launchMode)}</span>
+                    <ChevronDown size={11} />
+                  </button>
+                  {openMenu === "environment" && (
+                    <div
+                      className="tool-popover launch-mode-popover"
+                      role="menu"
+                    >
+                      <div className="tool-popover-note">
+                        <strong>启动模式</strong>
+                        <span>选择新任务使用的工作区方式</span>
+                      </div>
+                      <button
+                        className={launchMode === "local" ? "active" : ""}
+                        role="menuitemradio"
+                        aria-checked={launchMode === "local"}
+                        onClick={() => {
+                          onChangeLaunchMode("local");
+                          setOpenMenu(null);
+                        }}
+                      >
+                        <Laptop size={14} />
+                        <span>在本地处理</span>
+                        {launchMode === "local" && <Check size={13} />}
+                      </button>
+                      <button
+                        className={
+                          launchMode === "new_worktree" ? "active" : ""
+                        }
+                        role="menuitemradio"
+                        aria-checked={launchMode === "new_worktree"}
+                        title="线程级工作树创建尚未接入"
+                        onClick={() => {
+                          onChangeLaunchMode("new_worktree");
+                          setOpenMenu(null);
+                        }}
+                      >
+                        <GitFork size={14} />
+                        <span>新工作树</span>
+                        <small>内部未实现</small>
+                      </button>
+                      <button
+                        disabled
+                        role="menuitem"
+                        title="云端任务执行尚未实现"
+                      >
+                        <Cloud size={14} />
+                        <span>发送至云端</span>
+                        <small>未实现</small>
+                      </button>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <button
+                    className="composer-context-button"
+                    type="button"
+                    aria-expanded={openMenu === "environment"}
+                    onClick={() =>
+                      setOpenMenu((current) =>
+                        current === "environment" ? null : "environment",
+                      )
+                    }
+                  >
+                    <TerminalSquare size={12} />
+                    <span>{sandboxModeLabel(sandboxMode)}</span>
+                    <ChevronDown size={11} />
+                  </button>
+                  {openMenu === "environment" && (
+                    <div
+                      className="tool-popover environment-popover"
+                      role="menu"
+                    >
+                      {sandboxModeOptions.map((option) => (
+                        <button
+                          className={
+                            sandboxMode === option.value ? "active" : ""
+                          }
+                          key={option.value}
+                          role="menuitemradio"
+                          aria-checked={sandboxMode === option.value}
+                          onClick={() => {
+                            onChangeSandboxMode(option.value);
+                            setOpenMenu(null);
+                          }}
+                        >
+                          {sandboxMode === option.value ? (
+                            <Check size={13} />
+                          ) : (
+                            <span className="menu-icon-spacer" />
+                          )}
+                          <span>{option.label}</span>
+                          <small>{option.detail}</small>
+                        </button>
+                      ))}
+                      <div className="tool-popover-separator" />
+                      <button disabled title="Git 工作树创建尚未实现">
+                        <GitFork size={14} />
+                        <span>新工作树</span>
+                        <small>未实现</small>
+                      </button>
+                      <button disabled title="远程执行环境尚未实现">
+                        <Cloud size={14} />
+                        <span>云环境</span>
+                        <small>未实现</small>
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+            <button
+              className="composer-context-button"
+              type="button"
+              disabled
+              title="分支读取尚未实现"
             >
-              <Paperclip size={12} />
-              <span>{source.name}</span>
-              <small>{formatBytes(source.bytes)}</small>
-              <button
-                type="button"
-                title={`移除 ${source.name}`}
-                aria-label={`移除 ${source.name}`}
-                onClick={() => onRemoveContextSource(source.path)}
-              >
-                <X size={12} />
-              </button>
-            </span>
-          ))}
-          {skills
-            .filter((skill) => selectedSkillIds.includes(skill.id))
-            .map((skill) => (
+              <GitBranch size={12} />
+              <span>分支未接入</span>
+            </button>
+          </div>
+        )}
+        {(contextSources.length > 0 || selectedSkillIds.length > 0) && (
+          <div className="composer-sources" aria-label="已添加来源">
+            {contextSources.map((source) => (
               <span
-                className="composer-source is-skill"
-                key={skill.id}
-                title={skill.description || skill.path}
+                className="composer-source"
+                key={source.path}
+                title={source.path}
               >
-                <Plug size={12} />
-                <span>{skill.name}</span>
-                <small>Skill</small>
+                <Paperclip size={12} />
+                <span>{source.name}</span>
+                <small>{formatBytes(source.bytes)}</small>
                 <button
                   type="button"
-                  title={`移除 ${skill.name}`}
-                  aria-label={`移除 ${skill.name}`}
-                  onClick={() => onToggleSkill(skill.id)}
+                  title={`移除 ${source.name}`}
+                  aria-label={`移除 ${source.name}`}
+                  onClick={() => onRemoveContextSource(source.path)}
                 >
                   <X size={12} />
                 </button>
               </span>
             ))}
-        </div>
-      )}
-      <textarea
-        value={value}
-        aria-label="消息"
-        placeholder="请求后续更改"
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (
-            event.key === "Enter" &&
-            !event.altKey &&
-            !event.nativeEvent.isComposing &&
-            !event.repeat
-          ) {
-            event.preventDefault();
-            onSubmit();
-          }
-        }}
-      />
-      <div className="composer-toolbar">
-        <div className="composer-menu-wrap">
-          <button
-            className="composer-icon-button"
-            type="button"
-            title="添加上下文或打开工具"
-            aria-label="添加上下文或打开工具"
-            aria-expanded={openMenu === "actions"}
-            onClick={() =>
-              setOpenMenu((current) =>
-                current === "actions" ? null : "actions",
-              )
+            {skills
+              .filter((skill) => selectedSkillIds.includes(skill.id))
+              .map((skill) => (
+                <span
+                  className="composer-source is-skill"
+                  key={skill.id}
+                  title={skill.description || skill.path}
+                >
+                  <Plug size={12} />
+                  <span>{skill.name}</span>
+                  <small>Skill</small>
+                  <button
+                    type="button"
+                    title={`移除 ${skill.name}`}
+                    aria-label={`移除 ${skill.name}`}
+                    onClick={() => onToggleSkill(skill.id)}
+                  >
+                    <X size={12} />
+                  </button>
+                </span>
+              ))}
+          </div>
+        )}
+        <textarea
+          value={value}
+          aria-label="消息"
+          placeholder={collaborationModePlaceholder(collaborationMode)}
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (
+              event.key === "Enter" &&
+              !event.altKey &&
+              !event.nativeEvent.isComposing &&
+              !event.repeat
+            ) {
+              event.preventDefault();
+              onSubmit();
             }
-          >
-            <Plus size={16} />
-          </button>
-          {openMenu === "actions" && (
-            <div className="tool-popover composer-actions-popover" role="menu">
-              <button
-                role="menuitem"
-                disabled={!canOpenThreadTools}
-                title={canOpenThreadTools ? undefined : "创建任务后可浏览文件"}
-                onClick={() => {
-                  onPickWorkspace();
-                  setOpenMenu(null);
-                }}
-              >
-                <Folder size={14} />
-                <span>选择工作区</span>
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onAddContextSources();
-                  setOpenMenu(null);
-                }}
-              >
-                <Paperclip size={14} />
-                <span>添加文件或图片</span>
-              </button>
-              <button
-                role="menuitem"
-                disabled={!canOpenThreadTools}
-                title={canOpenThreadTools ? undefined : "创建任务后可打开终端"}
-                onClick={() => {
-                  onOpenTool("terminal");
-                  setOpenMenu(null);
-                }}
-              >
-                <TerminalSquare size={14} />
-                <span>终端</span>
-                {!canOpenThreadTools && <small>创建任务后</small>}
-              </button>
-              <button
-                role="menuitem"
-                disabled={!canOpenThreadTools}
-                title={canOpenThreadTools ? undefined : "创建任务后可审查变更"}
-                onClick={() => {
-                  onOpenTool("diff");
-                  setOpenMenu(null);
-                }}
-              >
-                <GitBranch size={14} />
-                <span>审查变更</span>
-                {!canOpenThreadTools && <small>创建任务后</small>}
-              </button>
-              <button
-                role="menuitem"
-                disabled={!canOpenThreadTools}
-                title={
-                  canOpenThreadTools ? undefined : "创建任务后可打开浏览器"
-                }
-                onClick={() => {
-                  onOpenTool("browser");
-                  setOpenMenu(null);
-                }}
-              >
-                <Globe2 size={14} />
-                <span>Browser</span>
-                {!canOpenThreadTools && <small>创建任务后</small>}
-              </button>
-              <button role="menuitem" onClick={() => setOpenMenu("skills")}>
-                <Plug size={14} />
-                <span>Skills</span>
-                <small>{selectedSkillIds.length || skills.length}</small>
-              </button>
-            </div>
-          )}
-          {openMenu === "skills" && (
-            <div
-              className="tool-popover composer-actions-popover skills-popover"
-              role="menu"
+          }}
+        />
+        <div className="composer-toolbar">
+          <div className="composer-menu-wrap">
+            <button
+              className="composer-icon-button"
+              type="button"
+              title="添加内容或选择模式"
+              aria-label="添加内容或选择模式"
+              aria-expanded={openMenu === "actions"}
+              onClick={() =>
+                setOpenMenu((current) =>
+                  current === "actions" ? null : "actions",
+                )
+              }
             >
-              <div className="tool-popover-note">
-                <strong>Skills</strong>
-                <span>最多为当前 Turn 选择 5 个</span>
-              </div>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onCreateSkill();
-                  setOpenMenu(null);
-                }}
+              <Plus size={16} />
+            </button>
+            {openMenu === "actions" && (
+              <div
+                className="tool-popover composer-actions-popover"
+                role="menu"
               >
-                <WandSparkles size={13} />
-                <span>使用 AI 创建</span>
-              </button>
-              <div className="tool-popover-separator" />
-              {skills.length ? (
-                skills.map((skill) => {
-                  const selected = selectedSkillIds.includes(skill.id);
+                <div className="composer-actions-section-label">添加</div>
+                <button
+                  role="menuitem"
+                  disabled={!canOpenThreadTools}
+                  title={
+                    canOpenThreadTools ? undefined : "创建任务后可浏览文件"
+                  }
+                  onClick={() => {
+                    onPickWorkspace();
+                    setOpenMenu(null);
+                  }}
+                >
+                  <Folder size={14} />
+                  <span>选择工作区</span>
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onAddContextSources();
+                    setOpenMenu(null);
+                  }}
+                >
+                  <Paperclip size={14} />
+                  <span>添加文件或图片</span>
+                </button>
+                <div className="tool-popover-separator" />
+                <div className="composer-actions-section-label">模式</div>
+                {collaborationModeOptions.map((option) => {
+                  const Icon = option.icon;
+                  const selected = collaborationMode === option.value;
                   return (
                     <button
-                      className={selected ? "active" : ""}
-                      key={skill.id}
+                      className={`composer-mode-option is-${option.value} ${selected ? "active" : ""}`}
+                      disabled={isRunning || isSending}
+                      key={option.value}
                       role="menuitemcheckbox"
                       aria-checked={selected}
-                      disabled={!selected && selectedSkillIds.length >= 5}
-                      title={skill.description || skill.path}
-                      onClick={() => onToggleSkill(skill.id)}
+                      onClick={() => {
+                        onChangeCollaborationMode(
+                          selected ? "default" : option.value,
+                        );
+                        setOpenMenu(null);
+                      }}
                     >
-                      {selected ? <Check size={13} /> : <Plug size={13} />}
-                      <span>{skill.name}</span>
-                      <small>
-                        {skill.scope === "workspace" ? "项目" : "用户"}
-                      </small>
+                      <Icon size={15} aria-hidden="true" />
+                      <span className="composer-action-copy">
+                        <strong>{option.label}</strong>
+                        <small>{option.detail}</small>
+                      </span>
+                      {selected ? <Check size={14} aria-hidden="true" /> : null}
                     </button>
                   );
-                })
-              ) : (
-                <button disabled>
-                  <Plug size={13} />
-                  <span>未发现 Skills</span>
-                </button>
-              )}
-              <div className="tool-popover-separator" />
-              <button onClick={() => setOpenMenu("actions")}>
-                <ArrowLeft size={13} />
-                <span>返回</span>
-              </button>
-            </div>
-          )}
-        </div>
-        <div className="composer-menu-wrap">
-          <button
-            className={`composer-collaboration-mode is-${collaborationMode}`}
-            type="button"
-            aria-label="选择协作模式"
-            aria-expanded={openMenu === "collaboration"}
-            onClick={() =>
-              setOpenMenu((current) =>
-                current === "collaboration" ? null : "collaboration",
-              )
-            }
-          >
-            {collaborationMode === "default" ? (
-              <Zap size={14} aria-hidden="true" />
-            ) : collaborationMode === "plan" ? (
-              <ListTodo size={14} aria-hidden="true" />
-            ) : (
-              <Target size={14} aria-hidden="true" />
+                })}
+                {skills.length > 0 ? (
+                  <>
+                    <div className="tool-popover-separator" />
+                    <div className="composer-actions-section-label">工具</div>
+                    {skills.map((skill) => {
+                      const selected = selectedSkillIds.includes(skill.id);
+                      return (
+                        <button
+                          className={`composer-tool-option ${selected ? "active" : ""}`}
+                          key={skill.id}
+                          role="menuitemcheckbox"
+                          aria-checked={selected}
+                          disabled={!selected && selectedSkillIds.length >= 5}
+                          title={skill.description || skill.path}
+                          onClick={() => onToggleSkill(skill.id)}
+                        >
+                          <Plug size={14} aria-hidden="true" />
+                          <span className="composer-action-copy">
+                            <strong>{skill.name}</strong>
+                            {skill.description ? (
+                              <small>{skill.description}</small>
+                            ) : null}
+                          </span>
+                          {selected ? (
+                            <Check size={14} aria-hidden="true" />
+                          ) : null}
+                        </button>
+                      );
+                    })}
+                  </>
+                ) : null}
+              </div>
             )}
-            <span>{collaborationModeLabel(collaborationMode)}</span>
-            <ChevronDown size={11} aria-hidden="true" />
-          </button>
-          {openMenu === "collaboration" && (
-            <div className="tool-popover collaboration-popover" role="menu">
-              {collaborationModeOptions.map((option) => {
-                const Icon = option.icon;
-                const selected = collaborationMode === option.value;
-                return (
-                  <button
-                    className={selected ? "active" : ""}
-                    disabled={isRunning || isSending}
-                    key={option.value}
-                    role="menuitemradio"
-                    aria-checked={selected}
-                    onClick={() => {
-                      onChangeCollaborationMode(option.value);
-                      setOpenMenu(null);
-                    }}
-                  >
-                    <Icon size={15} aria-hidden="true" />
-                    <span>{option.label}</span>
-                    {selected ? <Check size={14} aria-hidden="true" /> : null}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
-        <div className="composer-menu-wrap">
-          <button
-            className="composer-mode"
-            type="button"
-            aria-expanded={openMenu === "permission"}
-            onClick={() =>
-              setOpenMenu((current) =>
-                current === "permission" ? null : "permission",
-              )
-            }
-          >
-            {permissionModeLabel(permissionMode)}
-          </button>
-          {openMenu === "permission" && (
-            <div className="tool-popover permission-popover" role="menu">
-              <div className="permission-popover-header">
-                <span>应如何批准 OpenTopia 操作？</span>
-                <span title="权限预设会同时调整审批策略和本地沙箱">
-                  了解更多
-                </span>
+          </div>
+          <div className="composer-menu-wrap">
+            <button
+              className="composer-mode"
+              type="button"
+              aria-expanded={openMenu === "permission"}
+              onClick={() =>
+                setOpenMenu((current) =>
+                  current === "permission" ? null : "permission",
+                )
+              }
+            >
+              {permissionModeLabel(permissionMode)}
+            </button>
+            {openMenu === "permission" && (
+              <div className="tool-popover permission-popover" role="menu">
+                <div className="permission-popover-header">
+                  <span>应如何批准 OpenTopia 操作？</span>
+                  <span title="权限预设会同时调整审批策略和本地沙箱">
+                    了解更多
+                  </span>
+                </div>
+                {permissionModeOptions.map((option) => {
+                  const Icon = option.icon;
+                  const selected =
+                    normalizedPermissionMode(permissionMode) === option.value;
+                  return (
+                    <button
+                      className={`permission-option ${selected ? "active" : ""} ${option.value === "full_access" ? "is-danger" : ""}`}
+                      disabled={isRunning || isSending}
+                      key={option.value}
+                      role="menuitemradio"
+                      aria-checked={selected}
+                      onClick={() => {
+                        onChangePermissionMode(option.value);
+                        setOpenMenu(null);
+                      }}
+                    >
+                      <Icon size={17} aria-hidden="true" />
+                      <span className="permission-option-copy">
+                        <strong>{option.label}</strong>
+                        <small>{option.detail}</small>
+                      </span>
+                      {selected ? <Check size={15} aria-hidden="true" /> : null}
+                    </button>
+                  );
+                })}
               </div>
-              {permissionModeOptions.map((option) => {
-                const Icon = option.icon;
-                const selected =
-                  normalizedPermissionMode(permissionMode) === option.value;
-                return (
-                  <button
-                    className={`permission-option ${selected ? "active" : ""} ${option.value === "full_access" ? "is-danger" : ""}`}
-                    disabled={isRunning || isSending}
-                    key={option.value}
-                    role="menuitemradio"
-                    aria-checked={selected}
-                    onClick={() => {
-                      onChangePermissionMode(option.value);
-                      setOpenMenu(null);
-                    }}
-                  >
-                    <Icon size={17} aria-hidden="true" />
-                    <span className="permission-option-copy">
-                      <strong>{option.label}</strong>
-                      <small>{option.detail}</small>
-                    </span>
-                    {selected ? <Check size={15} aria-hidden="true" /> : null}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
-        <div className="composer-menu-wrap composer-meta-wrap">
-          <button
-            className="composer-meta"
-            type="button"
-            aria-expanded={openMenu === "model"}
-            onClick={() =>
-              setOpenMenu((current) => (current === "model" ? null : "model"))
-            }
-          >
-            <span title={model}>{model}</span>
-            <span>默认推理</span>
-            <ChevronDown size={12} />
-          </button>
-          {openMenu === "model" && (
-            <div className="tool-popover model-popover" role="menu">
-              <div className="tool-popover-note">
-                <strong>{model}</strong>
-                <span>当前 Provider 模型</span>
+            )}
+          </div>
+          <div className="composer-menu-wrap composer-meta-wrap">
+            <button
+              className="composer-meta"
+              type="button"
+              aria-expanded={openMenu === "model"}
+              onClick={() =>
+                setOpenMenu((current) => (current === "model" ? null : "model"))
+              }
+            >
+              <span title={model}>{model}</span>
+              <span>默认推理</span>
+              <ChevronDown size={12} />
+            </button>
+            {openMenu === "model" && (
+              <div className="tool-popover model-popover" role="menu">
+                <div className="tool-popover-note">
+                  <strong>{model}</strong>
+                  <span>当前 Provider 模型</span>
+                </div>
+                <button disabled title="单任务模型与推理强度尚未实现">
+                  <Activity size={14} />
+                  <span>模型与推理强度</span>
+                  <small>使用全局配置</small>
+                </button>
               </div>
-              <button disabled title="单任务模型与推理强度尚未实现">
-                <Activity size={14} />
-                <span>模型与推理强度</span>
-                <small>使用全局配置</small>
-              </button>
-            </div>
-          )}
+            )}
+          </div>
+          {queuedMessageCount > 0 ? (
+            <span className="composer-queue-status">
+              {queuedMessageCount} queued
+            </span>
+          ) : null}
         </div>
-        {queuedMessageCount > 0 ? (
-          <span className="composer-queue-status">
-            {queuedMessageCount} queued
-          </span>
-        ) : null}
-      </div>
-      <button
-        className={`send-button${isRunning ? " is-running" : ""}`}
-        type="button"
-        disabled={
-          isRunning
-            ? isCancelling
-            : isSending ||
-              (!value.trim() &&
-                contextSources.length === 0 &&
-                selectedSkillIds.length === 0)
-        }
-        onClick={isRunning ? onCancel : onSubmit}
-        title={
-          isRunning
-            ? isCancelling
-              ? "正在中断执行"
-              : "中断执行"
-            : isSending
-              ? "正在发送消息"
-              : "发送消息"
-        }
-        aria-label={
-          isRunning
-            ? isCancelling
-              ? "正在中断智能体执行"
-              : "中断智能体执行"
-            : isSending
-              ? "正在发送消息"
-              : "发送消息"
-        }
-        aria-busy={isSending || isCancelling}
-      >
-        {isRunning ? (
-          <Square
-            className="stop-icon"
-            size={15}
-            fill="currentColor"
-            aria-hidden="true"
-          />
-        ) : isSending ? (
-          <Loader2 size={17} className="spin" aria-hidden="true" />
-        ) : (
-          <ArrowUp size={18} strokeWidth={2.25} aria-hidden="true" />
-        )}
-      </button>
+        <button
+          className={`send-button${isRunning ? " is-running" : ""}`}
+          type="button"
+          disabled={
+            isRunning
+              ? isCancelling
+              : isSending ||
+                (!value.trim() &&
+                  contextSources.length === 0 &&
+                  selectedSkillIds.length === 0)
+          }
+          onClick={isRunning ? onCancel : onSubmit}
+          title={
+            isRunning
+              ? isCancelling
+                ? "正在中断执行"
+                : "中断执行"
+              : isSending
+                ? "正在发送消息"
+                : "发送消息"
+          }
+          aria-label={
+            isRunning
+              ? isCancelling
+                ? "正在中断智能体执行"
+                : "中断智能体执行"
+              : isSending
+                ? "正在发送消息"
+                : "发送消息"
+          }
+          aria-busy={isSending || isCancelling}
+        >
+          {isRunning ? (
+            <Square
+              className="stop-icon"
+              size={15}
+              fill="currentColor"
+              aria-hidden="true"
+            />
+          ) : isSending ? (
+            <Loader2 size={17} className="spin" aria-hidden="true" />
+          ) : (
+            <ArrowUp size={18} strokeWidth={2.25} aria-hidden="true" />
+          )}
+        </button>
       </div>
     </div>
   );
@@ -6347,16 +6069,27 @@ function Composer({
 const collaborationModeOptions: Array<{
   value: CollaborationMode;
   label: string;
+  detail: string;
   icon: typeof Zap;
 }> = [
-  { value: "default", label: "执行", icon: Zap },
-  { value: "plan", label: "规划", icon: ListTodo },
-  { value: "goal", label: "目标", icon: Target },
+  {
+    value: "goal",
+    label: "目标",
+    detail: "设置要持续追求的目标",
+    icon: Target,
+  },
+  {
+    value: "plan",
+    label: "计划模式",
+    detail: "先调研、确认方案并形成计划",
+    icon: ListTodo,
+  },
 ];
 
-function collaborationModeLabel(mode: CollaborationMode): string {
-  return collaborationModeOptions.find((option) => option.value === mode)!
-    .label;
+function collaborationModePlaceholder(mode: CollaborationMode): string {
+  if (mode === "goal") return "描述要持续推进的目标";
+  if (mode === "plan") return "描述需要调研和规划的任务";
+  return "请求后续更改";
 }
 
 const permissionModeOptions: Array<{
@@ -6793,14 +6526,12 @@ function NewTaskState({
   onChangeLaunchMode,
   onPickWorkspace,
   onSelectProject,
-  onOpenTool,
   onChangePermissionMode,
   onChangeCollaborationMode,
   onChangeSandboxMode,
   onAddContextSources,
   onRemoveContextSource,
   onToggleSkill,
-  onCreateSkill,
   onSubmit,
 }: {
   value: string;
@@ -6821,14 +6552,12 @@ function NewTaskState({
   onChangeLaunchMode(mode: NewTaskLaunchMode): void;
   onPickWorkspace(): void;
   onSelectProject(projectId: string): void;
-  onOpenTool(kind: ToolTabKind): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeCollaborationMode(mode: CollaborationMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onAddContextSources(): void;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
-  onCreateSkill(): void;
   onSubmit(): void;
 }) {
   const suggestions =
@@ -6933,7 +6662,6 @@ function NewTaskState({
         onChange={onChange}
         onSubmit={onSubmit}
         onCancel={() => undefined}
-        onOpenTool={onOpenTool}
         onPickWorkspace={onPickWorkspace}
         onSelectProject={onSelectProject}
         onChangeLaunchMode={onChangeLaunchMode}
@@ -6943,7 +6671,6 @@ function NewTaskState({
         onAddContextSources={onAddContextSources}
         onRemoveContextSource={onRemoveContextSource}
         onToggleSkill={onToggleSkill}
-        onCreateSkill={onCreateSkill}
       />
     </>
   );

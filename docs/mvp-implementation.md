@@ -69,8 +69,6 @@ Implemented:
 - `PATCH /api/projects/{project_id}`
 - `DELETE /api/projects/{project_id}`
 - `GET /api/skills?workspaceRoot=...`
-- `POST /api/skills/generate`
-- `POST /api/skills`
 - `GET /api/plugins?workspaceRoot=...&threadId=...`
 - `POST /api/plugins/install`
 - `POST /api/plugins/uninstall`
@@ -183,9 +181,10 @@ Implemented:
 - Plugin directory with local-folder installation, project/OpenTopia/Codex source filters,
   capability and compatibility status, bounded Skill selection, managed-copy removal,
   and per-Thread plugin MCP enablement.
-- Natural-language Skill authoring with strict structured model output, editable desktop preview,
-  project/user scope selection, server-side validation, conflict protection, and atomic creation of
-  `SKILL.md`, `agents/openai.yaml`, and optional text resources.
+- Model-driven `create_skill` tool calls from the ordinary conversation loop: the model summarizes
+  reusable instructions from current context, defaults to user scope, and reports what it created.
+  Tool execution retains policy approval, server-side validation, conflict protection, and atomic
+  creation of `SKILL.md`, `agents/openai.yaml`, and optional text resources.
 - Real persistent subagents with AgentCore execution, concurrency/depth controls, no scheduler
   execution deadline,
   recursive cancellation, model-callable lifecycle tools, concurrent `wait_agents`, HTTP
