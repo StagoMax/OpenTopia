@@ -561,10 +561,11 @@ mod tests {
         let registry = BackgroundProcessRegistry::default();
         let scope = scope();
 
+        // The window has to survive a loaded test machine, so the pause is generous.
         let command = if cfg!(windows) {
-            "Write-Output first; Start-Sleep -Milliseconds 1500; Write-Output second"
+            "Write-Output first; Start-Sleep -Seconds 6; Write-Output second"
         } else {
-            "echo first; sleep 1.5; echo second"
+            "echo first; sleep 6; echo second"
         };
         let snapshot = registry
             .spawn(
@@ -579,7 +580,7 @@ mod tests {
             .expect("spawn succeeds");
 
         let mut seen_first_early = false;
-        for _ in 0..40 {
+        for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let chunk = registry
                 .read_output(&scope, snapshot.job_id)
@@ -594,6 +595,7 @@ mod tests {
             "early output should be readable before the command exits"
         );
 
+        registry.stop(&scope, snapshot.job_id).ok();
         wait_until_terminal(&registry, &scope, snapshot.job_id).await;
         let _ = std::fs::remove_dir_all(root);
     }
