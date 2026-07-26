@@ -11,9 +11,9 @@
   margin: 0 auto 12px;
   overflow: auto;
   padding: 16px 18px 14px;
-  color: #242724;
-  background: #fff;
-  border: 1px solid #d9dcd8;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 8px 28px rgb(35 45 35 / 12%);
   scrollbar-width: thin;
@@ -31,7 +31,7 @@
   width: 22px;
   height: 22px;
   place-items: center;
-  color: #e5483d;
+  color: var(--danger);
 }
 
 .approval-dialog-heading {
@@ -40,7 +40,7 @@
 
 .approval-dialog-heading h2 {
   margin: 0;
-  color: #222522;
+  color: var(--text);
   font-size: 15px;
   font-weight: 600;
   line-height: 1.45;
@@ -52,20 +52,20 @@
   flex-wrap: wrap;
   gap: 4px 7px;
   margin: 7px 0 0;
-  color: #686e68;
+  color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.5;
 }
 
 .approval-dialog-heading strong {
-  color: #a9362e;
+  color: var(--danger);
   font-weight: 600;
 }
 
 .approval-dialog-queue {
   padding: 3px 7px;
-  color: #656965;
-  background: #f1f2f0;
+  color: var(--text-secondary);
+  background: var(--surface-subtle);
   border-radius: 5px;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -77,12 +77,12 @@
   gap: 7px;
   align-items: start;
   margin-top: 11px;
-  color: #555a55;
+  color: var(--text-secondary);
 }
 
 .approval-dialog-reason > svg {
   margin-top: 3px;
-  color: #a96624;
+  color: var(--warning);
 }
 
 .approval-dialog-reason p {
@@ -97,8 +97,8 @@
   margin: 11px 0 0;
   overflow: auto;
   padding: 11px 13px;
-  color: #252825;
-  background: #f5f6f4;
+  color: var(--text);
+  background: var(--surface-subtle);
   border: 0;
   border-radius: 6px;
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
@@ -120,8 +120,8 @@
 .approval-dialog-error {
   margin: 10px 0 0;
   padding: 8px 10px;
-  color: #a1261c;
-  background: #fff0ee;
+  color: var(--danger);
+  background: var(--danger-subtle);
   border-radius: 5px;
   font-size: 12px;
   line-height: 1.5;
@@ -161,29 +161,29 @@
 }
 
 .approval-dialog-deny {
-  color: #303330;
-  background: #f0f1ef;
-  border: 1px solid #f0f1ef;
+  color: var(--text);
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-subtle);
 }
 
 .approval-dialog-deny:hover:not(:disabled) {
-  background: #e7e9e6;
+  background: var(--surface-subtle);
 }
 
 .approval-dialog-deny kbd {
-  color: #7b807b;
+  color: var(--text-muted);
   font: inherit;
   font-size: 11px;
 }
 
 .approval-dialog-allow {
-  color: #fff;
-  background: #e5483d;
-  border: 1px solid #e5483d;
+  color: var(--on-accent);
+  background: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--border));
 }
 
 .approval-dialog-allow:hover:not(:disabled) {
-  background: #d83c32;
+  background: var(--danger);
 }
 
 .approval-dialog-spinner {

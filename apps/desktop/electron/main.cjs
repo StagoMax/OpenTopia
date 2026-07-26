@@ -10,7 +10,7 @@ const {
 } = require("electron");
 const path = require("node:path");
 const { URL, fileURLToPath } = require("node:url");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const net = require("node:net");
@@ -30,6 +30,22 @@ let defaultBackendUrl =
   process.env.OPENTOPIA_SERVER_URL || "http://127.0.0.1:8787";
 const backendApiToken = crypto.randomBytes(32).toString("base64url");
 const openTopiaProtocol = "opentopia";
+
+/*
+ * The Windows caption buttons are drawn by the OS, not by our CSS, so they have
+ * to be repainted explicitly whenever the renderer resolves a different theme.
+ * These values mirror --surface-chrome / --text-secondary in styles/tokens.css;
+ * keep them in step with it.
+ */
+const titleBarOverlayColors = {
+  light: { color: "#f4f7fa", symbolColor: "#5c6570" },
+  dark: { color: "#1f1f1f", symbolColor: "#c2c2c2" },
+};
+
+function titleBarOverlayFor(theme) {
+  const palette = titleBarOverlayColors[theme] ?? titleBarOverlayColors.light;
+  return { ...palette, height: 32 };
+}
 
 let mainWindow = null;
 let backendProcess = null;
@@ -1437,7 +1453,37 @@ function verifyCodexSandboxBundle(codexPath) {
   }
 }
 
-async function startBackendIfNeeded() {
+// A dev backend is compiled by `cargo run` on demand, so readiness is measured
+// in minutes on a cold or post-edit build, not seconds. Packaged builds launch a
+// prebuilt binary and only need a short grace period.
+const backendHealthAttempts = isDev ? 600 : 30;
+
+async function waitForBackendHealth(attempts) {
+  for (let i = 0; i < attempts; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (!backendProcess) {
+      writeLog("warn", "backend.spawn.gone", { attempts: i + 1 });
+      return false;
+    }
+    if (await isBackendHealthy()) {
+      writeLog("info", "backend.spawn.ready", {
+        attempts: i + 1,
+        backend: backendEndpointInfo(),
+      });
+      return true;
+    }
+  }
+  writeLog("error", "backend.spawn.health-timeout", {
+    backend: backendEndpointInfo(),
+    attempts,
+  });
+  return false;
+}
+
+async function startBackendIfNeeded({
+  waitForHealth = true,
+  attempts = backendHealthAttempts,
+} = {}) {
   if (await isBackendHealthy()) return;
 
   try {
@@ -1522,23 +1568,38 @@ async function startBackendIfNeeded() {
       if (backendProcess === spawnedBackend) backendProcess = null;
     });
 
-    for (let i = 0; i < 30; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      if (await isBackendHealthy()) {
-        writeLog("info", "backend.spawn.ready", {
-          attempts: i + 1,
-          backend: backendEndpointInfo(),
-        });
-        return;
-      }
-    }
-    writeLog("error", "backend.spawn.health-timeout", {
-      backend: backendEndpointInfo(),
-      attempts: 30,
+    // The renderer keeps probing /health on its own, so the window does not have
+    // to wait out a long build before it can be shown.
+    const readiness = waitForBackendHealth(attempts).catch((error) => {
+      logConsole("warn", "backend.health.wait.failed", { error });
+      return false;
     });
+    if (waitForHealth) await readiness;
   } catch (error) {
     logConsole("error", "backend.spawn.failed", { error });
   }
+}
+
+// In dev the tracked child is `cargo`, which spawns the real server as a
+// grandchild. Killing only `cargo` leaves that server alive and squatting the
+// backend port, so the next launch has to fall back to a random port. Quit is
+// synchronous, hence spawnSync rather than the async stopManagedBackend path.
+function killBackendProcessTree() {
+  const child = backendProcess;
+  if (!child?.pid) return;
+  backendProcess = null;
+  if (process.platform === "win32") {
+    try {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      return;
+    } catch (error) {
+      logConsole("warn", "backend.kill.taskkill.failed", { error });
+    }
+  }
+  child.kill();
 }
 
 async function stopManagedBackend() {
@@ -1574,12 +1635,36 @@ async function stopManagedBackend() {
   });
 }
 
+/**
+ * Restarts the backend so it picks up a credential change.
+ *
+ * The secret is already durable on disk by the time this runs, so a failed
+ * restart must not be reported to the renderer as a failed save — it is a
+ * separate, recoverable condition. Callers get a structured outcome instead of
+ * an exception, and the renderer surfaces the two independently.
+ */
+async function restartBackendAfterSecretChange(context) {
+  try {
+    await restartManagedBackend();
+    return { restarted: true, error: null };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeLog("warn", "secrets.backend-restart.failed", {
+      ...context,
+      error: message,
+    });
+    return { restarted: false, error: message };
+  }
+}
+
 async function restartManagedBackend() {
   if (!backendProcess) {
     throw new Error("The local backend is not managed by this desktop process");
   }
   await stopManagedBackend();
-  await startBackendIfNeeded();
+  // Bounded so a restart triggered from the UI cannot hang on a long rebuild;
+  // the renderer keeps probing if the build outlasts this window.
+  await startBackendIfNeeded({ attempts: isDev ? 120 : 30 });
   if (!(await isBackendHealthy())) {
     throw new Error("The local backend did not become ready after restart");
   }
@@ -1601,11 +1686,7 @@ function createMainWindow() {
     ...(process.platform === "win32"
       ? {
           titleBarStyle: "hidden",
-          titleBarOverlay: {
-            color: "#eef7e9",
-            symbolColor: "#465049",
-            height: 32,
-          },
+          titleBarOverlay: titleBarOverlayFor("light"),
         }
       : {}),
     webPreferences: {
@@ -1795,6 +1876,23 @@ function registerIpc() {
     openRequestHistory.map((request) => ({ ...request })),
   );
 
+  // Called by the renderer every time the resolved appearance changes.
+  ipcMain.handle("platform:set-theme", (_event, theme) => {
+    const resolved = theme === "dark" ? "dark" : "light";
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    // Repainting the window background too avoids a pale flash on resize.
+    mainWindow.setBackgroundColor(titleBarOverlayColors[resolved].color);
+    if (process.platform === "win32") {
+      try {
+        mainWindow.setTitleBarOverlay(titleBarOverlayFor(resolved));
+      } catch (error) {
+        writeLog("warn", "titlebar.overlay.failed", { error: String(error) });
+        return false;
+      }
+    }
+    return true;
+  });
+
   ipcMain.handle("platform:show-system-notification", (event, options) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) {
       throw new Error(
@@ -1834,8 +1932,10 @@ function registerIpc() {
       configured: metadata.providerApiKeyConfigured,
       status: metadata.status,
     });
-    await restartManagedBackend();
-    return listSecretSources();
+    const backendRestart = await restartBackendAfterSecretChange({
+      operation: "set-secret",
+    });
+    return { ...listSecretSources(), backendRestart };
   });
 
   ipcMain.handle("secrets:get-provider-key-metadata", (_event, providerId) =>
@@ -1852,8 +1952,11 @@ function registerIpc() {
         configured: metadata.providerApiKeyConfigured,
         status: metadata.status,
       });
-      await restartManagedBackend();
-      return metadata;
+      const backendRestart = await restartBackendAfterSecretChange({
+        operation: "set-provider-key",
+        providerId: metadata.providerId,
+      });
+      return { ...metadata, backendRestart };
     },
   );
 
@@ -1865,8 +1968,11 @@ function registerIpc() {
       configured: metadata.providerApiKeyConfigured,
       status: metadata.status,
     });
-    await restartManagedBackend();
-    return metadata;
+    const backendRestart = await restartBackendAfterSecretChange({
+      operation: "delete-provider-key",
+      providerId: metadata.providerId,
+    });
+    return { ...metadata, backendRestart };
   });
 
   ipcMain.handle("secrets:delete", async (_event, key) => {
@@ -1877,8 +1983,10 @@ function registerIpc() {
       configured: metadata.providerApiKeyConfigured,
       status: metadata.status,
     });
-    await restartManagedBackend();
-    return listSecretSources();
+    const backendRestart = await restartBackendAfterSecretChange({
+      operation: "delete-secret",
+    });
+    return { ...listSecretSources(), backendRestart };
   });
 
   ipcMain.handle("logs:list", async () => {
@@ -2127,7 +2235,7 @@ if (!singleInstance) {
     }
     registerIpc();
     desktopBrowserHost.registerIpc(ipcMain);
-    await startBackendIfNeeded();
+    await startBackendIfNeeded({ waitForHealth: false });
     createMainWindow();
 
     app.on("activate", () => {
@@ -2144,5 +2252,5 @@ app.on("before-quit", () => {
   void desktopBrowserHost?.close().catch((error) => {
     logConsole("warn", "browser.host.close.failed", { error });
   });
-  backendProcess?.kill();
+  killBackendProcessTree();
 });

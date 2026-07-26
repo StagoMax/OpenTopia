@@ -45,6 +45,7 @@ import type {
   McpServerView,
   Message,
   PluginView,
+  ReviewFileRequest,
   SandboxDescriptor,
   TerminalEvent,
   TerminalSession,
@@ -58,7 +59,12 @@ import type {
   WorkspaceTree,
 } from "../types";
 import { ArtifactGallery } from "./ArtifactGallery";
-import { detectLanguage, MonacoEditor } from "./MonacoEditor";
+import {
+  DiffReviewPanel,
+  type DiffReviewFileContent,
+  type DiffReviewGitAction,
+  type DiffReviewTurnScope,
+} from "./DiffReviewPanel";
 import type { XtermTerminalHandle } from "./XtermTerminal";
 import { XtermTerminal } from "./XtermTerminal";
 
@@ -89,6 +95,7 @@ type WorkbenchPanelProps = {
   isCompactingContext: boolean;
   revertingDiffPath: string | null;
   hunkActionKey: string | null;
+  reviewFileRequest?: ReviewFileRequest | null;
   onDecideApproval(approvalId: string, approved: boolean): void;
   onRefreshWorkbench(): void;
   onOpenWorkspacePath(path?: string): void;
@@ -123,6 +130,11 @@ type WorkbenchPanelProps = {
     hunk: WorkspaceDiffHunk,
     action: WorkspaceDiffHunkAction,
   ): void;
+  /** Opens a workspace file in its own tool tab from the review panel. */
+  onOpenFileTab(path: string): void;
+  onLoadFileContent(path: string): Promise<DiffReviewFileContent>;
+  onLoadTurnFileDiff(turnId: string, path: string): Promise<string>;
+  onGitAction(action: DiffReviewGitAction, message: string): Promise<string>;
   onGetArtifact(threadId: string, artifactId: string): Promise<ArtifactContent>;
 };
 
@@ -162,6 +174,7 @@ export function WorkbenchPanel({
   isCompactingContext,
   revertingDiffPath,
   hunkActionKey,
+  reviewFileRequest,
   onDecideApproval,
   onRefreshWorkbench,
   onOpenWorkspacePath,
@@ -184,6 +197,10 @@ export function WorkbenchPanel({
   onOpenArtifact,
   onRevertDiffFile,
   onApplyDiffHunk,
+  onOpenFileTab,
+  onLoadFileContent,
+  onLoadTurnFileDiff,
+  onGitAction,
   onGetArtifact,
 }: WorkbenchPanelProps) {
   const [internalActiveTab, setInternalActiveTab] =
@@ -214,9 +231,18 @@ export function WorkbenchPanel({
       )}
       {activeTab === "diff" && (
         <DiffView
+          events={events}
           workspaceDiff={workspaceDiff}
+          reviewFileRequest={reviewFileRequest ?? null}
+          isRefreshing={isRefreshingWorkbench}
           revertingDiffPath={revertingDiffPath}
           hunkActionKey={hunkActionKey}
+          canRunGit={Boolean(thread)}
+          onRefresh={onRefreshWorkbench}
+          onOpenFileTab={onOpenFileTab}
+          onLoadFileContent={onLoadFileContent}
+          onLoadTurnFileDiff={onLoadTurnFileDiff}
+          onGitAction={onGitAction}
           onRevertDiffFile={onRevertDiffFile}
           onApplyDiffHunk={onApplyDiffHunk}
         />
@@ -552,26 +578,83 @@ function Breadcrumb({
 type DiffSubTab = "diff" | "review";
 
 function DiffView({
+  events,
   workspaceDiff,
+  reviewFileRequest,
+  isRefreshing,
   revertingDiffPath,
   hunkActionKey,
+  canRunGit,
+  onRefresh,
+  onOpenFileTab,
+  onLoadFileContent,
+  onLoadTurnFileDiff,
+  onGitAction,
   onRevertDiffFile,
   onApplyDiffHunk,
 }: {
+  events: AgentEvent[];
   workspaceDiff: WorkspaceDiff | null;
+  reviewFileRequest: ReviewFileRequest | null;
+  isRefreshing: boolean;
   revertingDiffPath: string | null;
   hunkActionKey: string | null;
+  canRunGit: boolean;
+  onRefresh(): void;
+  onOpenFileTab(path: string): void;
+  onLoadFileContent(path: string): Promise<DiffReviewFileContent>;
+  onLoadTurnFileDiff(turnId: string, path: string): Promise<string>;
+  onGitAction(action: DiffReviewGitAction, message: string): Promise<string>;
   onRevertDiffFile(path: string): void;
   onApplyDiffHunk(
     hunk: WorkspaceDiffHunk,
     action: WorkspaceDiffHunkAction,
   ): void;
 }) {
-  const [filter, setFilter] = useState("");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [diffSubTab, setDiffSubTab] = useState<DiffSubTab>("diff");
+  // A review request usually lands before the diff that contains the file has
+  // been fetched, so the path is parked until a diff newer than the one on
+  // screen at request time arrives.
+  const [pendingReview, setPendingReview] = useState<ReviewFileRequest | null>(
+    null,
+  );
+  const [focusRequest, setFocusRequest] = useState<ReviewFileRequest | null>(
+    null,
+  );
+  const reviewBaselineRef = useRef<WorkspaceDiff | null>(null);
+  const workspaceDiffRef = useRef<WorkspaceDiff | null>(workspaceDiff);
+  workspaceDiffRef.current = workspaceDiff;
 
   useEffect(() => {
+    if (!reviewFileRequest) return;
+    reviewBaselineRef.current = workspaceDiffRef.current;
+    setPendingReview(reviewFileRequest);
+    setDiffSubTab("diff");
+  }, [reviewFileRequest]);
+
+  useEffect(() => {
+    if (!pendingReview) return;
+    const match = workspaceDiff?.files.find(
+      (file) =>
+        sameDiffPath(file.path, pendingReview.path) ||
+        sameDiffPath(file.originalPath, pendingReview.path),
+    );
+    if (match) {
+      setSelectedPath(match.path);
+      setFocusRequest({ path: match.path, nonce: pendingReview.nonce });
+      setPendingReview(null);
+      return;
+    }
+    // The file is genuinely absent from a freshly loaded diff (committed,
+    // reverted, or outside the workspace): stop waiting for it.
+    if (workspaceDiff && workspaceDiff !== reviewBaselineRef.current) {
+      setPendingReview(null);
+    }
+  }, [pendingReview, workspaceDiff]);
+
+  useEffect(() => {
+    if (pendingReview) return;
     if (!workspaceDiff?.files.length) {
       setSelectedPath(null);
       return;
@@ -582,65 +665,27 @@ function DiffView({
     ) {
       setSelectedPath(workspaceDiff.files[0].path);
     }
-  }, [selectedPath, workspaceDiff]);
+  }, [pendingReview, selectedPath, workspaceDiff]);
 
-  const filteredFiles = useMemo(() => {
-    const normalizedFilter = filter.trim().toLocaleLowerCase();
-    if (!workspaceDiff) return [];
-    if (!normalizedFilter) return workspaceDiff.files;
-    return workspaceDiff.files.filter((file) =>
-      `${file.status} ${file.stagedStatus ?? ""} ${file.unstagedStatus ?? ""} ${file.originalPath ?? ""} ${file.path}`
-        .toLocaleLowerCase()
-        .includes(normalizedFilter),
-    );
-  }, [filter, workspaceDiff]);
-  const statusSummary = useMemo(
-    () => buildDiffStatusSummary(workspaceDiff?.files ?? []),
-    [workspaceDiff],
-  );
-
+  const turnScopes = useMemo(() => buildTurnReviewScopes(events), [events]);
   const selectedFile =
     selectedPath && workspaceDiff
       ? (workspaceDiff.files.find((file) => file.path === selectedPath) ?? null)
       : null;
 
-  const previewText =
-    workspaceDiff && selectedFile
-      ? diffTextForPath(workspaceDiff, selectedFile.path)
-      : (workspaceDiff?.diff ?? "");
-
-  const parsedDiff =
-    selectedFile && workspaceDiff
-      ? parseDiffContent(
-          diffTextForPath(workspaceDiff, selectedFile.path),
-          selectedFile.path,
-        )
-      : null;
-
-  if (!workspaceDiff) {
-    return <div className="workbench-empty-state">No diff loaded.</div>;
-  }
+  const revertBlockedReason = useCallback(
+    (path: string) => {
+      const file = workspaceDiff?.files.find((entry) =>
+        sameDiffPath(entry.path, path),
+      );
+      if (!file) return "该文件不在当前工作区改动中。";
+      return restoreDisabledReason(file);
+    },
+    [workspaceDiff],
+  );
 
   return (
     <div className="diff-view">
-      <div className="diff-summary-row">
-        <span>{workspaceDiff.files.length} changed</span>
-        <span>{statusSummary.staged} staged</span>
-        <span>{statusSummary.unstaged} unstaged</span>
-        <span>{statusSummary.untracked} untracked</span>
-        <span>{statusSummary.renamed} renamed</span>
-        <span>{workspaceDiff.command}</span>
-        {workspaceDiff.truncated && (
-          <span className="truncated-pill">Truncated</span>
-        )}
-        {workspaceDiff.stagedTruncated && (
-          <span className="truncated-pill">Staged truncated</span>
-        )}
-        {workspaceDiff.unstagedTruncated && (
-          <span className="truncated-pill">Unstaged truncated</span>
-        )}
-      </div>
-
       <div className="diff-sub-tabs">
         <button
           className={`diff-sub-tab ${diffSubTab === "diff" ? "active" : ""}`}
@@ -648,7 +693,7 @@ function DiffView({
           onClick={() => setDiffSubTab("diff")}
         >
           <FileCode2 size={13} />
-          Diff
+          审阅
         </button>
         <button
           className={`diff-sub-tab ${diffSubTab === "review" ? "active" : ""}`}
@@ -656,102 +701,89 @@ function DiffView({
           onClick={() => setDiffSubTab("review")}
         >
           <ShieldAlert size={13} />
-          Review
+          补丁
         </button>
       </div>
 
       {diffSubTab === "diff" && (
-        <>
-          <label className="diff-filter">
-            <span>Filter</span>
-            <input
-              value={filter}
-              placeholder="Path or status"
-              onChange={(event) => setFilter(event.target.value)}
-            />
-          </label>
-
-          <div className="changed-file-list">
-            <button
-              className={`changed-file-row ${selectedPath === null ? "active" : ""}`}
-              type="button"
-              onClick={() => setSelectedPath(null)}
-            >
-              <span className="diff-status">all</span>
-              <span>All files</span>
-            </button>
-            {filteredFiles.length ? (
-              filteredFiles.map((file) => (
-                <ChangedFileButton
-                  key={`${file.status}-${file.path}`}
-                  file={file}
-                  selected={file.path === selectedPath}
-                  onSelect={() => setSelectedPath(file.path)}
-                />
-              ))
-            ) : (
-              <span className="muted">No matching files.</span>
-            )}
-          </div>
-
-          <div className="diff-preview-header">
-            <span title={selectedFile?.path ?? "Raw diff"}>
-              {selectedFile?.path ?? "Raw diff"}
-            </span>
-            {selectedFile && (
-              <button
-                className="secondary-button compact"
-                type="button"
-                onClick={() => setSelectedPath(null)}
-              >
-                Show raw
-              </button>
-            )}
-          </div>
-
-          {selectedFile && parsedDiff ? (
-            <div className="diff-editor-panel">
-              <div className="diff-editor-container">
-                <div className="diff-editor-label">Original</div>
-                <MonacoEditor
-                  value={parsedDiff.original}
-                  language={detectLanguage(selectedFile.path)}
-                  readOnly
-                />
-              </div>
-              <div className="diff-editor-container">
-                <div className="diff-editor-label">Modified</div>
-                <MonacoEditor
-                  value={parsedDiff.modified}
-                  language={detectLanguage(selectedFile.path)}
-                  readOnly
-                />
-              </div>
-            </div>
-          ) : (
-            <MonacoEditor
-              value={previewText || "(no diff)"}
-              language="diff"
-              readOnly
-            />
-          )}
-        </>
-      )}
-
-      {diffSubTab === "review" && (
-        <ReviewPanel
+        <DiffReviewPanel
           workspaceDiff={workspaceDiff}
-          selectedPath={selectedPath}
-          selectedFile={selectedFile}
-          revertingDiffPath={revertingDiffPath}
-          hunkActionKey={hunkActionKey}
-          onSelectPath={setSelectedPath}
-          onRevertDiffFile={onRevertDiffFile}
-          onApplyDiffHunk={onApplyDiffHunk}
+          turnScopes={turnScopes}
+          focusRequest={focusRequest}
+          isRefreshing={isRefreshing}
+          revertingPath={revertingDiffPath}
+          canRunGit={canRunGit}
+          onRefresh={onRefresh}
+          onOpenFileTab={onOpenFileTab}
+          onLoadFileContent={onLoadFileContent}
+          onLoadTurnFileDiff={onLoadTurnFileDiff}
+          onRevertFile={onRevertDiffFile}
+          revertBlockedReason={revertBlockedReason}
+          onGitAction={onGitAction}
         />
       )}
+
+      {diffSubTab === "review" &&
+        (workspaceDiff ? (
+          <>
+            <div className="diff-summary-row">
+              <span>{workspaceDiff.files.length} changed</span>
+              <span>{workspaceDiff.command}</span>
+              {workspaceDiff.truncated && (
+                <span className="truncated-pill">Truncated</span>
+              )}
+              {workspaceDiff.stagedTruncated && (
+                <span className="truncated-pill">Staged truncated</span>
+              )}
+              {workspaceDiff.unstagedTruncated && (
+                <span className="truncated-pill">Unstaged truncated</span>
+              )}
+            </div>
+            <ReviewPanel
+              workspaceDiff={workspaceDiff}
+              selectedPath={selectedPath}
+              selectedFile={selectedFile}
+              revertingDiffPath={revertingDiffPath}
+              hunkActionKey={hunkActionKey}
+              onSelectPath={setSelectedPath}
+              onRevertDiffFile={onRevertDiffFile}
+              onApplyDiffHunk={onApplyDiffHunk}
+            />
+          </>
+        ) : (
+          <div className="workbench-empty-state">No diff loaded.</div>
+        ))}
     </div>
   );
+}
+
+/**
+ * Review baselines taken from the turns this thread already recorded, newest
+ * first. Only finalized change sets can be reviewed; a capturing or failed one
+ * has no file list to read.
+ */
+function buildTurnReviewScopes(events: AgentEvent[]): DiffReviewTurnScope[] {
+  const byTurn = new Map<string, DiffReviewTurnScope>();
+  for (const event of events) {
+    if (event.payload.type !== "turn_changes_recorded") continue;
+    const changeSet = event.payload.change_set;
+    if (changeSet.status !== "ready") continue;
+    const files = changeSet.files
+      .map((file) => ({
+        path: file.newPath ?? file.oldPath ?? "",
+        binary: file.binary,
+      }))
+      .filter((file) => file.path);
+    if (!files.length) continue;
+    byTurn.set(changeSet.turnId, {
+      turnId: changeSet.turnId,
+      label: `${formatTime(changeSet.createdAt)} 的回合`,
+      additions: changeSet.additions,
+      deletions: changeSet.deletions,
+      files,
+    });
+  }
+  return [...byTurn.values()].reverse();
 }
 
 function ReviewPanel({
@@ -910,28 +942,6 @@ function ReviewPanel({
         )}
       </div>
     </div>
-  );
-}
-
-function ChangedFileButton({
-  file,
-  selected,
-  onSelect,
-}: {
-  file: ChangedFile;
-  selected: boolean;
-  onSelect(): void;
-}) {
-  return (
-    <button
-      className={`changed-file-row ${selected ? "active" : ""}`}
-      type="button"
-      title={file.path}
-      onClick={onSelect}
-    >
-      <ChangedFileStatusBadges file={file} />
-      <span>{file.path}</span>
-    </button>
   );
 }
 
@@ -2014,49 +2024,6 @@ function ArtifactReferenceList({
   );
 }
 
-function parseDiffContent(
-  diffText: string,
-  filePath: string,
-): { original: string; modified: string } | null {
-  const normalizedPath = filePath.replace(/\\/g, "/");
-  const chunks = diffText.split(/\n(?=diff --git )/);
-  const match = chunks.find((chunk) => {
-    const nc = chunk.replace(/\\/g, "/");
-    return (
-      nc.includes(` a/${normalizedPath}`) || nc.includes(` b/${normalizedPath}`)
-    );
-  });
-
-  if (!match) return null;
-
-  const originalLines: string[] = [];
-  const modifiedLines: string[] = [];
-  const lines = match.split("\n");
-  let inHunk = false;
-
-  for (const line of lines) {
-    if (/^@@ -\d+(,\d*)? \+\d+(,\d*)? @@/.test(line)) {
-      inHunk = true;
-      continue;
-    }
-    if (!inHunk) continue;
-    if (line.startsWith("-")) {
-      originalLines.push(line.slice(1));
-    } else if (line.startsWith("+")) {
-      modifiedLines.push(line.slice(1));
-    } else if (line.startsWith(" ")) {
-      const content = line.slice(1);
-      originalLines.push(content);
-      modifiedLines.push(content);
-    }
-  }
-
-  return {
-    original: originalLines.join("\n"),
-    modified: modifiedLines.join("\n"),
-  };
-}
-
 function reviewHunksForSelection(
   workspaceDiff: WorkspaceDiff,
   selectedFile: ChangedFile | null,
@@ -2372,6 +2339,18 @@ function extractDiffForPath(rawDiff: string, path: string): string {
   return match ?? rawDiff;
 }
 
+// Turn snapshots and `git status` disagree on separators and leading "./", so
+// review requests are matched on a normalized form.
+function sameDiffPath(
+  left: string | null | undefined,
+  right: string | null | undefined,
+) {
+  if (!left || !right) return false;
+  const normalize = (value: string) =>
+    value.replace(/\\/g, "/").replace(/^\.\//, "");
+  return normalize(left) === normalize(right);
+}
+
 function diffTextForPath(workspaceDiff: WorkspaceDiff, path: string): string {
   const sources = [
     workspaceDiff.stagedDiff ?? "",
@@ -2386,23 +2365,6 @@ function diffTextForPath(workspaceDiff: WorkspaceDiff, path: string): string {
 
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values));
-}
-
-function buildDiffStatusSummary(files: ChangedFile[]): {
-  staged: number;
-  unstaged: number;
-  untracked: number;
-  renamed: number;
-} {
-  return files.reduce(
-    (summary, file) => ({
-      staged: summary.staged + (hasStagedChange(file) ? 1 : 0),
-      unstaged: summary.unstaged + (hasUnstagedChange(file) ? 1 : 0),
-      untracked: summary.untracked + (isUntrackedFile(file) ? 1 : 0),
-      renamed: summary.renamed + (isRenamedFile(file) ? 1 : 0),
-    }),
-    { staged: 0, unstaged: 0, untracked: 0, renamed: 0 },
-  );
 }
 
 function changedFileBadges(file: ChangedFile): Array<{

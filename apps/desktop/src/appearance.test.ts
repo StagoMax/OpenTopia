@@ -23,6 +23,8 @@ const {
 /**
  * Stand-in for <html>. applyAppearance only needs `dataset` and `style`, so a
  * pair of plain maps is enough to assert what it writes without a real DOM.
+ * `removeProperty` matters as much as `setProperty` here: clearing an override
+ * is how an untouched field hands control back to tokens.css.
  */
 function fakeRoot() {
   const properties = new Map<string, string>();
@@ -31,6 +33,9 @@ function fakeRoot() {
     style: {
       setProperty(name: string, value: string) {
         properties.set(name, value);
+      },
+      removeProperty(name: string) {
+        properties.delete(name);
       },
     },
     properties,
@@ -93,36 +98,119 @@ test("normalizes junk and missing input to the full defaults", () => {
   assert.deepEqual(normalizeAppearanceSettings(42), defaultAppearanceSettings);
 });
 
+test("a stored retired dark default is refreshed to the current one", () => {
+  for (const retired of [
+    { accent: "#4C9BEA", background: "#181818", foreground: "#F2F3F5" },
+    { accent: "#5AA9F8", background: "#212121", foreground: "#ECECEC" },
+    { accent: "#5AA9F8", background: "#141518", foreground: "#ECEEF2" },
+  ]) {
+    const normalized = normalizeAppearanceSettings({
+      dark: { ...defaultDarkTheme, ...retired, contrast: 70 },
+    });
+
+    assert.equal(normalized.dark.background, defaultDarkTheme.background);
+    assert.equal(normalized.dark.foreground, defaultDarkTheme.foreground);
+    assert.equal(normalized.dark.accent, defaultDarkTheme.accent);
+    // Edits that are not part of the retired triple are kept.
+    assert.equal(normalized.dark.contrast, 70);
+  }
+});
+
+test("a genuinely customized dark theme is never refreshed", () => {
+  const custom = {
+    ...defaultDarkTheme,
+    accent: "#FF00AA",
+    background: "#0A0A0A",
+    foreground: "#FFFFFF",
+  };
+  const normalized = normalizeAppearanceSettings({ dark: custom });
+
+  assert.equal(normalized.dark.accent, "#FF00AA");
+  assert.equal(normalized.dark.background, "#0A0A0A");
+});
+
+test("a partial match against a retired triple is left alone", () => {
+  // Same background as a retired default but a hand-picked accent: the user
+  // clearly touched this, so nothing may be reset.
+  const normalized = normalizeAppearanceSettings({
+    dark: { ...defaultDarkTheme, background: "#212121", accent: "#FF00AA" },
+  });
+
+  assert.equal(normalized.dark.background, "#212121");
+  assert.equal(normalized.dark.accent, "#FF00AA");
+});
+
 test("an explicit mode resolves to itself and ignores the OS", () => {
   assert.equal(resolveTheme("light"), "light");
   assert.equal(resolveTheme("dark"), "dark");
 });
 
-test("applies the light half when the mode is light", () => {
-  const { root, resolved } = applyTo({
-    ...defaultAppearanceSettings,
-    mode: "light",
-  });
+test("an untouched theme writes no color overrides at all", () => {
+  // The point of this: tokens.css owns the default ramp. Deriving every role
+  // from two colors produced a flatter palette and silently shadowed it.
+  for (const mode of ["light", "dark"] as const) {
+    const { root, resolved } = applyTo({ ...defaultAppearanceSettings, mode });
 
-  assert.equal(resolved, "light");
-  assert.equal(root.dataset.theme, "light");
-  assert.equal(root.properties.get("--accent"), defaultLightTheme.accent);
-  assert.equal(root.properties.get("--text"), defaultLightTheme.foreground);
-  assert.equal(root.properties.get("--app-bg"), defaultLightTheme.background);
+    assert.equal(resolved, mode);
+    assert.equal(root.dataset.theme, mode);
+    for (const token of [
+      "--accent",
+      "--app-bg",
+      "--surface",
+      "--surface-subtle",
+      "--text",
+      "--text-secondary",
+      "--text-muted",
+      "--border",
+      "--font-sans",
+      "--font-size-base",
+    ]) {
+      assert.equal(
+        root.properties.get(token),
+        undefined,
+        `${token} should be left to tokens.css in default ${mode} mode`,
+      );
+    }
+  }
 });
 
-test("applies the dark half, and the two halves stay independent", () => {
-  const { root, resolved } = applyTo({
+test("editing the accent overrides only the accent roles", () => {
+  const { root } = applyTo({
     ...defaultAppearanceSettings,
     mode: "dark",
     dark: { ...defaultDarkTheme, accent: "#123456" },
   });
 
-  assert.equal(resolved, "dark");
-  assert.equal(root.dataset.theme, "dark");
   assert.equal(root.properties.get("--accent"), "#123456");
-  // The light theme's accent must not leak into the dark render.
-  assert.notEqual(root.properties.get("--accent"), defaultLightTheme.accent);
+  assert.equal(root.properties.get("--focus-ring"), "#123456");
+  // Surfaces and text were not touched, so they stay with the stylesheet.
+  assert.equal(root.properties.get("--surface"), undefined);
+  assert.equal(root.properties.get("--text"), undefined);
+});
+
+test("editing the surface colors overrides the surface and text ramp", () => {
+  const { root } = applyTo({
+    ...defaultAppearanceSettings,
+    mode: "dark",
+    dark: { ...defaultDarkTheme, background: "#101010", foreground: "#FAFAFA" },
+  });
+
+  assert.equal(root.properties.get("--app-bg"), "#101010");
+  assert.equal(root.properties.get("--text"), "#FAFAFA");
+  assert.match(root.properties.get("--text-secondary") ?? "", /color-mix/);
+  // Dark surfaces sit above the page so cards keep an edge.
+  assert.match(root.properties.get("--surface") ?? "", /color-mix/);
+});
+
+test("a light surface override keeps the work surface equal to the page", () => {
+  const { root } = applyTo({
+    ...defaultAppearanceSettings,
+    mode: "light",
+    light: { ...defaultLightTheme, background: "#FEFEFE" },
+  });
+
+  assert.equal(root.properties.get("--app-bg"), "#FEFEFE");
+  assert.equal(root.properties.get("--surface"), "#FEFEFE");
 });
 
 test("a non-hex color in storage cannot reach a CSS value", () => {
@@ -133,10 +221,18 @@ test("a non-hex color in storage cannot reach a CSS value", () => {
     light: { ...defaultLightTheme, accent: "red; position: fixed" },
   });
 
-  assert.equal(root.properties.get("--accent"), defaultLightTheme.accent);
+  // It normalizes back to the default, which then writes no override at all.
+  const accent = root.properties.get("--accent");
+  assert.ok(
+    accent === undefined || accent === defaultLightTheme.accent,
+    `unexpected accent override: ${accent}`,
+  );
+  for (const value of root.properties.values()) {
+    assert.doesNotMatch(value, /position\s*:/);
+  }
 });
 
-test("font sizes are written as px and fonts pass through verbatim", () => {
+test("font and size overrides are written only when changed", () => {
   const { root } = applyTo({
     ...defaultAppearanceSettings,
     mode: "light",
@@ -163,6 +259,7 @@ test("contrast moves the border away from the surface monotonically", () => {
     return Number(percent);
   }
 
+  // 45 is the default, so it writes nothing; the neighbours bracket it.
   const low = borderFor(0);
   const mid = borderFor(50);
   const high = borderFor(100);

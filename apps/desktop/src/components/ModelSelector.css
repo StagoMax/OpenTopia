@@ -1,26 +1,30 @@
+/* Sits at the trailing edge of the composer toolbar, next to the send button. */
 .model-selector {
+  position: relative;
   display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .model-selector-trigger {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
+  max-width: 240px;
   height: var(--control-height-sm);
   padding: 0 var(--space-3);
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
   border-radius: var(--radius-md);
-  background: var(--surface);
-  color: var(--text);
+  background: transparent;
+  color: var(--text-secondary);
   font-family: var(--font-sans);
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-xs);
   cursor: pointer;
   transition: background var(--motion-fast) var(--ease-standard);
 }
 
-.model-selector-trigger:not(:disabled):hover {
+.model-selector-trigger:not(:disabled):hover,
+.model-selector-trigger[aria-expanded="true"] {
   background: var(--surface-hover);
 }
 
@@ -29,15 +33,115 @@
   cursor: not-allowed;
 }
 
-.model-selector-trigger--effort {
-  color: var(--text-secondary);
-}
-
-.model-selector-trigger-name {
-  max-width: 200px;
+.model-selector-trigger-model {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.model-selector-trigger-effort {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+
+.model-selector-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + var(--space-2));
+  z-index: var(--z-popover);
+  min-width: 240px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+  padding: var(--space-2);
+}
+
+/* Invisible bridge so crossing the gap from the trigger does not close it. */
+.model-selector-menu::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  right: 0;
+  left: 0;
+  height: var(--space-2);
+}
+
+.model-selector-row-wrap {
+  position: relative;
+}
+
+.model-selector-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  width: 100%;
+  height: var(--control-height-md);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.model-selector-row:not(:disabled):hover,
+.model-selector-row[aria-expanded="true"] {
+  background: var(--surface-hover);
+}
+
+.model-selector-row:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.model-selector-row-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-selector-row-value {
+  overflow: hidden;
+  max-width: 160px;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-selector-row--reset {
+  color: var(--text-secondary);
+}
+
+.model-selector-menu-separator {
+  margin: var(--space-2) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/*
+ * Submenus open leftward and grow upward: the composer lives at the bottom
+ * right of the window, so this is the only direction with room.
+ */
+.model-selector-submenu {
+  position: absolute;
+  right: calc(100% + var(--space-2));
+  bottom: 0;
+  z-index: var(--z-popover);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+}
+
+.model-selector-submenu--effort {
+  min-width: 160px;
+  padding: var(--space-2);
 }
 
 .model-menu {

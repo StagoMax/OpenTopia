@@ -57,11 +57,11 @@ import type { TaskNotificationPreferences } from "../taskNotifications";
 import type {
   AgentRuntimeSettings,
   AppSettings,
-  KeyringMetadata,
   PlatformInfo,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
+  ProviderSecretOutcome,
   ProviderSettings,
   SecretSources,
 } from "../types";
@@ -121,8 +121,8 @@ type SettingsPanelProps = {
   onStoreProviderApiKey(
     providerId: string,
     value: string,
-  ): Promise<KeyringMetadata | null>;
-  onDeleteProviderApiKey(providerId: string): Promise<KeyringMetadata | null>;
+  ): Promise<ProviderSecretOutcome>;
+  onDeleteProviderApiKey(providerId: string): Promise<ProviderSecretOutcome>;
   onNotificationPreferencesChange(
     preferences: TaskNotificationPreferences,
   ): void;
@@ -444,14 +444,24 @@ export function SettingsPanel({
         setStatusMessage("供应商名称不能为空。");
         return;
       }
+      // A backend that fails to restart is not a failed save: the key is
+      // already in the keyring. Collect those warnings and keep going so the
+      // user never loses the connection they just filled in.
+      const backendWarnings: string[] = [];
       for (const [providerId, apiKey] of Object.entries(pendingApiKeys)) {
         if (!apiKey.trim()) continue;
-        const metadata = await onStoreProviderApiKey(providerId, apiKey);
-        if (!metadata) {
-          setStatusMessage(
-            `无法安全保存 ${providerId} 的密钥，请检查系统密钥存储。`,
-          );
+        const outcome = await onStoreProviderApiKey(providerId, apiKey);
+        if (!outcome.stored) {
+          setEditingProviderId(providerId);
+          setActiveTab("providers");
+          setStatusMessage(`无法保存 ${providerId} 的密钥：${outcome.error}`);
           return;
+        }
+        const { metadata } = outcome;
+        if (metadata.backendRestart && !metadata.backendRestart.restarted) {
+          backendWarnings.push(
+            metadata.backendRestart.error ?? "本地后端未能重启。",
+          );
         }
         nextProviders = nextProviders.map((provider) =>
           provider.id === providerId
@@ -483,7 +493,11 @@ export function SettingsPanel({
         agentRuntime,
         sandboxSettings,
       );
-      setStatusMessage("设置已保存。");
+      setStatusMessage(
+        backendWarnings.length > 0
+          ? `设置已保存，密钥也已写入系统密钥库；但本地后端未能重启：${backendWarnings[0]} 请重启应用后再发起对话。`
+          : "设置已保存。",
+      );
     } finally {
       setIsApplyingSave(false);
     }
@@ -648,14 +662,24 @@ export function SettingsPanel({
                   setShowApiKey((value) => !value)
                 }
                 onDeleteProviderApiKey={async (providerId) => {
-                  const metadata = await onDeleteProviderApiKey(providerId);
-                  if (!metadata) return;
+                  const outcome = await onDeleteProviderApiKey(providerId);
+                  if (!outcome.stored) {
+                    setStatusMessage(
+                      `无法移除 ${providerId} 的密钥：${outcome.error}`,
+                    );
+                    return;
+                  }
                   updateProvider(providerId, "apiKeyConfigured", false);
                   setPendingApiKeys((current) => ({
                     ...current,
                     [providerId]: "",
                   }));
-                  setStatusMessage(`已移除 ${providerId} 的密钥。`);
+                  const restart = outcome.metadata.backendRestart;
+                  setStatusMessage(
+                    restart && !restart.restarted
+                      ? `已移除 ${providerId} 的密钥，但本地后端未能重启：${restart.error ?? "未知原因"}`
+                      : `已移除 ${providerId} 的密钥。`,
+                  );
                 }}
                 onTestProvider={onTestProvider}
                 onSyncProviderModels={onSyncProviderModels}
@@ -1578,12 +1602,9 @@ function ProviderSettingsView({
                         ))}
                       </select>
                       <small>
-                        {selectedReasoningEffort
-                          ? REASONING_EFFORT_DETAILS[selectedReasoningEffort]
-                              .description
-                          : reasoningCapability?.official
-                            ? `已按官方能力显示 ${reasoningCapability.supportedEfforts.length} 个可用档位。`
-                            : "模型能力未知，保留兼容供应商支持的全部档位。"}
+                        {reasoningCapability?.official
+                          ? `已按官方能力显示 ${reasoningCapability.supportedEfforts.length} 个可用档位。`
+                          : "模型能力未知，保留兼容供应商支持的全部档位。"}
                       </small>
                     </label>
                   )}

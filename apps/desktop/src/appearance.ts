@@ -53,15 +53,52 @@ export const defaultLightTheme: ThemeOverrides = {
   contrast: 45,
 };
 
+/*
+ * Mirrors the `[data-theme="dark"]` block in tokens.css. When the user has not
+ * edited a field, applyAppearance leaves the corresponding custom property
+ * alone so the stylesheet's hand-tuned ramp stays in charge.
+ */
 export const defaultDarkTheme: ThemeOverrides = {
-  accent: "#4C9BEA",
+  accent: "#5AA9F8",
   background: "#181818",
-  foreground: "#F2F3F5",
+  foreground: "#ECECEC",
   uiFont: DEFAULT_UI_FONT,
   codeFont: DEFAULT_CODE_FONT,
   translucentSidebar: true,
-  contrast: 60,
+  contrast: 45,
 };
+
+/**
+ * Dark color triples that shipped as defaults in earlier builds.
+ *
+ * A stored theme matching one of these was never actually chosen — it is just a
+ * captured default. Left alone it would read as a deliberate customization and
+ * pin the retired palette forever, so the colors are refreshed to the current
+ * default while any other edits (fonts, contrast, sidebar) are preserved.
+ */
+const retiredDarkColors: ReadonlyArray<
+  Pick<ThemeOverrides, "accent" | "background" | "foreground">
+> = [
+  { accent: "#4C9BEA", background: "#181818", foreground: "#F2F3F5" },
+  { accent: "#5AA9F8", background: "#212121", foreground: "#ECECEC" },
+  { accent: "#5AA9F8", background: "#141518", foreground: "#ECEEF2" },
+];
+
+function refreshRetiredDarkColors(theme: ThemeOverrides): ThemeOverrides {
+  const retired = retiredDarkColors.some(
+    (old) =>
+      old.accent === theme.accent &&
+      old.background === theme.background &&
+      old.foreground === theme.foreground,
+  );
+  if (!retired) return theme;
+  return {
+    ...theme,
+    accent: defaultDarkTheme.accent,
+    background: defaultDarkTheme.background,
+    foreground: defaultDarkTheme.foreground,
+  };
+}
 
 export const defaultAppearanceSettings: AppearanceSettings = {
   mode: "system",
@@ -74,7 +111,12 @@ export const defaultAppearanceSettings: AppearanceSettings = {
   diffMarkers: "color",
 };
 
-const storageKey = "opentopia.appearance.v1";
+/*
+ * v1 predates the "only override what changed" model and is not read. Later
+ * palette changes are handled by refreshRetiredDarkColors rather than another
+ * key bump, so a genuinely customized theme survives them.
+ */
+const storageKey = "opentopia.appearance.v2";
 
 const HEX_COLOR = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
@@ -159,7 +201,9 @@ export function normalizeAppearanceSettings(
       defaults.mode,
     ),
     light: normalizeThemeOverrides(raw.light, defaults.light),
-    dark: normalizeThemeOverrides(raw.dark, defaults.dark),
+    dark: refreshRetiredDarkColors(
+      normalizeThemeOverrides(raw.dark, defaults.dark),
+    ),
     pointerCursor: pickBoolean(raw.pointerCursor, defaults.pointerCursor),
     reduceMotion: pickEnum(
       raw.reduceMotion,
@@ -227,10 +271,14 @@ function borderMixPercent(contrast: number): number {
 /**
  * Writes the resolved theme onto <html>.
  *
- * Only the roles the user can actually edit are set inline; everything else
- * keeps cascading from tokens.css so the two stay in sync. Colors are validated
- * as hex before they are written, so a hand-edited storage payload cannot
- * inject arbitrary CSS here.
+ * Inline custom properties are only written for fields the user actually
+ * changed. An untouched field is *removed* from the inline style so the
+ * hand-tuned ramp in tokens.css stays in charge — deriving every role
+ * mechanically from two colors produces a flatter, muddier result than the
+ * stylesheet does, and it silently shadowed those values before.
+ *
+ * Colors are validated as hex before they are written, so a hand-edited
+ * storage payload cannot inject arbitrary CSS through this path.
  */
 export function applyAppearance(
   settings: AppearanceSettings,
@@ -238,7 +286,7 @@ export function applyAppearance(
 ): ResolvedTheme {
   const resolved = resolveTheme(settings.mode);
   const theme = resolved === "dark" ? settings.dark : settings.light;
-  const fallback = resolved === "dark" ? defaultDarkTheme : defaultLightTheme;
+  const base = resolved === "dark" ? defaultDarkTheme : defaultLightTheme;
 
   root.dataset.theme = resolved;
   root.dataset.diffMarkers = settings.diffMarkers;
@@ -247,63 +295,114 @@ export function applyAppearance(
   if (settings.reduceMotion === "system") delete root.dataset.reduceMotion;
   else root.dataset.reduceMotion = settings.reduceMotion;
 
-  const accent = normalizeHexColor(theme.accent, fallback.accent);
-  const background = normalizeHexColor(theme.background, fallback.background);
-  const foreground = normalizeHexColor(theme.foreground, fallback.foreground);
+  const accent = normalizeHexColor(theme.accent, base.accent);
+  const background = normalizeHexColor(theme.background, base.background);
+  const foreground = normalizeHexColor(theme.foreground, base.foreground);
 
   const style = root.style;
-  style.setProperty("--accent", accent);
-  style.setProperty(
+  /** Sets an override, or clears it so tokens.css wins again. */
+  const put = (name: string, value: string | null) => {
+    if (value === null) style.removeProperty(name);
+    else style.setProperty(name, value);
+  };
+
+  const accentEdited = accent !== base.accent;
+  const surfaceEdited =
+    background !== base.background || foreground !== base.foreground;
+  const bordersEdited = surfaceEdited || theme.contrast !== base.contrast;
+
+  put("--accent", accentEdited ? accent : null);
+  put("--focus-ring", accentEdited ? accent : null);
+  put(
     "--accent-hover",
-    `color-mix(in srgb, ${accent} 82%, ${foreground})`,
+    accentEdited ? `color-mix(in srgb, ${accent} 82%, ${foreground})` : null,
   );
-  style.setProperty(
+  put(
     "--accent-subtle",
-    `color-mix(in srgb, ${accent} 14%, ${background})`,
+    accentEdited || surfaceEdited
+      ? `color-mix(in srgb, ${accent} 16%, ${background})`
+      : null,
   );
-  style.setProperty("--focus-ring", accent);
-  style.setProperty("--app-bg", background);
-  style.setProperty("--surface", background);
-  style.setProperty(
+
+  // Work surfaces sit above the page in dark mode, which is what gives cards
+  // their edge; in light mode the page is already the lightest thing there is.
+  const elevation = resolved === "dark" ? 5 : 0;
+  put("--app-bg", surfaceEdited ? background : null);
+  put(
+    "--surface",
+    surfaceEdited
+      ? elevation
+        ? `color-mix(in srgb, ${foreground} ${elevation}%, ${background})`
+        : background
+      : null,
+  );
+  put(
     "--surface-subtle",
-    `color-mix(in srgb, ${foreground} 4%, ${background})`,
+    surfaceEdited
+      ? `color-mix(in srgb, ${foreground} ${elevation + 6}%, ${background})`
+      : null,
   );
-  style.setProperty(
+  put(
     "--surface-hover",
-    `color-mix(in srgb, ${foreground} 7%, ${background})`,
+    surfaceEdited
+      ? `color-mix(in srgb, ${foreground} ${elevation + 9}%, ${background})`
+      : null,
   );
-  style.setProperty(
+  put(
     "--surface-active",
-    `color-mix(in srgb, ${foreground} 12%, ${background})`,
+    surfaceEdited
+      ? `color-mix(in srgb, ${foreground} ${elevation + 14}%, ${background})`
+      : null,
   );
-  style.setProperty("--text", foreground);
-  style.setProperty(
+
+  put("--text", surfaceEdited ? foreground : null);
+  put(
     "--text-secondary",
-    `color-mix(in srgb, ${foreground} 68%, ${background})`,
+    surfaceEdited
+      ? `color-mix(in srgb, ${foreground} 82%, ${background})`
+      : null,
   );
-  style.setProperty(
+  put(
     "--text-muted",
-    `color-mix(in srgb, ${foreground} 48%, ${background})`,
+    surfaceEdited
+      ? `color-mix(in srgb, ${foreground} 62%, ${background})`
+      : null,
   );
 
   const mix = borderMixPercent(theme.contrast);
-  style.setProperty(
+  put(
     "--border-subtle",
-    `color-mix(in srgb, ${foreground} ${Math.max(4, mix - 6)}%, ${background})`,
+    bordersEdited
+      ? `color-mix(in srgb, ${foreground} ${Math.max(5, mix - 6)}%, ${background})`
+      : null,
   );
-  style.setProperty(
+  put(
     "--border",
-    `color-mix(in srgb, ${foreground} ${mix}%, ${background})`,
+    bordersEdited
+      ? `color-mix(in srgb, ${foreground} ${mix}%, ${background})`
+      : null,
   );
-  style.setProperty(
+  put(
     "--border-strong",
-    `color-mix(in srgb, ${foreground} ${Math.min(72, mix + 14)}%, ${background})`,
+    bordersEdited
+      ? `color-mix(in srgb, ${foreground} ${Math.min(72, mix + 14)}%, ${background})`
+      : null,
   );
 
-  style.setProperty("--font-sans", theme.uiFont);
-  style.setProperty("--font-mono", theme.codeFont);
-  style.setProperty("--font-size-base", `${settings.uiFontSize}px`);
-  style.setProperty("--font-size-code", `${settings.codeFontSize}px`);
+  put("--font-sans", theme.uiFont === base.uiFont ? null : theme.uiFont);
+  put("--font-mono", theme.codeFont === base.codeFont ? null : theme.codeFont);
+  put(
+    "--font-size-base",
+    settings.uiFontSize === defaultAppearanceSettings.uiFontSize
+      ? null
+      : `${settings.uiFontSize}px`,
+  );
+  put(
+    "--font-size-code",
+    settings.codeFontSize === defaultAppearanceSettings.codeFontSize
+      ? null
+      : `${settings.codeFontSize}px`,
+  );
 
   return resolved;
 }

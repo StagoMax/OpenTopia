@@ -1,18 +1,19 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
   ChevronRight,
+  RotateCcw,
   Search,
   Settings,
 } from "lucide-react";
 
-import { Popover } from "./ui";
 import "./ModelSelector.css";
 import {
   buildConnectionModelGroups,
   formatModelDisplayName,
   reconcileReasoningEffort,
+  resolveDefaultModelId,
   resolveReasoningOptions,
   REASONING_EFFORT_DETAILS,
 } from "../modelCatalog";
@@ -42,10 +43,17 @@ type ModelOption = {
   familyLabel: string;
 };
 
+type OpenSubmenu = "model" | "effort" | null;
+
+/** Grace period that covers the gap between the panel and an open submenu. */
+const CLOSE_DELAY_MS = 200;
+
 /**
- * Composer-level model picker. Selection is two-step by design: pick the model
- * first, then its reasoning effort, because the valid efforts depend on the
- * model.
+ * Composer-level model picker. It reads as a quiet status label — the model in
+ * use and its reasoning effort — and only becomes a menu on hover, so the
+ * composer toolbar is not carrying two dropdowns for a setting most turns leave
+ * alone. Choosing stays two-step by design: the valid efforts depend on the
+ * model, so effort lives in its own submenu.
  */
 export function ModelSelector({
   connections,
@@ -61,110 +69,237 @@ export function ModelSelector({
     selection,
   );
 
+  const [open, setOpen] = useState(false);
+  const [submenu, setSubmenu] = useState<OpenSubmenu>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const closeTimer = useRef<number | null>(null);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current === null) return;
+    window.clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+  }, []);
+
+  const closeAll = useCallback(() => {
+    cancelClose();
+    setOpen(false);
+    setSubmenu(null);
+  }, [cancelClose]);
+
+  // Pointer exits are forgiving: a keyboard user typing in the model search
+  // must not lose the panel just because the pointer drifted off it.
+  const scheduleClose = useCallback(() => {
+    cancelClose();
+    closeTimer.current = window.setTimeout(() => {
+      closeTimer.current = null;
+      if (rootRef.current?.contains(document.activeElement)) return;
+      setOpen(false);
+      setSubmenu(null);
+    }, CLOSE_DELAY_MS);
+  }, [cancelClose]);
+
+  useEffect(() => cancelClose, [cancelClose]);
+
+  useEffect(() => {
+    if (disabled) closeAll();
+  }, [closeAll, disabled]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    function onPointerDown(event: PointerEvent) {
+      if (rootRef.current?.contains(event.target as Node)) return;
+      closeAll();
+    }
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.stopPropagation();
+      if (submenu) {
+        setSubmenu(null);
+        return;
+      }
+      closeAll();
+      triggerRef.current?.focus();
+    }
+
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeAll, open, submenu]);
+
   if (!resolved) return null;
 
   const { connection, modelId, reasoningEffort } = resolved;
   const capability = resolveReasoningOptions(connection.kind, modelId);
+  const modelLabel = formatModelDisplayName(modelId);
   const effortLabel = reasoningEffort
     ? REASONING_EFFORT_DETAILS[reasoningEffort].label
     : null;
+  const supportsEffort = capability.supportedEfforts.length > 0;
+
+  const fallback = defaultSelectionFor(
+    connections.find((item) => item.id === activeConnectionId) ??
+      connections[0],
+  );
+  const isDefault =
+    connection.id === fallback.connectionId &&
+    modelId === fallback.modelId &&
+    reasoningEffort === fallback.reasoningEffort;
 
   return (
-    <div className="model-selector">
-      <Popover
-        label="选择模型"
-        trigger={(triggerProps) => (
-          <button
-            {...triggerProps}
-            className="model-selector-trigger"
-            disabled={disabled}
-            type="button"
-          >
-            <span className="model-selector-trigger-name">
-              {formatModelDisplayName(modelId)}
-            </span>
-            <ChevronDown aria-hidden="true" size={14} />
-          </button>
-        )}
+    <div
+      className="model-selector"
+      onMouseEnter={() => {
+        if (disabled) return;
+        cancelClose();
+        setOpen(true);
+      }}
+      onMouseLeave={scheduleClose}
+      ref={rootRef}
+    >
+      <button
+        aria-expanded={open}
+        aria-haspopup="menu"
+        className="model-selector-trigger"
+        disabled={disabled}
+        onClick={() => {
+          if (open) closeAll();
+          else setOpen(true);
+        }}
+        ref={triggerRef}
+        title={modelId}
+        type="button"
       >
-        {({ close }) => (
-          <ModelMenu
-            connections={connections}
-            onOpenSettings={() => {
-              close();
-              onOpenSettings();
-            }}
-            onSelect={(option) => {
-              onChange({
-                connectionId: option.connection.id,
-                modelId: option.modelId,
-                reasoningEffort: reconcileReasoningEffort(
-                  option.connection.kind,
-                  option.modelId,
-                  reasoningEffort,
-                ),
-              });
-              close();
-            }}
-            selectedConnectionId={connection.id}
-            selectedModelId={modelId}
-          />
-        )}
-      </Popover>
+        <span className="model-selector-trigger-model">{modelLabel}</span>
+        {effortLabel ? (
+          <span className="model-selector-trigger-effort">{effortLabel}</span>
+        ) : null}
+      </button>
 
-      {capability.supportedEfforts.length > 0 ? (
-        <Popover
-          align="end"
-          label="选择推理强度"
-          trigger={(triggerProps) => (
+      {open ? (
+        <div aria-label="模型设置" className="model-selector-menu" role="menu">
+          <div className="model-selector-row-wrap">
             <button
-              {...triggerProps}
-              className="model-selector-trigger model-selector-trigger--effort"
-              disabled={disabled}
+              aria-expanded={submenu === "model"}
+              aria-haspopup="menu"
+              className="model-selector-row"
+              onClick={() =>
+                setSubmenu((current) => (current === "model" ? null : "model"))
+              }
+              onMouseEnter={() => setSubmenu("model")}
+              role="menuitem"
               type="button"
             >
-              <span className="model-selector-trigger-name">
-                {effortLabel ?? "默认强度"}
-              </span>
-              <ChevronDown aria-hidden="true" size={14} />
+              <span className="model-selector-row-label">模型</span>
+              <span className="model-selector-row-value">{modelLabel}</span>
+              <ChevronRight aria-hidden="true" size={14} />
             </button>
-          )}
-        >
-          {({ close }) => (
-            <ul className="model-menu-list" role="listbox">
-              {capability.supportedEfforts.map((effort) => (
-                <li key={effort}>
-                  <button
-                    aria-selected={effort === reasoningEffort}
-                    className="model-menu-option"
-                    onClick={() => {
-                      onChange({
-                        connectionId: connection.id,
-                        modelId,
-                        reasoningEffort: effort,
-                      });
-                      close();
-                    }}
-                    role="option"
-                    type="button"
-                  >
-                    <span className="model-menu-option-main">
-                      <span className="model-menu-option-name">
-                        {REASONING_EFFORT_DETAILS[effort].label}
-                      </span>
-                      <span className="model-menu-option-meta">
-                        {REASONING_EFFORT_DETAILS[effort].description}
-                      </span>
-                    </span>
-                    {effort === reasoningEffort ? (
-                      <Check aria-hidden="true" size={14} />
-                    ) : null}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Popover>
+            {submenu === "model" ? (
+              <div className="model-selector-submenu">
+                <ModelMenu
+                  connections={connections}
+                  onOpenSettings={() => {
+                    closeAll();
+                    onOpenSettings();
+                  }}
+                  onSelect={(option) => {
+                    onChange({
+                      connectionId: option.connection.id,
+                      modelId: option.modelId,
+                      reasoningEffort: reconcileReasoningEffort(
+                        option.connection.kind,
+                        option.modelId,
+                        reasoningEffort,
+                      ),
+                    });
+                    setSubmenu(null);
+                  }}
+                  selectedConnectionId={connection.id}
+                  selectedModelId={modelId}
+                />
+              </div>
+            ) : null}
+          </div>
+
+          {supportsEffort ? (
+            <div className="model-selector-row-wrap">
+              <button
+                aria-expanded={submenu === "effort"}
+                aria-haspopup="menu"
+                className="model-selector-row"
+                onClick={() =>
+                  setSubmenu((current) =>
+                    current === "effort" ? null : "effort",
+                  )
+                }
+                onMouseEnter={() => setSubmenu("effort")}
+                role="menuitem"
+                type="button"
+              >
+                <span className="model-selector-row-label">推理强度</span>
+                <span className="model-selector-row-value">
+                  {effortLabel ?? "默认"}
+                </span>
+                <ChevronRight aria-hidden="true" size={14} />
+              </button>
+              {submenu === "effort" ? (
+                <div className="model-selector-submenu model-selector-submenu--effort">
+                  <ul className="model-menu-list" role="listbox">
+                    {capability.supportedEfforts.map((effort) => (
+                      <li key={effort}>
+                        <button
+                          aria-selected={effort === reasoningEffort}
+                          className="model-menu-option"
+                          onClick={() => {
+                            onChange({
+                              connectionId: connection.id,
+                              modelId,
+                              reasoningEffort: effort,
+                            });
+                            setSubmenu(null);
+                          }}
+                          role="option"
+                          type="button"
+                        >
+                          <span className="model-menu-option-main">
+                            <span className="model-menu-option-name">
+                              {REASONING_EFFORT_DETAILS[effort].label}
+                            </span>
+                          </span>
+                          {effort === reasoningEffort ? (
+                            <Check aria-hidden="true" size={14} />
+                          ) : null}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div className="model-selector-menu-separator" />
+
+          <button
+            className="model-selector-row model-selector-row--reset"
+            disabled={isDefault}
+            onClick={() => {
+              onChange(fallback);
+              closeAll();
+            }}
+            onMouseEnter={() => setSubmenu(null)}
+            role="menuitem"
+            type="button"
+          >
+            <span className="model-selector-row-label">重置为默认设置</span>
+            <RotateCcw aria-hidden="true" size={14} />
+          </button>
+        </div>
       ) : null}
     </div>
   );
@@ -371,6 +506,30 @@ function connectionModelIds(connection: ProviderSettings): string[] {
     return [configured, ...synced];
   }
   return synced.length > 0 ? synced : configured ? [configured] : [];
+}
+
+/**
+ * What "重置为默认设置" restores: the newest stable model of the active
+ * connection, matching how a brand-new task picks its model.
+ */
+function defaultSelectionFor(
+  connection: ProviderSettings,
+): ThreadModelSelection {
+  const modelIds = connectionModelIds(connection);
+  const modelId = resolveDefaultModelId(
+    modelIds,
+    connection.enabledFamilies ?? [],
+    connection.model,
+  );
+  return {
+    connectionId: connection.id,
+    modelId,
+    reasoningEffort: reconcileReasoningEffort(
+      connection.kind,
+      modelId,
+      connection.reasoningEffort ?? null,
+    ),
+  };
 }
 
 /**

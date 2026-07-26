@@ -25,36 +25,15 @@ export type ModelReasoningCapability = {
 };
 
 export const REASONING_EFFORT_DETAILS: Readonly<
-  Record<ReasoningEffort, { label: string; description: string }>
+  Record<ReasoningEffort, { label: string }>
 > = {
-  none: {
-    label: "无推理 · 最快",
-    description: "适合检索、分类等延迟优先任务。",
-  },
-  minimal: {
-    label: "最小 · 轻量",
-    description: "使用很少或不使用推理 Token，适合提取与格式化。",
-  },
-  low: {
-    label: "低 · 快速",
-    description: "兼顾基础规划、工具调用、速度与成本。",
-  },
-  medium: {
-    label: "中 · 均衡",
-    description: "质量、可靠性、延迟与成本的平衡起点。",
-  },
-  high: {
-    label: "高 · 深度",
-    description: "适合复杂调试、规划和高价值任务。",
-  },
-  xhigh: {
-    label: "超高 · 长任务",
-    description: "适合深度研究、审查和长时间智能体任务。",
-  },
-  max: {
-    label: "最大 · 极复杂",
-    description: "为最复杂任务投入最多推理，延迟和成本最高。",
-  },
+  none: { label: "None" },
+  minimal: { label: "Minimal" },
+  low: { label: "Low" },
+  medium: { label: "Medium" },
+  high: { label: "High" },
+  xhigh: { label: "XHigh" },
+  max: { label: "Max" },
 };
 
 const ALL_REASONING_EFFORTS = [

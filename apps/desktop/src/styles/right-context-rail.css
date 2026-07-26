@@ -69,7 +69,7 @@
   border: 0;
   border-radius: 5px;
   background: transparent;
-  color: #858b85;
+  color: var(--text-muted);
   padding: 0;
   cursor: pointer;
   transition:
@@ -79,17 +79,17 @@
 
 .right-context-rail__header-action:hover {
   background: var(--rail-hover);
-  color: #4f5750;
+  color: var(--text-secondary);
 }
 
 .right-context-rail__header-action:disabled {
   cursor: not-allowed;
-  color: #a4aaa4;
+  color: var(--text-muted);
 }
 
 .right-context-rail__header-action:disabled:hover {
   background: transparent;
-  color: #a4aaa4;
+  color: var(--text-muted);
 }
 
 .right-context-rail__header-action:focus-visible,
@@ -129,7 +129,7 @@ button.right-context-rail__row {
 
 button.right-context-rail__row:hover:not(:disabled) {
   background: var(--rail-hover);
-  color: #343a34;
+  color: var(--text);
 }
 
 button.right-context-rail__row:disabled {
@@ -139,13 +139,13 @@ button.right-context-rail__row:disabled {
 
 .right-context-rail__row > svg {
   align-self: center;
-  color: #636a64;
+  color: var(--text-secondary);
   stroke-width: 1.7;
 }
 
 .right-context-rail__row:disabled > svg,
 .right-context-rail__row.is-empty > svg {
-  color: #a5aaa5;
+  color: var(--text-muted);
 }
 
 .right-context-rail__row-label {
@@ -160,14 +160,14 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__row.is-source .right-context-rail__row-label {
-  color: #727972;
+  color: var(--text-muted);
 }
 
 .right-context-rail__status {
   display: block;
   max-inline-size: 105px;
   overflow: hidden;
-  color: #596059;
+  color: var(--text-secondary);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   font-weight: 550;
@@ -208,7 +208,7 @@ button.right-context-rail__row:disabled {
   align-items: center;
   justify-content: flex-end;
   gap: 3px;
-  color: #7b827b;
+  color: var(--text-muted);
 }
 
 .right-context-rail__diff-stats {
@@ -217,7 +217,7 @@ button.right-context-rail__row:disabled {
   align-items: center;
   justify-content: flex-end;
   gap: 4px;
-  color: #777e77;
+  color: var(--text-muted);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -263,11 +263,11 @@ button.right-context-rail__row:disabled {
   display: grid;
   width: min(440px, calc(100vw - 32px));
   gap: 12px;
-  border: 1px solid #d9ddd8;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--surface);
   box-shadow: 0 18px 60px rgb(31 38 31 / 20%);
-  color: #343a34;
+  color: var(--text);
   padding: 16px;
   font:
     12px/1.5 Inter,
@@ -289,17 +289,17 @@ button.right-context-rail__row:disabled {
 .right-context-rail__dialog header span,
 .right-context-rail__dialog p {
   margin: 0;
-  color: #747b74;
+  color: var(--text-muted);
 }
 
 .right-context-rail__dialog input,
 .right-context-rail__dialog textarea {
   width: 100%;
-  border: 1px solid #d9ddd8;
+  border: 1px solid var(--border);
   border-radius: 6px;
   outline: 0;
-  background: #fbfcfa;
-  color: #343a34;
+  background: var(--success-subtle);
+  color: var(--text);
   padding: 7px 8px;
   font: inherit;
   resize: vertical;
@@ -318,17 +318,17 @@ button.right-context-rail__row:disabled {
 
 .right-context-rail__dialog footer button {
   min-height: 30px;
-  border: 1px solid #d9ddd8;
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: #f5f7f4;
-  color: #4b514b;
+  background: var(--success-subtle);
+  color: var(--text-secondary);
   padding: 0 12px;
 }
 
 .right-context-rail__dialog footer button[type="submit"] {
-  border-color: #337764;
-  background: #337764;
-  color: #fff;
+  border-color: color-mix(in srgb, var(--success) 34%, var(--border));
+  background: var(--success);
+  color: var(--on-accent);
 }
 
 .right-context-rail__dialog footer button:disabled {
@@ -344,7 +344,7 @@ button.right-context-rail__row:disabled {
   gap: 6px;
   border: 0;
   border-radius: 4px;
-  background: #fff4f3;
+  background: var(--danger-subtle);
   color: var(--rail-danger);
   padding: 5px 4px;
   text-align: left;
@@ -382,7 +382,7 @@ button.right-context-rail__row:disabled {
 
 .right-context-rail__git-dialog-header small {
   overflow: hidden;
-  color: #7b827b;
+  color: var(--text-muted);
   font-size: 10px;
   font-weight: 400;
   text-overflow: ellipsis;
@@ -403,12 +403,12 @@ button.right-context-rail__row:disabled {
   border: 0;
   border-radius: 5px;
   background: transparent;
-  color: #6d746d;
+  color: var(--text-secondary);
   padding: 0;
 }
 
 .right-context-rail__icon-button:hover:not(:disabled) {
-  background: #f1f4f0;
+  background: var(--success-subtle);
 }
 
 .right-context-rail__icon-button:disabled {
@@ -419,7 +419,7 @@ button.right-context-rail__row:disabled {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 2px;
-  border-bottom: 1px solid #e7eae6;
+  border-bottom: 1px solid var(--border);
   padding: 0 14px;
 }
 
@@ -428,17 +428,17 @@ button.right-context-rail__row:disabled {
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
-  color: #727972;
+  color: var(--text-muted);
   padding: 0 8px;
 }
 
 .right-context-rail__git-tabs button:hover:not(:disabled) {
-  color: #343a34;
+  color: var(--text);
 }
 
 .right-context-rail__git-tabs button.is-active {
-  border-bottom-color: #337764;
-  color: #285f50;
+  border-bottom-color: color-mix(in srgb, var(--success) 34%, var(--border));
+  color: var(--success);
   font-weight: 600;
 }
 
@@ -453,13 +453,13 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__git-message.is-error {
-  background: #fff2f1;
-  color: #a53f45;
+  background: var(--danger-subtle);
+  color: var(--danger);
 }
 
 .right-context-rail__git-message.is-success {
-  background: #eef8f1;
-  color: #26734f;
+  background: var(--success-subtle);
+  color: var(--success);
 }
 
 .right-context-rail__git-pane {
@@ -473,7 +473,7 @@ button.right-context-rail__row:disabled {
   max-height: 300px;
   gap: 2px;
   overflow: auto;
-  border-bottom: 1px solid #e7eae6;
+  border-bottom: 1px solid var(--border);
   padding: 2px 0 10px;
 }
 
@@ -484,13 +484,13 @@ button.right-context-rail__row:disabled {
   align-items: center;
   gap: 7px;
   border-radius: 5px;
-  color: #4b514b;
+  color: var(--text-secondary);
   padding: 4px 6px;
 }
 
 .right-context-rail__branch-item:hover,
 .right-context-rail__branch-item.is-current {
-  background: #f5f7f4;
+  background: var(--success-subtle);
 }
 
 .right-context-rail__branch-item > span:nth-child(2) {
@@ -507,7 +507,7 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__branch-item small {
-  color: #858c85;
+  color: var(--text-muted);
   font-size: 10px;
   font-weight: 400;
 }
@@ -518,21 +518,21 @@ button.right-context-rail__row:disabled {
   min-height: 26px;
   align-items: center;
   gap: 3px;
-  border: 1px solid #d9ddd8;
+  border: 1px solid var(--border);
   border-radius: 5px;
-  background: #fff;
-  color: #596059;
+  background: var(--surface);
+  color: var(--text-secondary);
   padding: 0 8px;
 }
 
 .right-context-rail__branch-current {
   border-color: transparent;
   background: transparent;
-  color: #26734f;
+  color: var(--success);
 }
 
 .right-context-rail__remote-branches {
-  color: #747b74;
+  color: var(--text-muted);
   padding: 5px 6px 0 25px;
 }
 
@@ -560,7 +560,7 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__git-form label {
-  color: #555c55;
+  color: var(--text-secondary);
   font-weight: 550;
 }
 
@@ -572,10 +572,10 @@ button.right-context-rail__row:disabled {
 .right-context-rail__primary-button,
 .right-context-rail__git-form > footer button[type="submit"] {
   min-height: 32px;
-  border: 1px solid #337764;
+  border: 1px solid color-mix(in srgb, var(--success) 34%, var(--border));
   border-radius: 6px;
-  background: #337764;
-  color: #fff;
+  background: var(--success);
+  color: var(--on-accent);
   padding: 0 12px;
 }
 
@@ -592,10 +592,10 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__git-summary span {
-  border: 1px solid #e1e5e0;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: #f7f9f6;
-  color: #676e67;
+  background: var(--success-subtle);
+  color: var(--text-secondary);
   padding: 3px 7px;
 }
 
@@ -622,7 +622,7 @@ button.right-context-rail__row:disabled {
 
 .right-context-rail__checkbox-row small,
 .right-context-rail__git-hero-icon small {
-  color: #858c85;
+  color: var(--text-muted);
   font-size: 10px;
   font-weight: 400;
 }
@@ -639,8 +639,8 @@ button.right-context-rail__row:disabled {
   align-items: center;
   gap: 8px;
   border-radius: 6px;
-  background: #f5f8f5;
-  color: #3e6f60;
+  background: var(--success-subtle);
+  color: var(--success);
   padding: 10px;
 }
 
@@ -652,9 +652,9 @@ button.right-context-rail__row:disabled {
 .right-context-rail__segmented {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  border: 1px solid #d9ddd8;
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: #f5f7f4;
+  background: var(--success-subtle);
   padding: 2px;
 }
 
@@ -663,13 +663,13 @@ button.right-context-rail__row:disabled {
   border: 0;
   border-radius: 4px;
   background: transparent;
-  color: #747b74;
+  color: var(--text-muted);
 }
 
 .right-context-rail__segmented button.is-active {
-  background: #fff;
+  background: var(--surface);
   box-shadow: 0 1px 2px rgb(31 38 31 / 10%);
-  color: #3f664f;
+  color: var(--success);
   font-weight: 550;
 }
 
@@ -677,9 +677,9 @@ button.right-context-rail__row:disabled {
   display: grid;
   min-height: 0;
   overflow: hidden;
-  border: 1px solid #dfe3de;
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: #fbfcfa;
+  background: var(--success-subtle);
 }
 
 .right-context-rail__dialog .right-context-rail__compare-result header {
@@ -687,12 +687,12 @@ button.right-context-rail__row:disabled {
   min-height: 34px;
   align-items: center;
   justify-content: space-between;
-  border-bottom: 1px solid #e7eae6;
+  border-bottom: 1px solid var(--border);
   padding: 0 9px;
 }
 
 .right-context-rail__compare-result header span {
-  color: #858c85;
+  color: var(--text-muted);
   font-size: 10px;
 }
 
@@ -700,7 +700,7 @@ button.right-context-rail__row:disabled {
   max-height: 300px;
   overflow: auto;
   margin: 0;
-  color: #3f463f;
+  color: var(--text);
   padding: 9px;
   font:
     10px/1.45 "SFMono-Regular",
@@ -711,7 +711,7 @@ button.right-context-rail__row:disabled {
 
 .right-context-rail__git-empty {
   margin: 0;
-  color: #858c85;
+  color: var(--text-muted);
   padding: 12px 6px;
 }
 
@@ -719,11 +719,11 @@ button.right-context-rail__row:disabled {
   display: grid;
   width: min(390px, calc(100vw - 24px));
   overflow: hidden;
-  border: 1px solid #dfe2df;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--surface);
   box-shadow: 0 18px 54px rgb(31 38 31 / 20%);
-  color: #3f4540;
+  color: var(--text);
   font:
     13px/1.45 Inter,
     ui-sans-serif,
@@ -766,21 +766,21 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__commit-stats .is-addition {
-  color: #079c4a;
+  color: var(--success);
 }
 
 .right-context-rail__commit-stats .is-deletion {
-  color: #d94545;
+  color: var(--danger);
 }
 
 .right-context-rail__commit-message {
   min-height: 116px;
   border: 0;
-  border-block: 1px solid #eceeec;
+  border-block: 1px solid var(--border-subtle);
   border-radius: 0;
   outline: 0;
-  background: #fff;
-  color: #363b37;
+  background: var(--surface);
+  color: var(--text);
   padding: 14px 16px;
   font: inherit;
   line-height: 1.5;
@@ -788,7 +788,7 @@ button.right-context-rail__row:disabled {
 }
 
 .right-context-rail__commit-message::placeholder {
-  color: #919692;
+  color: var(--text-muted);
 }
 
 .right-context-rail__commit-message:focus {
@@ -800,7 +800,7 @@ button.right-context-rail__row:disabled {
   min-height: 48px;
   align-items: center;
   gap: 8px;
-  border-bottom: 1px solid #eceeec;
+  border-bottom: 1px solid var(--border-subtle);
   cursor: pointer;
   padding: 8px 16px;
 }
@@ -819,9 +819,9 @@ button.right-context-rail__row:disabled {
   width: 18px;
   height: 18px;
   flex: 0 0 18px;
-  border: 1px solid #d8ddd9;
+  border: 1px solid var(--border);
   border-radius: 50%;
-  color: #2f6d5c;
+  color: var(--success);
   padding: 2px;
 }
 
@@ -853,14 +853,14 @@ button.right-context-rail__row:disabled {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: #454a46;
+  color: var(--text);
   padding: 0 10px;
   text-align: left;
 }
 
 .right-context-rail__commit-actions button:hover:not(:disabled),
 .right-context-rail__commit-actions button.is-primary {
-  background: #f2f4f2;
+  background: var(--surface-subtle);
 }
 
 .right-context-rail__commit-actions button:focus-visible {
@@ -875,8 +875,8 @@ button.right-context-rail__row:disabled {
 
 .right-context-rail__commit-actions kbd {
   border-radius: 4px;
-  background: #e4e7e4;
-  color: #6d736e;
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
   padding: 1px 5px;
   font:
     11px/1.45 "SFMono-Regular",

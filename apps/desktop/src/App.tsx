@@ -70,6 +70,10 @@ import {
 } from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
+import type {
+  DiffReviewFileContent,
+  DiffReviewGitAction,
+} from "./components/DiffReviewPanel";
 import { LogViewer } from "./components/LogViewer";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ModelSelector } from "./components/ModelSelector";
@@ -90,6 +94,10 @@ import { ComputerPanel } from "./components/ComputerPanel";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
 import { normalizeCopiedText } from "./clipboardText";
 import { resolveMarkdownLink } from "./markdownLinks";
+import {
+  useWorkspacePathIndex,
+  WorkspacePathIndexContext,
+} from "./components/WorkspacePathProvider";
 import {
   reconcileReasoningEffort,
   resolveDefaultModelId,
@@ -145,16 +153,17 @@ import type {
   McpServerView,
   Message,
   MessagePart,
-  KeyringMetadata,
   PlatformInfo,
   PluginView,
   Project,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
+  ProviderSecretOutcome,
   ProviderSettings,
   PreviewTarget,
   RecentWorkspace,
+  ReviewFileRequest,
   SandboxDescriptor,
   SecretSources,
   SkillDescriptor,
@@ -439,6 +448,9 @@ export function App() {
   const [client, setClient] = useState<ApiClient | null>(null);
   const [serverStatus, setServerStatus] = useState<ServerStatus>("checking");
   const [serverError, setServerError] = useState<string | null>(null);
+  const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
+  const [serverProbing, setServerProbing] = useState(true);
+  const clientEndpointRef = useRef<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
@@ -542,6 +554,12 @@ export function App() {
     null,
   );
   const [hunkActionKey, setHunkActionKey] = useState<string | null>(null);
+  // File the review panel was last asked to show. Bumped with a nonce so
+  // re-picking the same file after browsing away still refocuses it.
+  const [reviewFileRequest, setReviewFileRequest] = useState<{
+    path: string;
+    nonce: number;
+  } | null>(null);
   const [toolTabs, setToolTabs] = useState<ToolTab[]>([]);
   const [activeToolTabId, setActiveToolTabId] = useState<string | null>(null);
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
@@ -589,6 +607,11 @@ export function App() {
     activeThread?.workspaceRoot ??
     draftProject?.workspaceRoot ??
     null;
+  const workspacePathIndex = useWorkspacePathIndex({
+    client,
+    threadId: activeThread?.id ?? null,
+    workspaceRoot: activeThread?.workspaceRoot ?? null,
+  });
   const activeToolTab = useMemo(
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
@@ -717,17 +740,23 @@ export function App() {
   // Appearance is applied to <html> rather than held in React state, so the
   // whole tree (including portals and the Monaco host) picks it up from CSS.
   useEffect(() => {
-    setResolvedTheme(applyAppearance(appearance));
+    const resolved = applyAppearance(appearance);
+    setResolvedTheme(resolved);
     writeAppearanceSettings(appearance);
+    // The Windows caption buttons are outside the document, so CSS cannot
+    // reach them; the main process has to repaint them for us.
+    void window.opentopia?.setTheme(resolved);
   }, [appearance]);
 
   // Only follow the OS while the user is on "system"; an explicit choice must
   // survive the OS flipping underneath it.
   useEffect(() => {
     if (appearance.mode !== "system") return undefined;
-    return watchSystemTheme(() =>
-      setResolvedTheme(applyAppearance(appearance)),
-    );
+    return watchSystemTheme(() => {
+      const resolved = applyAppearance(appearance);
+      setResolvedTheme(resolved);
+      void window.opentopia?.setTheme(resolved);
+    });
   }, [appearance]);
 
   useEffect(() => {
@@ -1011,11 +1040,16 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false;
-    void loadPlatformInfo().then(async (info) => {
+    setServerProbing(true);
+    const bootstrapping = loadPlatformInfo().then(async (info) => {
       if (cancelled) return;
       const nextClient = new ApiClient(info.backendUrl);
       setPlatform(info);
-      setClient(nextClient);
+      // Retries reuse the existing client so effects keyed on it do not re-fire
+      // once every probe; only a reassigned backend port swaps the instance.
+      const sameEndpoint = clientEndpointRef.current === info.backendUrl;
+      clientEndpointRef.current = info.backendUrl;
+      setClient((current) => (current && sameEndpoint ? current : nextClient));
 
       try {
         const sources = await listSecretSources();
@@ -1099,17 +1133,40 @@ export function App() {
             null,
         );
         setServerStatus("online");
+        setServerError(null);
+        setServerProbing(false);
       } catch (error) {
         if (cancelled) return;
-        setServerStatus("offline");
+        // Stay in "checking" for the first probes: a warm dev launch answers
+        // within a second, and flashing the waiting screen is just noise.
+        setServerStatus(bootstrapAttempt >= 2 ? "offline" : "checking");
         setServerError(error instanceof Error ? error.message : String(error));
+        setServerProbing(false);
       }
+    });
+    void bootstrapping.catch((error) => {
+      if (cancelled) return;
+      setServerStatus(bootstrapAttempt >= 2 ? "offline" : "checking");
+      setServerError(error instanceof Error ? error.message : String(error));
+      setServerProbing(false);
     });
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [bootstrapAttempt]);
+
+  // In dev the backend is spawned through `cargo run`, so a cold or post-edit
+  // build routinely outlasts the first health probe. Keep probing instead of
+  // stranding the window on the offline screen until someone reloads it.
+  useEffect(() => {
+    if (serverStatus === "online" || serverProbing) return;
+    const timer = setTimeout(
+      () => setBootstrapAttempt((attempt) => attempt + 1),
+      bootstrapAttempt < 4 ? 500 : 2000,
+    );
+    return () => clearTimeout(timer);
+  }, [serverStatus, serverProbing, bootstrapAttempt]);
 
   // New tasks start on the newest stable model of the active connection. This is
   // why there is no "quality vs. speed" preference to configure: the latest
@@ -1456,6 +1513,18 @@ export function App() {
     );
     setActiveToolTabId(id);
     setConversationCollapsed(false);
+  }
+
+  // Entry point for "review this file": the change card, and anything else that
+  // wants to hand a path to the side review panel, calls this instead of
+  // opening its own viewer.
+  function openFileReview(path: string) {
+    setReviewFileRequest((current) => ({
+      path,
+      nonce: (current?.nonce ?? 0) + 1,
+    }));
+    openToolTab("diff");
+    void refreshWorkbench();
   }
 
   function toggleToolPanel(kind: Exclude<ToolTabKind, "preview">) {
@@ -2416,6 +2485,69 @@ export function App() {
     }
   }
 
+  // Review panel plumbing: opening a changed file in its own tab, reading the
+  // working-tree file behind a diff, and the per-turn diff baselines.
+  function openReviewFileTab(path: string) {
+    if (!activeThread) {
+      setActionError("Open a task before opening a file.");
+      return;
+    }
+    openPreviewTab(
+      activeThread.id,
+      { type: "workspace", path },
+      markdownLinkTitle(path),
+    );
+  }
+
+  async function loadReviewFileContent(
+    path: string,
+  ): Promise<DiffReviewFileContent> {
+    if (!client || !activeThread) throw new Error("服务尚未连接。");
+    const preview = await client.readWorkspaceFile(activeThread.id, path);
+    return { content: preview.content, truncated: preview.truncated };
+  }
+
+  async function loadReviewTurnFileDiff(
+    turnId: string,
+    path: string,
+  ): Promise<string> {
+    if (!client || !activeThread) throw new Error("服务尚未连接。");
+    const preview = await client.getTurnFileDiffPreview(
+      activeThread.id,
+      turnId,
+      path,
+    );
+    return preview.diff;
+  }
+
+  async function runReviewGitAction(
+    action: DiffReviewGitAction,
+    message: string,
+  ): Promise<string> {
+    if (!client || !activeThread) throw new Error("服务尚未连接。");
+    const threadId = activeThread.id;
+    const notices: string[] = [];
+    if (action === "commit" || action === "commit_push") {
+      if (!message.trim()) throw new Error("请填写提交信息。");
+      await client.runGitWorkflow(threadId, {
+        type: "commit",
+        request: { message, allTracked: true },
+      });
+      notices.push("提交已创建");
+    }
+    if (action === "push" || action === "commit_push") {
+      const status = await client.getGitStatus(threadId);
+      const branch = status.branch ?? "HEAD";
+      await client.runGitWorkflow(threadId, {
+        type: "push",
+        request: { remote: "origin", branch, setUpstream: !status.upstream },
+      });
+      notices.push(`已推送 ${branch}`);
+    }
+    await refreshWorkbench();
+    return notices.join("，");
+  }
+
   async function openTurnUndo(turnId: string) {
     if (!client || !activeThread) return;
     const threadId = activeThread.id;
@@ -2562,20 +2694,26 @@ export function App() {
     }
   }
 
+  // The failure reason is returned rather than only pushed into `serverError`,
+  // so the settings panel can tell the user what actually went wrong instead of
+  // guessing that the keyring was at fault.
   async function storeProviderApiKey(
     providerId: string,
     value: string,
-  ): Promise<KeyringMetadata | null> {
-    if (isSavingSecret) return null;
+  ): Promise<ProviderSecretOutcome> {
+    if (isSavingSecret) {
+      return { stored: false, error: "另一个密钥操作正在进行中，请稍后重试。" };
+    }
     setIsSavingSecret(true);
     setServerError(null);
     try {
       const metadata = await setProviderApiKey(providerId, value);
       setSecretSources(await listSecretSources());
-      return metadata;
+      return { stored: true, metadata };
     } catch (error) {
-      setServerError(error instanceof Error ? error.message : String(error));
-      return null;
+      const message = errorMessage(error);
+      setServerError(message);
+      return { stored: false, error: message };
     } finally {
       setIsSavingSecret(false);
     }
@@ -2583,17 +2721,20 @@ export function App() {
 
   async function removeProviderApiKey(
     providerId: string,
-  ): Promise<KeyringMetadata | null> {
-    if (isSavingSecret) return null;
+  ): Promise<ProviderSecretOutcome> {
+    if (isSavingSecret) {
+      return { stored: false, error: "另一个密钥操作正在进行中，请稍后重试。" };
+    }
     setIsSavingSecret(true);
     setServerError(null);
     try {
       const metadata = await deleteProviderApiKey(providerId);
       setSecretSources(await listSecretSources());
-      return metadata;
+      return { stored: true, metadata };
     } catch (error) {
-      setServerError(error instanceof Error ? error.message : String(error));
-      return null;
+      const message = errorMessage(error);
+      setServerError(message);
+      return { stored: false, error: message };
     } finally {
       setIsSavingSecret(false);
     }
@@ -2876,446 +3017,461 @@ export function App() {
   });
 
   return (
-    <div className="app-shell">
-      <TopBar
-        sidebarCollapsed={sidebarCollapsed}
-        onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
-        onNewTask={beginNewThread}
-        onOpenWorkspace={() => void chooseWorkspace()}
-        onToggleTool={toggleToolPanel}
-        onOpenSettings={() => setSettingsOpen(true)}
-        onOpenLogs={() => setLogViewerOpen(true)}
-        onShowKeyboardShortcuts={() => setKeyboardShortcutsOpen(true)}
-        onShowAbout={() => setAboutOpen(true)}
-        menuSuppressed={settingsOpen || keyboardShortcutsOpen || aboutOpen}
-      />
-      {actionError && (
-        <div className="action-error" role="alert">
-          <span>{actionError}</span>
-          <button
-            type="button"
-            title="关闭"
-            aria-label="关闭错误提示"
-            onClick={() => setActionError(null)}
-          >
-            <X size={14} />
-          </button>
-        </div>
-      )}
-      <main
-        ref={workspaceRef}
-        className={`workspace ${activeToolTab ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
-        style={workspaceStyle}
-      >
-        <Sidebar
-          projects={projects}
-          threads={threads}
-          activeThreadId={activeThreadId}
-          activeProjectId={activeThread?.projectId ?? draftProjectId}
-          activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
-          workspaceError={workspaceError}
-          isPickingWorkspace={isPickingWorkspace}
-          experienceMode={experienceMode}
-          onExperienceModeChange={changeExperienceMode}
-          onSelect={selectThread}
-          onNew={beginNewThread}
-          onPickWorkspace={() => void chooseWorkspace()}
-          onCreateProject={createBlankProject}
-          onRemoveProject={(project) => void removeProject(project)}
-          onRenameProject={(project) =>
-            setRenameTarget({
-              kind: "project",
-              id: project.id,
-              name: project.name,
-            })
-          }
-          onToggleProjectPinned={(project) => void toggleProjectPinned(project)}
-          onSelectProject={beginProjectDraft}
-          onNewThreadForProject={handleNewThreadForProject}
-          onRenameThread={(thread) =>
-            setRenameTarget({
-              kind: "thread",
-              id: thread.id,
-              name: thread.title,
-            })
-          }
-          onArchiveThread={(thread) => void archiveThread(thread)}
-          onRestoreThread={(thread) => void restoreThread(thread)}
-          onOpenThreadWorkspace={(workspaceRoot) =>
-            void openWorkspaceRoot(workspaceRoot)
-          }
-          onOpenExtensions={() => openToolTab("extensions")}
-          onSettings={() => setSettingsOpen(true)}
+    <WorkspacePathIndexContext.Provider value={workspacePathIndex}>
+      <div className="app-shell">
+        <TopBar
+          sidebarCollapsed={sidebarCollapsed}
+          onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
+          onNewTask={beginNewThread}
+          onOpenWorkspace={() => void chooseWorkspace()}
+          onToggleTool={toggleToolPanel}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenLogs={() => setLogViewerOpen(true)}
+          onShowKeyboardShortcuts={() => setKeyboardShortcutsOpen(true)}
+          onShowAbout={() => setAboutOpen(true)}
+          menuSuppressed={settingsOpen || keyboardShortcutsOpen || aboutOpen}
         />
-        {!settingsOpen && !sidebarCollapsed ? (
-          <div
-            className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
-            role="separator"
-            tabIndex={0}
-            aria-label="调整左侧栏宽度"
-            aria-controls="workspace-sidebar"
-            aria-orientation="vertical"
-            aria-valuemin={workspaceLayout.leftMin}
-            aria-valuemax={workspaceLayout.leftMax}
-            aria-valuenow={workspaceLayout.left}
-            aria-valuetext={`${workspaceLayout.left} 像素`}
-            onPointerDown={(event) => beginWorkspaceResize("left", event)}
-            onPointerMove={(event) => continueWorkspaceResize("left", event)}
-            onPointerUp={(event) => finishWorkspaceResize("left", event)}
-            onPointerCancel={(event) => finishWorkspaceResize("left", event)}
-            onLostPointerCapture={(event) =>
-              finishWorkspaceResize("left", event)
-            }
-            onDoubleClick={() => resetWorkspacePanelSize("left")}
-            onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
-          />
-        ) : null}
-        <section
-          className={`center-pane ${
-            activeApproval
-              ? "has-approval"
-              : activeUserInput
-                ? "has-plan-choice"
-                : ""
-          }`}
-          id="workspace-center-pane"
+        {actionError && (
+          <div className="action-error" role="alert">
+            <span>{actionError}</span>
+            <button
+              type="button"
+              title="关闭"
+              aria-label="关闭错误提示"
+              onClick={() => setActionError(null)}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
+        <main
+          ref={workspaceRef}
+          className={`workspace ${activeToolTab ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
+          style={workspaceStyle}
         >
-          <ThreadHeader
-            thread={activeThread}
-            onOpenLocation={() =>
-              activeThread && void openWorkspaceRoot(activeThread.workspaceRoot)
-            }
-            onOpenTool={openToolTab}
-            onRename={() =>
-              activeThread &&
+          <Sidebar
+            projects={projects}
+            threads={threads}
+            activeThreadId={activeThreadId}
+            activeProjectId={activeThread?.projectId ?? draftProjectId}
+            activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
+            workspaceError={workspaceError}
+            isPickingWorkspace={isPickingWorkspace}
+            experienceMode={experienceMode}
+            onExperienceModeChange={changeExperienceMode}
+            onSelect={selectThread}
+            onNew={beginNewThread}
+            onPickWorkspace={() => void chooseWorkspace()}
+            onCreateProject={createBlankProject}
+            onRemoveProject={(project) => void removeProject(project)}
+            onRenameProject={(project) =>
               setRenameTarget({
-                kind: "thread",
-                id: activeThread.id,
-                name: activeThread.title,
+                kind: "project",
+                id: project.id,
+                name: project.name,
               })
             }
-            onArchive={() => activeThread && void archiveThread(activeThread)}
-          />
-          {serverStatus === "offline" ? (
-            <OfflineState
-              backendUrl={platform?.backendUrl}
-              error={serverError}
-            />
-          ) : activeThread ? (
-            <>
-              {goalSnapshot ? (
-                <GoalStrip
-                  snapshot={goalSnapshot}
-                  isRunning={Boolean(activeTurnId)}
-                  action={goalAction}
-                  onRun={() => void runGoal()}
-                  onPause={() => void changeGoalStatus("paused")}
-                  onCancel={() => void changeGoalStatus("cancelled")}
-                />
-              ) : null}
-              <MessageList
-                messages={messages}
-                events={events}
-                activeTurnId={activeTurnId}
-                undoingTurnId={
-                  turnUndoDialog?.loading || turnUndoDialog?.applying
-                    ? turnUndoDialog.turnId
-                    : null
-                }
-                threadId={activeThread.id}
-                artifacts={artifacts}
-                onOpenArtifact={(artifactId) =>
-                  void openArtifact(activeThread.id, artifactId)
-                }
-                onOpenMarkdownLink={openMarkdownLink}
-                onUndoTurn={(turnId) => void openTurnUndo(turnId)}
-                onReviewChanges={() => {
-                  openToolTab("diff");
-                  void refreshWorkbench();
-                }}
-                onLoadTurnFilePreview={(turnId, path, offset) => {
-                  if (!client) {
-                    return Promise.reject(new Error("服务尚未连接"));
-                  }
-                  return client.getTurnFileDiffPreview(
-                    activeThread.id,
-                    turnId,
-                    path,
-                    offset,
-                  );
-                }}
-              />
-              {activeApproval ? (
-                <ApprovalDialog
-                  key={activeApproval.approval_id}
-                  request={activeApproval}
-                  queuePosition={1}
-                  queueLength={pendingApprovalQueue.length}
-                  isSubmitting={
-                    decidingApprovalId === activeApproval.approval_id
-                  }
-                  error={approvalDecisionError}
-                  onDecision={(approved) =>
-                    void decideApproval(activeApproval.approval_id, approved)
-                  }
-                />
-              ) : activeUserInput ? (
-                <PlanChoiceCard
-                  key={activeUserInput.request.requestId}
-                  request={activeUserInput.request}
-                  isSubmitting={
-                    submittingUserInputId === activeUserInput.request.requestId
-                  }
-                  error={userInputError}
-                  onSubmit={(response) =>
-                    void submitUserInput(
-                      activeUserInput.request.requestId,
-                      response,
-                    )
-                  }
-                />
-              ) : (
-                <Composer
-                  value={composer}
-                  taskPlan={composerTaskPlan}
-                  isSending={isSending}
-                  isRunning={Boolean(activeTurnId)}
-                  isCancelling={
-                    Boolean(activeTurnId) && cancellingTurnId === activeTurnId
-                  }
-                  queuedMessageCount={queuedMessageCount}
-                  modelSelection={activeThread?.modelSelection ?? null}
-                  providers={settings?.providers ?? []}
-                  activeProviderId={settings?.activeProviderId ?? ""}
-                  permissionMode={settings?.permissionMode ?? "auto"}
-                  collaborationMode={collaborationMode}
-                  sandboxMode={
-                    settings?.sandbox.sandboxMode ?? "workspace-write"
-                  }
-                  contextSources={contextSources}
-                  skills={skills}
-                  selectedSkillIds={selectedSkillIds}
-                  workspaceRoot={null}
-                  projectName={null}
-                  projects={projects}
-                  canOpenThreadTools
-                  onChange={setComposer}
-                  onSubmit={(value) => void submitMessage(value)}
-                  onCancel={() => void cancelTurn()}
-                  onPickWorkspace={() => void chooseWorkspace()}
-                  onSelectProject={selectProject}
-                  onChangePermissionMode={changeExecutionPreset}
-                  onChangeCollaborationMode={setCollaborationMode}
-                  onChangeSandboxMode={changeSandboxMode}
-                  onChangeModelSelection={changeModelSelection}
-                  onOpenSettings={() => setSettingsOpen(true)}
-                  onAddContextSources={() => void addContextSources()}
-                  onRemoveContextSource={removeContextSource}
-                  onToggleSkill={toggleSkill}
-                />
-              )}
-            </>
-          ) : (
-            <NewTaskState
-              value={composer}
-              workspaceRoot={currentWorkspaceRoot}
-              projectName={draftProject?.name ?? null}
-              projects={projects}
-              modelSelection={draftModelSelection}
-              providers={settings?.providers ?? []}
-              activeProviderId={settings?.activeProviderId ?? ""}
-              permissionMode={settings?.permissionMode ?? "auto"}
-              collaborationMode={collaborationMode}
-              sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
-              contextSources={contextSources}
-              skills={skills}
-              selectedSkillIds={selectedSkillIds}
-              isSending={isSending}
-              launchMode={newTaskLaunchMode}
-              experienceMode={experienceMode}
-              onChange={setComposer}
-              onChangeLaunchMode={setNewTaskLaunchMode}
-              onPickWorkspace={() => void chooseWorkspace(true)}
-              onSelectProject={selectProject}
-              onChangePermissionMode={changeExecutionPreset}
-              onChangeCollaborationMode={setCollaborationMode}
-              onChangeSandboxMode={changeSandboxMode}
-              onChangeModelSelection={changeModelSelection}
-              onOpenSettings={() => setSettingsOpen(true)}
-              onAddContextSources={() => void addContextSources()}
-              onRemoveContextSource={removeContextSource}
-              onToggleSkill={toggleSkill}
-              onSubmit={(value) => void createThread(value)}
-            />
-          )}
-        </section>
-        {!settingsOpen ? (
-          <div
-            className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
-            role="separator"
-            tabIndex={0}
-            aria-label="调整右侧栏宽度"
-            aria-controls="workspace-right-panel"
-            aria-orientation="vertical"
-            aria-valuemin={workspaceLayout.rightMin}
-            aria-valuemax={workspaceLayout.rightMax}
-            aria-valuenow={workspaceLayout.right}
-            aria-valuetext={`${workspaceLayout.right} 像素`}
-            onPointerDown={(event) => beginWorkspaceResize("right", event)}
-            onPointerMove={(event) => continueWorkspaceResize("right", event)}
-            onPointerUp={(event) => finishWorkspaceResize("right", event)}
-            onPointerCancel={(event) => finishWorkspaceResize("right", event)}
-            onLostPointerCapture={(event) =>
-              finishWorkspaceResize("right", event)
+            onToggleProjectPinned={(project) =>
+              void toggleProjectPinned(project)
             }
-            onDoubleClick={() => resetWorkspacePanelSize("right")}
-            onKeyDown={(event) => resizeWorkspaceWithKeyboard("right", event)}
+            onSelectProject={beginProjectDraft}
+            onNewThreadForProject={handleNewThreadForProject}
+            onRenameThread={(thread) =>
+              setRenameTarget({
+                kind: "thread",
+                id: thread.id,
+                name: thread.title,
+              })
+            }
+            onArchiveThread={(thread) => void archiveThread(thread)}
+            onRestoreThread={(thread) => void restoreThread(thread)}
+            onOpenThreadWorkspace={(workspaceRoot) =>
+              void openWorkspaceRoot(workspaceRoot)
+            }
+            onOpenExtensions={() => openToolTab("extensions")}
+            onSettings={() => setSettingsOpen(true)}
+          />
+          {!settingsOpen && !sidebarCollapsed ? (
+            <div
+              className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
+              role="separator"
+              tabIndex={0}
+              aria-label="调整左侧栏宽度"
+              aria-controls="workspace-sidebar"
+              aria-orientation="vertical"
+              aria-valuemin={workspaceLayout.leftMin}
+              aria-valuemax={workspaceLayout.leftMax}
+              aria-valuenow={workspaceLayout.left}
+              aria-valuetext={`${workspaceLayout.left} 像素`}
+              onPointerDown={(event) => beginWorkspaceResize("left", event)}
+              onPointerMove={(event) => continueWorkspaceResize("left", event)}
+              onPointerUp={(event) => finishWorkspaceResize("left", event)}
+              onPointerCancel={(event) => finishWorkspaceResize("left", event)}
+              onLostPointerCapture={(event) =>
+                finishWorkspaceResize("left", event)
+              }
+              onDoubleClick={() => resetWorkspacePanelSize("left")}
+              onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
+            />
+          ) : null}
+          <section
+            className={`center-pane ${
+              activeApproval
+                ? "has-approval"
+                : activeUserInput
+                  ? "has-plan-choice"
+                  : ""
+            }`}
+            id="workspace-center-pane"
+          >
+            <ThreadHeader
+              thread={activeThread}
+              onOpenLocation={() =>
+                activeThread &&
+                void openWorkspaceRoot(activeThread.workspaceRoot)
+              }
+              onOpenTool={openToolTab}
+              onRename={() =>
+                activeThread &&
+                setRenameTarget({
+                  kind: "thread",
+                  id: activeThread.id,
+                  name: activeThread.title,
+                })
+              }
+              onArchive={() => activeThread && void archiveThread(activeThread)}
+            />
+            {serverStatus === "offline" ? (
+              <OfflineState
+                backendUrl={platform?.backendUrl}
+                error={serverError}
+                attempt={bootstrapAttempt}
+                isProbing={serverProbing}
+                onRetry={() => setBootstrapAttempt((attempt) => attempt + 1)}
+              />
+            ) : activeThread ? (
+              <>
+                {goalSnapshot ? (
+                  <GoalStrip
+                    snapshot={goalSnapshot}
+                    isRunning={Boolean(activeTurnId)}
+                    action={goalAction}
+                    onRun={() => void runGoal()}
+                    onPause={() => void changeGoalStatus("paused")}
+                    onCancel={() => void changeGoalStatus("cancelled")}
+                  />
+                ) : null}
+                <MessageList
+                  messages={messages}
+                  events={events}
+                  activeTurnId={activeTurnId}
+                  undoingTurnId={
+                    turnUndoDialog?.loading || turnUndoDialog?.applying
+                      ? turnUndoDialog.turnId
+                      : null
+                  }
+                  threadId={activeThread.id}
+                  artifacts={artifacts}
+                  onOpenArtifact={(artifactId) =>
+                    void openArtifact(activeThread.id, artifactId)
+                  }
+                  onOpenMarkdownLink={openMarkdownLink}
+                  onUndoTurn={(turnId) => void openTurnUndo(turnId)}
+                  onReviewChanges={() => {
+                    openToolTab("diff");
+                    void refreshWorkbench();
+                  }}
+                  onOpenFileReview={openFileReview}
+                  onLoadTurnFilePreview={(turnId, path, offset) => {
+                    if (!client) {
+                      return Promise.reject(new Error("服务尚未连接"));
+                    }
+                    return client.getTurnFileDiffPreview(
+                      activeThread.id,
+                      turnId,
+                      path,
+                      offset,
+                    );
+                  }}
+                />
+                {activeApproval ? (
+                  <ApprovalDialog
+                    key={activeApproval.approval_id}
+                    request={activeApproval}
+                    queuePosition={1}
+                    queueLength={pendingApprovalQueue.length}
+                    isSubmitting={
+                      decidingApprovalId === activeApproval.approval_id
+                    }
+                    error={approvalDecisionError}
+                    onDecision={(approved) =>
+                      void decideApproval(activeApproval.approval_id, approved)
+                    }
+                  />
+                ) : activeUserInput ? (
+                  <PlanChoiceCard
+                    key={activeUserInput.request.requestId}
+                    request={activeUserInput.request}
+                    isSubmitting={
+                      submittingUserInputId ===
+                      activeUserInput.request.requestId
+                    }
+                    error={userInputError}
+                    onSubmit={(response) =>
+                      void submitUserInput(
+                        activeUserInput.request.requestId,
+                        response,
+                      )
+                    }
+                  />
+                ) : (
+                  <Composer
+                    value={composer}
+                    taskPlan={composerTaskPlan}
+                    isSending={isSending}
+                    isRunning={Boolean(activeTurnId)}
+                    isCancelling={
+                      Boolean(activeTurnId) && cancellingTurnId === activeTurnId
+                    }
+                    queuedMessageCount={queuedMessageCount}
+                    modelSelection={activeThread?.modelSelection ?? null}
+                    providers={settings?.providers ?? []}
+                    activeProviderId={settings?.activeProviderId ?? ""}
+                    permissionMode={settings?.permissionMode ?? "auto"}
+                    collaborationMode={collaborationMode}
+                    sandboxMode={
+                      settings?.sandbox.sandboxMode ?? "workspace-write"
+                    }
+                    contextSources={contextSources}
+                    skills={skills}
+                    selectedSkillIds={selectedSkillIds}
+                    workspaceRoot={null}
+                    projectName={null}
+                    projects={projects}
+                    canOpenThreadTools
+                    onChange={setComposer}
+                    onSubmit={(value) => void submitMessage(value)}
+                    onCancel={() => void cancelTurn()}
+                    onPickWorkspace={() => void chooseWorkspace()}
+                    onSelectProject={selectProject}
+                    onChangePermissionMode={changeExecutionPreset}
+                    onChangeCollaborationMode={setCollaborationMode}
+                    onChangeSandboxMode={changeSandboxMode}
+                    onChangeModelSelection={changeModelSelection}
+                    onOpenSettings={() => setSettingsOpen(true)}
+                    onAddContextSources={() => void addContextSources()}
+                    onRemoveContextSource={removeContextSource}
+                    onToggleSkill={toggleSkill}
+                  />
+                )}
+              </>
+            ) : (
+              <NewTaskState
+                value={composer}
+                workspaceRoot={currentWorkspaceRoot}
+                projectName={draftProject?.name ?? null}
+                projects={projects}
+                modelSelection={draftModelSelection}
+                providers={settings?.providers ?? []}
+                activeProviderId={settings?.activeProviderId ?? ""}
+                permissionMode={settings?.permissionMode ?? "auto"}
+                collaborationMode={collaborationMode}
+                sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
+                contextSources={contextSources}
+                skills={skills}
+                selectedSkillIds={selectedSkillIds}
+                isSending={isSending}
+                launchMode={newTaskLaunchMode}
+                experienceMode={experienceMode}
+                onChange={setComposer}
+                onChangeLaunchMode={setNewTaskLaunchMode}
+                onPickWorkspace={() => void chooseWorkspace(true)}
+                onSelectProject={selectProject}
+                onChangePermissionMode={changeExecutionPreset}
+                onChangeCollaborationMode={setCollaborationMode}
+                onChangeSandboxMode={changeSandboxMode}
+                onChangeModelSelection={changeModelSelection}
+                onOpenSettings={() => setSettingsOpen(true)}
+                onAddContextSources={() => void addContextSources()}
+                onRemoveContextSource={removeContextSource}
+                onToggleSkill={toggleSkill}
+                onSubmit={(value) => void createThread(value)}
+              />
+            )}
+          </section>
+          {!settingsOpen ? (
+            <div
+              className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
+              role="separator"
+              tabIndex={0}
+              aria-label="调整右侧栏宽度"
+              aria-controls="workspace-right-panel"
+              aria-orientation="vertical"
+              aria-valuemin={workspaceLayout.rightMin}
+              aria-valuemax={workspaceLayout.rightMax}
+              aria-valuenow={workspaceLayout.right}
+              aria-valuetext={`${workspaceLayout.right} 像素`}
+              onPointerDown={(event) => beginWorkspaceResize("right", event)}
+              onPointerMove={(event) => continueWorkspaceResize("right", event)}
+              onPointerUp={(event) => finishWorkspaceResize("right", event)}
+              onPointerCancel={(event) => finishWorkspaceResize("right", event)}
+              onLostPointerCapture={(event) =>
+                finishWorkspaceResize("right", event)
+              }
+              onDoubleClick={() => resetWorkspacePanelSize("right")}
+              onKeyDown={(event) => resizeWorkspaceWithKeyboard("right", event)}
+            />
+          ) : null}
+          <RightPanel
+            client={client}
+            toolTabs={toolTabs}
+            activeToolTab={activeToolTab}
+            conversationCollapsed={conversationCollapsed}
+            thread={activeThread}
+            workspaceRoot={currentWorkspaceRoot}
+            messages={messages}
+            events={events.filter(
+              (event) =>
+                event.payload.type !== "approval_requested" ||
+                pendingApprovalIds.includes(event.payload.approval_id),
+            )}
+            subagentRuns={subagentRuns}
+            terminalEvents={terminalEvents}
+            terminalSession={terminalSession}
+            workspaceTree={workspaceTree}
+            filePreview={filePreview}
+            workspaceDiff={workspaceDiff}
+            sandbox={sandbox}
+            plugins={plugins}
+            selectedSkillIds={selectedSkillIds}
+            mcpServers={mcpServers}
+            threadMcpServers={threadMcpServers}
+            workbenchError={workbenchError}
+            isRefreshingWorkbench={isRefreshingWorkbench}
+            pendingApprovalIds={pendingApprovalIds}
+            decidingApprovalId={decidingApprovalId}
+            artifacts={artifacts}
+            contextStatus={contextStatus}
+            isCompactingContext={isCompactingContext}
+            revertingDiffPath={revertingDiffPath}
+            hunkActionKey={hunkActionKey}
+            reviewFileRequest={reviewFileRequest}
+            onDecideApproval={decideApproval}
+            onRefreshWorkbench={() => void refreshWorkbench()}
+            onOpenWorkspacePath={(path) => void openWorkspacePath(path)}
+            onOpenWorkspaceEntry={(entry) => void openWorkspaceEntry(entry)}
+            onToggleThreadMcp={(serverId, enabled) =>
+              void toggleThreadMcp(serverId, enabled)
+            }
+            onCreateMcpServer={createMcpServer}
+            onUpdateMcpServer={updateMcpServer}
+            onRestartMcpServer={restartMcpServer}
+            onDeleteMcpServer={deleteMcpServer}
+            onInstallPlugin={installLocalPlugin}
+            onUninstallPlugin={uninstallLocalPlugin}
+            onToggleThreadPlugin={toggleThreadPlugin}
+            onUsePluginSkills={usePluginSkills}
+            onOpenWorkspace={(workspaceRoot) =>
+              void openWorkspaceRoot(workspaceRoot)
+            }
+            onEnsureTerminalSession={ensureTerminalSession}
+            onWriteTerminalSession={(threadId, sessionId, data) =>
+              void writeTerminalSession(threadId, sessionId, data)
+            }
+            onResizeTerminalSession={(threadId, sessionId, cols, rows) =>
+              void resizeTerminalSession(threadId, sessionId, cols, rows)
+            }
+            onCloseTerminalSession={(threadId, sessionId) =>
+              void closeTerminalSession(threadId, sessionId)
+            }
+            onCompactContext={() => void compactContext()}
+            onOpenArtifact={(threadId, artifactId) =>
+              void openArtifact(threadId, artifactId)
+            }
+            onOpenMarkdownLink={openMarkdownLink}
+            onRevertDiffFile={(path) => void revertDiffFile(path)}
+            onApplyDiffHunk={(hunk, action) => void applyDiffHunk(hunk, action)}
+            onOpenFileTab={openReviewFileTab}
+            onLoadFileContent={loadReviewFileContent}
+            onLoadTurnFileDiff={loadReviewTurnFileDiff}
+            onGitAction={runReviewGitAction}
+            onGetArtifact={(threadId, artifactId) =>
+              getArtifact(threadId, artifactId)
+            }
+            onOpenToolTab={openToolTab}
+            onActivateToolTab={setActiveToolTabId}
+            onCloseToolTab={closeToolTab}
+            onToggleConversation={() =>
+              setConversationCollapsed((current) => !current)
+            }
+            onAddContextSources={() => void addContextSources()}
+            onSpawnSubagent={spawnSubagent}
+            onCancelSubagent={(runId) => void cancelSubagent(runId)}
+          />
+        </main>
+        {settingsOpen && (
+          <RedesignedSettingsPanel
+            platform={platform}
+            settings={settings}
+            providerHealth={providerHealth}
+            providerTest={providerTest}
+            secretSources={secretSources}
+            notificationPreferences={taskNotificationPreferences}
+            appearance={appearance}
+            resolvedTheme={resolvedTheme}
+            personalization={personalization}
+            editorPreferences={editorPreferences}
+            isSaving={isSavingSettings}
+            isSavingSecret={isSavingSecret}
+            onAppearanceChange={setAppearance}
+            onPersonalizationChange={setPersonalization}
+            onEditorPreferencesChange={setEditorPreferences}
+            onSave={saveSettings}
+            onTestProvider={(providerId, providers) =>
+              void testProviderConnection(providerId, providers)
+            }
+            onSyncProviderModels={syncProviderModels}
+            onStoreProviderApiKey={storeProviderApiKey}
+            onDeleteProviderApiKey={removeProviderApiKey}
+            onNotificationPreferencesChange={setTaskNotificationPreferences}
+            onTestNotification={() =>
+              deliverTaskCompletionNotification(
+                "测试成功：OpenTopia 可以在任务完成时提醒你。",
+                true,
+              )
+            }
+            onOpenLogs={() => {
+              setSettingsOpen(false);
+              setLogViewerOpen(true);
+            }}
+            onClose={() => setSettingsOpen(false)}
+          />
+        )}
+        {keyboardShortcutsOpen ? (
+          <KeyboardShortcutsDialog
+            onClose={() => setKeyboardShortcutsOpen(false)}
           />
         ) : null}
-        <RightPanel
-          client={client}
-          toolTabs={toolTabs}
-          activeToolTab={activeToolTab}
-          conversationCollapsed={conversationCollapsed}
-          thread={activeThread}
-          workspaceRoot={currentWorkspaceRoot}
-          messages={messages}
-          events={events.filter(
-            (event) =>
-              event.payload.type !== "approval_requested" ||
-              pendingApprovalIds.includes(event.payload.approval_id),
-          )}
-          subagentRuns={subagentRuns}
-          terminalEvents={terminalEvents}
-          terminalSession={terminalSession}
-          workspaceTree={workspaceTree}
-          filePreview={filePreview}
-          workspaceDiff={workspaceDiff}
-          sandbox={sandbox}
-          plugins={plugins}
-          selectedSkillIds={selectedSkillIds}
-          mcpServers={mcpServers}
-          threadMcpServers={threadMcpServers}
-          workbenchError={workbenchError}
-          isRefreshingWorkbench={isRefreshingWorkbench}
-          pendingApprovalIds={pendingApprovalIds}
-          decidingApprovalId={decidingApprovalId}
-          artifacts={artifacts}
-          contextStatus={contextStatus}
-          isCompactingContext={isCompactingContext}
-          revertingDiffPath={revertingDiffPath}
-          hunkActionKey={hunkActionKey}
-          onDecideApproval={decideApproval}
-          onRefreshWorkbench={() => void refreshWorkbench()}
-          onOpenWorkspacePath={(path) => void openWorkspacePath(path)}
-          onOpenWorkspaceEntry={(entry) => void openWorkspaceEntry(entry)}
-          onToggleThreadMcp={(serverId, enabled) =>
-            void toggleThreadMcp(serverId, enabled)
-          }
-          onCreateMcpServer={createMcpServer}
-          onUpdateMcpServer={updateMcpServer}
-          onRestartMcpServer={restartMcpServer}
-          onDeleteMcpServer={deleteMcpServer}
-          onInstallPlugin={installLocalPlugin}
-          onUninstallPlugin={uninstallLocalPlugin}
-          onToggleThreadPlugin={toggleThreadPlugin}
-          onUsePluginSkills={usePluginSkills}
-          onOpenWorkspace={(workspaceRoot) =>
-            void openWorkspaceRoot(workspaceRoot)
-          }
-          onEnsureTerminalSession={ensureTerminalSession}
-          onWriteTerminalSession={(threadId, sessionId, data) =>
-            void writeTerminalSession(threadId, sessionId, data)
-          }
-          onResizeTerminalSession={(threadId, sessionId, cols, rows) =>
-            void resizeTerminalSession(threadId, sessionId, cols, rows)
-          }
-          onCloseTerminalSession={(threadId, sessionId) =>
-            void closeTerminalSession(threadId, sessionId)
-          }
-          onCompactContext={() => void compactContext()}
-          onOpenArtifact={(threadId, artifactId) =>
-            void openArtifact(threadId, artifactId)
-          }
-          onOpenMarkdownLink={openMarkdownLink}
-          onRevertDiffFile={(path) => void revertDiffFile(path)}
-          onApplyDiffHunk={(hunk, action) => void applyDiffHunk(hunk, action)}
-          onGetArtifact={(threadId, artifactId) =>
-            getArtifact(threadId, artifactId)
-          }
-          onOpenToolTab={openToolTab}
-          onActivateToolTab={setActiveToolTabId}
-          onCloseToolTab={closeToolTab}
-          onToggleConversation={() =>
-            setConversationCollapsed((current) => !current)
-          }
-          onAddContextSources={() => void addContextSources()}
-          onSpawnSubagent={spawnSubagent}
-          onCancelSubagent={(runId) => void cancelSubagent(runId)}
-        />
-      </main>
-      {settingsOpen && (
-        <RedesignedSettingsPanel
-          platform={platform}
-          settings={settings}
-          providerHealth={providerHealth}
-          providerTest={providerTest}
-          secretSources={secretSources}
-          notificationPreferences={taskNotificationPreferences}
-          appearance={appearance}
-          resolvedTheme={resolvedTheme}
-          personalization={personalization}
-          editorPreferences={editorPreferences}
-          isSaving={isSavingSettings}
-          isSavingSecret={isSavingSecret}
-          onAppearanceChange={setAppearance}
-          onPersonalizationChange={setPersonalization}
-          onEditorPreferencesChange={setEditorPreferences}
-          onSave={saveSettings}
-          onTestProvider={(providerId, providers) =>
-            void testProviderConnection(providerId, providers)
-          }
-          onSyncProviderModels={syncProviderModels}
-          onStoreProviderApiKey={storeProviderApiKey}
-          onDeleteProviderApiKey={removeProviderApiKey}
-          onNotificationPreferencesChange={setTaskNotificationPreferences}
-          onTestNotification={() =>
-            deliverTaskCompletionNotification(
-              "测试成功：OpenTopia 可以在任务完成时提醒你。",
-              true,
-            )
-          }
-          onOpenLogs={() => {
-            setSettingsOpen(false);
-            setLogViewerOpen(true);
-          }}
-          onClose={() => setSettingsOpen(false)}
-        />
-      )}
-      {keyboardShortcutsOpen ? (
-        <KeyboardShortcutsDialog
-          onClose={() => setKeyboardShortcutsOpen(false)}
-        />
-      ) : null}
-      {aboutOpen ? <AboutDialog onClose={() => setAboutOpen(false)} /> : null}
-      {logViewerOpen && <LogViewer onClose={() => setLogViewerOpen(false)} />}
-      {renameTarget && (
-        <RenameDialog
-          target={renameTarget}
-          onSubmit={submitRename}
-          onClose={() => setRenameTarget(null)}
-        />
-      )}
-      {turnUndoDialog && (
-        <TurnUndoDialog
-          state={turnUndoDialog}
-          onConfirm={() => void confirmTurnUndo()}
-          onClose={() => {
-            if (!turnUndoDialog.applying) setTurnUndoDialog(null);
-          }}
-        />
-      )}
-    </div>
+        {aboutOpen ? <AboutDialog onClose={() => setAboutOpen(false)} /> : null}
+        {logViewerOpen && <LogViewer onClose={() => setLogViewerOpen(false)} />}
+        {renameTarget && (
+          <RenameDialog
+            target={renameTarget}
+            onSubmit={submitRename}
+            onClose={() => setRenameTarget(null)}
+          />
+        )}
+        {turnUndoDialog && (
+          <TurnUndoDialog
+            state={turnUndoDialog}
+            onConfirm={() => void confirmTurnUndo()}
+            onClose={() => {
+              if (!turnUndoDialog.applying) setTurnUndoDialog(null);
+            }}
+          />
+        )}
+      </div>
+    </WorkspacePathIndexContext.Provider>
   );
 }
 
@@ -4127,8 +4283,8 @@ function SettingsPanel({
   onStoreProviderApiKey(
     providerId: string,
     value: string,
-  ): Promise<KeyringMetadata | null>;
-  onDeleteProviderApiKey(providerId: string): Promise<KeyringMetadata | null>;
+  ): Promise<ProviderSecretOutcome>;
+  onDeleteProviderApiKey(providerId: string): Promise<ProviderSecretOutcome>;
   onOpenLogs(): void;
   onClose(): void;
 }) {
@@ -4876,8 +5032,9 @@ function SettingsPanel({
                               void onStoreProviderApiKey(
                                 providerId,
                                 value,
-                              ).then((metadata) => {
-                                if (!metadata) return;
+                              ).then((outcome) => {
+                                if (!outcome.stored) return;
+                                const { metadata } = outcome;
                                 const nextProviders = providers.map(
                                   (provider) =>
                                     provider.id === providerId
@@ -4911,8 +5068,8 @@ function SettingsPanel({
                             onClick={() => {
                               const providerId = editingProvider.id;
                               void onDeleteProviderApiKey(providerId).then(
-                                (metadata) => {
-                                  if (!metadata) return;
+                                (outcome) => {
+                                  if (!outcome.stored) return;
                                   const nextProviders = providers.map(
                                     (provider) =>
                                       provider.id === providerId
@@ -6031,6 +6188,7 @@ function MessageList({
   onOpenMarkdownLink,
   onUndoTurn,
   onReviewChanges,
+  onOpenFileReview,
   onLoadTurnFilePreview,
 }: {
   messages: Message[];
@@ -6043,6 +6201,7 @@ function MessageList({
   onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
   onUndoTurn(turnId: string): void;
   onReviewChanges(): void;
+  onOpenFileReview(path: string): void;
   onLoadTurnFilePreview(
     turnId: string,
     path: string,
@@ -6108,6 +6267,7 @@ function MessageList({
         isReverted={revertedTurnIds.has(turnId)}
         onUndo={() => onUndoTurn(turnId)}
         onReview={onReviewChanges}
+        onOpenFileReview={onOpenFileReview}
         onLoadFilePreview={(path, offset) =>
           onLoadTurnFilePreview(turnId, path, offset)
         }
@@ -7009,6 +7169,12 @@ function Composer({
               </div>
             )}
           </div>
+          {queuedMessageCount > 0 ? (
+            <span className="composer-queue-status">
+              {queuedMessageCount} queued
+            </span>
+          ) : null}
+          {/* Trails the toolbar so the model label sits beside the send button. */}
           <ModelSelector
             activeConnectionId={activeProviderId}
             connections={providers}
@@ -7017,11 +7183,6 @@ function Composer({
             onOpenSettings={onOpenSettings}
             selection={modelSelection}
           />
-          {queuedMessageCount > 0 ? (
-            <span className="composer-queue-status">
-              {queuedMessageCount} queued
-            </span>
-          ) : null}
         </div>
         <button
           className={`send-button${isRunning ? " is-running" : ""}`}
@@ -7203,6 +7364,7 @@ function RightPanel({
   isCompactingContext,
   revertingDiffPath,
   hunkActionKey,
+  reviewFileRequest,
   onDecideApproval,
   onRefreshWorkbench,
   onOpenWorkspacePath,
@@ -7226,6 +7388,10 @@ function RightPanel({
   onOpenMarkdownLink,
   onRevertDiffFile,
   onApplyDiffHunk,
+  onOpenFileTab,
+  onLoadFileContent,
+  onLoadTurnFileDiff,
+  onGitAction,
   onGetArtifact,
   onOpenToolTab,
   onActivateToolTab,
@@ -7263,6 +7429,7 @@ function RightPanel({
   isCompactingContext: boolean;
   revertingDiffPath: string | null;
   hunkActionKey: string | null;
+  reviewFileRequest: ReviewFileRequest | null;
   onDecideApproval(approvalId: string, approved: boolean): void;
   onRefreshWorkbench(): void;
   onOpenWorkspacePath(path?: string): void;
@@ -7298,6 +7465,10 @@ function RightPanel({
     hunk: WorkspaceDiffHunk,
     action: WorkspaceDiffHunkAction,
   ): void;
+  onOpenFileTab(path: string): void;
+  onLoadFileContent(path: string): Promise<DiffReviewFileContent>;
+  onLoadTurnFileDiff(turnId: string, path: string): Promise<string>;
+  onGitAction(action: DiffReviewGitAction, message: string): Promise<string>;
   onGetArtifact(threadId: string, artifactId: string): Promise<ArtifactContent>;
   onOpenToolTab(kind: ToolTabKind): void;
   onActivateToolTab(tabId: string): void;
@@ -7335,6 +7506,7 @@ function RightPanel({
       isCompactingContext={isCompactingContext}
       revertingDiffPath={revertingDiffPath}
       hunkActionKey={hunkActionKey}
+      reviewFileRequest={reviewFileRequest}
       onDecideApproval={onDecideApproval}
       onRefreshWorkbench={onRefreshWorkbench}
       onOpenWorkspacePath={onOpenWorkspacePath}
@@ -7357,6 +7529,10 @@ function RightPanel({
       onOpenArtifact={onOpenArtifact}
       onRevertDiffFile={onRevertDiffFile}
       onApplyDiffHunk={onApplyDiffHunk}
+      onOpenFileTab={onOpenFileTab}
+      onLoadFileContent={onLoadFileContent}
+      onLoadTurnFileDiff={onLoadTurnFileDiff}
+      onGitAction={onGitAction}
       onGetArtifact={onGetArtifact}
     />
   );
@@ -7722,18 +7898,48 @@ function newTaskLaunchModeLabel(mode: NewTaskLaunchMode): string {
 function OfflineState({
   backendUrl,
   error,
+  attempt,
+  isProbing,
+  onRetry,
 }: {
   backendUrl?: string;
   error: string | null;
+  attempt: number;
+  isProbing: boolean;
+  onRetry: () => void;
 }) {
   return (
     <div className="empty-state offline">
       <TerminalSquare size={48} />
-      <h2>Local server is offline</h2>
-      <p>Start the Rust server, then reload the desktop app.</p>
-      <code>cargo run -p opentopia-server</code>
+      <h2>正在等待本地服务</h2>
+      <p>
+        {import.meta.env.DEV ? (
+          <>
+            开发模式下本地服务由 <code>cargo run</code> 启动，首次编译或改动
+            Rust 代码后可能需要几分钟；编译进度会打印在运行{" "}
+            <code>pnpm dev</code> 的终端里。
+          </>
+        ) : (
+          "本地服务正在启动。"
+        )}
+        此页面会自动重连，无需手动刷新。
+      </p>
       <small>{backendUrl ?? "http://127.0.0.1:8787"}</small>
-      {error && <pre>{error}</pre>}
+      <div className="offline-actions">
+        <button
+          className="secondary-button"
+          type="button"
+          disabled={isProbing}
+          onClick={onRetry}
+        >
+          <RotateCcw size={14} className={isProbing ? "spin" : undefined} />
+          {isProbing ? "连接中…" : "立即重试"}
+        </button>
+        <small>已尝试 {attempt + 1} 次</small>
+      </div>
+      {/* Early failures are just the build still running, so the raw error only
+          matters once retrying has clearly stopped helping. */}
+      {error && attempt >= 10 && <pre>{error}</pre>}
     </div>
   );
 }

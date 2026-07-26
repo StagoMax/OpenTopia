@@ -31,6 +31,7 @@ const browserHost = Object.freeze({
 
 contextBridge.exposeInMainWorld("opentopia", {
   getPlatformInfo: () => ipcRenderer.invoke("platform:get-info"),
+  setTheme: (theme) => ipcRenderer.invoke("platform:set-theme", theme),
   openExternal: (url) => ipcRenderer.invoke("platform:open-external", url),
   openPath: (targetPath) =>
     ipcRenderer.invoke("platform:open-path", targetPath),

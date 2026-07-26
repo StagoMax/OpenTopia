@@ -227,6 +227,11 @@ export type ProviderSettings = {
   enabledFamilies: string[];
   /** Model ids from the last `/v1/models` sync, cached for offline use. */
   syncedModels: string[];
+  /**
+   * Context windows the endpoint reported per model id, captured on sync. This
+   * is real capability detection and outranks the server's built-in table.
+   */
+  modelContextWindows?: Record<string, number>;
   modelsSyncedAt?: string | null;
   temperature: number;
   maxOutputTokens?: number | null;
@@ -295,6 +300,16 @@ export type SecretSource = {
   envTarget?: string;
 };
 
+/**
+ * Whether the local backend came back after a credential change. Reported
+ * separately from the credential write because the secret is already durable
+ * when this is produced — a failed restart is recoverable, not a lost key.
+ */
+export type BackendRestartOutcome = {
+  restarted: boolean;
+  error: string | null;
+};
+
 export type KeyringMetadata = {
   providerId?: string;
   available: boolean;
@@ -305,13 +320,24 @@ export type KeyringMetadata = {
   providerApiKeySourceId: string;
   envTarget: string;
   status: string;
+  backendRestart?: BackendRestartOutcome;
 };
+
+/**
+ * Result of writing or clearing a provider credential. `stored: true` means the
+ * key is persisted, even when `backendRestart.restarted` is false; callers must
+ * not discard user input on a restart failure.
+ */
+export type ProviderSecretOutcome =
+  | { stored: true; metadata: KeyringMetadata }
+  | { stored: false; error: string };
 
 export type SecretSources = {
   activeProviderKeySource: string | null;
   keyring?: KeyringMetadata;
   sources: SecretSource[];
   notes: string[];
+  backendRestart?: BackendRestartOutcome;
 };
 
 export type WorkspaceEntryKind = "file" | "directory" | "symlink" | "other";
@@ -377,6 +403,16 @@ export type WorkspaceDiff = {
   truncated: boolean;
   stagedTruncated?: boolean;
   unstagedTruncated?: boolean;
+};
+
+/**
+ * A file handed to the review panel, e.g. by clicking a row on a turn change
+ * card. `nonce` increments on every request so selecting the same path twice
+ * still reaches the panel as a fresh request.
+ */
+export type ReviewFileRequest = {
+  path: string;
+  nonce: number;
 };
 
 export type TurnChangeSetStatus = "capturing" | "ready" | "empty" | "failed";
@@ -1278,6 +1314,8 @@ declare global {
   interface Window {
     opentopia?: {
       getPlatformInfo(): Promise<PlatformInfo>;
+      /** Repaints the OS-drawn window chrome for the resolved theme. */
+      setTheme(theme: "light" | "dark"): Promise<boolean>;
       openExternal(url: string): Promise<void>;
       openPath(targetPath: string): Promise<{ path: string }>;
       showSystemNotification(
