@@ -1,10 +1,16 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   Activity,
   AlertCircle,
   Bot,
-  BrainCircuit,
-  Check,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   ChevronUp,
@@ -16,7 +22,6 @@ import {
   Globe2,
   Loader2,
   RotateCcw,
-  Send,
   Table2,
   TerminalSquare,
   Wrench,
@@ -24,7 +29,6 @@ import {
 } from "lucide-react";
 import type {
   AgentEvent,
-  ModelRequestSnapshot,
   SubagentRun,
   TaskPlan,
   ToolCall,
@@ -33,6 +37,7 @@ import type {
   TurnFileDiffPreview,
   TurnFileChange,
 } from "../types";
+import { MarkdownContent } from "./MarkdownContent";
 import "./TurnActivityTimeline.css";
 
 type ToolCategory =
@@ -67,13 +72,6 @@ type ActivityFile = {
 type PrimitiveActivity =
   | { kind: "tool"; seq: number; execution: ToolExecution }
   | {
-      kind: "model-request";
-      seq: number;
-      round: number;
-      request: ModelRequestSnapshot;
-      createdAt: string;
-    }
-  | {
       kind: "plan";
       seq: number;
       plan: TaskPlan;
@@ -96,11 +94,9 @@ type PrimitiveActivity =
       createdAt: string;
     }
   | {
-      kind: "observability";
+      kind: "commentary";
       seq: number;
-      title: string;
-      summary: string;
-      detail: unknown;
+      text: string;
       createdAt: string;
     }
   | { kind: "subagent"; seq: number; run: SubagentRun; createdAt: string }
@@ -111,7 +107,6 @@ type PrimitiveActivity =
       action: string;
       createdAt: string;
     }
-  | { kind: "context"; seq: number; createdAt: string }
   | { kind: "error"; seq: number; message: string; createdAt: string }
   | { kind: "cancelled"; seq: number; reason: string; createdAt: string }
   | { kind: "suspended"; seq: number; reason: string; createdAt: string };
@@ -133,7 +128,7 @@ type ActivityEntry =
 type ActivityState = "running" | "complete" | "waiting" | "cancelled" | "error";
 
 const defaultVisibleTurnFiles = 3;
-const defaultVisibleDiffLines = 120;
+const defaultVisibleDiffLines = 48;
 
 type TurnFilePreviewState = {
   key: string;
@@ -155,14 +150,17 @@ export function TurnActivityTimeline({
   events,
   isActive,
   formatError = (message) => message,
+  onOpenMarkdownLink,
 }: {
   events: AgentEvent[];
   isActive: boolean;
   formatError?(message: string): string;
+  onOpenMarkdownLink?(href: string): void;
 }) {
   const entries = useMemo(() => buildActivityEntries(events), [events]);
   const state = activityState(events, isActive);
   const [expanded, setExpanded] = useState(isActive);
+  const bodyId = useId();
   const mountedAt = useMemo(() => Date.now(), []);
   const hasRunningEntry = entries.some(activityEntryIsRunning);
   const now = useTimelineClock(
@@ -173,27 +171,10 @@ export function TurnActivityTimeline({
   useEffect(() => {
     if (isActive || state === "error" || state === "waiting") {
       setExpanded(true);
+    } else {
+      setExpanded(false);
     }
   }, [isActive, state]);
-
-  const tools = entries.flatMap((entry) =>
-    entry.kind === "tool-group" ? entry.executions : [],
-  );
-  const commandCount = tools.filter(
-    (execution) => toolCategory(execution.call.name) === "command",
-  ).length;
-  const otherToolCount = tools.length - commandCount;
-  const fileCount = entries.reduce(
-    (count, entry) =>
-      count + (entry.kind === "file-group" ? entry.files.length : 0),
-    0,
-  );
-  const operationCount =
-    tools.length +
-    fileCount +
-    entries.filter(
-      (entry) => entry.kind === "subagent" || entry.kind === "model-request",
-    ).length;
 
   const changeSetEvent = [...events]
     .reverse()
@@ -202,15 +183,18 @@ export function TurnActivityTimeline({
     changeSetEvent?.payload.type === "turn_changes_recorded"
       ? changeSetEvent.payload.change_set
       : null;
-  if (!isActive && entries.length === 0 && !changeSet) return null;
-
-  const terminalSummary = [...events]
-    .reverse()
-    .find((event) => event.payload.type === "turn_finished");
-  const summary =
-    terminalSummary?.payload.type === "turn_finished"
-      ? terminalSummary.payload.summary.trim()
-      : "";
+  const hasTurnLifecycle = events.some((event) =>
+    [
+      "turn_started",
+      "turn_finished",
+      "turn_cancelled",
+      "turn_suspended",
+      "error",
+    ].includes(event.payload.type),
+  );
+  if (!isActive && entries.length === 0 && !changeSet && !hasTurnLifecycle) {
+    return null;
+  }
 
   return (
     <section className="turn-activity" data-state={state}>
@@ -218,25 +202,12 @@ export function TurnActivityTimeline({
         className="turn-activity-header"
         type="button"
         aria-expanded={expanded}
+        aria-controls={bodyId}
         onClick={() => setExpanded((current) => !current)}
       >
-        <span className="turn-activity-status-icon" aria-hidden="true">
-          <ActivityStateIcon state={state} />
-        </span>
         <span className="turn-activity-heading">
-          <strong>{isActive ? "正在处理" : "处理过程"}</strong>
-          <small>
-            {activitySummary({
-              operationCount,
-              commandCount,
-              otherToolCount,
-              isActive,
-            })}
-            {turnTiming ? ` · ${turnTiming}` : ""}
-            {changeSet?.status === "ready"
-              ? ` · ${changeSet.files.length} 个文件 +${changeSet.additions} -${changeSet.deletions}`
-              : ""}
-          </small>
+          <strong>{activityStateLabel(state, isActive)}</strong>
+          {turnTiming && <small>{turnTiming}</small>}
         </span>
         <span className="turn-activity-chevron" aria-hidden="true">
           {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
@@ -244,10 +215,14 @@ export function TurnActivityTimeline({
       </button>
 
       {expanded && (
-        <div className="turn-activity-body">
+        <div
+          className="turn-activity-body"
+          id={bodyId}
+          aria-live={isActive ? "polite" : undefined}
+        >
           {entries.length === 0 && isActive && (
             <div className="turn-activity-pending" role="status">
-              <Loader2 size={13} className="spin" />
+              <ActivityFlow />
               <span>正在连接模型并准备执行步骤</span>
             </div>
           )}
@@ -258,6 +233,7 @@ export function TurnActivityTimeline({
               isActive={isActive}
               now={now}
               formatError={formatError}
+              onOpenMarkdownLink={onOpenMarkdownLink}
             />
           ))}
           {changeSet?.status === "failed" && changeSet.error && (
@@ -266,7 +242,6 @@ export function TurnActivityTimeline({
               <span>未能记录本轮文件快照：{changeSet.error}</span>
             </div>
           )}
-          {summary && <p className="turn-activity-footer">{summary}</p>}
         </div>
       )}
     </section>
@@ -375,12 +350,9 @@ export function TurnChangeCard({
       });
   };
 
-  const toggleFilePreview = (file: TurnFileChange) => {
+  const openFilePreview = (file: TurnFileChange) => {
     const key = turnChangeFileKey(file);
-    if (filePreviewState?.key === key) {
-      setFilePreviewState(null);
-      return;
-    }
+    if (filePreviewState?.key === key) return;
     if (file.binary) {
       setFilePreviewState({
         key,
@@ -393,6 +365,11 @@ export function TurnChangeCard({
       return;
     }
     loadFilePreview(file);
+  };
+
+  const closeFilePreview = (file: TurnFileChange) => {
+    const key = turnChangeFileKey(file);
+    setFilePreviewState((current) => (current?.key === key ? null : current));
   };
 
   return (
@@ -478,7 +455,8 @@ export function TurnChangeCard({
                 : null
             }
             canPreview={file.binary || Boolean(onLoadFilePreview)}
-            onToggle={() => toggleFilePreview(file)}
+            onOpen={() => openFilePreview(file)}
+            onClose={() => closeFilePreview(file)}
             onRetry={() => loadFilePreview(file)}
             onShowMoreLines={() =>
               setFilePreviewState((current) =>
@@ -528,7 +506,8 @@ function TurnChangeFileRow({
   previewId,
   previewState,
   canPreview,
-  onToggle,
+  onOpen,
+  onClose,
   onRetry,
   onShowMoreLines,
   onLoadMore,
@@ -537,7 +516,8 @@ function TurnChangeFileRow({
   previewId: string;
   previewState: TurnFilePreviewState | null;
   canPreview: boolean;
-  onToggle(): void;
+  onOpen(): void;
+  onClose(): void;
   onRetry(): void;
   onShowMoreLines(): void;
   onLoadMore(): void;
@@ -546,22 +526,73 @@ function TurnChangeFileRow({
   const kind = turnChangeKind(file.kind);
   const additions = file.additions ?? 0;
   const deletions = file.deletions ?? 0;
-  const expanded = Boolean(previewState);
+  const [pinned, setPinned] = useState(false);
+  // A hover-triggered fetch renders nothing until it resolves (see
+  // TurnChangeFilePreview), so the row must not advertise a panel that is not
+  // on screen yet.
+  const previewPending = Boolean(
+    previewState &&
+    !file.binary &&
+    previewState.loading &&
+    !previewState.preview &&
+    !pinned,
+  );
+  const expanded = Boolean(previewState) && !previewPending;
+
+  useEffect(() => {
+    if (!previewState) setPinned(false);
+  }, [previewState]);
+
+  const closePreview = () => {
+    if (!pinned) onClose();
+  };
 
   return (
     <div
       className="turn-change-card-file"
       data-expanded={expanded || undefined}
+      data-preview-visible={expanded || undefined}
       role="listitem"
+      onMouseEnter={canPreview ? onOpen : undefined}
+      onMouseLeave={canPreview ? closePreview : undefined}
+      onFocus={canPreview ? onOpen : undefined}
+      onBlur={
+        canPreview
+          ? (event) => {
+              const nextTarget = event.relatedTarget;
+              if (
+                !(nextTarget instanceof Node) ||
+                !event.currentTarget.contains(nextTarget)
+              ) {
+                closePreview();
+              }
+            }
+          : undefined
+      }
     >
       <button
         className="turn-change-card-file-button"
         type="button"
         disabled={!canPreview}
         aria-expanded={expanded}
+        aria-haspopup="dialog"
         aria-controls={canPreview ? previewId : undefined}
         aria-label={`${expanded ? "收起" : "预览"} ${path} 的代码差异`}
-        onClick={onToggle}
+        onKeyDown={(event) => {
+          if (event.key !== "Escape" || !expanded) return;
+          event.preventDefault();
+          setPinned(false);
+          onClose();
+        }}
+        onClick={() => {
+          if (pinned) {
+            setPinned(false);
+            onClose();
+            return;
+          }
+          setPinned(true);
+          onOpen();
+        }}
       >
         <span
           className="turn-change-card-file-kind"
@@ -596,6 +627,7 @@ function TurnChangeFileRow({
           id={previewId}
           file={file}
           state={previewState}
+          showLoadingState={pinned}
           onRetry={onRetry}
           onShowMoreLines={onShowMoreLines}
           onLoadMore={onLoadMore}
@@ -609,6 +641,7 @@ function TurnChangeFilePreview({
   id,
   file,
   state,
+  showLoadingState,
   onRetry,
   onShowMoreLines,
   onLoadMore,
@@ -616,13 +649,19 @@ function TurnChangeFilePreview({
   id: string;
   file: TurnFileChange;
   state: TurnFilePreviewState;
+  showLoadingState: boolean;
   onRetry(): void;
   onShowMoreLines(): void;
   onLoadMore(): void;
 }) {
   if (file.binary) {
     return (
-      <div className="turn-change-card-preview-message" id={id} role="status">
+      <div
+        className="turn-change-card-preview-message"
+        id={id}
+        role="dialog"
+        aria-label={`${turnChangeFilePath(file)} 的代码差异预览`}
+      >
         <Code2 size={15} aria-hidden="true" />
         <span>这是二进制文件，没有可显示的文本代码差异。</span>
       </div>
@@ -630,8 +669,18 @@ function TurnChangeFilePreview({
   }
 
   if (state.loading && !state.preview) {
+    // Hovering a file row kicks off a fetch. Flashing a loading placeholder for
+    // a pointer that is just passing through is pure noise, so the placeholder
+    // is reserved for previews the user explicitly opened by clicking.
+    if (!showLoadingState) return null;
     return (
-      <div className="turn-change-card-preview-message" id={id} role="status">
+      <div
+        className="turn-change-card-preview-message"
+        id={id}
+        role="dialog"
+        aria-busy="true"
+        aria-label={`${turnChangeFilePath(file)} 的代码差异预览`}
+      >
         <Loader2 className="spin" size={15} aria-hidden="true" />
         <span>正在加载历史代码差异...</span>
       </div>
@@ -643,7 +692,8 @@ function TurnChangeFilePreview({
       <div
         className="turn-change-card-preview-message error"
         id={id}
-        role="alert"
+        role="dialog"
+        aria-label={`${turnChangeFilePath(file)} 的代码差异预览`}
       >
         <AlertCircle size={15} aria-hidden="true" />
         <span>{state.error}</span>
@@ -663,24 +713,41 @@ function TurnChangeFilePreview({
     preview.nextOffset !== null && preview.nextOffset !== undefined;
   const path = turnChangeFilePath(file);
   const loadedBytes = utf8ByteLength(preview.diff);
+  // A pure addition has no old line numbers (and a pure deletion no new ones),
+  // which would otherwise render as a permanently blank gutter column.
+  const hasOldNumbers = lines.some((line) => line.oldLine !== null);
+  const hasNewNumbers = lines.some((line) => line.newLine !== null);
+  const numberColumns = (hasOldNumbers ? 1 : 0) + (hasNewNumbers ? 1 : 0);
 
   return (
     <section
       className="turn-change-card-preview"
       id={id}
+      role="dialog"
       aria-label={`${path} 的代码差异预览`}
     >
       <header className="turn-change-card-preview-header">
         <code title={path}>{path}</code>
-        <span>
-          {canLoadNextPage
-            ? `已加载 ${formatPreviewBytes(loadedBytes)} / ${formatPreviewBytes(preview.totalBytes)}`
-            : `共 ${formatPreviewBytes(preview.totalBytes)}`}
+        <span className="turn-change-card-preview-meta">
+          <span className="turn-change-card-file-stats">
+            <span className="file-change-additions">
+              +{file.additions ?? 0}
+            </span>
+            <span className="file-change-deletions">
+              -{file.deletions ?? 0}
+            </span>
+          </span>
+          <span>
+            {canLoadNextPage
+              ? `已加载 ${formatPreviewBytes(loadedBytes)} / ${formatPreviewBytes(preview.totalBytes)}`
+              : `共 ${formatPreviewBytes(preview.totalBytes)}`}
+          </span>
         </span>
       </header>
       {visibleLines.length > 0 ? (
         <div
           className="turn-change-card-preview-code"
+          data-number-columns={numberColumns}
           role="table"
           tabIndex={0}
           aria-label="统一差异代码"
@@ -692,12 +759,16 @@ function TurnChangeFilePreview({
               role="row"
               key={`${index}:${line.oldLine ?? ""}:${line.newLine ?? ""}`}
             >
-              <span className="turn-change-card-preview-number" role="cell">
-                {line.oldLine ?? ""}
-              </span>
-              <span className="turn-change-card-preview-number" role="cell">
-                {line.newLine ?? ""}
-              </span>
+              {hasOldNumbers && (
+                <span className="turn-change-card-preview-number" role="cell">
+                  {line.oldLine ?? ""}
+                </span>
+              )}
+              {hasNewNumbers && (
+                <span className="turn-change-card-preview-number" role="cell">
+                  {line.newLine ?? ""}
+                </span>
+              )}
               <code role="cell">{line.text || " "}</code>
             </div>
           ))}
@@ -738,37 +809,52 @@ function parseTurnDiffLines(diff: string): TurnDiffLine[] {
   if (sourceLines.at(-1) === "") sourceLines.pop();
   let oldLine = 0;
   let newLine = 0;
+  // Everything before the first hunk header is git plumbing ("diff --git",
+  // "index ...", "--- /dev/null", "+++ b/..."). It is noise for the reader, so
+  // it is dropped instead of rendered. Tracking the first hunk also keeps
+  // content lines that happen to start with "---"/"+++" classified correctly.
+  let inHunk = false;
+  const lines: TurnDiffLine[] = [];
 
-  return sourceLines.map((text) => {
+  for (const text of sourceLines) {
+    // Re-arm the header skip at each file boundary so a multi-file diff does
+    // not leak the second file's plumbing back into the output.
+    if (text.startsWith("diff --git ")) {
+      inHunk = false;
+      continue;
+    }
     const hunk = text.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     if (hunk) {
       oldLine = Number(hunk[1]);
       newLine = Number(hunk[2]);
-      return { kind: "hunk", text, oldLine: null, newLine: null };
+      inHunk = true;
+      lines.push({ kind: "hunk", text, oldLine: null, newLine: null });
+      continue;
     }
-    if (text.startsWith("+") && !text.startsWith("+++")) {
+    if (!inHunk) continue;
+    if (text.startsWith("+")) {
       const line = newLine;
       newLine += 1;
-      return { kind: "added", text, oldLine: null, newLine: line };
+      lines.push({ kind: "added", text, oldLine: null, newLine: line });
+      continue;
     }
-    if (text.startsWith("-") && !text.startsWith("---")) {
+    if (text.startsWith("-")) {
       const line = oldLine;
       oldLine += 1;
-      return { kind: "deleted", text, oldLine: line, newLine: null };
+      lines.push({ kind: "deleted", text, oldLine: line, newLine: null });
+      continue;
     }
     if (text.startsWith(" ")) {
-      const line = {
-        kind: "context" as const,
-        text,
-        oldLine,
-        newLine,
-      };
+      lines.push({ kind: "context", text, oldLine, newLine });
       oldLine += 1;
       newLine += 1;
-      return line;
+      continue;
     }
-    return { kind: "meta", text, oldLine: null, newLine: null };
-  });
+    // "\ No newline at end of file" and friends.
+    lines.push({ kind: "meta", text, oldLine: null, newLine: null });
+  }
+
+  return lines;
 }
 
 function turnChangeFileKey(file: TurnFileChange) {
@@ -818,11 +904,13 @@ function ActivityEntryView({
   isActive,
   now,
   formatError,
+  onOpenMarkdownLink,
 }: {
   entry: ActivityEntry;
   isActive: boolean;
   now: number;
   formatError(message: string): string;
+  onOpenMarkdownLink?(href: string): void;
 }) {
   if (entry.kind === "tool-group") {
     return (
@@ -838,17 +926,22 @@ function ActivityEntryView({
     return <FileActivityGroup files={entry.files} defaultExpanded={isActive} />;
   }
   if (entry.kind === "reasoning") {
-    return <ReasoningActivity text={entry.text} />;
-  }
-  if (entry.kind === "model-request") {
-    return <ModelRequestActivity round={entry.round} request={entry.request} />;
-  }
-  if (entry.kind === "observability") {
     return (
-      <JsonActivity
-        title={entry.title}
-        summary={entry.summary}
-        detail={entry.detail}
+      <NarrativeActivity
+        kind="reasoning"
+        onOpenMarkdownLink={onOpenMarkdownLink}
+        streaming={isActive}
+        text={entry.text}
+      />
+    );
+  }
+  if (entry.kind === "commentary") {
+    return (
+      <NarrativeActivity
+        kind="commentary"
+        onOpenMarkdownLink={onOpenMarkdownLink}
+        streaming={isActive}
+        text={entry.text}
       />
     );
   }
@@ -875,15 +968,6 @@ function ActivityEntryView({
         tone="waiting"
         title="等待用户批准"
         detail={`${entry.reason}${entry.action ? `\n操作：${entry.action}` : ""}`}
-      />
-    );
-  }
-  if (entry.kind === "context") {
-    return (
-      <ActivityNotice
-        icon={<Activity size={13} />}
-        title="已压缩对话上下文"
-        detail="系统已生成上下文摘要，以便继续执行长程任务。"
       />
     );
   }
@@ -929,15 +1013,37 @@ function ToolActivityGroup({
   now: number;
 }) {
   const running = executions.some((execution) => !execution.result);
+  const commandBatch = category === "command" && executions.length > 1;
+  const runningCommand = [...executions]
+    .reverse()
+    .find((execution) => !execution.result);
   const failed = executions.some((execution) =>
     toolResultFailed(execution.result),
   );
   const timing = formatExecutionGroupTiming(executions, running, now);
-  const [expanded, setExpanded] = useState(defaultExpanded || running);
+  const [expanded, setExpanded] = useState(
+    !commandBatch && (defaultExpanded || running),
+  );
+  const wasRunning = useRef(running);
 
   useEffect(() => {
+    if (commandBatch) {
+      if (!running && wasRunning.current) setExpanded(false);
+      wasRunning.current = running;
+      return;
+    }
     if (running) setExpanded(true);
-  }, [running]);
+  }, [commandBatch, running]);
+
+  if (executions.length === 1) {
+    return <ToolExecutionItem execution={executions[0]} now={now} />;
+  }
+
+  if (commandBatch && running && runningCommand) {
+    return (
+      <ToolExecutionItem execution={runningCommand} now={now} currentCommand />
+    );
+  }
 
   return (
     <div
@@ -978,9 +1084,11 @@ function ToolActivityGroup({
 function ToolExecutionItem({
   execution,
   now,
+  currentCommand = false,
 }: {
   execution: ToolExecution;
   now: number;
+  currentCommand?: boolean;
 }) {
   const running = !execution.result;
   const failed = toolResultFailed(execution.result);
@@ -1003,10 +1111,15 @@ function ToolExecutionItem({
       ? `修改了 ${fileChanges.length} 个文件`
       : toolExecutionTitle(execution.call);
 
+  useEffect(() => {
+    if (currentCommand) setExpanded(false);
+  }, [currentCommand, execution.call.id]);
+
   return (
     <div
       className="tool-execution"
       data-state={failed ? "error" : running ? "running" : "complete"}
+      data-current-command={currentCommand || undefined}
     >
       <button
         className="tool-execution-header"
@@ -1015,10 +1128,19 @@ function ToolExecutionItem({
         onClick={() => setExpanded((current) => !current)}
       >
         <span className="tool-execution-state" aria-hidden="true">
-          <ActivityResultIcon running={running} failed={failed} />
+          {currentCommand ? (
+            <TerminalSquare size={12} />
+          ) : (
+            <ActivityResultIcon running={running} failed={failed} />
+          )}
         </span>
         <span className="tool-execution-title">
-          <strong title={primaryFileChange?.path}>{title}</strong>
+          <strong
+            className={currentCommand ? "tool-execution-title-flow" : undefined}
+            title={primaryFileChange?.path}
+          >
+            {title}
+          </strong>
           <small className="tool-execution-meta">
             <span>
               {primaryFileChange?.operation ||
@@ -1054,6 +1176,19 @@ function ToolExecutionItem({
             <span>结果</span>
             <pre>{output}</pre>
           </div>
+          {execution.call.name === "shell" && !running && (
+            <footer
+              className="tool-execution-shell-status"
+              data-state={failed ? "error" : "success"}
+            >
+              {failed ? (
+                <X size={12} aria-hidden="true" />
+              ) : (
+                <CheckCircle2 size={12} aria-hidden="true" />
+              )}
+              <span>{failed ? "失败" : "成功"}</span>
+            </footer>
+          )}
         </div>
       )}
     </div>
@@ -1167,109 +1302,29 @@ function FileChangeStatsView({ change }: { change: FileChangeSummary }) {
   );
 }
 
-function ReasoningActivity({ text }: { text: string }) {
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <div className="activity-group reasoning-activity" data-state="complete">
-      <button
-        className="activity-group-header"
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <span className="activity-group-icon" aria-hidden="true">
-          <BrainCircuit size={13} />
-        </span>
-        <span>思考过程</span>
-        <span />
-        {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-      </button>
-      {expanded && (
-        <pre className="reasoning-activity-detail">
-          {truncateText(redactText(text), 12_000)}
-        </pre>
-      )}
-    </div>
-  );
-}
-
-function ModelRequestActivity({
-  round,
-  request,
+function NarrativeActivity({
+  kind,
+  onOpenMarkdownLink,
+  streaming,
+  text,
 }: {
-  round: number;
-  request: ModelRequestSnapshot;
+  kind: "reasoning" | "commentary";
+  onOpenMarkdownLink?(href: string): void;
+  streaming: boolean;
+  text: string;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const historyCount = request.conversation?.length ?? 0;
-  const toolCount = request.toolCandidates?.length ?? 0;
-  const resultCount = request.toolResults?.length ?? 0;
-  const summary = [
-    `${historyCount} history`,
-    `${toolCount} tools`,
-    `${resultCount} results`,
-  ].join(" / ");
-
   return (
     <div
-      className="activity-group model-request-activity"
-      data-state="complete"
+      className="activity-narrative"
+      data-kind={kind}
+      aria-label={kind === "reasoning" ? "思考过程" : "处理说明"}
     >
-      <button
-        className="activity-group-header"
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <span className="activity-group-icon" aria-hidden="true">
-          <Send size={13} />
-        </span>
-        <span>Model request #{round}</span>
-        <small className="activity-group-count">{summary}</small>
-        {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-      </button>
-      {expanded && (
-        <pre className="model-request-activity-detail">
-          {JSON.stringify(request, null, 2)}
-        </pre>
-      )}
-    </div>
-  );
-}
-
-function JsonActivity({
-  title,
-  summary,
-  detail,
-}: {
-  title: string;
-  summary: string;
-  detail: unknown;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <div
-      className="activity-group model-request-activity"
-      data-state="complete"
-    >
-      <button
-        className="activity-group-header"
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <span className="activity-group-icon" aria-hidden="true">
-          <Activity size={13} />
-        </span>
-        <span>{title}</span>
-        <small className="activity-group-count">{summary}</small>
-        {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-      </button>
-      {expanded && (
-        <pre className="model-request-activity-detail">
-          {JSON.stringify(detail, null, 2)}
-        </pre>
-      )}
+      <MarkdownContent
+        className="activity-narrative-markdown"
+        onOpenLink={onOpenMarkdownLink}
+        streaming={streaming}
+        text={redactText(text)}
+      />
     </div>
   );
 }
@@ -1364,9 +1419,9 @@ function PlanActivity({
                 >
                   <span aria-hidden="true">
                     {step.status === "completed" ? (
-                      <Check size={12} />
+                      <span className="activity-plan-dot is-complete" />
                     ) : step.status === "in_progress" ? (
-                      <Loader2 size={12} className="spin" />
+                      <ActivityFlow compact />
                     ) : step.status === "blocked" ? (
                       <AlertCircle size={12} />
                     ) : step.status === "cancelled" ? (
@@ -1466,13 +1521,6 @@ function ActivityNotice({
   );
 }
 
-function ActivityStateIcon({ state }: { state: ActivityState }) {
-  if (state === "running") return <Loader2 size={14} className="spin" />;
-  if (state === "error" || state === "cancelled") return <X size={14} />;
-  if (state === "waiting") return <Clock3 size={14} />;
-  return <Check size={14} />;
-}
-
 function ActivityResultIcon({
   running,
   failed,
@@ -1480,14 +1528,31 @@ function ActivityResultIcon({
   running: boolean;
   failed: boolean;
 }) {
-  if (running)
-    return <Loader2 size={12} className="spin activity-result-icon" />;
+  if (running) return <ActivityFlow compact />;
   if (failed) return <X size={12} className="activity-result-icon" />;
-  return <Check size={12} className="activity-result-icon" />;
+  return <span className="activity-result-spacer" aria-hidden="true" />;
+}
+
+function ActivityFlow({ compact = false }: { compact?: boolean }) {
+  return (
+    <span
+      className={`activity-flow${compact ? " is-compact" : ""}`}
+      aria-hidden="true"
+    />
+  );
+}
+
+function activityStateLabel(state: ActivityState, isActive: boolean) {
+  if (isActive) return "处理中";
+  if (state === "error") return "执行失败";
+  if (state === "cancelled") return "已取消";
+  if (state === "waiting") return "等待继续";
+  return "已处理";
 }
 
 function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
   const sorted = [...events].sort((left, right) => left.seq - right.seq);
+  const finalResponseDeltaSeqs = findFinalResponseDeltaSeqs(sorted);
   const resultEvents = new Map<
     string,
     { result: ToolResult; createdAt: string; seq: number }
@@ -1532,86 +1597,15 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         isDelta: reasoning.isDelta,
         createdAt: event.createdAt,
       });
-    } else if (payload.type === "thread_context_snapshot") {
+    } else if (
+      payload.type === "model_delta" &&
+      !finalResponseDeltaSeqs.has(event.seq) &&
+      payload.text.length > 0
+    ) {
       primitives.push({
-        kind: "observability",
+        kind: "commentary",
         seq: event.seq,
-        title: "Thread context",
-        summary: `${payload.snapshot.providerKind} / ${payload.snapshot.model}`,
-        detail: payload.snapshot,
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "turn_context_snapshot") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: "Turn world state",
-        summary:
-          payload.snapshot.changedKeys.length > 0
-            ? payload.snapshot.changedKeys.join(", ")
-            : "unchanged",
-        detail: payload.snapshot,
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "model_context_built") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: `Model context #${payload.round}`,
-        summary: `${payload.items.length} items / ~${payload.token_estimate} tokens`,
-        detail: {
-          requestId: payload.request_id,
-          contextHash: payload.context_hash,
-          items: payload.items,
-        },
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "model_request") {
-      primitives.push({
-        kind: "model-request",
-        seq: event.seq,
-        round: payload.round,
-        request: payload.request,
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "provider_request_sent") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: `Provider request #${payload.round}`,
-        summary: `${payload.adapter} / attempt ${payload.attempt}`,
-        detail: {
-          requestId: payload.request_id,
-          method: payload.method,
-          endpoint: payload.endpoint,
-          body: payload.body,
-        },
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "provider_request_retried") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: `Provider retry #${payload.round}`,
-        summary: `attempt ${payload.attempt}`,
-        detail: {
-          requestId: payload.request_id,
-          reason: payload.reason,
-          body: payload.body,
-        },
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "provider_response_received") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: `Provider response #${payload.round}`,
-        summary: `HTTP ${payload.status ?? "n/a"} / attempt ${payload.attempt}`,
-        detail: {
-          requestId: payload.request_id,
-          responseId: payload.response_id,
-          body: payload.body,
-        },
+        text: payload.text,
         createdAt: event.createdAt,
       });
     } else if (payload.type === "tool_call_started") {
@@ -1672,97 +1666,6 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         seq: event.seq,
         reason: payload.reason,
         action: payload.action,
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "automatic_approval_review_started") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: "Auto-review",
-        summary: "Reviewing requested access",
-        detail: {
-          reviewId: payload.review_id,
-          targetItemId: payload.target_item_id,
-          action: payload.action,
-        },
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "automatic_approval_review_completed") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: `Auto-review ${payload.status.replace("_", " ")}`,
-        summary: [payload.risk_level, payload.rationale]
-          .filter(Boolean)
-          .join(" / "),
-        detail: {
-          reviewId: payload.review_id,
-          targetItemId: payload.target_item_id,
-          riskLevel: payload.risk_level,
-          userAuthorization: payload.user_authorization,
-          rationale: payload.rationale,
-          action: payload.action,
-        },
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "auto_review_interruption_warning") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: "Auto-review interrupted the turn",
-        summary: payload.message,
-        detail: payload,
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "context_compacted") {
-      primitives.push({
-        kind: "context",
-        seq: event.seq,
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "context_warning") {
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: "Context warning",
-        summary: payload.message,
-        detail: payload,
-        createdAt: event.createdAt,
-      });
-    } else if (payload.type === "token_usage") {
-      const cacheMetrics = [
-        payload.cached_input_tokens != null
-          ? `${payload.cached_input_tokens.toLocaleString()} cached`
-          : null,
-        payload.cache_write_tokens != null
-          ? `${payload.cache_write_tokens.toLocaleString()} cache write`
-          : null,
-        payload.reasoning_tokens != null
-          ? `${payload.reasoning_tokens.toLocaleString()} reasoning`
-          : null,
-      ].filter((value): value is string => value !== null);
-      primitives.push({
-        kind: "observability",
-        seq: event.seq,
-        title: "Token usage",
-        summary: [
-          `${payload.total_tokens.toLocaleString()} total`,
-          ...cacheMetrics,
-        ].join(" / "),
-        detail: {
-          inputTokens: payload.input_tokens,
-          outputTokens: payload.output_tokens,
-          totalTokens: payload.total_tokens,
-          ...(payload.cached_input_tokens != null && {
-            cachedInputTokens: payload.cached_input_tokens,
-          }),
-          ...(payload.cache_write_tokens != null && {
-            cacheWriteTokens: payload.cache_write_tokens,
-          }),
-          ...(payload.reasoning_tokens != null && {
-            reasoningTokens: payload.reasoning_tokens,
-          }),
-        },
         createdAt: event.createdAt,
       });
     } else if (payload.type === "error") {
@@ -1857,11 +1760,61 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
       } else {
         entries.push(primitive);
       }
+    } else if (primitive.kind === "commentary") {
+      const previous = entries[entries.length - 1];
+      if (previous?.kind === "commentary") {
+        previous.text = appendReasoningText(
+          previous.text,
+          primitive.text,
+          true,
+        );
+      } else {
+        entries.push(primitive);
+      }
     } else {
       entries.push(primitive);
     }
   }
   return entries;
+}
+
+function findFinalResponseDeltaSeqs(events: AgentEvent[]): Set<number> {
+  let assistantIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].payload.type === "assistant_message") {
+      assistantIndex = index;
+      break;
+    }
+  }
+  if (assistantIndex < 0) return new Set();
+
+  const assistantEvent = events[assistantIndex];
+  if (assistantEvent.payload.type !== "assistant_message") return new Set();
+  const finalText = assistantEvent.payload.message.parts
+    .filter((part) => part.type === "text")
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("");
+  if (!finalText) return new Set();
+
+  let requestIndex = -1;
+  for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+    if (events[index].payload.type === "model_request") {
+      requestIndex = index;
+      break;
+    }
+  }
+  if (requestIndex < 0) return new Set();
+
+  let remaining = finalText;
+  const matched = new Set<number>();
+  for (const event of events.slice(requestIndex + 1, assistantIndex)) {
+    if (event.payload.type !== "model_delta") continue;
+    if (!remaining.startsWith(event.payload.text)) return new Set();
+    remaining = remaining.slice(event.payload.text.length);
+    matched.add(event.seq);
+    if (!remaining) return matched;
+  }
+  return new Set();
 }
 
 function buildPlanStepTimings(
@@ -1940,24 +1893,6 @@ function activityState(events: AgentEvent[], isActive: boolean): ActivityState {
   return "complete";
 }
 
-function activitySummary({
-  operationCount,
-  commandCount,
-  otherToolCount,
-  isActive,
-}: {
-  operationCount: number;
-  commandCount: number;
-  otherToolCount: number;
-  isActive: boolean;
-}) {
-  if (operationCount === 0) return isActive ? "等待执行步骤" : "未调用工具";
-  const parts = [`${operationCount} 步`];
-  if (commandCount > 0) parts.push(`${commandCount} 条命令`);
-  if (otherToolCount > 0) parts.push(`${otherToolCount} 个工具`);
-  return parts.join(" · ");
-}
-
 function activityEntryKey(entry: ActivityEntry) {
   if (entry.kind === "tool-group" || entry.kind === "file-group")
     return entry.id;
@@ -2005,7 +1940,7 @@ function toolCategoryIcon(category: ToolCategory) {
 }
 
 function toolGroupTitle(category: ToolCategory, count: number) {
-  if (category === "command") return `执行了 ${count} 条命令`;
+  if (category === "command") return "运行了多个命令";
   if (category === "file") return `进行了 ${count} 个文件操作`;
   if (category === "browser") return `进行了 ${count} 个浏览器操作`;
   if (category === "spreadsheet") return `进行了 ${count} 个表格操作`;
@@ -2551,9 +2486,7 @@ function formatTurnTiming(
     ? now
     : (terminal?.time ?? validEvents[validEvents.length - 1]?.time ?? null);
   if (finishedAt === null || finishedAt < startedAt) return "";
-  return `${isActive ? "已运行" : "总耗时"} ${formatElapsed(
-    finishedAt - startedAt,
-  )}`;
+  return formatTurnElapsed(finishedAt - startedAt);
 }
 
 function formatActivityTiming(
@@ -2644,6 +2577,17 @@ function formatElapsed(duration: number) {
   const hours = Math.floor(totalMinutes / 60);
   if (hours > 0) return `${hours} 小时 ${minutes} 分 ${seconds} 秒`;
   return `${minutes} 分 ${seconds} 秒`;
+}
+
+function formatTurnElapsed(duration: number) {
+  const totalSeconds = Math.max(0, Math.round(duration / 1_000));
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }
 
 function subagentStatusLabel(status: SubagentRun["status"]) {

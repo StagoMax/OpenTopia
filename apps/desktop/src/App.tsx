@@ -40,7 +40,6 @@ import {
   Laptop,
   ListTodo,
   Loader2,
-  Menu,
   Monitor,
   MessageCircle,
   MoreHorizontal,
@@ -71,6 +70,8 @@ import {
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
 import { LogViewer } from "./components/LogViewer";
+import { MarkdownContent } from "./components/MarkdownContent";
+import { ModelSelector } from "./components/ModelSelector";
 import {
   ApprovalDialog,
   type ApprovalRequest,
@@ -86,11 +87,17 @@ import {
 import { WebPreviewSurface } from "./components/WebPreviewSurface";
 import { ComputerPanel } from "./components/ComputerPanel";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
+import { resolveMarkdownLink } from "./markdownLinks";
+import {
+  reconcileReasoningEffort,
+  resolveDefaultModelId,
+} from "./modelCatalog";
 import {
   deleteProviderApiKey,
   getRecentWorkspaces,
   listSecretSources,
   loadPlatformInfo,
+  openExternal,
   openPath,
   selectContextFiles,
   selectPluginDirectory,
@@ -109,6 +116,7 @@ import type {
   AppSettings,
   ArtifactContent,
   ArtifactDescriptor,
+  BrowserNavigationRequest,
   CollaborationMode,
   ContextStatus,
   ContextSourceFile,
@@ -138,6 +146,7 @@ import type {
   TerminalSession,
   Thread,
   ThreadMcpServerView,
+  ThreadModelSelection,
   TurnChangeSet,
   TurnFileDiffPreview,
   TurnUndoPreview,
@@ -160,6 +169,7 @@ type ToolTab = {
   kind: ToolTabKind;
   title: string;
   previewTarget?: PreviewTarget;
+  browserNavigation?: BrowserNavigationRequest;
 };
 
 type DirectToolCommand =
@@ -415,6 +425,10 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  // Model picked on the new-task screen, before a thread exists to pin it to.
+  // Carried into the thread the draft creates.
+  const [draftModelSelection, setDraftModelSelection] =
+    useState<ThreadModelSelection | null>(null);
   const [experienceMode, setExperienceMode] =
     useState<ExperienceMode>(readExperienceMode);
   const [collaborationMode, setCollaborationMode] = useState<CollaborationMode>(
@@ -503,6 +517,9 @@ export function App() {
   const [toolTabs, setToolTabs] = useState<ToolTab[]>([]);
   const [activeToolTabId, setActiveToolTabId] = useState<string | null>(null);
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [keyboardShortcutsOpen, setKeyboardShortcutsOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [turnUndoDialog, setTurnUndoDialog] =
@@ -521,8 +538,11 @@ export function App() {
     value: number;
   } | null>(null);
   const workspaceResizeFrameRef = useRef<number | null>(null);
+  const markdownNavigationIdRef = useRef(0);
   const taskNotificationPreferencesRef = useRef(taskNotificationPreferences);
   const ingestedEventIdsRef = useRef(new Set<string>());
+  const pendingEventRenderRef = useRef<AgentEvent[]>([]);
+  const eventRenderTimeoutRef = useRef<number | null>(null);
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -568,6 +588,17 @@ export function App() {
     setTurnUndoDialog(null);
   }, [activeThreadId]);
 
+  useEffect(
+    () => () => {
+      if (eventRenderTimeoutRef.current !== null) {
+        window.clearTimeout(eventRenderTimeoutRef.current);
+        eventRenderTimeoutRef.current = null;
+      }
+      pendingEventRenderRef.current = [];
+    },
+    [activeThreadId],
+  );
+
   useEffect(() => {
     if (!activeApproval) return;
     setConversationCollapsed(false);
@@ -610,7 +641,9 @@ export function App() {
     ],
   );
   const workspaceStyle = {
-    "--workspace-left-width": `${workspaceLayout.left}px`,
+    "--workspace-left-width": `${
+      sidebarCollapsed ? 0 : workspaceLayout.left
+    }px`,
     "--workspace-right-width": `${workspaceLayout.right}px`,
   } as CSSProperties;
 
@@ -672,6 +705,17 @@ export function App() {
     },
     [],
   );
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    if (workspaceResizeFrameRef.current !== null) {
+      window.cancelAnimationFrame(workspaceResizeFrameRef.current);
+      workspaceResizeFrameRef.current = null;
+    }
+    pendingWorkspaceSizeRef.current = null;
+    workspaceResizeDragRef.current = null;
+    setWorkspaceResizeSide(null);
+  }, [settingsOpen]);
 
   useEffect(() => {
     if (!client) return;
@@ -748,10 +792,29 @@ export function App() {
         if (oldestId) ingestedEventIdsRef.current.delete(oldestId);
       }
 
-      setEvents((current) => {
-        if (current.some((item) => item.id === event.id)) return current;
-        return [...current, event].sort((a, b) => a.seq - b.seq);
-      });
+      pendingEventRenderRef.current.push(event);
+      if (eventRenderTimeoutRef.current === null) {
+        eventRenderTimeoutRef.current = window.setTimeout(() => {
+          eventRenderTimeoutRef.current = null;
+          const pending = pendingEventRenderRef.current;
+          pendingEventRenderRef.current = [];
+          if (pending.length === 0) return;
+
+          // Streaming events can arrive faster than the renderer can paint.
+          setEvents((current) => {
+            const knownIds = new Set(current.map((item) => item.id));
+            const additions: AgentEvent[] = [];
+            for (const queuedEvent of pending) {
+              if (knownIds.has(queuedEvent.id)) continue;
+              knownIds.add(queuedEvent.id);
+              additions.push(queuedEvent);
+            }
+            return additions.length > 0
+              ? [...current, ...additions].sort((a, b) => a.seq - b.seq)
+              : current;
+          });
+        }, 80);
+      }
 
       if (event.payload.type === "assistant_message") {
         const assistantMessage = event.payload.message;
@@ -995,6 +1058,37 @@ export function App() {
       cancelled = true;
     };
   }, []);
+
+  // New tasks start on the newest stable model of the active connection. This is
+  // why there is no "quality vs. speed" preference to configure: the latest
+  // model is the default, and the composer is where you deviate from it.
+  useEffect(() => {
+    if (!settings) return;
+    const active =
+      settings.providers.find(
+        (provider) => provider.id === settings.activeProviderId,
+      ) ?? settings.providers[0];
+    if (!active) return;
+    setDraftModelSelection((current) => {
+      if (current && current.connectionId === active.id) return current;
+      const modelIds =
+        active.syncedModels.length > 0 ? active.syncedModels : [active.model];
+      const modelId = resolveDefaultModelId(
+        modelIds,
+        active.enabledFamilies,
+        active.model,
+      );
+      return {
+        connectionId: active.id,
+        modelId,
+        reasoningEffort: reconcileReasoningEffort(
+          active.kind,
+          modelId,
+          active.reasoningEffort ?? null,
+        ),
+      };
+    });
+  }, [settings]);
 
   useEffect(() => {
     setPendingApprovalIds([]);
@@ -1312,7 +1406,16 @@ export function App() {
     setConversationCollapsed(false);
   }
 
-  function openPreviewTab(
+  function toggleToolPanel(kind: Exclude<ToolTabKind, "preview">) {
+    const tabId = `tool-${kind}`;
+    if (activeToolTabId === tabId) {
+      closeToolTab(tabId);
+      return;
+    }
+    openToolTab(kind);
+  }
+
+  const openPreviewTab = useCallback(function openPreviewTab(
     threadId: string,
     target: PreviewTarget,
     title: string,
@@ -1331,7 +1434,64 @@ export function App() {
     );
     setActiveToolTabId(id);
     setConversationCollapsed(false);
-  }
+  }, []);
+
+  const openMarkdownLink = useCallback(
+    function openMarkdownLink(href: string, baseWorkspacePath?: string | null) {
+      const target = resolveMarkdownLink(href, baseWorkspacePath);
+      if (target.kind === "anchor") return;
+      if (target.kind === "blocked") {
+        setActionError(target.reason);
+        return;
+      }
+      if (target.kind === "email") {
+        void openExternal(target.url).catch((error) =>
+          setActionError(
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+        return;
+      }
+      if (!activeThread) {
+        setActionError("Open a task before following this link.");
+        return;
+      }
+      if (target.kind === "workspace") {
+        openPreviewTab(
+          activeThread.id,
+          { type: "workspace", path: target.path },
+          markdownLinkTitle(target.path),
+        );
+        return;
+      }
+
+      const navigation: BrowserNavigationRequest = {
+        id: `${activeThread.id}:${++markdownNavigationIdRef.current}`,
+        url: target.url,
+      };
+      const id = "tool-browser";
+      setToolTabs((current) => {
+        const existing = current.find((tab) => tab.id === id);
+        if (!existing) {
+          return [
+            ...current,
+            {
+              id,
+              kind: "browser",
+              title: toolTabTitle("browser"),
+              browserNavigation: navigation,
+            },
+          ];
+        }
+        return current.map((tab) =>
+          tab.id === id ? { ...tab, browserNavigation: navigation } : tab,
+        );
+      });
+      setActiveToolTabId(id);
+      setConversationCollapsed(false);
+    },
+    [activeThread, openPreviewTab],
+  );
 
   function closeToolTab(tabId: string) {
     setToolTabs((current) => {
@@ -1573,6 +1733,7 @@ export function App() {
     model?: string;
     apiKeySource?: string;
     permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
+    agentRuntime?: AppSettings["agentRuntime"];
     sandbox?: AppSettings["sandbox"];
   }) {
     if (!client) return false;
@@ -1755,20 +1916,43 @@ export function App() {
     );
     setActionError(null);
     try {
-      const thread = await client.createThread({
-        title: initialPrompt?.trim()
-          ? threadTitleFromPrompt(initialPrompt)
-          : project.name,
+      const prompt = initialPrompt?.trim() ?? "";
+      let thread = await client.createThread({
+        title: prompt ? threadTitleFromPrompt(prompt) : project.name,
         workspaceRoot: project.workspaceRoot,
         projectId: project.id,
         experienceMode,
       });
+      if (draftModelSelection) {
+        // Pin before the first turn runs, so the conversation starts on the
+        // model picked in the draft composer rather than the connection default.
+        try {
+          thread = await client.setThreadModel(thread.id, draftModelSelection);
+        } catch (error) {
+          console.warn("OpenTopia could not pin the task model", error);
+        }
+      }
       setThreads((current) => [thread, ...current]);
       setActiveThreadId(thread.id);
       setSelectedWorkspaceRoot(thread.workspaceRoot);
       setDraftProjectId(null);
       setToolTabs([]);
       setActiveToolTabId(null);
+      if (threadTitleNeedsSummary(prompt)) {
+        void client
+          .generateThreadTitle(thread.id, prompt, thread.title)
+          .then(({ thread: titledThread, updated }) => {
+            if (!updated) return;
+            setThreads((current) =>
+              current.map((item) =>
+                item.id === titledThread.id ? titledThread : item,
+              ),
+            );
+          })
+          .catch((error) => {
+            console.warn("OpenTopia could not generate the task title", error);
+          });
+      }
       if (directCommand) {
         await runDirectToolCommand(thread.id, directCommand);
         setComposer("");
@@ -1864,11 +2048,12 @@ export function App() {
     }
   }
 
-  async function submitMessage() {
+  async function submitMessage(input: string) {
+    const messageText = input.trim();
     if (
       !client ||
       !activeThread ||
-      (!composer.trim() &&
+      (!messageText &&
         contextSources.length === 0 &&
         selectedSkillIds.length === 0) ||
       isSending ||
@@ -1876,8 +2061,8 @@ export function App() {
       activeUserInput
     )
       return;
-    const directCommand = parseDirectToolCommand(composer);
-    if (!directCommand && isLegacyDirectToolCommand(composer)) {
+    const directCommand = parseDirectToolCommand(messageText);
+    if (!directCommand && isLegacyDirectToolCommand(messageText)) {
       setActionError("/run and /read require an argument.");
       return;
     }
@@ -1897,7 +2082,7 @@ export function App() {
       }
       const { message, turnId, queued } = await client.sendMessage(
         activeThread.id,
-        composer.trim(),
+        messageText,
         contextSources.map((source) => source.path),
         selectedSkillIds,
         collaborationMode,
@@ -2522,9 +2707,133 @@ export function App() {
     });
   }
 
+  async function syncProviderModels(
+    providerId: string,
+  ): Promise<string[] | null> {
+    if (!client) return null;
+    try {
+      const result = await client.syncProviderModels(providerId);
+      setSettings((current) =>
+        current
+          ? {
+              ...current,
+              providers: current.providers.map((provider) =>
+                provider.id === providerId
+                  ? {
+                      ...provider,
+                      syncedModels: result.models,
+                      modelsSyncedAt: result.syncedAt,
+                    }
+                  : provider,
+              ),
+            }
+          : current,
+      );
+      return result.models;
+    } catch (error) {
+      console.warn("OpenTopia could not sync the model list", error);
+      return null;
+    }
+  }
+
+  function changeModelSelection(selection: ThreadModelSelection) {
+    if (!settings || activeTurnId) return;
+
+    // Follow the picked connection globally so new threads and utility calls
+    // (title generation, guardian) land on the same API the user just chose.
+    if (settings.activeProviderId !== selection.connectionId && !isSavingSettings) {
+      void saveSettings({ activeProviderId: selection.connectionId });
+    }
+
+    if (!activeThreadId) {
+      setDraftModelSelection(selection);
+      return;
+    }
+
+    const threadId = activeThreadId;
+    setThreads((current) =>
+      current.map((thread) =>
+        thread.id === threadId
+          ? { ...thread, modelSelection: selection }
+          : thread,
+      ),
+    );
+    void (async () => {
+      try {
+        const updated = await client?.setThreadModel(threadId, selection);
+        if (updated) {
+          setThreads((current) =>
+            current.map((thread) =>
+              thread.id === threadId ? updated : thread,
+            ),
+          );
+        }
+      } catch (error) {
+        setActionError(`切换模型失败：${errorMessage(error)}`);
+      }
+    })();
+  }
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing) return;
+      if (!(event.ctrlKey || event.metaKey)) return;
+
+      const key = event.key.toLocaleLowerCase();
+      if (key === ",") {
+        event.preventDefault();
+        if (!settingsOpen) setSettingsOpen(true);
+        return;
+      }
+      if (settingsOpen || keyboardShortcutsOpen || aboutOpen) return;
+
+      if (event.altKey) {
+        if (key === "b" && !event.shiftKey) {
+          event.preventDefault();
+          toggleToolPanel("diff");
+        }
+        return;
+      }
+
+      if (key === "b" && !event.shiftKey) {
+        event.preventDefault();
+        setSidebarCollapsed((current) => !current);
+      } else if (key === "n" && !event.shiftKey) {
+        event.preventDefault();
+        beginNewThread();
+      } else if (key === "o" && !event.shiftKey) {
+        event.preventDefault();
+        void chooseWorkspace();
+      } else if (key === "`" && !event.shiftKey) {
+        event.preventDefault();
+        toggleToolPanel("terminal");
+      } else if (key === "e" && event.shiftKey) {
+        event.preventDefault();
+        toggleToolPanel("files");
+      } else if (key === "/" && !event.shiftKey) {
+        event.preventDefault();
+        setKeyboardShortcutsOpen(true);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   return (
     <div className="app-shell">
-      <TopBar />
+      <TopBar
+        sidebarCollapsed={sidebarCollapsed}
+        onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
+        onNewTask={beginNewThread}
+        onOpenWorkspace={() => void chooseWorkspace()}
+        onToggleTool={toggleToolPanel}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenLogs={() => setLogViewerOpen(true)}
+        onShowKeyboardShortcuts={() => setKeyboardShortcutsOpen(true)}
+        onShowAbout={() => setAboutOpen(true)}
+        menuSuppressed={settingsOpen || keyboardShortcutsOpen || aboutOpen}
+      />
       {actionError && (
         <div className="action-error" role="alert">
           <span>{actionError}</span>
@@ -2540,7 +2849,7 @@ export function App() {
       )}
       <main
         ref={workspaceRef}
-        className={`workspace ${activeToolTab ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
+        className={`workspace ${activeToolTab ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
         style={workspaceStyle}
       >
         <Sidebar
@@ -2583,25 +2892,29 @@ export function App() {
           onOpenExtensions={() => openToolTab("extensions")}
           onSettings={() => setSettingsOpen(true)}
         />
-        <div
-          className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
-          role="separator"
-          tabIndex={0}
-          aria-label="调整左侧栏宽度"
-          aria-controls="workspace-sidebar"
-          aria-orientation="vertical"
-          aria-valuemin={workspaceLayout.leftMin}
-          aria-valuemax={workspaceLayout.leftMax}
-          aria-valuenow={workspaceLayout.left}
-          aria-valuetext={`${workspaceLayout.left} 像素`}
-          onPointerDown={(event) => beginWorkspaceResize("left", event)}
-          onPointerMove={(event) => continueWorkspaceResize("left", event)}
-          onPointerUp={(event) => finishWorkspaceResize("left", event)}
-          onPointerCancel={(event) => finishWorkspaceResize("left", event)}
-          onLostPointerCapture={(event) => finishWorkspaceResize("left", event)}
-          onDoubleClick={() => resetWorkspacePanelSize("left")}
-          onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
-        />
+        {!settingsOpen && !sidebarCollapsed ? (
+          <div
+            className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
+            role="separator"
+            tabIndex={0}
+            aria-label="调整左侧栏宽度"
+            aria-controls="workspace-sidebar"
+            aria-orientation="vertical"
+            aria-valuemin={workspaceLayout.leftMin}
+            aria-valuemax={workspaceLayout.leftMax}
+            aria-valuenow={workspaceLayout.left}
+            aria-valuetext={`${workspaceLayout.left} 像素`}
+            onPointerDown={(event) => beginWorkspaceResize("left", event)}
+            onPointerMove={(event) => continueWorkspaceResize("left", event)}
+            onPointerUp={(event) => finishWorkspaceResize("left", event)}
+            onPointerCancel={(event) => finishWorkspaceResize("left", event)}
+            onLostPointerCapture={(event) =>
+              finishWorkspaceResize("left", event)
+            }
+            onDoubleClick={() => resetWorkspacePanelSize("left")}
+            onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
+          />
+        ) : null}
         <section
           className={`center-pane ${
             activeApproval
@@ -2659,6 +2972,7 @@ export function App() {
                 onOpenArtifact={(artifactId) =>
                   void openArtifact(activeThread.id, artifactId)
                 }
+                onOpenMarkdownLink={openMarkdownLink}
                 onUndoTurn={(turnId) => void openTurnUndo(turnId)}
                 onReviewChanges={() => {
                   openToolTab("diff");
@@ -2715,11 +3029,9 @@ export function App() {
                     Boolean(activeTurnId) && cancellingTurnId === activeTurnId
                   }
                   queuedMessageCount={queuedMessageCount}
-                  model={
-                    settings?.providers.find(
-                      (provider) => provider.id === settings.activeProviderId,
-                    )?.model ?? "Model"
-                  }
+                  modelSelection={activeThread?.modelSelection ?? null}
+                  providers={settings?.providers ?? []}
+                  activeProviderId={settings?.activeProviderId ?? ""}
                   permissionMode={settings?.permissionMode ?? "auto"}
                   collaborationMode={collaborationMode}
                   sandboxMode={
@@ -2733,13 +3045,15 @@ export function App() {
                   projects={projects}
                   canOpenThreadTools
                   onChange={setComposer}
-                  onSubmit={submitMessage}
+                  onSubmit={(value) => void submitMessage(value)}
                   onCancel={() => void cancelTurn()}
                   onPickWorkspace={() => void chooseWorkspace()}
                   onSelectProject={selectProject}
                   onChangePermissionMode={changeExecutionPreset}
                   onChangeCollaborationMode={setCollaborationMode}
                   onChangeSandboxMode={changeSandboxMode}
+                  onChangeModelSelection={changeModelSelection}
+                  onOpenSettings={() => setSettingsOpen(true)}
                   onAddContextSources={() => void addContextSources()}
                   onRemoveContextSource={removeContextSource}
                   onToggleSkill={toggleSkill}
@@ -2752,11 +3066,9 @@ export function App() {
               workspaceRoot={currentWorkspaceRoot}
               projectName={draftProject?.name ?? null}
               projects={projects}
-              model={
-                settings?.providers.find(
-                  (provider) => provider.id === settings.activeProviderId,
-                )?.model ?? "Model"
-              }
+              modelSelection={draftModelSelection}
+              providers={settings?.providers ?? []}
+              activeProviderId={settings?.activeProviderId ?? ""}
               permissionMode={settings?.permissionMode ?? "auto"}
               collaborationMode={collaborationMode}
               sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
@@ -2773,34 +3085,38 @@ export function App() {
               onChangePermissionMode={changeExecutionPreset}
               onChangeCollaborationMode={setCollaborationMode}
               onChangeSandboxMode={changeSandboxMode}
+              onChangeModelSelection={changeModelSelection}
+              onOpenSettings={() => setSettingsOpen(true)}
               onAddContextSources={() => void addContextSources()}
               onRemoveContextSource={removeContextSource}
               onToggleSkill={toggleSkill}
-              onSubmit={() => void createThread(composer)}
+              onSubmit={(value) => void createThread(value)}
             />
           )}
         </section>
-        <div
-          className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
-          role="separator"
-          tabIndex={0}
-          aria-label="调整右侧栏宽度"
-          aria-controls="workspace-right-panel"
-          aria-orientation="vertical"
-          aria-valuemin={workspaceLayout.rightMin}
-          aria-valuemax={workspaceLayout.rightMax}
-          aria-valuenow={workspaceLayout.right}
-          aria-valuetext={`${workspaceLayout.right} 像素`}
-          onPointerDown={(event) => beginWorkspaceResize("right", event)}
-          onPointerMove={(event) => continueWorkspaceResize("right", event)}
-          onPointerUp={(event) => finishWorkspaceResize("right", event)}
-          onPointerCancel={(event) => finishWorkspaceResize("right", event)}
-          onLostPointerCapture={(event) =>
-            finishWorkspaceResize("right", event)
-          }
-          onDoubleClick={() => resetWorkspacePanelSize("right")}
-          onKeyDown={(event) => resizeWorkspaceWithKeyboard("right", event)}
-        />
+        {!settingsOpen ? (
+          <div
+            className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
+            role="separator"
+            tabIndex={0}
+            aria-label="调整右侧栏宽度"
+            aria-controls="workspace-right-panel"
+            aria-orientation="vertical"
+            aria-valuemin={workspaceLayout.rightMin}
+            aria-valuemax={workspaceLayout.rightMax}
+            aria-valuenow={workspaceLayout.right}
+            aria-valuetext={`${workspaceLayout.right} 像素`}
+            onPointerDown={(event) => beginWorkspaceResize("right", event)}
+            onPointerMove={(event) => continueWorkspaceResize("right", event)}
+            onPointerUp={(event) => finishWorkspaceResize("right", event)}
+            onPointerCancel={(event) => finishWorkspaceResize("right", event)}
+            onLostPointerCapture={(event) =>
+              finishWorkspaceResize("right", event)
+            }
+            onDoubleClick={() => resetWorkspacePanelSize("right")}
+            onKeyDown={(event) => resizeWorkspaceWithKeyboard("right", event)}
+          />
+        ) : null}
         <RightPanel
           client={client}
           toolTabs={toolTabs}
@@ -2866,6 +3182,7 @@ export function App() {
           onOpenArtifact={(threadId, artifactId) =>
             void openArtifact(threadId, artifactId)
           }
+          onOpenMarkdownLink={openMarkdownLink}
           onRevertDiffFile={(path) => void revertDiffFile(path)}
           onApplyDiffHunk={(hunk, action) => void applyDiffHunk(hunk, action)}
           onGetArtifact={(threadId, artifactId) =>
@@ -2896,6 +3213,7 @@ export function App() {
           onTestProvider={(providerId, providers) =>
             void testProviderConnection(providerId, providers)
           }
+          onSyncProviderModels={syncProviderModels}
           onStoreProviderApiKey={storeProviderApiKey}
           onDeleteProviderApiKey={removeProviderApiKey}
           onNotificationPreferencesChange={setTaskNotificationPreferences}
@@ -2912,6 +3230,12 @@ export function App() {
           onClose={() => setSettingsOpen(false)}
         />
       )}
+      {keyboardShortcutsOpen ? (
+        <KeyboardShortcutsDialog
+          onClose={() => setKeyboardShortcutsOpen(false)}
+        />
+      ) : null}
+      {aboutOpen ? <AboutDialog onClose={() => setAboutOpen(false)} /> : null}
       {logViewerOpen && <LogViewer onClose={() => setLogViewerOpen(false)} />}
       {renameTarget && (
         <RenameDialog
@@ -3167,40 +3491,537 @@ function diffHunkActionLabel(action: WorkspaceDiffHunkAction): string {
   }
 }
 
-function TopBar() {
+type TopBarMenu = "file" | "edit" | "view" | "help";
+type NativeEditCommand =
+  "undo" | "redo" | "cut" | "copy" | "paste" | "delete" | "selectAll";
+
+function isEditableElement(value: EventTarget | null): value is HTMLElement {
+  if (value instanceof HTMLTextAreaElement)
+    return !value.disabled && !value.readOnly;
+  if (value instanceof HTMLInputElement)
+    return !value.disabled && !value.readOnly;
+  return value instanceof HTMLElement && value.isContentEditable;
+}
+
+function TopBar({
+  sidebarCollapsed,
+  onToggleSidebar,
+  onNewTask,
+  onOpenWorkspace,
+  onToggleTool,
+  onOpenSettings,
+  onOpenLogs,
+  onShowKeyboardShortcuts,
+  onShowAbout,
+  menuSuppressed,
+}: {
+  sidebarCollapsed: boolean;
+  onToggleSidebar(): void;
+  onNewTask(): void;
+  onOpenWorkspace(): void;
+  onToggleTool(kind: Exclude<ToolTabKind, "preview">): void;
+  onOpenSettings(): void;
+  onOpenLogs(): void;
+  onShowKeyboardShortcuts(): void;
+  onShowAbout(): void;
+  menuSuppressed: boolean;
+}) {
+  const [openMenu, setOpenMenu] = useState<TopBarMenu | null>(null);
+  const [hasEditableTarget, setHasEditableTarget] = useState(false);
+  const editableTargetRef = useRef<HTMLElement | null>(null);
+  const menuRef = useDismissiblePopover(Boolean(openMenu), () =>
+    setOpenMenu(null),
+  );
+
+  useEffect(() => {
+    const rememberEditableTarget = (event: FocusEvent) => {
+      if (!isEditableElement(event.target)) return;
+      editableTargetRef.current = event.target;
+      setHasEditableTarget(true);
+    };
+    document.addEventListener("focusin", rememberEditableTarget);
+    return () =>
+      document.removeEventListener("focusin", rememberEditableTarget);
+  }, []);
+
+  useEffect(() => {
+    if (menuSuppressed) setOpenMenu(null);
+  }, [menuSuppressed]);
+
+  useEffect(() => {
+    setOpenMenu(null);
+  }, [sidebarCollapsed]);
+
+  const toggleMenu = (menu: TopBarMenu) => {
+    setOpenMenu((current) => (current === menu ? null : menu));
+  };
+  const closeMenu = () => setOpenMenu(null);
+  const runAction = (action: () => void) => {
+    action();
+    closeMenu();
+  };
+  const runEditCommand = (command: NativeEditCommand) => {
+    const target = editableTargetRef.current;
+    if (!target || !target.isConnected || !isEditableElement(target)) {
+      setHasEditableTarget(false);
+      closeMenu();
+      return;
+    }
+    target.focus({ preventScroll: true });
+    if (command === "selectAll" && target instanceof HTMLInputElement) {
+      target.select();
+    } else if (
+      command === "selectAll" &&
+      target instanceof HTMLTextAreaElement
+    ) {
+      target.select();
+    } else {
+      document.execCommand(command);
+    }
+    closeMenu();
+  };
+  const preserveEditableFocus = (event: ReactPointerEvent<HTMLButtonElement>) =>
+    event.preventDefault();
+
+  const menuButton = (menu: TopBarMenu, label: string) => (
+    <button
+      className={`window-menu-item ${openMenu === menu ? "active" : ""}`}
+      type="button"
+      aria-haspopup="menu"
+      aria-expanded={openMenu === menu}
+      onClick={() => toggleMenu(menu)}
+    >
+      {label}
+    </button>
+  );
+
   return (
     <header className="topbar">
-      <div className="window-menu">
+      <div className="window-menu" ref={menuRef}>
         <button
-          className="window-app-button"
-          disabled
-          title="应用菜单 · 未实现"
+          className="window-app-button sidebar-toggle-button"
+          type="button"
+          aria-label={sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}
+          aria-pressed={sidebarCollapsed}
+          title={sidebarCollapsed ? "展开侧栏 (Ctrl+B)" : "折叠侧栏 (Ctrl+B)"}
+          onClick={() => runAction(onToggleSidebar)}
         >
-          <Menu size={14} />
+          {sidebarCollapsed ? (
+            <PanelLeftOpen size={15} aria-hidden="true" />
+          ) : (
+            <PanelLeftClose size={15} aria-hidden="true" />
+          )}
+          {sidebarCollapsed ? <span className="sidebar-toggle-dot" /> : null}
         </button>
-        <button className="window-nav-button" disabled title="后退 · 未实现">
+        <button className="window-nav-button" disabled title="后退不可用">
           <ArrowLeft size={14} />
         </button>
-        <button className="window-nav-button" disabled title="前进 · 未实现">
+        <button className="window-nav-button" disabled title="前进不可用">
           <ArrowRight size={14} />
         </button>
-        {[
-          ["文件", "文件菜单 · 未实现"],
-          ["编辑", "编辑菜单 · 未实现"],
-          ["视图", "视图菜单 · 未实现"],
-          ["帮助", "帮助菜单 · 未实现"],
-        ].map(([label, title]) => (
-          <button
-            className="window-menu-item"
-            disabled
-            key={label}
-            title={title}
-          >
-            {label}
-          </button>
-        ))}
+
+        <div className="window-menu-entry">
+          {menuButton("file", "文件")}
+          {openMenu === "file" ? (
+            <div className="window-menu-popover" role="menu" aria-label="文件">
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onNewTask)}
+              >
+                <span>新建任务</span>
+                <kbd>Ctrl+N</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本不支持多个应用窗口"
+              >
+                <span>新建窗口</span>
+                <kbd>Ctrl+Shift+N</kbd>
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onOpenWorkspace)}
+              >
+                <span>打开工作区...</span>
+                <kbd>Ctrl+O</kbd>
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本没有关闭任务的独立操作"
+              >
+                <span>关闭任务</span>
+                <kbd>Ctrl+W</kbd>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="window-menu-entry">
+          {menuButton("edit", "编辑")}
+          {openMenu === "edit" ? (
+            <div className="window-menu-popover" role="menu" aria-label="编辑">
+              {(
+                [
+                  ["undo", "撤销", "Ctrl+Z"],
+                  ["redo", "重做", "Ctrl+Y"],
+                ] as const
+              ).map(([command, label, shortcut]) => (
+                <button
+                  key={command}
+                  type="button"
+                  role="menuitem"
+                  disabled={!hasEditableTarget}
+                  onPointerDown={preserveEditableFocus}
+                  onClick={() => runEditCommand(command)}
+                >
+                  <span>{label}</span>
+                  <kbd>{shortcut}</kbd>
+                </button>
+              ))}
+              <div className="window-menu-divider" role="separator" />
+              {(
+                [
+                  ["cut", "剪切", "Ctrl+X"],
+                  ["copy", "复制", "Ctrl+C"],
+                  ["paste", "粘贴", "Ctrl+V"],
+                  ["delete", "删除", ""],
+                ] as const
+              ).map(([command, label, shortcut]) => (
+                <button
+                  key={command}
+                  type="button"
+                  role="menuitem"
+                  disabled={!hasEditableTarget}
+                  onPointerDown={preserveEditableFocus}
+                  onClick={() => runEditCommand(command)}
+                >
+                  <span>{label}</span>
+                  <kbd>{shortcut}</kbd>
+                </button>
+              ))}
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled={!hasEditableTarget}
+                onPointerDown={preserveEditableFocus}
+                onClick={() => runEditCommand("selectAll")}
+              >
+                <span>全选</span>
+                <kbd>Ctrl+A</kbd>
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onOpenSettings)}
+              >
+                <span>设置...</span>
+                <kbd>Ctrl+,</kbd>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="window-menu-entry">
+          {menuButton("view", "视图")}
+          {openMenu === "view" ? (
+            <div
+              className="window-menu-popover window-menu-popover-wide"
+              role="menu"
+              aria-label="视图"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onToggleSidebar)}
+              >
+                <span>{sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}</span>
+                <kbd>Ctrl+B</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前布局没有底部面板"
+              >
+                <span>切换底部面板</span>
+                <kbd>Ctrl+J</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本没有置顶摘要面板"
+              >
+                <span>切换置顶摘要</span>
+                <kbd />
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(() => onToggleTool("terminal"))}
+              >
+                <span>打开终端</span>
+                <kbd>Ctrl+`</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(() => onToggleTool("files"))}
+              >
+                <span>切换文件树</span>
+                <kbd>Ctrl+Shift+E</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(() => onToggleTool("diff"))}
+              >
+                <span>切换审查面板</span>
+                <kbd>Ctrl+Alt+B</kbd>
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(() => onToggleTool("browser"))}
+              >
+                <span>浏览器</span>
+                <kbd />
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本没有全局查找面板"
+              >
+                <span>查找</span>
+                <kbd>Ctrl+F</kbd>
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本不支持缩放界面"
+              >
+                <span>放大</span>
+                <kbd>Ctrl+Shift+=</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本不支持缩放界面"
+              >
+                <span>缩小</span>
+                <kbd>Ctrl+-</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本不支持缩放界面"
+              >
+                <span>实际大小</span>
+                <kbd>Ctrl+0</kbd>
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本不支持全屏切换"
+              >
+                <span>切换全屏</span>
+                <kbd>F11</kbd>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="window-menu-entry">
+          {menuButton("help", "帮助")}
+          {openMenu === "help" ? (
+            <div className="window-menu-popover" role="menu" aria-label="帮助">
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本没有在线文档入口"
+              >
+                <span>文档</span>
+                <kbd />
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onShowKeyboardShortcuts)}
+              >
+                <span>键盘快捷键</span>
+                <kbd>Ctrl+/</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本没有更新公告"
+              >
+                <span>更新内容</span>
+                <kbd />
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onOpenLogs)}
+              >
+                <span>故障排查（日志）</span>
+                <kbd />
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本没有系统状态页"
+              >
+                <span>系统状态</span>
+                <kbd />
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled
+                title="当前版本没有反馈入口"
+              >
+                <span>发送反馈</span>
+                <kbd />
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onShowAbout)}
+              >
+                <span>关于 OpenTopia</span>
+                <kbd />
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
     </header>
+  );
+}
+
+function KeyboardShortcutsDialog({ onClose }: { onClose(): void }) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  const shortcuts = [
+    ["新建任务", "Ctrl+N"],
+    ["打开工作区", "Ctrl+O"],
+    ["切换侧栏", "Ctrl+B"],
+    ["设置", "Ctrl+,"],
+    ["打开终端", "Ctrl+`"],
+    ["切换文件树", "Ctrl+Shift+E"],
+  ];
+
+  return (
+    <div
+      className="modal-backdrop chrome-dialog-backdrop"
+      role="presentation"
+      onMouseDown={onClose}
+    >
+      <section
+        className="chrome-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="keyboard-shortcuts-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <h2 id="keyboard-shortcuts-title">键盘快捷键</h2>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="关闭键盘快捷键"
+            title="关闭"
+            onClick={onClose}
+          >
+            <X size={17} />
+          </button>
+        </header>
+        <dl className="chrome-shortcuts-list">
+          {shortcuts.map(([label, shortcut]) => (
+            <div key={shortcut}>
+              <dt>{label}</dt>
+              <dd>
+                <kbd>{shortcut}</kbd>
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+    </div>
+  );
+}
+
+function AboutDialog({ onClose }: { onClose(): void }) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="modal-backdrop chrome-dialog-backdrop"
+      role="presentation"
+      onMouseDown={onClose}
+    >
+      <section
+        className="chrome-dialog chrome-about-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="about-opentopia-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <h2 id="about-opentopia-title">OpenTopia</h2>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="关闭关于 OpenTopia"
+            title="关闭"
+            onClick={onClose}
+          >
+            <X size={17} />
+          </button>
+        </header>
+        <p>本地优先的 AI 编码与工作代理。</p>
+      </section>
+    </div>
   );
 }
 
@@ -3267,7 +4088,7 @@ function SettingsPanel({
     settings?.sandbox ?? {
       sandboxMode: "workspace-write",
       enforcement: "enforce",
-      network: "deny",
+      network: "allow",
       writableRoots: [],
       readPaths: [],
     },
@@ -3305,12 +4126,16 @@ function SettingsPanel({
       ...current,
       {
         id: newId,
+        name: "Custom provider",
         kind: "openai_compatible",
         baseUrl: "https://api.openai.com/v1",
         model: "gpt-4.1-mini",
+        enabledFamilies: [],
+        syncedModels: [],
+        modelsSyncedAt: null,
         temperature: 0.2,
         maxOutputTokens: null,
-        contextWindowTokens: 128000,
+        contextWindowTokens: null,
         reasoningEffort: null,
         storeResponses: false,
         parallelToolCalls: false,
@@ -3602,9 +4427,12 @@ function SettingsPanel({
                       }
                     >
                       <option value="openai_compatible">
-                        OpenAI Compatible
+                        OpenAI Chat Completions (compatible)
                       </option>
-                      <option value="openai_responses">OpenAI Responses</option>
+                      <option value="openai_responses">
+                        OpenAI Responses (native)
+                      </option>
+                      <option value="anthropic">Anthropic Messages</option>
                       <option value="mock">Mock</option>
                     </select>
                   </label>
@@ -3677,12 +4505,14 @@ function SettingsPanel({
                         type="number"
                         min="4096"
                         step="1024"
-                        value={editingProvider.contextWindowTokens}
+                        value={editingProvider.contextWindowTokens ?? ""}
                         onChange={(event) =>
                           updateProvider(
                             editingProvider.id,
                             "contextWindowTokens",
-                            Number(event.target.value),
+                            event.target.value
+                              ? Number(event.target.value)
+                              : null,
                           )
                         }
                       />
@@ -4682,7 +5512,49 @@ function SidebarThreadRow({
   onRestore?(): void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [titleOverflow, setTitleOverflow] = useState({
+    distance: 0,
+    durationMs: 0,
+  });
+  const titleViewportRef = useRef<HTMLSpanElement>(null);
+  const titleTextRef = useRef<HTMLSpanElement>(null);
   const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
+
+  useEffect(() => {
+    const viewport = titleViewportRef.current;
+    const text = titleTextRef.current;
+    if (!viewport || !text) return;
+
+    const measure = () => {
+      const distance = Math.max(
+        0,
+        Math.ceil(text.scrollWidth - viewport.clientWidth),
+      );
+      const durationMs =
+        distance > 0 ? Math.min(8_000, 1_800 + distance * 24) : 0;
+      setTitleOverflow((current) =>
+        current.distance === distance && current.durationMs === durationMs
+          ? current
+          : { distance, durationMs },
+      );
+    };
+    const frame = window.requestAnimationFrame(measure);
+    const observer = new ResizeObserver(measure);
+    observer.observe(viewport);
+    observer.observe(text);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [thread.title]);
+
+  const titleStyle =
+    titleOverflow.distance > 0
+      ? ({
+          "--thread-title-scroll-distance": `${titleOverflow.distance}px`,
+          "--thread-title-scroll-duration": `${titleOverflow.durationMs}ms`,
+        } as CSSProperties)
+      : undefined;
 
   return (
     <div className={`thread-row-wrap ${menuOpen ? "menu-open" : ""}`}>
@@ -4690,8 +5562,20 @@ function SidebarThreadRow({
         className={`thread-row ${active ? "active" : ""}`}
         onClick={onSelect}
         title={thread.title}
+        aria-label={thread.title}
       >
-        <span>{thread.title}</span>
+        <span
+          className={`thread-title-viewport ${titleOverflow.distance > 0 ? "is-overflowing" : ""}`}
+          ref={titleViewportRef}
+        >
+          <span
+            className="thread-title-text"
+            ref={titleTextRef}
+            style={titleStyle}
+          >
+            {thread.title}
+          </span>
+        </span>
       </button>
       <div className="thread-row-menu-wrap" ref={menuRef}>
         <button
@@ -5082,6 +5966,7 @@ function MessageList({
   threadId,
   artifacts,
   onOpenArtifact,
+  onOpenMarkdownLink,
   onUndoTurn,
   onReviewChanges,
   onLoadTurnFilePreview,
@@ -5093,6 +5978,7 @@ function MessageList({
   threadId: string;
   artifacts: ArtifactDescriptor[];
   onOpenArtifact(artifactId: string): void;
+  onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
   onUndoTurn(turnId: string): void;
   onReviewChanges(): void;
   onLoadTurnFilePreview(
@@ -5104,18 +5990,6 @@ function MessageList({
   const visibleMessages = messages.filter(
     (message) => message.role === "user" || message.role === "assistant",
   );
-  const streamingText = activeTurnId
-    ? events
-        .filter(
-          (event) =>
-            event.turnId === activeTurnId &&
-            event.payload.type === "model_delta",
-        )
-        .map((event) =>
-          event.payload.type === "model_delta" ? event.payload.text : "",
-        )
-        .join("")
-    : "";
   const eventsByTurn = new Map<string, AgentEvent[]>();
   const turnIdsByUserMessage = new Map<string, string[]>();
   const turnIdsByAssistantMessage = new Map<string, string[]>();
@@ -5203,6 +6077,7 @@ function MessageList({
                 threadId={threadId}
                 artifacts={artifacts}
                 onOpenArtifact={onOpenArtifact}
+                onOpenMarkdownLink={onOpenMarkdownLink}
               />
               {turnIds.map((turnId) => (
                 <Fragment key={turnId}>
@@ -5210,6 +6085,7 @@ function MessageList({
                     events={eventsByTurn.get(turnId) ?? []}
                     isActive={activeTurnId === turnId}
                     formatError={friendlyProviderError}
+                    onOpenMarkdownLink={onOpenMarkdownLink}
                   />
                   {!turnsWithAssistantCards.has(turnId) &&
                     renderTurnChangeCard(turnId)}
@@ -5235,13 +6111,6 @@ function MessageList({
           </div>
         </article>
       ))}
-      {streamingText && (
-        <article className="message assistant streaming-message">
-          <div className="message-body">
-            <p className="message-text">{streamingText}</p>
-          </div>
-        </article>
-      )}
     </div>
   );
 }
@@ -5251,22 +6120,34 @@ function MessageBubble({
   threadId,
   artifacts,
   onOpenArtifact,
+  onOpenMarkdownLink,
 }: {
   message: Message;
   threadId: string;
   artifacts: ArtifactDescriptor[];
   onOpenArtifact(artifactId: string): void;
+  onOpenMarkdownLink(href: string): void;
 }) {
+  const visibleParts = message.parts.filter(
+    (part) =>
+      part.type !== "turn_context" &&
+      part.type !== "tool_call" &&
+      part.type !== "tool_result",
+  );
+  if (visibleParts.length === 0) return null;
+
   return (
     <article className={`message ${message.role}`}>
       <div className="message-body">
-        {message.parts.map((part, index) => (
+        {visibleParts.map((part, index) => (
           <MessagePartView
             key={index}
             part={part}
+            role={message.role}
             threadId={threadId}
             artifacts={artifacts}
             onOpenArtifact={onOpenArtifact}
+            onOpenMarkdownLink={onOpenMarkdownLink}
           />
         ))}
       </div>
@@ -5276,20 +6157,32 @@ function MessageBubble({
 
 function MessagePartView({
   part,
+  role,
   threadId,
   artifacts,
   onOpenArtifact,
+  onOpenMarkdownLink,
 }: {
   part: MessagePart;
+  role: Message["role"];
   threadId: string;
   artifacts: ArtifactDescriptor[];
   onOpenArtifact(artifactId: string): void;
+  onOpenMarkdownLink(href: string): void;
 }) {
   if (part.type === "text") {
     const refs = artifactReferencesFromText(part.text);
     return (
       <>
-        <p className="message-text">{part.text}</p>
+        {role === "assistant" ? (
+          <MarkdownContent
+            className="message-markdown"
+            onOpenLink={onOpenMarkdownLink}
+            text={part.text}
+          />
+        ) : (
+          <p className="message-text">{part.text}</p>
+        )}
         <MessageArtifactLinks
           refs={refs}
           threadId={threadId}
@@ -5330,23 +6223,7 @@ function MessagePartView({
       </button>
     );
   }
-  if (part.type === "turn_context") return null;
-  if (part.type === "tool_call")
-    return <pre>{JSON.stringify(part.call, null, 2)}</pre>;
-  return (
-    <>
-      <pre>{part.result.output}</pre>
-      <MessageArtifactLinks
-        refs={collectArtifactReferences(
-          part.result.metadata,
-          part.result.output,
-        )}
-        threadId={threadId}
-        artifacts={artifacts}
-        onOpenArtifact={onOpenArtifact}
-      />
-    </>
-  );
+  return null;
 }
 
 function MessageArtifactLinks({
@@ -5480,8 +6357,9 @@ function ComposerPlanStepIcon({
 }: {
   status: TaskPlan["steps"][number]["status"];
 }) {
-  if (status === "completed") return <Check size={13} />;
-  if (status === "in_progress") return <Loader2 size={13} className="spin" />;
+  if (status === "completed")
+    return <span className="composer-plan-complete" />;
+  if (status === "in_progress") return <span className="composer-plan-flow" />;
   if (status === "blocked") return <AlertCircle size={13} />;
   if (status === "cancelled") return <X size={13} />;
   if (status === "deferred") return <Clock3 size={13} />;
@@ -5495,7 +6373,9 @@ function Composer({
   isRunning,
   isCancelling,
   queuedMessageCount = 0,
-  model,
+  providers,
+  activeProviderId,
+  modelSelection,
   permissionMode,
   collaborationMode,
   sandboxMode,
@@ -5516,6 +6396,8 @@ function Composer({
   onChangePermissionMode,
   onChangeCollaborationMode,
   onChangeSandboxMode,
+  onChangeModelSelection,
+  onOpenSettings,
   onAddContextSources,
   onRemoveContextSource,
   onToggleSkill,
@@ -5526,7 +6408,9 @@ function Composer({
   isRunning: boolean;
   isCancelling: boolean;
   queuedMessageCount?: number;
-  model: string;
+  providers: ProviderSettings[];
+  activeProviderId: string;
+  modelSelection: ThreadModelSelection | null;
   permissionMode: AppSettings["permissionMode"];
   collaborationMode: CollaborationMode;
   sandboxMode: AppSettings["sandbox"]["sandboxMode"];
@@ -5539,7 +6423,7 @@ function Composer({
   launchMode?: NewTaskLaunchMode;
   canOpenThreadTools?: boolean;
   onChange(value: string): void;
-  onSubmit(): void;
+  onSubmit(value: string): void;
   onCancel(): void;
   onPickWorkspace(): void;
   onSelectProject(projectId: string): void;
@@ -5547,6 +6431,8 @@ function Composer({
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeCollaborationMode(mode: CollaborationMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
+  onChangeModelSelection(selection: ThreadModelSelection): void;
+  onOpenSettings(): void;
   onAddContextSources(): void;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
@@ -5554,9 +6440,50 @@ function Composer({
   const [openMenu, setOpenMenu] = useState<
     "actions" | "permission" | "model" | "workspace" | "environment" | null
   >(null);
-  const popoverRef = useDismissiblePopover(Boolean(openMenu), () =>
-    setOpenMenu(null),
-  );
+  const [activeToolTooltip, setActiveToolTooltip] = useState<{
+    id: string;
+    description: string;
+    left: number;
+    top: number;
+  } | null>(null);
+  const closeMenus = () => {
+    setOpenMenu(null);
+    setActiveToolTooltip(null);
+  };
+  const popoverRef = useDismissiblePopover(Boolean(openMenu), closeMenus);
+  const [draft, setDraft] = useState(value);
+
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+
+  const submitDraft = () => {
+    if (isSending) return;
+    const submittedValue = draft;
+    setDraft("");
+    onChange("");
+    onSubmit(submittedValue);
+  };
+
+  const showToolTooltip = (
+    skill: SkillDescriptor,
+    target: HTMLButtonElement,
+  ) => {
+    if (!skill.description) return;
+
+    const anchor = target.getBoundingClientRect();
+    const width = Math.min(300, window.innerWidth - 24);
+    const height = Math.min(180, window.innerHeight - 24);
+    setActiveToolTooltip({
+      id: `composer-tool-tooltip-${skill.id}`,
+      description: skill.description,
+      left: Math.max(
+        12,
+        Math.min(anchor.right + 8, window.innerWidth - width - 12),
+      ),
+      top: Math.max(12, Math.min(anchor.top, window.innerHeight - height - 12)),
+    });
+  };
 
   return (
     <div className="composer-shell">
@@ -5810,10 +6737,12 @@ function Composer({
           </div>
         )}
         <textarea
-          value={value}
+          value={draft}
           aria-label="消息"
           placeholder={collaborationModePlaceholder(collaborationMode)}
-          onChange={(event) => onChange(event.target.value)}
+          onFocus={closeMenus}
+          onPointerDown={closeMenus}
+          onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
             if (
               event.key === "Enter" &&
@@ -5822,7 +6751,7 @@ function Composer({
               !event.repeat
             ) {
               event.preventDefault();
-              onSubmit();
+              submitDraft();
             }
           }}
         />
@@ -5906,23 +6835,42 @@ function Composer({
                     <div className="composer-actions-section-label">工具</div>
                     {skills.map((skill) => {
                       const selected = selectedSkillIds.includes(skill.id);
+                      const descriptionId = `composer-tool-description-${skill.id}`;
                       return (
                         <button
                           className={`composer-tool-option ${selected ? "active" : ""}`}
                           key={skill.id}
                           role="menuitemcheckbox"
                           aria-checked={selected}
+                          aria-describedby={
+                            skill.description ? descriptionId : undefined
+                          }
                           disabled={!selected && selectedSkillIds.length >= 5}
-                          title={skill.description || skill.path}
+                          onMouseEnter={(event) =>
+                            showToolTooltip(skill, event.currentTarget)
+                          }
+                          onMouseLeave={(event) => {
+                            if (
+                              document.activeElement !== event.currentTarget
+                            ) {
+                              setActiveToolTooltip(null);
+                            }
+                          }}
+                          onFocus={(event) =>
+                            showToolTooltip(skill, event.currentTarget)
+                          }
+                          onBlur={() => setActiveToolTooltip(null)}
                           onClick={() => onToggleSkill(skill.id)}
                         >
                           <Plug size={14} aria-hidden="true" />
                           <span className="composer-action-copy">
                             <strong>{skill.name}</strong>
-                            {skill.description ? (
-                              <small>{skill.description}</small>
-                            ) : null}
                           </span>
+                          {skill.description ? (
+                            <span className="sr-only" id={descriptionId}>
+                              {skill.description}
+                            </span>
+                          ) : null}
                           {selected ? (
                             <Check size={14} aria-hidden="true" />
                           ) : null}
@@ -5983,33 +6931,14 @@ function Composer({
               </div>
             )}
           </div>
-          <div className="composer-menu-wrap composer-meta-wrap">
-            <button
-              className="composer-meta"
-              type="button"
-              aria-expanded={openMenu === "model"}
-              onClick={() =>
-                setOpenMenu((current) => (current === "model" ? null : "model"))
-              }
-            >
-              <span title={model}>{model}</span>
-              <span>默认推理</span>
-              <ChevronDown size={12} />
-            </button>
-            {openMenu === "model" && (
-              <div className="tool-popover model-popover" role="menu">
-                <div className="tool-popover-note">
-                  <strong>{model}</strong>
-                  <span>当前 Provider 模型</span>
-                </div>
-                <button disabled title="单任务模型与推理强度尚未实现">
-                  <Activity size={14} />
-                  <span>模型与推理强度</span>
-                  <small>使用全局配置</small>
-                </button>
-              </div>
-            )}
-          </div>
+          <ModelSelector
+            activeConnectionId={activeProviderId}
+            connections={providers}
+            disabled={isRunning || isSending}
+            onChange={onChangeModelSelection}
+            onOpenSettings={onOpenSettings}
+            selection={modelSelection}
+          />
           {queuedMessageCount > 0 ? (
             <span className="composer-queue-status">
               {queuedMessageCount} queued
@@ -6023,11 +6952,11 @@ function Composer({
             isRunning
               ? isCancelling
               : isSending ||
-                (!value.trim() &&
+                (!draft.trim() &&
                   contextSources.length === 0 &&
                   selectedSkillIds.length === 0)
           }
-          onClick={isRunning ? onCancel : onSubmit}
+          onClick={isRunning ? onCancel : submitDraft}
           title={
             isRunning
               ? isCancelling
@@ -6061,6 +6990,22 @@ function Composer({
             <ArrowUp size={18} strokeWidth={2.25} aria-hidden="true" />
           )}
         </button>
+        {activeToolTooltip
+          ? createPortal(
+              <div
+                className="composer-tool-tooltip"
+                id={activeToolTooltip.id}
+                role="tooltip"
+                style={{
+                  left: activeToolTooltip.left,
+                  top: activeToolTooltip.top,
+                }}
+              >
+                {activeToolTooltip.description}
+              </div>,
+              document.body,
+            )
+          : null}
       </div>
     </div>
   );
@@ -6200,6 +7145,7 @@ function RightPanel({
   onCloseTerminalSession,
   onCompactContext,
   onOpenArtifact,
+  onOpenMarkdownLink,
   onRevertDiffFile,
   onApplyDiffHunk,
   onGetArtifact,
@@ -6268,6 +7214,7 @@ function RightPanel({
   onCloseTerminalSession(threadId: string, sessionId: string): void;
   onCompactContext(): void;
   onOpenArtifact(threadId: string, artifactId: string): void;
+  onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
   onRevertDiffFile(path: string): void;
   onApplyDiffHunk(
     hunk: WorkspaceDiffHunk,
@@ -6357,6 +7304,7 @@ function RightPanel({
               pendingApprovalIds={pendingApprovalIds}
               decidingApprovalId={decidingApprovalId}
               onDecideApproval={onDecideApproval}
+              navigationRequest={activeToolTab.browserNavigation ?? null}
             />
           ) : activeToolTab.kind === "computer" ? (
             <ComputerPanel client={client} threadId={thread?.id ?? null} />
@@ -6367,6 +7315,7 @@ function RightPanel({
               threadId={thread?.id ?? null}
               workspaceRoot={workspaceRoot}
               target={activeToolTab.previewTarget}
+              onOpenMarkdownLink={onOpenMarkdownLink}
             />
           ) : (
             activeToolTab.kind !== "preview" &&
@@ -6512,7 +7461,9 @@ function NewTaskState({
   workspaceRoot,
   projectName,
   projects,
-  model,
+  modelSelection,
+  providers,
+  activeProviderId,
   permissionMode,
   collaborationMode,
   sandboxMode,
@@ -6529,6 +7480,8 @@ function NewTaskState({
   onChangePermissionMode,
   onChangeCollaborationMode,
   onChangeSandboxMode,
+  onChangeModelSelection,
+  onOpenSettings,
   onAddContextSources,
   onRemoveContextSource,
   onToggleSkill,
@@ -6538,7 +7491,9 @@ function NewTaskState({
   workspaceRoot: string | null;
   projectName: string | null;
   projects: Project[];
-  model: string;
+  modelSelection: ThreadModelSelection | null;
+  providers: ProviderSettings[];
+  activeProviderId: string;
   permissionMode: AppSettings["permissionMode"];
   collaborationMode: CollaborationMode;
   sandboxMode: AppSettings["sandbox"]["sandboxMode"];
@@ -6555,10 +7510,12 @@ function NewTaskState({
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeCollaborationMode(mode: CollaborationMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
+  onChangeModelSelection(selection: ThreadModelSelection): void;
+  onOpenSettings(): void;
   onAddContextSources(): void;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
-  onSubmit(): void;
+  onSubmit(value: string): void;
 }) {
   const suggestions =
     experienceMode === "work"
@@ -6646,7 +7603,9 @@ function NewTaskState({
         isSending={isSending}
         isRunning={false}
         isCancelling={false}
-        model={model}
+        modelSelection={modelSelection}
+        providers={providers}
+        activeProviderId={activeProviderId}
         permissionMode={permissionMode}
         collaborationMode={collaborationMode}
         sandboxMode={sandboxMode}
@@ -6668,6 +7627,8 @@ function NewTaskState({
         onChangePermissionMode={onChangePermissionMode}
         onChangeCollaborationMode={onChangeCollaborationMode}
         onChangeSandboxMode={onChangeSandboxMode}
+        onChangeModelSelection={onChangeModelSelection}
+        onOpenSettings={onOpenSettings}
         onAddContextSources={onAddContextSources}
         onRemoveContextSource={onRemoveContextSource}
         onToggleSkill={onToggleSkill}
@@ -6894,7 +7855,7 @@ function controlledSandboxSettings(
     ...sandbox,
     sandboxMode: "workspace-write",
     enforcement: "enforce",
-    network: sandbox.network === "allow" ? "inherit" : sandbox.network,
+    network: sandbox.network,
   };
 }
 
@@ -7107,9 +8068,23 @@ function artifactPreviewTitle(
   return descriptor?.kind || artifactId;
 }
 
+function markdownLinkTitle(path: string): string {
+  const normalized = path.replaceAll("\\", "/");
+  return normalized.split("/").filter(Boolean).at(-1) ?? path;
+}
+
+const MAX_THREAD_TITLE_CHARS = 20;
+
+function threadTitleNeedsSummary(prompt: string): boolean {
+  return Array.from(prompt.trim()).length > MAX_THREAD_TITLE_CHARS;
+}
+
 function threadTitleFromPrompt(prompt: string): string {
-  const title = prompt.replace(/\s+/g, " ").trim();
-  return title.length > 32 ? `${title.slice(0, 31)}…` : title;
+  const title = prompt.trim();
+  const chars = Array.from(title);
+  if (chars.length <= MAX_THREAD_TITLE_CHARS) return title;
+  const singleLineTitle = Array.from(title.replace(/\s+/g, " "));
+  return `${singleLineTitle.slice(0, MAX_THREAD_TITLE_CHARS - 1).join("")}…`;
 }
 
 function workspaceName(workspaceRoot: string): string {
