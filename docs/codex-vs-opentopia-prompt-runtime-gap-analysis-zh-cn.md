@@ -191,7 +191,7 @@ Codex 有专门一节（原文 231-235 行），且规则很具体：
 
 ## 7. 落地状态
 
-以下全部已实施，提示词版本从 `2026-07-25.1` 升到 `2026-07-26.1`。
+以下全部已实施，提示词版本从 `2026-07-25.1` 升到 `2026-07-26.1`，随后文本级对比又补了五条、升到 `2026-07-26.2`（见 `codex-vs-opentopia-system-prompt-comparison-zh-cn.md` 的 7.2）。
 
 | # | 改动 | 位置 |
 |---|---|---|
@@ -203,6 +203,9 @@ Codex 有专门一节（原文 231-235 行），且规则很具体：
 | 6 | 选中 Skill 改 `Thread` 作用域；`skills_protocol` 补"已注入的 Skill 不要重复加载" | `main.rs`、`prompt_runtime.rs` |
 | 7 | final 自包含契约（含因果说明）+ 跨压缩连续性规则 | `base_agent_prompt.md`、`agent.rs` |
 | 8 | `provider_user_message` 给对话级摘要补上连续性框定与不可信内容边界 | `agent.rs` |
+| 9 | 修正第 3 项的能力位：`request_user_input` 仅在 Plan 模式可用，工具目录与提示词共用 `request_user_input_is_available` 谓词 | `agent.rs`、`prompt_runtime.rs` |
+
+> **第 9 项是对第 3 项的修正。** `clarification_policy` 的分支由 `request_user_input_available` 选择，而该字段原先只判断工具是否注册且未被禁用。`RequestUserInputTool` 在 `ToolRegistry::with_builtins` 里无条件注册，Default 模式下 `allowed_tools` 为空，字段因此恒为 `true`：提示词告诉模型结构化提问可用，`provider_tool_candidates` 也把工具放进目录，但 `RequestUserInputTool::execute` 开头就 `ensure!` 要求 Plan 模式，调用必然失败。这正是该模块本来要防的失败模式——模型结构化提问失败后很可能改用纯文本伪造选择题。现在两处共用同一个谓词，`PromptRuntimeCapabilities::default()` 里该字段也从 `true` 改为 `false`（它原先是该结构中唯一默认「可用」的字段）。新增测试 `request_user_input_is_advertised_only_in_plan_mode`。
 
 新增测试：`prompt_runtime.rs` 的 `output_contract_and_clarification_modules_track_the_surface_and_tool`，`main.rs` 的两个 `condense_git_status` 用例，`agent.rs` 里 base prompt 优先级顺序的位置断言与 durable context 框定断言，以及对多 Agent 模块正文的断言扩展。
 

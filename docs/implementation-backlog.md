@@ -458,12 +458,38 @@ Tasks:
     capped at 8 MiB and terminal aggregate output at 4 MiB.
 - Remaining hardening, in scope (Windows):
   - Add native CPU and memory quotas. Output and timeout limits are already enforced.
-    Design note: `build_windows_sandbox_command` delegates to the vendored
-    `codex sandbox` helper, so the helper owns the restricted token and its own job
-    object. Quotas therefore need either helper `--config` keys that support them, or an
-    OpenTopia-owned job object assigned around the spawned helper process in
-    `execution.rs` (`CreateJobObject` + `SetInformationJobObject` with
-    `JOB_OBJECT_LIMIT_PROCESS_MEMORY` / `JOB_OBJECT_LIMIT_JOB_TIME`).
+    Resolved design: the helper cannot carry quotas. `codex sandbox` exposes only
+    permission-shaped options (`--config`, `--permission-profile`, `--sandbox-state-*`,
+    `--enable`/`--disable`, `--cd`); there is no resource-limit flag, and `--config` only
+    overrides Codex agent configuration. So quotas must be an OpenTopia-owned job object
+    wrapped around the spawned helper in `execution.rs`. Windows 8+ allows nested job
+    objects, so an outer OpenTopia job coexists with the job `codex.exe` creates itself.
+    Required order: spawn with `CREATE_SUSPENDED`, `CreateJobObject`,
+    `SetInformationJobObject` with `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`
+    (`JOB_OBJECT_LIMIT_PROCESS_MEMORY` / `JOB_OBJECT_LIMIT_JOB_MEMORY` /
+    `JOB_OBJECT_LIMIT_JOB_TIME`), `AssignProcessToJobObject`, then `ResumeThread`.
+    Assigning after the process is already running leaves a window in which it can spawn
+    grandchildren outside the job. Add `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so the process
+    tree is reclaimed when the owning OpenTopia process exits.
+
+    Codex is a reference for the restricted token and an explicit anti-pattern for the job
+    object. Verified against upstream `openai/codex` at `61a44880a` (2026-07-26):
+      - Codex has no resource quota of any kind. `JOB_OBJECT_LIMIT_PROCESS_MEMORY`,
+        `JOB_OBJECT_LIMIT_JOB_MEMORY`, `JOB_OBJECT_LIMIT_JOB_TIME`, and
+        `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` appear nowhere in `codex-rs`. Its job object is
+        lifecycle management, never a security boundary.
+      - `codex-rs/utils/pty/src/win/job.rs` sets
+        `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK`. OpenTopia must
+        NOT set `BREAKAWAY_OK`: it lets a child leave the job with
+        `CREATE_BREAKAWAY_FROM_JOB`, which would void the quota.
+      - Codex never uses `CREATE_SUSPENDED`; it assigns the job after the process is already
+        running. Do not copy that ordering.
+      - Nested job limits intersect, so an outer OpenTopia job still binds the command even
+        though `codex.exe` creates its own inner job with `BREAKAWAY_OK`. A command that
+        breaks away from Codex's inner job stays confined by the outer job, as long as the
+        outer job does not set `BREAKAWAY_OK`.
+      - Codex discards the result of `AssignProcessToJobObject` (`let _ = ...`). OpenTopia
+        must fail closed when assignment fails, or the command would run unmetered.
   - Do not promise disk quotas. Windows job objects expose no per-process disk quota;
     that would require FSRM or a filesystem filter driver. The earlier
     "CPU/memory/disk quotas" wording was not achievable as specified.
