@@ -25,6 +25,7 @@ import type {
   SpreadsheetPreviewRange,
 } from "../types";
 import { detectLanguage, MonacoEditor } from "./MonacoEditor";
+import { MarkdownContent } from "./MarkdownContent";
 
 type LoadState<T> =
   | { status: "loading" }
@@ -36,11 +37,13 @@ export function PreviewHost({
   threadId,
   workspaceRoot,
   target,
+  onOpenMarkdownLink,
 }: {
   client: ApiClient | null;
   threadId: string | null;
   workspaceRoot: string | null;
   target: PreviewTarget;
+  onOpenMarkdownLink?(href: string, baseWorkspacePath?: string | null): void;
 }) {
   const [reloadKey, setReloadKey] = useState(0);
   const [state, setState] = useState<LoadState<PreviewDescriptor>>({
@@ -143,7 +146,11 @@ export function PreviewHost({
         </div>
       </header>
       <div className="preview-surface">
-        <PreviewRenderer client={client} descriptor={descriptor} />
+        <PreviewRenderer
+          client={client}
+          descriptor={descriptor}
+          onOpenMarkdownLink={onOpenMarkdownLink}
+        />
       </div>
     </section>
   );
@@ -152,14 +159,22 @@ export function PreviewHost({
 function PreviewRenderer({
   client,
   descriptor,
+  onOpenMarkdownLink,
 }: {
   client: ApiClient;
   descriptor: PreviewDescriptor;
+  onOpenMarkdownLink?(href: string, baseWorkspacePath?: string | null): void;
 }) {
   switch (descriptor.renderer) {
     case "text":
     case "code":
-      return <TextPreview client={client} descriptor={descriptor} />;
+      return (
+        <TextPreview
+          client={client}
+          descriptor={descriptor}
+          onOpenMarkdownLink={onOpenMarkdownLink}
+        />
+      );
     case "image":
       return <ImagePreview client={client} descriptor={descriptor} />;
     case "pdf":
@@ -178,9 +193,11 @@ function PreviewRenderer({
 function TextPreview({
   client,
   descriptor,
+  onOpenMarkdownLink,
 }: {
   client: ApiClient;
   descriptor: PreviewDescriptor;
+  onOpenMarkdownLink?(href: string, baseWorkspacePath?: string | null): void;
 }) {
   const state = usePreviewBlob(client, descriptor);
   const [text, setText] = useState<LoadState<string>>({ status: "loading" });
@@ -216,6 +233,17 @@ function TextPreview({
       />
     );
   }
+  if (isMarkdownPreview(descriptor)) {
+    const baseWorkspacePath =
+      descriptor.target.type === "workspace" ? descriptor.target.path : null;
+    return (
+      <MarkdownContent
+        className="preview-markdown"
+        onOpenLink={(href) => onOpenMarkdownLink?.(href, baseWorkspacePath)}
+        text={text.value}
+      />
+    );
+  }
   return (
     <div className="preview-code">
       <MonacoEditor
@@ -225,6 +253,13 @@ function TextPreview({
         theme="vs"
       />
     </div>
+  );
+}
+
+function isMarkdownPreview(descriptor: PreviewDescriptor): boolean {
+  return (
+    descriptor.contentType.toLowerCase().includes("markdown") ||
+    /\.md(?:own)?$/i.test(descriptor.title)
   );
 }
 

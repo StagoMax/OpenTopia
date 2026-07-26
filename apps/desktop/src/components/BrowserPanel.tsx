@@ -14,6 +14,7 @@ import { openPath } from "../platform";
 import type {
   AgentEvent,
   BrowserContent,
+  BrowserNavigationRequest,
   BrowserNode,
   BrowserObservation,
   BrowserOutput,
@@ -37,6 +38,7 @@ export function BrowserPanel({
   pendingApprovalIds,
   decidingApprovalId,
   onDecideApproval,
+  navigationRequest,
 }: {
   client: ApiClient | null;
   threadId: string | null;
@@ -44,6 +46,7 @@ export function BrowserPanel({
   pendingApprovalIds: string[];
   decidingApprovalId: string | null;
   onDecideApproval(approvalId: string, approved: boolean): void;
+  navigationRequest: BrowserNavigationRequest | null;
 }) {
   const [url, setUrl] = useState("");
   const [selectedNodeRef, setSelectedNodeRef] = useState("");
@@ -60,6 +63,7 @@ export function BrowserPanel({
   } | null>(null);
   const latestEventSeqRef = useRef(0);
   const handledBrowserEventIdRef = useRef<string | null>(null);
+  const handledNavigationIdRef = useRef<string | null>(null);
 
   activeThreadIdRef.current = threadId;
 
@@ -94,6 +98,7 @@ export function BrowserPanel({
     manualOperationRunningRef.current = false;
     manualEventBarrierRef.current = null;
     handledBrowserEventIdRef.current = null;
+    handledNavigationIdRef.current = null;
     setUrl("");
     setSelectedNodeRef("");
     setOutput(null);
@@ -130,6 +135,21 @@ export function BrowserPanel({
     if (next.url) setUrl(next.url);
     setError(browserToolError(result));
   }, [latestBrowserEvent]);
+
+  useEffect(() => {
+    if (
+      !navigationRequest ||
+      !client ||
+      !threadId ||
+      isRunning ||
+      handledNavigationIdRef.current === navigationRequest.id
+    ) {
+      return;
+    }
+    handledNavigationIdRef.current = navigationRequest.id;
+    setUrl(navigationRequest.url);
+    void run("navigate", navigationRequest.url);
+  }, [client, isRunning, navigationRequest, threadId]);
 
   const snapshotText = useMemo(
     () =>
@@ -181,7 +201,7 @@ export function BrowserPanel({
     [events, pendingApprovalIds],
   );
 
-  async function run(action: BrowserAction) {
+  async function run(action: BrowserAction, requestedUrl = url) {
     if (!client || !threadId || isRunning) return;
     const requestVersion = ++requestVersionRef.current;
     const requestThreadId = threadId;
@@ -191,7 +211,10 @@ export function BrowserPanel({
     try {
       const next = await client.runBrowserCommand(threadId, {
         action,
-        url: action === "navigate" || action === "download" ? url : undefined,
+        url:
+          action === "navigate" || action === "download"
+            ? requestedUrl
+            : undefined,
         observationId:
           action === "click" || action === "type"
             ? observation?.observationId

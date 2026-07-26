@@ -8,7 +8,11 @@ import {
 } from "lucide-react";
 import type { ApiClient } from "../api/client";
 import { openExternal } from "../platform";
-import type { AgentEvent, WebPreviewState } from "../types";
+import type {
+  AgentEvent,
+  BrowserNavigationRequest,
+  WebPreviewState,
+} from "../types";
 import { BrowserPanel } from "./BrowserPanel";
 
 export function WebPreviewSurface({
@@ -18,6 +22,7 @@ export function WebPreviewSurface({
   pendingApprovalIds,
   decidingApprovalId,
   onDecideApproval,
+  navigationRequest,
 }: {
   client: ApiClient | null;
   threadId: string | null;
@@ -25,6 +30,7 @@ export function WebPreviewSurface({
   pendingApprovalIds: string[];
   decidingApprovalId: string | null;
   onDecideApproval(approvalId: string, approved: boolean): void;
+  navigationRequest: BrowserNavigationRequest | null;
 }) {
   const nativeApi = window.opentopia?.browserHost;
   if (!nativeApi) {
@@ -36,6 +42,7 @@ export function WebPreviewSurface({
         pendingApprovalIds={pendingApprovalIds}
         decidingApprovalId={decidingApprovalId}
         onDecideApproval={onDecideApproval}
+        navigationRequest={navigationRequest}
       />
     );
   }
@@ -59,6 +66,7 @@ export function WebPreviewSurface({
       approval={approval}
       decidingApprovalId={decidingApprovalId}
       onDecideApproval={onDecideApproval}
+      navigationRequest={navigationRequest}
     />
   );
 }
@@ -68,6 +76,7 @@ function NativeWebPreview({
   approval,
   decidingApprovalId,
   onDecideApproval,
+  navigationRequest,
 }: {
   threadId: string | null;
   approval: Extract<
@@ -76,6 +85,7 @@ function NativeWebPreview({
   > | null;
   decidingApprovalId: string | null;
   onDecideApproval(approvalId: string, approved: boolean): void;
+  navigationRequest: BrowserNavigationRequest | null;
 }) {
   const api = window.opentopia!.browserHost!;
   const containerRef = useRef<HTMLDivElement>(null);
@@ -90,6 +100,7 @@ function NativeWebPreview({
   });
   const [error, setError] = useState<string | null>(null);
   const visibleRef = useRef(true);
+  const handledNavigationIdRef = useRef<string | null>(null);
 
   const reportBounds = useCallback(() => {
     const element = containerRef.current;
@@ -151,6 +162,32 @@ function NativeWebPreview({
       void api.hide(sessionId).catch(() => {});
     };
   }, [api, reportBounds, sessionId, threadId]);
+
+  useEffect(() => {
+    if (
+      !navigationRequest ||
+      !sessionId ||
+      handledNavigationIdRef.current === navigationRequest.id
+    ) {
+      return;
+    }
+    handledNavigationIdRef.current = navigationRequest.id;
+    let disposed = false;
+    setAddress(navigationRequest.url);
+    setError(null);
+    void api
+      .createSession({ sessionId, visible: false })
+      .then(() => {
+        if (disposed) return undefined;
+        return api.navigate(sessionId, navigationRequest.url);
+      })
+      .catch((cause) => {
+        if (!disposed) setError(errorMessage(cause));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [api, navigationRequest, sessionId]);
 
   useEffect(() => {
     const element = containerRef.current;
