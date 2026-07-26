@@ -38,10 +38,10 @@
 
 | 模块 | 装配类 | 字符 |
 |---|---|---:|
-| `base_agent_prompt.md` | fixed | 13,100 |
+| `base_agent_prompt.md` | fixed | 12,309 |
 | `output_contract`（desktop） | conditional | 2,722 |
 | `multi_agent_policy`（explicit，depth ≤ 1） | conditional | 2,249 |
-| `skills_protocol` | fixed | 1,524 |
+| `skills_protocol` | fixed | 1,250 |
 | `desktop_protocol` | conditional | 619 |
 | `clarification_policy`（unavailable） | conditional | 606 |
 | `permission_policy` | dynamic | 457 |
@@ -49,12 +49,12 @@
 | `progress_updates`（balanced） | conditional | 294 |
 | `autonomy`（balanced） | conditional | 291 |
 | `personality`（professional） | conditional | 280 |
-| 合计 | | **22,500** |
+| 合计 | | **21,435** |
 
 三点值得注意：
 
 - 每个 conditional 模块只发送被选中的那一个分支。三档人格加起来不到 900 字符，但任一时刻只有 280 字符进入上下文。`output_contract` 的三档 surface 同理。
-- 补齐 7.2 那五条之后，OpenTopia 的全部提示词文本（22,500 字符）与 Codex 单条桌面 developer 消息（22,785 字符）几乎相等。但构成完全不同：Codex 那 22.8k 里相当大的比例是 `::directive` 协议、线程工具语义和自动化工具语义，这部分 OpenTopia 结构上不需要（见 4.2、7.1）；OpenTopia 的同等预算花在指令优先级、依赖追踪方法论、不可信内容边界和 surface 分档上。
+- OpenTopia 的全部提示词文本（21,435 字符）与 Codex 单条桌面 developer 消息（22,785 字符）大致相当，但构成完全不同：Codex 那 22.8k 里相当大的比例是 `::directive` 协议、线程工具语义和自动化工具语义，这部分 OpenTopia 结构上不需要（见 4.2、7.1）；OpenTopia 的同等预算花在指令优先级、依赖追踪方法论、不可信内容边界和 surface 分档上。
 - Codex 的 Skill 目录每次变化就重注入 15k 字符全文。OpenTopia 把目录放在 `Thread` 作用域，靠前缀缓存复用。
 
 ## 3. 覆盖面三分
@@ -144,7 +144,9 @@ OpenTopia 的对应内容在固定底座的 “Codebase exploration and dependen
 
 **差异性质**：OpenTopia 强在方法论，弱在具体禁令。「反引号和 `$()` 在 `cmd` 参数里仍会执行」这类知识没有抽象版本可以替代——它要么写出来，要么模型踩。
 
-**已补**，且数字全部来自实测 `ShellTool`，不是照抄 Codex 的 60 秒：`timeoutSeconds` 默认 30、上限 300（超过会被杀掉而不是被尊重），命令串直接交给平台 shell 所以插值文本里的 `$(...)`、反引号、重定向都会执行，模型可见输出被截到约 24,000 字符 stdout / 12,000 字符 stderr。最后这一条把 Codex 的「不要用 `echo` 分隔符」从「输出噪音」升级成了更硬的理由：输出有截断预算，分隔符占的是有效信息的额度。
+**我先按 Codex 的做法把这些写进了固定底座，然后撤回了。** 撤回的理由是一条更重要的原则（见 5.6），也有一个直接的实证：我写进去的数字是实测的 `timeoutSeconds` 默认 30、上限 300，两天不到就已经错了——`ShellTool` 被改成支持后台任务，上限变成前台 1800 秒、后台 21600 秒。工具属性写进系统提示词，必然和代码各自漂移，而且漂移之后没有任何测试会发现。
+
+现在的分工：超时上限、后台语义写在 `shell` 的 schema 描述里（本来就写了，我只补了一句「命令串由平台 shell 解释，其中的替换和重定向会被执行」）；输出截断根本不需要说，因为 `truncate()` 已经在结果末尾追加 `[output truncated]`，harness 在当场就告诉了模型。固定底座里关于 shell 的段落全部删除。
 
 ### 4.7 文件编辑与 Git 安全
 
@@ -172,7 +174,9 @@ OpenTopia 的 `skills_protocol`（`prompt_runtime.rs` 的 `skills_protocol_instr
 
 1. **禁止把读取 Skill 指令委派给子 Agent**。OpenTopia 有完整的子 Agent 体系，这个失败模式是真实存在的：主 Agent 派一个子 Agent 去「读一下这个 Skill 然后告诉我要点」，等于用摘要替代指令原文。补的措辞带上理由：「a summary is not the instruction, and the agent that acts under a Skill is the agent that has to have read it」，同时明确子 Agent 仍可以执行 Skill 描述的任务工作。
 2. **多 Skill 的最小覆盖集合与顺序说明**。原先只有「select the smallest set」，现在要求说明应用顺序。
-3. **截断处理，但规则与 Codex 相反**。Codex 说「继续读取直到文件结束」，这在 OpenTopia 做不到：`ReadSkillTool` 的 schema 只有 `id`，没有 offset 或分页参数，只在 metadata 里返回一个 `truncated` 标志。所以规则写成：`truncated` 为真时你并没有完整指令、也无法翻页取剩余部分，必须说出来而不是当作已经读全；Skill 路径落在工作区内时用 `read_file` 补读。这是第二处「照抄会写出做不到的规则」的例子。
+3. **截断处理最后没有变成提示词规则，而是变成了工具能力。** Codex 说「继续读取直到文件结束」，这在当时的 OpenTopia 做不到：`ReadSkillTool` 只接受 `id`，没有偏移量，只在 metadata 回一个 `truncated` 标志。我第一版写的是一条应对规则——"发现被截断就说出来，并用 `read_file` 补读"。这条规则有两个问题：一是 `read_file` 自己也在 16,000 字符处截断、同样没有偏移量，所以补读根本走不通，规则本身是错的；二是它属于用提示词去掩盖工具的缺失能力。
+
+    正确的修法是把缺的能力补上：`read_skill` 与 `read_file` 都加了 `offset` / `limit`，结果里回 `nextOffset`，读到末尾时为 `null`。翻页现在是一个动作，不是一条需要模型体谅的说明，提示词里那条规则整条删掉。测试 `skill_windows_reach_the_end_of_a_file_longer_than_one_read` 和 `read_file_windows_reach_the_end_of_a_long_file` 把「长文件能读到尾」钉住。
 
 ### 4.10 多 Agent
 
@@ -212,6 +216,21 @@ OpenTopia 给了六级显式降序（固定底座的 “Instruction hierarchy an
 
 5. **渲染契约不可移植，其余规则可移植。** 4.2 是全篇唯一「照抄必错」的一节：链接、图片、图示三条规则在 OpenTopia 全部相反或不成立。可移植的是方法论、纪律和边界；不可移植的是任何依赖对端渲染器行为的规则。
 
+6. **能力信息归工具，声明归系统提示词；"遇到 X 就做 Y" 两边都不该有。** 这条是本轮改造的产物，也是对前面几条的收束，单列在下面。
+
+### 5.6 系统提示词不承接 try-catch
+
+对照下来，Codex 的提示词主体确实是声明式的——它说"你是什么""频道是什么""什么优先于什么""这个操作会造成什么后果"，而不是罗列异常分支。它也有例外（"如果 Skill 不可用，简要说明然后用最佳替代方案继续"就是标准的 try-catch），但那是少数。
+
+这条原则可以拆成两个可执行的判据：
+
+- **一条信息如果只属于某一个工具，就写在那个工具的描述或 schema 里，不写进系统提示词。** 系统提示词每轮都在，工具描述只在模型考虑用它时才起作用；而且工具属性写进提示词会和代码各自漂移——4.6 里那两个超时数字不到两天就作废了，而且没有任何测试会发现。
+- **一条规则如果是在教模型"这里少了个能力，你要这样将就"，那要改的是能力，不是提示词。** 4.9 第 3 条是最清楚的例子：真正的问题是读取工具不能翻页，写十句"发现截断要如实说明"也换不来文件的后半段。
+
+按这两条回头筛，本轮加的东西里有两处被撤回（shell 段落、Skill 截断规则），换成了工具侧的改动（schema 描述、`offset` / `limit` 参数）。留下来的都是声明或跨工具判断：指令优先级、不可信内容边界、持续性指令不扩大授权、不要把读取 Skill 指令委派给子 Agent、以及各 surface 的渲染契约。
+
+渲染契约（4.2）是这条原则下最尴尬的一项：它确实是"环境事实的声明"而不是异常处理，但它声明的是一个**缺陷**——图片和 Mermaid 显示不出来。按上面第二条判据，该修的是渲染器；在修好之前它留在提示词里是止损，不是终态。
+
 ## 6. 各自更强的地方
 
 **Codex 更强**：Skills 协议的完备性（尤其禁止委派读取指令、截断续读、别名根展开）；shell 层的具体踩坑禁令；人格描写带来的语气稳定性；图片与图示的渲染契约（本身正确，只是不适用于 OpenTopia）；「终止条件不扩大授权范围」这一句边界。
@@ -231,17 +250,17 @@ OpenTopia 给了六级显式降序（固定底座的 “Instruction hierarchy an
 
 提示词版本 `2026-07-26.1` → `2026-07-26.2`。
 
-| # | 缺口 | 落点 | 是否照抄 Codex |
+| # | 缺口 | 最终落点 | 结果 |
 |---|---|---|---|
-| 1 | 禁止把读取 Skill 指令委派给子 Agent；多 Skill 说明应用顺序 | `skills_protocol_instruction` | 照抄（规则本身通用） |
-| 2 | 图片引用与 Mermaid | `output_contract_instruction` 的 `media_rule` | **反向重写**（见 4.2） |
-| 3 | 终止条件不扩大授权范围 | 固定底座 “Interpret the request precisely” | 照抄 |
-| 4 | shell 转义、超时上限、输出截断 | 固定底座 “Tool loop and long-running work” | 数字全部实测重写（见 4.6） |
-| 5 | `read_skill` 截断处理 | `skills_protocol_instruction` | **反向重写**（无分页参数，见 4.9） |
+| 1 | 禁止把读取 Skill 指令委派给子 Agent；多 Skill 说明应用顺序 | `skills_protocol_instruction` | 提示词，照抄 Codex |
+| 2 | 图片引用与 Mermaid | `output_contract_instruction` 的 `media_rule` | 提示词，**反向重写**；且只是止损（见 5.6） |
+| 3 | 终止条件不扩大授权范围 | 固定底座 “Interpret the request precisely” | 提示词，照抄 Codex |
+| 4 | shell 转义、超时、输出截断 | `shell` 的 schema 描述 | **撤出提示词**，改工具自述（见 4.6） |
+| 5 | Skill / 文件读取的截断 | `read_skill`、`read_file` 的 `offset` / `limit` | **撤出提示词**，改成工具能力（见 4.9） |
 
-五条里两条不能照抄，一条数字要重测——这个比例和 4.2 的结论一致：可移植的是方法论与纪律，不可移植的是任何依赖运行时或渲染器实际行为的规则。
+五条里两条最终不属于提示词。这是本轮最有价值的结论，独立于 Codex 对比：**先问这条规则是不是在替某个工具道歉，是的话就去改工具。**
 
-新增/扩展的测试：`output_contract_and_clarification_modules_track_the_surface_and_tool` 增加图片、Mermaid 与 Skill 委派断言，并断言 CLI 档**不含** Desktop 的图片措辞；`base_agent_prompt_is_versioned_and_contains_the_runtime_contract` 增加三条必需字符串。
+新增/扩展的测试：`skill_windows_reach_the_end_of_a_file_longer_than_one_read` 与 `read_file_windows_reach_the_end_of_a_long_file` 钉住"长文件能读到尾"；`output_contract_and_clarification_modules_track_the_surface_and_tool` 增加图片、Mermaid、Skill 委派断言，并断言 CLI 档**不含** Desktop 的图片措辞、`skills_protocol` **不含** `truncated` 字样；`base_agent_prompt_is_versioned_and_contains_the_runtime_contract` 增加持续性指令那一条。
 
 ### 7.3 仍未处理的一条
 
