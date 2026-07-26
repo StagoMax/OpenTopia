@@ -330,8 +330,9 @@ Requirements implemented for the local runtime:
 - Sandbox and approval are independent controls. `read-only`, `workspace-write`,
   and `danger-full-access` define the technical boundary; the existing policy
   engine and durable approval continuation decide when execution pauses.
-- `workspace-write` is the desktop default, blocks direct network access by
-  default, and supports additional `writable_roots` without broad full access.
+- `workspace-write` is the desktop default, allows network access by default,
+  and supports both an explicit network deny policy and additional
+  `writable_roots` without broad full access.
 - Built-in file writes and spawned commands consume the same boundary.
 - One-shot terminal commands, long-lived PTY sessions, Git actions, and MCP stdio
   processes use that same OS sandbox command plan. App/model API keys are scrubbed

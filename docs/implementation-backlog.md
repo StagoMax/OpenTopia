@@ -23,9 +23,15 @@ Implemented:
 - Incremental model/tool/event streaming with persisted token-usage events.
 - OpenAI-compatible provider with env reuse from the credit review project and
   an eight-round bounded autonomous built-in/MCP tool loop.
-- Built-in tools: `list_files`, `read_file`, `write_file`, `search`, `shell`, `git_diff`,
-  `apply_patch`, `update_plan`, `spreadsheet`, `browser`, `spawn_agent`, `send_input`,
-  `cancel_agent`, `wait_agent`, and concurrent `wait_agents`.
+- Built-in tools registered in `ToolRegistry` (`crates/opentopia-core/src/tools.rs`):
+  - Files/shell: `list_files`, `read_file`, `write_file`, `search`, `shell`, `git_diff`,
+    `apply_patch`.
+  - Planning: `set_plan`, `update_plan`, `complete_task`.
+  - Subagents: `spawn_agent`, `send_message`, `followup_task`, `interrupt_agent`,
+    `list_agents`, `send_input`, `cancel_agent`, `wait_agent`, concurrent `wait_agents`.
+  - Skills: `list_skills`, `read_skill`, `create_skill`.
+  - Work tools: `spreadsheet`, `browser`, `computer`.
+  - Interaction: `request_user_input`.
 - Permission modes plus persistent, resumable allow-once approvals. Approval
   restores the exact provider/tool-loop state instead of starting a full-access turn.
 - Dev/build scripts for Windows GNU Rust + WinLibs.
@@ -59,7 +65,21 @@ Implemented:
 - Persisted sandbox mode/enforcement/network/read/write roots with Settings and Composer controls.
 - Validated Git workflow core and sandboxed Thread API for status, branch, commit, push,
   compare, and worktree actions, with desktop status/branch/create/switch/commit/push/compare
-  controls. Worktree UI and PR/GitHub CLI remain open.
+  controls plus a `new_worktree` new-task launch mode. PR/GitHub CLI remains open.
+- `CollaborationMode` (`default` / `plan` / `goal`) with a server-assigned goal: SQLite `goals`,
+  `goal_plan_revisions`, `goal_tasks`, and `goal_task_attempts` tables carry objective, status,
+  goal-level `token_budget`/`tokens_used`, optimistic `plan_revision` concurrency, a
+  dependency-aware step DAG, measurable acceptance criteria, evidence, and bounded
+  `max_attempts` retries. Plan mode proposes a plan via `set_plan` without executing steps.
+- Guardian automatic approval review (`crates/opentopia-core/src/guardian.rs`): risk
+  classification, provider-backed assessment of each tool call, review sessions, and
+  approve/deny actions layered on the existing policy engine. Guardian review requests are
+  denied hosted web search so they only judge the existing trace.
+- Per-Turn change sets (`turn_change_sets`): before/after tree capture, per-file additions and
+  deletions, and turn-scoped revert.
+- Durable `request_user_input` round trips persisted in `user_input_requests`.
+- Agent profiles (`agent_profiles.rs`) and a plugin-owned MCP server model (`plugins.rs`,
+  `mcp_servers.plugin_id`).
 
 ## Current Product Focus
 
@@ -70,9 +90,22 @@ Active development is intentionally limited to:
 3. Parent-controlled multi-agent decomposition, parallel execution, result collection,
    and synthesis.
 
-Deferred from this focus: child-agent approval/budget hardening, Linux/macOS native sandbox
-validation, Linear/Jira product connectors, top-level menu/navigation/help, Docker/Remote,
-and release signing/publishing.
+Deferred from this focus: child-agent approval/budget hardening, Linear/Jira product connectors,
+top-level menu/navigation/help, Docker/Remote, and release signing/publishing.
+
+### Target Platform: Windows Local Only
+
+The current delivery target is **Windows local execution only**. Treat non-Windows work as out
+of scope rather than merely deferred, and do not report it as an open gap:
+
+- Linux bubblewrap and macOS Seatbelt command builders stay in the tree and stay unit tested,
+  but their native integration suites, seccomp/Landlock hardening, and end-to-end confinement
+  validation are out of scope.
+- `computer.rs` implements screen observation and input injection with the Windows `SendInput`
+  API. Every `#[cfg(not(windows))]` path intentionally returns `ComputerError::UnsupportedPlatform`.
+  This is the accepted design under this scope, not a defect.
+- macOS signing/notarization and Linux release artifacts are out of scope. Windows signing and
+  publishing remain open only because they need real credentials.
 
 ## P0: Make The MVP Product-Shaped
 
@@ -414,23 +447,32 @@ Tasks:
   - One-shot terminal commands, long-lived PTY sessions, Git workflow actions, and
     MCP stdio processes consume the same sandbox command builder. Git responses are
     capped at 8 MiB and terminal aggregate output at 4 MiB.
-- Remaining hardening:
-  - Run Linux bubblewrap and macOS Seatbelt integration suites on native release
-    runners; current cross-platform builders are unit tested but only Windows has
-    an end-to-end confinement test in this workspace.
-  - Add optional Linux seccomp/Landlock defense in depth.
-  - Linux bwrap remounts existing `.git`/`.agents`/`.codex` paths read-only, but
-    preventing first creation of a missing metadata directory by arbitrary shell
-    commands requires the pending Landlock layer. Built-in file tools already deny it.
-- Add native CPU/memory/disk quotas. Output and timeout limits are already enforced.
+- Remaining hardening, in scope (Windows):
+  - Add native CPU and memory quotas. Output and timeout limits are already enforced.
+    Design note: `build_windows_sandbox_command` delegates to the vendored
+    `codex sandbox` helper, so the helper owns the restricted token and its own job
+    object. Quotas therefore need either helper `--config` keys that support them, or an
+    OpenTopia-owned job object assigned around the spawned helper process in
+    `execution.rs` (`CreateJobObject` + `SetInformationJobObject` with
+    `JOB_OBJECT_LIMIT_PROCESS_MEMORY` / `JOB_OBJECT_LIMIT_JOB_TIME`).
+  - Do not promise disk quotas. Windows job objects expose no per-process disk quota;
+    that would require FSRM or a filesystem filter driver. The earlier
+    "CPU/memory/disk quotas" wording was not achievable as specified.
+- Out of scope under the Windows-local target (see Target Platform above), retained for
+  reference only:
+  - Linux bubblewrap and macOS Seatbelt native integration suites.
+  - Optional Linux seccomp/Landlock defense in depth.
+  - Linux bwrap first-creation of a missing `.git`/`.agents`/`.codex` metadata directory by
+    arbitrary shell commands, which would need the Landlock layer. Built-in file tools already
+    deny it on every platform.
 - ~~Add stdio session streaming for command observability.~~ (Done at terminal API level)
 - ~~Add cancel/interrupt support for running commands.~~ (Done)
 
 Acceptance:
 
-- Shell commands are confined to the workspace by default; network access is blocked or proxied.
-- Measure and publish per-platform startup overhead; do not use a single `<10ms`
-  target for bwrap, Seatbelt, and Windows native sandbox backends.
+- Shell commands are confined to the workspace by default; network access follows the configured allow, inherit, or deny policy.
+- Measure and publish Windows native sandbox startup overhead. Do not reuse a single `<10ms`
+  target across backends.
 - Docker implementation can be added without rewriting tool APIs.
 
 ### Docker/Remote Sandbox (Optional Backend)
@@ -467,11 +509,14 @@ Implemented:
 - Add electron-updater channel boundary.
 - Produce a verified Windows NSIS installer and unpacked app with the bundled Rust server.
 
-Remaining external release work:
+Remaining external release work (Windows only):
 
-- Supply real Windows/macOS signing identities and notarization credentials.
+- Supply a real Windows signing identity. This needs credentials that are not in this
+  repository, so it cannot be closed from the workspace.
 - Configure the real GitHub release owner/repository and publication token.
-- Add CI release jobs for Windows, macOS, and Linux artifacts.
+- Add a Windows CI release job. There is currently no `.github/workflows` directory at all.
+
+Out of scope under the Windows-local target: macOS signing/notarization and Linux artifacts.
 
 Acceptance:
 

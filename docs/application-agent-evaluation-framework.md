@@ -5,6 +5,8 @@
 > 适用对象：OpenTopia Desktop、Server、Agent Runtime、工具系统、Skill、MCP、插件、多 Agent 与持久化层
 > 与现有文档的关系：本文件补充 `docs/evaluation-system.md`，重点描述可落地的应用级评测架构、任务设计、指标和发布门槛。
 
+> 实现说明：仓库中的第一版独立 Harness 位于 `evaluation/`，当前使用 JSON 和 `schemaVersion`/camelCase 字段实现黑盒 Runner；本文件中的 YAML 示例用于表达任务模型，迁移时应以 `evaluation/schemas/` 为机器契约。
+
 ## 1. 目标
 
 这套体系评测的对象是完整应用，而不是单独的模型。被测对象包括：

@@ -154,11 +154,11 @@ pub trait ExecutionEnvironment: Send + Sync {
    - Windows: restricted token / integrity level isolation
    Current implementation:
    - Linux builder emits a `bwrap` command with workspace write bind, extra read allowlists, and optional network namespace isolation.
-   - macOS builder emits `sandbox-exec -p <profile>` with workspace read/write allowlists and network denied by default.
+   - macOS builder emits `sandbox-exec -p <profile>` with workspace read/write allowlists and configurable network access.
    - Windows invokes the packaged Codex restricted-token/ACL/job-object helper via
      `codex sandbox`. `enforce` fails closed if that backend is absent; best-effort
      reports an explicit passthrough instead of claiming isolation.
-   Acceptance: shell commands are confined to workspace paths; network access is blocked or proxied.
+   Acceptance: shell commands are confined to workspace paths; network access follows the configured allow, inherit, or deny policy.
 
 8. Add local sandbox status route.
    Acceptance: API can report current thread environment kind, id, workspace, and status.
