@@ -3,6 +3,7 @@ use crate::prompt_runtime::AgentRuntimeSettings;
 use crate::sandbox::{LocalSandboxConfig, NetworkPolicy, OsSandboxMode, SandboxMode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +67,11 @@ pub struct ProviderSettings {
     /// Cached so the picker works offline; refreshed on explicit sync.
     #[serde(default)]
     pub synced_models: Vec<String>,
+    /// Context windows the connection reported for its own models. Populated on
+    /// sync when the endpoint publishes them, which is the only real capability
+    /// detection available; it outranks the built-in table.
+    #[serde(default)]
+    pub model_context_windows: BTreeMap<String, usize>,
     #[serde(default)]
     pub models_synced_at: Option<DateTime<Utc>>,
     #[serde(default = "default_provider_temperature")]
@@ -109,6 +115,7 @@ impl Default for ProviderSettings {
             model: "gpt-4.1-mini".to_string(),
             enabled_families: Vec::new(),
             synced_models: Vec::new(),
+            model_context_windows: BTreeMap::new(),
             models_synced_at: None,
             temperature: default_provider_temperature(),
             max_output_tokens: None,
@@ -166,13 +173,24 @@ impl ProviderSettings {
         }
     }
 
-    /// User-declared context limits always win. Known model families are used
-    /// only when no override is present, leaving custom endpoints predictable.
+    /// Resolution order, most to least trusted: the user's own override, then
+    /// what the endpoint reported about this model, then the built-in table,
+    /// then a conservative default. The endpoint outranks the table because the
+    /// table cannot know about models released after this build.
     pub fn resolved_context_window_tokens(&self) -> usize {
         self.context_window_tokens
             .filter(|tokens| *tokens >= MIN_PROVIDER_CONTEXT_WINDOW_TOKENS)
+            .or_else(|| self.reported_context_window_tokens())
             .or_else(|| known_model_context_window_tokens(&self.model))
             .unwrap_or(DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS)
+    }
+
+    /// Context window this connection published for its current model.
+    fn reported_context_window_tokens(&self) -> Option<usize> {
+        self.model_context_windows
+            .get(self.model.trim())
+            .copied()
+            .filter(|tokens| *tokens >= MIN_PROVIDER_CONTEXT_WINDOW_TOKENS)
     }
 
     /// Applies a per-thread model override on top of the connection defaults.
@@ -254,19 +272,125 @@ impl ProviderSettings {
     }
 }
 
+/// Context window for model families we ship knowledge about.
+///
+/// This is a hand-maintained fallback, not capability detection: it only runs
+/// when the user has not set an override and the connection's model catalog did
+/// not report a window. Entries are matched against the model id with vendor
+/// prefixes stripped, because relays rename freely (`openai/gpt-5.6`).
+///
+/// Unmatched models deliberately return `None` so the caller applies its
+/// conservative default instead of guessing high and overflowing the context.
 pub fn known_model_context_window_tokens(model: &str) -> Option<usize> {
-    let model = model.trim().to_ascii_lowercase();
-    if model.starts_with("gpt-4.1") {
-        Some(1_047_576)
-    } else if model.starts_with("gpt-4o") || model.starts_with("gpt-4-turbo") {
-        Some(128_000)
-    } else if model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
-        Some(200_000)
-    } else if model.starts_with("claude-") {
-        Some(200_000)
-    } else {
-        None
+    model_bases(model)
+        .iter()
+        .find_map(|base| context_window_for_base(base))
+}
+
+fn context_window_for_base(model: &str) -> Option<usize> {
+    // OpenAI
+    if model.starts_with("gpt-5") {
+        return Some(400_000);
     }
+    if model.starts_with("gpt-4.1") {
+        return Some(1_047_576);
+    }
+    if model.starts_with("gpt-4o") || model.starts_with("gpt-4-turbo") {
+        return Some(128_000);
+    }
+    if is_openai_reasoning_model(model) {
+        return Some(200_000);
+    }
+
+    // Anthropic
+    if model.starts_with("claude-") || model.contains("claude") {
+        return Some(200_000);
+    }
+
+    // Google
+    if model.starts_with("gemini-1.5") || model.starts_with("gemini-2") {
+        return Some(1_000_000);
+    }
+    if model.starts_with("gemini") {
+        return Some(128_000);
+    }
+
+    // Moonshot
+    if model.starts_with("kimi") {
+        return Some(256_000);
+    }
+    if model.starts_with("moonshot-v1-128k") {
+        return Some(128_000);
+    }
+    if model.starts_with("moonshot-v1-32k") {
+        return Some(32_000);
+    }
+    if model.starts_with("moonshot-v1") {
+        return Some(8_000);
+    }
+
+    // DeepSeek / Qwen / Zhipu / xAI
+    if model.starts_with("deepseek") {
+        return Some(128_000);
+    }
+    if model.starts_with("qwen") || model.starts_with("qwq") || model.starts_with("qvq") {
+        return Some(128_000);
+    }
+    if model.starts_with("glm") || model.starts_with("chatglm") {
+        return Some(128_000);
+    }
+    if model.starts_with("grok") {
+        return Some(128_000);
+    }
+
+    None
+}
+
+/// Whether a model accepts a caller-supplied `temperature`.
+///
+/// OpenAI's reasoning families (o-series, GPT-5.x) reject any value other than
+/// the default and answer with HTTP 400, so the parameter must be omitted
+/// rather than clamped. Unknown models are assumed to accept it: relay
+/// endpoints serve arbitrary ids, and dropping the parameter for everything
+/// would silently change behaviour for models that do honour it.
+pub fn model_accepts_temperature(model: &str) -> bool {
+    !model_bases(model)
+        .iter()
+        .any(|base| is_openai_reasoning_model(base))
+}
+
+/// Candidate model names after removing the vendor prefixes relays prepend.
+///
+/// Only a leading `vendor.` is stripped, never an inner dot, because dots also
+/// carry version numbers (`gpt-5.6`).
+fn model_bases(model: &str) -> Vec<String> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let after_slash = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized)
+        .to_string();
+
+    let mut bases = vec![after_slash.clone()];
+    if let Some((prefix, rest)) = after_slash.split_once('.') {
+        // `azure.o3-mini` is a vendor prefix; `gpt-5.6` is a version.
+        let looks_like_vendor = !prefix.is_empty()
+            && prefix.chars().all(|c| c.is_ascii_alphabetic())
+            && rest.starts_with(|c: char| c.is_ascii_alphabetic());
+        if looks_like_vendor {
+            bases.push(rest.to_string());
+        }
+    }
+    bases
+}
+
+fn is_openai_reasoning_model(model: &str) -> bool {
+    if model.starts_with("gpt-5") {
+        return true;
+    }
+    // o1 / o3 / o4-mini and friends, but not `olmo` or `openai`.
+    let mut chars = model.chars();
+    chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 fn default_provider_temperature() -> f64 {
@@ -644,6 +768,107 @@ fn env_path_list(name: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn reasoning_models_do_not_accept_a_temperature() {
+        for model in [
+            "o1",
+            "o3-mini",
+            "o4-mini",
+            "gpt-5",
+            "gpt-5.6-sol",
+            "openai/gpt-5.6",
+            "azure.o3-mini",
+        ] {
+            assert!(
+                !model_accepts_temperature(model),
+                "{model} should reject temperature"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_models_still_accept_a_temperature() {
+        // `olmo` and `openai` must not be mistaken for the o-series, and a
+        // version dot must not be mistaken for a vendor prefix.
+        for model in [
+            "gpt-4.1-mini",
+            "gpt-4o",
+            "claude-sonnet-4-5",
+            "kimi-k2.5-turbo",
+            "deepseek-chat",
+            "olmo-2-13b",
+            "openai-mirror",
+        ] {
+            assert!(
+                model_accepts_temperature(model),
+                "{model} should accept temperature"
+            );
+        }
+    }
+
+    #[test]
+    fn context_window_table_covers_the_families_the_picker_offers() {
+        assert_eq!(
+            known_model_context_window_tokens("gpt-5.6-sol"),
+            Some(400_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("gpt-4.1-mini"),
+            Some(1_047_576)
+        );
+        assert_eq!(known_model_context_window_tokens("o3-mini"), Some(200_000));
+        assert_eq!(
+            known_model_context_window_tokens("anthropic/claude-sonnet-4-5"),
+            Some(200_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("kimi-k2.5"),
+            Some(256_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("moonshot-v1-32k"),
+            Some(32_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("deepseek-reasoner"),
+            Some(128_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("gemini-2.5-pro"),
+            Some(1_000_000)
+        );
+        assert_eq!(known_model_context_window_tokens("my-finetune-v3"), None);
+    }
+
+    #[test]
+    fn a_window_reported_by_the_endpoint_outranks_the_builtin_table() {
+        let mut provider = ProviderSettings {
+            model: "kimi-k2.5".to_string(),
+            ..ProviderSettings::default()
+        };
+        // The table would say 256K; the endpoint knows this deployment is 1M.
+        provider
+            .model_context_windows
+            .insert("kimi-k2.5".to_string(), 1_000_000);
+        assert_eq!(provider.resolved_context_window_tokens(), 1_000_000);
+
+        // An explicit user override still beats both.
+        provider.context_window_tokens = Some(64_000);
+        assert_eq!(provider.resolved_context_window_tokens(), 64_000);
+    }
+
+    #[test]
+    fn an_unknown_model_without_reported_metadata_uses_the_conservative_default() {
+        let provider = ProviderSettings {
+            model: "some-relay-only-model".to_string(),
+            ..ProviderSettings::default()
+        };
+        assert_eq!(
+            provider.resolved_context_window_tokens(),
+            DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
+        );
+    }
 
     const SANDBOX_ENV_KEYS: [&str; 5] = [
         "OPENTOPIA_SANDBOX_MODE",

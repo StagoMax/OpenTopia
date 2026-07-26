@@ -21,10 +21,10 @@ use opentopia_core::{
     world_state_catalog_item, world_state_item, AgentContextBudget, AgentContinuation, AgentCore,
     AgentEvent, AgentEventPayload, AgentProfileRegistry, AgentRuntimeSettings, AgentTurnInput,
     AgentTurnOutcome, AnthropicMessagesProvider, AppSettings, Approval, ApprovalStatus, Artifact,
-    ArtifactMetadata, BasicPolicyEngine, BrowserAction, BrowserActionReceipt, BrowserContent,
-    BrowserDownloadRequest, BrowserNavigateRequest, BrowserNodeRef, BrowserObservation,
-    BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserRuntime,
-    BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
+    ArtifactMetadata, BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction,
+    BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
+    BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
+    BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
     BrowserWaitRequest, ChangedFile, CodexAppServerProvider, CollaborationMode,
     CompiledModelContext, ComputerRuntime, ComputerRuntimeConfig, ComputerSessionId,
     ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity, ContextSourcePolicy,
@@ -43,15 +43,16 @@ use opentopia_core::{
     SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
     SubagentScope, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot,
     ThreadMcpServer, ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult,
-    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus, UserInputRecord,
-    UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff, WorkspaceDiffHunk,
-    WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
-    WorldStateSkill, WorldStateSnapshot, MAX_PREVIEW_CONTENT_BYTES,
+    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus,
+    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff,
+    WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
+    WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
+    MAX_PREVIEW_CONTENT_BYTES, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -139,9 +140,13 @@ async fn main() -> anyhow::Result<()> {
     let browser = initialize_browser_runtime().await;
     let computer: Arc<dyn ComputerRuntime> =
         Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default()));
+    // One registry for the whole process: a command left running in one turn has to
+    // still be readable in the next one, and rebuilding the agent must not orphan it.
+    let background = BackgroundProcessRegistry::default();
     let mut initial_agent = AgentCore::from_settings(&loaded_settings);
     initial_agent.set_browser_runtime(browser.clone());
     initial_agent.set_computer_runtime(computer.clone());
+    initial_agent.set_background_processes(background.clone());
     let agent = Arc::new(RwLock::new(initial_agent));
     let subagents = SubagentScheduler::new(
         SubagentSchedulerConfig::default(),
@@ -180,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         turn_changes: TurnChangeManager::new(store.clone()),
         turn_queue,
         subagents,
+        background,
     };
 
     let queue_state = state.clone();
@@ -530,6 +536,7 @@ struct AppState {
     turn_changes: TurnChangeManager,
     turn_queue: mpsc::UnboundedSender<Uuid>,
     subagents: SubagentScheduler,
+    background: BackgroundProcessRegistry,
 }
 
 struct StoreSubagentObserver {
@@ -1175,6 +1182,7 @@ async fn update_settings(
         agent.set_browser_runtime(state.browser.clone());
         agent.set_computer_runtime(state.computer.clone());
         agent.set_subagent_scheduler(state.subagents.clone());
+        agent.set_background_processes(state.background.clone());
         *agent_guard = agent;
     }
     Ok(Json(settings))
@@ -1538,7 +1546,8 @@ async fn sync_provider_models(
         ApiError::bad_gateway(format!("model list response was not valid JSON: {error}"))
     })?;
 
-    let mut models = extract_model_ids(&payload);
+    let catalog = extract_model_catalog(&payload);
+    let mut models: Vec<String> = catalog.iter().map(|(id, _)| id.clone()).collect();
     models.sort();
     models.dedup();
     if models.is_empty() {
@@ -1546,6 +1555,10 @@ async fn sync_provider_models(
             "model list response contained no model ids",
         ));
     }
+    let context_windows: BTreeMap<String, usize> = catalog
+        .into_iter()
+        .filter_map(|(id, window)| window.map(|window| (id, window)))
+        .collect();
 
     let synced_at = Utc::now();
     let mut settings = current_settings(&state);
@@ -1559,6 +1572,7 @@ async fn sync_provider_models(
         )));
     };
     target.synced_models = models.clone();
+    target.model_context_windows = context_windows;
     target.models_synced_at = Some(synced_at);
     let settings = state.store.save_settings(settings)?;
     {
@@ -1573,9 +1587,17 @@ async fn sync_provider_models(
     }))
 }
 
-/// Accepts both the OpenAI (`{"data":[{"id":...}]}`) and Anthropic
-/// (`{"data":[{"id":...}]}`) shapes, plus the bare arrays some relays return.
-fn extract_model_ids(payload: &Value) -> Vec<String> {
+/// Model ids paired with the context window the endpoint reported, when it
+/// reports one at all.
+///
+/// Accepts the OpenAI and Anthropic (`{"data":[{"id":...}]}`) shapes plus the
+/// bare arrays some relays return.
+///
+/// This is the only genuine capability detection in the system: OpenAI's own
+/// `/v1/models` returns nothing but ids, but OpenRouter, vLLM, LiteLLM and many
+/// relay panels do publish a window, and a value from the endpoint always beats
+/// the hand-maintained table in `settings.rs`.
+fn extract_model_catalog(payload: &Value) -> Vec<(String, Option<usize>)> {
     let entries = payload
         .get("data")
         .or_else(|| payload.get("models"))
@@ -1586,18 +1608,53 @@ fn extract_model_ids(payload: &Value) -> Vec<String> {
     entries
         .iter()
         .filter_map(|entry| match entry {
-            Value::String(id) => Some(id.clone()),
-            Value::Object(_) => entry
-                .get("id")
-                .or_else(|| entry.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            Value::String(id) => Some((id.trim().to_string(), None)),
+            Value::Object(_) => {
+                let id = entry
+                    .get("id")
+                    .or_else(|| entry.get("name"))
+                    .and_then(Value::as_str)?
+                    .trim()
+                    .to_string();
+                Some((id, extract_context_window(entry)))
+            }
             _ => None,
         })
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
+        .filter(|(id, _)| !id.is_empty())
         .collect()
 }
+
+/// Reads whichever context-window field the endpoint happens to use. Values are
+/// sanity-checked so a bogus catalog cannot inflate the window and overflow the
+/// real limit mid-conversation.
+fn extract_context_window(entry: &Value) -> Option<usize> {
+    const CONTEXT_WINDOW_FIELDS: [&str; 5] = [
+        "context_length",   // OpenRouter, many relay panels
+        "max_model_len",    // vLLM
+        "context_window",   // assorted gateways
+        "max_input_tokens", // LiteLLM
+        "context_size",
+    ];
+
+    let direct = CONTEXT_WINDOW_FIELDS
+        .iter()
+        .find_map(|field| entry.get(*field).and_then(Value::as_u64));
+    // OpenRouter nests the authoritative value under `top_provider`.
+    let nested = entry
+        .get("top_provider")
+        .and_then(|provider| provider.get("context_length"))
+        .and_then(Value::as_u64);
+
+    direct
+        .or(nested)
+        .filter(|tokens| *tokens >= MIN_PROVIDER_CONTEXT_WINDOW_TOKENS as u64)
+        .filter(|tokens| *tokens <= MAX_REPORTED_CONTEXT_WINDOW_TOKENS as u64)
+        .map(|tokens| tokens as usize)
+}
+
+/// Upper bound on a self-reported window. Guards against catalogs that publish
+/// byte counts or placeholder values where a token count belongs.
+const MAX_REPORTED_CONTEXT_WINDOW_TOKENS: usize = 20_000_000;
 
 /// Pins (or clears) the model a thread runs with.
 async fn set_thread_model(
@@ -8452,6 +8509,70 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_catalog_reads_ids_from_every_shape_relays_return() {
+        let openai = json!({"data": [{"id": "gpt-4.1-mini"}, {"id": "o3-mini"}]});
+        assert_eq!(
+            extract_model_catalog(&openai),
+            vec![
+                ("gpt-4.1-mini".to_string(), None),
+                ("o3-mini".to_string(), None)
+            ]
+        );
+
+        let bare = json!(["kimi-k2.5", "glm-4.6"]);
+        assert_eq!(
+            extract_model_catalog(&bare),
+            vec![
+                ("kimi-k2.5".to_string(), None),
+                ("glm-4.6".to_string(), None)
+            ]
+        );
+
+        let named = json!({"models": [{"name": "deepseek-reasoner"}]});
+        assert_eq!(
+            extract_model_catalog(&named),
+            vec![("deepseek-reasoner".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn model_catalog_picks_up_whichever_context_field_the_endpoint_uses() {
+        let payload = json!({"data": [
+            {"id": "a", "context_length": 200_000},
+            {"id": "b", "max_model_len": 32_768},
+            {"id": "c", "max_input_tokens": 128_000},
+            {"id": "d", "top_provider": {"context_length": 1_000_000}},
+        ]});
+        assert_eq!(
+            extract_model_catalog(&payload),
+            vec![
+                ("a".to_string(), Some(200_000)),
+                ("b".to_string(), Some(32_768)),
+                ("c".to_string(), Some(128_000)),
+                ("d".to_string(), Some(1_000_000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn implausible_reported_context_windows_are_ignored() {
+        // Too small to be a real window, and a byte count masquerading as tokens.
+        let payload = json!({"data": [
+            {"id": "tiny", "context_length": 8},
+            {"id": "huge", "context_length": 999_000_000_u64},
+            {"id": "text", "context_length": "200000"},
+        ]});
+        assert_eq!(
+            extract_model_catalog(&payload),
+            vec![
+                ("tiny".to_string(), None),
+                ("huge".to_string(), None),
+                ("text".to_string(), None),
+            ]
+        );
+    }
 
     #[test]
     fn generated_thread_titles_are_plain_and_unicode_bounded() {

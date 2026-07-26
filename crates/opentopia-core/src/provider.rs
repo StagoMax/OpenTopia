@@ -2,7 +2,10 @@ use crate::model::ModelContentPart;
 use crate::model_context::{
     CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ModelContextItem,
 };
-use crate::settings::{PromptCachePolicy, ProviderHealthCheck, ProviderKind, ProviderSettings};
+use crate::settings::{
+    model_accepts_temperature, PromptCachePolicy, ProviderHealthCheck, ProviderKind,
+    ProviderSettings,
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -533,11 +536,15 @@ impl OpenAiCompatibleProvider {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut payload = json!({
             "model": self.model,
-            "temperature": self.temperature,
             "messages": openai_messages(&request),
             "stream": true,
             "stream_options": { "include_usage": true }
         });
+        // Reasoning models reject any explicit temperature with a 400, so the
+        // field is omitted rather than clamped.
+        if model_accepts_temperature(&self.model) {
+            payload["temperature"] = json!(self.temperature);
+        }
         if let Some(max_output_tokens) = self.max_output_tokens {
             payload["max_tokens"] = json!(max_output_tokens);
         }
@@ -660,7 +667,11 @@ impl OpenAiCompatibleProvider {
 
         let mut decoder = SseDecoder::default();
         let mut accumulator = OpenAiStreamAccumulator::default();
-        while let Some(chunk) = response.chunk().await? {
+        let idle_timeout = stream_idle_timeout();
+        loop {
+            let Some(chunk) = next_stream_chunk(&mut response, idle_timeout).await? else {
+                break;
+            };
             for data in decoder.push(&chunk)? {
                 if data == "[DONE]" {
                     continue;
@@ -794,8 +805,12 @@ impl OpenAiResponsesProvider {
             "stream": true,
             "store": self.store_responses,
             "parallel_tool_calls": self.parallel_tool_calls,
-            "temperature": self.temperature,
         });
+        // Reasoning models reject any explicit temperature with a 400, so the
+        // field is omitted rather than clamped.
+        if model_accepts_temperature(&self.model) {
+            payload["temperature"] = json!(self.temperature);
+        }
         let mut system_instructions = responses_system_instructions(&request);
         if self.native_web_search {
             if !system_instructions.trim().is_empty() {
@@ -917,7 +932,11 @@ impl OpenAiResponsesProvider {
         let mut decoder = SseDecoder::default();
         let mut accumulator = ResponsesStreamAccumulator::default();
         let mut response = response;
-        while let Some(chunk) = response.chunk().await? {
+        let idle_timeout = stream_idle_timeout();
+        loop {
+            let Some(chunk) = next_stream_chunk(&mut response, idle_timeout).await? else {
+                break;
+            };
             for data in decoder.push(&chunk)? {
                 if data == "[DONE]" {
                     continue;
@@ -1055,7 +1074,11 @@ impl AnthropicMessagesProvider {
 
         let mut decoder = SseDecoder::default();
         let mut accumulator = AnthropicStreamAccumulator::default();
-        while let Some(chunk) = response.chunk().await? {
+        let idle_timeout = stream_idle_timeout();
+        loop {
+            let Some(chunk) = next_stream_chunk(&mut response, idle_timeout).await? else {
+                break;
+            };
             for data in decoder.push(&chunk)? {
                 let event: Value = serde_json::from_str(&data).map_err(|error| {
                     anyhow::anyhow!("invalid Anthropic Messages SSE data: {error}: {data}")
@@ -1304,6 +1327,61 @@ impl AnthropicStreamAccumulator {
             provider_items: Vec::new(),
             finish_reason,
         })
+    }
+}
+
+/// Default ceiling on the gap between two streamed chunks of one model response.
+///
+/// A total request timeout is the wrong shape for streaming: it truncates a
+/// legitimately long answer while still letting a dead connection hold the turn
+/// open for its full duration. Bounding the idle gap instead lets a response run
+/// as long as it needs to as long as it keeps producing output.
+///
+/// The bound is generous because silence is not always failure. A reasoning model
+/// can think for minutes before its first token, and an OpenAI-compatible endpoint
+/// is not obliged to send keep-alive events while it does.
+const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Default ceiling on the gap between two Codex App Server events.
+///
+/// This stream carries a whole turn rather than one model response, so the gaps
+/// include tool execution: a build, an install, or a download can legitimately run
+/// for many minutes without producing an event. The bound has to clear that, and it
+/// still only measures silence, never total turn length.
+const DEFAULT_APP_SERVER_IDLE_TIMEOUT_SECS: u64 = 900;
+
+fn env_timeout_secs(key: &str, default_secs: u64) -> Duration {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(Duration::from_secs(default_secs), Duration::from_secs)
+}
+
+fn stream_idle_timeout() -> Duration {
+    env_timeout_secs(
+        "OPENTOPIA_STREAM_IDLE_TIMEOUT_SECS",
+        DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+    )
+}
+
+fn app_server_idle_timeout() -> Duration {
+    env_timeout_secs(
+        "OPENTOPIA_APP_SERVER_IDLE_TIMEOUT_SECS",
+        DEFAULT_APP_SERVER_IDLE_TIMEOUT_SECS,
+    )
+}
+
+async fn next_stream_chunk(
+    response: &mut reqwest::Response,
+    idle_timeout: Duration,
+) -> anyhow::Result<Option<impl std::ops::Deref<Target = [u8]>>> {
+    match tokio::time::timeout(idle_timeout, response.chunk()).await {
+        Ok(chunk) => Ok(chunk?),
+        Err(_) => anyhow::bail!(
+            "provider stream stalled: no data for {} seconds",
+            idle_timeout.as_secs()
+        ),
     }
 }
 
@@ -3445,108 +3523,106 @@ impl CodexAppServerProvider {
         &self,
         session: &mut CodexAppServerSession,
     ) -> anyhow::Result<CodexDriveResult> {
-        tokio::time::timeout(Duration::from_secs(300), async {
-            loop {
-                let event = codex_next_event(&mut session.stdout).await?;
-                let Some(method) = event.get("method").and_then(Value::as_str) else {
-                    continue;
-                };
-                let params = event.get("params").cloned().unwrap_or(Value::Null);
-                match method {
-                    "item/started" => {
-                        if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
-                            && params.pointer("/item/type").and_then(Value::as_str)
-                                == Some("agentMessage")
-                            && params.pointer("/item/phase").and_then(Value::as_str)
-                                == Some("final_answer")
-                        {
-                            if let Some(item_id) =
-                                params.pointer("/item/id").and_then(Value::as_str)
-                            {
-                                session.final_message_item_ids.insert(item_id.to_string());
-                            }
+        // The bound is on silence, not on total turn length: a Codex turn may legitimately
+        // run for a long time as long as it keeps emitting events, but a session that goes
+        // quiet must not hold the caller open indefinitely.
+        let idle_timeout = app_server_idle_timeout();
+        loop {
+            let event = tokio::time::timeout(idle_timeout, codex_next_event(&mut session.stdout))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Codex App Server stalled: no event for {} seconds",
+                        idle_timeout.as_secs()
+                    )
+                })??;
+            let Some(method) = event.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            let params = event.get("params").cloned().unwrap_or(Value::Null);
+            match method {
+                "item/started" => {
+                    if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
+                        && params.pointer("/item/type").and_then(Value::as_str)
+                            == Some("agentMessage")
+                        && params.pointer("/item/phase").and_then(Value::as_str)
+                            == Some("final_answer")
+                    {
+                        if let Some(item_id) = params.pointer("/item/id").and_then(Value::as_str) {
+                            session.final_message_item_ids.insert(item_id.to_string());
                         }
                     }
-                    "item/agentMessage/delta" | "agentMessage/delta" => {
-                        if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
-                            && params
-                                .get("itemId")
-                                .and_then(Value::as_str)
-                                .is_some_and(|item_id| {
-                                    session.final_message_item_ids.contains(item_id)
-                                })
-                        {
-                            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                                session.assistant_text.push_str(delta);
-                                session.received_agent_delta = true;
-                            }
-                        }
-                    }
-                    "item/completed" => {
-                        if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
-                            && !session.received_agent_delta
-                            && params
-                                .pointer("/item/id")
-                                .and_then(Value::as_str)
-                                .is_some_and(|item_id| {
-                                    session.final_message_item_ids.contains(item_id)
-                                })
-                        {
-                            session.assistant_text.push_str(&codex_item_text(
-                                params.get("item").unwrap_or(&Value::Null),
-                            ));
-                        }
-                    }
-                    "item/tool/call" => {
-                        let call = codex_dynamic_tool_call(&event)?;
-                        if call.call_id.is_empty() || call.name.is_empty() {
-                            anyhow::bail!(
-                                "Codex App Server returned an incomplete dynamic tool call"
-                            );
-                        }
-                        return Ok(CodexDriveResult::ToolCall(call));
-                    }
-                    "turn/completed" => {
-                        if params.pointer("/turn/id").and_then(Value::as_str)
-                            != Some(&session.turn_id)
-                        {
-                            continue;
-                        }
-                        let status = params
-                            .pointer("/turn/status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("completed");
-                        if status != "completed" {
-                            let detail = params
-                                .pointer("/turn/error/message")
-                                .and_then(Value::as_str)
-                                .unwrap_or(status);
-                            anyhow::bail!("Codex App Server turn failed: {detail}");
-                        }
-                        return Ok(CodexDriveResult::Completed(session.assistant_text.clone()));
-                    }
-                    "error" => {
-                        let error = params.get("error").unwrap_or(&Value::Null);
-                        let will_retry = params
-                            .get("willRetry")
-                            .and_then(Value::as_bool)
-                            // Older App Server builds nested this field in the error payload.
-                            .or_else(|| error.get("willRetry").and_then(Value::as_bool))
-                            .unwrap_or(false);
-                        if !will_retry {
-                            let detail = error
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Codex App Server reported an error");
-                            anyhow::bail!("Codex App Server error: {detail}");
-                        }
-                    }
-                    _ => {}
                 }
+                "item/agentMessage/delta" | "agentMessage/delta" => {
+                    if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
+                        && params
+                            .get("itemId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|item_id| session.final_message_item_ids.contains(item_id))
+                    {
+                        if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                            session.assistant_text.push_str(delta);
+                            session.received_agent_delta = true;
+                        }
+                    }
+                }
+                "item/completed" => {
+                    if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
+                        && !session.received_agent_delta
+                        && params
+                            .pointer("/item/id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|item_id| session.final_message_item_ids.contains(item_id))
+                    {
+                        session
+                            .assistant_text
+                            .push_str(&codex_item_text(params.get("item").unwrap_or(&Value::Null)));
+                    }
+                }
+                "item/tool/call" => {
+                    let call = codex_dynamic_tool_call(&event)?;
+                    if call.call_id.is_empty() || call.name.is_empty() {
+                        anyhow::bail!("Codex App Server returned an incomplete dynamic tool call");
+                    }
+                    return Ok(CodexDriveResult::ToolCall(call));
+                }
+                "turn/completed" => {
+                    if params.pointer("/turn/id").and_then(Value::as_str) != Some(&session.turn_id)
+                    {
+                        continue;
+                    }
+                    let status = params
+                        .pointer("/turn/status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    if status != "completed" {
+                        let detail = params
+                            .pointer("/turn/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or(status);
+                        anyhow::bail!("Codex App Server turn failed: {detail}");
+                    }
+                    return Ok(CodexDriveResult::Completed(session.assistant_text.clone()));
+                }
+                "error" => {
+                    let error = params.get("error").unwrap_or(&Value::Null);
+                    let will_retry = params
+                        .get("willRetry")
+                        .and_then(Value::as_bool)
+                        // Older App Server builds nested this field in the error payload.
+                        .or_else(|| error.get("willRetry").and_then(Value::as_bool))
+                        .unwrap_or(false);
+                    if !will_retry {
+                        let detail = error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex App Server reported an error");
+                        anyhow::bail!("Codex App Server error: {detail}");
+                    }
+                }
+                _ => {}
             }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Codex App Server turn timed out after five minutes"))?
+        }
     }
 
     async fn complete_request(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
