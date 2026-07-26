@@ -10,7 +10,6 @@ import {
   Activity,
   AlertCircle,
   Bot,
-  CheckCircle2,
   ChevronDown,
   ChevronRight,
   ChevronUp,
@@ -19,12 +18,8 @@ import {
   FileDiff,
   FileSearch,
   FileText,
-  Globe2,
   Loader2,
   RotateCcw,
-  Table2,
-  TerminalSquare,
-  Wrench,
   X,
 } from "lucide-react";
 import type {
@@ -37,11 +32,20 @@ import type {
   TurnFileDiffPreview,
   TurnFileChange,
 } from "../types";
+import {
+  asRecord,
+  classifyToolCall,
+  redactText,
+  stringField,
+  toolActivityGroup,
+  toolResultFailed,
+  truncateText,
+  type ToolActivityGroup as ToolGroupKey,
+  type ToolActivityKind,
+} from "../toolActivity";
 import { MarkdownContent } from "./MarkdownContent";
+import { ToolActivityCard, toolActivityIcon } from "./ToolActivityCard";
 import "./TurnActivityTimeline.css";
-
-type ToolCategory =
-  "command" | "file" | "browser" | "spreadsheet" | "agent" | "tool";
 
 type ToolExecution = {
   call: ToolCall;
@@ -115,7 +119,7 @@ type ActivityEntry =
   | {
       kind: "tool-group";
       id: string;
-      category: ToolCategory;
+      group: ToolGroupKey;
       executions: ToolExecution[];
     }
   | {
@@ -256,6 +260,7 @@ export function TurnChangeCard({
   onUndo,
   onReview,
   onLoadFilePreview,
+  onOpenFileReview,
 }: {
   changeSet: TurnChangeSet;
   isWorkspaceBusy?: boolean;
@@ -267,6 +272,9 @@ export function TurnChangeCard({
     path: string,
     offset?: number,
   ): Promise<TurnFileDiffPreview>;
+  // Clicking a file row hands the file to the side review panel instead of
+  // pinning the hover preview. Without this the row falls back to pinning.
+  onOpenFileReview?(path: string): void;
 }) {
   const [showAll, setShowAll] = useState(false);
   const [filePreviewState, setFilePreviewState] =
@@ -455,6 +463,14 @@ export function TurnChangeCard({
                 : null
             }
             canPreview={file.binary || Boolean(onLoadFilePreview)}
+            onSelect={
+              onOpenFileReview
+                ? () => {
+                    const path = turnChangeFileRequestPath(file);
+                    if (path) onOpenFileReview(path);
+                  }
+                : undefined
+            }
             onOpen={() => openFilePreview(file)}
             onClose={() => closeFilePreview(file)}
             onRetry={() => loadFilePreview(file)}
@@ -506,6 +522,7 @@ function TurnChangeFileRow({
   previewId,
   previewState,
   canPreview,
+  onSelect,
   onOpen,
   onClose,
   onRetry,
@@ -516,6 +533,7 @@ function TurnChangeFileRow({
   previewId: string;
   previewState: TurnFilePreviewState | null;
   canPreview: boolean;
+  onSelect?(): void;
   onOpen(): void;
   onClose(): void;
   onRetry(): void;
@@ -573,11 +591,15 @@ function TurnChangeFileRow({
       <button
         className="turn-change-card-file-button"
         type="button"
-        disabled={!canPreview}
+        disabled={!canPreview && !onSelect}
         aria-expanded={expanded}
-        aria-haspopup="dialog"
+        aria-haspopup={onSelect ? undefined : "dialog"}
         aria-controls={canPreview ? previewId : undefined}
-        aria-label={`${expanded ? "收起" : "预览"} ${path} 的代码差异`}
+        aria-label={
+          onSelect
+            ? `在审阅面板中打开 ${path}`
+            : `${expanded ? "收起" : "预览"} ${path} 的代码差异`
+        }
         onKeyDown={(event) => {
           if (event.key !== "Escape" || !expanded) return;
           event.preventDefault();
@@ -585,6 +607,14 @@ function TurnChangeFileRow({
           onClose();
         }}
         onClick={() => {
+          // With a review panel wired up, a click belongs to it; the hover
+          // preview stays a hover affordance and gets out of the way.
+          if (onSelect) {
+            setPinned(false);
+            onClose();
+            onSelect();
+            return;
+          }
           if (pinned) {
             setPinned(false);
             onClose();
@@ -915,7 +945,7 @@ function ActivityEntryView({
   if (entry.kind === "tool-group") {
     return (
       <ToolActivityGroup
-        category={entry.category}
+        group={entry.group}
         executions={entry.executions}
         defaultExpanded={isActive}
         now={now}
@@ -1002,18 +1032,18 @@ function ActivityEntryView({
 }
 
 function ToolActivityGroup({
-  category,
+  group,
   executions,
   defaultExpanded,
   now,
 }: {
-  category: ToolCategory;
+  group: ToolGroupKey;
   executions: ToolExecution[];
   defaultExpanded: boolean;
   now: number;
 }) {
   const running = executions.some((execution) => !execution.result);
-  const commandBatch = category === "command" && executions.length > 1;
+  const commandBatch = group === "shell" && executions.length > 1;
   const runningCommand = [...executions]
     .reverse()
     .find((execution) => !execution.result);
@@ -1057,10 +1087,10 @@ function ToolActivityGroup({
         onClick={() => setExpanded((current) => !current)}
       >
         <span className="activity-group-icon" aria-hidden="true">
-          {toolCategoryIcon(category)}
+          {toolActivityIcon(toolGroupIconKind(group), 13)}
         </span>
         <span>
-          {toolGroupTitle(category, executions.length)}
+          {toolGroupTitle(group, executions.length)}
           {timing ? ` · ${timing}` : ""}
         </span>
         <ActivityResultIcon running={running} failed={failed} />
@@ -1091,107 +1121,21 @@ function ToolExecutionItem({
   currentCommand?: boolean;
 }) {
   const running = !execution.result;
-  const failed = toolResultFailed(execution.result);
-  const [expanded, setExpanded] = useState(false);
   const timing = formatActivityTiming(
     execution.startedAt,
     execution.finishedAt,
     running,
     now,
   );
-  const fileChanges = toolFileChangeSummaries(execution);
-  const primaryFileChange =
-    fileChanges.length === 1 ? fileChanges[0] : undefined;
-  const input = formatToolInput(execution.call, fileChanges.length > 0);
-  const output = formatToolOutput(execution.result);
-  const sandbox = formatToolSandbox(execution.result);
-  const title = primaryFileChange
-    ? primaryFileChange.path
-    : fileChanges.length > 1
-      ? `修改了 ${fileChanges.length} 个文件`
-      : toolExecutionTitle(execution.call);
-
-  useEffect(() => {
-    if (currentCommand) setExpanded(false);
-  }, [currentCommand, execution.call.id]);
 
   return (
-    <div
-      className="tool-execution"
-      data-state={failed ? "error" : running ? "running" : "complete"}
-      data-current-command={currentCommand || undefined}
-    >
-      <button
-        className="tool-execution-header"
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <span className="tool-execution-state" aria-hidden="true">
-          {currentCommand ? (
-            <TerminalSquare size={12} />
-          ) : (
-            <ActivityResultIcon running={running} failed={failed} />
-          )}
-        </span>
-        <span className="tool-execution-title">
-          <strong
-            className={currentCommand ? "tool-execution-title-flow" : undefined}
-            title={primaryFileChange?.path}
-          >
-            {title}
-          </strong>
-          <small className="tool-execution-meta">
-            <span>
-              {primaryFileChange?.operation ||
-                toolDisplayName(execution.call.name)}
-            </span>
-            {primaryFileChange && (
-              <FileChangeStatsView change={primaryFileChange} />
-            )}
-            {timing && <span>· {timing}</span>}
-            {sandbox && (
-              <span
-                className="tool-sandbox-state"
-                data-tone={sandbox.unsafe ? "warning" : "neutral"}
-                title={sandbox.detail}
-              >
-                · {sandbox.label}
-              </span>
-            )}
-          </small>
-        </span>
-        {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-      </button>
-      {fileChanges.length > 1 && (
-        <FileChangeSummaryList changes={fileChanges} />
-      )}
-      {expanded && (
-        <div className="tool-execution-details">
-          <div>
-            <span>{execution.call.name === "shell" ? "命令" : "参数"}</span>
-            <pre>{input}</pre>
-          </div>
-          <div>
-            <span>结果</span>
-            <pre>{output}</pre>
-          </div>
-          {execution.call.name === "shell" && !running && (
-            <footer
-              className="tool-execution-shell-status"
-              data-state={failed ? "error" : "success"}
-            >
-              {failed ? (
-                <X size={12} aria-hidden="true" />
-              ) : (
-                <CheckCircle2 size={12} aria-hidden="true" />
-              )}
-              <span>{failed ? "失败" : "成功"}</span>
-            </footer>
-          )}
-        </div>
-      )}
-    </div>
+    <ToolActivityCard
+      call={execution.call}
+      result={execution.result}
+      timing={timing}
+      sandbox={formatToolSandbox(execution.result)}
+      streaming={currentCommand}
+    />
   );
 }
 
@@ -1262,23 +1206,6 @@ function FileActivityItem({ file }: { file: ActivityFile }) {
         )}
       </button>
       {expanded && detail && <p className="activity-file-detail">{detail}</p>}
-    </div>
-  );
-}
-
-function FileChangeSummaryList({ changes }: { changes: FileChangeSummary[] }) {
-  return (
-    <div className="file-change-summary-list" role="list" aria-label="文件变更">
-      {changes.map((change, index) => (
-        <div key={`${change.path}-${index}`} role="listitem">
-          <FileText size={12} aria-hidden="true" />
-          <span title={change.path}>{change.path}</span>
-          <span className="activity-file-meta">
-            <span>{change.operation}</span>
-            <FileChangeStatsView change={change} />
-          </span>
-        </div>
-      ))}
     </div>
   );
 }
@@ -1716,15 +1643,17 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
   const entries: ActivityEntry[] = [];
   for (const primitive of primitives) {
     if (primitive.kind === "tool") {
-      const category = toolCategory(primitive.execution.call.name);
+      const group = toolActivityGroup(
+        classifyToolCall(primitive.execution.call),
+      );
       const previous = entries[entries.length - 1];
-      if (previous?.kind === "tool-group" && previous.category === category) {
+      if (previous?.kind === "tool-group" && previous.group === group) {
         previous.executions.push(primitive.execution);
       } else {
         entries.push({
           kind: "tool-group",
           id: `tool-${primitive.seq}`,
-          category,
+          group,
           executions: [primitive.execution],
         });
       }
@@ -1900,179 +1829,6 @@ function activityEntryKey(entry: ActivityEntry) {
   return `${entry.kind}-${entry.seq}`;
 }
 
-function toolCategory(name: string): ToolCategory {
-  if (name === "shell") return "command";
-  if (
-    [
-      "list_files",
-      "read_file",
-      "write_file",
-      "search",
-      "git_diff",
-      "apply_patch",
-    ].includes(name)
-  ) {
-    return "file";
-  }
-  if (name === "browser") return "browser";
-  if (name === "spreadsheet") return "spreadsheet";
-  if (
-    [
-      "spawn_agent",
-      "send_input",
-      "cancel_agent",
-      "wait_agent",
-      "wait_agents",
-    ].includes(name)
-  ) {
-    return "agent";
-  }
-  return "tool";
-}
-
-function toolCategoryIcon(category: ToolCategory) {
-  if (category === "command") return <TerminalSquare size={13} />;
-  if (category === "file") return <FileText size={13} />;
-  if (category === "browser") return <Globe2 size={13} />;
-  if (category === "spreadsheet") return <Table2 size={13} />;
-  if (category === "agent") return <Bot size={13} />;
-  return <Wrench size={13} />;
-}
-
-function toolGroupTitle(category: ToolCategory, count: number) {
-  if (category === "command") return "运行了多个命令";
-  if (category === "file") return `进行了 ${count} 个文件操作`;
-  if (category === "browser") return `进行了 ${count} 个浏览器操作`;
-  if (category === "spreadsheet") return `进行了 ${count} 个表格操作`;
-  if (category === "agent") return `进行了 ${count} 个子智能体操作`;
-  return `调用了 ${count} 个工具`;
-}
-
-function toolExecutionTitle(call: ToolCall) {
-  const input = asRecord(call.input);
-  if (call.name === "shell") {
-    return truncateLine(stringField(input, "command") || "运行命令", 140);
-  }
-  if (call.name === "list_files")
-    return `查看文件 ${stringField(input, "path") || "."}`;
-  if (call.name === "read_file")
-    return `读取 ${stringField(input, "path") || "文件"}`;
-  if (call.name === "write_file")
-    return `写入 ${stringField(input, "path") || "文件"}`;
-  if (call.name === "search") {
-    return `搜索 ${stringField(input, "query") || stringField(input, "pattern") || "内容"}`;
-  }
-  if (call.name === "git_diff") return "检查 Git 变更";
-  if (call.name === "apply_patch")
-    return `修改文件${patchTarget(input) ? ` ${patchTarget(input)}` : ""}`;
-  if (call.name === "browser") {
-    const action = stringField(input, "action") || "操作";
-    const target = stringField(input, "url") || stringField(input, "selector");
-    return `浏览器 ${action}${target ? ` · ${truncateLine(target, 90)}` : ""}`;
-  }
-  if (call.name === "spreadsheet") {
-    const action = stringField(input, "action") || "操作";
-    const target =
-      stringField(input, "path") || stringField(input, "outputPath");
-    return `表格 ${action}${target ? ` · ${target}` : ""}`;
-  }
-  if (call.name === "spawn_agent")
-    return `创建子智能体 ${stringField(input, "name") || ""}`.trim();
-  if (call.name === "send_input") return "向子智能体发送消息";
-  if (call.name === "wait_agent" || call.name === "wait_agents")
-    return "等待子智能体完成";
-  if (call.name === "cancel_agent") return "取消子智能体";
-  if (call.name === "update_plan") return "更新执行计划";
-  if (call.name === "complete_task") return "完成任务";
-  if (call.name === "list_skills") return "查看可用 Skill";
-  if (call.name === "read_skill")
-    return `读取 Skill ${stringField(input, "name") || ""}`.trim();
-  const mcpTool = mcpToolNameParts(call.name);
-  if (mcpTool) return `MCP · ${mcpTool.server} / ${mcpTool.tool}`;
-  return call.name;
-}
-
-function mcpToolNameParts(
-  name: string,
-): { server: string; tool: string } | null {
-  const separator = name.indexOf("__");
-  if (separator <= 0 || separator >= name.length - 2) return null;
-  return {
-    server: name.slice(0, separator),
-    tool: name.slice(separator + 2),
-  };
-}
-
-function toolDisplayName(name: string) {
-  const names: Record<string, string> = {
-    shell: "Shell",
-    list_files: "文件列表",
-    read_file: "读取文件",
-    write_file: "写入文件",
-    search: "代码搜索",
-    git_diff: "Git Diff",
-    apply_patch: "Apply Patch",
-    browser: "浏览器",
-    spreadsheet: "Excel",
-    spawn_agent: "子智能体",
-    send_input: "子智能体",
-    wait_agent: "子智能体",
-    wait_agents: "子智能体",
-    cancel_agent: "子智能体",
-    update_plan: "任务计划",
-    complete_task: "任务闭环",
-  };
-  return names[name] || (mcpToolNameParts(name) ? "MCP" : name);
-}
-
-function toolFileChangeSummaries(
-  execution: ToolExecution,
-): FileChangeSummary[] {
-  const input = asRecord(execution.call.input);
-  const metadataChanges = fileChangesFromMetadata(execution.result?.metadata);
-
-  if (execution.call.name === "write_file") {
-    const inputPath = stringField(input, "path");
-    const metadataChange = findMatchingFileChange(metadataChanges, inputPath);
-    const path = inputPath || metadataChange?.path;
-    if (!path) return metadataChanges;
-    return [
-      {
-        path,
-        operation: metadataChange?.operation || "写入",
-        additions: metadataChange?.additions,
-        deletions: metadataChange?.deletions,
-      },
-    ];
-  }
-
-  const diffText =
-    execution.call.name === "apply_patch"
-      ? stringField(input, "patch")
-      : execution.call.name === "git_diff"
-        ? execution.result?.output || ""
-        : "";
-  const diffChanges = parseUnifiedDiffChanges(diffText);
-  if (diffChanges.length > 0) {
-    return diffChanges.map((change) => {
-      const metadataChange = findMatchingFileChange(
-        metadataChanges,
-        change.path,
-      );
-      return metadataChange
-        ? mergeFileChange(change, metadataChange, change.path)
-        : change;
-    });
-  }
-  if (metadataChanges.length > 0) return metadataChanges;
-
-  if (execution.call.name === "apply_patch") {
-    const path = patchTarget(input);
-    return path ? [{ path, operation: "修改" }] : [];
-  }
-  return [];
-}
-
 function fileChangedEventSummary(file: ActivityFile): FileChangeSummary {
   const stats = parseSummaryLineStats(file.summary);
   return {
@@ -2081,146 +1837,6 @@ function fileChangedEventSummary(file: ActivityFile): FileChangeSummary {
     ...stats,
     detail: file.summary.trim() || undefined,
   };
-}
-
-function fileChangesFromMetadata(value: unknown): FileChangeSummary[] {
-  const metadata = asRecord(value);
-  if (!metadata) return [];
-  const candidates: Record<string, unknown>[] = [];
-  for (const key of ["fileChanges", "changes", "files"]) {
-    const list = metadata[key];
-    if (!Array.isArray(list)) continue;
-    for (const item of list) {
-      const record = asRecord(item);
-      if (record) candidates.push(record);
-    }
-  }
-  if (
-    ["changedPath", "path", "filePath"].some(
-      (key) => typeof metadata[key] === "string",
-    )
-  ) {
-    candidates.push(metadata);
-  }
-
-  return candidates.flatMap((record) => {
-    const path = firstStringField(record, [
-      "changedPath",
-      "path",
-      "filePath",
-      "file",
-    ]);
-    if (!path) return [];
-    const additions = firstLineCount(record, [
-      "additions",
-      "addedLines",
-      "linesAdded",
-      "insertions",
-    ]);
-    const deletions = firstLineCount(record, [
-      "deletions",
-      "deletedLines",
-      "removedLines",
-      "linesDeleted",
-    ]);
-    const operation = fileOperationLabel(
-      firstStringField(record, ["operation", "action", "status"]),
-      "修改",
-    );
-    return [{ path, operation, additions, deletions }];
-  });
-}
-
-function parseUnifiedDiffChanges(value: string): FileChangeSummary[] {
-  if (!value.trim()) return [];
-  type MutableChange = FileChangeSummary & { statsKnown: boolean };
-  const changes: MutableChange[] = [];
-  let current: MutableChange | undefined;
-  let oldPath = "";
-  let inHunk = false;
-
-  const selectChange = (
-    path: string,
-    operation = "修改",
-    statsKnown = false,
-  ) => {
-    const normalizedPath = cleanDiffPath(path);
-    if (!normalizedPath || normalizedPath === "/dev/null") return undefined;
-    const key = normalizeFileChangeKey(normalizedPath);
-    current = changes.find(
-      (change) => normalizeFileChangeKey(change.path) === key,
-    );
-    if (!current) {
-      current = {
-        path: normalizedPath,
-        operation,
-        additions: 0,
-        deletions: 0,
-        statsKnown,
-      };
-      changes.push(current);
-    } else {
-      current.operation = operation || current.operation;
-      current.statsKnown ||= statsKnown;
-    }
-    return current;
-  };
-
-  for (const line of value.split(/\r?\n/)) {
-    const customHeader = line.match(
-      /^\*\*\* (Add|Update|Delete) File:\s*(.+)$/,
-    );
-    if (customHeader) {
-      const operation =
-        customHeader[1] === "Add"
-          ? "新建"
-          : customHeader[1] === "Delete"
-            ? "删除"
-            : "修改";
-      selectChange(customHeader[2], operation, true);
-      inHunk = true;
-      continue;
-    }
-
-    const diffHeader = line.match(/^diff --git\s+\S+\s+(\S+)$/);
-    if (diffHeader) {
-      selectChange(diffHeader[1]);
-      oldPath = "";
-      inHunk = false;
-      continue;
-    }
-    if (line.startsWith("--- ")) {
-      oldPath = cleanDiffPath(line.slice(4));
-      inHunk = false;
-      continue;
-    }
-    if (line.startsWith("+++ ")) {
-      const newPath = cleanDiffPath(line.slice(4));
-      const deleting = newPath === "/dev/null";
-      selectChange(
-        deleting ? oldPath : newPath,
-        deleting ? "删除" : oldPath === "/dev/null" ? "新建" : "修改",
-      );
-      continue;
-    }
-    if (line.startsWith("@@")) {
-      if (current) current.statsKnown = true;
-      inHunk = true;
-      continue;
-    }
-    if (!current || !inHunk) continue;
-    if (line.startsWith("+") && !line.startsWith("+++")) {
-      current.additions = (current.additions || 0) + 1;
-      current.statsKnown = true;
-    } else if (line.startsWith("-") && !line.startsWith("---")) {
-      current.deletions = (current.deletions || 0) + 1;
-      current.statsKnown = true;
-    }
-  }
-
-  return changes.map(({ statsKnown, ...change }) =>
-    statsKnown ? change : { path: change.path, operation: change.operation },
-  );
 }
 
 function parseSummaryLineStats(
@@ -2239,33 +1855,6 @@ function parseSummaryLineStats(
   };
 }
 
-function findMatchingFileChange(changes: FileChangeSummary[], path: string) {
-  if (!path) return changes[0];
-  const key = normalizeFileChangeKey(path);
-  return changes.find((change) => {
-    const candidate = normalizeFileChangeKey(change.path);
-    return (
-      candidate === key ||
-      candidate.endsWith(`/${key}`) ||
-      key.endsWith(`/${candidate}`)
-    );
-  });
-}
-
-function mergeFileChange(
-  base: FileChangeSummary,
-  overlay: FileChangeSummary,
-  path = base.path,
-): FileChangeSummary {
-  return {
-    path,
-    operation: overlay.operation || base.operation,
-    additions: overlay.additions ?? base.additions,
-    deletions: overlay.deletions ?? base.deletions,
-    detail: overlay.detail || base.detail,
-  };
-}
-
 function fileOperationLabel(value: string, fallback: string) {
   const normalized = value.toLowerCase();
   if (/\b(add|added|create|created|new)\b|新建|创建/.test(normalized))
@@ -2276,41 +1865,6 @@ function fileOperationLabel(value: string, fallback: string) {
   if (/\b(revert|reverted|restore|restored)\b|回滚|恢复/.test(normalized))
     return "回滚";
   return fallback;
-}
-
-function cleanDiffPath(value: string) {
-  const withoutTimestamp = value.trim().split("\t", 1)[0].replace(/^"|"$/g, "");
-  if (withoutTimestamp === "/dev/null") return withoutTimestamp;
-  return withoutTimestamp.replace(/^(?:a|b)[\\/]/, "").replace(/\\/g, "/");
-}
-
-function normalizeFileChangeKey(value: string) {
-  return cleanDiffPath(value).replace(/^\.\//, "").toLowerCase();
-}
-
-function firstStringField(record: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
-    if (typeof record[key] === "string" && record[key].trim()) {
-      return record[key].trim();
-    }
-  }
-  return "";
-}
-
-function firstLineCount(record: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
-    const value = record[key];
-    const count =
-      typeof value === "number"
-        ? value
-        : typeof value === "string" && /^\d+$/.test(value)
-          ? Number(value)
-          : undefined;
-    if (count !== undefined && Number.isFinite(count) && count >= 0) {
-      return Math.floor(count);
-    }
-  }
-  return undefined;
 }
 
 function fileChangeStatsLabel(change: FileChangeSummary) {
@@ -2348,49 +1902,6 @@ function appendReasoningText(previous: string, text: string, isDelta: boolean) {
   if (!previous) return text;
   if (previous === text || previous.endsWith(text)) return previous;
   return isDelta ? `${previous}${text}` : `${previous}\n${text}`;
-}
-
-function formatToolInput(call: ToolCall, hasFileSummary = false) {
-  const input = asRecord(call.input);
-  if (call.name === "shell") {
-    return truncateText(
-      redactText(stringField(input, "command") || "未提供命令"),
-      20_000,
-    );
-  }
-  let value: unknown = call.input;
-  if (
-    call.name === "write_file" &&
-    input &&
-    typeof input.content === "string"
-  ) {
-    value = {
-      ...input,
-      content: `[已隐藏文件正文，共 ${input.content.length} 个字符]`,
-    };
-  } else if (
-    call.name === "apply_patch" &&
-    input &&
-    typeof input.patch === "string" &&
-    !hasFileSummary
-  ) {
-    value = {
-      ...input,
-      patch: `[已隐藏补丁正文，共 ${input.patch.length} 个字符；未获得可靠的文件行数统计]`,
-    };
-  }
-  return truncateText(
-    JSON.stringify(sanitizeValue(value), null, 2) || "{}",
-    20_000,
-  );
-}
-
-function formatToolOutput(result?: ToolResult) {
-  if (!result) return "等待工具返回...";
-  const output = redactText(result.output || "").trim();
-  return output
-    ? truncateText(output, 20_000)
-    : "工具执行完成，未返回文本输出。";
 }
 
 function formatToolSandbox(
@@ -2448,12 +1959,6 @@ function formatToolSandbox(
     detail: `OS sandbox wrapping was disabled for profile ${profile}.`,
     unsafe: true,
   };
-}
-
-function toolResultFailed(result?: ToolResult) {
-  if (!result) return false;
-  const metadata = asRecord(result.metadata);
-  return metadata?.success === false || metadata?.isError === true;
 }
 
 function formatTurnTiming(
@@ -2602,67 +2107,23 @@ function subagentStatusLabel(status: SubagentRun["status"]) {
   return labels[status];
 }
 
-function patchTarget(input: Record<string, unknown> | null) {
-  const patch = stringField(input, "patch");
-  if (!patch) return "";
-  return (
-    patch.match(/^\*\*\* (?:Update|Add|Delete) File:\s*(.+)$/m)?.[1]?.trim() ||
-    ""
-  );
+function toolGroupTitle(group: ToolGroupKey, count: number) {
+  if (group === "explore") return `探索了 ${count} 处`;
+  if (group === "shell") return `运行了 ${count} 个命令`;
+  if (group === "edit") return `修改了 ${count} 次文件`;
+  if (group === "browser") return `进行了 ${count} 个浏览器操作`;
+  if (group === "computer") return `进行了 ${count} 个计算机操作`;
+  if (group === "spreadsheet") return `进行了 ${count} 个表格操作`;
+  if (group === "agent") return `进行了 ${count} 个子智能体操作`;
+  if (group === "plan") return `更新了 ${count} 次执行计划`;
+  if (group === "skill") return `进行了 ${count} 次 Skill 操作`;
+  if (group === "mcp") return `调用了 ${count} 个 MCP 工具`;
+  return `调用了 ${count} 个工具`;
 }
 
-function stringField(record: Record<string, unknown> | null, key: string) {
-  const value = record?.[key];
-  return typeof value === "string" ? value : "";
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function sanitizeValue(value: unknown, key = "", depth = 0): unknown {
-  if (/api[_-]?key|token|secret|password|authorization|credential/i.test(key)) {
-    return "[已隐藏]";
-  }
-  if (depth > 8) return "[内容层级过深]";
-  if (typeof value === "string") return redactText(value);
-  if (Array.isArray(value)) {
-    return value
-      .slice(0, 100)
-      .map((item) => sanitizeValue(item, key, depth + 1));
-  }
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(
-        ([entryKey, item]) => [
-          entryKey,
-          sanitizeValue(item, entryKey, depth + 1),
-        ],
-      ),
-    );
-  }
-  return value;
-}
-
-function redactText(value: string) {
-  return value
-    .replace(/(Bearer\s+)[^\s"'`]+/gi, "$1[已隐藏]")
-    .replace(
-      /((?:api[_-]?key|token|secret|password|authorization|credential)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)/gi,
-      "$1[已隐藏]",
-    )
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[已隐藏]");
-}
-
-function truncateLine(value: string, limit: number) {
-  const line = value.replace(/\s+/g, " ").trim();
-  return line.length <= limit ? line : `${line.slice(0, limit - 1)}…`;
-}
-
-function truncateText(value: string, limit: number) {
-  return value.length <= limit
-    ? value
-    : `${value.slice(0, limit)}\n\n… 输出已截断，共 ${value.length} 个字符`;
+function toolGroupIconKind(group: ToolGroupKey): ToolActivityKind {
+  if (group === "explore") return "search";
+  if (group === "shell") return "shell";
+  if (group === "edit") return "edit";
+  return group;
 }

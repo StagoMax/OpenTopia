@@ -1,21 +1,3 @@
-.tool-execution-meta {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.tool-sandbox-state {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tool-sandbox-state[data-tone="warning"] {
-  color: #9b5b17;
-  font-weight: 600;
-}
-
 .file-change-stats {
   display: inline-flex;
   flex: 0 0 auto;
@@ -25,11 +7,11 @@
 }
 
 .file-change-additions {
-  color: #238653;
+  color: var(--success);
 }
 
 .file-change-deletions {
-  color: #c44843;
+  color: var(--danger);
 }
 
 .turn-change-card {
@@ -152,8 +134,10 @@
 }
 
 .turn-change-card-file {
+  --turn-preview-gap: 8px;
+
   position: relative;
-  border-bottom: 1px solid #eef0ed;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .turn-change-card-file:last-child {
@@ -201,17 +185,17 @@
 }
 
 .turn-change-card-file-kind[data-kind="added"] {
-  background: #eef8f2;
+  background: var(--success-subtle);
   color: var(--success);
 }
 
 .turn-change-card-file-kind[data-kind="deleted"] {
-  background: #fff2f1;
+  background: var(--danger-subtle);
   color: var(--danger);
 }
 
 .turn-change-card-file-kind[data-kind="renamed"] {
-  background: #eef4fb;
+  background: var(--accent-subtle);
   color: var(--accent);
 }
 
@@ -251,19 +235,34 @@
 .turn-change-card-preview {
   position: absolute;
   z-index: 20;
-  bottom: calc(100% + 8px);
-  left: 50%;
+  bottom: calc(100% + var(--turn-preview-gap));
+  left: 0;
+  right: 0;
   display: flex;
-  width: min(680px, calc(100vw - 32px));
+  /* Sized to the change card, not to the diff text: long lines scroll inside
+     .turn-change-card-preview-code instead of widening the popover past the
+     conversation column. */
   max-height: min(468px, calc(100dvh - 104px));
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: 7px;
   box-shadow: 0 12px 28px rgb(30 40 32 / 18%);
-  transform: translateX(-50%);
   border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface-subtle) 54%, var(--surface));
+}
+
+/* The popover floats a few pixels above the row, and crossing that gap used to
+   fire mouseleave and dismiss it. This invisible bridge spans the gap; because
+   it is the row's own pseudo-element, the pointer never leaves the row. */
+.turn-change-card-file[data-preview-visible="true"]::after {
+  content: "";
+  position: absolute;
+  z-index: 19;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  height: calc(var(--turn-preview-gap) + 2px);
 }
 
 .turn-change-card-preview-header {
@@ -483,8 +482,8 @@
   display: flex;
   align-items: flex-start;
   gap: 6px;
-  margin: 5px 7px 3px 26px;
-  color: #9a5d22;
+  margin: 5px 0 3px var(--activity-gutter);
+  color: var(--warning);
   font-size: 10px;
   line-height: 1.5;
 }
@@ -492,28 +491,6 @@
 .turn-change-set-warning svg {
   flex: 0 0 auto;
   margin-top: 1px;
-}
-
-.file-change-summary-list {
-  display: grid;
-  gap: 1px;
-  padding: 0 7px 7px 30px;
-}
-
-.file-change-summary-list > div {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 6px;
-  min-height: 26px;
-  color: #525952;
-}
-
-.file-change-summary-list > div > span:nth-child(2) {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .activity-file-list > .activity-file-item {
@@ -525,20 +502,20 @@
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr) auto 16px;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   width: 100%;
   min-height: 28px;
-  padding: 3px 4px;
+  padding: 3px 0;
   border: 0;
   border-radius: 4px;
   background: transparent;
-  color: #525952;
+  color: var(--text-secondary);
   font: inherit;
   text-align: left;
 }
 
 .activity-file-row:hover {
-  background: #f7f8f6;
+  background: var(--surface-subtle);
 }
 
 .activity-file-row:focus-visible {
@@ -559,18 +536,18 @@
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
-  color: #8a918a;
+  color: var(--text-muted);
   font-size: 9px;
   white-space: nowrap;
 }
 
 .activity-file-detail {
-  margin: 1px 20px 7px 25px;
+  margin: 1px 0 7px var(--activity-gutter);
   padding: 7px 8px;
-  border: 1px solid #e4e7e4;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: #f5f6f4;
-  color: #666d66;
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
   font-size: 10px;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -578,13 +555,13 @@
 }
 
 .activity-narrative {
-  padding: 9px 6px;
-  color: #303530;
+  padding: 8px 0;
+  color: var(--text);
 }
 
 .activity-narrative-markdown {
   min-width: 0;
-  color: #303530;
+  color: var(--text);
   font-size: 14px;
   line-height: 1.7;
   overflow-wrap: anywhere;
@@ -636,26 +613,26 @@
 }
 
 .activity-narrative-markdown strong {
-  color: #252a25;
+  color: var(--text);
   font-weight: 650;
 }
 
 .activity-narrative-markdown pre {
   max-width: 100%;
   overflow: auto;
-  border: 1px solid #dfe3df;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: #f3f5f2;
-  color: #343934;
+  background: var(--surface-subtle);
+  color: var(--text);
   padding: 9px 10px;
   white-space: pre;
 }
 
 .activity-narrative-markdown code {
-  border: 1px solid #dfe3df;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: #ecefeb;
-  color: #3f4640;
+  background: var(--surface-subtle);
+  color: var(--text);
   padding: 1px 5px;
 }
 
@@ -674,7 +651,7 @@
 
 .activity-narrative-markdown th,
 .activity-narrative-markdown td {
-  border: 1px solid #dfe3df;
+  border: 1px solid var(--border);
   padding: 3px 5px;
   text-align: left;
 }
@@ -694,7 +671,6 @@
   }
 
   .turn-change-card-preview {
-    width: calc(100vw - 24px);
     max-height: min(420px, calc(100dvh - 72px));
   }
 
@@ -706,13 +682,12 @@
     display: none;
   }
 
-  .file-change-summary-list,
   .activity-file-list {
     padding-left: 18px;
   }
 
   .activity-narrative {
-    padding-right: 2px;
-    padding-left: 2px;
+    padding-right: 0;
+    padding-left: 0;
   }
 }

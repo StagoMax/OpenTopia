@@ -1,0 +1,404 @@
+/* One tool call = one text line + one panel. The icon sits in the activity
+   gutter so every row starts on the same left edge as the surrounding
+   narrative text, and the panel is indented by exactly that gutter. */
+.tool-activity {
+  min-width: 0;
+}
+
+.tool-activity-header {
+  display: flex;
+  width: 100%;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-relaxed);
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard);
+}
+
+.tool-activity-header:hover {
+  color: var(--text);
+}
+
+.tool-activity-header:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.tool-activity-icon {
+  display: inline-flex;
+  width: var(--icon-size-sm);
+  flex: 0 0 var(--icon-size-sm);
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+
+.tool-activity[data-state="running"] .tool-activity-icon {
+  color: var(--success);
+}
+
+.tool-activity[data-state="error"] .tool-activity-icon {
+  color: var(--danger);
+}
+
+.tool-activity-title {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-activity-title[data-flow="true"] {
+  background: linear-gradient(
+    100deg,
+    var(--surface-subtle) 0%,
+    var(--surface-subtle) 28%,
+    var(--success-subtle) 44%,
+    var(--success) 52%,
+    var(--success-subtle) 60%,
+    var(--surface-subtle) 76%,
+    var(--surface-subtle) 100%
+  );
+  background-position: 160% 50%;
+  background-size: 240% 100%;
+  color: transparent;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: tool-command-text-flow 1.85s ease-in-out infinite;
+}
+
+.tool-activity-meta {
+  display: inline-flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.tool-activity-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-activity-chip {
+  flex: 0 0 auto;
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-xs);
+  line-height: 18px;
+}
+
+.tool-activity-chip[data-tone="danger"] {
+  background: var(--danger-subtle);
+  color: var(--danger);
+}
+
+.tool-activity-chip[data-tone="warning"] {
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+
+.tool-activity-timing {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-activity-chevron {
+  display: inline-flex;
+  margin-left: auto;
+  flex: 0 0 auto;
+  align-items: center;
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity var(--motion-fast) var(--ease-standard);
+}
+
+.tool-activity-header:hover .tool-activity-chevron,
+.tool-activity-header:focus-visible .tool-activity-chevron,
+.tool-activity-header[aria-expanded="true"] .tool-activity-chevron {
+  opacity: 1;
+}
+
+/* The call and its output share one panel: no separate parameter box. */
+.tool-activity-body {
+  min-width: 0;
+  margin: var(--space-1) 0 var(--space-4) var(--activity-gutter, 22px);
+}
+
+.tool-panel {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.tool-panel.is-pending {
+  padding: var(--space-4) var(--space-5);
+  color: var(--text-muted);
+}
+
+.tool-panel-head {
+  display: flex;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+.tool-panel-prompt {
+  flex: 0 0 auto;
+  color: var(--success);
+  font-family: var(--font-mono);
+  font-weight: var(--font-weight-semibold);
+}
+
+.tool-panel-command {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-panel-label {
+  flex: 1 1 auto;
+  color: var(--text-muted);
+}
+
+.tool-panel-status {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-panel-status[data-tone="danger"] {
+  color: var(--danger);
+}
+
+.tool-panel-status[data-tone="success"] {
+  color: var(--success);
+}
+
+.tool-panel-scroll {
+  min-width: 0;
+  max-height: 320px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.tool-panel-stream {
+  margin: 0;
+  padding: var(--space-4) var(--space-5);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  line-height: var(--line-height-relaxed);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tool-panel-stream[data-stream="stderr"] {
+  border-top: 1px solid var(--border-subtle);
+  color: var(--danger);
+}
+
+.tool-panel-empty {
+  margin: 0;
+  padding: var(--space-4) var(--space-5);
+  color: var(--text-muted);
+}
+
+.tool-panel-foot {
+  padding: var(--space-2) var(--space-4);
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.tool-panel-diff-line {
+  display: grid;
+  grid-template-columns: 40px 40px minmax(max-content, 1fr);
+  min-width: 100%;
+  width: max-content;
+  min-height: 19px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  line-height: 19px;
+  white-space: pre;
+}
+
+.tool-panel-diff[data-number-columns="1"] .tool-panel-diff-line {
+  grid-template-columns: 40px minmax(max-content, 1fr);
+}
+
+.tool-panel-diff[data-number-columns="0"] .tool-panel-diff-line {
+  grid-template-columns: minmax(max-content, 1fr);
+}
+
+.tool-panel-diff-line[data-kind="file"] {
+  grid-template-columns: minmax(max-content, 1fr);
+  background: var(--surface-subtle);
+}
+
+.tool-panel-diff-line[data-kind="added"] {
+  background: var(--diff-added-bg);
+}
+
+.tool-panel-diff-line[data-kind="deleted"] {
+  background: var(--diff-removed-bg);
+}
+
+.tool-panel-diff-line[data-kind="hunk"] {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.tool-panel-diff-line[data-kind="meta"] {
+  color: var(--text-muted);
+}
+
+.tool-panel-diff-line code,
+.tool-panel-match code {
+  display: block;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0 var(--space-4);
+  font: inherit;
+}
+
+.tool-panel-diff-file {
+  color: var(--text);
+  font-weight: var(--font-weight-semibold);
+}
+
+.tool-panel-diff-number {
+  padding: 0 var(--space-3);
+  border-right: 1px solid var(--border);
+  color: var(--text-muted);
+  text-align: right;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-panel-entries {
+  display: grid;
+  gap: 1px;
+  padding: var(--space-3) var(--space-4);
+}
+
+.tool-panel-entries code {
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-panel-matches {
+  padding: var(--space-2) 0;
+}
+
+.tool-panel-match-group + .tool-panel-match-group {
+  margin-top: var(--space-3);
+}
+
+.tool-panel-match-path {
+  display: block;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  padding: var(--space-1) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  font-weight: var(--font-weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.tool-panel-match {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  min-height: 19px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  line-height: 19px;
+}
+
+.tool-panel-match code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+
+.tool-panel-fields {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-4) var(--space-5);
+}
+
+.tool-panel-fields > div {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.tool-panel-fields dt {
+  color: var(--text-muted);
+}
+
+.tool-panel-fields dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  line-height: var(--line-height-body);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.tool-panel-fields dd[data-mono] {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+}
+
+.tool-panel-fields + .tool-panel-scroll {
+  border-top: 1px solid var(--border);
+}
