@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "glm-5.2-opentopia",
+  "description": "Connects to a running OpenTopia server backed by GLM-5.2. The harness still communicates only through HTTP and JSONL — no product code is imported.",
+  "command": "node",
+  "args": ["{targetDir}/../../adapters/opentopia-http.mjs"],
+  "cwd": "{targetDir}",
+  "env": {
+    "OPENTOPIA_EVAL_BASE_URL": "http://127.0.0.1:8812",
+    "OPENTOPIA_EVAL_APPROVAL_MODE": "deny",
+    "OPENTOPIA_EVAL_TIMEOUT_MS": "300000"
+  },
+  "passEnvironment": ["OPENTOPIA_API_TOKEN"],
+  "inheritEnvironment": false,
+  "promptTransport": "stdin",
+  "eventTransport": "jsonl-file"
+}

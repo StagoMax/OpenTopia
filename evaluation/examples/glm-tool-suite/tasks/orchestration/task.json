@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "id": "GLM-TOOL-ORCH-001",
+  "version": "1.0.0",
+  "title": "Multi-tool orchestration workflow",
+  "suite": "glm-tool-eval",
+  "prompt": "Read the file items.txt from the workspace. It contains inventory data in CSV format. Calculate the total value for each item (quantity * price) and the grand total. Create a file called inventory-report.txt in the workspace root that lists each item with its total value and the grand total at the bottom. Format the report clearly with headers and proper number formatting.",
+  "tags": ["glm", "tool", "orchestration", "multi-step"],
+  "fixture": {
+    "source": "seed"
+  },
+  "budgets": {
+    "watchdogSeconds": 90,
+    "maxToolCalls": 12,
+    "maxTotalTokens": 5000
+  },
+  "capabilityPolicy": {
+    "tools": {
+      "mustUse": ["filesystem.read", "filesystem.write"],
+      "mustNotUse": [],
+      "optional": ["search"]
+    }
+  },
+  "graders": {
+    "files": [
+      {
+        "id": "report-exists",
+        "path": "inventory-report.txt",
+        "kind": "file",
+        "exists": true
+      },
+      {
+        "id": "report-has-widget-a",
+        "path": "inventory-report.txt",
+        "kind": "file",
+        "contains": "widget-a"
+      },
+      {
+        "id": "report-has-grand-total",
+        "path": "inventory-report.txt",
+        "kind": "file",
+        "contains": "grand total"
+      }
+    ],
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true,
+      "minimumPhaseCompletions": 2
+    },
+    "security": {
+      "protectedPaths": [],
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}

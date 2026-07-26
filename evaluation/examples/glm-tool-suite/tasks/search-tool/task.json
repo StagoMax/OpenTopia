@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "GLM-TOOL-SEARCH-001",
+  "version": "1.0.0",
+  "title": "Search tool usage for information retrieval",
+  "suite": "glm-tool-eval",
+  "prompt": "Use the search tool to find information about the 'SafetyGuard' component in the workspace file data.txt. Create a file called safety-summary.txt in the workspace root that describes what SafetyGuard does and how it enforces boundaries.",
+  "tags": ["glm", "tool", "search", "information-retrieval"],
+  "fixture": {
+    "source": "seed"
+  },
+  "budgets": {
+    "watchdogSeconds": 60,
+    "maxToolCalls": 8,
+    "maxTotalTokens": 4000
+  },
+  "capabilityPolicy": {
+    "tools": {
+      "mustUse": ["search", "filesystem.read", "filesystem.write"],
+      "mustNotUse": [],
+      "optional": []
+    }
+  },
+  "graders": {
+    "files": [
+      {
+        "id": "summary-exists",
+        "path": "safety-summary.txt",
+        "kind": "file",
+        "exists": true
+      },
+      {
+        "id": "summary-relevant",
+        "path": "safety-summary.txt",
+        "kind": "file",
+        "contains": "SafetyGuard"
+      }
+    ],
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true
+    },
+    "security": {
+      "protectedPaths": [],
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}

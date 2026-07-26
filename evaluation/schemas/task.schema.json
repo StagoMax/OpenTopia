@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opentopia.local/evaluation/task.schema.json",
+  "title": "Application evaluation task",
+  "type": "object",
+  "required": ["schemaVersion", "id", "title", "suite", "prompt", "graders"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "default": "1.0.0" },
+    "title": { "type": "string", "minLength": 1 },
+    "suite": { "type": "string", "minLength": 1 },
+    "prompt": { "type": "string", "minLength": 1 },
+    "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "repetitions": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "fixture": {
+      "type": "object",
+      "required": ["source"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "budgets": {
+      "type": "object",
+      "properties": {
+        "watchdogSeconds": { "type": "integer", "minimum": 1 },
+        "maxToolCalls": { "type": "integer", "minimum": 0 },
+        "maxTotalTokens": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "capabilityPolicy": { "$ref": "#/$defs/capabilityPolicy" },
+    "graders": {
+      "type": "object",
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/commandGrader" }
+        },
+        "files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fileGrader" }
+        },
+        "trajectory": {
+          "type": "object",
+          "properties": {
+            "requireValidEvents": { "type": "boolean" },
+            "minimumPhaseCompletions": { "type": "integer", "minimum": 0 },
+            "requireCompletionClaim": { "type": "boolean" },
+            "minimumBrowserActions": { "type": "integer", "minimum": 0 },
+            "minimumValidBrowserActions": { "type": "integer", "minimum": 0 },
+            "minimumMemoryAssertions": { "type": "integer", "minimum": 0 },
+            "minimumSubagentCompletions": { "type": "integer", "minimum": 0 },
+            "requireNoOrphanSubagents": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "security": {
+          "type": "object",
+          "properties": {
+            "protectedPaths": { "type": "array", "items": { "type": "string" } },
+            "secretCanaries": { "type": "array", "items": { "type": "string", "minLength": 4 } },
+            "exposeCanariesAsEnvironment": { "type": "boolean" },
+            "forbiddenEventTypes": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "policyEntry": {
+      "type": "object",
+      "properties": {
+        "mustUse": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "mustNotUse": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "optional": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "oneOf": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "uniqueItems": true
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilityPolicy": {
+      "type": "object",
+      "properties": {
+        "tools": { "$ref": "#/$defs/policyEntry" },
+        "skills": { "$ref": "#/$defs/policyEntry" },
+        "mcpServers": { "$ref": "#/$defs/policyEntry" },
+        "plugins": { "$ref": "#/$defs/policyEntry" }
+      },
+      "additionalProperties": false
+    },
+    "commandGrader": {
+      "type": "object",
+      "required": ["id", "command"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "type": "string" },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "fileGrader": {
+      "type": "object",
+      "required": ["id", "path"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "exists": { "type": "boolean" },
+        "kind": { "enum": ["file", "directory"] },
+        "equals": { "type": "string" },
+        "contains": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "notContains": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "jsonEquals": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

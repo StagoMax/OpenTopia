@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "black-box-mock",
+  "description": "A deterministic process that implements the target adapter contract without importing the harness.",
+  "command": "node",
+  "args": ["{targetDir}/mock-target.mjs"],
+  "cwd": "{workspace}",
+  "inheritEnvironment": false,
+  "promptTransport": "stdin",
+  "eventTransport": "jsonl-file"
+}

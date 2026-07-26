@@ -1,0 +1,18 @@
+{
+  "name": "@opentopia/application-eval-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Application-level agent evaluation harness with black-box target adapters.",
+  "bin": {
+    "agent-eval": "./src/cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "validate:example": "node src/cli.mjs validate --suite examples/smoke/suite.json --target examples/smoke/target.json",
+    "run:example": "node src/cli.mjs run --suite examples/smoke/suite.json --target examples/smoke/target.json --output .runs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

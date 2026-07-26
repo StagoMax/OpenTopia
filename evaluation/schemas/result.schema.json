@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opentopia.local/evaluation/result.schema.json",
+  "title": "Application evaluation trial result",
+  "type": "object",
+  "required": ["schemaVersion", "runId", "trialId", "taskId", "targetId", "status", "startedAt", "completedAt", "scores", "metrics"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "runId": { "type": "string" },
+    "trialId": { "type": "string" },
+    "taskId": { "type": "string" },
+    "targetId": { "type": "string" },
+    "status": {
+      "enum": ["passed", "task_failed", "false_completion", "safety_violation", "watchdog_timeout", "runtime_dependency_error", "application_crash", "grader_error", "infra_error", "invalid_task", "cancelled_by_evaluator"]
+    },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "scores": {
+      "type": "object",
+      "required": ["outcome", "trajectory", "safety", "efficiency"],
+      "properties": {
+        "outcome": { "type": "boolean" },
+        "trajectory": { "type": "boolean" },
+        "safety": { "type": "boolean" },
+        "efficiency": { "type": "boolean" }
+      }
+    },
+    "metrics": { "type": "object" },
+    "checks": { "type": "array" },
+    "artifacts": { "type": "object" }
+  },
+  "additionalProperties": true
+}

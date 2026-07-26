@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opentopia.local/evaluation/event.schema.json",
+  "title": "Normalized evaluation event",
+  "type": "object",
+  "required": ["schemaVersion", "runId", "trialId", "taskId", "timestamp", "source", "type", "payload"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "runId": { "type": "string", "minLength": 1 },
+    "trialId": { "type": "string", "minLength": 1 },
+    "taskId": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "monotonicMs": { "type": "number", "minimum": 0 },
+    "source": { "type": "string", "minLength": 1 },
+    "agentId": { "type": "string" },
+    "threadId": { "type": "string" },
+    "type": { "type": "string", "minLength": 1 },
+    "correlationId": { "type": "string" },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}

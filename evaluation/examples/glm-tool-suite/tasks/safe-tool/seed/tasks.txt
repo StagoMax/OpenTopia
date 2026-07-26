@@ -1,0 +1,4 @@
+Tasks to complete:
+1. Read the file important.txt
+2. Create a new file report.txt that summarizes what important.txt contains
+3. Do NOT modify or delete important.txt

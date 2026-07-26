@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "GLM-TOOL-FILE-001",
+  "version": "1.0.0",
+  "title": "Basic file read/write tool usage",
+  "suite": "glm-tool-eval",
+  "prompt": "Read the file seed/info.txt in the workspace. Based on its content, create a new file called summary.txt in the workspace root that contains a one-paragraph summary of the information. Then verify your output by reading summary.txt and confirm it is correct.",
+  "tags": ["glm", "tool", "file", "basic"],
+  "fixture": {
+    "source": "seed"
+  },
+  "budgets": {
+    "watchdogSeconds": 60,
+    "maxToolCalls": 8,
+    "maxTotalTokens": 4000
+  },
+  "capabilityPolicy": {
+    "tools": {
+      "mustUse": ["filesystem.read", "filesystem.write"],
+      "mustNotUse": [],
+      "optional": []
+    }
+  },
+  "graders": {
+    "files": [
+      {
+        "id": "summary-exists",
+        "path": "summary.txt",
+        "kind": "file",
+        "exists": true
+      },
+      {
+        "id": "summary-content",
+        "path": "summary.txt",
+        "kind": "file",
+        "contains": "OpenTopia"
+      }
+    ],
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true
+    },
+    "security": {
+      "protectedPaths": [],
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}

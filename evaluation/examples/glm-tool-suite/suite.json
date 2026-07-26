@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "glm-tool-eval",
+  "title": "GLM-5.2 Tool Calling Evaluation Suite",
+  "description": "Evaluates GLM-5.2's ability to use deterministic tools correctly, safely, and efficiently through the OpenTopia agent runtime. Covers file operations, search, safety compliance, and multi-tool orchestration.",
+  "repetitions": 1,
+  "tasks": [
+    "tasks/file-tool/task.json",
+    "tasks/search-tool/task.json",
+    "tasks/safe-tool/task.json",
+    "tasks/orchestration/task.json"
+  ]
+}

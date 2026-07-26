@@ -1,0 +1,21 @@
+Project: OpenTopia Agent Framework
+Components:
+  - AgentCore: Manages the agent loop, tool dispatch, and context window
+  - ToolRegistry: Registers and resolves tool implementations by name
+  - FileSystem: Provides read, write, list, and search operations
+  - ShellExecutor: Runs terminal commands in isolated PTY sessions
+  - GitService: Handles diff, stage, unstage, and patch operations
+  - SearchEngine: Full-text search across workspace files
+  - BrowserController: Navigates and interacts with web pages
+  - MultiAgentOrchestrator: Spawns and coordinates sub-agents
+  - MemoryService: Manages cross-session memory and assertions
+  - SafetyGuard: Enforces file access boundaries and approval flows
+
+Key capabilities:
+  - Deterministic tool execution with rollback support
+  - Streaming SSE responses for real-time UI updates
+  - SQLite-based thread and event persistence
+  - Built-in approval system for dangerous actions
+  - Sandbox isolation for workspace and network access
+  - MCP server integration for extensible tooling
+  - Provider-agnostic model interface (OpenAI-compatible)

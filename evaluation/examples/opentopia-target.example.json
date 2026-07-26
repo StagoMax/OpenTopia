@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-http-black-box",
+  "description": "Optional adapter for a running OpenTopia server. The Harness still communicates only through HTTP and JSONL.",
+  "command": "node",
+  "args": ["../../adapters/opentopia-http.mjs"],
+  "cwd": "{targetDir}",
+  "env": {
+    "OPENTOPIA_EVAL_BASE_URL": "http://127.0.0.1:8812",
+    "OPENTOPIA_EVAL_APPROVAL_MODE": "deny",
+    "OPENTOPIA_EVAL_TIMEOUT_MS": "1800000"
+  },
+  "passEnvironment": ["OPENTOPIA_API_TOKEN"],
+  "inheritEnvironment": false,
+  "promptTransport": "stdin",
+  "eventTransport": "jsonl-file"
+}

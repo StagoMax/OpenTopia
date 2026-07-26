@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opentopia.local/evaluation/target.schema.json",
+  "title": "Black-box application target adapter",
+  "type": "object",
+  "required": ["schemaVersion", "id", "command"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "command": { "type": "string", "minLength": 1 },
+    "args": { "type": "array", "items": { "type": "string" } },
+    "cwd": { "type": "string" },
+    "env": { "type": "object", "additionalProperties": { "type": "string" } },
+    "passEnvironment": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "inheritEnvironment": { "type": "boolean", "default": false },
+    "promptTransport": { "enum": ["stdin", "file", "none"], "default": "stdin" },
+    "eventTransport": { "const": "jsonl-file", "default": "jsonl-file" }
+  },
+  "additionalProperties": false
+}

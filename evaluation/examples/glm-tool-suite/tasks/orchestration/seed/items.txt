@@ -1,0 +1,5 @@
+item,quantity,price
+widget-a,10,2.50
+widget-b,5,4.00
+widget-c,20,1.75
+widget-d,8,3.25

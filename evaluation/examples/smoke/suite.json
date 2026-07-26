@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "harness-smoke",
+  "title": "Standalone harness smoke suite",
+  "description": "Exercises outcome, trajectory, safety, usage, browser, memory, and multi-agent telemetry against a black-box mock target.",
+  "repetitions": 1,
+  "tasks": [
+    "tasks/black-box-smoke/task.json"
+  ]
+}
