@@ -50,6 +50,30 @@ test("resolves repository-relative links against a markdown file", () => {
   });
 });
 
+test("opens detected filesystem paths in the workspace preview", () => {
+  assert.deepEqual(resolveMarkdownLink("opentopia-file:docs%2Fplan.md"), {
+    kind: "workspace",
+    path: "docs/plan.md",
+    fragment: null,
+  });
+  assert.deepEqual(
+    resolveMarkdownLink("opentopia-file:src%2FApp.tsx#L42", "docs/readme.md"),
+    { kind: "workspace", path: "src/App.tsx", fragment: "L42" },
+  );
+  assert.deepEqual(
+    resolveMarkdownLink("opentopia-file:%2Fsrv%2Fapp%2Fmain.rs"),
+    { kind: "workspace", path: "/srv/app/main.rs", fragment: null },
+  );
+});
+
+test("keeps Windows drive paths absolute", () => {
+  assert.deepEqual(resolveMarkdownLink("J:\\Project\\OpenTopia\\README.md"), {
+    kind: "workspace",
+    path: "J:/Project/OpenTopia/README.md",
+    fragment: null,
+  });
+});
+
 test("blocks unsafe protocols and workspace traversal", () => {
   assert.equal(resolveMarkdownLink("javascript:alert(1)").kind, "blocked");
   assert.equal(resolveMarkdownLink("data:text/html,hello").kind, "blocked");

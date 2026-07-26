@@ -1,3 +1,5 @@
+import { decodeFilePathHref, isWindowsDrivePath } from "./filePathLinks.ts";
+
 export type MarkdownLinkTarget =
   | { kind: "anchor"; href: string }
   | { kind: "web"; url: string }
@@ -16,6 +18,16 @@ export function resolveMarkdownLink(
 
   if (value.startsWith("#")) {
     return { kind: "anchor", href: value };
+  }
+
+  const literal = decodeFilePathHref(value);
+  if (literal) {
+    return resolveLiteralFilePath(literal.path, literal.fragment);
+  }
+
+  if (isWindowsDrivePath(value)) {
+    const { path, fragment } = splitRelativeReference(value);
+    return resolveLiteralFilePath(path, fragment);
   }
 
   if (value.startsWith("//")) {
@@ -53,6 +65,36 @@ export function resolveMarkdownLink(
   }
 
   return { kind: "workspace", path: resolved, fragment };
+}
+
+/**
+ * Resolves a path that was written as a filesystem path rather than as a
+ * markdown-relative link: `docs/guide.md`, `/srv/app/main.rs` or `D:\repo\a.md`.
+ * Absolute paths stay absolute so the server can validate them against the
+ * workspace root.
+ */
+function resolveLiteralFilePath(
+  rawPath: string,
+  fragment: string | null,
+): MarkdownLinkTarget {
+  const normalized = rawPath.trim().replaceAll("\\", "/");
+  if (!normalized) return { kind: "blocked", reason: "Link target is empty." };
+
+  const drive = /^[A-Za-z]:/.exec(normalized)?.[0] ?? null;
+  const body = drive ? normalized.slice(drive.length) : normalized;
+  const segments = collapseSegments(body);
+  if (!segments) {
+    return {
+      kind: "blocked",
+      reason: "Link path escapes the active workspace.",
+    };
+  }
+
+  const joined = segments.join("/");
+  if (drive) return { kind: "workspace", path: `${drive}/${joined}`, fragment };
+  if (body.startsWith("/"))
+    return { kind: "workspace", path: `/${joined}`, fragment };
+  return { kind: "workspace", path: joined, fragment };
 }
 
 export function markdownStreamInterval(textLength: number): number {
@@ -104,6 +146,11 @@ function workspaceBaseDirectory(path?: string | null): string[] {
 }
 
 function resolveWorkspaceSegments(base: string[], path: string): string | null {
+  const segments = collapseSegments(path, base);
+  return segments ? segments.join("/") : null;
+}
+
+function collapseSegments(path: string, base: string[] = []): string[] | null {
   const segments = [...base];
   for (const segment of path.replace(/^\/+/, "").split("/")) {
     if (!segment || segment === ".") continue;
@@ -114,5 +161,5 @@ function resolveWorkspaceSegments(base: string[], path: string): string | null {
     }
     segments.push(segment);
   }
-  return segments.length ? segments.join("/") : null;
+  return segments.length ? segments : null;
 }

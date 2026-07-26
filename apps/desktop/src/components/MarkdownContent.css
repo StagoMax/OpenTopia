@@ -66,6 +66,35 @@
   border: 0;
 }
 
+.markdown-content a.markdown-path-link {
+  color: var(--accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.markdown-content a.markdown-path-link:hover {
+  color: var(--accent-hover);
+}
+
+.markdown-content a.markdown-path-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+.markdown-content a.markdown-path-link-text {
+  font-family: var(--font-mono);
+  font-size: 0.94em;
+}
+
+/* A path in a code span keeps the span's type, not its chip framing. */
+.markdown-content a.markdown-path-link > code {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+}
+
 .markdown-image-alt {
   color: var(--text-secondary);
   font-style: italic;
@@ -135,7 +164,7 @@
   max-width: 100%;
   overflow: auto;
   border-radius: 6px;
-  background: #f5f6f4;
+  background: var(--surface-subtle);
   padding: 12px;
   font-size: 12px;
   line-height: 1.6;

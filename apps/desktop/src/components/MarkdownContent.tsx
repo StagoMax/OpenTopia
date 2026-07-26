@@ -13,9 +13,17 @@ import {
 import ReactMarkdown, {
   defaultUrlTransform,
   type Components,
+  type Options,
 } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  decodeFilePathHref,
+  FILE_PATH_LINK_SCHEME,
+  isWindowsDrivePath,
+  remarkFilePathLinks,
+} from "../filePathLinks";
 import { markdownStreamInterval } from "../markdownLinks";
+import { useWorkspacePathStatus } from "./WorkspacePathProvider";
 import "./MarkdownContent.css";
 
 export type MarkdownContentProps = {
@@ -24,6 +32,11 @@ export type MarkdownContentProps = {
   streaming?: boolean;
   onOpenLink?(href: string): void;
 };
+
+type RemarkPlugins = Options["remarkPlugins"];
+
+const basePlugins: RemarkPlugins = [remarkGfm];
+const pathLinkPlugins: RemarkPlugins = [remarkGfm, remarkFilePathLinks];
 
 const MarkdownLinkHandlerContext =
   createContext<MarkdownContentProps["onOpenLink"]>(undefined);
@@ -46,6 +59,7 @@ export function MarkdownContent({
       <MemoizedMarkdown
         className={`markdown-content ${className}`.trim()}
         clobberPrefix={`opentopia-${instanceId}-`}
+        linkifyPaths={Boolean(onOpenLink)}
         text={renderedText}
       />
     </MarkdownLinkHandlerContext.Provider>
@@ -55,19 +69,22 @@ export function MarkdownContent({
 const MemoizedMarkdown = memo(function MemoizedMarkdown({
   className,
   clobberPrefix,
+  linkifyPaths,
   text,
 }: {
   className: string;
   clobberPrefix: string;
+  linkifyPaths: boolean;
   text: string;
 }) {
   return (
     <div className={className}>
       <ReactMarkdown
         components={markdownComponents}
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={linkifyPaths ? pathLinkPlugins : basePlugins}
         remarkRehypeOptions={{ clobberPrefix }}
         skipHtml
+        urlTransform={markdownUrlTransform}
       >
         {text}
       </ReactMarkdown>
@@ -75,12 +92,26 @@ const MemoizedMarkdown = memo(function MemoizedMarkdown({
   );
 });
 
+function markdownUrlTransform(url: string): string {
+  if (url.startsWith(FILE_PATH_LINK_SCHEME) || isWindowsDrivePath(url)) {
+    return url;
+  }
+  return defaultUrlTransform(url);
+}
+
 function MarkdownAnchor({
   href,
   children,
   ...props
 }: AnchorHTMLAttributes<HTMLAnchorElement>) {
   const onOpenLink = useContext(MarkdownLinkHandlerContext);
+  const detectedPath = href ? decodeFilePathHref(href)?.path : null;
+  const pathStatus = useWorkspacePathStatus(detectedPath ?? null);
+
+  // A path picked out of prose only becomes a link once the file is known to
+  // exist; otherwise it stays plain text instead of opening onto an error.
+  if (detectedPath && pathStatus !== "known") return <>{children}</>;
+
   return (
     <a
       {...props}
