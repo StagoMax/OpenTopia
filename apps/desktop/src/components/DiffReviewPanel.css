@@ -1,0 +1,648 @@
+/*
+ * Review panel.
+ *
+ * A continuous multi-file diff with a sticky toolbar, an optional file tree,
+ * and two reading modes (split and unified) selected through [data-view].
+ * Colors, spacing, and radii come from styles/tokens.css.
+ */
+
+.diff-review {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  background: var(--surface);
+}
+
+/*
+ * In the narrow right rail the panel has no sized row to fill, so it is capped
+ * instead of growing the whole card to the height of the diff.
+ */
+.workbench-tab-panel:not(.stage) .diff-review {
+  max-height: 60vh;
+}
+
+/* Toolbar ----------------------------------------------------------------- */
+
+.diff-review__toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-chrome);
+  padding: var(--space-3) var(--space-4);
+}
+
+.diff-review__spacer {
+  flex: 1;
+}
+
+.diff-review__scope {
+  display: inline-flex;
+  height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text);
+  padding: 0 var(--space-3);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.diff-review__scope:hover {
+  background: var(--surface-hover);
+}
+
+.diff-review__stats {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.diff-review__stats .is-addition {
+  color: var(--success);
+}
+
+.diff-review__stats .is-deletion {
+  color: var(--danger);
+}
+
+.diff-review__pill {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--warning-subtle);
+  color: var(--warning);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-xs);
+}
+
+.diff-review__notice {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.diff-review__commit {
+  display: inline-flex;
+  height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 var(--space-3);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+}
+
+.diff-review__commit:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.diff-review__commit:disabled {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+/* Menus ------------------------------------------------------------------- */
+
+/*
+ * The shared popover opens upward, which would leave a toolbar menu off the
+ * top of the panel. These menus hang below their trigger instead.
+ */
+.diff-review__menu .ot-popover-surface {
+  top: calc(100% + var(--space-2));
+  bottom: auto;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.diff-review__menu {
+  position: relative;
+}
+
+.diff-review__menu-list {
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-2);
+}
+
+.diff-review__menu-item {
+  display: flex;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  text-align: left;
+}
+
+.diff-review__menu-item:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.diff-review__menu-item:disabled {
+  color: var(--text-muted);
+}
+
+.diff-review__menu-check {
+  display: inline-flex;
+  width: var(--icon-size-xs);
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+
+.diff-review__menu-item[aria-checked="false"] .diff-review__menu-check {
+  color: transparent;
+}
+
+.diff-review__menu-meta {
+  display: inline-flex;
+  margin-left: auto;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.diff-review__menu-meta .is-addition {
+  color: var(--success);
+}
+
+.diff-review__menu-meta .is-deletion {
+  color: var(--danger);
+}
+
+.diff-review__jump {
+  display: flex;
+  min-width: 280px;
+  flex-direction: column;
+  padding: var(--space-2);
+}
+
+.diff-review__jump-list {
+  display: flex;
+  max-height: 320px;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.diff-review__jump-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+}
+
+.diff-review__jump-item:hover {
+  background: var(--surface-hover);
+}
+
+.diff-review__jump-item strong {
+  color: var(--text);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+}
+
+.diff-review__jump-item span {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.diff-review__commit-form {
+  display: flex;
+  min-width: 320px;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+}
+
+.diff-review__commit-label {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.diff-review__commit-input {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-3);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  resize: vertical;
+}
+
+.diff-review__commit-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.diff-review__commit-result {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
+}
+
+.diff-review__commit-result.is-error {
+  color: var(--danger);
+}
+
+/* Body -------------------------------------------------------------------- */
+
+.diff-review__body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+}
+
+.diff-review__scroll {
+  min-width: 0;
+  flex: 1;
+  overflow: auto;
+  padding-bottom: var(--space-8);
+}
+
+.diff-review__empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  color: var(--text-muted);
+  padding: var(--space-12);
+  font-size: var(--font-size-sm);
+}
+
+.diff-review__empty.compact {
+  justify-content: flex-start;
+  padding: var(--space-4) var(--space-8);
+}
+
+.diff-review__empty.is-error {
+  color: var(--danger);
+}
+
+/* File section ------------------------------------------------------------ */
+
+.diff-review__file {
+  border-bottom: 1px solid var(--border);
+}
+
+.diff-review__file-header {
+  position: sticky;
+  z-index: var(--z-sticky);
+  top: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-subtle);
+  padding: var(--space-2) var(--space-4);
+}
+
+.diff-review__file[data-active] .diff-review__file-header {
+  background: var(--surface-active);
+}
+
+.diff-review__file-toggle {
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  padding: var(--space-1);
+}
+
+.diff-review__file-toggle:hover {
+  background: var(--surface-hover);
+}
+
+.diff-review__file-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+
+.diff-review__file-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-review__file-dir {
+  color: var(--text-muted);
+}
+
+.diff-review__file-status {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-xs);
+}
+
+.diff-review__file-actions {
+  display: inline-flex;
+  margin-left: auto;
+  gap: var(--space-1);
+}
+
+.diff-review__rich {
+  padding: var(--space-4) var(--space-8);
+}
+
+.diff-review__more {
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-subtle);
+  color: var(--accent);
+  padding: var(--space-3);
+  font-size: var(--font-size-sm);
+}
+
+.diff-review__more:hover {
+  background: var(--surface-hover);
+}
+
+/* Diff grid --------------------------------------------------------------- */
+
+.diff-review__rows {
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  line-height: var(--line-height-body);
+}
+
+.diff-review__grid {
+  display: grid;
+  width: max-content;
+  min-width: 100%;
+}
+
+.diff-review[data-view="split"] .diff-review__grid {
+  grid-template-columns: max-content 1fr max-content 1fr;
+}
+
+.diff-review[data-view="unified"] .diff-review__grid {
+  grid-template-columns: max-content max-content 1fr;
+}
+
+/* Wrapping trades the horizontal scroll for taller rows. */
+.diff-review[data-wrap="on"] .diff-review__rows {
+  overflow-x: hidden;
+}
+
+.diff-review[data-wrap="on"] .diff-review__grid {
+  width: auto;
+}
+
+.diff-review[data-wrap="on"] .diff-review__code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.diff-review__row {
+  display: contents;
+}
+
+.diff-review__gutter {
+  border-right: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  padding: 0 var(--space-2);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  user-select: none;
+}
+
+.diff-review__gutter[data-kind="added"] {
+  background: var(--diff-added-bg);
+}
+
+.diff-review__gutter[data-kind="removed"] {
+  background: var(--diff-removed-bg);
+}
+
+.diff-review__code {
+  border-left: 2px solid transparent;
+  color: var(--text);
+  padding: 0 var(--space-4) 0 var(--space-2);
+  white-space: pre;
+}
+
+.diff-review__code[data-kind="added"] {
+  border-left-color: var(--diff-added-marker);
+  background: var(--diff-added-bg);
+}
+
+.diff-review__code[data-kind="removed"] {
+  border-left-color: var(--diff-removed-marker);
+  background: var(--diff-removed-bg);
+}
+
+/*
+ * The filler keeps both sides of a split view aligned where one side has no
+ * counterpart. The stripes mark it as "nothing here" rather than "empty line".
+ */
+.diff-review__code--filler {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--border-subtle),
+    var(--border-subtle) 1px,
+    transparent 1px,
+    transparent 6px
+  );
+}
+
+.diff-review__sign {
+  display: none;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+/* The appearance setting can move the meaning from the fill to a +/- sign. */
+[data-diff-markers="sign"] .diff-review__sign {
+  display: inline;
+}
+
+[data-diff-markers="sign"] .diff-review__code[data-kind="added"],
+[data-diff-markers="sign"] .diff-review__code[data-kind="removed"] {
+  border-left-color: transparent;
+  background: transparent;
+}
+
+[data-diff-markers="sign"] .diff-review__gutter[data-kind="added"],
+[data-diff-markers="sign"] .diff-review__gutter[data-kind="removed"] {
+  background: transparent;
+}
+
+/*
+ * Color carries no meaning in this mode, so changed words are underlined.
+ * The `[data-kind]` selector is what outranks the word fills declared below.
+ */
+[data-diff-markers="sign"] .diff-review__code[data-kind] .is-changed {
+  background: transparent;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.diff-review__token--keyword {
+  color: var(--syntax-keyword);
+}
+
+.diff-review__token--string {
+  color: var(--syntax-string);
+}
+
+.diff-review__token--number {
+  color: var(--syntax-number);
+}
+
+.diff-review__token--type {
+  color: var(--syntax-type);
+}
+
+.diff-review__token--punct {
+  color: var(--syntax-punctuation);
+}
+
+.diff-review__token--comment {
+  color: var(--syntax-comment);
+}
+
+.diff-review__code[data-kind="added"] .is-changed {
+  border-radius: var(--radius-sm);
+  background: var(--diff-added-word);
+}
+
+.diff-review__code[data-kind="removed"] .is-changed {
+  border-radius: var(--radius-sm);
+  background: var(--diff-removed-word);
+}
+
+.diff-review__gap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border: 0;
+  border-block: 1px solid var(--border-subtle);
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  padding: var(--space-1) var(--space-4);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-xs);
+  grid-column: 1 / -1;
+  text-align: left;
+}
+
+.diff-review__gap:hover {
+  background: var(--surface-hover);
+  color: var(--accent);
+}
+
+/* File tree --------------------------------------------------------------- */
+
+.diff-review__files {
+  display: flex;
+  width: 260px;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+.diff-review__filter {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: var(--space-2) var(--space-3);
+}
+
+.diff-review__filter input {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+}
+
+.diff-review__filter input:focus {
+  outline: none;
+}
+
+.diff-review__tree {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: var(--space-2) 0;
+}
+
+.diff-review__tree-file {
+  display: flex;
+  align-items: center;
+}
+
+.diff-review__tree-file .diff-review__tree-open {
+  opacity: 0;
+}
+
+.diff-review__tree-file:hover .diff-review__tree-open,
+.diff-review__tree-file:focus-within .diff-review__tree-open {
+  opacity: 1;
+}
+
+.diff-review__tree-row {
+  display: flex;
+  min-width: 0;
+  height: var(--control-height-sm);
+  flex: 1;
+  align-items: center;
+  gap: var(--space-2);
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding-right: var(--space-3);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  text-align: left;
+}
+
+.diff-review__tree-row:hover {
+  background: var(--surface-hover);
+}
+
+.diff-review__tree-row[data-active] {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.diff-review__tree-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
