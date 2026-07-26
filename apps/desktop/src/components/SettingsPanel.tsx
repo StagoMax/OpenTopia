@@ -15,8 +15,11 @@ import {
   RefreshCw,
   Search,
   Server,
+  Settings,
   Shield,
   SlidersHorizontal,
+  Smile,
+  Sun,
   Trash2,
   X,
 } from "lucide-react";
@@ -31,7 +34,13 @@ import {
   availableFamiliesForModels,
   classifyModelFamily,
 } from "../modelCatalog";
-import { Button } from "./ui";
+import { Button, SegmentedControl, Select, Switch } from "./ui";
+import { SettingsGroup, SettingsPage, SettingsRow } from "./SettingsLayout";
+import { AppearanceSettingsView } from "./AppearanceSettings";
+import { PersonalizationSettingsView } from "./PersonalizationSettings";
+import type { AppearanceSettings, ResolvedTheme } from "../appearance";
+import type { PersonalizationSettings } from "../personalization";
+import type { EditorPreferences } from "../editorPreferences";
 import {
   MAX_PROVIDER_NAME_LENGTH,
   OFFICIAL_OPENAI_MODEL_PRESETS,
@@ -58,7 +67,21 @@ import type {
 } from "../types";
 
 type SettingsTab =
-  "general" | "agent" | "providers" | "permissions" | "advanced";
+  | "general"
+  | "appearance"
+  | "personalization"
+  | "agent"
+  | "providers"
+  | "permissions"
+  | "advanced";
+
+/** Nav grouping shown in the sidebar, in render order. */
+type SettingsSection = "personal" | "coding";
+
+const settingsSectionLabels: Record<SettingsSection, string> = {
+  personal: "个人",
+  coding: "编码",
+};
 
 const CUSTOM_MODEL_PRESET_VALUE = "__custom_model__";
 
@@ -81,8 +104,15 @@ type SettingsPanelProps = {
   } | null;
   secretSources: SecretSources | null;
   notificationPreferences: TaskNotificationPreferences;
+  appearance: AppearanceSettings;
+  resolvedTheme: ResolvedTheme;
+  personalization: PersonalizationSettings;
+  editorPreferences: EditorPreferences;
   isSaving: boolean;
   isSavingSecret: boolean;
+  onAppearanceChange(value: AppearanceSettings): void;
+  onPersonalizationChange(value: PersonalizationSettings): void;
+  onEditorPreferencesChange(value: EditorPreferences): void;
   onSave(input: SettingsSaveInput): Promise<boolean>;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
   // Pulls the connection's model list so families can be picked from what the
@@ -103,6 +133,7 @@ type SettingsPanelProps = {
 
 const settingsTabs: Array<{
   id: SettingsTab;
+  section: SettingsSection;
   label: string;
   description: string;
   keywords: string;
@@ -110,13 +141,34 @@ const settingsTabs: Array<{
 }> = [
   {
     id: "general",
+    section: "personal",
     label: "常规",
-    description: "通知与应用信息",
-    keywords: "通知 提示 音效 系统 弹窗 日志 平台 backend",
-    icon: Bell,
+    description: "编辑器、通知与应用信息",
+    keywords:
+      "通知 提示 音效 系统 弹窗 日志 平台 backend 编辑器 发送 快捷键 上下文",
+    icon: Settings,
+  },
+  {
+    id: "appearance",
+    section: "personal",
+    label: "外观",
+    description: "主题、字体与密度",
+    keywords:
+      "外观 主题 深色 浅色 dark light 字体 字号 颜色 强调色 对比度 动画 差异 diff appearance theme",
+    icon: Sun,
+  },
+  {
+    id: "personalization",
+    section: "personal",
+    label: "个性化",
+    description: "语气与自定义指令",
+    keywords:
+      "个性化 语气 个性 personality 自定义指令 instructions 提示 personalization",
+    icon: Smile,
   },
   {
     id: "agent",
+    section: "coding",
     label: "智能体",
     description: "风格、自治与协作",
     keywords:
@@ -125,6 +177,7 @@ const settingsTabs: Array<{
   },
   {
     id: "providers",
+    section: "coding",
     label: "模型与 API",
     description: "供应商、模型和密钥",
     keywords: "api 模型 provider 供应商 导入 密钥 key url ollama openai",
@@ -132,6 +185,7 @@ const settingsTabs: Array<{
   },
   {
     id: "permissions",
+    section: "coding",
     label: "权限",
     description: "审批、沙箱和网络",
     keywords: "权限 审批 沙箱 网络 文件 sandbox permission",
@@ -139,12 +193,15 @@ const settingsTabs: Array<{
   },
   {
     id: "advanced",
+    section: "coding",
     label: "高级",
     description: "连接状态与诊断",
     keywords: "高级 状态 诊断 健康 测试 connection health logs",
     icon: SlidersHorizontal,
   },
 ];
+
+const settingsSectionOrder: SettingsSection[] = ["personal", "coding"];
 
 const defaultAgentRuntimeSettings: AgentRuntimeSettings = {
   personality: "professional",
@@ -160,8 +217,15 @@ export function SettingsPanel({
   providerTest,
   secretSources,
   notificationPreferences,
+  appearance,
+  resolvedTheme,
+  personalization,
+  editorPreferences,
   isSaving,
   isSavingSecret,
+  onAppearanceChange,
+  onPersonalizationChange,
+  onEditorPreferencesChange,
   onSave,
   onTestProvider,
   onSyncProviderModels,
@@ -479,23 +543,38 @@ export function SettingsPanel({
                 </button>
               ) : null}
             </label>
-            <nav>
-              {matchingTabs.map((tab) => {
-                const Icon = tab.icon;
+            <nav aria-label="设置分类导航">
+              {settingsSectionOrder.map((section) => {
+                const tabs = matchingTabs.filter(
+                  (tab) => tab.section === section,
+                );
+                if (tabs.length === 0) return null;
                 return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    className={activeTab === tab.id ? "active" : ""}
-                    aria-current={activeTab === tab.id ? "page" : undefined}
-                    onClick={() => setActiveTab(tab.id)}
-                  >
-                    <Icon size={17} aria-hidden="true" />
-                    <span>
-                      <strong>{tab.label}</strong>
-                      <small>{tab.description}</small>
-                    </span>
-                  </button>
+                  <div key={section} className="settings-nav-section">
+                    <h3 className="settings-nav-section__label">
+                      {settingsSectionLabels[section]}
+                    </h3>
+                    {tabs.map((tab) => {
+                      const Icon = tab.icon;
+                      return (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          className={activeTab === tab.id ? "active" : ""}
+                          aria-current={
+                            activeTab === tab.id ? "page" : undefined
+                          }
+                          onClick={() => setActiveTab(tab.id)}
+                        >
+                          <Icon size={17} aria-hidden="true" />
+                          <span>
+                            <strong>{tab.label}</strong>
+                            <small>{tab.description}</small>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 );
               })}
             </nav>
@@ -509,9 +588,26 @@ export function SettingsPanel({
               <GeneralSettings
                 platform={platform}
                 preferences={notificationPreferences}
+                editorPreferences={editorPreferences}
+                onEditorPreferencesChange={onEditorPreferencesChange}
                 onChange={onNotificationPreferencesChange}
                 onTestNotification={onTestNotification}
                 onOpenLogs={onOpenLogs}
+              />
+            ) : null}
+            {activeTab === "appearance" ? (
+              <AppearanceSettingsView
+                value={appearance}
+                resolvedTheme={resolvedTheme}
+                onChange={onAppearanceChange}
+              />
+            ) : null}
+            {activeTab === "personalization" ? (
+              <PersonalizationSettingsView
+                agentRuntime={agentRuntime}
+                personalization={personalization}
+                onAgentRuntimeChange={setAgentRuntime}
+                onPersonalizationChange={onPersonalizationChange}
               />
             ) : null}
             {activeTab === "agent" ? (
@@ -632,12 +728,16 @@ export function SettingsPanel({
 function GeneralSettings({
   platform,
   preferences,
+  editorPreferences,
+  onEditorPreferencesChange,
   onChange,
   onTestNotification,
   onOpenLogs,
 }: {
   platform: PlatformInfo | null;
   preferences: TaskNotificationPreferences;
+  editorPreferences: EditorPreferences;
+  onEditorPreferencesChange(value: EditorPreferences): void;
   onChange(preferences: TaskNotificationPreferences): void;
   onTestNotification(): void;
   onOpenLogs(): void;
@@ -647,8 +747,83 @@ function GeneralSettings({
     value: TaskNotificationPreferences[K],
   ) => onChange({ ...preferences, [key]: value });
 
+  const updateEditor = <K extends keyof EditorPreferences>(
+    key: K,
+    value: EditorPreferences[K],
+  ) => onEditorPreferencesChange({ ...editorPreferences, [key]: value });
+
   return (
-    <SettingsPage title="常规" description="本机通知和应用信息。">
+    <SettingsPage title="常规" description="编辑器、通知和应用信息。">
+      <SettingsGroup title="编辑器">
+        <SettingsRow
+          title="显示上下文窗口使用情况"
+          description="在对话框附近显示当前轮次占用的上下文比例。"
+          control={
+            <Switch
+              label="显示上下文窗口使用情况"
+              checked={editorPreferences.showContextWindowUsage}
+              onChange={(checked) =>
+                updateEditor("showContextWindowUsage", checked)
+              }
+            />
+          }
+        />
+        <SettingsRow
+          title="发送快捷键"
+          description="选择按 Enter 时是发送提示还是插入新行。"
+          control={
+            <Select
+              label="发送快捷键"
+              value={editorPreferences.sendShortcut}
+              options={[
+                { value: "enter", label: "按 Enter 键" },
+                { value: "mod-enter", label: "按 Ctrl/Cmd + Enter" },
+              ]}
+              onChange={(next) => updateEditor("sendShortcut", next)}
+            />
+          }
+        />
+        <SettingsRow
+          title="跟进行为"
+          description="在运行时将后续指令加入队列，或引导当前运行。"
+          control={
+            <SegmentedControl
+              label="跟进行为"
+              value={editorPreferences.followUpBehavior}
+              options={[
+                { value: "queue", label: "排队" },
+                { value: "steer", label: "引导" },
+              ]}
+              onChange={(next) => updateEditor("followUpBehavior", next)}
+            />
+          }
+        />
+        <SettingsRow
+          title="底部面板"
+          description="在应用标题栏中显示底部面板控件。"
+          control={
+            <Switch
+              label="底部面板"
+              checked={editorPreferences.showBottomPanel}
+              onChange={(checked) => updateEditor("showBottomPanel", checked)}
+            />
+          }
+        />
+        <SettingsRow
+          title="默认设为无项目任务"
+          description="无需选择项目即可开始新任务。"
+          control={
+            <Switch
+              label="默认设为无项目任务"
+              checked={editorPreferences.allowProjectlessTasks}
+              onChange={(checked) =>
+                updateEditor("allowProjectlessTasks", checked)
+              }
+            />
+          }
+        />
+      </SettingsGroup>
+
       <SettingsGroup title="任务通知">
         <SettingsRow
           title="完成提醒"
@@ -940,7 +1115,7 @@ function ProviderSettingsView({
     : null;
   const usesManualModel = Boolean(
     editingProvider &&
-      (manualModelProviderId === editingProvider.id || !selectedModelPreset),
+    (manualModelProviderId === editingProvider.id || !selectedModelPreset),
   );
   const reasoningCapability = editingProvider
     ? resolveModelReasoningCapability(
@@ -1140,7 +1315,9 @@ function ProviderSettingsView({
                               CUSTOM_MODEL_PRESET_VALUE)
                         }
                         onChange={(event) => {
-                          if (event.target.value === CUSTOM_MODEL_PRESET_VALUE) {
+                          if (
+                            event.target.value === CUSTOM_MODEL_PRESET_VALUE
+                          ) {
                             setManualModelProviderId(editingProvider.id);
                             return;
                           }
@@ -1901,48 +2078,6 @@ function ProviderImportDialog({
   );
 }
 
-function SettingsPage({
-  title,
-  description,
-  actions,
-  children,
-}: {
-  title: string;
-  description: string;
-  actions?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="settings-page" aria-labelledby={`settings-${title}`}>
-      <div className="settings-page-heading">
-        <div>
-          <h3 id={`settings-${title}`}>{title}</h3>
-          <p>{description}</p>
-        </div>
-        {actions ? (
-          <div className="settings-page-actions">{actions}</div>
-        ) : null}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function SettingsGroup({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="settings-group">
-      <h4>{title}</h4>
-      <div className="settings-group-body">{children}</div>
-    </section>
-  );
-}
-
 /**
  * Per-connection model scope. Users pick whole families rather than individual
  * model ids, because one API key on an aggregator or relay already grants the
@@ -2049,8 +2184,7 @@ function ModelFamilySection({
       ) : null}
       {families.length === 0 ? (
         <p className="settings-model-families-note">
-          还没有模型列表。点击「同步模型」从该连接拉取，或先在上方填写模型
-          ID。
+          还没有模型列表。点击「同步模型」从该连接拉取，或先在上方填写模型 ID。
         </p>
       ) : (
         <div className="settings-toggle-stack">
@@ -2078,54 +2212,6 @@ function ModelFamilySection({
         </div>
       )}
     </section>
-  );
-}
-
-function SettingsRow({
-  title,
-  description,
-  control,
-  disabled = false,
-}: {
-  title: string;
-  description: string;
-  control?: React.ReactNode;
-  disabled?: boolean;
-}) {
-  return (
-    <div className={`settings-row ${disabled ? "disabled" : ""}`}>
-      <div>
-        <strong>{title}</strong>
-        <span>{description}</span>
-      </div>
-      {control ? <div className="settings-row-control">{control}</div> : null}
-    </div>
-  );
-}
-
-function Switch({
-  label,
-  checked,
-  disabled = false,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  disabled?: boolean;
-  onChange(checked: boolean): void;
-}) {
-  return (
-    <button
-      type="button"
-      className="settings-switch"
-      role="switch"
-      aria-label={label}
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-    >
-      <span />
-    </button>
   );
 }
 

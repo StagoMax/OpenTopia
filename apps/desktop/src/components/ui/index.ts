@@ -5,7 +5,17 @@ export {
   type ButtonSize,
   type ButtonVariant,
 } from "./Button";
+export { ColorField, type ColorFieldProps } from "./ColorField";
 export { IconButton, type IconButtonProps } from "./IconButton";
+export { NumberField, type NumberFieldProps } from "./NumberField";
 export { Panel, type PanelProps } from "./Panel";
 export { Popover, type PopoverAlign, type PopoverProps } from "./Popover";
+export {
+  SegmentedControl,
+  type SegmentedControlProps,
+  type SegmentedOption,
+} from "./SegmentedControl";
+export { Select, type SelectOption, type SelectProps } from "./Select";
+export { Slider, type SliderProps } from "./Slider";
+export { Switch, type SwitchProps } from "./Switch";
 export { TextField, type TextFieldProps } from "./TextField";

@@ -20,6 +20,8 @@
   --font-size-lg: 16px;
   --font-size-xl: 20px;
   --font-size-xxl: 24px;
+  /* Baseline for code, diffs, and terminals. User adjustable in Appearance. */
+  --font-size-code: 12px;
   --font-weight-regular: 400;
   --font-weight-medium: 500;
   --font-weight-semibold: 600;
@@ -74,6 +76,24 @@
   --shadow-float: 0 8px 24px rgb(31 41 55 / 12%), 0 1px 3px rgb(31 41 55 / 8%);
   --shadow-overlay: 0 18px 48px rgb(31 41 55 / 18%);
 
+  /*
+   * Control roles used by the settings surfaces. The switch knob and the track
+   * are separate roles because the knob stays light in both themes while the
+   * track follows the theme surface.
+   */
+  --control-track: #dfe3e8;
+  --control-knob: #ffffff;
+  --control-knob-shadow: 0 1px 3px rgb(35 45 55 / 25%);
+  --diff-added-bg: #eaf7ee;
+  --diff-added-marker: #2f9e5f;
+  --diff-removed-bg: #fdecec;
+  --diff-removed-marker: #d0555a;
+  --syntax-keyword: #9333b8;
+  --syntax-string: #1c7a4a;
+  --syntax-number: #1f6fb2;
+  --syntax-type: #0b6fd3;
+  --syntax-punctuation: #6b7280;
+
   --control-height-sm: 28px;
   --control-height-md: 32px;
   --control-height-lg: 36px;
@@ -91,4 +111,56 @@
   --z-popover: 20;
   --z-modal: 30;
   --z-toast: 40;
+}
+
+/*
+ * Dark theme.
+ *
+ * `[data-theme="dark"]` is set on <html> by the appearance controller, which
+ * resolves the "system" preference to a concrete value so the rest of the app
+ * never has to branch on a media query.
+ */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --app-bg: #181818;
+  --sidebar-bg: #1f2124;
+  --surface: #1f2124;
+  --surface-subtle: #232629;
+  --surface-chrome: #1c1e21;
+  --surface-hover: #2b2e33;
+  --surface-active: #343840;
+  --border-subtle: #2a2d31;
+  --border: #34383d;
+  --border-strong: #464b52;
+  --text: #f2f3f5;
+  --text-secondary: #b3bac2;
+  --text-muted: #8b939d;
+  --accent: #4c9bea;
+  --accent-hover: #6bafef;
+  --accent-subtle: #1c3145;
+  --on-accent: #10151b;
+  --focus-ring: #5aa7f0;
+  --success: #4bbd8a;
+  --success-subtle: #16301f;
+  --warning: #d9a04a;
+  --warning-subtle: #33260f;
+  --danger: #e4757a;
+  --danger-subtle: #3a1c1f;
+
+  --shadow-float: 0 8px 24px rgb(0 0 0 / 45%), 0 1px 3px rgb(0 0 0 / 35%);
+  --shadow-overlay: 0 18px 48px rgb(0 0 0 / 60%);
+
+  --control-track: #4a4f57;
+  --control-knob: #f5f6f7;
+  --control-knob-shadow: 0 1px 3px rgb(0 0 0 / 45%);
+  --diff-added-bg: #16301f;
+  --diff-added-marker: #3f9e6a;
+  --diff-removed-bg: #3a1c1f;
+  --diff-removed-marker: #d2666b;
+  --syntax-keyword: #c98bdd;
+  --syntax-string: #7cc79b;
+  --syntax-number: #7fb6e6;
+  --syntax-type: #6bafef;
+  --syntax-punctuation: #9aa3ad;
 }

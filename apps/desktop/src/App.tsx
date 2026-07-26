@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -87,6 +88,7 @@ import {
 import { WebPreviewSurface } from "./components/WebPreviewSurface";
 import { ComputerPanel } from "./components/ComputerPanel";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
+import { normalizeCopiedText } from "./clipboardText";
 import { resolveMarkdownLink } from "./markdownLinks";
 import {
   reconcileReasoningEffort,
@@ -111,6 +113,22 @@ import {
   shouldDeliverTaskNotification,
   writeTaskNotificationPreferences,
 } from "./taskNotifications";
+import {
+  applyAppearance,
+  readAppearanceSettings,
+  resolveTheme,
+  watchSystemTheme,
+  writeAppearanceSettings,
+  type ResolvedTheme,
+} from "./appearance";
+import {
+  readPersonalizationSettings,
+  writePersonalizationSettings,
+} from "./personalization";
+import {
+  readEditorPreferences,
+  writeEditorPreferences,
+} from "./editorPreferences";
 import type {
   AgentEvent,
   AppSettings,
@@ -476,6 +494,16 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [taskNotificationPreferences, setTaskNotificationPreferences] =
     useState(readTaskNotificationPreferences);
+  const [appearance, setAppearance] = useState(readAppearanceSettings);
+  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() =>
+    resolveTheme(readAppearanceSettings().mode),
+  );
+  const [personalization, setPersonalization] = useState(
+    readPersonalizationSettings,
+  );
+  const [editorPreferences, setEditorPreferences] = useState(
+    readEditorPreferences,
+  );
   const [providerHealth, setProviderHealth] = useState<ProviderHealth[]>([]);
   const [providerTest, setProviderTest] = useState<{
     providerId: string;
@@ -685,6 +713,30 @@ export function App() {
     taskNotificationPreferencesRef.current = taskNotificationPreferences;
     writeTaskNotificationPreferences(taskNotificationPreferences);
   }, [taskNotificationPreferences]);
+
+  // Appearance is applied to <html> rather than held in React state, so the
+  // whole tree (including portals and the Monaco host) picks it up from CSS.
+  useEffect(() => {
+    setResolvedTheme(applyAppearance(appearance));
+    writeAppearanceSettings(appearance);
+  }, [appearance]);
+
+  // Only follow the OS while the user is on "system"; an explicit choice must
+  // survive the OS flipping underneath it.
+  useEffect(() => {
+    if (appearance.mode !== "system") return undefined;
+    return watchSystemTheme(() =>
+      setResolvedTheme(applyAppearance(appearance)),
+    );
+  }, [appearance]);
+
+  useEffect(() => {
+    writePersonalizationSettings(personalization);
+  }, [personalization]);
+
+  useEffect(() => {
+    writeEditorPreferences(editorPreferences);
+  }, [editorPreferences]);
 
   useEffect(() => {
     try {
@@ -2741,7 +2793,10 @@ export function App() {
 
     // Follow the picked connection globally so new threads and utility calls
     // (title generation, guardian) land on the same API the user just chose.
-    if (settings.activeProviderId !== selection.connectionId && !isSavingSettings) {
+    if (
+      settings.activeProviderId !== selection.connectionId &&
+      !isSavingSettings
+    ) {
       void saveSettings({ activeProviderId: selection.connectionId });
     }
 
@@ -3207,8 +3262,15 @@ export function App() {
           providerTest={providerTest}
           secretSources={secretSources}
           notificationPreferences={taskNotificationPreferences}
+          appearance={appearance}
+          resolvedTheme={resolvedTheme}
+          personalization={personalization}
+          editorPreferences={editorPreferences}
           isSaving={isSavingSettings}
           isSavingSecret={isSavingSecret}
+          onAppearanceChange={setAppearance}
+          onPersonalizationChange={setPersonalization}
+          onEditorPreferencesChange={setEditorPreferences}
           onSave={saveSettings}
           onTestProvider={(providerId, providers) =>
             void testProviderConnection(providerId, providers)
@@ -6053,7 +6115,7 @@ function MessageList({
     );
   };
   return (
-    <div className="message-list">
+    <div className="message-list" onCopy={trimCopiedSelection}>
       {visibleMessages.length === 0 ? (
         <div className="empty-thread">
           <Bot size={42} />
@@ -6113,6 +6175,22 @@ function MessageList({
       ))}
     </div>
   );
+}
+
+/**
+ * Hands the clipboard the text that was actually selected. Chromium serializes
+ * a selection block by block, so a drag that lands a hair past the last glyph
+ * of a message still closes that block and opens the next one, and the paste
+ * arrives with a blank line or two glued to the end. The rewrite is skipped
+ * when nothing needs trimming, which keeps the rich-text flavor intact for the
+ * copies that were already clean.
+ */
+function trimCopiedSelection(event: ReactClipboardEvent<HTMLDivElement>) {
+  const selected = window.getSelection()?.toString() ?? "";
+  const trimmed = normalizeCopiedText(selected);
+  if (!trimmed || trimmed === selected) return;
+  event.clipboardData.setData("text/plain", trimmed);
+  event.preventDefault();
 }
 
 function MessageBubble({
