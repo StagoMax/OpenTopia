@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_profiles;
+pub mod background;
 pub mod browser;
 pub mod computer;
 pub mod context_sources;
@@ -15,6 +16,7 @@ pub mod model_context;
 pub mod plugins;
 pub mod policy;
 pub mod preview;
+pub mod process_quota;
 pub mod prompt_runtime;
 pub mod provider;
 pub mod sandbox;
@@ -33,6 +35,10 @@ pub use agent::{
     ContextBudget as AgentContextBudget, ProviderConversationCursor,
 };
 pub use agent_profiles::{AgentProfile, AgentProfileRegistry};
+pub use background::{
+    BackgroundJobSnapshot, BackgroundJobStatus, BackgroundOutputChunk, BackgroundProcessRegistry,
+    BackgroundRegistryConfig, BackgroundScope, BackgroundSpawnRequest,
+};
 pub use browser::{
     BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownload, BrowserDownloadRequest,
     BrowserError, BrowserNavigateRequest, BrowserNavigation, BrowserNode, BrowserNodeRef,
@@ -84,8 +90,8 @@ pub use model::{
     SkillRef, TaskPlan, TaskPlanStep, TaskPlanStepStatus, TerminalCommandHistory,
     TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet,
     TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord, TurnStatus,
-    UserInputAnswer, UserInputOption,
-    UserInputQuestion, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
+    UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord, UserInputRequest,
+    UserInputResponse, UserInputStatus,
 };
 pub use model_context::{
     content_fingerprint, estimate_tokens as estimate_model_context_tokens,
@@ -129,7 +135,7 @@ pub use sandbox::{
 };
 pub use settings::{
     AppSettings, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
-    RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
+    RolloutBudgetSettings, SandboxEnforcement, SandboxSettings, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,

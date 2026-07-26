@@ -1,4 +1,5 @@
 use crate::agent_profiles::AgentProfileRegistry;
+use crate::background::{BackgroundProcessRegistry, BackgroundScope, BackgroundSpawnRequest};
 use crate::browser::{
     BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
     BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
@@ -26,24 +27,28 @@ use crate::sandbox::LocalSandboxConfig;
 use crate::skill_authoring::{
     create_skill_from_draft, preview_skill_draft, SkillDraft, SkillResourceDraft,
 };
-use crate::skills::{discover_skills, load_selected_skills, SkillScope};
+use crate::skills::{discover_skills, load_skill_slice, SkillScope, MAX_SKILL_BYTES};
 use crate::spreadsheet::{
     execute_spreadsheet, CellRange, InspectWorkbookRequest, ListSheetsRequest, ReadRangeRequest,
     SheetWriteRequest, SpreadsheetAction, SpreadsheetRequest, SpreadsheetResult,
     WriteWorkbookRequest, MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
 use crate::store::SessionStore;
-use crate::subagents::{SpawnSubagentRequest, SubagentRunStatus, SubagentScheduler, SubagentScope};
+use crate::subagents::{
+    SpawnSubagentRequest, SubagentRun, SubagentRunStatus, SubagentScheduler, SubagentScope,
+};
 use anyhow::Context;
 use async_trait::async_trait;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -56,6 +61,8 @@ pub struct ToolContext {
     pub thread_id: Option<Uuid>,
     pub cancel: Option<CancellationToken>,
     pub subagents: Option<SubagentScheduler>,
+    /// Commands that outlive the tool call that started them.
+    pub background: Option<BackgroundProcessRegistry>,
     pub parent_turn_id: Option<Uuid>,
     pub subagent_depth: u8,
     pub agent_path: String,
@@ -94,6 +101,7 @@ impl ToolContext {
             thread_id: None,
             cancel: None,
             subagents: None,
+            background: None,
             parent_turn_id: None,
             subagent_depth: 0,
             agent_path: "/root".to_string(),
@@ -121,6 +129,7 @@ impl ToolContext {
             thread_id: None,
             cancel: None,
             subagents: None,
+            background: None,
             parent_turn_id: None,
             subagent_depth: 0,
             agent_path: "/root".to_string(),
@@ -174,6 +183,10 @@ impl ToolRegistry {
         tools.insert("write_file".to_string(), Arc::new(WriteFileTool));
         tools.insert("search".to_string(), Arc::new(SearchTool));
         tools.insert("shell".to_string(), Arc::new(ShellTool));
+        tools.insert(
+            "background_output".to_string(),
+            Arc::new(BackgroundOutputTool),
+        );
         tools.insert("git_diff".to_string(), Arc::new(GitDiffTool));
         tools.insert("apply_patch".to_string(), Arc::new(ApplyPatchTool));
         tools.insert("spawn_agent".to_string(), Arc::new(SpawnAgentTool));
@@ -1802,13 +1815,25 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read one Skill's instructions after deciding it is relevant to the current task."
+        "Read one Skill's instructions after deciding it is relevant to the current task. Returns at most 64 KB per call; when the result reports a next offset, call again with that offset to read the rest."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "id": { "type": "string", "description": "Skill ID returned by list_skills." } },
+            "properties": {
+                "id": { "type": "string", "description": "Skill ID returned by list_skills." },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Byte offset to start reading from. Defaults to 0. Use the nextOffset reported by a previous call to continue."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum bytes to return, capped at 65536."
+                }
+            },
             "required": ["id"],
             "additionalProperties": false
         })
@@ -1816,23 +1841,34 @@ impl Tool for ReadSkillTool {
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
         let id = required_string(&call.input, "id")?;
-        // load_selected_skills resolves the opaque ID against the bounded, canonicalized Skill
+        let offset = call
+            .input
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let limit = call
+            .input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(MAX_SKILL_BYTES, |value| {
+                (value as usize).min(MAX_SKILL_BYTES)
+            });
+        // load_skill_slice resolves the opaque ID against the bounded, canonicalized Skill
         // catalog. It cannot be used as a general-purpose path read, including for user Skills
         // that intentionally live outside the thread workspace.
-        let loaded = load_selected_skills(Some(&ctx.workspace_root), &[id])?
-            .into_iter()
-            .next()
-            .context("Skill is unavailable")?;
-        let output = loaded.render_for_model();
+        let slice = load_skill_slice(Some(&ctx.workspace_root), &id, offset, limit)?;
+        let output = slice.render_for_model();
         Ok(ToolResult {
             call_id: call.id,
             output: output.clone(),
             content: vec![ModelContentPart::text(output)],
             metadata: json!({
-                "id": loaded.descriptor.id,
-                "name": loaded.descriptor.name,
-                "path": loaded.descriptor.path,
-                "truncated": loaded.truncated
+                "id": slice.descriptor.id,
+                "name": slice.descriptor.name,
+                "path": slice.descriptor.path,
+                "offset": slice.offset,
+                "nextOffset": slice.next_offset,
+                "totalBytes": slice.total_bytes
             }),
         })
     }
@@ -3018,8 +3054,8 @@ impl Tool for WaitAgentTool {
             "properties": {
                 "target": { "type": "string", "description": "Optional agent UUID or canonical path." },
                 "runId": { "type": "string", "description": "Deprecated target UUID alias." },
-                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000 },
-                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 120000, "description": "Deprecated alias for timeout_ms." }
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "description": "How long to block, up to one hour. Waiting costs nothing, so prefer one long wait over repeated short ones." },
+                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 3600000, "description": "Deprecated alias for timeout_ms." }
             },
             "additionalProperties": false
         })
@@ -3035,8 +3071,8 @@ impl Tool for WaitAgentTool {
             .get("timeout_ms")
             .or_else(|| call.input.get("timeoutMs"))
             .and_then(Value::as_u64)
-            .unwrap_or(30_000)
-            .clamp(1, 120_000);
+            .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
+            .clamp(1, MAX_WAIT_TIMEOUT_MS);
         let scope = subagent_scope(&ctx)?;
         if let Some(target) = call
             .input
@@ -3045,9 +3081,11 @@ impl Tool for WaitAgentTool {
             .and_then(Value::as_str)
         {
             let run = scheduler.resolve_scoped(scope.clone(), target)?;
-            let run = scheduler
-                .wait_scoped(scope.clone(), run.id, Duration::from_millis(timeout_ms))
-                .await?;
+            let run = await_cancellable(
+                ctx.cancel.as_ref(),
+                scheduler.wait_scoped(scope.clone(), run.id, Duration::from_millis(timeout_ms)),
+            )
+            .await??;
             let messages = scheduler.drain_mailbox_from_scoped(&scope, &run.agent_path);
             let message_count = messages.len();
             let value = json!({
@@ -3069,9 +3107,11 @@ impl Tool for WaitAgentTool {
                 }),
             });
         }
-        let activity = scheduler
-            .wait_for_activity_scoped(scope, Duration::from_millis(timeout_ms))
-            .await?;
+        let activity = await_cancellable(
+            ctx.cancel.as_ref(),
+            scheduler.wait_for_activity_scoped(scope, Duration::from_millis(timeout_ms)),
+        )
+        .await??;
         let update_count = activity.agents.len();
         let message_count = activity.messages.len();
         let value = serde_json::to_value(activity)?;
@@ -3100,7 +3140,7 @@ impl Tool for WaitAgentsTool {
     }
 
     fn description(&self) -> &str {
-        "Wait concurrently for multiple direct child agents and return every completed result or timeout error in one structured response."
+        "Wait on several child agents at once and return as soon as the first one finishes, together with any other agent that is already done. Agents still working are reported in stillRunning and keep going; their results arrive on their own once they finish."
     }
 
     fn schema(&self) -> Value {
@@ -3113,7 +3153,7 @@ impl Tool for WaitAgentsTool {
                     "maxItems": MAX_BATCH_WAIT_AGENTS,
                     "items": { "type": "string", "description": "Child run UUID." }
                 },
-                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 120000 }
+                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 3600000, "description": "How long to block, up to one hour. Waiting costs nothing, so prefer one long wait over repeated short ones." }
             },
             "required": ["runIds"],
             "additionalProperties": false
@@ -3150,32 +3190,79 @@ impl Tool for WaitAgentsTool {
             .input
             .get("timeoutMs")
             .and_then(Value::as_u64)
-            .unwrap_or(30_000)
-            .clamp(1, 120_000);
+            .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
+            .clamp(1, MAX_WAIT_TIMEOUT_MS);
         let timeout = Duration::from_millis(timeout_ms);
         let scope = subagent_scope(&ctx)?;
-        let waits = run_ids
+        let mut inflight = run_ids
             .iter()
-            .map(|run_id| scheduler.wait_scoped(scope.clone(), *run_id, timeout));
-        let outcomes = futures_util::future::join_all(waits).await;
+            .map(|run_id| {
+                let scope = scope.clone();
+                let run_id = *run_id;
+                async move { (run_id, scheduler.wait_scoped(scope, run_id, timeout).await) }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        // Return as soon as one agent reaches a terminal state, then harvest every
+        // other agent that is already done. Blocking until the slowest child of the
+        // batch finishes would withhold results the caller could act on immediately.
+        let mut settled: HashMap<Uuid, SubagentRun> = HashMap::new();
+        let mut wait_errors: HashMap<Uuid, String> = HashMap::new();
+        await_cancellable(ctx.cancel.as_ref(), async {
+            while let Some((run_id, outcome)) = inflight.next().await {
+                match outcome {
+                    Ok(run) => {
+                        settled.insert(run_id, run);
+                        break;
+                    }
+                    Err(error) => {
+                        wait_errors.insert(run_id, error.to_string());
+                    }
+                }
+            }
+        })
+        .await?;
+        while let Some(Some((run_id, outcome))) = inflight.next().now_or_never() {
+            match outcome {
+                Ok(run) => {
+                    settled.insert(run_id, run);
+                }
+                Err(error) => {
+                    wait_errors.insert(run_id, error.to_string());
+                }
+            }
+        }
+        // Cancels the remaining waits, not the agents behind them: those keep running
+        // and report back on their own.
+        drop(inflight);
+
+        let mut still_running = Vec::new();
         let runs = run_ids
             .iter()
-            .zip(outcomes)
-            .map(|(run_id, outcome)| match outcome {
-                Ok(run) => json!({
+            .map(|run_id| {
+                if let Some(run) = settled.get(run_id) {
+                    return json!({
+                        "runId": run_id,
+                        "agentPath": run.agent_path,
+                        "status": run.status,
+                        "result": run.result,
+                        "error": run.error,
+                        "terminal": run.status.is_terminal(),
+                        "success": run.status == SubagentRunStatus::Completed
+                    });
+                }
+                let current = scheduler
+                    .resolve_scoped(scope.clone(), &run_id.to_string())
+                    .ok();
+                still_running.push(*run_id);
+                json!({
                     "runId": run_id,
-                    "status": run.status,
-                    "result": run.result,
-                    "error": run.error,
-                    "terminal": run.status.is_terminal(),
-                    "success": run.status == SubagentRunStatus::Completed
-                }),
-                Err(error) => json!({
-                    "runId": run_id,
+                    "agentPath": current.as_ref().map(|run| run.agent_path.clone()),
+                    "status": current.as_ref().map(|run| run.status),
                     "terminal": false,
                     "success": false,
-                    "waitError": error.to_string()
-                }),
+                    "waitError": wait_errors.get(run_id),
+                })
             })
             .collect::<Vec<_>>();
         let all_terminal = runs
@@ -3189,7 +3276,13 @@ impl Tool for WaitAgentsTool {
             "runs": runs,
             "messages": messages,
             "allTerminal": all_terminal,
-            "allSucceeded": all_succeeded
+            "allSucceeded": all_succeeded,
+            "stillRunning": still_running,
+            "note": if still_running.is_empty() {
+                "Every requested agent reached a terminal state."
+            } else {
+                "This call returned as soon as the first agent finished. The agents in stillRunning are unaffected and keep working; their results reach you automatically once they finish."
+            },
         });
         Ok(ToolResult {
             call_id: call.id,
@@ -3198,11 +3291,43 @@ impl Tool for WaitAgentsTool {
             metadata: json!({
                 "toolName": self.name(),
                 "runCount": run_ids.len(),
+                "settledCount": settled.len(),
+                "stillRunningCount": still_running.len(),
                 "allTerminal": all_terminal,
                 "allSucceeded": all_succeeded,
-                "success": all_succeeded
+                "success": !settled.is_empty() || run_ids.is_empty()
             }),
         })
+    }
+}
+
+/// Longest a wait tool may block.
+///
+/// Waiting is the cheap way to wait: a blocked tool call burns no tokens, while a
+/// short cap forces the model to spend a whole round every time it polls. The cap
+/// exists only so a wait cannot outlive any plausible turn, and it matches the
+/// ceiling the interactive terminal already allows.
+const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
+const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
+
+/// Runs a future while staying responsive to turn cancellation.
+///
+/// A long wait is only acceptable if the user can still stop it.
+async fn await_cancellable<F>(
+    cancel: Option<&CancellationToken>,
+    future: F,
+) -> anyhow::Result<F::Output>
+where
+    F: std::future::Future,
+{
+    match cancel {
+        Some(token) => {
+            tokio::select! {
+                value = future => Ok(value),
+                _ = token.cancelled() => anyhow::bail!("cancelled"),
+            }
+        }
+        None => Ok(future.await),
     }
 }
 
@@ -3318,6 +3443,7 @@ impl Tool for ListFilesTool {
 pub struct ReadFileTool;
 
 const READ_FILE_ARTIFACT_THRESHOLD: usize = 64_000;
+const READ_FILE_WINDOW_CHARS: usize = 16_000;
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -3326,14 +3452,24 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a UTF-8 text file inside the workspace."
+        "Read a UTF-8 text file inside the workspace. Returns at most 16000 characters per call; when the result reports a next offset, call again with that offset to read the rest."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "File path relative to workspace." }
+                "path": { "type": "string", "description": "File path relative to workspace." },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Character offset to start reading from. Defaults to 0. Use the nextOffset reported by a previous call to continue."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum characters to return, capped at 16000."
+                }
             },
             "required": ["path"]
         })
@@ -3356,10 +3492,40 @@ impl Tool for ReadFileTool {
         let contents = String::from_utf8(read.bytes)
             .with_context(|| format!("failed to read {} as UTF-8", read.path.display()))?;
         let bytes = contents.len();
-        let mut output = truncate(&contents, 16_000);
+
+        // A window rather than a bare cap: before this, everything past the
+        // first 16000 characters of a file was simply unreachable through this
+        // tool, and the model could not tell that from a short file.
+        let total_chars = contents.chars().count();
+        let offset = call
+            .input
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        let limit = call
+            .input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(READ_FILE_WINDOW_CHARS, |value| {
+                (value as usize).clamp(1, READ_FILE_WINDOW_CHARS)
+            });
+        let window: String = contents.chars().skip(offset).take(limit).collect();
+        let read_to = offset.saturating_add(window.chars().count());
+        let next_offset = (read_to < total_chars).then_some(read_to);
+
+        let mut output = window;
+        if let Some(next) = next_offset {
+            output.push_str(&format!(
+                "\n\n[characters {offset}-{} of {total_chars}; call read_file again with offset {next} for the rest]",
+                read_to.saturating_sub(1)
+            ));
+        }
         let mut metadata = json!({
             "path": read.path.display().to_string(),
-            "bytes": bytes
+            "bytes": bytes,
+            "offset": offset,
+            "nextOffset": next_offset,
+            "totalChars": total_chars
         });
 
         if bytes > READ_FILE_ARTIFACT_THRESHOLD {
@@ -3624,7 +3790,124 @@ impl Tool for SearchTool {
 
 pub struct ShellTool;
 
+/// Display copies of the streams kept in result metadata. They are smaller than
+/// the model-facing envelope on purpose: the timeline only needs enough to show
+/// the call, and the untruncated text stays in the output (or its artifact).
+const SHELL_DISPLAY_STDOUT_LIMIT: usize = 16_000;
+const SHELL_DISPLAY_STDERR_LIMIT: usize = 8_000;
+
 const ARTIFACT_THRESHOLD: usize = 16_000;
+/// A foreground command blocks the model for its whole runtime, so its ceiling stays
+/// modest; anything longer belongs in the background, where waiting costs nothing.
+const MAX_FOREGROUND_TIMEOUT_SECONDS: u64 = 1_800;
+const MAX_BACKGROUND_TIMEOUT_SECONDS: u64 = 21_600;
+const DEFAULT_BACKGROUND_TIMEOUT_SECONDS: u64 = 3_600;
+
+fn background_scope(ctx: &ToolContext) -> anyhow::Result<BackgroundScope> {
+    Ok(BackgroundScope {
+        thread_id: ctx
+            .thread_id
+            .context("background commands need an owning thread")?,
+        agent_path: ctx.agent_path.clone(),
+    })
+}
+
+pub struct BackgroundOutputTool;
+
+#[async_trait]
+impl Tool for BackgroundOutputTool {
+    fn name(&self) -> &str {
+        "background_output"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect the background commands you started: list them, read the output produced since you last looked, or stop one. You do not need to poll for completion; a finished command reports itself."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "list", "stop"],
+                    "description": "read returns new output for one job, list summarizes every job you own, stop ends one job."
+                },
+                "jobId": { "type": "string", "description": "Job UUID returned by shell. Required for read and stop." }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let registry = ctx
+            .background
+            .as_ref()
+            .context("background commands are unavailable in this runtime")?;
+        let scope = background_scope(&ctx)?;
+        let action = call
+            .input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("read");
+        let job_id = call
+            .input
+            .get("jobId")
+            .and_then(Value::as_str)
+            .map(Uuid::parse_str)
+            .transpose()
+            .context("jobId must be a UUID")?;
+
+        let (value, metadata) = match action {
+            "list" => {
+                let jobs = registry.list(&scope);
+                let running = jobs.iter().filter(|job| !job.status.is_terminal()).count();
+                (
+                    json!({ "jobs": jobs, "running": running }),
+                    json!({ "jobCount": jobs.len(), "running": running, "success": true }),
+                )
+            }
+            "stop" => {
+                let job_id = job_id.context("background_output stop requires jobId")?;
+                registry.stop(&scope, job_id)?;
+                (
+                    json!({
+                        "jobId": job_id,
+                        "stopped": true,
+                        "note": "The command was signalled to stop. Its final status arrives with the next update."
+                    }),
+                    json!({ "jobId": job_id, "success": true }),
+                )
+            }
+            "read" => {
+                let job_id = job_id.context("background_output read requires jobId")?;
+                let chunk = registry.read_output(&scope, job_id)?;
+                let metadata = json!({
+                    "jobId": job_id,
+                    "status": chunk.job.status.as_str(),
+                    "terminal": chunk.job.status.is_terminal(),
+                    "exitCode": chunk.job.exit_code,
+                    "success": true
+                });
+                (serde_json::to_value(&chunk)?, metadata)
+            }
+            other => anyhow::bail!("unsupported background_output action: {other}"),
+        };
+
+        Ok(ToolResult {
+            call_id: call.id,
+            output: serde_json::to_string_pretty(&value)?,
+            content: vec![ModelContentPart::json(value)],
+            metadata: {
+                let mut metadata = metadata;
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert("toolName".to_string(), json!(self.name()));
+                }
+                metadata
+            },
+        })
+    }
+}
 
 #[async_trait]
 impl Tool for ShellTool {
@@ -3633,15 +3916,19 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in the workspace with timeout and output caps."
+        "Run a shell command in the workspace with timeout and output caps. Set background for anything slow (installs, builds, downloads, servers): it returns a job id immediately, the command keeps running while you do other work, and its result is delivered to you automatically when it finishes."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Command to run." },
-                "timeoutSeconds": { "type": "number", "description": "Timeout in seconds." }
+                "command": { "type": "string", "description": "Command to run. The platform shell interprets it, so substitutions and redirection inside the string are executed." },
+                "timeoutSeconds": { "type": "number", "description": "Timeout in seconds. Up to 1800 in the foreground, or 21600 in the background." },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run detached and return a job id right away. Use background_output to read progress or stop the job; the finished result reaches you on its own."
+                }
             },
             "required": ["command"]
         })
@@ -3655,13 +3942,61 @@ impl Tool for ShellTool {
             .context("shell requires a command")?;
         enforce_policy_decision(ctx.policy.inspect_command(command), ctx.approval_granted)?;
 
+        let background = call
+            .input
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let timeout_seconds = call
             .input
             .get("timeoutSeconds")
             .and_then(Value::as_u64)
-            .unwrap_or(30)
-            .min(300);
+            .unwrap_or(if background {
+                DEFAULT_BACKGROUND_TIMEOUT_SECONDS
+            } else {
+                30
+            })
+            .min(if background {
+                MAX_BACKGROUND_TIMEOUT_SECONDS
+            } else {
+                MAX_FOREGROUND_TIMEOUT_SECONDS
+            });
 
+        if background {
+            let registry = ctx
+                .background
+                .as_ref()
+                .context("background commands are unavailable in this runtime")?;
+            let job = registry.spawn(
+                ctx.environment.clone(),
+                BackgroundSpawnRequest {
+                    scope: background_scope(&ctx)?,
+                    command: command.to_string(),
+                    request: ExecRequest::shell(command).cwd(&ctx.workspace_root),
+                    context: ctx.execution_context(Duration::from_secs(timeout_seconds)),
+                },
+            )?;
+            let value = json!({
+                "jobId": job.job_id,
+                "status": job.status.as_str(),
+                "command": job.command,
+                "startedAt": job.started_at,
+                "note": "The command is running detached. Carry on with other work: its output and exit status are delivered to you when it finishes, and background_output reads progress or stops it in the meantime."
+            });
+            return Ok(ToolResult {
+                call_id: call.id,
+                output: serde_json::to_string_pretty(&value)?,
+                content: vec![ModelContentPart::json(value)],
+                metadata: json!({
+                    "toolName": self.name(),
+                    "background": true,
+                    "jobId": job.job_id,
+                    "success": true
+                }),
+            });
+        }
+
+        let started_at = Instant::now();
         let output = ctx
             .environment
             .exec(
@@ -3669,6 +4004,7 @@ impl Tool for ShellTool {
                 ctx.execution_context(Duration::from_secs(timeout_seconds)),
             )
             .await?;
+        let duration_ms = started_at.elapsed().as_millis() as u64;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.success && looks_like_sandbox_denial(&stderr) {
@@ -3689,13 +4025,21 @@ impl Tool for ShellTool {
             truncate(&stderr, 12_000)
         );
 
+        // `output` above is the model-facing envelope. The UI renders the call
+        // from these structured fields instead of re-parsing that text, so a
+        // terminal view can separate the command, stdout and stderr reliably.
         let mut result = ToolResult {
             call_id: call.id,
             output: combined,
             content: Vec::new(),
             metadata: json!({
+                "command": command,
                 "exitCode": output.exit_code,
                 "success": output.success,
+                "truncated": output.truncated,
+                "durationMs": duration_ms,
+                "stdout": truncate(&stdout, SHELL_DISPLAY_STDOUT_LIMIT),
+                "stderr": truncate(&stderr, SHELL_DISPLAY_STDERR_LIMIT),
                 "sandbox": output.sandbox
             }),
         };

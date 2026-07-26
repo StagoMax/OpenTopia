@@ -1,4 +1,5 @@
 use crate::policy::ApprovalRequired;
+use crate::process_quota::ProcessQuota;
 use crate::sandbox::{
     build_local_sandbox_command, is_protected_metadata_path, sandbox_permission_profile,
     ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy, OsSandboxPlatform,
@@ -42,11 +43,30 @@ impl Default for ResourceLimit {
     }
 }
 
+/// Which stream a chunk of live command output came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Receives command output while the command is still running.
+///
+/// `exec` normally returns output only once the process exits, which is fine for a
+/// command that finishes in seconds and useless for one that runs for an hour. A
+/// sink makes the same execution path observable as it happens, so a long command
+/// can report progress without being treated differently from a short one.
+pub trait BackgroundOutputSink: std::fmt::Debug + Send + Sync {
+    fn push(&self, stream: OutputStream, chunk: &[u8]);
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     pub timeout: Duration,
     pub cancel: Option<CancellationToken>,
     pub resource_limits: ResourceLimit,
+    /// When set, output is forwarded here as it arrives as well as being returned.
+    pub output_sink: Option<Arc<dyn BackgroundOutputSink>>,
 }
 
 impl ExecutionContext {
@@ -55,6 +75,7 @@ impl ExecutionContext {
             timeout,
             cancel: None,
             resource_limits: ResourceLimit::default(),
+            output_sink: None,
         }
     }
 
@@ -67,6 +88,11 @@ impl ExecutionContext {
         self.resource_limits = limits;
         self
     }
+
+    pub fn with_output_sink(mut self, sink: Arc<dyn BackgroundOutputSink>) -> Self {
+        self.output_sink = Some(sink);
+        self
+    }
 }
 
 impl Default for ExecutionContext {
@@ -75,6 +101,7 @@ impl Default for ExecutionContext {
             timeout: Duration::from_secs(30),
             cancel: None,
             resource_limits: ResourceLimit::default(),
+            output_sink: None,
         }
     }
 }
@@ -565,9 +592,34 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             process.stdin(Stdio::piped());
         }
 
+        // Held until the command finishes: the job terminates its members when the last
+        // handle closes, so dropping this early would kill the command.
+        let quota = ProcessQuota::prepare(&context.resource_limits)?;
+        #[cfg(windows)]
+        {
+            let flags = crate::process_quota::suspended_creation_flags(quota.as_ref());
+            if flags != 0 {
+                process.creation_flags(flags);
+            }
+        }
+
         let mut child = process
             .spawn()
             .with_context(|| format!("failed to spawn {}", command_plan.program))?;
+
+        if let Some(quota) = quota.as_ref() {
+            // Fail closed. The process is still suspended, so killing it here means no
+            // instruction of the unmetered command ever runs.
+            if let Err(error) = quota.bind_and_resume(&child) {
+                let _ = child.kill().await;
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to apply the resource quota to {}",
+                        command_plan.program
+                    )
+                });
+            }
+        }
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let cancel_token = CancellationToken::new();
@@ -592,9 +644,12 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         let read_stdout = {
             let limit = output_limit_reached.clone();
             let max = max_bytes;
+            let sink = context.output_sink.clone();
             async move {
                 match stdout_pipe {
-                    Some(pipe) => read_pipe_with_limit(pipe, max, limit).await,
+                    Some(pipe) => {
+                        read_pipe_with_limit(pipe, max, limit, sink, OutputStream::Stdout).await
+                    }
                     None => (Vec::new(), false),
                 }
             }
@@ -602,9 +657,12 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         let read_stderr = {
             let limit = output_limit_reached.clone();
             let max = max_bytes;
+            let sink = context.output_sink.clone();
             async move {
                 match stderr_pipe {
-                    Some(pipe) => read_pipe_with_limit(pipe, max, limit).await,
+                    Some(pipe) => {
+                        read_pipe_with_limit(pipe, max, limit, sink, OutputStream::Stderr).await
+                    }
                     None => (Vec::new(), false),
                 }
             }
@@ -751,9 +809,30 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        let quota = ProcessQuota::prepare(&context.resource_limits)?;
+        #[cfg(windows)]
+        {
+            let flags = crate::process_quota::suspended_creation_flags(quota.as_ref());
+            if flags != 0 {
+                process.creation_flags(flags);
+            }
+        }
+
         let mut child = process
             .spawn()
             .with_context(|| format!("failed to spawn {}", command_plan.program))?;
+
+        if let Some(quota) = quota.as_ref() {
+            if let Err(error) = quota.bind_and_resume(&child) {
+                let _ = child.kill().await;
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to apply the resource quota to {}",
+                        command_plan.program
+                    )
+                });
+            }
+        }
 
         let child_stdin = child
             .stdin
@@ -782,6 +861,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             request_id: Some(request_id),
             env: Some(Arc::new(self.clone())),
             sandbox,
+            _quota: quota,
         }))
     }
 
@@ -844,6 +924,8 @@ async fn read_pipe_with_limit<R: AsyncRead + Unpin>(
     mut reader: R,
     max_bytes: Option<usize>,
     limit_reached: CancellationToken,
+    sink: Option<Arc<dyn BackgroundOutputSink>>,
+    stream: OutputStream,
 ) -> (Vec<u8>, bool) {
     let mut output = Vec::new();
     let mut buf = [0u8; 8192];
@@ -853,6 +935,9 @@ async fn read_pipe_with_limit<R: AsyncRead + Unpin>(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
+                        if let Some(sink) = sink.as_ref() {
+                            sink.push(stream, &buf[..n]);
+                        }
                         output.extend_from_slice(&buf[..n]);
                         if let Some(max) = max_bytes {
                             if output.len() > max {
@@ -893,6 +978,9 @@ pub struct LocalStdioSession {
     request_id: Option<String>,
     env: Option<std::sync::Arc<LocalExecutionEnvironment>>,
     sandbox: Option<ExecutionSandboxMetadata>,
+    /// Kept for the session's lifetime. The job terminates its members when the last handle
+    /// closes, so releasing this before the session ends would kill the child.
+    _quota: Option<ProcessQuota>,
 }
 
 #[async_trait]
@@ -1431,6 +1519,79 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove temp workspace");
         std::fs::remove_dir_all(extra).expect("remove extra writable root");
         let _ = std::fs::remove_dir_all(sandbox_home);
+    }
+
+    /// Allocates 256 MiB and reports which branch it took, so the same script can prove both
+    /// that a quota bites and that the allocation is otherwise fine.
+    #[cfg(windows)]
+    const ALLOCATION_PROBE: &str = "$ErrorActionPreference='Stop'; try { $d = New-Object byte[] (256MB); $d[0]=1; Write-Output 'allocated' } catch { Write-Output 'allocation-failed' }";
+
+    /// A quota must actually stop the command, not merely be configured.
+    ///
+    /// The script allocates well past the limit, so a working job object makes the
+    /// allocation fail and the command exit non-zero. Without the job it would succeed.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_memory_quota_stops_an_over_allocating_command() {
+        let root =
+            std::env::temp_dir().join(format!("opentopia-core-execution-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        let env = LocalExecutionEnvironment::new(root.clone());
+
+        // 256 MiB of allocation against a 64 MiB job limit.
+        let exec = env
+            .exec(
+                ExecRequest::shell(ALLOCATION_PROBE),
+                ExecutionContext::with_timeout(Duration::from_secs(60)).with_resource_limits(
+                    ResourceLimit {
+                        max_memory_bytes: Some(64 * 1024 * 1024),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("exec should complete rather than error");
+
+        // The exit code is not the signal here: a failed allocation surfaces as a
+        // non-terminating PowerShell error, which still exits zero. What matters is that the
+        // allocation did not succeed.
+        let stdout = String::from_utf8_lossy(&exec.stdout);
+        assert!(
+            stdout.contains("allocation-failed"),
+            "the job memory limit did not stop the allocation; stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&exec.stderr)
+        );
+        assert!(
+            !stdout.contains("allocated"),
+            "the command allocated past its quota; stdout={stdout}"
+        );
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    /// The same command must succeed without a quota, so the assertion above is attributable
+    /// to the job object rather than to the script being broken.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_allocation_succeeds_without_a_quota() {
+        let root =
+            std::env::temp_dir().join(format!("opentopia-core-execution-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        let env = LocalExecutionEnvironment::new(root.clone());
+
+        let exec = env
+            .exec(
+                ExecRequest::shell(ALLOCATION_PROBE),
+                ExecutionContext::with_timeout(Duration::from_secs(60)),
+            )
+            .await
+            .expect("exec should complete");
+
+        assert!(
+            String::from_utf8_lossy(&exec.stdout).contains("allocated"),
+            "baseline allocation failed, so the quota test proves nothing; stderr={}",
+            String::from_utf8_lossy(&exec.stderr)
+        );
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
     }
 
     #[tokio::test]
