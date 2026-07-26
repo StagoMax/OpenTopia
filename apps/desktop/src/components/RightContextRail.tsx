@@ -293,7 +293,8 @@ export function RightContextRail({
         )}
       </RailSection>
 
-      {gitDialogOpen && gitStatus &&
+      {gitDialogOpen &&
+        gitStatus &&
         createPortal(
           <GitCommitDialog
             status={gitStatus}
@@ -648,13 +649,19 @@ function GitCommitDialog({
         </label>
 
         {error && (
-          <div className="right-context-rail__git-message is-error" role="alert">
+          <div
+            className="right-context-rail__git-message is-error"
+            role="alert"
+          >
             <AlertCircle size={14} aria-hidden="true" />
             <span>{error}</span>
           </div>
         )}
         {notice && !error && (
-          <div className="right-context-rail__git-message is-success" role="status">
+          <div
+            className="right-context-rail__git-message is-success"
+            role="status"
+          >
             <Check size={14} aria-hidden="true" />
             <span>{notice}</span>
           </div>
@@ -698,7 +705,8 @@ function gitStatusTitle(
   workspaceRoot: string | null,
 ): string {
   if (!status) return workspaceRoot ? "Git 状态不可用" : "暂无工作区";
-  const branch = status.branch ?? (status.detached ? "detached HEAD" : "未知分支");
+  const branch =
+    status.branch ?? (status.detached ? "detached HEAD" : "未知分支");
   const tracking = status.upstream
     ? `${status.upstream} · 领先 ${status.ahead} / 落后 ${status.behind}`
     : "未设置 upstream";

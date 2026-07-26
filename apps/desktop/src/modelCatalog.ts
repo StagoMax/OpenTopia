@@ -1,9 +1,11 @@
 import type { ProviderKind, ReasoningEffort } from "./types";
+// Explicit extension so `node --experimental-strip-types --test` can resolve
+// this at runtime; Vite and tsc both accept it.
 import {
   REASONING_EFFORT_DETAILS,
   resolveModelReasoningCapability,
   type ModelReasoningCapability,
-} from "./providerSettings";
+} from "./providerSettings.ts";
 
 export { REASONING_EFFORT_DETAILS };
 export type { ModelReasoningCapability };
@@ -233,8 +235,7 @@ export function buildConnectionModelGroups(
   const allowed = new Set(enabledFamilies);
 
   return MODEL_FAMILIES.filter(
-    (family) =>
-      byFamily.has(family.id) && (allowAll || allowed.has(family.id)),
+    (family) => byFamily.has(family.id) && (allowAll || allowed.has(family.id)),
   ).map((family) => {
     const ids = byFamily.get(family.id)!.slice().sort(compareModelRecency);
     const latestStableId = ids.find((id) => !isPreviewModel(id)) ?? ids[0];

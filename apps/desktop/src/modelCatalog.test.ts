@@ -114,7 +114,10 @@ test("falls back to the configured model when nothing is enabled", () => {
 
 test("prettifies ids while preserving version shape", () => {
   assert.equal(formatModelDisplayName("kimi-k2.5-turbo"), "Kimi K2.5 Turbo");
-  assert.equal(formatModelDisplayName("deepseek-reasoner"), "Deepseek Reasoner");
+  assert.equal(
+    formatModelDisplayName("deepseek-reasoner"),
+    "Deepseek Reasoner",
+  );
   assert.equal(
     formatModelDisplayName("anthropic/claude-sonnet-4-20250514"),
     "Claude Sonnet 4",

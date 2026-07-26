@@ -1,5 +1,11 @@
 import { useMemo, useState } from "react";
-import { Check, ChevronDown, ChevronRight, Search, Settings } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Search,
+  Settings,
+} from "lucide-react";
 
 import { Popover } from "./ui";
 import "./ModelSelector.css";
@@ -180,10 +186,7 @@ function ModelMenu({
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
 
-  const sections = useMemo(
-    () => buildSections(connections),
-    [connections],
-  );
+  const sections = useMemo(() => buildSections(connections), [connections]);
 
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const filtered = useMemo(() => {
@@ -273,7 +276,9 @@ function ModelMenu({
                             option.modelId === selectedModelId &&
                             option.connection.id === selectedConnectionId;
                           return (
-                            <li key={`${option.connection.id}:${option.modelId}`}>
+                            <li
+                              key={`${option.connection.id}:${option.modelId}`}
+                            >
                               <button
                                 aria-selected={selected}
                                 className="model-menu-option"

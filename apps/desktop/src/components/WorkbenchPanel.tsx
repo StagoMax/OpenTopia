@@ -1324,7 +1324,11 @@ function ExtensionsView({
   return (
     <div className="extensions-view plugins-browser">
       <div className="plugin-browser-header">
-        <div className="plugin-view-switch" role="tablist" aria-label="Plugin view">
+        <div
+          className="plugin-view-switch"
+          role="tablist"
+          aria-label="Plugin view"
+        >
           <button
             className={view === "plugins" ? "active" : ""}
             type="button"
@@ -1436,7 +1440,10 @@ function ExtensionsView({
                             : "OpenTopia"}
                       </span>
                     </div>
-                    <div className="plugin-capabilities" aria-label="Capabilities">
+                    <div
+                      className="plugin-capabilities"
+                      aria-label="Capabilities"
+                    >
                       {plugin.skillCount > 0 && (
                         <span>
                           <Workflow size={12} /> {plugin.skillCount} Skills
@@ -1456,7 +1463,9 @@ function ExtensionsView({
                       <details className="plugin-issues">
                         <summary>
                           <ShieldAlert size={13} />
-                          {item.compatible ? "Limited support" : "Not available"}
+                          {item.compatible
+                            ? "Limited support"
+                            : "Not available"}
                         </summary>
                         <ul>
                           {plugin.issues.map((issue) => (
@@ -1476,7 +1485,11 @@ function ExtensionsView({
                               onUsePluginSkills(plugin.id, !skillsSelected)
                             }
                           >
-                            {skillsSelected ? <Check size={13} /> : <Plus size={13} />}
+                            {skillsSelected ? (
+                              <Check size={13} />
+                            ) : (
+                              <Plus size={13} />
+                            )}
                             {skillsSelected ? "Skills added" : "Use Skills"}
                           </button>
                         )}
@@ -1536,7 +1549,9 @@ function ExtensionsView({
             ) : (
               <div className="workbench-empty-state plugin-empty-state">
                 <Puzzle size={22} />
-                <strong>{plugins.length ? "No plugins match" : "No plugins installed"}</strong>
+                <strong>
+                  {plugins.length ? "No plugins match" : "No plugins installed"}
+                </strong>
                 <span>
                   {plugins.length
                     ? "Try another search or source."
@@ -1677,7 +1692,9 @@ function McpServersView({
       {editor && (
         <form className="mcp-editor" onSubmit={submitEditor}>
           <div className="mcp-editor-header">
-            <strong>{editor.serverId ? "Edit MCP server" : "New MCP server"}</strong>
+            <strong>
+              {editor.serverId ? "Edit MCP server" : "New MCP server"}
+            </strong>
             <button
               className="icon-button"
               type="button"
@@ -1803,7 +1820,9 @@ function McpServersView({
                 />
                 <div className="extension-main">
                   <span>{view.server.name}</span>
-                  <small title={view.server.command}>{view.server.command}</small>
+                  <small title={view.server.command}>
+                    {view.server.command}
+                  </small>
                 </div>
                 <em
                   className={`mcp-status is-${view.status.status}`}
@@ -1835,7 +1854,9 @@ function McpServersView({
                     onClick={() => void restart(serverId)}
                   >
                     <RefreshCw
-                      className={busyKey === `restart:${serverId}` ? "spinning" : ""}
+                      className={
+                        busyKey === `restart:${serverId}` ? "spinning" : ""
+                      }
                       size={14}
                     />
                   </button>
@@ -1854,7 +1875,9 @@ function McpServersView({
             );
           })
         ) : (
-          <div className="workbench-empty-state">No MCP servers configured.</div>
+          <div className="workbench-empty-state">
+            No MCP servers configured.
+          </div>
         )}
       </div>
     </div>

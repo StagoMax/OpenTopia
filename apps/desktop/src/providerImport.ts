@@ -1,9 +1,7 @@
 export type ProviderImportFormat = "json" | "env" | "curl" | "unknown";
 
 export type ImportableProviderKind =
-  | "openai_compatible"
-  | "openai_responses"
-  | "anthropic";
+  "openai_compatible" | "openai_responses" | "anthropic";
 
 export type ProviderImportDraft = {
   /** Suggested stable identifier. Callers should resolve collisions before saving. */
@@ -53,7 +51,8 @@ export const PROVIDER_IMPORT_PRESETS: readonly ProviderImportPreset[] = [
   {
     id: "anthropic-messages",
     name: "Anthropic Messages",
-    description: "Anthropic's native Messages API. This is not OpenAI-compatible.",
+    description:
+      "Anthropic's native Messages API. This is not OpenAI-compatible.",
     kind: "anthropic",
     baseUrl: "https://api.anthropic.com",
     model: "claude-sonnet-4-20250514",

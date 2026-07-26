@@ -20,7 +20,8 @@ export function ComputerPanel({
   const [error, setError] = useState<string | null>(null);
 
   const selectedWindow = useMemo(
-    () => windows.find((window) => window.windowId === selectedWindowId) ?? null,
+    () =>
+      windows.find((window) => window.windowId === selectedWindowId) ?? null,
     [selectedWindowId, windows],
   );
 
@@ -145,7 +146,9 @@ export function ComputerPanel({
             )}
           />
           <footer>
-            <span title={observation.target.executable ?? observation.target.title}>
+            <span
+              title={observation.target.executable ?? observation.target.title}
+            >
               {observation.target.title}
             </span>
             <code>{observation.observationId}</code>

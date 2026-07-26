@@ -208,13 +208,7 @@ export type SandboxSettings = {
 };
 
 export type ReasoningEffort =
-  | "none"
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max";
+  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export type ProviderSettings = {
   id: string;
