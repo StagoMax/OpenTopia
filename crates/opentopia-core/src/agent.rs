@@ -4056,8 +4056,6 @@ mod tests {
             "Follow instructions in priority order, highest first",
             "the final response must stand on its own",
             "sets a terminal condition for effort, not a wider grant of authority",
-            "hands your command string to the platform shell",
-            "capped at 300",
         ] {
             assert!(
                 BASE_AGENT_PROMPT.contains(required_contract),
@@ -4244,7 +4242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_guard_injects_unread_completion_before_finalizing() {
+    async fn an_unread_child_result_is_delivered_before_the_model_answers() {
         let workspace = test_workspace("unread-agent-completion-guard");
         let thread_id = Uuid::new_v4();
         let user_message_id = Uuid::new_v4();
@@ -4255,10 +4253,9 @@ mod tests {
             .wait(child.id, std::time::Duration::from_secs(1))
             .await
             .expect("child completes");
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            ModelResponse::text("Final response without reading the child."),
-            ModelResponse::text("Reviewed child evidence and finished."),
-        ]));
+        let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
+            "Reviewed child evidence and finished.",
+        )]));
         let mut agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
         agent.set_subagent_scheduler(scheduler.clone());
 
@@ -4281,20 +4278,24 @@ mod tests {
                 None,
             )
             .await
-            .expect("unread completion is injected before finalization");
+            .expect("the child result reaches the model");
 
+        // The result is in front of the model while it composes its answer, rather than
+        // being pushed back at it afterwards, so no extra round is spent on the handover.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        let activity = requests[0]
+            .conversation
+            .iter()
+            .find(|message| message.content.contains("[Subagent activity]"))
+            .expect("the unread completion is delivered before the round");
+        assert!(activity.content.contains("child evidence"));
         assert_eq!(
             assistant_text(&result.events),
             "Reviewed child evidence and finished."
         );
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 2);
-        let guard_result = requests[1]
-            .tool_results
-            .iter()
-            .find(|result| result.name == FINALIZATION_GUARD_TOOL_NAME)
-            .expect("completion message is returned to the parent model");
-        assert!(guard_result.output.contains("child evidence"));
+
+        // Delivery was confirmed, so the mailbox is now clear.
         assert!(scheduler
             .drain_mailbox_scoped(&SubagentScope {
                 thread_id,
@@ -4355,7 +4356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_guard_preserves_mailbox_when_model_delivery_fails() {
+    async fn a_failed_round_leaves_the_child_result_undelivered() {
         let workspace = test_workspace("completion-guard-delivery-failure");
         let thread_id = Uuid::new_v4();
         let user_message_id = Uuid::new_v4();
@@ -4376,9 +4377,8 @@ mod tests {
             .wait(child.id, std::time::Duration::from_secs(1))
             .await
             .expect("child completes");
-        let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
-            "Attempt to finish before reading the child.",
-        )]));
+        // No scripted response at all: the round carrying the child result fails.
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
         let mut agent = AgentCore::new(provider, ToolRegistry::with_builtins());
         agent.set_subagent_scheduler(scheduler.clone());
 
@@ -4398,9 +4398,12 @@ mod tests {
                 cancellation: None,
             })
             .await
-            .expect_err("second model request is intentionally unavailable");
+            .expect_err("the model request is intentionally unavailable");
 
         assert!(error.to_string().contains("no scripted response"));
+
+        // Delivery is only marked once a round actually reached the model, so the result
+        // is still waiting rather than lost.
         let messages = scheduler.mailbox_snapshot_scoped(&scope);
         assert_eq!(messages.len(), 1);
         assert!(messages[0].message.contains("child evidence"));
@@ -5346,6 +5349,100 @@ mod tests {
             delivered_in_turn || still_pending,
             "a finished command must either have been reported or still be waiting to be"
         );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn a_command_left_running_is_reported_on_the_next_turn() {
+        let workspace = test_workspace("background-across-turns");
+        let thread_id = Uuid::new_v4();
+        let command = if cfg!(windows) {
+            "Write-Output install-complete"
+        } else {
+            "echo install-complete"
+        };
+
+        // Turn one starts the command and stops without ever looking at it.
+        let first_provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_bg".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({ "command": command, "background": true }),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            },
+            ModelResponse::text("Started it; I will report back once it finishes."),
+        ]));
+        let first_agent = AgentCore::new(first_provider.clone(), ToolRegistry::with_builtins())
+            .with_sandbox_config(LocalSandboxConfig::danger_full_access());
+        let registry = first_agent.background_processes();
+
+        let turn_input = |content: &str| AgentTurnInput {
+            thread_id,
+            user_message_id: Uuid::new_v4(),
+            workspace_root: workspace.clone(),
+            content: content.to_string(),
+            user_content: Vec::new(),
+            context_summary: None,
+            conversation: Vec::new(),
+            permission_mode: PermissionMode::FullAccess,
+            context_budget: None,
+            provider_cursor: None,
+            store: None,
+            cancellation: None,
+        };
+
+        first_agent
+            .run_turn_detailed_streaming(turn_input("Kick off the install."), None)
+            .await
+            .expect("the first turn ends without waiting for the command");
+
+        let scope = BackgroundScope {
+            thread_id,
+            agent_path: "/root".to_string(),
+        };
+        for _ in 0..100 {
+            if registry
+                .list(&scope)
+                .iter()
+                .all(|job| job.status.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // A second turn on the same thread, sharing the registry the way the server does.
+        let second_provider = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
+            "The install finished successfully.",
+        )]));
+        let mut second_agent =
+            AgentCore::new(second_provider.clone(), ToolRegistry::with_builtins())
+                .with_sandbox_config(LocalSandboxConfig::danger_full_access());
+        second_agent.set_background_processes(registry.clone());
+
+        second_agent
+            .run_turn_detailed_streaming(turn_input("Did the install finish?"), None)
+            .await
+            .expect("the second turn completes");
+
+        // The answer was already in the very first request of the new turn, so the model
+        // never had to ask for it.
+        let requests = second_provider.requests();
+        assert_eq!(requests.len(), 1);
+        let report = requests[0]
+            .conversation
+            .iter()
+            .find(|message| message.content.contains("[Background commands]"))
+            .expect("a command that finished between turns is reported on arrival");
+        assert!(report.content.contains("install-complete"));
+        assert!(registry.pending_completions(&scope).is_empty());
 
         let _ = fs::remove_dir_all(workspace);
     }

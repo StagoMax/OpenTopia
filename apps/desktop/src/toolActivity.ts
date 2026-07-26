@@ -892,8 +892,7 @@ function bytesChip(bytes?: number): ToolActivityChip[] {
 
 function commandSegments(command: string) {
   return command
-    .replace(/?
-/g, " ")
+    .replace(/\r?\n/g, " ")
     .split(/\s*(?:\|\||&&|[|;])\s*/)
     .map((segment) => segment.trim())
     .filter(Boolean)

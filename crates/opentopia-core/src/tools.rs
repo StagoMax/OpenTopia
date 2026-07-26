@@ -5028,6 +5028,58 @@ mod tests {
         fs::remove_dir_all(outside).unwrap();
     }
 
+    /// Before windowing, everything past the first 16000 characters of a file
+    /// was unreachable through `read_file`, and a truncated read looked the same
+    /// to the model as a short file.
+    #[tokio::test]
+    async fn read_file_windows_reach_the_end_of_a_long_file() {
+        let id = Uuid::new_v4();
+        let workspace_root = std::env::temp_dir().join(format!("opentopia-read-window-{id}"));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let contents = format!("{}TAIL", "z".repeat(READ_FILE_WINDOW_CHARS + 500));
+        fs::write(workspace_root.join("long.txt"), &contents).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::Auto,
+        ));
+        let context = ToolContext::local(workspace_root.clone(), policy);
+
+        let first = ReadFileTool
+            .execute(
+                ToolCall::new("read_file", json!({ "path": "long.txt" })),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.metadata["offset"], 0);
+        assert_eq!(first.metadata["nextOffset"], READ_FILE_WINDOW_CHARS);
+        assert_eq!(first.metadata["totalChars"], contents.chars().count());
+        assert!(!first.output.contains("TAIL"));
+        assert!(first.output.contains("call read_file again with offset"));
+
+        let next = first.metadata["nextOffset"].as_u64().unwrap();
+        let second = ReadFileTool
+            .execute(
+                ToolCall::new("read_file", json!({ "path": "long.txt", "offset": next })),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(second.output.contains("TAIL"), "the tail must be reachable");
+        assert!(second.metadata["nextOffset"].is_null());
+
+        let bounded = ReadFileTool
+            .execute(
+                ToolCall::new("read_file", json!({ "path": "long.txt", "limit": 10 })),
+                context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bounded.metadata["nextOffset"], 10);
+
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
     #[tokio::test]
     async fn file_observation_tools_preserve_explicit_additional_readable_roots() {
         let id = Uuid::new_v4();

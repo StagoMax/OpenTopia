@@ -602,4 +602,50 @@ mod tests {
         assert_eq!(loaded[0].instructions.len(), MAX_SKILL_BYTES);
         assert!(loaded[0].truncated);
     }
+
+    /// The tail of a long Skill used to be unreachable: the reader reported
+    /// `truncated` and took no offset. Windowing is what makes "read the rest"
+    /// an operation instead of a rule the model has to apologize for.
+    #[test]
+    fn skill_windows_reach_the_end_of_a_file_longer_than_one_read() {
+        let dir = TestDir::new();
+        let body = "y".repeat(MAX_SKILL_BYTES + 512);
+        let content = format!("---\nname: Windowed\ndescription: Paged read\n---\n{body}");
+        dir.skill("windowed", &content);
+        let descriptor = discover_skills(Some(&dir.0))
+            .into_iter()
+            .find(|skill| skill.name == "Windowed")
+            .unwrap();
+
+        let mut collected = String::new();
+        let mut offset = 0;
+        let mut reads = 0;
+        loop {
+            let slice = load_skill_slice(Some(&dir.0), &descriptor.id, offset, MAX_SKILL_BYTES)
+                .expect("slice reads");
+            collected.push_str(&slice.instructions);
+            reads += 1;
+            assert_eq!(slice.total_bytes, content.len() as u64);
+            match slice.next_offset {
+                Some(next) => {
+                    assert!(next > offset, "offset must advance");
+                    offset = next;
+                }
+                None => break,
+            }
+            assert!(reads < 10, "windowing failed to terminate");
+        }
+
+        assert!(reads > 1, "the file should need more than one window");
+        assert_eq!(collected, content);
+
+        let first = load_skill_slice(Some(&dir.0), &descriptor.id, 0, MAX_SKILL_BYTES).unwrap();
+        assert_eq!(first.next_offset, Some(MAX_SKILL_BYTES as u64));
+        assert!(first.render_for_model().contains("Call read_skill again"));
+
+        let past_end =
+            load_skill_slice(Some(&dir.0), &descriptor.id, u64::MAX, MAX_SKILL_BYTES).unwrap();
+        assert!(past_end.instructions.is_empty());
+        assert_eq!(past_end.next_offset, None);
+    }
 }
