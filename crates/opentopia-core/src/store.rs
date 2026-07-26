@@ -4,6 +4,7 @@ use crate::model::{
     ArtifactStorage, ArtifactStorageMetadata, ExperienceMode, GoalAttemptStatus, GoalRecord,
     GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart,
     MessageRole, Project, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, Thread,
+    ThreadModelSelection,
     ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord, TurnStatus, UserInputRecord,
     UserInputRequest, UserInputResponse, UserInputStatus,
 };
@@ -80,6 +81,13 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         title: Option<String>,
         project_id: Option<Option<Uuid>>,
         archived: Option<bool>,
+    ) -> anyhow::Result<Option<Thread>>;
+    /// Pins the model a thread runs with. Passing `None` clears the pin so the
+    /// thread follows the active connection's default again.
+    fn set_thread_model_selection(
+        &self,
+        id: Uuid,
+        selection: Option<ThreadModelSelection>,
     ) -> anyhow::Result<Option<Thread>>;
     fn delete_thread(&self, id: Uuid) -> anyhow::Result<bool>;
     fn create_goal(
@@ -392,6 +400,7 @@ impl SqliteSessionStore {
                 project_id TEXT,
                 experience_mode TEXT NOT NULL DEFAULT 'code'
                     CHECK(experience_mode IN ('work', 'code')),
+                model_selection TEXT,
                 archived_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -763,6 +772,9 @@ impl SqliteSessionStore {
                 "ALTER TABLE threads ADD COLUMN experience_mode TEXT NOT NULL DEFAULT 'code' CHECK(experience_mode IN ('work', 'code'))",
                 [],
             )?;
+        }
+        if !table_has_column(&conn, "threads", "model_selection")? {
+            conn.execute("ALTER TABLE threads ADD COLUMN model_selection TEXT", [])?;
         }
         for (column, definition) in [
             ("agent_path", "TEXT NOT NULL DEFAULT ''"),
@@ -1297,7 +1309,7 @@ impl SessionStore for SqliteSessionStore {
         let thread = conn
             .query_row(
                 r#"
-                SELECT id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
+                SELECT id, title, workspace_root, project_id, archived_at, experience_mode, model_selection, created_at, updated_at
                 FROM threads
                 WHERE id = ?1
                 "#,
@@ -1319,13 +1331,13 @@ impl SessionStore for SqliteSessionStore {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let sql = if include_archived {
             r#"
-            SELECT id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
+            SELECT id, title, workspace_root, project_id, archived_at, experience_mode, model_selection, created_at, updated_at
             FROM threads
             ORDER BY updated_at DESC
             "#
         } else {
             r#"
-            SELECT id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
+            SELECT id, title, workspace_root, project_id, archived_at, experience_mode, model_selection, created_at, updated_at
             FROM threads
             WHERE archived_at IS NULL
             ORDER BY updated_at DESC
@@ -1384,6 +1396,32 @@ impl SessionStore for SqliteSessionStore {
                 thread.workspace_root.to_string_lossy(),
                 thread.project_id.map(|value| value.to_string()),
                 thread.archived_at.map(|value| value.to_rfc3339()),
+                thread.updated_at.to_rfc3339(),
+                id.to_string(),
+            ],
+        )?;
+        Ok(Some(thread))
+    }
+
+    fn set_thread_model_selection(
+        &self,
+        id: Uuid,
+        selection: Option<ThreadModelSelection>,
+    ) -> anyhow::Result<Option<Thread>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let Some(mut thread) = query_thread(&conn, id)? else {
+            return Ok(None);
+        };
+        thread.model_selection = selection;
+        thread.updated_at = Utc::now();
+        conn.execute(
+            r#"
+            UPDATE threads
+            SET model_selection = ?1, updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![
+                encode_model_selection(thread.model_selection.as_ref())?,
                 thread.updated_at.to_rfc3339(),
                 id.to_string(),
             ],
@@ -3091,9 +3129,9 @@ fn insert_thread(conn: &Connection, thread: &Thread) -> anyhow::Result<()> {
     conn.execute(
         r#"
         INSERT INTO threads (
-            id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
+            id, title, workspace_root, project_id, archived_at, experience_mode, model_selection, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         "#,
         params![
             thread.id.to_string(),
@@ -3102,6 +3140,7 @@ fn insert_thread(conn: &Connection, thread: &Thread) -> anyhow::Result<()> {
             thread.project_id.map(|id| id.to_string()),
             thread.archived_at.map(|value| value.to_rfc3339()),
             thread.experience_mode.as_str(),
+            encode_model_selection(thread.model_selection.as_ref())?,
             thread.created_at.to_rfc3339(),
             thread.updated_at.to_rfc3339(),
         ],
@@ -3112,7 +3151,7 @@ fn insert_thread(conn: &Connection, thread: &Thread) -> anyhow::Result<()> {
 fn query_thread(conn: &Connection, id: Uuid) -> anyhow::Result<Option<Thread>> {
     conn.query_row(
         r#"
-        SELECT id, title, workspace_root, project_id, archived_at, experience_mode, created_at, updated_at
+        SELECT id, title, workspace_root, project_id, archived_at, experience_mode, model_selection, created_at, updated_at
         FROM threads
         WHERE id = ?1
         "#,
@@ -3156,18 +3195,46 @@ fn map_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
             )),
         )
     })?;
+    let model_selection: Option<String> = row.get(6)?;
+    let model_selection = model_selection
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            serde_json::from_str::<ThreadModelSelection>(value).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        err.to_string(),
+                    )),
+                )
+            })
+        })
+        .transpose()?;
     Ok(Thread {
         id: parse_uuid(row.get(0)?, 0)?,
         title: row.get(1)?,
         workspace_root: PathBuf::from(row.get::<_, String>(2)?),
         project_id: project_id.map(|value| parse_uuid(value, 3)).transpose()?,
         experience_mode,
+        model_selection,
         archived_at: archived_at
             .map(|value| parse_datetime(value, 4))
             .transpose()?,
-        created_at: parse_datetime(row.get(6)?, 6)?,
-        updated_at: parse_datetime(row.get(7)?, 7)?,
+        created_at: parse_datetime(row.get(7)?, 7)?,
+        updated_at: parse_datetime(row.get(8)?, 8)?,
     })
+}
+
+fn encode_model_selection(
+    selection: Option<&ThreadModelSelection>,
+) -> anyhow::Result<Option<String>> {
+    selection
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {

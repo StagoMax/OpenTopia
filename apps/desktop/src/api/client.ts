@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  AgentRuntimeSettings,
   AppSettings,
   ArtifactContent,
   ArtifactDescriptor,
@@ -30,6 +31,7 @@ import type {
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
+  ProviderModelSyncResult,
   ProviderSettings,
   SandboxDescriptor,
   SkillDescriptor,
@@ -49,6 +51,7 @@ import type {
   TurnStatus,
   ThreadMcpServer,
   ThreadMcpServerView,
+  ThreadModelSelection,
   UserInputRecord,
   UserInputResponse,
   WorkspaceDiff,
@@ -140,6 +143,7 @@ export class ApiClient {
     model?: string;
     apiKeySource?: string;
     permissionMode?: PermissionMode;
+    agentRuntime?: AgentRuntimeSettings;
     defaultWorkspaceRoot?: string;
     clearDefaultWorkspaceRoot?: boolean;
     sandbox?: AppSettings["sandbox"];
@@ -200,6 +204,24 @@ export class ApiClient {
     return this.post("/api/provider/test", { providerId });
   }
 
+  /** Refreshes the cached model list for one connection from its API. */
+  async syncProviderModels(
+    providerId: string,
+  ): Promise<ProviderModelSyncResult> {
+    return this.post(
+      `/api/provider/${encodeURIComponent(providerId)}/models/sync`,
+      {},
+    );
+  }
+
+  /** Pins a model to a thread. Pass `null` to follow the active connection. */
+  async setThreadModel(
+    threadId: string,
+    selection: ThreadModelSelection | null,
+  ): Promise<Thread> {
+    return this.put(`/api/threads/${threadId}/model`, { selection });
+  }
+
   async listProjects(): Promise<Project[]> {
     return this.get("/api/projects");
   }
@@ -244,6 +266,17 @@ export class ApiClient {
     experienceMode?: ExperienceMode;
   }): Promise<Thread> {
     return this.post("/api/threads", input);
+  }
+
+  async generateThreadTitle(
+    threadId: string,
+    prompt: string,
+    expectedTitle: string,
+  ): Promise<{ thread: Thread; updated: boolean }> {
+    return this.post(`/api/threads/${threadId}/title`, {
+      prompt,
+      expectedTitle,
+    });
   }
 
   async updateThread(
@@ -1008,13 +1041,25 @@ export class ApiClient {
           await consumeSse(
             response.body,
             (data) => {
+              let sequence: unknown;
               try {
-                const sequence = JSON.parse(data)?.seq;
-                if (typeof sequence === "number") lastSequence = sequence;
+                sequence = JSON.parse(data)?.seq;
               } catch {
                 // Event payload validation remains the caller's responsibility.
               }
+              if (
+                typeof sequence === "number" &&
+                lastSequence !== undefined &&
+                sequence > lastSequence + 1
+              ) {
+                console.warn(
+                  `OpenTopia event stream skipped sequences ${lastSequence + 1}-${sequence - 1}; reconnecting to replay them`,
+                );
+                return false;
+              }
+              if (typeof sequence === "number") lastSequence = sequence;
               onData(data);
+              return true;
             },
             controller.signal,
           );
@@ -1034,7 +1079,7 @@ export class ApiClient {
 
 async function consumeSse(
   body: ReadableStream<Uint8Array>,
-  onData: (data: string) => void,
+  onData: (data: string) => boolean | void,
   signal: AbortSignal,
 ): Promise<void> {
   const reader = body.getReader();
@@ -1055,7 +1100,10 @@ async function consumeSse(
           .filter((line) => line.startsWith("data:"))
           .map((line) => line.slice(5).trimStart())
           .join("\n");
-        if (data) onData(data);
+        if (data && onData(data) === false) {
+          await reader.cancel("Reconnecting to recover missing events");
+          return;
+        }
         boundary = buffer.indexOf("\n\n");
       }
     }

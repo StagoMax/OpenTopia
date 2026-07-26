@@ -45,9 +45,25 @@ pub struct Thread {
     pub project_id: Option<Uuid>,
     #[serde(default)]
     pub experience_mode: ExperienceMode,
+    /// Model chosen for this conversation. Pinned at creation so a catalog
+    /// refresh never swaps the model mid-thread; `None` means "use the active
+    /// connection's default", which keeps pre-existing threads working.
+    #[serde(default)]
+    pub model_selection: Option<ThreadModelSelection>,
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A concrete model to run a thread with. The connection supplies the endpoint
+/// and credentials; this only narrows which model and how hard it thinks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadModelSelection {
+    pub connection_id: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +136,7 @@ impl Thread {
             workspace_root,
             project_id: None,
             experience_mode,
+            model_selection: None,
             archived_at: None,
             created_at: now,
             updated_at: now,

@@ -1,6 +1,9 @@
 export type ProviderImportFormat = "json" | "env" | "curl" | "unknown";
 
-export type ImportableProviderKind = "openai_compatible" | "openai_responses";
+export type ImportableProviderKind =
+  | "openai_compatible"
+  | "openai_responses"
+  | "anthropic";
 
 export type ProviderImportDraft = {
   /** Suggested stable identifier. Callers should resolve collisions before saving. */
@@ -16,7 +19,10 @@ export type ProviderImportDraft = {
 };
 
 export type ProviderImportPresetId =
-  "openai-compatible" | "openai-responses" | "ollama-local";
+  | "openai-compatible"
+  | "openai-responses"
+  | "anthropic-messages"
+  | "ollama-local";
 
 export type ProviderImportPreset = {
   id: ProviderImportPresetId;
@@ -30,7 +36,7 @@ export type ProviderImportPreset = {
 export const PROVIDER_IMPORT_PRESETS: readonly ProviderImportPreset[] = [
   {
     id: "openai-compatible",
-    name: "OpenAI Compatible",
+    name: "OpenAI Chat Completions",
     description: "Any service exposing the OpenAI Chat Completions API.",
     kind: "openai_compatible",
     baseUrl: "https://api.openai.com/v1",
@@ -38,11 +44,19 @@ export const PROVIDER_IMPORT_PRESETS: readonly ProviderImportPreset[] = [
   },
   {
     id: "openai-responses",
-    name: "OpenAI Responses",
+    name: "OpenAI Responses (native)",
     description: "OpenAI's Responses API with reasoning and response storage.",
     kind: "openai_responses",
     baseUrl: "https://api.openai.com/v1",
     model: "gpt-4.1-mini",
+  },
+  {
+    id: "anthropic-messages",
+    name: "Anthropic Messages",
+    description: "Anthropic's native Messages API. This is not OpenAI-compatible.",
+    kind: "anthropic",
+    baseUrl: "https://api.anthropic.com",
+    model: "claude-sonnet-4-20250514",
   },
   {
     id: "ollama-local",
@@ -83,6 +97,10 @@ const KEY_ALIASES = {
     "openaiapibase",
     "openaiapiurl",
     "openaiendpoint",
+    "anthropicbaseurl",
+    "anthropicapibase",
+    "anthropicapiurl",
+    "anthropicendpoint",
     "providerbaseurl",
     "baseurl",
     "apibaseurl",
@@ -95,6 +113,7 @@ const KEY_ALIASES = {
     "opentopiamodel",
     "openaimodel",
     "openaimodelname",
+    "anthropicmodel",
     "providermodel",
     "modelname",
     "model",
@@ -102,6 +121,7 @@ const KEY_ALIASES = {
   apiKey: [
     "opentopiaapikey",
     "openaiapikey",
+    "anthropicapikey",
     "providerapikey",
     "bearertoken",
     "accesstoken",
@@ -333,6 +353,9 @@ function candidatesFromEntries(entries: FlatEntry[]): CandidateValues {
         entry.normalizedKey,
       ) && entry.value === true,
   );
+  const anthropicVersion = entries.some(
+    (entry) => entry.normalizedKey === "anthropicversion",
+  );
 
   return {
     id: toOptionalString(findEntry(entries, KEY_ALIASES.id), false),
@@ -341,6 +364,7 @@ function candidatesFromEntries(entries: FlatEntry[]): CandidateValues {
       toOptionalString(kindValue, false),
       undefined,
       Boolean(responseFlag),
+      anthropicVersion,
     ),
     baseUrl: toOptionalString(findEntry(entries, KEY_ALIASES.baseUrl), false),
     model: toOptionalString(findEntry(entries, KEY_ALIASES.model), false),
@@ -427,7 +451,7 @@ function normalizeBaseUrl(
       );
     } else {
       url.pathname = url.pathname.replace(
-        /\/(?:chat\/completions|responses|models)\/?$/i,
+        /\/(?:chat\/completions|responses|models|v1\/messages)\/?$/i,
         "",
       );
     }
@@ -445,8 +469,17 @@ function inferKind(
   rawKind: ImportableProviderKind | string | undefined,
   url?: string,
   responseFlag = false,
+  anthropicFlag = false,
 ): ImportableProviderKind | undefined {
   const value = rawKind?.toLowerCase().replace(/[^a-z]/g, "") ?? "";
+  if (
+    anthropicFlag ||
+    value.includes("anthropic") ||
+    /(?:^|\.)anthropic\.com(?:[/:?#]|$)/i.test(url ?? "") ||
+    /\/v1\/messages(?:[/?#]|$)/i.test(url ?? "")
+  ) {
+    return "anthropic";
+  }
   if (
     responseFlag ||
     value.includes("response") ||
@@ -623,6 +656,7 @@ function suggestNameFromUrl(
     if (host === "api.openai.com") {
       return kind === "openai_responses" ? "OpenAI Responses" : "OpenAI";
     }
+    if (host === "api.anthropic.com") return "Anthropic Messages";
     if (
       host === "localhost" ||
       host === "127.0.0.1" ||
@@ -645,6 +679,9 @@ function suggestNameFromUrl(
 function defaultModelFor(baseUrl: string): string {
   try {
     const url = new URL(baseUrl);
+    if (url.hostname.toLowerCase() === "api.anthropic.com") {
+      return getProviderImportPreset("anthropic-messages").model;
+    }
     if (
       url.port === "11434" &&
       ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"].includes(

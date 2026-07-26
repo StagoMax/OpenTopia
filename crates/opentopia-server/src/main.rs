@@ -12,36 +12,38 @@ use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    browser_domain_approval_action, browser_domain_from_approval_action, browser_domain_from_url,
-    browser_domain_is_approved, build_local_sandbox_command, content_fingerprint,
-    default_agent_model_context, discover_plugins, discover_skills, execute_git_workflow,
-    install_plugin, load_context_sources, load_plugin_mcp_servers, load_selected_skills,
+    agent_model_context_with_runtime, browser_domain_approval_action,
+    browser_domain_from_approval_action, browser_domain_from_url, browser_domain_is_approved,
+    build_local_sandbox_command, content_fingerprint, discover_plugins, discover_skills,
+    execute_git_workflow, experience_mode_module, install_plugin, load_context_sources,
+    load_plugin_mcp_servers, load_selected_skills, permission_policy_module,
     redact_model_observation, resolve_instruction_documents, uninstall_plugin,
     world_state_catalog_item, world_state_item, AgentContextBudget, AgentContinuation, AgentCore,
-    AgentEvent, AgentEventPayload, AgentProfileRegistry, AgentTurnInput, AgentTurnOutcome,
-    AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata, BasicPolicyEngine,
-    BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
-    BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
-    BrowserObserveOptions, BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector,
-    BrowserSessionId, BrowserWaitCondition, BrowserWaitRequest, ChangedFile,
-    CodexAppServerProvider, CollaborationMode, CompiledModelContext, ComputerRuntime,
-    ComputerRuntimeConfig, ComputerSessionId, ContextCacheScope, ContextItemKind, ContextRole,
-    ContextSensitivity, ContextSourcePolicy, ContextSourceRef, ContextSummary,
-    DesktopBrowserRuntime, ExecRequest, ExecutionContext, ExperienceMode, GitWorkflowAction,
-    GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill, LocalBrowserRuntime,
-    LocalComputerRuntime, LocalExecutionEnvironment, McpCallResult, McpServerConfig,
-    McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole, ModelContentPart,
-    ModelContextItem, ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest,
-    ObserveOptions, OpenAiCompatibleProvider, OpenAiResponsesProvider, PermissionMode,
-    PluginDescriptor, PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError,
-    PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderConversationCursor,
-    ProviderConversationState, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
-    ProviderTransportEvent, ResolvedPreview, ResourceLimit, SandboxDescriptor, SandboxSettings,
+    AgentEvent, AgentEventPayload, AgentProfileRegistry, AgentRuntimeSettings, AgentTurnInput,
+    AgentTurnOutcome, AnthropicMessagesProvider, AppSettings, Approval, ApprovalStatus, Artifact,
+    ArtifactMetadata, BasicPolicyEngine, BrowserAction, BrowserActionReceipt, BrowserContent,
+    BrowserDownloadRequest, BrowserNavigateRequest, BrowserNodeRef, BrowserObservation,
+    BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserRuntime,
+    BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
+    BrowserWaitRequest, ChangedFile, CodexAppServerProvider, CollaborationMode,
+    CompiledModelContext, ComputerRuntime, ComputerRuntimeConfig, ComputerSessionId,
+    ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity, ContextSourcePolicy,
+    ContextSourceRef, ContextSummary, DesktopBrowserRuntime, ExecRequest, ExecutionContext,
+    ExperienceMode, GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus,
+    LoadedSkill, LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment,
+    McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart,
+    MessageRole, ModelContentPart, ModelContextItem, ModelConversationMessage,
+    ModelConversationRole, ModelProvider, ModelRequest, ObserveOptions, OpenAiCompatibleProvider,
+    OpenAiResponsesProvider, PermissionMode, PluginDescriptor, PluginError, PolicyDecision,
+    PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest,
+    PreviewTarget, PreviewWorkbook, ProviderConversationCursor, ProviderConversationState,
+    ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent,
+    ResolvedPreview, ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxSettings,
     SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
     SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
     SubagentScope, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot,
-    ThreadMcpServer, ToolCall, ToolPermissionDescriptor, ToolResult, TurnChangeSet,
-    TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus, UserInputRecord,
+    ThreadMcpServer, ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult,
+    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus, UserInputRecord,
     UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff, WorkspaceDiffHunk,
     WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
     WorldStateSkill, WorldStateSnapshot, MAX_PREVIEW_CONTENT_BYTES,
@@ -307,7 +309,13 @@ fn build_router(state: AppState) -> Router {
         .route("/api/threads/:thread_id/plugins", put(set_thread_plugin))
         .route("/api/provider/health", get(provider_health))
         .route("/api/provider/test", post(test_provider_connection))
+        .route(
+            "/api/provider/:provider_id/models/sync",
+            post(sync_provider_models),
+        )
+        .route("/api/threads/:thread_id/model", put(set_thread_model))
         .route("/api/threads", get(list_threads).post(create_thread))
+        .route("/api/threads/:thread_id/title", post(generate_thread_title))
         .route(
             "/api/threads/:thread_id",
             patch(update_thread).delete(delete_thread),
@@ -1129,6 +1137,9 @@ async fn update_settings(
     if let Some(permission_mode) = request.permission_mode {
         settings.permission_mode = permission_mode;
     }
+    if let Some(agent_runtime) = request.agent_runtime {
+        settings.agent_runtime = agent_runtime;
+    }
     if request.clear_default_workspace_root.unwrap_or(false) {
         settings.default_workspace_root = None;
     } else if let Some(default_workspace_root) = request.default_workspace_root {
@@ -1136,6 +1147,16 @@ async fn update_settings(
     }
     if let Some(sandbox) = request.sandbox {
         settings.sandbox = sandbox;
+    }
+    validate_provider_settings(&settings.providers)?;
+    if !settings
+        .providers
+        .iter()
+        .any(|provider| provider.id == settings.active_provider_id)
+    {
+        return Err(ApiError::bad_request(
+            "active provider must reference a configured provider",
+        ));
     }
     let settings = state.store.save_settings(settings)?;
     {
@@ -1438,12 +1459,171 @@ async fn test_provider_connection(
         }
         ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(provider_settings)
             .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(provider_settings)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
         ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(provider_settings)
             .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
     }
     .ok_or_else(|| ApiError::bad_request("provider is not configured"))?;
     let result = provider.check_health().await?;
     Ok(Json(result))
+}
+
+/// Fetches the model ids a connection actually serves and caches them on the
+/// connection. Relay endpoints ("中转站") front many vendors behind one key, so
+/// this is what turns a single credential into a browsable model list.
+async fn sync_provider_models(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+) -> Result<Json<ProviderModelSyncResult>, ApiError> {
+    let settings = current_settings(&state);
+    let provider = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| ApiError::not_found(format!("provider not found: {provider_id}")))?
+        .clone();
+
+    if provider.kind == ProviderKind::Mock {
+        return Err(ApiError::bad_request(
+            "mock provider has no remote model list",
+        ));
+    }
+
+    let api_key = std::env::var(&provider.api_key_source)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "provider '{}' has no configured API key",
+                provider.id
+            ))
+        })?;
+
+    let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+    let mut request = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(20));
+    // Anthropic authenticates with `x-api-key`; everything else uses Bearer.
+    request = if provider.kind == ProviderKind::Anthropic {
+        request
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+    };
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("model list request failed: {error}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("model list read failed: {error}")))?;
+    if !status.is_success() {
+        return Err(ApiError::bad_gateway(format!(
+            "model list request returned {status}: {}",
+            truncate_chars(body.trim(), 300)
+        )));
+    }
+    let payload: Value = serde_json::from_str(&body).map_err(|error| {
+        ApiError::bad_gateway(format!("model list response was not valid JSON: {error}"))
+    })?;
+
+    let mut models = extract_model_ids(&payload);
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        return Err(ApiError::bad_gateway(
+            "model list response contained no model ids",
+        ));
+    }
+
+    let synced_at = Utc::now();
+    let mut settings = current_settings(&state);
+    let Some(target) = settings
+        .providers
+        .iter_mut()
+        .find(|candidate| candidate.id == provider_id)
+    else {
+        return Err(ApiError::not_found(format!(
+            "provider not found: {provider_id}"
+        )));
+    };
+    target.synced_models = models.clone();
+    target.models_synced_at = Some(synced_at);
+    let settings = state.store.save_settings(settings)?;
+    {
+        let mut settings_guard = state.settings.write().expect("settings lock poisoned");
+        *settings_guard = settings;
+    }
+
+    Ok(Json(ProviderModelSyncResult {
+        provider_id,
+        models,
+        synced_at,
+    }))
+}
+
+/// Accepts both the OpenAI (`{"data":[{"id":...}]}`) and Anthropic
+/// (`{"data":[{"id":...}]}`) shapes, plus the bare arrays some relays return.
+fn extract_model_ids(payload: &Value) -> Vec<String> {
+    let entries = payload
+        .get("data")
+        .or_else(|| payload.get("models"))
+        .or(Some(payload));
+    let Some(entries) = entries.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Value::String(id) => Some(id.clone()),
+            Value::Object(_) => entry
+                .get("id")
+                .or_else(|| entry.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// Pins (or clears) the model a thread runs with.
+async fn set_thread_model(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(request): Json<ThreadModelRequest>,
+) -> Result<Json<opentopia_core::Thread>, ApiError> {
+    let selection = match request.selection {
+        Some(selection) => {
+            let settings = current_settings(&state);
+            if !settings
+                .providers
+                .iter()
+                .any(|provider| provider.id == selection.connection_id)
+            {
+                return Err(ApiError::bad_request(format!(
+                    "unknown connection: {}",
+                    selection.connection_id
+                )));
+            }
+            if selection.model_id.trim().is_empty() {
+                return Err(ApiError::bad_request("modelId cannot be empty"));
+            }
+            Some(selection)
+        }
+        None => None,
+    };
+    state
+        .store
+        .set_thread_model_selection(thread_id, selection)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))
 }
 
 async fn list_threads(
@@ -1486,6 +1666,145 @@ async fn create_thread(
         )?
     };
     Ok(Json(thread))
+}
+
+async fn generate_thread_title(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(request): Json<GenerateThreadTitleRequest>,
+) -> Result<Json<GenerateThreadTitleResponse>, ApiError> {
+    let current = state
+        .store
+        .get_thread(thread_id)?
+        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
+    if current.title != request.expected_title {
+        return Ok(Json(GenerateThreadTitleResponse {
+            thread: current,
+            updated: false,
+        }));
+    }
+
+    let title = summarize_thread_title(&state, &request.prompt).await?;
+    let latest = state
+        .store
+        .get_thread(thread_id)?
+        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
+    if latest.title != request.expected_title {
+        return Ok(Json(GenerateThreadTitleResponse {
+            thread: latest,
+            updated: false,
+        }));
+    }
+
+    let thread = state
+        .store
+        .update_thread(thread_id, Some(title), None, None)?
+        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
+    Ok(Json(GenerateThreadTitleResponse {
+        thread,
+        updated: true,
+    }))
+}
+
+async fn summarize_thread_title(state: &AppState, prompt: &str) -> Result<String, ApiError> {
+    const TITLE_PROMPT_LIMIT: usize = 12_000;
+
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err(ApiError::bad_request("thread title prompt cannot be empty"));
+    }
+
+    let settings = current_settings(state);
+    let mut active = settings.active_provider().clone();
+    if active.kind == ProviderKind::Mock {
+        return Err(ApiError::bad_request(
+            "thread title generation requires a configured model provider",
+        ));
+    }
+    active.temperature = active.temperature.min(0.2);
+    active.max_output_tokens = Some(active.max_output_tokens.unwrap_or(64).min(64));
+    let provider: Box<dyn ModelProvider> = match active.kind {
+        ProviderKind::Mock => None,
+        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(&active)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(&active)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(&active)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(&active)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+    }
+    .ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "provider '{}' has no configured API key",
+            active.id
+        ))
+    })?;
+    let request = ModelRequest {
+        system_prompt: "Create a concise sidebar title for the user's first message. Use the same language as the user and preserve specific product, file, and error names. Return only the title: no quotes, Markdown, label, or trailing punctuation. The title must contain at most 20 Unicode characters."
+            .to_string(),
+        conversation: Vec::new(),
+        user_message: truncate_chars(prompt, TITLE_PROMPT_LIMIT),
+        user_content: Vec::new(),
+        tool_candidates: Vec::new(),
+        previous_tool_calls: Vec::new(),
+        tool_results: Vec::new(),
+        context_items: Vec::new(),
+        previous_response_items: Vec::new(),
+        previous_response_id: None,
+        branch_developer_instructions: None,
+        prompt_cache_key: None,
+        final_output_json_schema: None,
+    };
+    let response = timeout(Duration::from_secs(45), provider.complete(request))
+        .await
+        .map_err(|_| ApiError::gateway_timeout("thread title generation timed out"))?
+        .map_err(|error| {
+            ApiError::bad_gateway(format!("thread title generation failed: {error}"))
+        })?;
+    normalize_generated_thread_title(&response.text)
+        .ok_or_else(|| ApiError::bad_gateway("thread title provider returned an empty title"))
+}
+
+const MAX_THREAD_TITLE_CHARS: usize = 20;
+
+fn normalize_generated_thread_title(response: &str) -> Option<String> {
+    response.lines().find_map(|line| {
+        let mut title = line.trim();
+        if title.is_empty() || title == "```" {
+            return None;
+        }
+        title = title.trim_start_matches(['#', '-', '*', ' ']);
+        for prefix in ["Title:", "Title：", "标题:", "标题："] {
+            if let Some(value) = title.strip_prefix(prefix) {
+                title = value.trim();
+                break;
+            }
+        }
+        title = title
+            .trim_matches('`')
+            .trim_matches('*')
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim_matches('“')
+            .trim_matches('”')
+            .trim_matches('「')
+            .trim_matches('」')
+            .trim();
+        if title.is_empty() {
+            return None;
+        }
+        let chars = title.chars().collect::<Vec<_>>();
+        if chars.len() <= MAX_THREAD_TITLE_CHARS {
+            return Some(title.to_string());
+        }
+        let mut shortened = chars
+            .into_iter()
+            .take(MAX_THREAD_TITLE_CHARS - 1)
+            .collect::<String>();
+        shortened.push('…');
+        Some(shortened)
+    })
 }
 
 async fn update_thread(
@@ -4964,6 +5283,11 @@ async fn run_new_agent_turn(
     let _workspace_guard = state.turn_changes.lock_workspace(&workspace_root).await;
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
+    // The thread's pinned model wins over the globally active connection, so a
+    // settings change never swaps the model mid-conversation.
+    if thread.model_selection.is_some() {
+        agent.set_provider_from_settings_with_model(&settings, thread.model_selection.as_ref());
+    }
     if let Err(error) = agent.apply_collaboration_mode(collaboration_mode, goal.clone()) {
         let message = error.to_string();
         publish_payload(
@@ -5266,6 +5590,16 @@ async fn run_resumed_agent_turn(
     let _workspace_guard = state.turn_changes.lock_workspace(&workspace_root).await;
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
+    // Continuations must stay on the model the conversation started with.
+    if let Some(selection) = state
+        .store
+        .get_thread(thread_id)
+        .ok()
+        .flatten()
+        .and_then(|thread| thread.model_selection)
+    {
+        agent.set_provider_from_settings_with_model(&settings, Some(&selection));
+    }
     if let Err(error) = agent.apply_collaboration_mode(collaboration_mode, goal.clone()) {
         let message = error.to_string();
         publish_payload(
@@ -5716,7 +6050,7 @@ fn turn_context_reservation(
     current_text: &str,
     current_content: &[ModelContentPart],
 ) -> TurnContextReservation {
-    let context_window = settings.active_provider().context_window_tokens.max(4_096);
+    let context_window = settings.active_provider().resolved_context_window_tokens();
     let model_context_tokens = model_context
         .items
         .iter()
@@ -5757,6 +6091,88 @@ fn turn_context_reservation(
     }
 }
 
+/// Maximum individual paths listed in the per-turn git status summary.
+const MAX_GIT_STATUS_ENTRIES: usize = 40;
+
+/// Condense `git status --short --branch` into a bounded summary.
+///
+/// The raw output is re-sent on every turn and grows with the size of the
+/// working tree, which makes it the largest volatile part of the prompt. The
+/// model needs to know the branch, roughly what is dirty, and which paths are
+/// involved; it does not need an unbounded file listing, and it can always run
+/// git itself for the full picture.
+fn condense_git_status(raw: &str, max_entries: usize) -> String {
+    let mut branch = None;
+    let mut entries = Vec::new();
+    let mut staged = 0usize;
+    let mut unstaged = 0usize;
+    let mut untracked = 0usize;
+    let mut conflicted = 0usize;
+
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("##") {
+            branch = Some(rest.trim().to_string());
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let code = line.chars().take(2).collect::<String>();
+        let index = code.chars().next().unwrap_or(' ');
+        let worktree = code.chars().nth(1).unwrap_or(' ');
+        if code == "??" {
+            untracked += 1;
+        } else if index == 'U' || worktree == 'U' || code == "AA" || code == "DD" {
+            conflicted += 1;
+        } else {
+            if index != ' ' {
+                staged += 1;
+            }
+            if worktree != ' ' {
+                unstaged += 1;
+            }
+        }
+        entries.push(line.trim_end().to_string());
+    }
+
+    let mut parts = Vec::new();
+    if let Some(branch) = branch {
+        parts.push(format!("branch {branch}"));
+    }
+    let mut counts = Vec::new();
+    if staged > 0 {
+        counts.push(format!("{staged} staged"));
+    }
+    if unstaged > 0 {
+        counts.push(format!("{unstaged} unstaged"));
+    }
+    if untracked > 0 {
+        counts.push(format!("{untracked} untracked"));
+    }
+    if conflicted > 0 {
+        counts.push(format!("{conflicted} conflicted"));
+    }
+    parts.push(if counts.is_empty() {
+        "clean working tree".to_string()
+    } else {
+        counts.join(", ")
+    });
+
+    let mut summary = parts.join("; ");
+    if !entries.is_empty() {
+        let shown = entries.len().min(max_entries);
+        summary.push('\n');
+        summary.push_str(&entries[..shown].join("\n"));
+        if entries.len() > shown {
+            summary.push_str(&format!(
+                "\n… and {} more changed paths; run git status for the full list",
+                entries.len() - shown
+            ));
+        }
+    }
+    truncate_with_flag(&summary, 4_000).0
+}
+
 struct BuiltTurnModelContext {
     context: CompiledModelContext,
     thread_snapshot: ThreadContextSnapshot,
@@ -5777,15 +6193,14 @@ async fn build_turn_model_context(
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let sandbox = settings.sandbox.to_local_sandbox_config();
-    let mut context = default_agent_model_context(&cwd, &sandbox);
-    context.items.push(ModelContextItem::text(
-        ContextItemKind::DeveloperInstructions,
-        ContextRole::Developer,
-        "opentopia:experience_mode",
-        experience_mode_instruction(experience_mode),
-        ContextCacheScope::Thread,
-        ContextSensitivity::Public,
-    ));
+    let runtime_capabilities = agent.prompt_runtime_capabilities(RuntimeSurface::Desktop);
+    let mut context = agent_model_context_with_runtime(
+        &cwd,
+        &sandbox,
+        &settings.agent_runtime,
+        runtime_capabilities,
+    );
+    context.items.push(experience_mode_module(experience_mode));
     let instruction_resolution = resolve_instruction_documents(&cwd, &cwd);
     let instruction_refs = instruction_resolution
         .documents
@@ -5810,21 +6225,14 @@ async fn build_turn_model_context(
                 "bytes": document.bytes,
             }))
         }));
-    context.items.push(ModelContextItem::text(
-        ContextItemKind::Environment,
-        ContextRole::Developer,
-        "opentopia:permissions",
-        format!(
-            "Permission mode: {}\nSandbox mode: {}\nNetwork policy: {}",
-            permission_mode_name(settings.permission_mode),
-            settings.sandbox.sandbox_mode.as_str(),
-            serde_json::to_value(settings.sandbox.network)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_string))
-                .unwrap_or_else(|| "unknown".to_string())
-        ),
-        ContextCacheScope::Thread,
-        ContextSensitivity::Workspace,
+    let network_policy = serde_json::to_value(settings.sandbox.network)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    context.items.push(permission_policy_module(
+        permission_mode_name(settings.permission_mode),
+        settings.sandbox.sandbox_mode.as_str(),
+        &network_policy,
     ));
 
     let tool_catalog = agent.provider_tool_catalog();
@@ -5898,7 +6306,7 @@ async fn build_turn_model_context(
     )
     .await
     .ok()
-    .map(|value| truncate_with_flag(&value, 16_000).0)
+    .map(|value| condense_git_status(&value, MAX_GIT_STATUS_ENTRIES))
     .filter(|value| !value.trim().is_empty());
     let local_now = Local::now();
     let world_state = WorldStateSnapshot {
@@ -5926,6 +6334,14 @@ async fn build_turn_model_context(
                 .iter()
                 .map(|skill| skill.descriptor.id.clone())
                 .collect::<Vec<_>>(),
+            "agentRuntime": settings.agent_runtime,
+            "agentRuntimeHash": settings.agent_runtime.content_hash(),
+            "promptRuntime": {
+                "surface": runtime_capabilities.surface.as_str(),
+                "multiAgentAvailable": runtime_capabilities.multi_agent_available,
+                "maxParallelAgents": runtime_capabilities.max_parallel_agents,
+                "requestUserInputAvailable": runtime_capabilities.request_user_input_available,
+            },
         }),
     };
     let world_state_hash = world_state.content_hash();
@@ -5936,10 +6352,14 @@ async fn build_turn_model_context(
             ContextRole::Developer,
             skill.descriptor.path.display().to_string(),
             skill.render_for_model(),
-            ContextCacheScope::Turn,
+            // Selected skills change rarely within a thread. Keeping them in the
+            // thread-scoped block puts this large payload ahead of the volatile
+            // world state so it stays inside the cached prefix.
+            ContextCacheScope::Thread,
             ContextSensitivity::Workspace,
         )
         .with_metadata(json!({
+            "preloaded": true,
             "skillId": skill.descriptor.id,
             "pluginId": skill.descriptor.plugin_id,
             "name": skill.descriptor.name,
@@ -5953,12 +6373,13 @@ async fn build_turn_model_context(
             "opentopia-{}",
             content_fingerprint(
                 format!(
-                    "{}\n{}\n{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}\n{}",
                     active.id,
                     active.model,
                     active.kind.as_str(),
                     cwd.display(),
-                    experience_mode.as_str()
+                    experience_mode.as_str(),
+                    settings.agent_runtime.content_hash(),
                 )
                 .as_bytes()
             )
@@ -6037,17 +6458,6 @@ fn thread_context_snapshot_changed(
         || previous.context_hash != current.context_hash
 }
 
-fn experience_mode_instruction(mode: ExperienceMode) -> &'static str {
-    match mode {
-        ExperienceMode::Work => {
-            "Experience mode: Work. This mode changes collaboration and presentation only; it does not change the available tool catalog, tool eligibility, permissions, sandbox, or supported artifact types. Freely use code, shell, browser, documents, spreadsheets, presentations, previews, and every other available capability when they help. Collaborate in terms of the user's goal, progress, sources, artifacts, and finished outputs. Lead with the outcome, keep implementation details concise by default, and expand technical details when the user asks or when they are necessary to make a decision."
-        }
-        ExperienceMode::Code => {
-            "Experience mode: Code. This mode changes collaboration and presentation only; it does not change the available tool catalog, tool eligibility, permissions, sandbox, or supported artifact types. Freely use documents, spreadsheets, presentations, previews, browser, shell, code, and every other available capability when they help. Collaborate in implementation terms: foreground relevant files, commands, diffs, tests, verification, and technical tradeoffs while still leading with the completed outcome."
-        }
-    }
-}
-
 #[cfg(test)]
 mod experience_mode_tests {
     use super::*;
@@ -6055,15 +6465,50 @@ mod experience_mode_tests {
     #[test]
     fn experience_modes_change_presentation_without_changing_capabilities() {
         for mode in [ExperienceMode::Work, ExperienceMode::Code] {
-            let instruction = experience_mode_instruction(mode);
-            assert!(instruction.contains("does not change the available tool catalog"));
+            let instruction = experience_mode_module(mode).text_content().to_string();
+            assert!(instruction.contains("changes collaboration and presentation"));
             assert!(instruction.contains("permissions"));
             assert!(instruction.contains("sandbox"));
         }
-        assert!(experience_mode_instruction(ExperienceMode::Work)
+        assert!(experience_mode_module(ExperienceMode::Work)
+            .text_content()
             .contains("goal, progress, sources, artifacts, and finished outputs"));
-        assert!(experience_mode_instruction(ExperienceMode::Code)
+        assert!(experience_mode_module(ExperienceMode::Code)
+            .text_content()
             .contains("files, commands, diffs, tests, verification"));
+    }
+
+    #[test]
+    fn git_status_summary_keeps_branch_counts_and_bounds_the_path_list() {
+        let mut raw = String::from("## main...origin/main [ahead 1]\n");
+        raw.push_str(" M crates/core/src/agent.rs\n");
+        raw.push_str("A  crates/core/src/new.rs\n");
+        raw.push_str("?? scratch.txt\n");
+        raw.push_str("UU crates/core/src/conflict.rs\n");
+
+        let summary = condense_git_status(&raw, 40);
+        assert!(summary.contains("branch main...origin/main [ahead 1]"));
+        assert!(summary.contains("1 staged"));
+        assert!(summary.contains("1 unstaged"));
+        assert!(summary.contains("1 untracked"));
+        assert!(summary.contains("1 conflicted"));
+        assert!(summary.contains("crates/core/src/agent.rs"));
+
+        let mut many = String::from("## main\n");
+        for index in 0..100 {
+            many.push_str(&format!(" M crates/core/src/file{index}.rs\n"));
+        }
+        let bounded = condense_git_status(&many, 40);
+        assert!(bounded.contains("… and 60 more changed paths"));
+        assert!(bounded.contains("file0.rs"));
+        assert!(!bounded.contains("file99.rs"));
+        assert!(bounded.len() < many.len());
+    }
+
+    #[test]
+    fn git_status_summary_reports_a_clean_tree() {
+        let summary = condense_git_status("## main...origin/main\n", 40);
+        assert!(summary.contains("clean working tree"));
     }
 }
 
@@ -6314,17 +6759,9 @@ fn message_token_estimate(message: &Message) -> usize {
 }
 
 fn context_window_tokens(state: &AppState) -> usize {
-    let configured = current_settings(state)
+    current_settings(state)
         .active_provider()
-        .context_window_tokens;
-    if configured >= 4_096 {
-        return configured;
-    }
-    std::env::var("OPENTOPIA_CONTEXT_WINDOW_TOKENS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value >= 4_096)
-        .unwrap_or(128_000)
+        .resolved_context_window_tokens()
 }
 
 fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiError> {
@@ -6346,6 +6783,15 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
         {
             return Err(ApiError::bad_request(
                 "provider IDs may contain only letters, numbers, dots, underscores, and hyphens",
+            ));
+        }
+        let name = provider.name.trim();
+        if (!provider.name.is_empty() && name.is_empty())
+            || name.chars().count() > 80
+            || name.chars().any(char::is_control)
+        {
+            return Err(ApiError::bad_request(
+                "provider names must contain 1 to 80 visible characters",
             ));
         }
         if provider.kind != ProviderKind::CodexAppServer {
@@ -6371,13 +6817,17 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
                 "max output tokens must be greater than zero",
             ));
         }
-        if provider.context_window_tokens < 4_096 {
+        if provider
+            .context_window_tokens
+            .is_some_and(|tokens| tokens < 4_096)
+        {
             return Err(ApiError::bad_request(
                 "context window must be at least 4096 tokens",
             ));
         }
         if let Some(threshold) = provider.responses_compaction_threshold_tokens {
-            if threshold < 4_096 || threshold as usize >= provider.context_window_tokens {
+            if threshold < 4_096 || threshold as usize >= provider.resolved_context_window_tokens()
+            {
                 return Err(ApiError::bad_request(
                     "native compaction threshold must be at least 4096 tokens and below the context window",
                 ));
@@ -6533,6 +6983,8 @@ async fn generate_context_summary(
         ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(&active)
             .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
         ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(&active)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(&active)
             .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
         ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(&active)
             .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
@@ -7274,6 +7726,7 @@ struct SettingsPatchRequest {
     model: Option<String>,
     api_key_source: Option<String>,
     permission_mode: Option<PermissionMode>,
+    agent_runtime: Option<AgentRuntimeSettings>,
     default_workspace_root: Option<PathBuf>,
     clear_default_workspace_root: Option<bool>,
     sandbox: Option<SandboxSettings>,
@@ -7283,6 +7736,23 @@ struct SettingsPatchRequest {
 #[serde(rename_all = "camelCase")]
 struct ProviderTestRequest {
     provider_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderModelSyncResult {
+    provider_id: String,
+    models: Vec<String>,
+    synced_at: DateTime<Utc>,
+}
+
+/// `selection: null` clears the pin and returns the thread to the active
+/// connection's default model.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadModelRequest {
+    #[serde(default)]
+    selection: Option<ThreadModelSelection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -7326,6 +7796,20 @@ struct CreateThreadRequest {
     project_id: Option<Uuid>,
     #[serde(default)]
     experience_mode: ExperienceMode,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateThreadTitleRequest {
+    prompt: String,
+    expected_title: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateThreadTitleResponse {
+    thread: opentopia_core::Thread,
+    updated: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -7964,6 +8448,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generated_thread_titles_are_plain_and_unicode_bounded() {
+        assert_eq!(
+            normalize_generated_thread_title("**标题：修复侧栏标题滚动**\nextra"),
+            Some("修复侧栏标题滚动".to_string())
+        );
+        let title =
+            normalize_generated_thread_title("This generated title is intentionally much too long")
+                .expect("normalized title");
+        assert_eq!(title.chars().count(), MAX_THREAD_TITLE_CHARS);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn generated_thread_title_skips_empty_model_preamble_lines() {
+        assert_eq!(
+            normalize_generated_thread_title("```\n\n\"OpenTopia 标题规则\"\n```"),
+            Some("OpenTopia 标题规则".to_string())
+        );
+        assert_eq!(normalize_generated_thread_title(" \n```\n"), None);
+    }
+
+    #[test]
     fn plugin_mcp_identity_is_stable_and_source_specific() {
         let workspace = short_plugin_identity("workspace:C:/repo/.codex-plugin/plugin.json");
         assert_eq!(workspace.len(), 8);
@@ -8071,10 +8577,11 @@ mod tests {
     fn provider_settings_validate_generation_limits_and_ids() {
         let mut provider = ProviderSettings::default();
         provider.id = "custom-glm".to_string();
+        provider.name = "Custom GLM".to_string();
         provider.base_url = "https://example.test/v1".to_string();
         provider.temperature = 0.7;
         provider.max_output_tokens = Some(8_192);
-        provider.context_window_tokens = 128_000;
+        provider.context_window_tokens = Some(128_000);
         provider.reasoning_effort = Some("high".to_string());
         validate_provider_settings(&[provider.clone()]).expect("valid provider settings");
 
@@ -8084,7 +8591,7 @@ mod tests {
 
         let mut provider = ProviderSettings::default();
         provider.kind = ProviderKind::OpenAiResponses;
-        provider.context_window_tokens = 8_192;
+        provider.context_window_tokens = Some(8_192);
         provider.responses_compaction_threshold_tokens = Some(8_192);
         let error =
             validate_provider_settings(&[provider]).expect_err("reject compaction at window");
@@ -8097,6 +8604,11 @@ mod tests {
             prefill_token_weight: 1.0,
         });
         let error = validate_provider_settings(&[provider]).expect_err("reject rollout budget");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let mut provider = ProviderSettings::default();
+        provider.name = " ".to_string();
+        let error = validate_provider_settings(&[provider]).expect_err("reject blank name");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 

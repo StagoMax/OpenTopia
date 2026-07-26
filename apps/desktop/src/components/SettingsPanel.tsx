@@ -2,14 +2,17 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   Bell,
   BellRing,
+  Bot,
   Check,
   Eye,
   EyeOff,
+  ExternalLink,
   FileJson,
   FileText,
   Import,
   KeyRound,
   Plus,
+  RefreshCw,
   Search,
   Server,
   Shield,
@@ -23,8 +26,27 @@ import {
   parseProviderImport,
   type ProviderImportDraft,
 } from "../providerImport";
+import { openExternal } from "../platform";
+import {
+  availableFamiliesForModels,
+  classifyModelFamily,
+} from "../modelCatalog";
+import { Button } from "./ui";
+import {
+  MAX_PROVIDER_NAME_LENGTH,
+  OFFICIAL_OPENAI_MODEL_PRESETS,
+  OPENAI_MODEL_CATALOG_VERIFIED_AT,
+  REASONING_EFFORT_DETAILS,
+  findOfficialModelPreset,
+  normalizeProviderNames,
+  normalizeProviderReasoningEffort,
+  normalizeReasoningEffortForModel,
+  providerDisplayName,
+  resolveModelReasoningCapability,
+} from "../providerSettings";
 import type { TaskNotificationPreferences } from "../taskNotifications";
 import type {
+  AgentRuntimeSettings,
   AppSettings,
   KeyringMetadata,
   PlatformInfo,
@@ -35,12 +57,16 @@ import type {
   SecretSources,
 } from "../types";
 
-type SettingsTab = "general" | "providers" | "permissions" | "advanced";
+type SettingsTab =
+  "general" | "agent" | "providers" | "permissions" | "advanced";
+
+const CUSTOM_MODEL_PRESET_VALUE = "__custom_model__";
 
 export type SettingsSaveInput = {
   providers?: ProviderSettings[];
   activeProviderId?: string;
   permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
+  agentRuntime?: AgentRuntimeSettings;
   sandbox?: AppSettings["sandbox"];
 };
 
@@ -59,6 +85,9 @@ type SettingsPanelProps = {
   isSavingSecret: boolean;
   onSave(input: SettingsSaveInput): Promise<boolean>;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
+  // Pulls the connection's model list so families can be picked from what the
+  // endpoint actually serves. Resolves to the ids, or null when it failed.
+  onSyncProviderModels(providerId: string): Promise<string[] | null>;
   onStoreProviderApiKey(
     providerId: string,
     value: string,
@@ -87,6 +116,14 @@ const settingsTabs: Array<{
     icon: Bell,
   },
   {
+    id: "agent",
+    label: "智能体",
+    description: "风格、自治与协作",
+    keywords:
+      "智能体 agent 提示词 风格 自治 进度 多 agent 委派 personality autonomy",
+    icon: Bot,
+  },
+  {
     id: "providers",
     label: "模型与 API",
     description: "供应商、模型和密钥",
@@ -109,6 +146,13 @@ const settingsTabs: Array<{
   },
 ];
 
+const defaultAgentRuntimeSettings: AgentRuntimeSettings = {
+  personality: "professional",
+  autonomy: "balanced",
+  multiAgent: "explicit",
+  progressUpdates: "balanced",
+};
+
 export function SettingsPanel({
   platform,
   settings,
@@ -120,6 +164,7 @@ export function SettingsPanel({
   isSavingSecret,
   onSave,
   onTestProvider,
+  onSyncProviderModels,
   onStoreProviderApiKey,
   onDeleteProviderApiKey,
   onNotificationPreferencesChange,
@@ -130,7 +175,7 @@ export function SettingsPanel({
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [searchQuery, setSearchQuery] = useState("");
   const [providers, setProviders] = useState<ProviderSettings[]>(
-    settings?.providers ?? [],
+    normalizeProviderNames(settings?.providers ?? []),
   );
   const [activeProviderId, setActiveProviderId] = useState(
     settings?.activeProviderId ?? settings?.providers[0]?.id ?? "default",
@@ -141,13 +186,16 @@ export function SettingsPanel({
   const [permissionMode, setPermissionMode] = useState<
     "chat" | "read_only" | "auto" | "approve" | "full_access"
   >(settings?.permissionMode ?? "auto");
+  const [agentRuntime, setAgentRuntime] = useState<AgentRuntimeSettings>(
+    settings?.agentRuntime ?? defaultAgentRuntimeSettings,
+  );
   const [sandboxSettings, setSandboxSettings] = useState<
     AppSettings["sandbox"]
   >(
     settings?.sandbox ?? {
       sandboxMode: "workspace-write",
       enforcement: "enforce",
-      network: "deny",
+      network: "allow",
       writableRoots: [],
       readPaths: [],
     },
@@ -173,7 +221,8 @@ export function SettingsPanel({
 
   useEffect(() => {
     if (!settings) return;
-    setProviders(settings.providers);
+    const normalizedProviders = normalizeProviderNames(settings.providers);
+    setProviders(normalizedProviders);
     setActiveProviderId(settings.activeProviderId);
     setEditingProviderId((current) =>
       settings.providers.some((provider) => provider.id === current)
@@ -181,11 +230,13 @@ export function SettingsPanel({
         : settings.activeProviderId,
     );
     setPermissionMode(settings.permissionMode);
+    setAgentRuntime(settings.agentRuntime ?? defaultAgentRuntimeSettings);
     setSandboxSettings(settings.sandbox);
     baselineRef.current = settingsSnapshot(
-      settings.providers,
+      normalizedProviders,
       settings.activeProviderId,
       settings.permissionMode,
+      settings.agentRuntime ?? defaultAgentRuntimeSettings,
       settings.sandbox,
     );
   }, [settings]);
@@ -198,6 +249,7 @@ export function SettingsPanel({
     providers,
     activeProviderId,
     permissionMode,
+    agentRuntime,
     sandboxSettings,
   );
   const isDirty =
@@ -268,6 +320,7 @@ export function SettingsPanel({
   function applyImportedProvider(draft: ProviderImportDraft) {
     const id = uniqueProviderId(draft.id, providers);
     const provider = createProviderSettings(id, {
+      name: draft.name,
       kind: draft.kind,
       baseUrl: draft.baseUrl,
       model: draft.model,
@@ -290,7 +343,13 @@ export function SettingsPanel({
 
   function removeProvider(id: string) {
     if (providers.length <= 1) return;
-    if (!window.confirm(`确定移除供应商“${id}”吗？`)) return;
+    const provider = providers.find((item) => item.id === id);
+    if (
+      !window.confirm(
+        `确定移除供应商“${provider ? providerDisplayName(provider) : id}”吗？`,
+      )
+    )
+      return;
     const next = providers.filter((provider) => provider.id !== id);
     setProviders(next);
     setPendingApiKeys((current) => {
@@ -308,7 +367,19 @@ export function SettingsPanel({
     setStatusMessage(null);
     setIsApplyingSave(true);
     try {
-      let nextProviders = providers;
+      let nextProviders = providers.map((provider) =>
+        normalizeProviderReasoningEffort({
+          ...provider,
+          name: provider.name.trim(),
+        }),
+      );
+      const invalidProvider = nextProviders.find((provider) => !provider.name);
+      if (invalidProvider) {
+        setEditingProviderId(invalidProvider.id);
+        setActiveTab("providers");
+        setStatusMessage("供应商名称不能为空。");
+        return;
+      }
       for (const [providerId, apiKey] of Object.entries(pendingApiKeys)) {
         if (!apiKey.trim()) continue;
         const metadata = await onStoreProviderApiKey(providerId, apiKey);
@@ -333,6 +404,7 @@ export function SettingsPanel({
         providers: nextProviders,
         activeProviderId,
         permissionMode,
+        agentRuntime,
         sandbox: sandboxSettings,
       });
       if (!didSave) {
@@ -344,6 +416,7 @@ export function SettingsPanel({
         nextProviders,
         activeProviderId,
         permissionMode,
+        agentRuntime,
         sandboxSettings,
       );
       setStatusMessage("设置已保存。");
@@ -441,6 +514,12 @@ export function SettingsPanel({
                 onOpenLogs={onOpenLogs}
               />
             ) : null}
+            {activeTab === "agent" ? (
+              <AgentRuntimeSettingsView
+                value={agentRuntime}
+                onChange={setAgentRuntime}
+              />
+            ) : null}
             {activeTab === "providers" ? (
               <ProviderSettingsView
                 platform={platform}
@@ -483,6 +562,7 @@ export function SettingsPanel({
                   setStatusMessage(`已移除 ${providerId} 的密钥。`);
                 }}
                 onTestProvider={onTestProvider}
+                onSyncProviderModels={onSyncProviderModels}
               />
             ) : null}
             {activeTab === "permissions" ? (
@@ -509,8 +589,6 @@ export function SettingsPanel({
               <AdvancedSettings
                 providers={providers}
                 providerHealth={providerHealth}
-                providerTest={providerTest}
-                onTestProvider={onTestProvider}
                 onOpenLogs={onOpenLogs}
               />
             ) : null}
@@ -642,13 +720,19 @@ function GeneralSettings({
         <SettingsRow
           title="运行平台"
           description={platform?.platform === "desktop" ? "桌面应用" : "浏览器"}
-          control={<code>{platform?.os ?? "browser"}</code>}
+          control={
+            <span className="settings-readonly-value">
+              {platform?.os ?? "browser"}
+            </span>
+          }
         />
         <SettingsRow
           title="服务地址"
           description="OpenTopia 本地后端"
           control={
-            <code>{platform?.backendUrl ?? "http://127.0.0.1:8787"}</code>
+            <span className="settings-readonly-value">
+              {platform?.backendUrl ?? "http://127.0.0.1:8787"}
+            </span>
           }
         />
         <SettingsRow
@@ -667,6 +751,134 @@ function GeneralSettings({
         />
       </SettingsGroup>
     </SettingsPage>
+  );
+}
+
+function AgentRuntimeSettingsView({
+  value,
+  onChange,
+}: {
+  value: AgentRuntimeSettings;
+  onChange(value: AgentRuntimeSettings): void;
+}) {
+  return (
+    <SettingsPage title="智能体" description="配置每轮任务装配的协作策略。">
+      <SettingsGroup title="行为策略">
+        <RuntimeChoiceGroup
+          label="沟通风格"
+          description="控制表达密度与协作语气。"
+          value={value.personality}
+          options={[
+            ["focused", "专注", "直接、紧凑，以结果和关键证据为主。"],
+            ["professional", "专业", "清晰说明重要判断与取舍。"],
+            ["warm", "自然", "更有引导性，同时保持准确克制。"],
+          ]}
+          onChange={(personality) => onChange({ ...value, personality })}
+        />
+        <RuntimeChoiceGroup
+          label="自治程度"
+          description="控制已授权范围内的推进方式。"
+          value={value.autonomy}
+          options={[
+            ["guided", "引导", "遇到重要设计选择时先与你确认。"],
+            ["balanced", "平衡", "处理常规细节，只确认关键决策。"],
+            ["proactive", "主动", "自主完成可逆选择并推进到验证。"],
+          ]}
+          onChange={(autonomy) => onChange({ ...value, autonomy })}
+        />
+        <RuntimeChoiceGroup
+          label="多 Agent"
+          description="控制内部任务委派及相关工具是否可用。"
+          value={value.multiAgent}
+          options={[
+            ["off", "关闭", "隐藏委派工具，由当前智能体独立完成。"],
+            ["explicit", "显式", "仅在你或项目规则明确要求时委派。"],
+            ["adaptive", "自适应", "有明确并行收益时按边界主动委派。"],
+          ]}
+          onChange={(multiAgent) => onChange({ ...value, multiAgent })}
+        />
+        <RuntimeChoiceGroup
+          label="进度更新"
+          description="控制长任务中的状态同步频率。"
+          value={value.progressUpdates}
+          options={[
+            ["milestones", "里程碑", "仅阶段完成、变化或阻塞时更新。"],
+            ["balanced", "适中", "报告重要发现、决策和验证结果。"],
+            ["frequent", "频繁", "在每个有意义的工作转换点更新。"],
+          ]}
+          onChange={(progressUpdates) =>
+            onChange({ ...value, progressUpdates })
+          }
+        />
+        <div className="settings-runtime-boundary" role="note">
+          <Shield size={16} aria-hidden="true" />
+          行为策略不会扩大工具权限、系统沙箱或网络范围。
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup title="提示词装配">
+        <div className="settings-runtime-layers">
+          <div>
+            <span className="settings-layer-badge fixed">固定</span>
+            <strong>核心契约</strong>
+            <small>安全边界、完成条件、验证纪律、上下文与 Skill 协议。</small>
+          </div>
+          <div>
+            <span className="settings-layer-badge conditional">条件</span>
+            <strong>运行时策略</strong>
+            <small>当前页面选择的风格、自治、进度和多 Agent 模块。</small>
+          </div>
+          <div>
+            <span className="settings-layer-badge dynamic">动态</span>
+            <strong>每轮状态</strong>
+            <small>工作区、项目规则、权限、工具、Skills 与当前环境快照。</small>
+          </div>
+        </div>
+      </SettingsGroup>
+    </SettingsPage>
+  );
+}
+
+function RuntimeChoiceGroup<T extends string>({
+  label,
+  description,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  description: string;
+  value: T;
+  options: ReadonlyArray<readonly [T, string, string]>;
+  onChange(value: T): void;
+}) {
+  return (
+    <div className="settings-runtime-section">
+      <div className="settings-runtime-heading">
+        <strong>{label}</strong>
+        <span>{description}</span>
+      </div>
+      <div className="settings-runtime-options" role="group" aria-label={label}>
+        {options.map(([id, title, detail]) => {
+          const selected = value === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              className={selected ? "active" : ""}
+              aria-pressed={selected}
+              onClick={() => onChange(id)}
+            >
+              <span className="settings-runtime-check">
+                {selected ? <Check size={14} aria-hidden="true" /> : null}
+              </span>
+              <strong>{title}</strong>
+              <small>{detail}</small>
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -691,6 +903,7 @@ function ProviderSettingsView({
   onToggleApiKeyVisibility,
   onDeleteProviderApiKey,
   onTestProvider,
+  onSyncProviderModels,
 }: {
   platform: PlatformInfo | null;
   providers: ProviderSettings[];
@@ -716,8 +929,75 @@ function ProviderSettingsView({
   onToggleApiKeyVisibility(): void;
   onDeleteProviderApiKey(providerId: string): Promise<void>;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
+  onSyncProviderModels(providerId: string): Promise<string[] | null>;
 }) {
   const usesCodexAppServer = editingProvider?.kind === "codex_app_server";
+  const [manualModelProviderId, setManualModelProviderId] = useState<
+    string | null
+  >(null);
+  const selectedModelPreset = editingProvider
+    ? findOfficialModelPreset(editingProvider.model)
+    : null;
+  const usesManualModel = Boolean(
+    editingProvider &&
+      (manualModelProviderId === editingProvider.id || !selectedModelPreset),
+  );
+  const reasoningCapability = editingProvider
+    ? resolveModelReasoningCapability(
+        editingProvider.kind,
+        editingProvider.model,
+      )
+    : null;
+  const selectedReasoningEffort = editingProvider
+    ? normalizeReasoningEffortForModel(
+        editingProvider.kind,
+        editingProvider.model,
+        editingProvider.reasoningEffort,
+      )
+    : null;
+  const modelSourceUrl =
+    selectedModelPreset?.sourceUrl ?? reasoningCapability?.sourceUrl ?? null;
+  const modelDescription = selectedModelPreset
+    ? selectedModelPreset.description
+    : reasoningCapability?.official
+      ? reasoningCapability.status === "supported"
+        ? `已识别官方能力，支持 ${reasoningCapability.supportedEfforts.length} 个推理档位。`
+        : "已识别官方模型，不提供推理强度参数。"
+      : "自定义模型；可使用供应商兼容档位，保存前建议完成连接测试。";
+
+  function updateModel(model: string) {
+    if (!editingProvider) return;
+    onUpdateProvider(editingProvider.id, "model", model);
+    const reasoningEffort = normalizeReasoningEffortForModel(
+      editingProvider.kind,
+      model,
+      editingProvider.reasoningEffort,
+    );
+    if (reasoningEffort !== (editingProvider.reasoningEffort ?? null)) {
+      onUpdateProvider(editingProvider.id, "reasoningEffort", reasoningEffort);
+    }
+  }
+
+  function updateProviderKind(kind: ProviderKind) {
+    if (!editingProvider) return;
+    const model =
+      kind === "codex_app_server"
+        ? ""
+        : editingProvider.model.trim() || "gpt-4.1-mini";
+    onUpdateProvider(editingProvider.id, "kind", kind);
+    if (model !== editingProvider.model) {
+      onUpdateProvider(editingProvider.id, "model", model);
+    }
+    const reasoningEffort = normalizeReasoningEffortForModel(
+      kind,
+      model,
+      editingProvider.reasoningEffort,
+    );
+    if (reasoningEffort !== (editingProvider.reasoningEffort ?? null)) {
+      onUpdateProvider(editingProvider.id, "reasoningEffort", reasoningEffort);
+    }
+    if (kind === "codex_app_server") setManualModelProviderId(null);
+  }
 
   return (
     <SettingsPage
@@ -747,6 +1027,7 @@ function ProviderSettingsView({
       <div className="settings-provider-workspace">
         <div className="settings-provider-list" role="list" aria-label="供应商">
           {providers.map((provider) => {
+            const displayName = providerDisplayName(provider);
             const health = providerHealth.find(
               (item) => item.id === provider.id,
             );
@@ -762,19 +1043,14 @@ function ProviderSettingsView({
                   className="settings-provider-select"
                   onClick={() => onSelectProvider(provider.id)}
                 >
-                  <span className="settings-provider-name">
-                    {provider.id === activeProviderId ? (
-                      <Check size={13} />
-                    ) : null}
-                    {provider.id}
-                  </span>
+                  <span className="settings-provider-name">{displayName}</span>
                   <small>{health?.status ?? "未检测"}</small>
                 </button>
                 <button
                   type="button"
                   className="icon-button small danger"
                   disabled={providers.length <= 1}
-                  aria-label={`移除 ${provider.id}`}
+                  aria-label={`移除 ${displayName}`}
                   title="移除供应商"
                   onClick={() => onRemoveProvider(provider.id)}
                 >
@@ -789,7 +1065,7 @@ function ProviderSettingsView({
           <div className="settings-provider-editor">
             <div className="settings-editor-heading">
               <div>
-                <h3>{editingProvider.id}</h3>
+                <h3>{providerDisplayName(editingProvider)}</h3>
                 <span>{providerKindLabel(editingProvider.kind)}</span>
               </div>
               {editingProvider.id === activeProviderId ? (
@@ -808,49 +1084,129 @@ function ProviderSettingsView({
             </div>
 
             <div className="settings-form-grid">
+              <label className="settings-field-wide">
+                <span>名称</span>
+                <input
+                  value={editingProvider.name}
+                  required
+                  maxLength={MAX_PROVIDER_NAME_LENGTH}
+                  aria-invalid={!editingProvider.name.trim()}
+                  placeholder="例如：Kimi K3"
+                  onChange={(event) =>
+                    onUpdateProvider(
+                      editingProvider.id,
+                      "name",
+                      event.target.value,
+                    )
+                  }
+                />
+                {!editingProvider.name.trim() ? (
+                  <small className="settings-field-error" role="alert">
+                    请输入供应商名称。
+                  </small>
+                ) : null}
+              </label>
               <label>
                 <span>供应商类型</span>
                 <select
                   value={editingProvider.kind}
-                  onChange={(event) => {
-                    const kind = event.target.value as ProviderKind;
-                    onUpdateProvider(editingProvider.id, "kind", kind);
-                    if (kind === "codex_app_server") {
-                      onUpdateProvider(editingProvider.id, "model", "");
-                    } else if (!editingProvider.model.trim()) {
-                      onUpdateProvider(
-                        editingProvider.id,
-                        "model",
-                        "gpt-4.1-mini",
-                      );
-                    }
-                  }}
+                  onChange={(event) =>
+                    updateProviderKind(event.target.value as ProviderKind)
+                  }
                 >
-                  <option value="openai_compatible">OpenAI Compatible</option>
-                  <option value="openai_responses">OpenAI Responses</option>
-                  <option value="codex_app_server">Codex App Server (local)</option>
+                  <option value="openai_compatible">
+                    OpenAI Chat Completions (compatible)
+                  </option>
+                  <option value="openai_responses">
+                    OpenAI Responses (native)
+                  </option>
+                  <option value="anthropic">Anthropic Messages</option>
+                  <option value="codex_app_server">
+                    Codex App Server (local)
+                  </option>
                   <option value="mock">Mock</option>
                 </select>
               </label>
               {!usesCodexAppServer ? (
-                <label>
-                  <span>模型</span>
-                  <input
-                    value={editingProvider.model}
-                    required
-                    onChange={(event) =>
-                      onUpdateProvider(
-                        editingProvider.id,
-                        "model",
-                        event.target.value,
-                      )
-                    }
-                  />
-                </label>
+                <div className="settings-field-wide settings-model-config">
+                  <div className="settings-model-controls">
+                    <label>
+                      <span>模型预设</span>
+                      <select
+                        value={
+                          usesManualModel
+                            ? CUSTOM_MODEL_PRESET_VALUE
+                            : (selectedModelPreset?.model ??
+                              CUSTOM_MODEL_PRESET_VALUE)
+                        }
+                        onChange={(event) => {
+                          if (event.target.value === CUSTOM_MODEL_PRESET_VALUE) {
+                            setManualModelProviderId(editingProvider.id);
+                            return;
+                          }
+                          setManualModelProviderId(null);
+                          updateModel(event.target.value);
+                        }}
+                      >
+                        <optgroup label="OpenAI 官方推荐">
+                          {OFFICIAL_OPENAI_MODEL_PRESETS.filter(
+                            (preset) => preset.group === "recommended",
+                          ).map((preset) => (
+                            <option key={preset.model} value={preset.model}>
+                              {preset.label} · {preset.description}
+                            </option>
+                          ))}
+                        </optgroup>
+                        <optgroup label="兼容现有项目">
+                          {OFFICIAL_OPENAI_MODEL_PRESETS.filter(
+                            (preset) => preset.group === "compatibility",
+                          ).map((preset) => (
+                            <option key={preset.model} value={preset.model}>
+                              {preset.label} · {preset.description}
+                            </option>
+                          ))}
+                        </optgroup>
+                        <option value={CUSTOM_MODEL_PRESET_VALUE}>
+                          自定义模型 ID
+                        </option>
+                      </select>
+                    </label>
+                    {usesManualModel ? (
+                      <label>
+                        <span>模型 ID</span>
+                        <input
+                          value={editingProvider.model}
+                          required
+                          spellCheck={false}
+                          placeholder="例如：自托管或兼容模型 ID"
+                          onChange={(event) => updateModel(event.target.value)}
+                        />
+                      </label>
+                    ) : null}
+                  </div>
+                  <div className="settings-model-meta">
+                    <span>{modelDescription}</span>
+                    {modelSourceUrl ? (
+                      <button
+                        type="button"
+                        className="settings-source-link"
+                        title={`OpenAI 官方资料，${OPENAI_MODEL_CATALOG_VERIFIED_AT} 核对`}
+                        onClick={() => void openExternal(modelSourceUrl)}
+                      >
+                        官方资料
+                        <ExternalLink size={12} aria-hidden="true" />
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
               ) : null}
               {usesCodexAppServer ? (
-                <div className="settings-field-wide settings-provider-local-note" role="status">
-                  使用本机已安装的 Codex 及其模型配置处理本地附件；不需要 Base URL、API 密钥、模型名或图片服务器。
+                <div
+                  className="settings-field-wide settings-provider-local-note"
+                  role="status"
+                >
+                  使用本机已安装的 Codex 及其模型配置处理本地附件；不需要 Base
+                  URL、API 密钥、模型名或图片服务器。
                 </div>
               ) : (
                 <>
@@ -897,7 +1253,9 @@ function ProviderSettingsView({
                       />
                       <button
                         type="button"
-                        aria-label={showApiKey ? "隐藏 API 密钥" : "显示 API 密钥"}
+                        aria-label={
+                          showApiKey ? "隐藏 API 密钥" : "显示 API 密钥"
+                        }
                         title={showApiKey ? "隐藏密钥" : "显示密钥"}
                         onClick={onToggleApiKeyVisibility}
                       >
@@ -934,182 +1292,226 @@ function ProviderSettingsView({
               />
             </div>
 
-            {!usesCodexAppServer ? <details className="settings-advanced-fields">
-              <summary>模型高级参数</summary>
-              <div className="settings-form-grid">
-                <label>
-                  <span>Temperature</span>
-                  <input
-                    type="number"
-                    min="0"
-                    max="2"
-                    step="0.1"
-                    value={editingProvider.temperature}
-                    onChange={(event) =>
-                      onUpdateProvider(
-                        editingProvider.id,
-                        "temperature",
-                        Number(event.target.value),
-                      )
-                    }
-                  />
-                </label>
-                <label>
-                  <span>最大输出 Token</span>
-                  <input
-                    type="number"
-                    min="1"
-                    value={editingProvider.maxOutputTokens ?? ""}
-                    placeholder="跟随供应商"
-                    onChange={(event) =>
-                      onUpdateProvider(
-                        editingProvider.id,
-                        "maxOutputTokens",
-                        event.target.value ? Number(event.target.value) : null,
-                      )
-                    }
-                  />
-                </label>
-                <label>
-                  <span>上下文窗口</span>
-                  <input
-                    type="number"
-                    min="4096"
-                    step="1024"
-                    value={editingProvider.contextWindowTokens}
-                    onChange={(event) =>
-                      onUpdateProvider(
-                        editingProvider.id,
-                        "contextWindowTokens",
-                        Number(event.target.value),
-                      )
-                    }
-                  />
-                </label>
-                <label>
-                  <span>推理强度</span>
-                  <select
-                    value={editingProvider.reasoningEffort ?? ""}
-                    onChange={(event) =>
-                      onUpdateProvider(
-                        editingProvider.id,
-                        "reasoningEffort",
-                        (event.target.value ||
-                          null) as ProviderSettings["reasoningEffort"],
-                      )
-                    }
-                  >
-                    <option value="">跟随供应商</option>
-                    <option value="none">None</option>
-                    <option value="minimal">Minimal</option>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                    <option value="xhigh">Extra high</option>
-                    <option value="max">Max</option>
-                  </select>
-                </label>
-                <label className="settings-field-wide">
-                  <span>Prompt cache key</span>
-                  <input
-                    value={editingProvider.promptCacheKey ?? ""}
-                    placeholder="按工作区自动生成"
-                    onChange={(event) =>
-                      onUpdateProvider(
-                        editingProvider.id,
-                        "promptCacheKey",
-                        event.target.value || null,
-                      )
-                    }
-                  />
-                </label>
-                {editingProvider.kind === "openai_responses" ? (
-                  <>
-                    <label>
-                      <span>缓存策略</span>
-                      <select
-                        value={editingProvider.promptCachePolicy ?? ""}
-                        onChange={(event) =>
-                          onUpdateProvider(
-                            editingProvider.id,
-                            "promptCachePolicy",
-                            (event.target.value ||
-                              null) as ProviderSettings["promptCachePolicy"],
-                          )
-                        }
-                      >
-                        <option value="">自动</option>
-                        <option value="explicit_30m">
-                          显式断点（30 分钟）
-                        </option>
-                        <option value="legacy_in_memory">旧版内存缓存</option>
-                        <option value="legacy_24h">旧版 24 小时缓存</option>
-                      </select>
-                    </label>
-                    <label>
-                      <span>原生压缩阈值</span>
-                      <input
-                        type="number"
-                        min="4096"
-                        step="1024"
-                        value={
-                          editingProvider.responsesCompactionThresholdTokens ??
-                          ""
-                        }
-                        placeholder="关闭"
-                        onChange={(event) =>
-                          onUpdateProvider(
-                            editingProvider.id,
-                            "responsesCompactionThresholdTokens",
-                            event.target.value
-                              ? Number(event.target.value)
-                              : null,
-                          )
-                        }
-                      />
-                    </label>
-                  </>
-                ) : null}
-              </div>
-              <div className="settings-toggle-stack">
-                <SettingsRow
-                  title="并行工具调用"
-                  description="允许模型在同一轮并行请求多个工具。"
-                  control={
-                    <Switch
-                      label="并行工具调用"
-                      checked={editingProvider.parallelToolCalls}
-                      onChange={(checked) =>
+            {!usesCodexAppServer ? (
+              <ModelFamilySection
+                connection={editingProvider}
+                onUpdateProvider={onUpdateProvider}
+                onSyncProviderModels={onSyncProviderModels}
+              />
+            ) : null}
+
+            {!usesCodexAppServer ? (
+              <details className="settings-advanced-fields">
+                <summary>模型高级参数</summary>
+                <div className="settings-form-grid">
+                  <label>
+                    <span>Temperature</span>
+                    <input
+                      type="number"
+                      min="0"
+                      max="2"
+                      step="0.1"
+                      value={editingProvider.temperature}
+                      onChange={(event) =>
                         onUpdateProvider(
                           editingProvider.id,
-                          "parallelToolCalls",
-                          checked,
+                          "temperature",
+                          Number(event.target.value),
                         )
                       }
                     />
-                  }
-                />
-                {editingProvider.kind === "openai_responses" ? (
+                  </label>
+                  <label>
+                    <span>最大输出 Token</span>
+                    <input
+                      type="number"
+                      min="1"
+                      value={editingProvider.maxOutputTokens ?? ""}
+                      placeholder="跟随供应商"
+                      onChange={(event) =>
+                        onUpdateProvider(
+                          editingProvider.id,
+                          "maxOutputTokens",
+                          event.target.value
+                            ? Number(event.target.value)
+                            : null,
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>上下文窗口</span>
+                    <input
+                      type="number"
+                      min="4096"
+                      step="1024"
+                      value={editingProvider.contextWindowTokens ?? ""}
+                      placeholder="自动识别"
+                      title="留空时按模型能力自动识别，未知模型使用 128K 保守默认"
+                      onChange={(event) =>
+                        onUpdateProvider(
+                          editingProvider.id,
+                          "contextWindowTokens",
+                          event.target.value
+                            ? Number(event.target.value)
+                            : null,
+                        )
+                      }
+                    />
+                    <small>
+                      留空则自动使用已知模型上限；未知模型使用 128K 保守默认。
+                    </small>
+                  </label>
+                  {reasoningCapability?.status === "unsupported" ? (
+                    <div
+                      className="settings-field-wide settings-reasoning-unavailable"
+                      role="status"
+                    >
+                      <span>推理强度</span>
+                      <strong>
+                        {reasoningCapability.official
+                          ? "当前模型不提供推理强度"
+                          : "当前供应商类型不使用此参数"}
+                      </strong>
+                    </div>
+                  ) : (
+                    <label className="settings-field-wide settings-reasoning-field">
+                      <span>推理强度</span>
+                      <select
+                        value={selectedReasoningEffort ?? ""}
+                        onChange={(event) =>
+                          onUpdateProvider(
+                            editingProvider.id,
+                            "reasoningEffort",
+                            (event.target.value ||
+                              null) as ProviderSettings["reasoningEffort"],
+                          )
+                        }
+                      >
+                        <option value="">
+                          {reasoningCapability?.official &&
+                          reasoningCapability.defaultEffort
+                            ? `自动 · 官方默认（${REASONING_EFFORT_DETAILS[reasoningCapability.defaultEffort].label}）`
+                            : "自动 · 跟随供应商"}
+                        </option>
+                        {reasoningCapability?.supportedEfforts.map((effort) => (
+                          <option key={effort} value={effort}>
+                            {REASONING_EFFORT_DETAILS[effort].label}
+                          </option>
+                        ))}
+                      </select>
+                      <small>
+                        {selectedReasoningEffort
+                          ? REASONING_EFFORT_DETAILS[selectedReasoningEffort]
+                              .description
+                          : reasoningCapability?.official
+                            ? `已按官方能力显示 ${reasoningCapability.supportedEfforts.length} 个可用档位。`
+                            : "模型能力未知，保留兼容供应商支持的全部档位。"}
+                      </small>
+                    </label>
+                  )}
+                  <label className="settings-field-wide">
+                    <span>Prompt cache key</span>
+                    <input
+                      value={editingProvider.promptCacheKey ?? ""}
+                      placeholder="按工作区自动生成"
+                      onChange={(event) =>
+                        onUpdateProvider(
+                          editingProvider.id,
+                          "promptCacheKey",
+                          event.target.value || null,
+                        )
+                      }
+                    />
+                  </label>
+                  {editingProvider.kind === "openai_responses" ? (
+                    <>
+                      <label>
+                        <span>缓存策略</span>
+                        <select
+                          value={editingProvider.promptCachePolicy ?? ""}
+                          onChange={(event) =>
+                            onUpdateProvider(
+                              editingProvider.id,
+                              "promptCachePolicy",
+                              (event.target.value ||
+                                null) as ProviderSettings["promptCachePolicy"],
+                            )
+                          }
+                        >
+                          <option value="">自动</option>
+                          <option value="explicit_30m">
+                            显式断点（30 分钟）
+                          </option>
+                          <option value="legacy_in_memory">旧版内存缓存</option>
+                          <option value="legacy_24h">旧版 24 小时缓存</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>原生压缩阈值</span>
+                        <input
+                          type="number"
+                          min="4096"
+                          step="1024"
+                          value={
+                            editingProvider.responsesCompactionThresholdTokens ??
+                            ""
+                          }
+                          placeholder="关闭"
+                          onChange={(event) =>
+                            onUpdateProvider(
+                              editingProvider.id,
+                              "responsesCompactionThresholdTokens",
+                              event.target.value
+                                ? Number(event.target.value)
+                                : null,
+                            )
+                          }
+                        />
+                      </label>
+                    </>
+                  ) : null}
+                </div>
+                <div className="settings-toggle-stack">
                   <SettingsRow
-                    title="延续 Responses 状态"
-                    description="在多轮请求间保留供应商响应状态。"
+                    title="并行工具调用"
+                    description="允许模型在同一轮并行请求多个工具。"
                     control={
                       <Switch
-                        label="延续 Responses 状态"
-                        checked={editingProvider.storeResponses}
+                        label="并行工具调用"
+                        checked={editingProvider.parallelToolCalls}
                         onChange={(checked) =>
                           onUpdateProvider(
                             editingProvider.id,
-                            "storeResponses",
+                            "parallelToolCalls",
                             checked,
                           )
                         }
                       />
                     }
                   />
-                ) : null}
-              </div>
-            </details> : null}
+                  {editingProvider.kind === "openai_responses" ? (
+                    <SettingsRow
+                      title="延续 Responses 状态"
+                      description="在多轮请求间保留供应商响应状态。"
+                      control={
+                        <Switch
+                          label="延续 Responses 状态"
+                          checked={editingProvider.storeResponses}
+                          onChange={(checked) =>
+                            onUpdateProvider(
+                              editingProvider.id,
+                              "storeResponses",
+                              checked,
+                            )
+                          }
+                        />
+                      }
+                    />
+                  ) : null}
+                </div>
+              </details>
+            ) : null}
 
             <div className="settings-provider-footer">
               <div className="settings-provider-health-status">
@@ -1318,39 +1720,23 @@ function PermissionSettings({
 function AdvancedSettings({
   providers,
   providerHealth,
-  providerTest,
-  onTestProvider,
   onOpenLogs,
 }: {
   providers: ProviderSettings[];
   providerHealth: ProviderHealth[];
-  providerTest: SettingsPanelProps["providerTest"];
-  onTestProvider(providerId: string, providers: ProviderSettings[]): void;
   onOpenLogs(): void;
 }) {
   return (
     <SettingsPage title="高级" description="检查模型连接状态并打开诊断信息。">
       <SettingsGroup title="供应商连接">
         {providers.map((provider) => {
+          const displayName = providerDisplayName(provider);
           const health = providerHealth.find((item) => item.id === provider.id);
-          const isTesting =
-            providerTest?.providerId === provider.id &&
-            providerTest.status === "testing";
           return (
             <SettingsRow
               key={provider.id}
-              title={provider.id}
+              title={displayName}
               description={`${provider.model} · ${health?.status ?? "未检测"}`}
-              control={
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={providerTest?.status === "testing"}
-                  onClick={() => onTestProvider(provider.id, providers)}
-                >
-                  {isTesting ? "测试中…" : "测试"}
-                </button>
-              }
             />
           );
         })}
@@ -1557,6 +1943,144 @@ function SettingsGroup({
   );
 }
 
+/**
+ * Per-connection model scope. Users pick whole families rather than individual
+ * model ids, because one API key on an aggregator or relay already grants the
+ * whole vendor lineup — enumerating every id by hand is busywork that goes
+ * stale on every vendor release.
+ */
+function ModelFamilySection({
+  connection,
+  onUpdateProvider,
+  onSyncProviderModels,
+}: {
+  connection: ProviderSettings;
+  onUpdateProvider<K extends keyof ProviderSettings>(
+    id: string,
+    field: K,
+    value: ProviderSettings[K],
+  ): void;
+  onSyncProviderModels(providerId: string): Promise<string[] | null>;
+}) {
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  // The hand-configured default belongs in the catalog even when the endpoint
+  // has no /v1/models, so those connections still get a usable picker.
+  const modelIds = useMemo(() => {
+    const ids = [...connection.syncedModels];
+    const fallback = connection.model.trim();
+    if (fallback && !ids.includes(fallback)) ids.push(fallback);
+    return ids;
+  }, [connection.syncedModels, connection.model]);
+
+  const families = useMemo(
+    () => availableFamiliesForModels(modelIds),
+    [modelIds],
+  );
+  const modelCountByFamily = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const id of modelIds) {
+      const familyId = classifyModelFamily(id);
+      counts.set(familyId, (counts.get(familyId) ?? 0) + 1);
+    }
+    return counts;
+  }, [modelIds]);
+
+  // An empty allow-list means "not narrowed yet", which shows everything.
+  const enabled = connection.enabledFamilies;
+  const allowAll = enabled.length === 0;
+  const effectivelyEnabled = allowAll
+    ? families.map((family) => family.id)
+    : enabled;
+
+  function toggleFamily(familyId: string, checked: boolean) {
+    const next = checked
+      ? Array.from(new Set([...effectivelyEnabled, familyId]))
+      : effectivelyEnabled.filter((id) => id !== familyId);
+    onUpdateProvider(connection.id, "enabledFamilies", next);
+  }
+
+  async function sync() {
+    setSyncing(true);
+    setSyncError(null);
+    try {
+      const ids = await onSyncProviderModels(connection.id);
+      if (!ids) setSyncError("同步失败，请检查 Base URL 和 API 密钥。");
+      else if (ids.length === 0) {
+        setSyncError("该连接没有返回模型列表，可继续使用手填的模型 ID。");
+      } else {
+        // The server already persisted these; mirroring them into the draft
+        // keeps the family list in sync without reloading the whole panel.
+        onUpdateProvider(connection.id, "syncedModels", ids);
+      }
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  return (
+    <section className="settings-model-families">
+      <header>
+        <div>
+          <strong>模型系列</strong>
+          <span>
+            启用后，这些系列的模型会出现在对话框的模型选择里。
+            {connection.modelsSyncedAt
+              ? ` 上次同步：${new Date(connection.modelsSyncedAt).toLocaleString()}。`
+              : ""}
+          </span>
+        </div>
+        <Button
+          type="button"
+          variant="secondary"
+          size="compact"
+          disabled={syncing}
+          onClick={() => void sync()}
+        >
+          <RefreshCw size={14} aria-hidden="true" />
+          {syncing ? "同步中…" : "同步模型"}
+        </Button>
+      </header>
+      {syncError ? (
+        <p className="settings-model-families-note" role="status">
+          {syncError}
+        </p>
+      ) : null}
+      {families.length === 0 ? (
+        <p className="settings-model-families-note">
+          还没有模型列表。点击「同步模型」从该连接拉取，或先在上方填写模型
+          ID。
+        </p>
+      ) : (
+        <div className="settings-toggle-stack">
+          {families.map((family) => (
+            <SettingsRow
+              key={family.id}
+              title={family.label}
+              description={`${family.vendor} · ${modelCountByFamily.get(family.id) ?? 0} 个模型`}
+              control={
+                <Switch
+                  label={`启用 ${family.label}`}
+                  checked={effectivelyEnabled.includes(family.id)}
+                  // Turning off the last family would empty the list, which the
+                  // "empty means all" convention would read as re-enabling
+                  // everything. Keep at least one on instead.
+                  disabled={
+                    effectivelyEnabled.length <= 1 &&
+                    effectivelyEnabled.includes(family.id)
+                  }
+                  onChange={(checked) => toggleFamily(family.id, checked)}
+                />
+              }
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function SettingsRow({
   title,
   description,
@@ -1565,7 +2089,7 @@ function SettingsRow({
 }: {
   title: string;
   description: string;
-  control: React.ReactNode;
+  control?: React.ReactNode;
   disabled?: boolean;
 }) {
   return (
@@ -1574,7 +2098,7 @@ function SettingsRow({
         <strong>{title}</strong>
         <span>{description}</span>
       </div>
-      <div className="settings-row-control">{control}</div>
+      {control ? <div className="settings-row-control">{control}</div> : null}
     </div>
   );
 }
@@ -1629,12 +2153,16 @@ function createProviderSettings(
 ): ProviderSettings {
   return {
     id,
+    name: id,
     kind: "openai_compatible",
     baseUrl: "https://api.openai.com/v1",
     model: "gpt-4.1-mini",
+    enabledFamilies: [],
+    syncedModels: [],
+    modelsSyncedAt: null,
     temperature: 0.2,
     maxOutputTokens: null,
-    contextWindowTokens: 128000,
+    contextWindowTokens: null,
     reasoningEffort: null,
     storeResponses: false,
     parallelToolCalls: false,
@@ -1671,12 +2199,14 @@ function settingsSnapshot(
   providers: ProviderSettings[],
   activeProviderId: string,
   permissionMode: AppSettings["permissionMode"],
+  agentRuntime: AgentRuntimeSettings,
   sandbox: AppSettings["sandbox"],
 ): string {
   return JSON.stringify({
     providers,
     activeProviderId,
     permissionMode,
+    agentRuntime,
     sandbox,
   });
 }
@@ -1692,7 +2222,7 @@ function controlledSandboxSettings(
         : sandbox.sandboxMode,
     enforcement:
       sandbox.enforcement === "disabled" ? "enforce" : sandbox.enforcement,
-    network: sandbox.network === "allow" ? "deny" : sandbox.network,
+    network: sandbox.network,
   };
 }
 
@@ -1709,6 +2239,7 @@ function parsePathList(value: string): string[] {
 
 function providerKindLabel(kind: ProviderKind): string {
   if (kind === "codex_app_server") return "Codex App Server";
+  if (kind === "anthropic") return "Anthropic Messages";
   if (kind === "openai_responses") return "OpenAI Responses";
   if (kind === "openai_compatible") return "OpenAI Compatible";
   return "Mock";

@@ -371,6 +371,53 @@ pub trait ModelProvider: Send + Sync {
     async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck>;
 }
 
+/// Builds the transport for a connection. Callers pass settings that already
+/// carry any per-thread model override, so this stays the single place that
+/// maps a provider kind onto a concrete client.
+///
+/// An unconfigured connection degrades to [`MockProvider`] rather than failing,
+/// matching the behaviour the desktop app relies on for first-run setup.
+pub fn provider_from_settings(settings: &ProviderSettings) -> std::sync::Arc<dyn ModelProvider> {
+    use std::sync::Arc;
+    match settings.kind {
+        ProviderKind::Mock => Arc::new(MockProvider),
+        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(settings)
+            .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider)),
+        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(settings)
+            .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider)),
+        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(settings)
+            .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider)),
+        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(settings)
+            .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider)),
+    }
+}
+
+/// Same connection, constrained for guardian review calls.
+pub fn guardian_provider_from_settings(
+    settings: &ProviderSettings,
+) -> std::sync::Arc<dyn ModelProvider> {
+    use std::sync::Arc;
+    match settings.kind {
+        ProviderKind::Mock => Arc::new(MockProvider),
+        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(settings)
+            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider)),
+        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(settings)
+            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider)),
+        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(settings)
+            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider)),
+        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(settings)
+            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
+            .unwrap_or_else(|| Arc::new(MockProvider)),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleProvider {
     client: reqwest::Client,
@@ -898,6 +945,368 @@ impl OpenAiResponsesProvider {
     }
 }
 
+/// Native Anthropic Messages API adapter. This intentionally does not reuse
+/// the OpenAI-compatible transport: headers, request shape, tool calls, and
+/// streamed events are different protocols.
+#[derive(Debug, Clone)]
+pub struct AnthropicMessagesProvider {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+    temperature: f64,
+    max_output_tokens: Option<u32>,
+    supports_vision: bool,
+}
+
+impl AnthropicMessagesProvider {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            temperature: 0.2,
+            max_output_tokens: None,
+            supports_vision: true,
+        }
+    }
+
+    pub fn from_settings(settings: &ProviderSettings) -> Option<Self> {
+        if settings.kind != ProviderKind::Anthropic {
+            return None;
+        }
+        let api_key = provider_api_key(settings)?;
+        let mut provider = Self::new(settings.base_url.clone(), api_key, settings.model.clone());
+        provider.temperature = settings.temperature;
+        provider.max_output_tokens = settings.max_output_tokens;
+        provider.supports_vision = settings.supports_vision;
+        Some(provider)
+    }
+
+    pub(crate) fn for_guardian(mut self) -> Self {
+        self.temperature = 0.0;
+        self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
+        self
+    }
+
+    fn prepare_messages_request(
+        &self,
+        request_id: Uuid,
+        request: ModelRequest,
+    ) -> anyhow::Result<PreparedProviderRequest> {
+        ensure_visual_input_supported(&request, self.supports_vision)?;
+        let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let mut payload = json!({
+            "model": self.model,
+            "max_tokens": self.max_output_tokens.unwrap_or(4_096),
+            "temperature": self.temperature,
+            "stream": true,
+            "messages": anthropic_messages(&request),
+        });
+        let instructions = anthropic_system_instructions(&request);
+        if !instructions.trim().is_empty() {
+            payload["system"] = json!(instructions);
+        }
+        if !request.tool_candidates.is_empty() {
+            payload["tools"] = json!(anthropic_tools(&request.tool_candidates));
+        }
+        Ok(PreparedProviderRequest {
+            request_id,
+            adapter: "anthropic_messages".to_string(),
+            method: "POST".to_string(),
+            endpoint,
+            observation_body: redact_transport_value(&payload),
+            body: payload,
+            logical_request: request,
+        })
+    }
+
+    async fn execute_messages_request(
+        &self,
+        prepared: PreparedProviderRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        let mut response = self
+            .client
+            .post(&prepared.endpoint)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header(CONTENT_TYPE, "application/json")
+            .json(&prepared.body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            on_transport(ProviderTransportEvent::Response {
+                attempt: 1,
+                status: Some(status.as_u16()),
+                response_id: None,
+                body: json!({ "error": truncate_observation_text(&body) }),
+            })?;
+            anyhow::bail!("Anthropic Messages request failed ({status}): {body}");
+        }
+
+        let mut decoder = SseDecoder::default();
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        while let Some(chunk) = response.chunk().await? {
+            for data in decoder.push(&chunk)? {
+                let event: Value = serde_json::from_str(&data).map_err(|error| {
+                    anyhow::anyhow!("invalid Anthropic Messages SSE data: {error}: {data}")
+                })?;
+                accumulator.apply(&event, on_delta)?;
+            }
+        }
+        for data in decoder.finish()? {
+            let event: Value = serde_json::from_str(&data).map_err(|error| {
+                anyhow::anyhow!("invalid Anthropic Messages SSE data: {error}: {data}")
+            })?;
+            accumulator.apply(&event, on_delta)?;
+        }
+        let response = accumulator.finish()?;
+        on_transport(ProviderTransportEvent::Response {
+            attempt: 1,
+            status: Some(status.as_u16()),
+            response_id: response.response_id.clone(),
+            body: model_response_observation(&response),
+        })?;
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl ModelProvider for AnthropicMessagesProvider {
+    async fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        let prepared = self.prepare(Uuid::new_v4(), request)?;
+        self.stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(()))
+            .await
+    }
+
+    fn prepare(
+        &self,
+        request_id: Uuid,
+        request: ModelRequest,
+    ) -> anyhow::Result<PreparedProviderRequest> {
+        self.prepare_messages_request(request_id, request)
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        let prepared = self.prepare(Uuid::new_v4(), request)?;
+        self.stream_prepared(prepared, on_delta, &mut |_| Ok(()))
+            .await
+    }
+
+    async fn stream_prepared(
+        &self,
+        prepared: PreparedProviderRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        self.execute_messages_request(prepared, on_delta, on_transport)
+            .await
+    }
+
+    async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
+        let start = std::time::Instant::now();
+        let endpoint = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client
+                .get(endpoint)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let reachable = response.status().is_success();
+                Ok(ProviderHealthCheck {
+                    reachable,
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                    model_available: reachable,
+                    error: (!reachable).then(|| format!("HTTP {}", response.status())),
+                })
+            }
+            Ok(Err(error)) => Ok(ProviderHealthCheck {
+                reachable: false,
+                latency_ms: Some(start.elapsed().as_millis() as u64),
+                model_available: false,
+                error: Some(error.to_string()),
+            }),
+            Err(_) => Ok(ProviderHealthCheck {
+                reachable: false,
+                latency_ms: None,
+                model_available: false,
+                error: Some("timeout".to_string()),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AnthropicStreamAccumulator {
+    text: String,
+    tool_calls: BTreeMap<usize, StreamingToolCall>,
+    usage: Option<ModelUsage>,
+    response_id: Option<String>,
+    finish_reason: Option<ModelFinishReason>,
+}
+
+impl AnthropicStreamAccumulator {
+    fn apply(
+        &mut self,
+        event: &Value,
+        on_delta: &mut ModelStreamCallback<'_>,
+    ) -> anyhow::Result<()> {
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(event_type, "error") || event.get("error").is_some() {
+            anyhow::bail!("Anthropic Messages stream returned an error: {event}");
+        }
+        match event_type {
+            "message_start" => {
+                self.response_id = event
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.update_usage(event.pointer("/message/usage"), on_delta)?;
+            }
+            "content_block_start" => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let block = event.get("content_block").unwrap_or(&Value::Null);
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let call = self.tool_calls.entry(index).or_default();
+                    call.id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    call.name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if block.get("input").is_some_and(|input| input != &json!({})) {
+                        call.arguments = block["input"].to_string();
+                    }
+                    on_delta(ModelStreamDelta::ToolCall {
+                        index,
+                        id: (!call.id.is_empty()).then(|| call.id.clone()),
+                        name: (!call.name.is_empty()).then(|| call.name.clone()),
+                        arguments_delta: String::new(),
+                    })?;
+                }
+            }
+            "content_block_delta" => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let delta = event.get("delta").unwrap_or(&Value::Null);
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            self.text.push_str(text);
+                            on_delta(ModelStreamDelta::Text {
+                                text: text.to_string(),
+                            })?;
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let partial = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let call = self.tool_calls.entry(index).or_default();
+                        call.arguments.push_str(partial);
+                        on_delta(ModelStreamDelta::ToolCall {
+                            index,
+                            id: (!call.id.is_empty()).then(|| call.id.clone()),
+                            name: (!call.name.is_empty()).then(|| call.name.clone()),
+                            arguments_delta: partial.to_string(),
+                        })?;
+                    }
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.finish_reason = Some(chat_finish_reason(reason));
+                }
+                self.update_usage(event.get("usage"), on_delta)?;
+            }
+            "message_stop" => {
+                self.finish_reason.get_or_insert(ModelFinishReason::Stop);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn update_usage(
+        &mut self,
+        value: Option<&Value>,
+        on_delta: &mut ModelStreamCallback<'_>,
+    ) -> anyhow::Result<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let previous = self.usage.clone().unwrap_or_default();
+        let mut usage = parse_model_usage(Some(value)).unwrap_or_default();
+        if value.get("input_tokens").is_none() {
+            usage.input_tokens = previous.input_tokens;
+        }
+        if value.get("output_tokens").is_none() {
+            usage.output_tokens = previous.output_tokens;
+        }
+        usage.total_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        self.usage = Some(usage.clone());
+        on_delta(ModelStreamDelta::Usage { usage })
+    }
+
+    fn finish(self) -> anyhow::Result<ModelResponse> {
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(|(index, call)| {
+                if call.name.is_empty() {
+                    anyhow::bail!("Anthropic tool call {index} was missing a name");
+                }
+                Ok(ProviderToolCall {
+                    id: if call.id.is_empty() {
+                        format!("call_{index}")
+                    } else {
+                        call.id
+                    },
+                    name: call.name,
+                    arguments: parse_tool_arguments(Some(&Value::String(call.arguments)))?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let finish_reason = if !tool_calls.is_empty() {
+            ModelFinishReason::ToolCalls
+        } else {
+            self.finish_reason
+                .unwrap_or(ModelFinishReason::StreamInterrupted)
+        };
+        Ok(ModelResponse {
+            text: self.text,
+            tool_calls,
+            usage: self.usage,
+            response_id: self.response_id,
+            provider_items: Vec::new(),
+            finish_reason,
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 struct SseDecoder {
     buffer: Vec<u8>,
@@ -1263,7 +1672,7 @@ impl ResponsesStreamAccumulator {
 fn chat_finish_reason(reason: &str) -> ModelFinishReason {
     match reason {
         "stop" | "end_turn" => ModelFinishReason::Stop,
-        "tool_calls" | "function_call" => ModelFinishReason::ToolCalls,
+        "tool_calls" | "function_call" | "tool_use" => ModelFinishReason::ToolCalls,
         "length" | "max_tokens" | "max_output_tokens" => ModelFinishReason::Length,
         "content_filter" => ModelFinishReason::ContentFilter,
         other => ModelFinishReason::Incomplete(other.to_string()),
@@ -1508,6 +1917,150 @@ fn responses_system_instructions(request: &ModelRequest) -> String {
         .filter_map(|(role, content)| (role == ContextRole::System).then_some(content))
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn anthropic_system_instructions(request: &ModelRequest) -> String {
+    let mut instructions = instruction_messages(request)
+        .into_iter()
+        .map(|(_, content)| content)
+        .filter(|content| !content.trim().is_empty())
+        .collect::<Vec<_>>();
+    if let Some(branch) = request
+        .branch_developer_instructions
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        instructions.push(branch.to_string());
+    }
+    instructions.join("\n\n")
+}
+
+fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
+    let mut messages = Vec::new();
+    for message in &request.conversation {
+        if message.role == ModelConversationRole::System {
+            continue;
+        }
+        let role = if message.role == ModelConversationRole::Assistant {
+            "assistant"
+        } else {
+            "user"
+        };
+        push_anthropic_message(
+            &mut messages,
+            role,
+            anthropic_content_parts(&message.content, &message.content_parts),
+        );
+    }
+    for call in &request.previous_tool_calls {
+        push_anthropic_message(
+            &mut messages,
+            "assistant",
+            vec![json!({
+                "type": "tool_use",
+                "id": &call.id,
+                "name": &call.name,
+                "input": &call.arguments,
+            })],
+        );
+        let results = request
+            .tool_results
+            .iter()
+            .filter(|result| result.call_id == call.id)
+            .map(anthropic_tool_result)
+            .collect::<Vec<_>>();
+        if !results.is_empty() {
+            push_anthropic_message(&mut messages, "user", results);
+        }
+    }
+    for result in &request.tool_results {
+        if !request
+            .previous_tool_calls
+            .iter()
+            .any(|call| call.id == result.call_id)
+        {
+            push_anthropic_message(&mut messages, "user", vec![anthropic_tool_result(result)]);
+        }
+    }
+    push_anthropic_message(
+        &mut messages,
+        "user",
+        anthropic_content_parts(&request.user_message, &request.user_content),
+    );
+    if messages.is_empty() {
+        messages.push(json!({ "role": "user", "content": [{ "type": "text", "text": "" }] }));
+    }
+    messages
+}
+
+fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, content: Vec<Value>) {
+    if content.is_empty() {
+        return;
+    }
+    if let Some(last) = messages
+        .last_mut()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some(role))
+    {
+        if let Some(parts) = last.get_mut("content").and_then(Value::as_array_mut) {
+            parts.extend(content);
+            return;
+        }
+    }
+    messages.push(json!({ "role": role, "content": content }));
+}
+
+fn anthropic_content_parts(legacy_text: &str, parts: &[ModelInputContent]) -> Vec<Value> {
+    let mut content = Vec::new();
+    if !legacy_text.is_empty() {
+        content.push(json!({ "type": "text", "text": legacy_text }));
+    }
+    content.extend(parts.iter().map(|part| match part {
+        ModelInputContent::Text { text } => json!({ "type": "text", "text": text }),
+        ModelInputContent::Json { value } => json!({ "type": "text", "text": value.to_string() }),
+        ModelInputContent::Image { content_type, data } => json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": content_type,
+                "data": encode_base64(data),
+            }
+        }),
+        ModelInputContent::Resource {
+            uri,
+            content_type,
+            name,
+        } => json!({
+            "type": "text",
+            "text": resource_fallback_text(uri, content_type.as_deref(), name.as_deref()),
+        }),
+    }));
+    content
+}
+
+fn anthropic_tool_result(result: &ProviderToolResult) -> Value {
+    let mut content = anthropic_content_parts(&result.output, &result.content);
+    if content.is_empty() {
+        content.push(json!({ "type": "text", "text": "" }));
+    }
+    json!({
+        "type": "tool_result",
+        "tool_use_id": &result.call_id,
+        "content": content,
+        "is_error": result.is_error,
+    })
+}
+
+fn anthropic_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "name": &candidate.name,
+                "description": &candidate.description,
+                "input_schema": &candidate.input_schema,
+            })
+        })
+        .collect()
 }
 
 fn chat_request_needs_message_compatibility_fallback(request: &ModelRequest) -> bool {
@@ -3656,6 +4209,90 @@ mod tests {
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
         assert_eq!(prepared.body["text"]["format"]["type"], "json_schema");
         assert_eq!(prepared.body["text"]["format"]["strict"], true);
+    }
+
+    #[test]
+    fn anthropic_provider_uses_native_messages_protocol() {
+        let provider = AnthropicMessagesProvider::new(
+            "https://api.anthropic.com",
+            "test-key",
+            "claude-sonnet-4-20250514",
+        );
+        let mut request = model_request();
+        request.tool_candidates.push(ProviderToolCandidate {
+            name: "read_file".to_string(),
+            description: "Read a workspace file".to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        });
+        request.user_content.push(ModelInputContent::image(
+            "image/png",
+            vec![0x89, b'P', b'N', b'G'],
+        ));
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+
+        assert_eq!(prepared.adapter, "anthropic_messages");
+        assert_eq!(prepared.endpoint, "https://api.anthropic.com/v1/messages");
+        assert_eq!(prepared.body["stream"], true);
+        assert_eq!(prepared.body["max_tokens"], 4_096);
+        assert_eq!(prepared.body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(
+            prepared.body["messages"][0]["content"][1]["source"]["type"],
+            "base64"
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_accumulates_text_tools_and_usage() {
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        accumulator
+            .apply(
+                &json!({
+                    "type": "message_start",
+                    "message": { "id": "msg_1", "usage": { "input_tokens": 12 } }
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                &json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use", "id": "tool_1", "name": "read_file", "input": {}
+                    }
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                &json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"README.md\"}" }
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                &json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": { "output_tokens": 7 }
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+
+        let response = accumulator.finish().unwrap();
+        assert_eq!(response.finish_reason, ModelFinishReason::ToolCalls);
+        assert_eq!(response.response_id.as_deref(), Some("msg_1"));
+        assert_eq!(response.usage.unwrap().total_tokens, 19);
+        assert_eq!(response.tool_calls[0].id, "tool_1");
+        assert_eq!(response.tool_calls[0].arguments["path"], "README.md");
     }
 
     #[test]

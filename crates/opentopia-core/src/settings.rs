@@ -1,4 +1,5 @@
 use crate::policy::PermissionMode;
+use crate::prompt_runtime::AgentRuntimeSettings;
 use crate::sandbox::{LocalSandboxConfig, NetworkPolicy, OsSandboxMode, SandboxMode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -16,6 +17,9 @@ pub enum ProviderKind {
     /// Codex App Server instance.
     #[serde(rename = "codex_app_server")]
     CodexAppServer,
+    /// Anthropic Messages API provider.
+    #[serde(rename = "anthropic")]
+    Anthropic,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +40,7 @@ impl ProviderKind {
             Self::OpenAiCompatible => "openai_compatible",
             Self::OpenAiResponses => "openai_responses",
             Self::CodexAppServer => "codex_app_server",
+            Self::Anthropic => "anthropic",
         }
     }
 }
@@ -44,15 +49,33 @@ impl ProviderKind {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSettings {
     pub id: String,
+    /// User-facing label. Empty values from legacy settings fall back to `id`.
+    #[serde(default)]
+    pub name: String,
     pub kind: ProviderKind,
     pub base_url: String,
+    /// Default model for this connection. Threads may override it per
+    /// conversation; this value is the fallback for new threads and for
+    /// internal utility calls such as title generation.
     pub model: String,
+    /// Model families the user allowed for this connection. Empty means "not
+    /// narrowed yet", which shows every synced family rather than none.
+    #[serde(default)]
+    pub enabled_families: Vec<String>,
+    /// Model ids last returned by the connection's `/v1/models` endpoint.
+    /// Cached so the picker works offline; refreshed on explicit sync.
+    #[serde(default)]
+    pub synced_models: Vec<String>,
+    #[serde(default)]
+    pub models_synced_at: Option<DateTime<Utc>>,
     #[serde(default = "default_provider_temperature")]
     pub temperature: f64,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
-    #[serde(default = "default_provider_context_window_tokens")]
-    pub context_window_tokens: usize,
+    /// Optional user override. When omitted, the server resolves a known model
+    /// capability and falls back to a conservative default for custom models.
+    #[serde(default)]
+    pub context_window_tokens: Option<usize>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
@@ -80,12 +103,16 @@ impl Default for ProviderSettings {
     fn default() -> Self {
         Self {
             id: "default".to_string(),
+            name: "default".to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4.1-mini".to_string(),
+            enabled_families: Vec::new(),
+            synced_models: Vec::new(),
+            models_synced_at: None,
             temperature: default_provider_temperature(),
             max_output_tokens: None,
-            context_window_tokens: default_provider_context_window_tokens(),
+            context_window_tokens: None,
             reasoning_effort: None,
             store_responses: false,
             parallel_tool_calls: false,
@@ -130,6 +157,50 @@ impl RolloutBudgetSettings {
 }
 
 impl ProviderSettings {
+    pub fn display_name(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() {
+            &self.id
+        } else {
+            name
+        }
+    }
+
+    /// User-declared context limits always win. Known model families are used
+    /// only when no override is present, leaving custom endpoints predictable.
+    pub fn resolved_context_window_tokens(&self) -> usize {
+        self.context_window_tokens
+            .filter(|tokens| *tokens >= MIN_PROVIDER_CONTEXT_WINDOW_TOKENS)
+            .or_else(|| known_model_context_window_tokens(&self.model))
+            .unwrap_or(DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS)
+    }
+
+    /// Applies a per-thread model override on top of the connection defaults.
+    /// The connection keeps owning transport concerns (endpoint, key, limits);
+    /// only the model and its reasoning effort vary per conversation.
+    pub fn with_model_override(
+        &self,
+        model: Option<&str>,
+        reasoning_effort: Option<Option<&str>>,
+    ) -> Self {
+        let mut resolved = self.clone();
+        if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
+            if model != resolved.model {
+                // A different model invalidates the connection's context-window
+                // override, which was declared for the previous model.
+                resolved.context_window_tokens = None;
+            }
+            resolved.model = model.to_string();
+        }
+        if let Some(reasoning_effort) = reasoning_effort {
+            resolved.reasoning_effort = reasoning_effort
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+        resolved
+    }
+
     pub fn from_env() -> Self {
         let mut settings = Self::default();
         if let Some(base_url) = first_env([
@@ -183,13 +254,27 @@ impl ProviderSettings {
     }
 }
 
+pub fn known_model_context_window_tokens(model: &str) -> Option<usize> {
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("gpt-4.1") {
+        Some(1_047_576)
+    } else if model.starts_with("gpt-4o") || model.starts_with("gpt-4-turbo") {
+        Some(128_000)
+    } else if model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+        Some(200_000)
+    } else if model.starts_with("claude-") {
+        Some(200_000)
+    } else {
+        None
+    }
+}
+
 fn default_provider_temperature() -> f64 {
     0.2
 }
 
-fn default_provider_context_window_tokens() -> usize {
-    128_000
-}
+pub const MIN_PROVIDER_CONTEXT_WINDOW_TOKENS: usize = 4_096;
+pub const DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS: usize = 128_000;
 
 fn default_provider_supports_vision() -> bool {
     true
@@ -232,7 +317,7 @@ impl Default for SandboxSettings {
         Self {
             sandbox_mode: SandboxMode::WorkspaceWrite,
             enforcement: SandboxEnforcement::Enforce,
-            network: NetworkPolicy::Deny,
+            network: NetworkPolicy::Allow,
             writable_roots: Vec::new(),
             read_paths: Vec::new(),
         }
@@ -329,8 +414,7 @@ impl SandboxSettings {
                 Some(network) => network,
                 None => return Self::fail_safe(writable_roots, read_paths),
             },
-            Err(_) if sandbox_mode == SandboxMode::DangerFullAccess => NetworkPolicy::Allow,
-            Err(_) => NetworkPolicy::Deny,
+            Err(_) => NetworkPolicy::Allow,
         };
 
         Self {
@@ -396,6 +480,8 @@ pub struct AppSettings {
     pub active_provider_id: String,
     pub permission_mode: PermissionMode,
     #[serde(default)]
+    pub agent_runtime: AgentRuntimeSettings,
+    #[serde(default)]
     pub default_workspace_root: Option<PathBuf>,
     #[serde(default)]
     pub sandbox: SandboxSettings,
@@ -409,6 +495,7 @@ impl AppSettings {
             providers: vec![provider.clone()],
             active_provider_id: provider.id.clone(),
             permission_mode,
+            agent_runtime: AgentRuntimeSettings::default(),
             default_workspace_root: None,
             sandbox: SandboxSettings::from_env(),
             updated_at: Utc::now(),
@@ -421,6 +508,15 @@ impl AppSettings {
             .find(|p| p.id == self.active_provider_id)
             .or_else(|| self.providers.first())
             .expect("AppSettings has no providers configured")
+    }
+
+    /// Resolves the connection a thread pinned. Falls back to the active
+    /// connection when the pin refers to a connection the user has since
+    /// deleted, so an old thread stays usable instead of erroring.
+    pub fn provider_by_id_or_active(&self, connection_id: Option<&str>) -> &ProviderSettings {
+        connection_id
+            .and_then(|id| self.providers.iter().find(|provider| provider.id == id))
+            .unwrap_or_else(|| self.active_provider())
     }
 
     pub fn active_provider_mut(&mut self) -> &mut ProviderSettings {
@@ -602,6 +698,7 @@ mod tests {
         .expect("deserialize settings without sandbox");
 
         assert_eq!(settings.sandbox, SandboxSettings::default());
+        assert_eq!(settings.agent_runtime, AgentRuntimeSettings::default());
     }
 
     #[test]
@@ -620,8 +717,14 @@ mod tests {
         .expect("deserialize provider without generation settings");
 
         assert_eq!(provider.temperature, 0.2);
+        assert_eq!(provider.name, "");
+        assert_eq!(provider.display_name(), "legacy");
         assert_eq!(provider.max_output_tokens, None);
-        assert_eq!(provider.context_window_tokens, 128_000);
+        assert_eq!(provider.context_window_tokens, None);
+        assert_eq!(
+            provider.resolved_context_window_tokens(),
+            DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
+        );
         assert_eq!(provider.reasoning_effort, None);
         assert!(!provider.store_responses);
         assert!(!provider.parallel_tool_calls);
@@ -634,6 +737,7 @@ mod tests {
     #[test]
     fn responses_provider_settings_round_trip_state_and_cache_options() {
         let mut provider = ProviderSettings::default();
+        provider.name = "Primary Responses".to_string();
         provider.kind = ProviderKind::OpenAiResponses;
         provider.store_responses = true;
         provider.parallel_tool_calls = true;
@@ -651,6 +755,7 @@ mod tests {
         let restored: ProviderSettings = serde_json::from_value(json).unwrap();
 
         assert_eq!(restored.kind, ProviderKind::OpenAiResponses);
+        assert_eq!(restored.name, "Primary Responses");
         assert!(restored.store_responses);
         assert!(restored.parallel_tool_calls);
         assert_eq!(
@@ -669,6 +774,22 @@ mod tests {
             .expect("rollout budget")
             .validate()
             .is_ok());
+    }
+
+    #[test]
+    fn provider_context_limit_uses_override_known_model_then_fallback() {
+        let mut provider = ProviderSettings::default();
+        assert_eq!(provider.resolved_context_window_tokens(), 1_047_576);
+
+        provider.context_window_tokens = Some(64_000);
+        assert_eq!(provider.resolved_context_window_tokens(), 64_000);
+
+        provider.context_window_tokens = None;
+        provider.model = "private-model".to_string();
+        assert_eq!(
+            provider.resolved_context_window_tokens(),
+            DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
+        );
     }
 
     #[test]
@@ -702,6 +823,7 @@ mod tests {
             providers: vec![provider.clone()],
             active_provider_id: provider.id,
             permission_mode: PermissionMode::Auto,
+            agent_runtime: AgentRuntimeSettings::default(),
             default_workspace_root: None,
             sandbox: SandboxSettings::default(),
             updated_at: Utc::now(),
@@ -740,6 +862,7 @@ mod tests {
         let env = EnvGuard::cleared(&SANDBOX_ENV_KEYS);
         let settings = AppSettings::from_env(PermissionMode::Auto);
         assert_eq!(settings.sandbox, SandboxSettings::default());
+        assert_eq!(settings.sandbox.network, NetworkPolicy::Allow);
 
         env.set("OPENTOPIA_SANDBOX_MODE", "best_effort");
         env.set("OPENTOPIA_SANDBOX_NETWORK", "inherit");
@@ -760,6 +883,9 @@ mod tests {
         assert_eq!(settings.network, NetworkPolicy::Inherit);
         assert_eq!(settings.writable_roots, writable_roots);
         assert_eq!(settings.read_paths, read_paths);
+
+        env.set("OPENTOPIA_SANDBOX_NETWORK", "deny");
+        assert_eq!(SandboxSettings::from_env().network, NetworkPolicy::Deny);
     }
 
     #[test]

@@ -111,6 +111,20 @@ test("extracts endpoint, bearer token, model, and kind from multiline curl", () 
   assert.equal(draft.warnings.join(" ").includes("secret-curl-key"), false);
 });
 
+test("recognizes Anthropic's native Messages API without treating it as OpenAI-compatible", () => {
+  const draft = parseProviderImport(`
+    ANTHROPIC_BASE_URL=https://api.anthropic.com/v1/messages
+    ANTHROPIC_MODEL=claude-sonnet-4-20250514
+    ANTHROPIC_API_KEY=secret-anthropic-key
+  `);
+
+  assert.equal(draft.kind, "anthropic");
+  assert.equal(draft.baseUrl, "https://api.anthropic.com");
+  assert.equal(draft.model, "claude-sonnet-4-20250514");
+  assert.equal(draft.apiKey, "secret-anthropic-key");
+  assert.equal(draft.name, "Anthropic Messages");
+});
+
 test("does not treat a curl environment-variable reference as an API key", () => {
   const draft =
     parseProviderImport(`curl.exe --url http://localhost:11434/api/chat \\
@@ -145,7 +159,12 @@ test("returns usable defaults and warnings for unknown or incomplete input", () 
 test("exposes stable presets and creates independent editable drafts", () => {
   assert.deepEqual(
     PROVIDER_IMPORT_PRESETS.map((preset) => preset.id),
-    ["openai-compatible", "openai-responses", "ollama-local"],
+    [
+      "openai-compatible",
+      "openai-responses",
+      "anthropic-messages",
+      "ollama-local",
+    ],
   );
 
   const draft = createProviderDraftFromPreset("ollama-local");

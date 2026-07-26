@@ -140,9 +140,26 @@ export type Thread = {
   workspaceRoot: string;
   projectId: string | null;
   experienceMode: ExperienceMode;
+  /**
+   * Model pinned to this conversation. Pinned at creation so a catalog refresh
+   * never swaps the model mid-thread; `null` follows the active connection.
+   */
+  modelSelection: ThreadModelSelection | null;
   archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type ThreadModelSelection = {
+  connectionId: string;
+  modelId: string;
+  reasoningEffort: ReasoningEffort | null;
+};
+
+export type ProviderModelSyncResult = {
+  providerId: string;
+  models: string[];
+  syncedAt: string;
 };
 
 export type Project = {
@@ -158,16 +175,25 @@ export type Project = {
 export type PermissionMode =
   "chat" | "read_only" | "auto" | "approve" | "full_access";
 
+export type AgentRuntimeSettings = {
+  personality: "focused" | "professional" | "warm";
+  autonomy: "guided" | "balanced" | "proactive";
+  multiAgent: "off" | "explicit" | "adaptive";
+  progressUpdates: "milestones" | "balanced" | "frequent";
+};
+
 export type ProviderKind =
   | "mock"
   | "openai_compatible"
   | "openai_responses"
+  | "anthropic"
   | "codex_app_server";
 
 export type AppSettings = {
   providers: ProviderSettings[];
   activeProviderId: string;
   permissionMode: PermissionMode;
+  agentRuntime: AgentRuntimeSettings;
   defaultWorkspaceRoot?: string | null;
   sandbox: SandboxSettings;
   updatedAt: string;
@@ -181,16 +207,41 @@ export type SandboxSettings = {
   readPaths: string[];
 };
 
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
 export type ProviderSettings = {
   id: string;
+  name: string;
   kind: ProviderKind;
   baseUrl: string;
+  /**
+   * Default model for this connection. Threads may pin a different model; this
+   * is the fallback for new threads and internal calls like title generation.
+   */
   model: string;
+  /**
+   * Model families the user allowed for this connection. Empty means "not
+   * narrowed yet", which shows every synced family rather than none.
+   */
+  enabledFamilies: string[];
+  /** Model ids from the last `/v1/models` sync, cached for offline use. */
+  syncedModels: string[];
+  modelsSyncedAt?: string | null;
   temperature: number;
   maxOutputTokens?: number | null;
-  contextWindowTokens: number;
-  reasoningEffort?:
-    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+  /**
+   * Optional user override. When unset, the server resolves a known model
+   * capability and otherwise uses its conservative unknown-model fallback.
+   */
+  contextWindowTokens: number | null;
+  reasoningEffort?: ReasoningEffort | null;
   storeResponses: boolean;
   parallelToolCalls: boolean;
   promptCacheKey?: string | null;
@@ -647,6 +698,11 @@ export type WebPreviewState = {
   visible?: boolean;
   bounds?: WebPreviewBounds;
   error?: string | null;
+};
+
+export type BrowserNavigationRequest = {
+  id: string;
+  url: string;
 };
 
 export type SandboxDescriptor = {
