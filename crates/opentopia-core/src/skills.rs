@@ -2,12 +2,12 @@ use crate::plugins::{discover_plugins, PluginScope};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const MAX_SKILLS_PER_TURN: usize = 5;
-const MAX_SKILL_BYTES: usize = 64 * 1024;
+pub const MAX_SKILL_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_SKILL_BYTES: usize = 128 * 1024;
 const MAX_SKILL_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_DISCOVERY_BYTES: usize = 64 * 1024;
@@ -278,6 +278,106 @@ pub(crate) fn descriptor_for_skill_file(
         .canonicalize()
         .map_err(|_| SkillError::Read(path.display().to_string()))?;
     descriptor_from_file(skill_id(scope, &canonical), canonical, scope, None, None)
+}
+
+/// One window of a Skill's instructions.
+///
+/// `read_skill` reads at most `MAX_SKILL_BYTES` at a time. Without a window the
+/// tail of a longer Skill was unreachable: the tool reported `truncated` and had
+/// no parameter that could ask for the rest. `next_offset` is the offset that
+/// returns the following window, or `None` once the end of the file is reached.
+#[derive(Debug, Clone)]
+pub struct SkillSlice {
+    pub descriptor: SkillDescriptor,
+    pub instructions: String,
+    pub offset: u64,
+    pub next_offset: Option<u64>,
+    pub total_bytes: u64,
+}
+
+impl SkillSlice {
+    pub fn render_for_model(&self) -> String {
+        let continuation = match self.next_offset {
+            Some(next) => format!(
+                "Bytes {}-{} of {}. Call read_skill again with offset {next} for the rest.",
+                self.offset,
+                next.saturating_sub(1),
+                self.total_bytes
+            ),
+            None if self.offset == 0 => "Complete.".to_string(),
+            None => format!(
+                "Bytes {}-{} of {}. End of file.",
+                self.offset,
+                self.total_bytes.saturating_sub(1),
+                self.total_bytes
+            ),
+        };
+        format!(
+            "<skill>\nName: {}\nDescription: {}\nPath: {}\n{continuation}\n\n{}\n</skill>",
+            self.descriptor.name,
+            self.descriptor.description,
+            self.descriptor.path.display(),
+            self.instructions
+        )
+    }
+}
+
+/// Reads one window of a single Skill, starting at `offset` bytes.
+pub fn load_skill_slice(
+    workspace_root: Option<&Path>,
+    id: &str,
+    offset: u64,
+    limit: usize,
+) -> Result<SkillSlice, SkillError> {
+    let descriptor = discover_skills(workspace_root)
+        .into_iter()
+        .find(|skill| skill.id == id)
+        .ok_or_else(|| SkillError::Unknown(id.to_string()))?;
+    let limit = limit.clamp(1, MAX_SKILL_BYTES);
+    let (bytes, total_bytes) = read_skill_window(&descriptor.path, offset, limit)?;
+    let read_to = offset.saturating_add(bytes.len() as u64);
+    let next_offset = (read_to < total_bytes).then_some(read_to);
+    Ok(SkillSlice {
+        descriptor,
+        instructions: String::from_utf8_lossy(&bytes).into_owned(),
+        offset,
+        next_offset,
+        total_bytes,
+    })
+}
+
+/// Reads `read_limit` bytes starting at `offset`, plus the file's total length.
+fn read_skill_window(
+    path: &Path,
+    offset: u64,
+    read_limit: usize,
+) -> Result<(Vec<u8>, u64), SkillError> {
+    let path_display = path.display().to_string();
+    let metadata = fs::metadata(path).map_err(|_| SkillError::Read(path_display.clone()))?;
+    if !metadata.is_file() {
+        return Err(SkillError::Read(path_display));
+    }
+    if metadata.len() > MAX_SKILL_SOURCE_BYTES {
+        return Err(SkillError::TooLarge {
+            path: path_display,
+            actual: metadata.len(),
+            maximum: MAX_SKILL_SOURCE_BYTES,
+        });
+    }
+    let total_bytes = metadata.len();
+    if offset >= total_bytes {
+        return Ok((Vec::new(), total_bytes));
+    }
+
+    let mut file = File::open(path).map_err(|_| SkillError::Read(path_display.clone()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|_| SkillError::Read(path_display.clone()))?;
+    let mut reader = BufReader::new(file).take(read_limit as u64);
+    let mut bytes = Vec::with_capacity(read_limit.min(total_bytes as usize));
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|_| SkillError::Read(path_display))?;
+    Ok((bytes, total_bytes))
 }
 
 fn read_skill_file(path: &Path, read_limit: usize) -> Result<(Vec<u8>, bool), SkillError> {

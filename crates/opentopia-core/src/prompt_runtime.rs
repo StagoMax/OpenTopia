@@ -163,7 +163,11 @@ impl Default for PromptRuntimeCapabilities {
             multi_agent_available: false,
             max_parallel_agents: 0,
             max_agent_depth: 0,
-            request_user_input_available: true,
+            // Every field here describes the absence of a capability, and the
+            // structured ask is only reachable in plan mode, which is never the
+            // default. Defaulting this to `true` would make the clarification
+            // module promise a channel the runtime rejects.
+            request_user_input_available: false,
         }
     }
 }
@@ -373,7 +377,7 @@ fn progress_instruction(mode: ProgressUpdateMode) -> &'static str {
 }
 
 fn skills_protocol_instruction() -> &'static str {
-    "<skills_protocol>\nThe runtime may provide a compact Skill catalog. A catalog entry is routing metadata, not the Skill's full instructions. When the user names a Skill or the request clearly matches one, use the Skill tools to load its complete instruction resource before acting. Select the smallest set that covers the task, read only task-relevant linked references after the main resource, reuse supplied scripts and assets, and report a concise fallback if loading fails. User intent and higher-priority runtime policy remain controlling.\n\nA Skill whose full instructions are already present in your context is loaded; do not call a Skill tool to fetch it again. Load only the linked references that this task actually needs. Do not carry a Skill into later turns unless it is still selected or the user triggers it again.\n</skills_protocol>"
+    "<skills_protocol>\nThe runtime may provide a compact Skill catalog. A catalog entry is routing metadata, not the Skill's full instructions. When the user names a Skill or the request clearly matches one, use the Skill tools to load its complete instruction resource before acting. Select the smallest set that covers the task, read only task-relevant linked references after the main resource, reuse supplied scripts and assets, and report a concise fallback if loading fails. User intent and higher-priority runtime policy remain controlling.\n\nA Skill whose full instructions are already present in your context is loaded; do not call a Skill tool to fetch it again. Load only the linked references that this task actually needs. Do not carry a Skill into later turns unless it is still selected or the user triggers it again.\n\nRead a Skill's instructions yourself. Do not delegate reading, summarizing, or interpreting them to a child agent: a summary is not the instruction, and the agent that acts under a Skill is the agent that has to have read it. A child may still perform the task work the Skill describes. When several Skills apply, use the smallest set that covers the request and say in what order you are applying them.\n</skills_protocol>"
 }
 
 fn output_contract_instruction(surface: RuntimeSurface) -> String {
@@ -388,6 +392,14 @@ fn output_contract_instruction(surface: RuntimeSurface) -> String {
             "Reference real workspace files by path, and include a line number as path:line when pointing at specific code. Keep paths in the form the surrounding conversation already uses."
         }
     };
+    let media_rule = match surface {
+        RuntimeSurface::Desktop => {
+            "Images render only from http or https URLs. The renderer strips a filesystem path, drive-letter path, or file:// URI out of an image target and the reader is left with the alt text alone, so never point image syntax at a workspace file; reference the file as a link and let the reader open it. Mermaid is not rendered on this surface either: a ```mermaid fence appears as a code block, so carry the diagram with a table, a tree, or a compact ASCII layout instead."
+        }
+        RuntimeSurface::Cli | RuntimeSurface::Core => {
+            "Images and diagram markup do not render on this surface. Give the artifact's path and describe what it shows instead of emitting image syntax or a Mermaid fence."
+        }
+    };
     let markup_rule = match surface {
         RuntimeSurface::Desktop => {
             "Your response is rendered as GitHub-flavored Markdown. Follow CommonMark structure: leave a blank line before any list and between a heading and the content that follows it, or the output will not render correctly."
@@ -397,7 +409,7 @@ fn output_contract_instruction(surface: RuntimeSurface) -> String {
         }
     };
     format!(
-        "<output_contract>\n{markup_rule}\n\nDo not over-format. Use bold, headings, lists, and tables only where they make the answer easier to read than prose would, and prefer the smallest structure that does the job. A short answer usually needs no structure at all.\n\n{reference_rule}\n\nUse a visualization only when it makes an important relationship materially clearer than prose or a short list would. Reach for one when you are comparing several precise mappings or repeated fields, when one source or decision fans out to three or more downstream consumers, when three or more interdependent steps or state transitions are involved, or when the subject is a hierarchy, ownership graph, or layout that reads poorly in linear text. Pick the smallest form that works: a table for mappings and comparisons, a flow or timeline for sequence and change, a tree for hierarchy, a wireframe for layout. Do not add one merely because an answer has several parts. A large ASCII diagram counts as a visualization; compact notation and small inline examples do not.\n\nNever fabricate a rendered artifact. Markdown alone does not change application state, create a file, or complete an action; only a real tool result does.\n</output_contract>"
+        "<output_contract>\n{markup_rule}\n\nDo not over-format. Use bold, headings, lists, and tables only where they make the answer easier to read than prose would, and prefer the smallest structure that does the job. A short answer usually needs no structure at all.\n\n{reference_rule}\n\n{media_rule}\n\nUse a visualization only when it makes an important relationship materially clearer than prose or a short list would. Reach for one when you are comparing several precise mappings or repeated fields, when one source or decision fans out to three or more downstream consumers, when three or more interdependent steps or state transitions are involved, or when the subject is a hierarchy, ownership graph, or layout that reads poorly in linear text. Pick the smallest form that works: a table for mappings and comparisons, a flow or timeline for sequence and change, a tree for hierarchy, a wireframe for layout. Do not add one merely because an answer has several parts. A large ASCII diagram counts as a visualization; compact notation and small inline examples do not.\n\nNever fabricate a rendered artifact. Markdown alone does not change application state, create a file, or complete an action; only a real tool result does.\n</output_contract>"
     )
 }
 
@@ -521,6 +533,24 @@ mod tests {
         assert!(output
             .text_content()
             .contains("never use a filesystem-absolute path"));
+        // The renderer only accepts http(s) image targets and has no mermaid
+        // plugin, so both rules have to say what actually happens instead of
+        // copying a contract written for another renderer.
+        assert!(output
+            .text_content()
+            .contains("Images render only from http or https URLs"));
+        assert!(output.text_content().contains("Mermaid is not rendered"));
+
+        let skills = desktop
+            .iter()
+            .find(|item| item.metadata["promptModuleId"] == "skills_protocol")
+            .expect("skills protocol module");
+        assert!(skills.text_content().contains(
+            "Do not delegate reading, summarizing, or interpreting them to a child agent"
+        ));
+        // Paging past a truncated read is the read_skill tool's job. The module
+        // must not carry a rule for coping with a capability the tool should have.
+        assert!(!skills.text_content().contains("truncated"));
 
         let clarification = desktop
             .iter()
@@ -544,8 +574,16 @@ mod tests {
             .find(|item| item.metadata["promptModuleId"] == "output_contract")
             .expect("output contract module");
         assert!(cli_output.text_content().contains("path:line"));
-        assert!(!cli_output.text_content().contains("clickable Markdown links"));
-        assert!(cli_output.text_content().contains("Terminals do not render"));
+        assert!(!cli_output
+            .text_content()
+            .contains("clickable Markdown links"));
+        assert!(cli_output
+            .text_content()
+            .contains("Terminals do not render"));
+        assert!(cli_output
+            .text_content()
+            .contains("Images and diagram markup do not render"));
+        assert!(!cli_output.text_content().contains("http or https URLs"));
 
         let cli_clarification = cli
             .iter()
