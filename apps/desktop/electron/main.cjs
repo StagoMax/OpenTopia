@@ -13,11 +13,20 @@ const { URL, fileURLToPath } = require("node:url");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const net = require("node:net");
 const updater = require("./updater.cjs");
 const { createDesktopBrowserHost } = require("./browser-host.cjs");
 
 const isDev = !app.isPackaged;
-const defaultBackendUrl =
+if (isDev) {
+  app.setName("OpenTopia Dev");
+  const devUserDataPath =
+    process.env.OPENTOPIA_DEV_USER_DATA ||
+    path.join(app.getPath("appData"), "OpenTopia Dev");
+  app.setPath("userData", path.resolve(devUserDataPath));
+}
+const hasExplicitBackendUrl = Boolean(process.env.OPENTOPIA_SERVER_URL);
+let defaultBackendUrl =
   process.env.OPENTOPIA_SERVER_URL || "http://127.0.0.1:8787";
 const backendApiToken = crypto.randomBytes(32).toString("base64url");
 const openTopiaProtocol = "opentopia";
@@ -726,6 +735,12 @@ function createBackendEnv(repoRoot, options = {}) {
     OPENTOPIA_API_TOKEN: backendApiToken,
   };
 
+  if (isDev) {
+    env.CARGO_TARGET_DIR ||=
+      process.env.OPENTOPIA_DEV_CARGO_TARGET_DIR ||
+      path.join(repoRoot, "target", "desktop-dev");
+  }
+
   if (desktopBrowserBroker) {
     env.OPENTOPIA_DESKTOP_BROWSER_BROKER_URL = desktopBrowserBroker.url;
     env.OPENTOPIA_DESKTOP_BROWSER_BROKER_TOKEN = desktopBrowserBroker.token;
@@ -756,7 +771,7 @@ function createBackendEnv(repoRoot, options = {}) {
     env.OPENTOPIA_SANDBOX_MODE ||= "workspace-write";
     env.OPENTOPIA_SANDBOX_ENFORCEMENT ||=
       process.env.OPENTOPIA_SANDBOX_ENFORCEMENT || "enforce";
-    env.OPENTOPIA_SANDBOX_NETWORK ||= "deny";
+    env.OPENTOPIA_SANDBOX_NETWORK ||= "allow";
     env.OPENTOPIA_WINDOWS_SANDBOX ||=
       process.env.OPENTOPIA_WINDOWS_SANDBOX || "unelevated";
     env.OPENTOPIA_SANDBOX_HOME ||= path.join(
@@ -1259,6 +1274,59 @@ async function isBackendHealthy() {
   }
 }
 
+function canListenOnPort(host, port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.listen({ host, port, exclusive: true }, () => {
+      probe.close(() => resolve(true));
+    });
+  });
+}
+
+function findAvailablePort(host) {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", reject);
+    probe.listen({ host, port: 0, exclusive: true }, () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      probe.close((error) => {
+        if (error) reject(error);
+        else if (port > 0) resolve(port);
+        else reject(new Error("Could not reserve an available backend port"));
+      });
+    });
+  });
+}
+
+async function selectAvailableManagedBackendUrl() {
+  if (hasExplicitBackendUrl) return;
+
+  const endpoint = new URL(defaultBackendUrl);
+  const host = endpoint.hostname.replace(/^\[|\]$/g, "");
+  const port = Number(endpoint.port || "8787");
+  if (
+    endpoint.protocol !== "http:" ||
+    !["127.0.0.1", "::1", "localhost"].includes(host) ||
+    !Number.isInteger(port) ||
+    port < 1 ||
+    port > 65535 ||
+    (await canListenOnPort(host, port))
+  ) {
+    return;
+  }
+
+  const availablePort = await findAvailablePort(host);
+  const urlHost = host.includes(":") ? `[${host}]` : host;
+  defaultBackendUrl = `http://${urlHost}:${availablePort}`;
+  writeLog("info", "backend.port.reassigned", {
+    previousPort: port,
+    selectedPort: availablePort,
+    host,
+  });
+}
+
 function serverBinaryName() {
   return process.platform === "win32"
     ? "opentopia-server.exe"
@@ -1371,6 +1439,12 @@ function verifyCodexSandboxBundle(codexPath) {
 
 async function startBackendIfNeeded() {
   if (await isBackendHealthy()) return;
+
+  try {
+    await selectAvailableManagedBackendUrl();
+  } catch (error) {
+    logConsole("warn", "backend.port.selection.failed", { error });
+  }
 
   const repoRoot = path.resolve(__dirname, "..", "..", "..");
   const packagedServer = resolvePackagedServerBinary();
@@ -1521,7 +1595,7 @@ function createMainWindow() {
     height: 900,
     minWidth: 1080,
     minHeight: 720,
-    title: "OpenTopia",
+    title: isDev ? "OpenTopia Dev" : "OpenTopia",
     backgroundColor: "#ffffff",
     show: false,
     ...(process.platform === "win32"
@@ -1543,6 +1617,13 @@ function createMainWindow() {
   });
 
   desktopBrowserHost?.attachWindow(mainWindow);
+
+  if (isDev) {
+    mainWindow.on("page-title-updated", (event) => {
+      event.preventDefault();
+      mainWindow?.setTitle("OpenTopia Dev");
+    });
+  }
 
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();

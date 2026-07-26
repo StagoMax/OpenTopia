@@ -53,6 +53,17 @@ pnpm install
 pnpm dev:desktop
 ```
 
+`pnpm dev:desktop` opens an isolated **OpenTopia Dev** instance backed by the
+Vite development server. Changes under `apps/desktop/src` are applied with hot
+module replacement, so rebuilding or reinstalling the desktop package is not
+required. The installed OpenTopia app may remain open at the same time.
+
+Changes to `apps/desktop/electron` or the Rust crates require restarting
+`pnpm dev:desktop` so the Electron main process or local server can restart;
+they still do not require rebuilding the installer.
+The managed development server uses `target/desktop-dev` by default so it can
+run alongside other Cargo-launched OpenTopia servers.
+
 In the desktop UI, use **Open Workspace** in the left sidebar to pick a
 directory. New threads are created with the selected `workspaceRoot`; recently
 opened directories are stored in Electron user data and can be selected again
@@ -79,13 +90,13 @@ cargo run -p opentopia-server -- --permission auto
 ```
 
 Sandbox and approval are configured independently. The desktop defaults to a
-network-restricted, workspace-write sandbox; development may explicitly fall
+network-enabled, workspace-write sandbox; development may explicitly fall
 back when the platform helper is unavailable, while packaged builds fail closed:
 
 ```powershell
 $env:OPENTOPIA_SANDBOX_MODE="workspace-write" # read-only | workspace-write | danger-full-access
 $env:OPENTOPIA_SANDBOX_ENFORCEMENT="enforce"  # disabled | best-effort | enforce
-$env:OPENTOPIA_SANDBOX_NETWORK="deny"
+$env:OPENTOPIA_SANDBOX_NETWORK="allow" # allow (default) | inherit | deny
 $env:OPENTOPIA_SANDBOX_WRITABLE_ROOTS="D:\shared"
 ```
 

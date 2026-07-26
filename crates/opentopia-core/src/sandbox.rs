@@ -103,7 +103,7 @@ impl Default for LocalSandboxConfig {
         Self {
             enabled: false,
             mode: OsSandboxMode::Disabled,
-            network: NetworkPolicy::Deny,
+            network: NetworkPolicy::Allow,
             read_paths: Vec::new(),
             write_paths: Vec::new(),
             sandbox_mode: SandboxMode::WorkspaceWrite,
@@ -209,13 +209,7 @@ impl LocalSandboxConfig {
                 }
             });
         let configured_network = match std::env::var("OPENTOPIA_SANDBOX_NETWORK")
-            .unwrap_or_else(|_| {
-                if sandbox_mode == SandboxMode::DangerFullAccess {
-                    "allow".to_string()
-                } else {
-                    "deny".to_string()
-                }
-            })
+            .unwrap_or_else(|_| "allow".to_string())
             .to_ascii_lowercase()
             .as_str()
         {
@@ -1115,7 +1109,7 @@ mod tests {
         let config = LocalSandboxConfig::default();
         assert!(!config.is_enabled());
         assert_eq!(config.mode, OsSandboxMode::Disabled);
-        assert_eq!(config.network, NetworkPolicy::Deny);
+        assert_eq!(config.network, NetworkPolicy::Allow);
         assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
     }
 
@@ -1197,13 +1191,15 @@ mod tests {
     #[test]
     fn linux_sandbox_plan_wraps_with_bubblewrap() {
         let args = sample_args();
+        let mut config = LocalSandboxConfig::best_effort();
+        config.network = NetworkPolicy::Deny;
         let plan = build_local_sandbox_command_for_platform(
             OsSandboxPlatform::Linux,
             "sh",
             &args,
             Path::new("/workspace"),
             Path::new("/workspace"),
-            &LocalSandboxConfig::best_effort(),
+            &config,
         )
         .expect("build plan");
 
@@ -1264,13 +1260,15 @@ mod tests {
     #[test]
     fn macos_sandbox_plan_wraps_with_sandbox_exec() {
         let args = sample_args();
+        let mut config = LocalSandboxConfig::best_effort();
+        config.network = NetworkPolicy::Deny;
         let plan = build_local_sandbox_command_for_platform(
             OsSandboxPlatform::Macos,
             "sh",
             &args,
             Path::new("/workspace"),
             Path::new("/workspace"),
-            &LocalSandboxConfig::best_effort(),
+            &config,
         )
         .expect("build plan");
 
