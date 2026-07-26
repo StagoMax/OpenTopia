@@ -368,10 +368,19 @@ Implemented:
   per-Thread enablement. Direct API calls require the owning Thread.
 - Parse OpenAI-compatible tool calls and run up to eight provider tool rounds,
   including enabled MCP tools, with a hard loop limit and local-summary fallback.
+- Persist the tool catalog in `mcp_server_tools` so cache warmup survives a server restart.
+  `McpExtensionHost` write-through happens on both catalog write points: a ready client
+  install and a `tools/list_changed` refresh. `warm_tool_cache()` restores the catalog at
+  startup, before enabled servers are restarted.
+  Persisted descriptors describe a server that has no live runtime yet, and are deliberately
+  never inserted into the routing table: `call_tool` still requires a ready client, so a
+  restored catalog can never make a dead server look callable. `stop_server` keeps the last
+  known catalog; `forget_server` drops it, and the `mcp_servers` foreign key cascades the rows.
 
 Future refinement:
 
-- Persist refreshed MCP tool schemas if cache warmup should survive server restart.
+- Persist per-server tool `updated_at` in the workbench UI so a stale catalog is visibly
+  marked while its server is still starting.
 
 Acceptance:
 

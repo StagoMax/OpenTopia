@@ -1,12 +1,11 @@
-use crate::mcp::{McpServerConfig, ThreadMcpServer};
+use crate::mcp::{McpServerConfig, McpToolDescriptor, ThreadMcpServer};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
     ArtifactStorage, ArtifactStorageMetadata, ExperienceMode, GoalAttemptStatus, GoalRecord,
     GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart,
     MessageRole, Project, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, Thread,
-    ThreadModelSelection,
-    ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord, TurnStatus, UserInputRecord,
-    UserInputRequest, UserInputResponse, UserInputStatus,
+    ThreadModelSelection, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord, TurnStatus,
+    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::provider::ModelConversationMessage;
 use crate::settings::AppSettings;
@@ -681,6 +680,19 @@ impl SqliteSessionStore {
                 FOREIGN KEY(server_id) REFERENCES mcp_servers(server_id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS mcp_server_tools (
+                server_id TEXT NOT NULL,
+                public_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                description TEXT,
+                input_schema_json TEXT NOT NULL,
+                annotations_json TEXT NOT NULL,
+                permission_labels_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(server_id, public_name),
+                FOREIGN KEY(server_id) REFERENCES mcp_servers(server_id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_thread_created
                 ON messages(thread_id, created_at);
 
@@ -1068,6 +1080,79 @@ impl SqliteSessionStore {
             ],
         )?;
         Ok(binding)
+    }
+
+    /// Replaces the persisted tool catalog for one MCP server.
+    ///
+    /// The cache is a mirror of the server's last successful `tools/list`, so the whole
+    /// catalog is rewritten in a single transaction rather than merged. Tools the server
+    /// stopped advertising must not survive the rewrite.
+    pub fn replace_mcp_server_tools(
+        &self,
+        server_id: Uuid,
+        tools: &[McpToolDescriptor],
+    ) -> anyhow::Result<()> {
+        let updated_at = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM mcp_server_tools WHERE server_id = ?1",
+            params![server_id.to_string()],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO mcp_server_tools (
+                    server_id, public_name, tool_name, description,
+                    input_schema_json, annotations_json, permission_labels_json, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+            )?;
+            for tool in tools {
+                stmt.execute(params![
+                    server_id.to_string(),
+                    tool.public_name,
+                    tool.tool_name,
+                    tool.description,
+                    serde_json::to_string(&tool.input_schema)?,
+                    serde_json::to_string(&tool.annotations)?,
+                    serde_json::to_string(&tool.permission_labels)?,
+                    updated_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_mcp_server_tools(&self, server_id: Uuid) -> anyhow::Result<Vec<McpToolDescriptor>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT server_id, public_name, tool_name, description,
+                   input_schema_json, annotations_json, permission_labels_json
+            FROM mcp_server_tools
+            WHERE server_id = ?1
+            ORDER BY public_name ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![server_id.to_string()], map_mcp_server_tool)?;
+        collect_rows(rows)
+    }
+
+    pub fn list_all_mcp_server_tools(&self) -> anyhow::Result<Vec<McpToolDescriptor>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT server_id, public_name, tool_name, description,
+                   input_schema_json, annotations_json, permission_labels_json
+            FROM mcp_server_tools
+            ORDER BY public_name ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], map_mcp_server_tool)?;
+        collect_rows(rows)
     }
 }
 
@@ -3760,6 +3845,27 @@ fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerConfig> 
     })
 }
 
+fn map_mcp_server_tool(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpToolDescriptor> {
+    let input_schema_json: String = row.get(4)?;
+    let annotations_json: String = row.get(5)?;
+    let permission_labels_json: String = row.get(6)?;
+    Ok(McpToolDescriptor {
+        server_id: parse_uuid(row.get(0)?, 0)?,
+        public_name: row.get(1)?,
+        tool_name: row.get(2)?,
+        description: row.get(3)?,
+        input_schema: serde_json::from_str(&input_schema_json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(err))
+        })?,
+        annotations: serde_json::from_str(&annotations_json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(err))
+        })?,
+        permission_labels: serde_json::from_str(&permission_labels_json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(err))
+        })?,
+    })
+}
+
 fn map_thread_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadMcpServer> {
     Ok(ThreadMcpServer {
         thread_id: parse_uuid(row.get(0)?, 0)?,
@@ -3860,6 +3966,123 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    fn mcp_server_fixture(store: &SqliteSessionStore, name: &str) -> McpServerConfig {
+        store
+            .insert_mcp_server(McpServerConfig {
+                server_id: Uuid::new_v4(),
+                name: name.to_string(),
+                command: "node".to_string(),
+                args: vec!["server.js".to_string()],
+                cwd: None,
+                env_keys: vec![],
+                timeout_ms: 5_000,
+                enabled: true,
+                plugin_id: None,
+                plugin_server_name: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .expect("insert mcp server")
+    }
+
+    fn tool_fixture(server_id: Uuid, tool_name: &str) -> McpToolDescriptor {
+        McpToolDescriptor {
+            public_name: format!("files__{tool_name}"),
+            server_id,
+            tool_name: tool_name.to_string(),
+            description: Some(format!("{tool_name} description")),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+            annotations: serde_json::json!({ "readOnlyHint": true }),
+            permission_labels: vec!["read".to_string()],
+        }
+    }
+
+    #[test]
+    fn mcp_tool_catalog_round_trips_through_sqlite() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let server = mcp_server_fixture(&store, "files");
+        let tools = vec![
+            tool_fixture(server.server_id, "read"),
+            tool_fixture(server.server_id, "write"),
+        ];
+
+        store
+            .replace_mcp_server_tools(server.server_id, &tools)
+            .expect("persist tools");
+
+        let restored = store
+            .list_mcp_server_tools(server.server_id)
+            .expect("load tools");
+        assert_eq!(restored.len(), 2);
+        let read = restored
+            .iter()
+            .find(|tool| tool.tool_name == "read")
+            .expect("read tool persisted");
+        assert_eq!(read.public_name, "files__read");
+        assert_eq!(read.server_id, server.server_id);
+        assert_eq!(read.description.as_deref(), Some("read description"));
+        assert_eq!(read.permission_labels, vec!["read".to_string()]);
+        assert_eq!(read.annotations["readOnlyHint"], serde_json::json!(true));
+        assert_eq!(read.input_schema["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn mcp_tool_catalog_replaces_rather_than_merges() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let server = mcp_server_fixture(&store, "files");
+        store
+            .replace_mcp_server_tools(
+                server.server_id,
+                &[
+                    tool_fixture(server.server_id, "read"),
+                    tool_fixture(server.server_id, "write"),
+                ],
+            )
+            .expect("persist first catalog");
+
+        // The server stopped advertising `write`; the stale row must not survive.
+        store
+            .replace_mcp_server_tools(server.server_id, &[tool_fixture(server.server_id, "read")])
+            .expect("persist second catalog");
+
+        let restored = store
+            .list_mcp_server_tools(server.server_id)
+            .expect("load tools");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].tool_name, "read");
+    }
+
+    #[test]
+    fn mcp_tool_catalog_is_scoped_per_server_and_cascades_on_delete() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let files = mcp_server_fixture(&store, "files");
+        let search = mcp_server_fixture(&store, "search");
+        store
+            .replace_mcp_server_tools(files.server_id, &[tool_fixture(files.server_id, "read")])
+            .expect("persist files catalog");
+        store
+            .replace_mcp_server_tools(search.server_id, &[tool_fixture(search.server_id, "query")])
+            .expect("persist search catalog");
+
+        assert_eq!(
+            store.list_all_mcp_server_tools().expect("load all").len(),
+            2
+        );
+
+        assert!(store.delete_mcp_server(files.server_id).expect("delete"));
+
+        let remaining = store.list_all_mcp_server_tools().expect("load all");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].server_id, search.server_id);
+        assert!(store
+            .list_mcp_server_tools(files.server_id)
+            .expect("load deleted server tools")
+            .is_empty());
     }
 
     #[test]

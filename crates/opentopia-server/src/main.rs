@@ -128,7 +128,13 @@ async fn main() -> anyhow::Result<()> {
             workspace_root,
             sandbox_config,
         ))
-    });
+    })
+    .with_tool_catalog_store(store.clone());
+    match mcp_host.warm_tool_cache().await {
+        Ok(0) => {}
+        Ok(tools) => info!(tools, "restored persisted MCP tool schema cache"),
+        Err(err) => warn!(?err, "failed to restore persisted MCP tool schema cache"),
+    }
     restore_enabled_mcp_servers(store.clone(), mcp_host.clone());
     let browser = initialize_browser_runtime().await;
     let computer: Arc<dyn ComputerRuntime> =
@@ -4855,7 +4861,7 @@ async fn delete_mcp_server(
     State(state): State<AppState>,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
-    state.mcp_host.stop_server(server_id).await.ok();
+    state.mcp_host.forget_server(server_id).await.ok();
     let deleted = state.store.delete_mcp_server(server_id)?;
     if !deleted {
         return Err(ApiError::not_found(format!(

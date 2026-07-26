@@ -27,6 +27,27 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_CLIENT_NAME: &str = "opentopia";
 const MCP_MAX_TOOL_LIST_PAGES: usize = 128;
 
+/// Durable mirror of each MCP server's last successful `tools/list`.
+///
+/// The host keeps the authoritative catalog in memory. This trait only lets that catalog
+/// survive a server restart so the workbench can describe a server's tools before its stdio
+/// process has finished initializing, or when it fails to start at all. Persisted entries are
+/// never used to route a `call_tool`: routing still requires a live, ready client.
+pub trait McpToolCatalogStore: Send + Sync {
+    fn replace_tools(&self, server_id: Uuid, tools: &[McpToolDescriptor]) -> anyhow::Result<()>;
+    fn load_all_tools(&self) -> anyhow::Result<Vec<McpToolDescriptor>>;
+}
+
+impl McpToolCatalogStore for crate::store::SqliteSessionStore {
+    fn replace_tools(&self, server_id: Uuid, tools: &[McpToolDescriptor]) -> anyhow::Result<()> {
+        self.replace_mcp_server_tools(server_id, tools)
+    }
+
+    fn load_all_tools(&self) -> anyhow::Result<Vec<McpToolDescriptor>> {
+        self.list_all_mcp_server_tools()
+    }
+}
+
 type PendingMap = Arc<Mutex<HashMap<u64, PendingRequest>>>;
 type StdinWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
@@ -87,6 +108,7 @@ pub struct McpExtensionHost {
     inner: Arc<RwLock<McpExtensionHostInner>>,
     spawner: Arc<dyn McpProcessSpawner>,
     lifecycle_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    catalog: Option<Arc<dyn McpToolCatalogStore>>,
 }
 
 impl Default for McpExtensionHost {
@@ -105,6 +127,43 @@ impl McpExtensionHost {
             inner: Arc::new(RwLock::new(McpExtensionHostInner::default())),
             spawner,
             lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
+            catalog: None,
+        }
+    }
+
+    /// Attaches the durable tool catalog used to warm the cache after a restart.
+    pub fn with_tool_catalog_store(mut self, catalog: Arc<dyn McpToolCatalogStore>) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    /// Loads the persisted tool catalog into memory.
+    ///
+    /// Call once during startup, before servers are started. Persisted descriptors only answer
+    /// `cached_tools` for servers that have no live runtime yet; they are never added to the
+    /// routing table.
+    pub async fn warm_tool_cache(&self) -> anyhow::Result<usize> {
+        let Some(catalog) = self.catalog.clone() else {
+            return Ok(0);
+        };
+        let tools = catalog.load_all_tools()?;
+        let mut persisted: HashMap<Uuid, Vec<McpToolDescriptor>> = HashMap::new();
+        for tool in tools {
+            persisted.entry(tool.server_id).or_default().push(tool);
+        }
+        let count = persisted.values().map(Vec::len).sum();
+        let mut inner = self.inner.write().await;
+        inner.persisted_tools = persisted;
+        Ok(count)
+    }
+
+    fn persist_tools(&self, server_id: Uuid, tools: &[McpToolDescriptor]) {
+        let Some(catalog) = self.catalog.as_ref() else {
+            return;
+        };
+        if let Err(err) = catalog.replace_tools(server_id, tools) {
+            // A stale mirror must not fail an otherwise healthy server start.
+            warn!(%server_id, error = %err, "failed to persist MCP tool schema cache");
         }
     }
 
@@ -233,6 +292,20 @@ impl McpExtensionHost {
         self.stop_server_locked(server_id).await
     }
 
+    /// Stops a server and drops its cached catalog.
+    ///
+    /// Use when the server configuration itself is deleted. A plain `stop_server` deliberately
+    /// keeps the last known catalog so a stopped server can still describe its tools. The
+    /// persisted rows are removed by the `mcp_servers` foreign key cascade.
+    pub async fn forget_server(&self, server_id: Uuid) -> Result<(), McpHostError> {
+        let lifecycle_lock = self.lifecycle_lock(server_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        self.stop_server_locked(server_id).await?;
+        let mut inner = self.inner.write().await;
+        inner.persisted_tools.remove(&server_id);
+        Ok(())
+    }
+
     async fn stop_server_locked(&self, server_id: Uuid) -> Result<(), McpHostError> {
         let runtime = {
             let mut inner = self.inner.write().await;
@@ -297,6 +370,7 @@ impl McpExtensionHost {
             .servers
             .get(&server_id)
             .map(|runtime| runtime.tools.clone())
+            .or_else(|| inner.persisted_tools.get(&server_id).cloned())
             .unwrap_or_default()
     }
 
@@ -418,7 +492,7 @@ impl McpExtensionHost {
         }
 
         if let Some(runtime) = inner.servers.get_mut(&server_id) {
-            runtime.tools = descriptors;
+            runtime.tools = descriptors.clone();
             runtime.tools_generation = observed_generation;
         }
         let tools_count = inner
@@ -430,6 +504,10 @@ impl McpExtensionHost {
             status.message = "MCP tool schema cache refreshed.".to_string();
             status.updated_at = chrono::Utc::now();
         }
+        inner.persisted_tools.insert(server_id, descriptors.clone());
+        drop(inner);
+
+        self.persist_tools(server_id, &descriptors);
 
         Ok(())
     }
@@ -453,6 +531,7 @@ impl McpExtensionHost {
         raw_tools: Vec<McpRawTool>,
     ) -> Result<McpServerStatus, McpHostError> {
         let descriptors = descriptors_from_raw_tools(&config, raw_tools)?;
+        let server_id = config.server_id;
 
         let status = McpServerStatus {
             server_id: config.server_id,
@@ -493,10 +572,14 @@ impl McpExtensionHost {
                 config,
                 tools_generation: client.tools_generation(),
                 client,
-                tools: descriptors,
+                tools: descriptors.clone(),
             },
         );
         inner.statuses.insert(status.server_id, status.clone());
+        inner.persisted_tools.insert(server_id, descriptors.clone());
+        drop(inner);
+
+        self.persist_tools(server_id, &descriptors);
 
         Ok(status)
     }
@@ -517,6 +600,9 @@ struct McpExtensionHostInner {
     servers: HashMap<Uuid, McpServerRuntime>,
     statuses: HashMap<Uuid, McpServerStatus>,
     tool_routes: HashMap<String, McpToolRoute>,
+    /// Last known catalog per server, restored from the durable mirror at startup. Only read
+    /// for servers with no live runtime; a live runtime is always authoritative.
+    persisted_tools: HashMap<Uuid, Vec<McpToolDescriptor>>,
 }
 
 struct McpServerRuntime {
@@ -1911,6 +1997,114 @@ mod tests {
             .await
             .expect("stop should succeed");
         server.await.expect("mock server task should finish");
+    }
+
+    #[derive(Default)]
+    struct RecordingCatalogStore {
+        tools: std::sync::Mutex<HashMap<Uuid, Vec<McpToolDescriptor>>>,
+    }
+
+    impl McpToolCatalogStore for RecordingCatalogStore {
+        fn replace_tools(
+            &self,
+            server_id: Uuid,
+            tools: &[McpToolDescriptor],
+        ) -> anyhow::Result<()> {
+            self.tools
+                .lock()
+                .expect("catalog mutex poisoned")
+                .insert(server_id, tools.to_vec());
+            Ok(())
+        }
+
+        fn load_all_tools(&self) -> anyhow::Result<Vec<McpToolDescriptor>> {
+            Ok(self
+                .tools
+                .lock()
+                .expect("catalog mutex poisoned")
+                .values()
+                .flatten()
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_server_writes_tool_catalog_through_to_the_store() {
+        let (client_stdin, server_stdin) = duplex(16 * 1024);
+        let (server_stdout, client_stdout) = duplex(16 * 1024);
+        let server = tokio::spawn(run_mock_mcp_server(server_stdin, server_stdout));
+
+        let mut config = McpServerConfig::new("Mock Server".to_string(), "mock".to_string());
+        config.timeout_ms = 5_000;
+        let client = Arc::new(McpStdioClient::from_io_for_test(
+            config.clone(),
+            client_stdout,
+            client_stdin,
+        ));
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+
+        let catalog = Arc::new(RecordingCatalogStore::default());
+        let host = McpExtensionHost::new().with_tool_catalog_store(catalog.clone());
+        host.install_client_for_test(config.clone(), client.clone())
+            .await
+            .expect("client should install");
+
+        let persisted = catalog.tools.lock().expect("catalog mutex poisoned");
+        let stored = persisted
+            .get(&config.server_id)
+            .expect("catalog should be persisted on ready");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].tool_name, "echo");
+        drop(persisted);
+
+        host.stop_server(config.server_id)
+            .await
+            .expect("stop should succeed");
+        server.await.expect("mock server task should finish");
+    }
+
+    #[tokio::test]
+    async fn warm_cache_describes_stopped_servers_without_making_them_callable() {
+        let server_id = Uuid::new_v4();
+        let descriptor = McpToolDescriptor {
+            public_name: "mock__echo".to_string(),
+            server_id,
+            tool_name: "echo".to_string(),
+            description: Some("echo text".to_string()),
+            input_schema: json!({ "type": "object" }),
+            annotations: json!({ "readOnlyHint": true }),
+            permission_labels: vec!["read".to_string()],
+        };
+        let catalog = Arc::new(RecordingCatalogStore::default());
+        catalog
+            .replace_tools(server_id, std::slice::from_ref(&descriptor))
+            .expect("seed catalog");
+
+        let host = McpExtensionHost::new().with_tool_catalog_store(catalog);
+        assert_eq!(host.warm_tool_cache().await.expect("warm cache"), 1);
+
+        // The catalog is visible for a server that was never started in this process.
+        let tools = host.cached_tools(server_id).await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].public_name, "mock__echo");
+
+        // But a persisted descriptor must never be routable: routing requires a live client.
+        let err = host
+            .call_tool("mock__echo", json!({}))
+            .await
+            .expect_err("persisted tools must not be callable");
+        assert!(
+            matches!(err, McpHostError::ToolNotFound(name) if name == "mock__echo"),
+            "expected the persisted tool to be absent from the routing table"
+        );
+
+        // Forgetting the server drops the warmed catalog.
+        host.forget_server(server_id).await.expect("forget server");
+        assert!(host.cached_tools(server_id).await.is_empty());
     }
 
     #[tokio::test]
