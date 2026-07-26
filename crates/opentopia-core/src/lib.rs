@@ -15,6 +15,7 @@ pub mod model_context;
 pub mod plugins;
 pub mod policy;
 pub mod preview;
+pub mod prompt_runtime;
 pub mod provider;
 pub mod sandbox;
 pub mod settings;
@@ -27,9 +28,9 @@ pub mod tools;
 pub mod workspace;
 
 pub use agent::{
-    default_agent_model_context, AgentContinuation, AgentCore, AgentEventSender, AgentTurnInput,
-    AgentTurnOutcome, AgentTurnResult, ContextBudget as AgentContextBudget,
-    ProviderConversationCursor,
+    agent_model_context_with_runtime, default_agent_model_context, AgentContinuation, AgentCore,
+    AgentEventSender, AgentTurnInput, AgentTurnOutcome, AgentTurnResult,
+    ContextBudget as AgentContextBudget, ProviderConversationCursor,
 };
 pub use agent_profiles::{AgentProfile, AgentProfileRegistry};
 pub use browser::{
@@ -81,8 +82,9 @@ pub use model::{
     ExperienceMode, GoalAttemptStatus, GoalRecord, GoalSnapshot, GoalStatus, GoalTask,
     GoalTaskAttempt, GoalTaskStatus, Message, MessagePart, MessageRole, ModelContentPart, Project,
     SkillRef, TaskPlan, TaskPlanStep, TaskPlanStepStatus, TerminalCommandHistory,
-    TerminalCommandStatus, Thread, ToolCall, ToolResult, TurnChangeSet, TurnChangeSetStatus,
-    TurnFileChange, TurnFileChangeKind, TurnRecord, TurnStatus, UserInputAnswer, UserInputOption,
+    TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet,
+    TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord, TurnStatus,
+    UserInputAnswer, UserInputOption,
     UserInputQuestion, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
 };
 pub use model_context::{
@@ -107,12 +109,18 @@ pub use preview::{
     PreviewRangeRequest, PreviewSheet, PreviewSource, PreviewTarget, PreviewWorkbook,
     ResolvedPreview, MAX_PREVIEW_CONTENT_BYTES,
 };
+pub use prompt_runtime::{
+    compile_runtime_prompt_modules, experience_mode_module, permission_policy_module,
+    AgentAutonomy, AgentPersonality, AgentRuntimeSettings, MultiAgentMode, ProgressUpdateMode,
+    PromptRuntimeCapabilities, RuntimeSurface,
+};
 pub use provider::{
-    redact_model_observation, CodexAppServerProvider, IncompleteReason, MockProvider,
-    ModelConversationMessage, ModelConversationRole, ModelDecision, ModelFinishReason,
-    ModelInputContent, ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
-    OpenAiCompatibleProvider, OpenAiResponsesProvider, PreparedProviderRequest, ProviderToolCall,
-    ProviderToolCandidate, ProviderToolResult, ProviderTransportEvent,
+    redact_model_observation, AnthropicMessagesProvider, CodexAppServerProvider, IncompleteReason,
+    MockProvider, ModelConversationMessage, ModelConversationRole, ModelDecision,
+    ModelFinishReason, ModelInputContent, ModelProvider, ModelRequest, ModelResponse,
+    ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider, OpenAiResponsesProvider,
+    PreparedProviderRequest, ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
+    ProviderTransportEvent,
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,

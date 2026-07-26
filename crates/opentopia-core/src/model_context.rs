@@ -268,22 +268,26 @@ impl WorldStateSnapshot {
         content_fingerprint(serde_json::to_vec(self).unwrap_or_default().as_slice())
     }
 
+    /// Canonical group keys, in render order. A first turn reports all of them,
+    /// which makes `changed_keys` usable directly as a render filter.
+    pub const GROUP_KEYS: [&'static str; 6] = [
+        "workspace",
+        "date_time",
+        "git",
+        "skills",
+        "tools",
+        "metadata",
+    ];
+
     pub fn changed_keys(&self, previous: Option<&Self>) -> Vec<String> {
         let Some(previous) = previous else {
-            return vec![
-                "cwd",
-                "workspace_roots",
-                "date_time",
-                "git",
-                "skills",
-                "tools",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+            return Self::GROUP_KEYS.into_iter().map(str::to_string).collect();
         };
         let mut changed = Vec::new();
-        if self.cwd != previous.cwd || self.workspace_roots != previous.workspace_roots {
+        if self.cwd != previous.cwd
+            || self.workspace_roots != previous.workspace_roots
+            || self.platform != previous.platform
+        {
             changed.push("workspace".to_string());
         }
         if self.current_date != previous.current_date || self.timezone != previous.timezone {
@@ -336,6 +340,11 @@ impl WorldStateSnapshot {
             .unwrap_or_else(|_| "{\"skills\":[]}".to_string())
     }
 
+    /// Always renders the full state. Each turn rebuilds the instruction blob
+    /// from scratch and the previous turn's world state is not retained anywhere
+    /// the model can see, so an incremental render would assert "unchanged"
+    /// about values the model was never shown. Keep the volatile payload small
+    /// by shrinking the fields themselves, not by omitting them.
     pub fn render_dynamic_for_model(&self) -> String {
         serde_json::to_string(&json!({
             "cwd": self.cwd,

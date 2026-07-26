@@ -1314,7 +1314,7 @@ mod tests {
         assert!(exec.success);
         assert!(String::from_utf8_lossy(&exec.stdout).contains("ok"));
         let sandbox = exec.sandbox.expect("execution records sandbox metadata");
-        assert_eq!(sandbox.permission_profile, ":workspace");
+        assert_eq!(sandbox.permission_profile, "opentopia");
         assert!(matches!(
             sandbox.status,
             SandboxCommandStatus::Wrapped {

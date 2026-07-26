@@ -265,6 +265,18 @@ impl SubagentScheduler {
         self.inner.events.subscribe()
     }
 
+    pub fn max_concurrency_per_parent(&self) -> usize {
+        self.inner.config.max_concurrency_per_parent.max(1)
+    }
+
+    pub fn max_threads(&self) -> usize {
+        self.inner.config.max_threads.max(1)
+    }
+
+    pub fn max_depth(&self) -> u8 {
+        self.inner.config.max_depth
+    }
+
     /// Re-register a persisted, non-running agent identity after process restart.
     pub fn restore(&self, run: SubagentRun) -> Result<(), SubagentError> {
         if !run.status.is_terminal() {
