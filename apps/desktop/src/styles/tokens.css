@@ -1,0 +1,94 @@
+/*
+ * OpenTopia design tokens.
+ *
+ * This is the only place where visual primitives (color, spacing, typography,
+ * radius, elevation, motion, and layer values) may be introduced.
+ */
+:root {
+  color-scheme: light;
+
+  --font-sans:
+    "Segoe UI Variable Text", "Segoe UI", ui-sans-serif, system-ui,
+    -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  --line-height-body: 1.45;
+  --line-height-relaxed: 1.6;
+
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-base: 14px;
+  --font-size-lg: 16px;
+  --font-size-xl: 20px;
+  --font-size-xxl: 24px;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+
+  --space-0: 0;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 10px;
+  --space-6: 12px;
+  --space-8: 16px;
+  --space-10: 20px;
+  --space-12: 24px;
+  --space-16: 32px;
+  --spacing-xs: var(--space-2);
+  --spacing-sm: var(--space-4);
+  --spacing-md: var(--space-6);
+  --spacing-lg: var(--space-8);
+  --spacing-xl: var(--space-12);
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-round: 999px;
+
+  --app-bg: #ffffff;
+  --sidebar-bg: #f3f6fa;
+  --surface: #ffffff;
+  --surface-subtle: #f8f9fb;
+  --surface-chrome: #f4f7fa;
+  --surface-hover: #eef2f6;
+  --surface-active: #e5ecf4;
+  --border-subtle: #edf0f3;
+  --border: #e1e5e9;
+  --border-strong: #cbd2da;
+  --text: #25272a;
+  --text-secondary: #5c6570;
+  --text-muted: #7d8691;
+  --accent: #0b6fd3;
+  --accent-hover: #075eaf;
+  --accent-subtle: #e9f2fc;
+  --on-accent: #ffffff;
+  --focus-ring: #247edb;
+  --success: #087b52;
+  --success-subtle: #e9f7f0;
+  --warning: #9a5c16;
+  --warning-subtle: #fff5e8;
+  --danger: #c23d42;
+  --danger-subtle: #fff0f1;
+
+  --shadow-float: 0 8px 24px rgb(31 41 55 / 12%), 0 1px 3px rgb(31 41 55 / 8%);
+  --shadow-overlay: 0 18px 48px rgb(31 41 55 / 18%);
+
+  --control-height-sm: 28px;
+  --control-height-md: 32px;
+  --control-height-lg: 36px;
+  --icon-size-xs: 14px;
+  --icon-size-sm: 16px;
+  --icon-size-md: 18px;
+  --icon-size-lg: 20px;
+
+  --motion-fast: 120ms;
+  --motion-standard: 180ms;
+  --ease-standard: ease;
+
+  --z-base: 0;
+  --z-sticky: 10;
+  --z-popover: 20;
+  --z-modal: 30;
+  --z-toast: 40;
+}

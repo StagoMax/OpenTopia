@@ -1,0 +1,235 @@
+/* Shared primitive classes. Use the React components in components/ui where possible. */
+.ot-button {
+  display: inline-flex;
+  min-height: var(--control-height-md);
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text-secondary);
+  padding: 0 var(--space-4);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  transition:
+    border-color var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.ot-button:not(:disabled):hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.ot-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.ot-button--primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.ot-button--primary:not(:disabled):hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+  color: var(--on-accent);
+}
+
+.ot-button--quiet {
+  border-color: transparent;
+  background: transparent;
+}
+
+.ot-button--danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: var(--on-accent);
+}
+
+.ot-button--danger:not(:disabled):hover {
+  border-color: var(--danger);
+  background: var(--danger);
+  filter: brightness(0.92);
+  color: var(--on-accent);
+}
+
+.ot-button--compact {
+  min-height: var(--control-height-sm);
+  padding-inline: var(--space-3);
+}
+
+.ot-icon-button {
+  width: var(--control-height-md);
+  min-width: var(--control-height-md);
+  padding: 0;
+}
+
+.ot-icon-button--compact {
+  width: var(--control-height-sm);
+  min-width: var(--control-height-sm);
+}
+
+.ot-text-field {
+  display: grid;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.ot-text-field__input {
+  width: 100%;
+  min-height: var(--control-height-md);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 var(--space-3);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
+}
+
+.ot-text-field__input::placeholder {
+  color: var(--text-muted);
+}
+
+.ot-text-field__input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.ot-text-field__hint {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+}
+
+.ot-text-field__error {
+  color: var(--danger);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+}
+
+.ot-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.ot-panel__header {
+  display: flex;
+  min-height: var(--control-height-lg);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 var(--space-4);
+}
+
+.ot-panel__title {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+}
+
+.ot-panel__body {
+  padding: var(--space-4);
+}
+
+.ot-badge {
+  display: inline-flex;
+  min-height: 20px;
+  align-items: center;
+  gap: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-round);
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  padding: 0 var(--space-3);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.ot-badge--info {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: var(--accent-subtle);
+  color: var(--accent-hover);
+}
+
+.ot-badge--success {
+  border-color: color-mix(in srgb, var(--success) 28%, var(--border));
+  background: var(--success-subtle);
+  color: var(--success);
+}
+
+.ot-badge--warning {
+  border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+
+.ot-badge--danger {
+  border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+  background: var(--danger-subtle);
+  color: var(--danger);
+}
+
+.ot-popover {
+  position: relative;
+  display: inline-flex;
+}
+
+.ot-popover-surface {
+  position: absolute;
+  bottom: calc(100% + var(--space-2));
+  z-index: var(--z-popover);
+  min-width: 260px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+}
+
+.ot-popover-surface--start {
+  left: 0;
+}
+
+.ot-popover-surface--end {
+  right: 0;
+}
+
+.ot-button:focus-visible,
+.ot-text-field__input:focus-visible,
+.ot-panel :focus-visible,
+.ot-popover-surface :focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.ot-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ot-button {
+    transition: none;
+  }
+}
