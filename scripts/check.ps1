@@ -31,6 +31,7 @@ try {
     throw "cargo check failed with exit code $LASTEXITCODE"
   }
   Invoke-Pnpm --filter @opentopia/desktop typecheck
+  Invoke-Pnpm --filter @opentopia/desktop test
   Invoke-Pnpm --filter @opentopia/desktop build
 } finally {
   Pop-Location

@@ -15,6 +15,7 @@
     "pack": "pnpm build && electron-builder --dir",
     "dist": "pnpm build && electron-builder",
     "typecheck": "tsc --noEmit",
+    "test": "node --test \"src/**/*.test.ts\"",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"electron/**/*.cjs\""
   },
   "build": {

@@ -9,7 +9,8 @@
     "dev": "pnpm --filter @opentopia/desktop dev",
     "dev:desktop": "pnpm --filter @opentopia/desktop dev",
     "dev:server": "cargo run -p opentopia-server",
-    "check": "cargo check --workspace && pnpm --filter @opentopia/desktop typecheck && pnpm design:check",
+    "check": "cargo check --workspace && pnpm --filter @opentopia/desktop typecheck && pnpm --filter @opentopia/desktop test && pnpm design:check",
+    "test": "pnpm --filter @opentopia/desktop test",
     "design:check": "node scripts/check-design-system.mjs",
     "format": "pnpm --filter @opentopia/desktop format"
   },
