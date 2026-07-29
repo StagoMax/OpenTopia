@@ -30,6 +30,7 @@ let defaultBackendUrl =
   process.env.OPENTOPIA_SERVER_URL || "http://127.0.0.1:8787";
 const backendApiToken = crypto.randomBytes(32).toString("base64url");
 const openTopiaProtocol = "opentopia";
+const evalRuntimeFileName = "opentopia-eval-runtime.json";
 
 /*
  * The Windows caption buttons are drawn by the OS, not by our CSS, so they have
@@ -58,6 +59,50 @@ let crashLogsDirPath = null;
 let nextOpenRequestId = 1;
 let desktopBrowserHost = null;
 let desktopBrowserBroker = null;
+
+function evalRuntimeFilePath() {
+  return (
+    process.env.OPENTOPIA_EVAL_RUNTIME_FILE ||
+    path.join(app.getPath("userData"), evalRuntimeFileName)
+  );
+}
+
+function writeEvalRuntimeDescriptor() {
+  try {
+    const filePath = evalRuntimeFilePath();
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const descriptor = {
+      schemaVersion: 1,
+      backendUrl: defaultBackendUrl,
+      apiToken: backendApiToken,
+      pid: process.pid,
+      isDev,
+      startedAt: new Date().toISOString(),
+      launcher: process.execPath,
+      launcherArgs:
+        isDev && process.argv[1] ? [path.resolve(process.argv[1])] : [],
+      launcherCwd: process.cwd(),
+    };
+    const temporaryPath = `${filePath}.tmp-${process.pid}`;
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(descriptor)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.renameSync(temporaryPath, filePath);
+  } catch (error) {
+    logConsole("warn", "evaluation.runtime-descriptor.failed", { error });
+  }
+}
+
+function removeEvalRuntimeDescriptor() {
+  try {
+    fs.rmSync(evalRuntimeFilePath(), { force: true });
+  } catch (error) {
+    logConsole("warn", "evaluation.runtime-descriptor.remove-failed", {
+      error,
+    });
+  }
+}
 
 const secretsFilePath = "secrets.json";
 const providerSecretStorageKey = "provider-api-key";
@@ -800,7 +845,7 @@ function createBackendEnv(repoRoot, options = {}) {
     env.RUSTUP_TOOLCHAIN =
       process.env.OPENTOPIA_RUST_TOOLCHAIN ||
       process.env.RUSTUP_TOOLCHAIN ||
-      "stable-x86_64-pc-windows-gnu";
+      "stable-x86_64-pc-windows-msvc";
     if (process.env.USERPROFILE)
       prependPath(env, path.join(process.env.USERPROFILE, ".cargo", "bin"));
     prependPath(env, resolveMingwBin());
@@ -947,6 +992,9 @@ function parseDeepLinkOpenRequest(rawUrl, source, cwd) {
     url: redactSecrets(parsed.toString()),
     params: safeDeepLinkParams(parsed.searchParams),
   });
+
+  const threadId = parsed.searchParams.get("thread");
+  if (threadId && threadId.length <= 200) request.threadId = threadId;
 
   const targetPath =
     parsed.searchParams.get("workspace") || parsed.searchParams.get("path");
@@ -1453,10 +1501,10 @@ function verifyCodexSandboxBundle(codexPath) {
   }
 }
 
-// A dev backend is compiled by `cargo run` on demand, so readiness is measured
-// in minutes on a cold or post-edit build, not seconds. Packaged builds launch a
+// A dev backend is compiled ahead of time via `cargo build` and then spawned
+// directly, so the binary starts in under a second. Packaged builds launch a
 // prebuilt binary and only need a short grace period.
-const backendHealthAttempts = isDev ? 600 : 30;
+const backendHealthAttempts = isDev ? 60 : 30;
 
 async function waitForBackendHealth(attempts) {
   for (let i = 0; i < attempts; i += 1) {
@@ -1480,11 +1528,52 @@ async function waitForBackendHealth(attempts) {
   return false;
 }
 
+function devServerBinaryPath(repoRoot) {
+  const targetDir =
+    process.env.CARGO_TARGET_DIR ||
+    process.env.OPENTOPIA_DEV_CARGO_TARGET_DIR ||
+    path.join(repoRoot, "target", "desktop-dev");
+  const binaryName = `opentopia-server${process.platform === "win32" ? ".exe" : ""}`;
+  return path.join(targetDir, "debug", binaryName);
+}
+
+async function ensureBackendBuilt(repoRoot) {
+  writeLog("info", "backend.build.starting", { repoRoot });
+  const env = createBackendEnv(repoRoot);
+  return new Promise((resolve, reject) => {
+    const child = spawn("cargo", ["build", "-p", "opentopia-server"], {
+      cwd: repoRoot,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const stderrChunks = [];
+    child.stderr?.on("data", (chunk) => stderrChunks.push(chunk.toString()));
+    child.on("exit", (code) => {
+      if (code === 0) {
+        writeLog("info", "backend.build.completed");
+        resolve();
+      } else {
+        const stderr = stderrChunks.join("").slice(-2000);
+        writeLog("error", "backend.build.failed", { code, stderr });
+        reject(new Error(`cargo build exited with code ${code}`));
+      }
+    });
+    child.on("error", (error) => {
+      writeLog("error", "backend.build.error", { error: error.message });
+      reject(error);
+    });
+  });
+}
+
 async function startBackendIfNeeded({
   waitForHealth = true,
   attempts = backendHealthAttempts,
 } = {}) {
-  if (await isBackendHealthy()) return;
+  if (await isBackendHealthy()) {
+    writeEvalRuntimeDescriptor();
+    return;
+  }
 
   try {
     await selectAvailableManagedBackendUrl();
@@ -1503,7 +1592,6 @@ async function startBackendIfNeeded({
     return;
   }
 
-  const command = isDev ? "cargo" : packagedServer.path;
   const endpoint = new URL(defaultBackendUrl);
   const endpointHost = endpoint.hostname.replace(/^\[|\]$/g, "");
   if (
@@ -1520,11 +1608,18 @@ async function startBackendIfNeeded({
     "--port",
     endpoint.port || "8787",
   ];
-  const args =
-    command === "cargo"
-      ? ["run", "-p", "opentopia-server", "--", ...serverArgs]
-      : serverArgs;
-  const cwd = command === "cargo" ? repoRoot : undefined;
+
+  let command, args, cwd;
+  if (isDev) {
+    await ensureBackendBuilt(repoRoot);
+    command = devServerBinaryPath(repoRoot);
+    args = serverArgs;
+    cwd = undefined;
+  } else {
+    command = packagedServer.path;
+    args = serverArgs;
+    cwd = undefined;
+  }
 
   try {
     writeLog("info", "backend.spawn.starting", {
@@ -1545,6 +1640,7 @@ async function startBackendIfNeeded({
       windowsHide: true,
     });
     backendProcess = spawnedBackend;
+    writeEvalRuntimeDescriptor();
 
     writeLog("info", "backend.spawn.started", {
       pid: backendProcess.pid,
@@ -1664,7 +1760,7 @@ async function restartManagedBackend() {
   await stopManagedBackend();
   // Bounded so a restart triggered from the UI cannot hang on a long rebuild;
   // the renderer keeps probing if the build outlasts this window.
-  await startBackendIfNeeded({ attempts: isDev ? 120 : 30 });
+  await startBackendIfNeeded({ attempts: 30 });
   if (!(await isBackendHealthy())) {
     throw new Error("The local backend did not become ready after restart");
   }
@@ -2166,6 +2262,27 @@ function registerIpc() {
     };
   });
 
+  ipcMain.handle("context:add-dropped-files", async (_event, filePaths) => {
+    if (
+      !Array.isArray(filePaths) ||
+      filePaths.some((filePath) => typeof filePath !== "string")
+    ) {
+      throw new Error("Dropped files must be provided as file paths.");
+    }
+    if (filePaths.length === 0) {
+      return { canceled: true, files: [] };
+    }
+    if (filePaths.length > maxContextSourceFiles) {
+      throw new Error(
+        `Drop at most ${maxContextSourceFiles} context files at once.`,
+      );
+    }
+    return {
+      canceled: false,
+      files: filePaths.map(contextSourceMetadata),
+    };
+  });
+
   ipcMain.handle("plugins:select-directory", async (event, options = {}) => {
     let defaultPath;
     if (typeof options?.defaultPath === "string" && options.defaultPath) {
@@ -2215,13 +2332,22 @@ const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, commandLine, workingDirectory) => {
+    queueOpenRequestsFromArgv("second-instance", commandLine, workingDirectory);
     if (!mainWindow) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
   });
 
+  app.on("open-url", (event, rawUrl) => {
+    event.preventDefault();
+    queueOpenRequestFromValue("open-url", rawUrl, process.cwd());
+    focusMainWindow();
+  });
+
   app.whenReady().then(async () => {
+    queueOpenRequestsFromArgv("startup", process.argv, process.cwd());
+    registerOpenTopiaProtocolClient();
     desktopBrowserHost = createDesktopBrowserHost({
       app,
       WebContentsView,
@@ -2235,8 +2361,12 @@ if (!singleInstance) {
     }
     registerIpc();
     desktopBrowserHost.registerIpc(ipcMain);
-    await startBackendIfNeeded({ waitForHealth: false });
+    // Show the window immediately so the user sees something while cargo
+    // builds the backend binary on first MSVC launch (~3 min cold build).
     createMainWindow();
+    startBackendIfNeeded({ waitForHealth: false }).catch((error) => {
+      logConsole("error", "backend.init.failed", { error });
+    });
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
@@ -2249,6 +2379,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  removeEvalRuntimeDescriptor();
   void desktopBrowserHost?.close().catch((error) => {
     logConsole("warn", "browser.host.close.failed", { error });
   });

@@ -108,6 +108,11 @@
   color: var(--danger);
 }
 
+.tool-activity-chip[data-tone="success"] {
+  background: var(--success-subtle);
+  color: var(--success);
+}
+
 .tool-activity-chip[data-tone="warning"] {
   background: var(--warning-subtle);
   color: var(--warning);

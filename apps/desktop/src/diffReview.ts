@@ -583,18 +583,41 @@ export type DiffUnifiedRow =
       side: DiffRowSide;
     };
 
+/** Counts rows without allocating syntax or word-diff spans. */
+export function countDiffRows(
+  blocks: DiffBlock[],
+  view: "split" | "unified",
+): number {
+  return blocks.reduce((count, block) => {
+    if (block.type === "gap") return count + 1;
+    if (block.type === "context") return count + block.lines.length;
+    return (
+      count +
+      (view === "split"
+        ? Math.max(block.removed.length, block.added.length)
+        : block.removed.length + block.added.length)
+    );
+  }, 0);
+}
+
 export function buildSplitRows(
   blocks: DiffBlock[],
   options: DiffBuildOptions = {},
+  maxRows = Number.POSITIVE_INFINITY,
 ): DiffSplitRow[] {
   const rows: DiffSplitRow[] = [];
-  blocks.forEach((block, blockIndex) => {
+  const limit = Math.max(0, maxRows);
+  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+    const block = blocks[blockIndex];
+    if (rows.length >= limit) break;
     if (block.type === "gap") {
       rows.push(block);
-      return;
+      continue;
     }
     if (block.type === "context") {
-      block.lines.forEach((line, index) => {
+      for (let index = 0; index < block.lines.length; index += 1) {
+        if (rows.length >= limit) break;
+        const line = block.lines[index];
         // The same text sits at different line numbers on the two sides once
         // an earlier hunk has shifted the file, so each side is numbered from
         // its own image rather than copied across.
@@ -604,11 +627,12 @@ export function buildSplitRows(
           left: toSide(line, null, options, "old"),
           right: toSide(line, null, options, "new"),
         });
-      });
-      return;
+      }
+      continue;
     }
     const height = Math.max(block.removed.length, block.added.length);
     for (let index = 0; index < height; index += 1) {
+      if (rows.length >= limit) break;
       const left = block.removed[index] ?? null;
       const right = block.added[index] ?? null;
       rows.push({
@@ -618,46 +642,70 @@ export function buildSplitRows(
         right: right ? toSide(right, left, options) : null,
       });
     }
-  });
+  }
   return rows;
 }
 
 export function buildUnifiedRows(
   blocks: DiffBlock[],
   options: DiffBuildOptions = {},
+  maxRows = Number.POSITIVE_INFINITY,
 ): DiffUnifiedRow[] {
   const rows: DiffUnifiedRow[] = [];
-  blocks.forEach((block, blockIndex) => {
+  const limit = Math.max(0, maxRows);
+  const push = (row: DiffUnifiedRow): boolean => {
+    if (rows.length >= limit) return false;
+    rows.push(row);
+    return true;
+  };
+
+  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+    const block = blocks[blockIndex];
+    if (rows.length >= limit) break;
     if (block.type === "gap") {
-      rows.push(block);
-      return;
+      push(block);
+      continue;
     }
-    const push = (
+    const pushLine = (
       line: ParsedDiffLine,
       counterpart: ParsedDiffLine | null,
       key: string,
-    ) => {
-      rows.push({
+    ): boolean =>
+      push({
         type: "line",
         id: key,
         oldLine: line.oldLine,
         newLine: line.newLine,
         side: toSide(line, counterpart, options),
       });
-    };
     if (block.type === "context") {
-      block.lines.forEach((line, index) =>
-        push(line, null, `c${blockIndex}-${index}`),
-      );
-      return;
+      for (let index = 0; index < block.lines.length; index += 1) {
+        if (!pushLine(block.lines[index], null, `c${blockIndex}-${index}`))
+          break;
+      }
+      continue;
     }
-    block.removed.forEach((line, index) =>
-      push(line, block.added[index] ?? null, `r${blockIndex}-${index}`),
-    );
-    block.added.forEach((line, index) =>
-      push(line, block.removed[index] ?? null, `a${blockIndex}-${index}`),
-    );
-  });
+    for (let index = 0; index < block.removed.length; index += 1) {
+      if (
+        !pushLine(
+          block.removed[index],
+          block.added[index] ?? null,
+          `r${blockIndex}-${index}`,
+        )
+      )
+        break;
+    }
+    for (let index = 0; index < block.added.length; index += 1) {
+      if (
+        !pushLine(
+          block.added[index],
+          block.removed[index] ?? null,
+          `a${blockIndex}-${index}`,
+        )
+      )
+        break;
+    }
+  }
   return rows;
 }
 
@@ -1131,15 +1179,30 @@ export function matchesPathQuery(path: string, query: string): boolean {
   return true;
 }
 
-/**
- * Wraps a patch in a here-document so it can be pasted into a shell as-is.
- * Returns null when there is nothing to apply, which is what disables the
- * menu entry.
- */
-export function buildGitApplyCommand(patch: string): string | null {
+/** Builds a paste-ready command for the active shell. */
+export type GitApplyShell = "posix" | "powershell";
+
+export function buildGitApplyCommand(
+  patch: string,
+  shell: GitApplyShell = "posix",
+): string | null {
   const body = patch.replace(/\r\n/g, "\n").replace(/\n+$/, "");
   if (!body.trim()) return null;
+  if (shell === "powershell") {
+    const payload = encodeBase64Utf8(`${body}\n`);
+    return `$opentopiaPatch = Join-Path ([IO.Path]::GetTempPath()) ('opentopia-' + [guid]::NewGuid().ToString('N') + '.patch'); [IO.File]::WriteAllBytes($opentopiaPatch, [Convert]::FromBase64String('${payload}')); try { git apply -- $opentopiaPatch } finally { Remove-Item -LiteralPath $opentopiaPatch -Force -ErrorAction SilentlyContinue }`;
+  }
   return `git apply <<'OPENTOPIA_PATCH'\n${body}\nOPENTOPIA_PATCH`;
+}
+
+function encodeBase64Utf8(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  const chunkSize = 32_768;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
 }
 
 export function splitFileContent(content: string): string[] {

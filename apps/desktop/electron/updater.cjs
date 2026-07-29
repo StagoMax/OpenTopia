@@ -1,33 +1,39 @@
-const { autoUpdater } = require("electron-updater");
-const { BrowserWindow } = require("electron");
-
 let mainWindow = null;
+let autoUpdater = null;
+
+function getAutoUpdater() {
+  if (!autoUpdater) {
+    autoUpdater = require("electron-updater").autoUpdater;
+  }
+  return autoUpdater;
+}
 
 function setupAutoUpdater(window) {
   mainWindow = window;
 
-  autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = true;
+  const updater = getAutoUpdater();
+  updater.autoDownload = false;
+  updater.autoInstallOnAppQuit = true;
 
-  autoUpdater.on("checking-for-update", () => {
+  updater.on("checking-for-update", () => {
     sendStatus("checking-for-update");
   });
 
-  autoUpdater.on("update-available", (info) => {
+  updater.on("update-available", (info) => {
     sendStatus("update-available", {
       version: info.version,
       releaseDate: info.releaseDate,
     });
-    autoUpdater.downloadUpdate();
+    updater.downloadUpdate();
   });
 
-  autoUpdater.on("update-not-available", (info) => {
+  updater.on("update-not-available", (info) => {
     sendStatus("update-not-available", {
       version: info.version,
     });
   });
 
-  autoUpdater.on("download-progress", (progress) => {
+  updater.on("download-progress", (progress) => {
     sendStatus("download-progress", {
       percent: progress.percent,
       bytesPerSecond: progress.bytesPerSecond,
@@ -36,14 +42,14 @@ function setupAutoUpdater(window) {
     });
   });
 
-  autoUpdater.on("update-downloaded", (info) => {
+  updater.on("update-downloaded", (info) => {
     sendStatus("update-downloaded", {
       version: info.version,
       releaseDate: info.releaseDate,
     });
   });
 
-  autoUpdater.on("error", (error) => {
+  updater.on("error", (error) => {
     sendStatus("error", {
       message: error == null ? "unknown" : (error.message || error).toString(),
     });
@@ -56,13 +62,13 @@ function sendStatus(status, data) {
 }
 
 function checkForUpdates() {
-  autoUpdater.checkForUpdates().catch(() => {
+  getAutoUpdater().checkForUpdates().catch(() => {
     // Silently ignore update check failures
   });
 }
 
 function quitAndInstall() {
-  autoUpdater.quitAndInstall();
+  getAutoUpdater().quitAndInstall();
 }
 
 module.exports = {

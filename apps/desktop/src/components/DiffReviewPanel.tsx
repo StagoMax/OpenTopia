@@ -36,6 +36,7 @@ import {
   buildGitApplyCommand,
   buildSplitRows,
   buildUnifiedRows,
+  countDiffRows,
   diffFileDirectory,
   diffFileName,
   diffLanguageFromPath,
@@ -94,7 +95,9 @@ export type DiffReviewPanelProps = {
 };
 
 const workspaceScopeId = "workspace";
-const defaultRowLimit = 3000;
+const defaultRowLimit = 800;
+const initialRenderedFileCount = 1;
+const turnDiffConcurrency = 3;
 
 type ReviewScope =
   | { id: "workspace"; kind: "workspace"; label: string }
@@ -111,6 +114,8 @@ type ContentState = {
 type TurnFilesState = {
   status: "loading" | "ready" | "error";
   files: ParsedDiffFile[];
+  loadedFileCount: number;
+  totalFileCount: number;
   error?: string;
 };
 
@@ -133,7 +138,11 @@ export function DiffReviewPanel({
     readDiffReviewPreferences,
   );
   const [scopeId, setScopeId] = useState<string>(
-    turnScopes[0] ? `turn:${turnScopes[0].turnId}` : workspaceScopeId,
+    focusRequest
+      ? workspaceScopeId
+      : turnScopes[0]
+        ? `turn:${turnScopes[0].turnId}`
+        : workspaceScopeId,
   );
   const [collapsedFiles, setCollapsedFiles] = useState<ReadonlySet<string>>(
     new Set(),
@@ -146,6 +155,9 @@ export function DiffReviewPanel({
     {},
   );
   const [rowLimits, setRowLimits] = useState<Record<string, number>>({});
+  const [renderedPaths, setRenderedPaths] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
   const [activePath, setActivePath] = useState<string | null>(null);
   const [focusPath, setFocusPath] = useState<string | null>(null);
   const [treeFilter, setTreeFilter] = useState("");
@@ -153,6 +165,7 @@ export function DiffReviewPanel({
   const sectionRefs = useRef(new Map<string, HTMLElement>());
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const requestedPaths = useRef(new Set<string>());
+  const renderedScopeRef = useRef<string | null>(null);
 
   useEffect(() => writeDiffReviewPreferences(preferences), [preferences]);
 
@@ -210,35 +223,77 @@ export function DiffReviewPanel({
 
   const loadTurnFiles = useCallback(
     (turn: DiffReviewTurnScope) => {
+      const totalFileCount = turn.files.length;
       setTurnFiles((current) =>
         current[turn.turnId]?.status === "loading"
           ? current
-          : { ...current, [turn.turnId]: { status: "loading", files: [] } },
+          : {
+              ...current,
+              [turn.turnId]: {
+                status: "loading",
+                files: [],
+                loadedFileCount: 0,
+                totalFileCount,
+              },
+            },
       );
-      Promise.all(
-        turn.files.map(async (file) => {
-          if (file.binary) return binaryPlaceholderFile(file.path);
-          const diff = await onLoadTurnFileDiff(turn.turnId, file.path);
-          const parsed = parseUnifiedDiff(diff, file.path);
-          return parsed.length ? parsed : [emptyPlaceholderFile(file.path)];
-        }),
-      )
-        .then((results) =>
-          setTurnFiles((current) => ({
-            ...current,
-            [turn.turnId]: { status: "ready", files: results.flat() },
-          })),
-        )
-        .catch((error: unknown) =>
-          setTurnFiles((current) => ({
+      if (!totalFileCount) return;
+
+      const results: Array<ParsedDiffFile[] | null> = Array.from(
+        { length: totalFileCount },
+        () => null,
+      );
+      let nextIndex = 0;
+      let loadedFileCount = 0;
+      let firstError: string | undefined;
+
+      const publish = () => {
+        setTurnFiles((current) => {
+          const state = current[turn.turnId];
+          if (!state || state.status === "error") return current;
+          return {
             ...current,
             [turn.turnId]: {
-              status: "error",
-              files: [],
-              error: errorMessage(error),
+              status: loadedFileCount === totalFileCount ? "ready" : "loading",
+              files: results.flatMap((result) => result ?? []),
+              loadedFileCount,
+              totalFileCount,
+              error: firstError,
             },
-          })),
-        );
+          };
+        });
+      };
+
+      const loadNext = async () => {
+        while (nextIndex < totalFileCount) {
+          const index = nextIndex;
+          nextIndex += 1;
+          const file = turn.files[index];
+          try {
+            if (file.binary) {
+              results[index] = [binaryPlaceholderFile(file.path)];
+            } else {
+              const diff = await onLoadTurnFileDiff(turn.turnId, file.path);
+              const parsed = parseUnifiedDiff(diff, file.path);
+              results[index] = parsed.length
+                ? parsed
+                : [emptyPlaceholderFile(file.path)];
+            }
+          } catch (error: unknown) {
+            firstError ??= errorMessage(error);
+            results[index] = [emptyPlaceholderFile(file.path)];
+          }
+          loadedFileCount += 1;
+          publish();
+        }
+      };
+
+      void Promise.all(
+        Array.from(
+          { length: Math.min(turnDiffConcurrency, totalFileCount) },
+          () => loadNext(),
+        ),
+      );
     },
     [onLoadTurnFileDiff],
   );
@@ -301,6 +356,36 @@ export function DiffReviewPanel({
   ]);
 
   useEffect(() => {
+    const scopeKey = scope?.id ?? null;
+    const initialPaths = files
+      .slice(0, initialRenderedFileCount)
+      .map((file) => file.path);
+    setRenderedPaths((current) => {
+      if (renderedScopeRef.current !== scopeKey) {
+        renderedScopeRef.current = scopeKey;
+        return new Set(initialPaths);
+      }
+      const next = new Set(current);
+      let changed = false;
+      for (const path of initialPaths) {
+        if (next.has(path)) continue;
+        next.add(path);
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [files, scope?.id]);
+
+  const renderFile = useCallback((path: string) => {
+    setRenderedPaths((current) => {
+      if (current.has(path)) return current;
+      const next = new Set(current);
+      next.add(path);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
     const root = scrollRef.current;
     if (!root) return undefined;
     const observer = new IntersectionObserver(
@@ -312,7 +397,18 @@ export function DiffReviewPanel({
               left.boundingClientRect.top - right.boundingClientRect.top,
           );
         const path = visible[0]?.target.getAttribute("data-file-path");
-        if (path) setActivePath(path);
+        if (path) setActivePath((current) => (current === path ? current : path));
+        setRenderedPaths((current) => {
+          const next = new Set(current);
+          let changed = false;
+          for (const entry of visible) {
+            const visiblePath = entry.target.getAttribute("data-file-path");
+            if (!visiblePath || next.has(visiblePath)) continue;
+            next.add(visiblePath);
+            changed = true;
+          }
+          return changed ? next : current;
+        });
       },
       { root, rootMargin: "0px 0px -60% 0px", threshold: 0 },
     );
@@ -321,23 +417,30 @@ export function DiffReviewPanel({
     return () => observer.disconnect();
   }, [files]);
 
-  const allCollapsed = files.length > 0 && collapsedFiles.size >= files.length;
+  const allCollapsed =
+    files.length > 0 && files.every((file) => collapsedFiles.has(file.path));
 
   const toggleFile = useCallback((path: string) => {
+    renderFile(path);
     setCollapsedFiles((current) => {
       const next = new Set(current);
       if (next.has(path)) next.delete(path);
       else next.add(path);
       return next;
     });
-  }, []);
+  }, [renderFile]);
 
   const toggleAllFiles = useCallback(() => {
-    setCollapsedFiles((current) =>
-      current.size >= files.length
-        ? new Set<string>()
-        : new Set(files.map((file) => file.path)),
-    );
+    setCollapsedFiles((current) => {
+      const currentPaths = files.map((file) => file.path);
+      const collapse = currentPaths.some((path) => !current.has(path));
+      const next = new Set(current);
+      for (const path of currentPaths) {
+        if (collapse) next.add(path);
+        else next.delete(path);
+      }
+      return next;
+    });
   }, [files]);
 
   const expandGap = useCallback(
@@ -349,6 +452,7 @@ export function DiffReviewPanel({
   );
 
   const scrollToFile = useCallback((path: string) => {
+    renderFile(path);
     setCollapsedFiles((current) => {
       if (!current.has(path)) return current;
       const next = new Set(current);
@@ -362,7 +466,7 @@ export function DiffReviewPanel({
         .get(path)
         ?.scrollIntoView({ block: "start", behavior: "smooth" }),
     );
-  }, []);
+  }, [renderFile]);
 
   // A "review this file" request names a working-tree path, so it always
   // resolves against the workspace baseline rather than a recorded turn.
@@ -384,9 +488,10 @@ export function DiffReviewPanel({
       return next;
     });
     setActivePath(focusPath);
+    renderFile(focusPath);
     element.scrollIntoView({ block: "start", behavior: "smooth" });
     setFocusPath(null);
-  }, [files, focusPath]);
+  }, [files, focusPath, renderFile]);
 
   const patchText = useMemo(
     () =>
@@ -398,7 +503,12 @@ export function DiffReviewPanel({
   );
 
   const copyGitApply = useCallback(() => {
-    const command = buildGitApplyCommand(patchText);
+    const command = buildGitApplyCommand(
+      patchText,
+      navigator.userAgent.toLocaleLowerCase().includes("windows")
+        ? "powershell"
+        : "posix",
+    );
     if (!command) return;
     void navigator.clipboard
       .writeText(command)
@@ -518,12 +628,16 @@ export function DiffReviewPanel({
 
       <div className="diff-review__body">
         <div className="diff-review__scroll" ref={scrollRef}>
-          {scope?.kind === "turn" && turnState?.status === "loading" ? (
+          {scope?.kind === "turn" &&
+          turnState?.status === "loading" &&
+          files.length === 0 ? (
             <p className="diff-review__empty">
               <Loader2 className="spin" size={15} aria-hidden="true" />
               正在加载本轮差异…
             </p>
-          ) : scope?.kind === "turn" && turnState?.status === "error" ? (
+          ) : scope?.kind === "turn" &&
+            turnState?.status === "error" &&
+            files.length === 0 ? (
             <p className="diff-review__empty is-error">
               <AlertCircle size={15} aria-hidden="true" />
               {turnState.error}
@@ -531,41 +645,57 @@ export function DiffReviewPanel({
           ) : files.length === 0 ? (
             <p className="diff-review__empty">没有需要审阅的改动。</p>
           ) : (
-            files.map((file) => (
-              <DiffFileSection
-                key={file.path}
-                file={file}
-                content={contents[file.path] ?? null}
-                collapsed={collapsedFiles.has(file.path)}
-                active={activePath === file.path}
-                preferences={preferences}
-                buildOptions={buildOptions}
-                expandedGaps={expandedGaps}
-                rowLimit={rowLimits[file.path] ?? defaultRowLimit}
-                isReverting={revertingPath === file.path}
-                revertBlockedReason={
-                  scope?.kind === "workspace"
-                    ? revertBlockedReason(file.path)
-                    : "只有工作区改动可以还原。"
-                }
-                registerSection={(element) => {
-                  if (element) sectionRefs.current.set(file.path, element);
-                  else sectionRefs.current.delete(file.path);
-                }}
-                onToggle={() => toggleFile(file.path)}
-                onOpenFileTab={() => onOpenFileTab(file.path)}
-                onRevert={() => onRevertFile(file.path)}
-                onExpandGap={(gapId) => expandGap(file.path, gapId)}
-                onRequestContent={() => requestContent(file.path)}
-                onShowMoreRows={() =>
-                  setRowLimits((current) => ({
-                    ...current,
-                    [file.path]:
-                      (current[file.path] ?? defaultRowLimit) + defaultRowLimit,
-                  }))
-                }
-              />
-            ))
+            <>
+              {scope?.kind === "turn" && turnState?.status === "loading" ? (
+                <p className="diff-review__empty compact" role="status">
+                  <Loader2 className="spin" size={14} aria-hidden="true" />
+                  正在加载 {turnState.loadedFileCount}/{turnState.totalFileCount} 个文件…
+                </p>
+              ) : null}
+              {turnState?.error ? (
+                <p className="diff-review__empty compact is-error" role="status">
+                  <AlertCircle size={14} aria-hidden="true" />
+                  {turnState.error}
+                </p>
+              ) : null}
+              {files.map((file) => (
+                <DeferredDiffFileSection
+                  key={file.path}
+                  file={file}
+                  content={contents[file.path] ?? null}
+                  collapsed={collapsedFiles.has(file.path)}
+                  active={activePath === file.path}
+                  renderBody={renderedPaths.has(file.path)}
+                  preferences={preferences}
+                  buildOptions={buildOptions}
+                  expandedGaps={expandedGaps}
+                  rowLimit={rowLimits[file.path] ?? defaultRowLimit}
+                  isReverting={revertingPath === file.path}
+                  revertBlockedReason={
+                    scope?.kind === "workspace"
+                      ? revertBlockedReason(file.path)
+                      : "只有工作区改动可以还原。"
+                  }
+                  registerSection={(element) => {
+                    if (element) sectionRefs.current.set(file.path, element);
+                    else sectionRefs.current.delete(file.path);
+                  }}
+                  onToggle={() => toggleFile(file.path)}
+                  onRender={() => renderFile(file.path)}
+                  onOpenFileTab={() => onOpenFileTab(file.path)}
+                  onRevert={() => onRevertFile(file.path)}
+                  onExpandGap={(gapId) => expandGap(file.path, gapId)}
+                  onRequestContent={() => requestContent(file.path)}
+                  onShowMoreRows={() =>
+                    setRowLimits((current) => ({
+                      ...current,
+                      [file.path]:
+                        (current[file.path] ?? defaultRowLimit) + defaultRowLimit,
+                    }))
+                  }
+                />
+              ))}
+            </>
           )}
         </div>
 
@@ -894,6 +1024,7 @@ function CommitMenu({
   };
 
   const needsMessage = !message.trim();
+  const hasChanges = changedFiles > 0;
 
   return (
     <div className="diff-review__menu">
@@ -930,7 +1061,7 @@ function CommitMenu({
             <div className="diff-review__commit-actions">
               <Button
                 size="compact"
-                disabled={needsMessage || busy !== null}
+                disabled={!hasChanges || needsMessage || busy !== null}
                 onClick={() => run("commit")}
               >
                 {busy === "commit" ? "提交中" : "提交"}
@@ -938,7 +1069,7 @@ function CommitMenu({
               <Button
                 size="compact"
                 variant="primary"
-                disabled={needsMessage || busy !== null}
+                disabled={!hasChanges || needsMessage || busy !== null}
                 onClick={() => run("commit_push")}
               >
                 {busy === "commit_push" ? "处理中" : "提交并推送"}
@@ -969,6 +1100,116 @@ function CommitMenu({
 
 /* -------------------------------------------------------------------- file */
 
+type DiffFileSectionProps = {
+  file: ParsedDiffFile;
+  content: ContentState | null;
+  collapsed: boolean;
+  active: boolean;
+  preferences: DiffReviewPreferences;
+  buildOptions: DiffBuildOptions;
+  expandedGaps: ReadonlySet<string>;
+  rowLimit: number;
+  isReverting: boolean;
+  revertBlockedReason: string | null;
+  registerSection(element: HTMLElement | null): void;
+  onToggle(): void;
+  onOpenFileTab(): void;
+  onRevert(): void;
+  onExpandGap(gapId: string): void;
+  onRequestContent(): void;
+  onShowMoreRows(): void;
+};
+
+function DeferredDiffFileSection({
+  renderBody,
+  onRender,
+  ...props
+}: DiffFileSectionProps & { renderBody: boolean; onRender(): void }) {
+  if (renderBody) return <DiffFileSection {...props} />;
+
+  const {
+    file,
+    collapsed,
+    active,
+    isReverting,
+    revertBlockedReason,
+    registerSection,
+    onToggle,
+    onOpenFileTab,
+    onRevert,
+  } = props;
+  const language = diffLanguageFromPath(file.path);
+  const additions = fileAdditions(file);
+  const deletions = fileDeletions(file);
+
+  return (
+    <section
+      className="diff-review__file"
+      data-file-path={file.path}
+      data-active={active || undefined}
+      ref={registerSection}
+      aria-label={file.path}
+    >
+      <header className="diff-review__file-header">
+        <button
+          className="diff-review__file-toggle"
+          type="button"
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? `展开 ${file.path}` : `折叠 ${file.path}`}
+          onClick={onToggle}
+        >
+          {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+        </button>
+        <span className="diff-review__file-icon" aria-hidden="true">
+          {language ? <FileCode2 size={14} /> : <FileText size={14} />}
+        </span>
+        <span className="diff-review__file-path" title={file.path}>
+          {diffFileDirectory(file.path) ? (
+            <span className="diff-review__file-dir">
+              {diffFileDirectory(file.path)}/
+            </span>
+          ) : null}
+          <strong>{diffFileName(file.path)}</strong>
+        </span>
+        <span className="diff-review__file-status">{statusLabel(file)}</span>
+        <span
+          className="diff-review__stats"
+          aria-label={`增加 ${additions} 行，删除 ${deletions} 行`}
+        >
+          <span className="is-addition">+{additions}</span>
+          <span className="is-deletion">-{deletions}</span>
+        </span>
+        <span className="diff-review__file-actions">
+          <IconButton
+            aria-label={`在标签页中打开 ${file.path}`}
+            title="在标签页中打开文件"
+            size="compact"
+            onClick={onOpenFileTab}
+          >
+            <ExternalLink size={13} />
+          </IconButton>
+          <IconButton
+            aria-label={`还原 ${file.path}`}
+            title={revertBlockedReason ?? "还原此文件到 HEAD"}
+            size="compact"
+            disabled={Boolean(revertBlockedReason) || isReverting}
+            onClick={onRevert}
+          >
+            <RotateCcw className={isReverting ? "spin" : ""} size={13} />
+          </IconButton>
+        </span>
+      </header>
+      {collapsed ? null : (
+        <div className="diff-review__empty compact">
+          <Button size="compact" variant="quiet" onClick={onRender}>
+            显示差异
+          </Button>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function DiffFileSection({
   file,
   content,
@@ -987,25 +1228,7 @@ function DiffFileSection({
   onExpandGap,
   onRequestContent,
   onShowMoreRows,
-}: {
-  file: ParsedDiffFile;
-  content: ContentState | null;
-  collapsed: boolean;
-  active: boolean;
-  preferences: DiffReviewPreferences;
-  buildOptions: DiffBuildOptions;
-  expandedGaps: ReadonlySet<string>;
-  rowLimit: number;
-  isReverting: boolean;
-  revertBlockedReason: string | null;
-  registerSection(element: HTMLElement | null): void;
-  onToggle(): void;
-  onOpenFileTab(): void;
-  onRevert(): void;
-  onExpandGap(gapId: string): void;
-  onRequestContent(): void;
-  onShowMoreRows(): void;
-}) {
+}: DiffFileSectionProps) {
   const language = useMemo(() => diffLanguageFromPath(file.path), [file.path]);
   // Truncated content would misnumber every expanded line, so it is only used
   // for the rich preview, never to fill in untouched regions.
@@ -1048,17 +1271,20 @@ function DiffFileSection({
   const rows = useMemo<Array<DiffSplitRow | DiffUnifiedRow>>(
     () =>
       preferences.view === "split"
-        ? buildSplitRows(blocks, options)
-        : buildUnifiedRows(blocks, options),
-    [blocks, options, preferences.view],
+        ? buildSplitRows(blocks, options, rowLimit)
+        : buildUnifiedRows(blocks, options, rowLimit),
+    [blocks, options, preferences.view, rowLimit],
+  );
+  const totalRows = useMemo(
+    () => countDiffRows(blocks, preferences.view),
+    [blocks, preferences.view],
   );
 
   // Reads from the effective file so an untracked file counts its lines once
   // the content behind it has been loaded.
   const additions = fileAdditions(effectiveFile);
   const deletions = fileDeletions(effectiveFile);
-  const visibleRows = rows.slice(0, rowLimit);
-  const hiddenRows = rows.length - visibleRows.length;
+  const hiddenRows = totalRows - rows.length;
   const showRichPreview =
     preferences.richPreview &&
     isRichPreviewPath(file.path) &&
@@ -1143,7 +1369,7 @@ function DiffFileSection({
             aria-label={file.path}
           >
             <div className="diff-review__grid">
-              {visibleRows.map((row) =>
+              {rows.map((row) =>
                 row.type === "gap" ? (
                   <button
                     key={row.id}

@@ -1,3 +1,4 @@
+import { FileText } from "lucide-react";
 import {
   createContext,
   memo,
@@ -105,13 +106,42 @@ function MarkdownAnchor({
   ...props
 }: AnchorHTMLAttributes<HTMLAnchorElement>) {
   const onOpenLink = useContext(MarkdownLinkHandlerContext);
-  const detectedPath = href ? decodeFilePathHref(href)?.path : null;
-  const pathStatus = useWorkspacePathStatus(detectedPath ?? null);
+  const linkInfo = href ? decodeFilePathHref(href) : null;
+  const pathStatus = useWorkspacePathStatus(linkInfo?.path ?? null);
 
-  // A path picked out of prose only becomes a link once the file is known to
-  // exist; otherwise it stays plain text instead of opening onto an error.
-  if (detectedPath && pathStatus !== "known") return <>{children}</>;
+  // File-detected link (opentopia-file: scheme): render as a compact chip once
+  // the file is confirmed to exist, otherwise show plain text.
+  if (linkInfo) {
+    if (pathStatus !== "known") return <>{children}</>;
 
+    const segments = linkInfo.path.split("/").filter(Boolean);
+    const fileName = segments.at(-1) ?? linkInfo.path;
+    const lineLabel = linkInfo.fragment
+      ? `(line ${linkInfo.fragment.replace(/^L+/, "")})`
+      : null;
+
+    return (
+      <a
+        href={href}
+        title={linkInfo.path}
+        className="markdown-path-chip"
+        onClick={(event) => {
+          if (event.defaultPrevented || !href) return;
+          if (!onOpenLink) return;
+          event.preventDefault();
+          onOpenLink(href);
+        }}
+      >
+        <FileText size={12} strokeWidth={2} aria-hidden />
+        <span>{fileName}</span>
+        {lineLabel && (
+          <span className="markdown-path-chip-line">{lineLabel}</span>
+        )}
+      </a>
+    );
+  }
+
+  // Normal markdown link
   return (
     <a
       {...props}

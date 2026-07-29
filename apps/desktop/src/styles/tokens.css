@@ -50,6 +50,7 @@
 
   --app-bg: #ffffff;
   --sidebar-bg: #f3f6fa;
+  --sidebar-gradient: linear-gradient(180deg, #f5f8fc 0%, #e2e9f1 100%);
   --surface: #ffffff;
   --surface-subtle: #f8f9fb;
   --surface-chrome: #f4f7fa;
@@ -65,6 +66,9 @@
   --accent-hover: #075eaf;
   --accent-subtle: #e9f2fc;
   --on-accent: #ffffff;
+  --loading-shimmer: #ffffff;
+  --loading-wordmark-ink: #1f2937;
+  --loading-wordmark-accent: #5277a3;
   --focus-ring: #247edb;
   --success: #087b52;
   --success-subtle: #e9f7f0;
@@ -72,6 +76,7 @@
   --warning-subtle: #fff5e8;
   --danger: #c23d42;
   --danger-subtle: #fff0f1;
+  --overlay-scrim: rgb(0 0 0 / 72%);
 
   --shadow-float: 0 8px 24px rgb(31 41 55 / 12%), 0 1px 3px rgb(31 41 55 / 8%);
   --shadow-overlay: 0 18px 48px rgb(31 41 55 / 18%);
@@ -101,6 +106,7 @@
   --control-height-sm: 28px;
   --control-height-md: 32px;
   --control-height-lg: 36px;
+  --popover-max-height: 300px;
   --icon-size-xs: 14px;
   --icon-size-sm: 16px;
   --icon-size-md: 18px;
@@ -137,6 +143,7 @@
    */
   --app-bg: #181818;
   --sidebar-bg: #1a2227;
+  --sidebar-gradient: linear-gradient(180deg, #1f2d37 0%, #141a1e 100%);
   --surface: #2d2d2d;
   --surface-subtle: #353535;
   --surface-chrome: #1f1f1f;
@@ -152,6 +159,8 @@
   --accent-hover: #7cbcfa;
   --accent-subtle: #1e3448;
   --on-accent: #0d1219;
+  --loading-wordmark-ink: #e7ebef;
+  --loading-wordmark-accent: #8eafd0;
   --focus-ring: #6cb4f8;
   --success: #56c98f;
   --success-subtle: #1a3227;
@@ -159,6 +168,7 @@
   --warning-subtle: #342a19;
   --danger: #ec8288;
   --danger-subtle: #3a2228;
+  --overlay-scrim: rgb(0 0 0 / 78%);
 
   --shadow-float: 0 8px 24px rgb(0 0 0 / 45%), 0 1px 3px rgb(0 0 0 / 35%);
   --shadow-overlay: 0 18px 48px rgb(0 0 0 / 60%);

@@ -155,12 +155,7 @@ function ToolActivityBodyView({
 
   if (body.type === "terminal") {
     const { streams } = body;
-    const status =
-      streams.exitCode === null
-        ? null
-        : streams.exitCode === 0
-          ? "退出码 0"
-          : `退出码 ${streams.exitCode}`;
+    const status = view.failed ? "失败" : "成功";
     return (
       <div className="tool-panel" data-panel="terminal">
         <div className="tool-panel-head">
@@ -171,7 +166,7 @@ function ToolActivityBodyView({
           {status && (
             <span
               className="tool-panel-status"
-              data-tone={streams.exitCode === 0 ? "success" : "danger"}
+              data-tone={view.failed ? "danger" : "success"}
             >
               {status}
             </span>

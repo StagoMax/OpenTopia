@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 const browserHost = Object.freeze({
   createSession: (options) =>
@@ -31,6 +31,15 @@ const browserHost = Object.freeze({
 
 contextBridge.exposeInMainWorld("opentopia", {
   getPlatformInfo: () => ipcRenderer.invoke("platform:get-info"),
+  getOpenRequests: () => ipcRenderer.invoke("platform:get-open-requests"),
+  onOpenRequest: (listener) => {
+    if (typeof listener !== "function") {
+      throw new TypeError("Open request listener must be a function.");
+    }
+    const wrapped = (_event, request) => listener(request);
+    ipcRenderer.on("platform:open-request", wrapped);
+    return () => ipcRenderer.removeListener("platform:open-request", wrapped);
+  },
   setTheme: (theme) => ipcRenderer.invoke("platform:set-theme", theme),
   openExternal: (url) => ipcRenderer.invoke("platform:open-external", url),
   openPath: (targetPath) =>
@@ -40,6 +49,11 @@ contextBridge.exposeInMainWorld("opentopia", {
   selectWorkspace: (options) => ipcRenderer.invoke("workspace:select", options),
   selectContextFiles: (options) =>
     ipcRenderer.invoke("context:select-files", options),
+  getDroppedContextFiles: (files) =>
+    ipcRenderer.invoke(
+      "context:add-dropped-files",
+      Array.from(files, (file) => webUtils.getPathForFile(file)).filter(Boolean),
+    ),
   selectPluginDirectory: (options) =>
     ipcRenderer.invoke("plugins:select-directory", options),
   getRecentWorkspaces: () => ipcRenderer.invoke("workspace:get-recent"),

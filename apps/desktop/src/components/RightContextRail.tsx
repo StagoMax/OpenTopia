@@ -52,6 +52,7 @@ export type RightContextRailProps = {
   onOpenDiff(): void;
   onOpenTerminal(): void;
   onOpenFiles(): void;
+  onOpenEnvironment(): void;
   onAddSource(): void;
   onSpawnSubagent(name: string, input: string): Promise<void>;
   onCancelSubagent(runId: string): void;
@@ -110,6 +111,7 @@ export function RightContextRail({
   onOpenDiff,
   onOpenTerminal,
   onOpenFiles,
+  onOpenEnvironment,
   onAddSource,
   onSpawnSubagent,
   onCancelSubagent,
@@ -214,9 +216,9 @@ export function RightContextRail({
           <button
             className="right-context-rail__header-action"
             type="button"
-            disabled
-            title="添加环境 · 未实现"
-            aria-label="添加环境"
+            title="管理环境"
+            aria-label="管理环境"
+            onClick={onOpenEnvironment}
           >
             <Plus size={14} aria-hidden="true" />
           </button>

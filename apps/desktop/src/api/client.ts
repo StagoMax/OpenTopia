@@ -18,10 +18,12 @@ import type {
   GitWorkflowResponse,
   GoalSnapshot,
   GoalStatus,
+  InlineImageAttachment,
   McpCallResult,
   McpServerInput,
   McpServerStatus,
   McpServerView,
+  McpToolDescriptor,
   Message,
   PermissionMode,
   PluginView,
@@ -305,6 +307,7 @@ export class ApiClient {
     skillIds: string[] = [],
     collaborationMode: CollaborationMode = "default",
     goalId?: string,
+    imageAttachments: InlineImageAttachment[] = [],
   ): Promise<{
     message: Message;
     turnId: string | null;
@@ -321,6 +324,7 @@ export class ApiClient {
           skillIds,
           collaborationMode,
           goalId,
+          imageAttachments,
         }),
       },
     );
@@ -837,6 +841,10 @@ export class ApiClient {
     return this.get("/api/mcp/servers");
   }
 
+  async listMcpTools(serverId: string): Promise<McpToolDescriptor[]> {
+    return this.get(`/api/mcp/servers/${serverId}/tools`);
+  }
+
   async createMcpServer(input: McpServerInput): Promise<McpServerView> {
     return this.post("/api/mcp/servers", input);
   }
@@ -1341,7 +1349,7 @@ export function parseGitBranches(output: string): GitBranchInfo[] {
 
 function gitFailureMessage(result: GitWorkflowResponse): string {
   const detail = result.stderr.trim() || result.stdout.trim();
-  const exit =
-    result.exitCode === null ? "未知退出码" : `退出码 ${result.exitCode}`;
-  return detail || `Git ${result.action} 执行失败（${exit}）`;
+  return (
+    detail || `Git ${result.action} 执行${result.success ? "成功" : "失败"}`
+  );
 }

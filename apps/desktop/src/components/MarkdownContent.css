@@ -66,33 +66,38 @@
   border: 0;
 }
 
-.markdown-content a.markdown-path-link {
+.markdown-content a.markdown-path-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   color: var(--accent);
   text-decoration: none;
-  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.94em;
+  line-height: inherit;
+  vertical-align: -0.125em;
+  white-space: nowrap;
 }
 
-.markdown-content a.markdown-path-link:hover {
+.markdown-content a.markdown-path-chip:hover {
   color: var(--accent-hover);
 }
 
-.markdown-content a.markdown-path-link:focus-visible {
+.markdown-content a.markdown-path-chip:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
   border-radius: 2px;
 }
 
-.markdown-content a.markdown-path-link-text {
-  font-family: var(--font-mono);
-  font-size: 0.94em;
+.markdown-content a.markdown-path-chip svg {
+  flex: 0 0 auto;
+  opacity: 0.65;
+  position: relative;
+  top: 0.05em;
 }
 
-/* A path in a code span keeps the span's type, not its chip framing. */
-.markdown-content a.markdown-path-link > code {
-  border: 0;
-  padding: 0;
-  background: none;
-  color: inherit;
+.markdown-content .markdown-path-chip-line {
+  opacity: 0.6;
 }
 
 .markdown-image-alt {

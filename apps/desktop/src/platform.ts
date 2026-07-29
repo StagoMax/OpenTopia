@@ -57,6 +57,13 @@ export async function selectContextFiles(options?: {
   return { canceled: true, files: [] };
 }
 
+export async function getDroppedContextFiles(
+  files: File[],
+): Promise<ContextSourcePickResult> {
+  if (window.opentopia) return window.opentopia.getDroppedContextFiles(files);
+  return { canceled: true, files: [] };
+}
+
 export async function selectPluginDirectory(options?: {
   defaultPath?: string;
 }): Promise<PluginDirectoryPickResult> {

@@ -50,6 +50,12 @@ export type ContextSourcePickResult =
   | { canceled: true; files: [] }
   | { canceled: false; files: ContextSourceFile[] };
 
+export type InlineImageAttachment = {
+  contentType: string;
+  data: number[];
+  name?: string;
+};
+
 export type PluginDirectoryPickResult =
   { canceled: true } | { canceled: false; path: string };
 
@@ -233,7 +239,8 @@ export type ProviderSettings = {
    */
   modelContextWindows?: Record<string, number>;
   modelsSyncedAt?: string | null;
-  temperature: number;
+  /** `null` = don't send temperature, let the model use its vendor default. */
+  temperature?: number | null;
   maxOutputTokens?: number | null;
   /**
    * Optional user override. When unset, the server resolves a known model
@@ -621,6 +628,101 @@ export type ContextSummary = {
   tokenEstimate?: number | null;
   createdAt: string;
   metadata: unknown;
+  checkpoint?: ContextCheckpoint | null;
+};
+
+export type ContextCheckpointFactStatus = "active" | "resolved" | "superseded";
+
+export type ContextCheckpointFact = {
+  id: string;
+  text: string;
+  status: ContextCheckpointFactStatus;
+  sourceSeqs: number[];
+  confidence?: number | null;
+};
+
+export type ContextCheckpoint = {
+  id: string;
+  threadId: string;
+  schemaVersion: number;
+  mode: "legacy_text" | "manual" | "structured_local" | "native_provider";
+  previousCheckpointId?: string | null;
+  coverage: {
+    throughSeq: number;
+    throughMessageCount: number;
+  };
+  providerCompatibilityHash?: string | null;
+  goal: string;
+  userConstraints: ContextCheckpointFact[];
+  decisions: ContextCheckpointFact[];
+  workspaceState: {
+    branch?: string | null;
+    gitStatus?: string | null;
+    filesChanged: Array<{
+      path: string;
+      status: string;
+      summary: string;
+      sourceSeqs: number[];
+    }>;
+  };
+  commandsAndValidation: Array<{
+    command: string;
+    outcome: string;
+    summary: string;
+    sourceSeqs: number[];
+  }>;
+  openIssues: ContextCheckpointFact[];
+  nextSteps: Array<{
+    id: string;
+    text: string;
+    status: string;
+    sourceSeqs: number[];
+  }>;
+  pendingInteractions: Array<{
+    kind: string;
+    summary: string;
+    sourceSeqs: number[];
+  }>;
+  artifacts: Array<{
+    id?: string | null;
+    path?: string | null;
+    kind: string;
+    summary: string;
+    sourceSeqs: number[];
+  }>;
+  createdAt: string;
+};
+
+export type ContextProjection = {
+  checkpointId?: string | null;
+  checkpointMode?: string | null;
+  checkpointTokens: number;
+  coveredThroughSeq: number;
+  coveredMessageCount: number;
+  unsummarizedMessageCount: number;
+  unsummarizedEventCount: number;
+  recentTailTokens: number;
+  nativeCompactionSupported: boolean;
+  providerStateAvailable: boolean;
+  providerStateKind?: string | null;
+  providerItemCount: number;
+  nativeCompactionItemCount: number;
+};
+
+export type ContextCompactionDetails = {
+  checkpointId?: string | null;
+  mode: ContextCheckpoint["mode"];
+  coverage: ContextCheckpoint["coverage"];
+  providerStateCheckpointId?: string | null;
+  metrics?: {
+    source: string;
+    inputTokens: number;
+    checkpointTokens: number;
+    tokenReductionPercent: number;
+    latencyMs: number;
+    factRetentionPercent: number;
+    activeConstraintRetentionPercent: number;
+  } | null;
 };
 
 export type ContextStatus = {
@@ -633,8 +735,16 @@ export type ContextStatus = {
     cacheWriteTokens: number;
     reasoningTokens: number;
     compactions: number;
+    nativeCompactions: number;
+    providerFallbacks: number;
     warnings: number;
+    compactionInputTokens: number;
+    checkpointTokens: number;
+    compactionLatencyMs: number;
+    lastFactRetentionPercent: number;
+    lastActiveConstraintRetentionPercent: number;
   };
+  projection?: ContextProjection;
 };
 
 export type ArtifactDescriptor = {
@@ -790,6 +900,16 @@ export type McpServerStatus = {
   updatedAt: string;
 };
 
+export type McpToolDescriptor = {
+  publicName: string;
+  serverId: string;
+  toolName: string;
+  description?: string | null;
+  inputSchema: unknown;
+  annotations: unknown;
+  permissionLabels: string[];
+};
+
 export type McpServerView = {
   server: McpServerConfig;
   status: McpServerStatus;
@@ -831,6 +951,7 @@ export type Message = {
 
 export type MessagePart =
   | { type: "text"; text: string }
+  | ({ type: "image" } & InlineImageAttachment)
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; result: ToolResult }
   | { type: "file_ref"; path: string }
@@ -1246,7 +1367,26 @@ export type AgentEventPayload =
       action: unknown;
     }
   | { type: "auto_review_interruption_warning"; message: string }
-  | { type: "context_compacted"; summary: ContextSummary }
+  | {
+      type: "context_compacted";
+      summary: ContextSummary;
+      details?: ContextCompactionDetails | null;
+    }
+  | { type: "context_projection_built"; projection: ContextProjection }
+  | {
+      type: "provider_context_state_updated";
+      provider_id: string;
+      model: string;
+      state_kind: string;
+      response_item_count: number;
+      compaction_item_count: number;
+    }
+  | {
+      type: "provider_context_state_invalidated";
+      provider_id?: string | null;
+      model?: string | null;
+      reason: string;
+    }
   | { type: "context_warning"; stage: string; message: string }
   | {
       type: "token_usage";
@@ -1310,10 +1450,25 @@ export type TurnCancelResult = {
   message: string;
 };
 
+export type PlatformOpenRequest = {
+  id: string;
+  source: string;
+  kind: string;
+  action?: string;
+  threadId?: string;
+  workspaceRoot?: string;
+  path?: string;
+  receivedAt: string;
+};
+
 declare global {
   interface Window {
     opentopia?: {
       getPlatformInfo(): Promise<PlatformInfo>;
+      getOpenRequests(): Promise<PlatformOpenRequest[]>;
+      onOpenRequest(
+        listener: (request: PlatformOpenRequest) => void,
+      ): () => void;
       /** Repaints the OS-drawn window chrome for the resolved theme. */
       setTheme(theme: "light" | "dark"): Promise<boolean>;
       openExternal(url: string): Promise<void>;
@@ -1327,6 +1482,7 @@ declare global {
       selectContextFiles(options?: {
         defaultPath?: string;
       }): Promise<ContextSourcePickResult>;
+      getDroppedContextFiles(files: File[]): Promise<ContextSourcePickResult>;
       selectPluginDirectory(options?: {
         defaultPath?: string;
       }): Promise<PluginDirectoryPickResult>;

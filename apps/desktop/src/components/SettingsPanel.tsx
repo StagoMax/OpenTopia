@@ -12,7 +12,6 @@ import {
   Import,
   KeyRound,
   Plus,
-  RefreshCw,
   Search,
   Server,
   Settings,
@@ -34,6 +33,7 @@ import {
   availableFamiliesForModels,
   classifyModelFamily,
 } from "../modelCatalog";
+import { ModelInputDropdown } from "./ModelInputDropdown";
 import { Button, SegmentedControl, Select, Switch } from "./ui";
 import { SettingsGroup, SettingsPage, SettingsRow } from "./SettingsLayout";
 import { AppearanceSettingsView } from "./AppearanceSettings";
@@ -43,7 +43,6 @@ import type { PersonalizationSettings } from "../personalization";
 import type { EditorPreferences } from "../editorPreferences";
 import {
   MAX_PROVIDER_NAME_LENGTH,
-  OFFICIAL_OPENAI_MODEL_PRESETS,
   OPENAI_MODEL_CATALOG_VERIFIED_AT,
   REASONING_EFFORT_DETAILS,
   findOfficialModelPreset,
@@ -82,8 +81,6 @@ const settingsSectionLabels: Record<SettingsSection, string> = {
   personal: "个人",
   coding: "编码",
 };
-
-const CUSTOM_MODEL_PRESET_VALUE = "__custom_model__";
 
 export type SettingsSaveInput = {
   providers?: ProviderSettings[];
@@ -1134,6 +1131,7 @@ function ProviderSettingsView({
   const [manualModelProviderId, setManualModelProviderId] = useState<
     string | null
   >(null);
+  const [modelSyncing, setModelSyncing] = useState(false);
   const selectedModelPreset = editingProvider
     ? findOfficialModelPreset(editingProvider.model)
     : null;
@@ -1174,6 +1172,19 @@ function ProviderSettingsView({
     );
     if (reasoningEffort !== (editingProvider.reasoningEffort ?? null)) {
       onUpdateProvider(editingProvider.id, "reasoningEffort", reasoningEffort);
+    }
+  }
+
+  async function syncModels() {
+    if (!editingProvider) return;
+    setModelSyncing(true);
+    try {
+      const ids = await onSyncProviderModels(editingProvider.id);
+      if (ids && ids.length > 0) {
+        onUpdateProvider(editingProvider.id, "syncedModels", ids);
+      }
+    } finally {
+      setModelSyncing(false);
     }
   }
 
@@ -1327,64 +1338,17 @@ function ProviderSettingsView({
                 </select>
               </label>
               {!usesCodexAppServer ? (
-                <div className="settings-field-wide settings-model-config">
-                  <div className="settings-model-controls">
-                    <label>
-                      <span>模型预设</span>
-                      <select
-                        value={
-                          usesManualModel
-                            ? CUSTOM_MODEL_PRESET_VALUE
-                            : (selectedModelPreset?.model ??
-                              CUSTOM_MODEL_PRESET_VALUE)
-                        }
-                        onChange={(event) => {
-                          if (
-                            event.target.value === CUSTOM_MODEL_PRESET_VALUE
-                          ) {
-                            setManualModelProviderId(editingProvider.id);
-                            return;
-                          }
-                          setManualModelProviderId(null);
-                          updateModel(event.target.value);
-                        }}
-                      >
-                        <optgroup label="OpenAI 官方推荐">
-                          {OFFICIAL_OPENAI_MODEL_PRESETS.filter(
-                            (preset) => preset.group === "recommended",
-                          ).map((preset) => (
-                            <option key={preset.model} value={preset.model}>
-                              {preset.label} · {preset.description}
-                            </option>
-                          ))}
-                        </optgroup>
-                        <optgroup label="兼容现有项目">
-                          {OFFICIAL_OPENAI_MODEL_PRESETS.filter(
-                            (preset) => preset.group === "compatibility",
-                          ).map((preset) => (
-                            <option key={preset.model} value={preset.model}>
-                              {preset.label} · {preset.description}
-                            </option>
-                          ))}
-                        </optgroup>
-                        <option value={CUSTOM_MODEL_PRESET_VALUE}>
-                          自定义模型 ID
-                        </option>
-                      </select>
-                    </label>
-                    {usesManualModel ? (
-                      <label>
-                        <span>模型 ID</span>
-                        <input
-                          value={editingProvider.model}
-                          required
-                          spellCheck={false}
-                          placeholder="例如：自托管或兼容模型 ID"
-                          onChange={(event) => updateModel(event.target.value)}
-                        />
-                      </label>
-                    ) : null}
-                  </div>
+                <div className="settings-field-wide">
+                  <label>
+                    <span>模型</span>
+                    <ModelInputDropdown
+                      connection={editingProvider}
+                      value={editingProvider.model}
+                      onChange={updateModel}
+                      onSync={() => void syncModels()}
+                      syncing={modelSyncing}
+                    />
+                  </label>
                   <div className="settings-model-meta">
                     <span>{modelDescription}</span>
                     {modelSourceUrl ? (
@@ -1497,7 +1461,6 @@ function ProviderSettingsView({
               <ModelFamilySection
                 connection={editingProvider}
                 onUpdateProvider={onUpdateProvider}
-                onSyncProviderModels={onSyncProviderModels}
               />
             ) : null}
 
@@ -1512,15 +1475,22 @@ function ProviderSettingsView({
                       min="0"
                       max="2"
                       step="0.1"
-                      value={editingProvider.temperature}
+                      value={editingProvider.temperature ?? ""}
+                      placeholder="默认（跟随模型）"
+                      title="留空则不发送 temperature 参数，使用模型供应商的默认值"
                       onChange={(event) =>
                         onUpdateProvider(
                           editingProvider.id,
                           "temperature",
-                          Number(event.target.value),
+                          event.target.value
+                            ? Number(event.target.value)
+                            : null,
                         )
                       }
                     />
+                    <small>
+                      留空则不发送此参数，使用模型默认值。推理模型（o 系列、GPT-5）不支持自定义温度。
+                    </small>
                   </label>
                   <label>
                     <span>最大输出 Token</span>
@@ -2108,7 +2078,6 @@ function ProviderImportDialog({
 function ModelFamilySection({
   connection,
   onUpdateProvider,
-  onSyncProviderModels,
 }: {
   connection: ProviderSettings;
   onUpdateProvider<K extends keyof ProviderSettings>(
@@ -2116,11 +2085,7 @@ function ModelFamilySection({
     field: K,
     value: ProviderSettings[K],
   ): void;
-  onSyncProviderModels(providerId: string): Promise<string[] | null>;
 }) {
-  const [syncing, setSyncing] = useState(false);
-  const [syncError, setSyncError] = useState<string | null>(null);
-
   // The hand-configured default belongs in the catalog even when the endpoint
   // has no /v1/models, so those connections still get a usable picker.
   const modelIds = useMemo(() => {
@@ -2157,24 +2122,6 @@ function ModelFamilySection({
     onUpdateProvider(connection.id, "enabledFamilies", next);
   }
 
-  async function sync() {
-    setSyncing(true);
-    setSyncError(null);
-    try {
-      const ids = await onSyncProviderModels(connection.id);
-      if (!ids) setSyncError("同步失败，请检查 Base URL 和 API 密钥。");
-      else if (ids.length === 0) {
-        setSyncError("该连接没有返回模型列表，可继续使用手填的模型 ID。");
-      } else {
-        // The server already persisted these; mirroring them into the draft
-        // keeps the family list in sync without reloading the whole panel.
-        onUpdateProvider(connection.id, "syncedModels", ids);
-      }
-    } finally {
-      setSyncing(false);
-    }
-  }
-
   return (
     <section className="settings-model-families">
       <header>
@@ -2187,25 +2134,10 @@ function ModelFamilySection({
               : ""}
           </span>
         </div>
-        <Button
-          type="button"
-          variant="secondary"
-          size="compact"
-          disabled={syncing}
-          onClick={() => void sync()}
-        >
-          <RefreshCw size={14} aria-hidden="true" />
-          {syncing ? "同步中…" : "同步模型"}
-        </Button>
       </header>
-      {syncError ? (
-        <p className="settings-model-families-note" role="status">
-          {syncError}
-        </p>
-      ) : null}
       {families.length === 0 ? (
         <p className="settings-model-families-note">
-          还没有模型列表。点击「同步模型」从该连接拉取，或先在上方填写模型 ID。
+          还没有模型列表。请在上方模型字段旁点击同步按钮拉取。
         </p>
       ) : (
         <div className="settings-toggle-stack">
@@ -2267,7 +2199,7 @@ function createProviderSettings(
     enabledFamilies: [],
     syncedModels: [],
     modelsSyncedAt: null,
-    temperature: 0.2,
+    temperature: null,
     maxOutputTokens: null,
     contextWindowTokens: null,
     reasoningEffort: null,

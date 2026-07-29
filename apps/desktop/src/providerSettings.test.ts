@@ -33,7 +33,7 @@ test("normalizes legacy providers that do not have a display name", () => {
       enabledFamilies: [],
       syncedModels: [],
       modelsSyncedAt: null,
-      temperature: 0.2,
+      temperature: null,
       maxOutputTokens: null,
       contextWindowTokens: null,
       reasoningEffort: null,

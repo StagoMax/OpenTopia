@@ -67,6 +67,7 @@ import {
 } from "./DiffReviewPanel";
 import type { XtermTerminalHandle } from "./XtermTerminal";
 import { XtermTerminal } from "./XtermTerminal";
+import { Badge, Button } from "./ui";
 
 export type WorkbenchTab =
   "files" | "diff" | "terminal" | "extensions" | "sandbox";
@@ -420,6 +421,7 @@ function ContextCard({
   const usage = budget?.estimatedUsage ?? 0;
   const latestSummary = contextStatus?.latestSummary;
   const providerUsage = contextStatus?.usage;
+  const projection = contextStatus?.projection;
 
   return (
     <section className="panel-card context-card">
@@ -447,31 +449,73 @@ function ContextCard({
           {providerUsage.compactions > 0 ? (
             <span>{providerUsage.compactions} compactions</span>
           ) : null}
+          {providerUsage.lastFactRetentionPercent > 0 ? (
+            <span>
+              {providerUsage.lastFactRetentionPercent}% facts retained
+            </span>
+          ) : null}
+          {providerUsage.nativeCompactions > 0 ? (
+            <span>{providerUsage.nativeCompactions} native</span>
+          ) : null}
+          {providerUsage.providerFallbacks > 0 ? (
+            <span>{providerUsage.providerFallbacks} fallbacks</span>
+          ) : null}
           {providerUsage.warnings > 0 ? (
             <span>{providerUsage.warnings} warnings</span>
+          ) : null}
+        </div>
+      ) : null}
+      {projection ? (
+        <div className="context-budget-row">
+          <Badge variant="info">
+            {(projection.checkpointMode ?? "uncompacted").replaceAll("_", " ")}
+          </Badge>
+          <Badge
+            variant={projection.providerStateAvailable ? "success" : "neutral"}
+          >
+            {projection.providerStateAvailable
+              ? (projection.providerStateKind ?? "provider state").replaceAll(
+                  "_",
+                  " ",
+                )
+              : projection.nativeCompactionSupported
+                ? "native ready"
+                : "local checkpoint"}
+          </Badge>
+          <Badge>{formatNumber(projection.checkpointTokens)} checkpoint</Badge>
+          <Badge>{formatNumber(projection.recentTailTokens)} recent</Badge>
+          {projection.unsummarizedMessageCount > 0 ? (
+            <Badge variant="warning">
+              {projection.unsummarizedMessageCount} messages uncovered
+            </Badge>
+          ) : null}
+          {projection.unsummarizedEventCount > 0 ? (
+            <Badge variant="warning">
+              {projection.unsummarizedEventCount} events uncovered
+            </Badge>
           ) : null}
         </div>
       ) : null}
       {latestSummary ? (
         <details className="context-summary">
           <summary>
-            Summary through event {latestSummary.coveredThroughSeq}
+            Checkpoint through event {latestSummary.coveredThroughSeq}
             <ChevronDown size={12} />
           </summary>
-          <p>{latestSummary.summary}</p>
+          <p>{latestSummary.checkpoint?.goal ?? latestSummary.summary}</p>
         </details>
       ) : (
-        <p>No context summary yet.</p>
+        <p>No context checkpoint yet.</p>
       )}
-      <button
-        className="secondary-button compact"
-        type="button"
+      <Button
+        size="compact"
+        variant="secondary"
         disabled={disabled}
         onClick={onCompactContext}
       >
         <RefreshCw size={13} className={isCompacting ? "spin" : ""} />
         {isCompacting ? "Compacting" : "Compact"}
-      </button>
+      </Button>
     </section>
   );
 }
@@ -2165,9 +2209,11 @@ function buildTerminalEventRows(events: TerminalEvent[]): TerminalRow[] {
 
 function terminalExitBody(event: TerminalEvent): string | undefined {
   const parts = [
-    event.exitCode === undefined || event.exitCode === null
+    event.success === undefined || event.success === null
       ? undefined
-      : `exit code: ${event.exitCode}`,
+      : event.success
+        ? "成功"
+        : "失败",
     event.message ?? undefined,
   ].filter(Boolean);
   return parts.length ? parts.join("\n") : undefined;
@@ -2256,6 +2302,33 @@ function buildTerminalRows(events: AgentEvent[]): TerminalRow[] {
             label: "context compacted",
             time,
             body: event.payload.summary.summary,
+            artifacts: [],
+          };
+        case "context_projection_built":
+          return {
+            id: event.id,
+            kind: "info",
+            label: "context projection built",
+            time,
+            body: `${event.payload.projection.checkpointTokens} checkpoint tokens, ${event.payload.projection.recentTailTokens} recent-tail tokens`,
+            artifacts: [],
+          };
+        case "provider_context_state_updated":
+          return {
+            id: event.id,
+            kind: "info",
+            label: "provider context updated",
+            time,
+            body: `${event.payload.state_kind.replaceAll("_", " ")}, ${event.payload.response_item_count} items`,
+            artifacts: [],
+          };
+        case "provider_context_state_invalidated":
+          return {
+            id: event.id,
+            kind: "info",
+            label: "provider context rebuilt",
+            time,
+            body: event.payload.reason,
             artifacts: [],
           };
         case "turn_finished":

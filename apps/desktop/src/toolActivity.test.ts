@@ -160,7 +160,7 @@ test("builds a terminal body for shell calls", () => {
   }
 });
 
-test("marks a non-zero exit as failed and chips the code", () => {
+test("marks a non-zero exit as failed and labels it as failed", () => {
   const view = buildToolActivity(
     call("shell", { command: "wc -l" }),
     result("$ wc -l\n\n[stdout]\n\n\n[stderr]\nnot found\n", {
@@ -171,7 +171,21 @@ test("marks a non-zero exit as failed and chips the code", () => {
   assert.equal(view.failed, true);
   assert.deepEqual(
     view.chips.map((chip) => chip.label),
-    ["退出码 1"],
+    ["失败"],
+  );
+});
+
+test("labels a successful shell call as successful", () => {
+  const view = buildToolActivity(
+    call("shell", { command: "echo ok" }),
+    result("$ echo ok\n\n[stdout]\nok\n", {
+      exitCode: 0,
+      success: true,
+    }),
+  );
+  assert.deepEqual(
+    view.chips.map((chip) => chip.label),
+    ["成功"],
   );
 });
 

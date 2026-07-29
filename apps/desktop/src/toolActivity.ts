@@ -87,7 +87,7 @@ export type ToolActivityBody =
 
 export type ToolActivityChip = {
   label: string;
-  tone?: "neutral" | "danger" | "warning";
+  tone?: "neutral" | "success" | "danger" | "warning";
   title?: string;
 };
 
@@ -437,7 +437,10 @@ export function parseShellCommand(command: string): ParsedShellCommand {
   // label on the row that the command does not deliver. Only a single command
   // gets a semantic label, and the rest keep their command line verbatim.
   if (segments.length !== 1) {
-    return { kind: "other", program: programName(tokenizeCommand(command)[0] ?? "") };
+    return {
+      kind: "other",
+      program: programName(tokenizeCommand(command)[0] ?? ""),
+    };
   }
   const segment = segments[0];
   const tokens = tokenizeCommand(segment);
@@ -811,8 +814,15 @@ function shellCommandTitle(parsed: ParsedShellCommand, command: string) {
 
 function shellChips(streams: ShellStreams, result?: ToolResult) {
   const chips: ToolActivityChip[] = [];
-  if (result && streams.exitCode !== null && streams.exitCode !== 0) {
-    chips.push({ label: `退出码 ${streams.exitCode}`, tone: "danger" });
+  if (result) {
+    const failed =
+      streams.exitCode !== null && streams.exitCode !== 0
+        ? true
+        : toolResultFailed(result);
+    chips.push({
+      label: failed ? "失败" : "成功",
+      tone: failed ? "danger" : "success",
+    });
   }
   if (streams.truncated) {
     chips.push({ label: "输出已截断", tone: "warning" });

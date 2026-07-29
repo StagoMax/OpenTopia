@@ -1,12 +1,15 @@
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
   type CSSProperties,
+  type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
@@ -17,19 +20,27 @@ import {
   Archive,
   ArrowLeft,
   ArrowRight,
+  ArrowDown,
   ArrowUp,
   Bot,
   Box,
   BriefcaseBusiness,
   Check,
+  CircleAlert,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Circle,
   CircleHelp,
   Cloud,
   Clock3,
   Code2,
+  Download,
   ExternalLink,
+  File,
   FileCode2,
+  FileImage,
+  FileJson,
   FileText,
   Folder,
   FolderOpen,
@@ -41,10 +52,14 @@ import {
   Laptop,
   ListTodo,
   Loader2,
+  Maximize2,
+  Minimize2,
   Monitor,
   MessageCircle,
   MoreHorizontal,
   PanelRight,
+  PanelRightClose,
+  PanelRightOpen,
   PanelLeftClose,
   PanelLeftOpen,
   Paperclip,
@@ -67,6 +82,8 @@ import {
   Trash2,
   X,
   Zap,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
@@ -92,6 +109,7 @@ import {
 import { WebPreviewSurface } from "./components/WebPreviewSurface";
 import { ComputerPanel } from "./components/ComputerPanel";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
+import { Button, IconButton } from "./components/ui";
 import { normalizeCopiedText } from "./clipboardText";
 import { resolveMarkdownLink } from "./markdownLinks";
 import {
@@ -103,7 +121,14 @@ import {
   resolveDefaultModelId,
 } from "./modelCatalog";
 import {
+  appendImageUnderstandingContext,
+  buildImageUnderstandingArguments,
+  extractImageUnderstandingText,
+  isImageUnderstandingMcpTool,
+} from "./imageProcessing";
+import {
   deleteProviderApiKey,
+  getDroppedContextFiles,
   getRecentWorkspaces,
   listSecretSources,
   loadPlatformInfo,
@@ -149,8 +174,10 @@ import type {
   ExperienceMode,
   GoalSnapshot,
   GoalStatus,
+  InlineImageAttachment,
   McpServerInput,
   McpServerView,
+  McpToolDescriptor,
   Message,
   MessagePart,
   PlatformInfo,
@@ -174,7 +201,9 @@ import type {
   Thread,
   ThreadMcpServerView,
   ThreadModelSelection,
+  TurnStatus,
   TurnChangeSet,
+  TurnFileChange,
   TurnFileDiffPreview,
   TurnUndoPreview,
   UserInputRecord,
@@ -188,6 +217,60 @@ import type {
 } from "./types";
 
 type ServerStatus = "checking" | "online" | "offline";
+
+type ThreadActivityStatus =
+  | "processing"
+  | "succeeded"
+  | "failed"
+  | "approval";
+
+type ConversationLoadState = {
+  threadId: string | null;
+  status: "idle" | "loading" | "ready" | "error";
+  error: string | null;
+};
+
+function resolveThreadActivityStatus(
+  turnStatus: TurnStatus | null,
+): ThreadActivityStatus | null {
+  switch (turnStatus?.status) {
+    case "running":
+    case "cancelling":
+      return "processing";
+    case "waiting_approval":
+      return "approval";
+    case "succeeded":
+      return "succeeded";
+    case "failed":
+      return "failed";
+    default:
+      return null;
+  }
+}
+
+async function loadThreadActivityStatuses(
+  client: ApiClient,
+  threadList: Thread[],
+): Promise<Record<string, ThreadActivityStatus>> {
+  const entries = await Promise.all(
+    threadList.map(async (thread) => {
+      try {
+        const turnStatus = await client.getTurnStatus(thread.id);
+        const status = resolveThreadActivityStatus(turnStatus);
+        return status ? ([thread.id, status] as const) : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  return Object.fromEntries(
+    entries.filter(
+      (entry): entry is readonly [string, ThreadActivityStatus] =>
+        entry !== null,
+    ),
+  );
+}
 
 type ToolTabKind = WorkbenchTab | "browser" | "computer" | "preview";
 
@@ -245,6 +328,7 @@ const workspaceLayoutStorageKey = "opentopia.workspace-layout.v1";
 const experienceModeStorageKey = "opentopia.experience-mode.v1";
 const collaborationModeStorageKey = "opentopia.collaboration-mode.v1";
 const workspaceThreePaneBreakpoint = 1120;
+const contextRailInlineMinWidth = 1120;
 const workspaceLeftMin = 200;
 const workspaceLeftMax = 420;
 
@@ -439,7 +523,14 @@ function emptyContextUsage(): ContextStatus["usage"] {
     cacheWriteTokens: 0,
     reasoningTokens: 0,
     compactions: 0,
+    nativeCompactions: 0,
+    providerFallbacks: 0,
     warnings: 0,
+    compactionInputTokens: 0,
+    checkpointTokens: 0,
+    compactionLatencyMs: 0,
+    lastFactRetentionPercent: 0,
+    lastActiveConstraintRetentionPercent: 0,
   };
 }
 
@@ -473,6 +564,13 @@ export function App() {
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
+  const [conversationLoadState, setConversationLoadState] =
+    useState<ConversationLoadState>({
+      threadId: null,
+      status: "idle",
+      error: null,
+    });
+  const [conversationLoadAttempt, setConversationLoadAttempt] = useState(0);
   const [subagentRuns, setSubagentRuns] = useState<SubagentRun[]>([]);
   const [terminalEvents, setTerminalEvents] = useState<TerminalEvent[]>([]);
   const [terminalSession, setTerminalSession] =
@@ -486,6 +584,9 @@ export function App() {
   const [skillsRevision, setSkillsRevision] = useState(0);
   const [isSending, setIsSending] = useState(false);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [threadActivityStatuses, setThreadActivityStatuses] = useState<
+    Record<string, ThreadActivityStatus>
+  >({});
   const [queuedMessageCount, setQueuedMessageCount] = useState(0);
   const [cancellingTurnId, setCancellingTurnId] = useState<string | null>(null);
   const [pendingApprovalIds, setPendingApprovalIds] = useState<string[]>([]);
@@ -563,6 +664,8 @@ export function App() {
   const [toolTabs, setToolTabs] = useState<ToolTab[]>([]);
   const [activeToolTabId, setActiveToolTabId] = useState<string | null>(null);
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
+  const [contextRailOpen, setContextRailOpen] = useState(false);
+  const [contextRailCollapsed, setContextRailCollapsed] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [keyboardShortcutsOpen, setKeyboardShortcutsOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -589,11 +692,48 @@ export function App() {
   const ingestedEventIdsRef = useRef(new Set<string>());
   const pendingEventRenderRef = useRef<AgentEvent[]>([]);
   const eventRenderTimeoutRef = useRef<number | null>(null);
+  const activeThreadIdRef = useRef<string | null>(null);
+
+  activeThreadIdRef.current = activeThreadId;
+
+  const setThreadActivityStatus = useCallback(
+    (threadId: string, status: ThreadActivityStatus | null) => {
+      setThreadActivityStatuses((current) => {
+        if (!status) {
+          if (!(threadId in current)) return current;
+          const next = { ...current };
+          delete next[threadId];
+          return next;
+        }
+        if (current[threadId] === status) return current;
+        return { ...current, [threadId]: status };
+      });
+    },
+    [],
+  );
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
     [threads, activeThreadId],
   );
+  const isConversationReady =
+    activeThreadId !== null &&
+    conversationLoadState.threadId === activeThreadId &&
+    conversationLoadState.status === "ready";
+  const conversationLoadError =
+    activeThreadId !== null &&
+    conversationLoadState.threadId === activeThreadId &&
+    conversationLoadState.status === "error"
+      ? conversationLoadState.error
+      : null;
+  const isConversationLoading =
+    activeThreadId !== null &&
+    !isConversationReady &&
+    conversationLoadError === null;
+  const conversationMessages = isConversationReady ? messages : [];
+  const conversationEvents = isConversationReady ? events : [];
+  const conversationGoalSnapshot = isConversationReady ? goalSnapshot : null;
+  const conversationActiveTurnId = isConversationReady ? activeTurnId : null;
   const draftProject = useMemo(
     () => projects.find((project) => project.id === draftProjectId) ?? null,
     [draftProjectId, projects],
@@ -618,20 +758,20 @@ export function App() {
   );
   const pendingApprovalQueue = useMemo(
     () =>
-      events
+      conversationEvents
         .filter(
           (event): event is AgentEvent & { payload: ApprovalRequest } =>
             event.payload.type === "approval_requested" &&
             pendingApprovalIds.includes(event.payload.approval_id),
         )
         .sort((a, b) => a.seq - b.seq),
-    [events, pendingApprovalIds],
+    [conversationEvents, pendingApprovalIds],
   );
   const activeApproval = pendingApprovalQueue[0]?.payload ?? null;
-  const activeUserInput = pendingUserInput[0] ?? null;
+  const activeUserInput = isConversationReady ? pendingUserInput[0] ?? null : null;
   const composerTaskPlan = useMemo(
-    () => resolveComposerTaskPlan(events, goalSnapshot),
-    [events, goalSnapshot],
+    () => resolveComposerTaskPlan(conversationEvents, conversationGoalSnapshot),
+    [conversationEvents, conversationGoalSnapshot],
   );
 
   useEffect(() => {
@@ -691,12 +831,34 @@ export function App() {
       workspaceWidth,
     ],
   );
+  const contextRailAutoVisible =
+    !activeToolTab &&
+    workspaceWidth - (sidebarCollapsed ? 0 : workspaceLayout.left) >=
+      contextRailInlineMinWidth;
+  const contextRailVisible =
+    contextRailOpen || (contextRailAutoVisible && !contextRailCollapsed);
   const workspaceStyle = {
     "--workspace-left-width": `${
       sidebarCollapsed ? 0 : workspaceLayout.left
     }px`,
     "--workspace-right-width": `${workspaceLayout.right}px`,
   } as CSSProperties;
+
+  useEffect(() => {
+    if (!contextRailVisible) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setContextRailOpen(false);
+      if (contextRailAutoVisible) setContextRailCollapsed(true);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [contextRailAutoVisible, contextRailVisible]);
+
+  useEffect(() => {
+    setContextRailOpen(false);
+    setContextRailCollapsed(false);
+  }, [activeThreadId]);
 
   useEffect(() => {
     const element = workspaceRef.current;
@@ -866,6 +1028,7 @@ export function App() {
 
   const ingestEvent = useCallback(
     (event: AgentEvent) => {
+      if (event.threadId !== activeThreadIdRef.current) return;
       if (ingestedEventIdsRef.current.has(event.id)) return;
       ingestedEventIdsRef.current.add(event.id);
       if (ingestedEventIdsRef.current.size > 4096) {
@@ -877,7 +1040,10 @@ export function App() {
       if (eventRenderTimeoutRef.current === null) {
         eventRenderTimeoutRef.current = window.setTimeout(() => {
           eventRenderTimeoutRef.current = null;
-          const pending = pendingEventRenderRef.current;
+          const pending = pendingEventRenderRef.current.filter(
+            (queuedEvent) =>
+              queuedEvent.threadId === activeThreadIdRef.current,
+          );
           pendingEventRenderRef.current = [];
           if (pending.length === 0) return;
 
@@ -912,6 +1078,7 @@ export function App() {
 
       if (event.payload.type === "approval_requested") {
         const approvalId = event.payload.approval_id;
+        setThreadActivityStatus(event.threadId, "approval");
         setApprovalDecisionError(null);
         setConversationCollapsed(false);
         setPendingApprovalIds((current) =>
@@ -943,20 +1110,43 @@ export function App() {
       }
 
       if (event.payload.type === "error") {
+        setThreadActivityStatus(event.threadId, "failed");
         setActionError(
           `Agent 请求失败：${friendlyProviderError(event.payload.message)}`,
         );
       }
 
       if (event.payload.type === "turn_started" && event.turnId) {
+        setThreadActivityStatus(event.threadId, "processing");
         setActiveTurnId(event.turnId);
         setCancellingTurnId(null);
         setQueuedMessageCount((current) => Math.max(0, current - 1));
+      } else if (event.payload.type === "turn_finished") {
+        setThreadActivityStatus(event.threadId, "succeeded");
+        setActiveTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+        setCancellingTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+      } else if (event.payload.type === "turn_suspended") {
+        setThreadActivityStatus(event.threadId, "approval");
+        setActiveTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+        setCancellingTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+      } else if (event.payload.type === "turn_cancelled") {
+        setThreadActivityStatus(event.threadId, null);
+        setActiveTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+        setCancellingTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
       } else if (
-        event.payload.type === "turn_finished" ||
-        event.payload.type === "turn_suspended" ||
         event.payload.type === "turn_awaiting_input" ||
-        event.payload.type === "turn_cancelled" ||
         event.payload.type === "error"
       ) {
         setActiveTurnId((current) =>
@@ -1001,7 +1191,57 @@ export function App() {
           },
           latestSummary,
           usage: current?.usage ?? emptyContextUsage(),
+          projection: current?.projection,
         }));
+      }
+
+      if (event.payload.type === "context_projection_built") {
+        const projection = event.payload.projection;
+        setContextStatus((current) =>
+          current ? { ...current, projection } : current,
+        );
+      }
+
+      if (event.payload.type === "provider_context_state_updated") {
+        const providerContextState = event.payload;
+        setContextStatus((current) => {
+          if (!current) return current;
+          return {
+            ...current,
+            projection: current.projection
+              ? {
+                  ...current.projection,
+                  providerStateAvailable: true,
+                  providerStateKind: providerContextState.state_kind,
+                  providerItemCount: providerContextState.response_item_count,
+                  nativeCompactionItemCount:
+                    providerContextState.compaction_item_count,
+                }
+              : undefined,
+          };
+        });
+      }
+
+      if (event.payload.type === "provider_context_state_invalidated") {
+        setContextStatus((current) => {
+          if (!current) return current;
+          return {
+            ...current,
+            usage: {
+              ...current.usage,
+              providerFallbacks: current.usage.providerFallbacks + 1,
+            },
+            projection: current.projection
+              ? {
+                  ...current.projection,
+                  providerStateAvailable: false,
+                  providerStateKind: null,
+                  providerItemCount: 0,
+                  nativeCompactionItemCount: 0,
+                }
+              : current.projection,
+          };
+        });
       }
 
       if (event.payload.type === "subagent_updated") {
@@ -1013,7 +1253,7 @@ export function App() {
         );
       }
     },
-    [deliverTaskCompletionNotification],
+    [deliverTaskCompletionNotification, setThreadActivityStatus],
   );
 
   const ingestTerminalEvent = useCallback((event: TerminalEvent) => {
@@ -1107,6 +1347,22 @@ export function App() {
         if (cancelled) return;
         setProjects(sortProjects(loadedProjects));
         setThreads(loadedThreads);
+        void loadThreadActivityStatuses(nextClient, loadedThreads).then(
+          (statuses) => {
+            if (cancelled) return;
+            const loadedThreadIds = new Set(
+              loadedThreads.map((thread) => thread.id),
+            );
+            setThreadActivityStatuses((current) => ({
+              ...statuses,
+              ...Object.fromEntries(
+                Object.entries(current).filter(([threadId]) =>
+                  loadedThreadIds.has(threadId),
+                ),
+              ),
+            }));
+          },
+        );
         setSettings(loadedSettings);
         setProviderHealth(loadedHealth);
         setMcpServers(loadedMcp);
@@ -1209,54 +1465,110 @@ export function App() {
     setActiveTurnId(null);
     setCancellingTurnId(null);
     setGoalSnapshot(null);
-    if (!client || !activeThreadId) return;
+    if (!client || !activeThreadId) {
+      setMessages([]);
+      setEvents([]);
+      setConversationLoadState({
+        threadId: null,
+        status: "idle",
+        error: null,
+      });
+      return;
+    }
+    const threadId = activeThreadId;
     let cancelled = false;
     let source: StreamHandle | null = null;
+    setMessages([]);
+    setEvents([]);
+    setConversationLoadState({ threadId, status: "loading", error: null });
 
-    void (async () => {
-      const [
-        loadedMessages,
-        loadedEvents,
-        turnStatus,
-        pendingApprovals,
-        pendingPlanningInput,
-        loadedSubagents,
-        loadedGoal,
-      ] = await Promise.all([
-        client.listMessages(activeThreadId),
-        client.listEvents(activeThreadId),
-        client.getTurnStatus(activeThreadId),
-        client.listPendingApprovals(activeThreadId),
-        client.listPendingUserInput(activeThreadId),
-        client.listSubagents(activeThreadId),
-        client.getGoal(activeThreadId),
-      ]);
-      if (cancelled) return;
-      setMessages(loadedMessages);
-      setEvents(loadedEvents);
-      setActiveTurnId(
-        turnStatus?.status === "running" || turnStatus?.status === "cancelling"
-          ? turnStatus.turnId
-          : null,
-      );
-      setPendingApprovalIds(
-        pendingApprovals.map((approval) => approval.approvalId),
-      );
-      setPendingUserInput(pendingPlanningInput);
-      setSubagentRuns(loadedSubagents);
-      setGoalSnapshot(loadedGoal);
-      const since = loadedEvents.at(-1)?.seq;
-      source = client.openEventStream(activeThreadId, since, ingestEvent);
-    })().catch((error) => {
-      if (!cancelled)
-        setServerError(error instanceof Error ? error.message : String(error));
-    });
+    const messagesRequest = client.listMessages(threadId);
+    const eventsRequest = client.listEvents(threadId);
+
+    void messagesRequest
+      .then((loadedMessages) => {
+        if (cancelled) return;
+        setMessages(loadedMessages);
+        setConversationLoadState({ threadId, status: "ready", error: null });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setConversationLoadState({
+          threadId,
+          status: "error",
+          error: message,
+        });
+        setServerError(message);
+      });
+
+    void eventsRequest
+      .then((loadedEvents) => {
+        if (cancelled) return;
+        setEvents(loadedEvents);
+        source = client.openEventStream(
+          threadId,
+          loadedEvents.at(-1)?.seq,
+          ingestEvent,
+        );
+      })
+      .catch((error) => {
+        if (!cancelled)
+          setServerError(error instanceof Error ? error.message : String(error));
+      });
+
+    void Promise.all([
+      client.getTurnStatus(threadId),
+      client.listPendingApprovals(threadId),
+      client.listPendingUserInput(threadId),
+      client.listSubagents(threadId),
+      client.getGoal(threadId),
+    ])
+      .then(
+        ([
+          turnStatus,
+          pendingApprovals,
+          pendingPlanningInput,
+          loadedSubagents,
+          loadedGoal,
+        ]) => {
+          if (cancelled) return;
+          setActiveTurnId(
+            turnStatus?.status === "running" ||
+              turnStatus?.status === "cancelling"
+              ? turnStatus.turnId
+              : null,
+          );
+          setThreadActivityStatus(
+            threadId,
+            pendingApprovals.length > 0
+              ? "approval"
+              : resolveThreadActivityStatus(turnStatus),
+          );
+          setPendingApprovalIds(
+            pendingApprovals.map((approval) => approval.approvalId),
+          );
+          setPendingUserInput(pendingPlanningInput);
+          setSubagentRuns(loadedSubagents);
+          setGoalSnapshot(loadedGoal);
+        },
+      )
+      .catch((error) => {
+        if (!cancelled)
+          setServerError(error instanceof Error ? error.message : String(error));
+      });
 
     return () => {
       cancelled = true;
       source?.close();
     };
-  }, [activeThreadId, client, ingestEvent]);
+  }, [
+    activeThreadId,
+    client,
+    conversationLoadAttempt,
+    ingestEvent,
+    setThreadActivityStatus,
+  ]);
 
   useEffect(() => {
     if (!client || !activeThreadId) {
@@ -1357,6 +1669,49 @@ export function App() {
     if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
   }
 
+  useEffect(() => {
+    const nativeApi = window.opentopia;
+    if (!nativeApi || !client) return;
+
+    let cancelled = false;
+    const openThread = async (request: { threadId?: string }) => {
+      if (!request.threadId || cancelled) return;
+      try {
+        const nextThreads = await client.listThreads(true);
+        if (cancelled) return;
+        setThreads(nextThreads);
+        const thread = nextThreads.find(
+          (item) => item.id === request.threadId,
+        );
+        if (!thread) return;
+        setActiveThreadId(thread.id);
+        setExperienceMode(thread.experienceMode);
+        setDraftProjectId(null);
+        setContextSources([]);
+        setSelectedSkillIds([]);
+        setSelectedWorkspaceRoot(thread.workspaceRoot);
+      } catch (error) {
+        console.warn("OpenTopia could not open the requested task", error);
+      }
+    };
+
+    const unsubscribe = nativeApi.onOpenRequest((request) => {
+      void openThread(request);
+    });
+    void nativeApi
+      .getOpenRequests()
+      .then((requests) => {
+        const latest = [...requests].reverse().find((request) => request.threadId);
+        if (latest) void openThread(latest);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [client]);
+
   function prepareNewThread(
     workspaceRoot: string | null,
     projectId: string | null = null,
@@ -1442,7 +1797,7 @@ export function App() {
   async function removeProject(project: Project) {
     if (!client) return;
     const confirmed = window.confirm(
-      `移除项目“${project.name}”？所属任务会归档，可在“已归档”中恢复。`,
+      `归档项目“${project.name}”？项目会从列表移除，所属任务会归档，可在“已归档”中恢复。`,
     );
     if (!confirmed) return;
 
@@ -1464,7 +1819,7 @@ export function App() {
         prepareNewThread(nextProject?.workspaceRoot ?? null, nextProject?.id);
       }
     } catch (error) {
-      setActionError(`移除项目失败：${errorMessage(error)}`);
+      setActionError(`归档项目失败：${errorMessage(error)}`);
     }
   }
 
@@ -1515,10 +1870,21 @@ export function App() {
     setConversationCollapsed(false);
   }
 
-  // Entry point for "review this file": the change card, and anything else that
-  // wants to hand a path to the side review panel, calls this instead of
-  // opening its own viewer.
-  function openFileReview(path: string) {
+  // Text files go to the diff review; binary files go to the format-aware
+  // preview host, which can render spreadsheets, PDFs, and images.
+  function openFileReview(path: string, file?: TurnFileChange) {
+    if (file?.binary) {
+      if (!activeThread) {
+        setActionError("Open a task before opening a file.");
+        return;
+      }
+      openPreviewTab(
+        activeThread.id,
+        { type: "workspace", path },
+        markdownLinkTitle(path),
+      );
+      return;
+    }
     setReviewFileRequest((current) => ({
       path,
       nonce: (current?.nonce ?? 0) + 1,
@@ -1916,12 +2282,14 @@ export function App() {
     });
   }
 
-  async function addContextSources() {
+  async function addContextSources(files?: File[]): Promise<void> {
     setActionError(null);
     try {
-      const result = await selectContextFiles({
-        defaultPath: currentWorkspaceRoot ?? undefined,
-      });
+      const result = files
+        ? await getDroppedContextFiles(files)
+        : await selectContextFiles({
+            defaultPath: currentWorkspaceRoot ?? undefined,
+          });
       if (result.canceled) return;
       setContextSources((current) => {
         const byPath = new Map(
@@ -1997,25 +2365,101 @@ export function App() {
     setFilePreview(await client.readWorkspaceFile(threadId, command.path));
   }
 
-  async function createThread(initialPrompt?: string): Promise<Thread | null> {
-    if (!client) return null;
+  async function prepareImageSubmission(
+    threadId: string,
+    prompt: string,
+    imageAttachments: InlineImageAttachment[],
+    modelSelection: ThreadModelSelection | null,
+  ): Promise<{
+    prompt: string;
+    imageAttachments: InlineImageAttachment[];
+  }> {
+    if (!client || imageAttachments.length === 0) {
+      return { prompt, imageAttachments };
+    }
+
+    const providerId =
+      modelSelection?.connectionId ?? settings?.activeProviderId;
+    const provider = settings?.providers.find((item) => item.id === providerId);
+    if (provider?.supportsVision) {
+      return { prompt, imageAttachments };
+    }
+
+    const threadServers = await client.listThreadMcpServers(threadId);
+    const configuredServers = threadServers.filter((view) => view.server.enabled);
+    const failures: string[] = [];
+
+    for (const view of configuredServers) {
+      let tools: McpToolDescriptor[];
+      try {
+        tools = await client.listMcpTools(view.server.serverId);
+      } catch (error) {
+        failures.push(`${view.server.name}: ${errorMessage(error)}`);
+        continue;
+      }
+      const tool = tools.find(isImageUnderstandingMcpTool);
+      if (!tool) continue;
+
+      try {
+        if (!view.enabled) {
+          await client.setThreadMcpServer(threadId, view.server.serverId, true);
+        }
+        const result = await client.callMcpTool(
+          view.server.serverId,
+          tool.toolName,
+          buildImageUnderstandingArguments(tool, prompt, imageAttachments),
+          threadId,
+        );
+        if (result.isError) {
+          failures.push(
+            `${view.server.name}: ${result.output || "tool returned an error"}`,
+          );
+          continue;
+        }
+        const understanding = extractImageUnderstandingText(result);
+        if (!understanding) {
+          failures.push(`${view.server.name}: tool returned no text`);
+          continue;
+        }
+        return {
+          prompt: appendImageUnderstandingContext(prompt, understanding),
+          imageAttachments: [],
+        };
+      } catch (error) {
+        failures.push(`${view.server.name}: ${errorMessage(error)}`);
+      }
+    }
+
+    const detail = failures.length > 0 ? ` (${failures.join("; ")})` : "";
+    throw new Error(
+      `The selected model does not support image input and no usable image understanding MCP is configured${detail}. Your message and images were kept in the composer.`,
+    );
+  }
+
+  async function createThread(
+    initialPrompt?: string,
+    imageAttachments: InlineImageAttachment[] = [],
+  ): Promise<boolean> {
+    if (!client) return false;
     if (newTaskLaunchMode === "new_worktree") {
       setActionError(
         "“新工作树”启动模式尚未接入线程创建；请选择“在本地处理”后继续。",
       );
-      return null;
+      return false;
     }
     const directCommand = parseDirectToolCommand(initialPrompt ?? "");
     if (!directCommand && isLegacyDirectToolCommand(initialPrompt ?? "")) {
       setActionError("/run and /read require an argument.");
-      return null;
+      return false;
     }
     if (
       directCommand &&
-      (contextSources.length > 0 || selectedSkillIds.length > 0)
+      (contextSources.length > 0 ||
+        imageAttachments.length > 0 ||
+        selectedSkillIds.length > 0)
     ) {
       setActionError("Direct tool commands cannot include agent context.");
-      return null;
+      return false;
     }
     let project =
       activeProject ??
@@ -2028,11 +2472,12 @@ export function App() {
       ) ??
       null;
     if (!project?.workspaceRoot) project = await chooseWorkspace(true);
-    if (!project?.workspaceRoot) return null;
+    if (!project?.workspaceRoot) return false;
 
     setIsSending(
       Boolean(initialPrompt?.trim()) ||
         contextSources.length > 0 ||
+        imageAttachments.length > 0 ||
         selectedSkillIds.length > 0,
     );
     setActionError(null);
@@ -2080,25 +2525,35 @@ export function App() {
       } else if (
         initialPrompt?.trim() ||
         contextSources.length > 0 ||
+        imageAttachments.length > 0 ||
         selectedSkillIds.length > 0
       ) {
-        const { message, turnId } = await client.sendMessage(
+        const prepared = await prepareImageSubmission(
           thread.id,
           initialPrompt?.trim() ?? "",
+          imageAttachments,
+          draftModelSelection,
+        );
+        const { message, turnId } = await client.sendMessage(
+          thread.id,
+          prepared.prompt,
           contextSources.map((source) => source.path),
           selectedSkillIds,
           collaborationMode,
+          undefined,
+          prepared.imageAttachments,
         );
         setMessages([message]);
+        setThreadActivityStatus(thread.id, "processing");
         if (turnId) setActiveTurnId(turnId);
         setComposer("");
         setContextSources([]);
         setSelectedSkillIds([]);
       }
-      return thread;
+      return true;
     } catch (error) {
       setActionError(`创建任务失败：${errorMessage(error)}`);
-      return null;
+      return false;
     } finally {
       setIsSending(false);
     }
@@ -2169,47 +2624,61 @@ export function App() {
     }
   }
 
-  async function submitMessage(input: string) {
+  async function submitMessage(
+    input: string,
+    imageAttachments: InlineImageAttachment[] = [],
+  ): Promise<boolean> {
     const messageText = input.trim();
     if (
       !client ||
       !activeThread ||
       (!messageText &&
         contextSources.length === 0 &&
-        selectedSkillIds.length === 0) ||
+        selectedSkillIds.length === 0 &&
+        imageAttachments.length === 0) ||
       isSending ||
       activeApproval ||
       activeUserInput
     )
-      return;
+      return false;
     const directCommand = parseDirectToolCommand(messageText);
     if (!directCommand && isLegacyDirectToolCommand(messageText)) {
       setActionError("/run and /read require an argument.");
-      return;
+      return false;
     }
     if (
       directCommand &&
-      (contextSources.length > 0 || selectedSkillIds.length > 0)
+      (contextSources.length > 0 ||
+        imageAttachments.length > 0 ||
+        selectedSkillIds.length > 0)
     ) {
       setActionError("Direct tool commands cannot include agent context.");
-      return;
+      return false;
     }
     setIsSending(true);
     try {
       if (directCommand) {
         await runDirectToolCommand(activeThread.id, directCommand);
         setComposer("");
-        return;
+        return true;
       }
-      const { message, turnId, queued } = await client.sendMessage(
+      const prepared = await prepareImageSubmission(
         activeThread.id,
         messageText,
+        imageAttachments,
+        activeThread.modelSelection,
+      );
+      const { message, turnId, queued } = await client.sendMessage(
+        activeThread.id,
+        prepared.prompt,
         contextSources.map((source) => source.path),
         selectedSkillIds,
         collaborationMode,
         reusableGoalId(collaborationMode, goalSnapshot),
+        prepared.imageAttachments,
       );
       setMessages((current) => [...current, message]);
+      setThreadActivityStatus(activeThread.id, "processing");
       if (turnId) setActiveTurnId(turnId);
       if (queued) setQueuedMessageCount((current) => current + 1);
       setComposer("");
@@ -2226,8 +2695,10 @@ export function App() {
       } catch {
         // The persisted event stream will reconcile Turn state after a successful send.
       }
+      return true;
     } catch (error) {
-      setActionError(`Could not send message: ${errorMessage(error)}`);
+      setActionError(errorMessage(error));
+      return false;
     } finally {
       setIsSending(false);
     }
@@ -2433,17 +2904,8 @@ export function App() {
     setIsCompactingContext(true);
     setWorkbenchError(null);
     try {
-      const summary = await client.compactContext(activeThread.id);
-      setContextStatus((current) => ({
-        budget: current?.budget ?? {
-          totalTokens: 128000,
-          usedTokens: 0,
-          messageCount: messages.length,
-          estimatedUsage: 0,
-        },
-        latestSummary: summary,
-        usage: current?.usage ?? emptyContextUsage(),
-      }));
+      await client.compactContext(activeThread.id);
+      setContextStatus(await client.getContextStatus(activeThread.id));
     } catch (error) {
       setWorkbenchError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -3050,8 +3512,10 @@ export function App() {
           style={workspaceStyle}
         >
           <Sidebar
+            client={client}
             projects={projects}
             threads={threads}
+            threadActivityStatuses={threadActivityStatuses}
             activeThreadId={activeThreadId}
             activeProjectId={activeThread?.projectId ?? draftProjectId}
             activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
@@ -3083,7 +3547,6 @@ export function App() {
                 name: thread.title,
               })
             }
-            onArchiveThread={(thread) => void archiveThread(thread)}
             onRestoreThread={(thread) => void restoreThread(thread)}
             onOpenThreadWorkspace={(workspaceRoot) =>
               void openWorkspaceRoot(workspaceRoot)
@@ -3126,11 +3589,21 @@ export function App() {
           >
             <ThreadHeader
               thread={activeThread}
+              contextRailOpen={contextRailVisible}
               onOpenLocation={() =>
                 activeThread &&
                 void openWorkspaceRoot(activeThread.workspaceRoot)
               }
               onOpenTool={openToolTab}
+              onToggleContextRail={() => {
+                if (contextRailAutoVisible) {
+                  setContextRailOpen(false);
+                  setContextRailCollapsed((current) => !current);
+                  return;
+                }
+                setContextRailCollapsed(false);
+                setContextRailOpen((current) => !current);
+              }}
               onRename={() =>
                 activeThread &&
                 setRenameTarget({
@@ -3151,20 +3624,31 @@ export function App() {
               />
             ) : activeThread ? (
               <>
-                {goalSnapshot ? (
+                {conversationGoalSnapshot ? (
                   <GoalStrip
-                    snapshot={goalSnapshot}
-                    isRunning={Boolean(activeTurnId)}
+                    snapshot={conversationGoalSnapshot}
+                    isRunning={Boolean(conversationActiveTurnId)}
                     action={goalAction}
                     onRun={() => void runGoal()}
                     onPause={() => void changeGoalStatus("paused")}
                     onCancel={() => void changeGoalStatus("cancelled")}
                   />
                 ) : null}
+                {conversationLoadError ? (
+                  <ConversationLoadErrorState
+                    error={conversationLoadError}
+                    onRetry={() =>
+                      setConversationLoadAttempt((attempt) => attempt + 1)
+                    }
+                  />
+                ) : isConversationLoading ? (
+                  <ConversationLoadingState />
+                ) : (
                 <MessageList
-                  messages={messages}
-                  events={events}
-                  activeTurnId={activeTurnId}
+                  key={activeThread.id}
+                  messages={conversationMessages}
+                  events={conversationEvents}
+                    activeTurnId={conversationActiveTurnId}
                   undoingTurnId={
                     turnUndoDialog?.loading || turnUndoDialog?.applying
                       ? turnUndoDialog.turnId
@@ -3194,6 +3678,7 @@ export function App() {
                     );
                   }}
                 />
+                )}
                 {activeApproval ? (
                   <ApprovalDialog
                     key={activeApproval.approval_id}
@@ -3229,11 +3714,14 @@ export function App() {
                     value={composer}
                     taskPlan={composerTaskPlan}
                     isSending={isSending}
-                    isRunning={Boolean(activeTurnId)}
+                    isRunning={Boolean(conversationActiveTurnId)}
                     isCancelling={
-                      Boolean(activeTurnId) && cancellingTurnId === activeTurnId
+                      Boolean(conversationActiveTurnId) &&
+                      cancellingTurnId === conversationActiveTurnId
                     }
-                    queuedMessageCount={queuedMessageCount}
+                    queuedMessageCount={
+                      isConversationReady ? queuedMessageCount : 0
+                    }
                     modelSelection={activeThread?.modelSelection ?? null}
                     providers={settings?.providers ?? []}
                     activeProviderId={settings?.activeProviderId ?? ""}
@@ -3248,9 +3736,8 @@ export function App() {
                     workspaceRoot={null}
                     projectName={null}
                     projects={projects}
-                    canOpenThreadTools
                     onChange={setComposer}
-                    onSubmit={(value) => void submitMessage(value)}
+                    onSubmit={submitMessage}
                     onCancel={() => void cancelTurn()}
                     onPickWorkspace={() => void chooseWorkspace()}
                     onSelectProject={selectProject}
@@ -3259,7 +3746,7 @@ export function App() {
                     onChangeSandboxMode={changeSandboxMode}
                     onChangeModelSelection={changeModelSelection}
                     onOpenSettings={() => setSettingsOpen(true)}
-                    onAddContextSources={() => void addContextSources()}
+                    onAddContextSources={addContextSources}
                     onRemoveContextSource={removeContextSource}
                     onToggleSkill={toggleSkill}
                   />
@@ -3292,14 +3779,14 @@ export function App() {
                 onChangeSandboxMode={changeSandboxMode}
                 onChangeModelSelection={changeModelSelection}
                 onOpenSettings={() => setSettingsOpen(true)}
-                onAddContextSources={() => void addContextSources()}
+                onAddContextSources={addContextSources}
                 onRemoveContextSource={removeContextSource}
                 onToggleSkill={toggleSkill}
-                onSubmit={(value) => void createThread(value)}
+                onSubmit={createThread}
               />
             )}
           </section>
-          {!settingsOpen ? (
+          {activeToolTab && !settingsOpen ? (
             <div
               className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
               role="separator"
@@ -3327,15 +3814,17 @@ export function App() {
             toolTabs={toolTabs}
             activeToolTab={activeToolTab}
             conversationCollapsed={conversationCollapsed}
+            contextRailOpen={contextRailVisible}
+            contextRailAutoVisible={contextRailAutoVisible}
             thread={activeThread}
             workspaceRoot={currentWorkspaceRoot}
-            messages={messages}
-            events={events.filter(
+            messages={conversationMessages}
+            events={conversationEvents.filter(
               (event) =>
                 event.payload.type !== "approval_requested" ||
                 pendingApprovalIds.includes(event.payload.approval_id),
             )}
-            subagentRuns={subagentRuns}
+            subagentRuns={isConversationReady ? subagentRuns : []}
             terminalEvents={terminalEvents}
             terminalSession={terminalSession}
             workspaceTree={workspaceTree}
@@ -3404,6 +3893,10 @@ export function App() {
             onToggleConversation={() =>
               setConversationCollapsed((current) => !current)
             }
+            onHideToolStage={() => {
+              setActiveToolTabId(null);
+              setConversationCollapsed(false);
+            }}
             onAddContextSources={() => void addContextSources()}
             onSpawnSubagent={spawnSubagent}
             onCancelSubagent={(runId) => void cancelSubagent(runId)}
@@ -4351,7 +4844,7 @@ function SettingsPanel({
         enabledFamilies: [],
         syncedModels: [],
         modelsSyncedAt: null,
-        temperature: 0.2,
+        temperature: null,
         maxOutputTokens: null,
         contextWindowTokens: null,
         reasoningEffort: null,
@@ -4688,12 +5181,15 @@ function SettingsPanel({
                         min="0"
                         max="2"
                         step="0.1"
-                        value={editingProvider.temperature}
+                        value={editingProvider.temperature ?? ""}
+                        placeholder="默认"
                         onChange={(event) =>
                           updateProvider(
                             editingProvider.id,
                             "temperature",
-                            Number(event.target.value),
+                            event.target.value
+                              ? Number(event.target.value)
+                              : null,
                           )
                         }
                       />
@@ -5115,8 +5611,10 @@ function SettingsPanel({
 }
 
 function Sidebar({
+  client,
   projects,
   threads,
+  threadActivityStatuses,
   activeThreadId,
   activeProjectId,
   activeWorkspaceRemoteUrl,
@@ -5135,13 +5633,14 @@ function Sidebar({
   onOpenThreadWorkspace,
   onNewThreadForProject,
   onRenameThread,
-  onArchiveThread,
   onRestoreThread,
   onOpenExtensions,
   onSettings,
 }: {
+  client: ApiClient | null;
   projects: Project[];
   threads: Thread[];
+  threadActivityStatuses: Record<string, ThreadActivityStatus>;
   activeThreadId: string | null;
   activeProjectId: string | null;
   activeWorkspaceRemoteUrl: string | null;
@@ -5160,7 +5659,6 @@ function Sidebar({
   onOpenThreadWorkspace(workspaceRoot: string): void;
   onNewThreadForProject?(project: Project): void;
   onRenameThread(thread: Thread): void;
-  onArchiveThread(thread: Thread): void;
   onRestoreThread(thread: Thread): void;
   onOpenExtensions(): void;
   onSettings(): void;
@@ -5440,27 +5938,32 @@ function Sidebar({
                         >
                           <button
                             role="menuitem"
+                            disabled={!project.workspaceRoot}
+                            onClick={() => {
+                              if (project.workspaceRoot) {
+                                onOpenThreadWorkspace(project.workspaceRoot);
+                              }
+                              setMoreMenuProjectId(null);
+                            }}
+                          >
+                            <FolderOpen size={14} />
+                            <span>在文件管理器中打开</span>
+                          </button>
+                          <button
+                            role="menuitem"
                             onClick={() => {
                               onRenameProject(project);
                               setMoreMenuProjectId(null);
                             }}
                           >
                             <Pencil size={14} />
-                            <span>重命名项目</span>
+                            <span>重命名</span>
                           </button>
-                          <button
-                            role="menuitem"
-                            onClick={() => {
-                              onToggleProjectPinned(project);
-                              setMoreMenuProjectId(null);
-                            }}
-                          >
-                            <Pin size={14} />
-                            <span>
-                              {project.pinned ? "取消固定" : "固定项目"}
-                            </span>
+                          <button disabled title="Git 工作树管理尚未实现">
+                            <GitFork size={14} />
+                            <span>创建工作树</span>
+                            <small>未实现</small>
                           </button>
-                          <div className="tool-popover-separator" />
                           <button
                             role="menuitem"
                             onClick={() => {
@@ -5468,8 +5971,8 @@ function Sidebar({
                               setMoreMenuProjectId(null);
                             }}
                           >
-                            <X size={14} />
-                            <span>从最近项目移除</span>
+                            <Archive size={14} />
+                            <span>归档</span>
                           </button>
                         </div>
                       )}
@@ -5491,14 +5994,15 @@ function Sidebar({
                     {projectThreads.map((thread) => (
                       <SidebarThreadRow
                         active={thread.id === activeThreadId}
+                        activityStatus={threadActivityStatuses[thread.id]}
+                        client={client}
                         key={thread.id}
+                        project={project}
                         thread={thread}
                         onSelect={() => onSelect(thread.id)}
-                        onOpenWorkspace={() =>
-                          onOpenThreadWorkspace(thread.workspaceRoot)
-                        }
                         onRename={() => onRenameThread(thread)}
-                        onArchive={() => onArchiveThread(thread)}
+                        onRemoveProject={onRemoveProject}
+                        onToggleProjectPinned={onToggleProjectPinned}
                       />
                     ))}
                     {projectThreads.length === 0 && (
@@ -5530,14 +6034,15 @@ function Sidebar({
                   {unassignedThreads.map((thread) => (
                     <SidebarThreadRow
                       active={thread.id === activeThreadId}
+                      activityStatus={threadActivityStatuses[thread.id]}
+                      client={client}
                       key={thread.id}
+                      project={null}
                       thread={thread}
                       onSelect={() => onSelect(thread.id)}
-                      onOpenWorkspace={() =>
-                        onOpenThreadWorkspace(thread.workspaceRoot)
-                      }
                       onRename={() => onRenameThread(thread)}
-                      onArchive={() => onArchiveThread(thread)}
+                      onRemoveProject={onRemoveProject}
+                      onToggleProjectPinned={onToggleProjectPinned}
                     />
                   ))}
                 </div>
@@ -5562,14 +6067,19 @@ function Sidebar({
                     <SidebarThreadRow
                       archived
                       active={false}
+                      activityStatus={threadActivityStatuses[thread.id]}
+                      client={client}
                       key={thread.id}
+                      project={
+                        projects.find(
+                          (project) => project.id === thread.projectId,
+                        ) ?? null
+                      }
                       thread={thread}
                       onSelect={() => onRestoreThread(thread)}
-                      onOpenWorkspace={() =>
-                        onOpenThreadWorkspace(thread.workspaceRoot)
-                      }
                       onRename={() => onRenameThread(thread)}
-                      onArchive={() => undefined}
+                      onRemoveProject={onRemoveProject}
+                      onToggleProjectPinned={onToggleProjectPinned}
                       onRestore={() => onRestoreThread(thread)}
                     />
                   ))}
@@ -5711,33 +6221,83 @@ function Sidebar({
   );
 }
 
+function ThreadStatusIndicator({
+  status,
+}: {
+  status?: ThreadActivityStatus;
+}) {
+  if (!status) {
+    return <span className="thread-row-status" aria-hidden="true" />;
+  }
+
+  const label =
+    status === "processing"
+      ? "处理中"
+      : status === "succeeded"
+        ? "已完成"
+        : status === "failed"
+          ? "失败"
+          : "需要审批";
+
+  return (
+    <span
+      className={`thread-row-status is-${status}`}
+      role="img"
+      aria-label={label}
+      title={label}
+    >
+      {status === "processing" ? (
+        <Loader2 size={14} className="spin" aria-hidden="true" />
+      ) : status === "failed" ? (
+        <CircleAlert size={14} aria-hidden="true" />
+      ) : (
+        <Circle size={9} fill="currentColor" aria-hidden="true" />
+      )}
+    </span>
+  );
+}
+
 function SidebarThreadRow({
+  client,
   thread,
+  project,
   active,
+  activityStatus,
   archived = false,
   onSelect,
-  onOpenWorkspace,
   onRename,
-  onArchive,
+  onRemoveProject,
+  onToggleProjectPinned,
   onRestore,
 }: {
+  client: ApiClient | null;
   thread: Thread;
+  project: Project | null;
   active: boolean;
+  activityStatus?: ThreadActivityStatus;
   archived?: boolean;
   onSelect(): void;
-  onOpenWorkspace(): void;
   onRename(): void;
-  onArchive(): void;
+  onRemoveProject(project: Project): void;
+  onToggleProjectPinned(project: Project): void;
   onRestore?(): void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [hoverCardPosition, setHoverCardPosition] = useState<{
+    left: number;
+    top: number;
+  } | null>(null);
+  const [gitBranch, setGitBranch] = useState<string | null>(null);
+  const [isGitBranchLoading, setIsGitBranchLoading] = useState(false);
   const [titleOverflow, setTitleOverflow] = useState({
     distance: 0,
     durationMs: 0,
   });
   const titleViewportRef = useRef<HTMLSpanElement>(null);
   const titleTextRef = useRef<HTMLSpanElement>(null);
+  const branchRequestIdRef = useRef(0);
   const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
+  const hoverCardId = `thread-hover-card-${thread.id}`;
 
   useEffect(() => {
     const viewport = titleViewportRef.current;
@@ -5775,13 +6335,66 @@ function SidebarThreadRow({
         } as CSSProperties)
       : undefined;
 
+  function showHoverCard(target: HTMLButtonElement) {
+    const bounds = target.getBoundingClientRect();
+    const cardWidth = 320;
+    const viewportMargin = 8;
+    const cardHeight = 128;
+    const left = Math.min(
+      bounds.right + viewportMargin,
+      window.innerWidth - cardWidth - viewportMargin,
+    );
+    setHoverCardPosition({
+      left: Math.max(viewportMargin, left),
+      top: Math.max(
+        viewportMargin,
+        Math.min(
+          bounds.top,
+          window.innerHeight - cardHeight - viewportMargin,
+        ),
+      ),
+    });
+
+    if (!client) {
+      setGitBranch(null);
+      setIsGitBranchLoading(false);
+      return;
+    }
+    const requestId = branchRequestIdRef.current + 1;
+    branchRequestIdRef.current = requestId;
+    setGitBranch(null);
+    setIsGitBranchLoading(true);
+    void client
+      .getGitStatus(thread.id)
+      .then((status) => {
+        if (branchRequestIdRef.current === requestId) {
+          setGitBranch(status.branch);
+          setIsGitBranchLoading(false);
+        }
+      })
+      .catch(() => {
+        if (branchRequestIdRef.current === requestId) {
+          setGitBranch(null);
+          setIsGitBranchLoading(false);
+        }
+      });
+  }
+
+  function hideHoverCard() {
+    setHoverCardPosition(null);
+  }
+
   return (
     <div className={`thread-row-wrap ${menuOpen ? "menu-open" : ""}`}>
       <button
         className={`thread-row ${active ? "active" : ""}`}
         onClick={onSelect}
-        title={thread.title}
         aria-label={thread.title}
+        aria-describedby={hoverCardPosition ? hoverCardId : undefined}
+        onMouseEnter={(event) => showHoverCard(event.currentTarget)}
+        onMouseLeave={hideHoverCard}
+        onFocus={(event) => showHoverCard(event.currentTarget)}
+        onBlur={hideHoverCard}
       >
         <span
           className={`thread-title-viewport ${titleOverflow.distance > 0 ? "is-overflowing" : ""}`}
@@ -5796,6 +6409,36 @@ function SidebarThreadRow({
           </span>
         </span>
       </button>
+      {hoverCardPosition &&
+        createPortal(
+          <div
+            className="thread-hover-card"
+            id={hoverCardId}
+            role="tooltip"
+            style={hoverCardPosition}
+          >
+            <header>
+              <strong>{thread.title}</strong>
+              <time dateTime={thread.updatedAt}>
+                {formatRelativeThreadTime(thread.updatedAt)}
+              </time>
+            </header>
+            <div className="thread-hover-card__row">
+              <Folder size={16} aria-hidden="true" />
+              <span>{project?.name ?? workspaceName(thread.workspaceRoot)}</span>
+            </div>
+            <div className="thread-hover-card__row">
+              <GitBranch size={16} aria-hidden="true" />
+              <span>
+                {isGitBranchLoading
+                  ? "正在读取 Git 分支"
+                  : (gitBranch ?? "未检测到 Git 分支")}
+              </span>
+            </div>
+          </div>,
+          document.body,
+        )}
+      <ThreadStatusIndicator status={activityStatus} />
       <div className="thread-row-menu-wrap" ref={menuRef}>
         <button
           className="thread-row-more"
@@ -5811,16 +6454,6 @@ function SidebarThreadRow({
             <button
               role="menuitem"
               onClick={() => {
-                onOpenWorkspace();
-                setMenuOpen(false);
-              }}
-            >
-              <FolderOpen size={14} />
-              <span>在文件管理器中打开</span>
-            </button>
-            <button
-              role="menuitem"
-              onClick={() => {
                 onRename();
                 setMenuOpen(false);
               }}
@@ -5828,32 +6461,58 @@ function SidebarThreadRow({
               <Pencil size={14} />
               <span>重命名</span>
             </button>
-            <button disabled title="Git 工作树管理尚未实现">
-              <GitFork size={14} />
-              <span>创建工作树</span>
-              <small>未实现</small>
-            </button>
-            {archived ? (
+            {project ? (
+              <>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onToggleProjectPinned(project);
+                    setMenuOpen(false);
+                  }}
+                >
+                  <Pin size={14} />
+                  <span>
+                    {project.pinned ? "取消固定项目" : "固定项目"}
+                  </span>
+                </button>
+                <div className="tool-popover-separator" />
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onRemoveProject(project);
+                    setMenuOpen(false);
+                  }}
+                >
+                  <X size={14} />
+                  <span>从最近项目移除</span>
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  disabled
+                  title="此对话尚未归属到项目"
+                >
+                  <Pin size={14} />
+                  <span>固定项目</span>
+                </button>
+                <div className="tool-popover-separator" />
+                <button disabled title="此对话尚未归属到项目">
+                  <X size={14} />
+                  <span>从最近项目移除</span>
+                </button>
+              </>
+            )}
+            {archived && onRestore && (
               <button
                 role="menuitem"
                 onClick={() => {
-                  onRestore?.();
+                  onRestore();
                   setMenuOpen(false);
                 }}
               >
                 <RotateCcw size={14} />
                 <span>恢复到项目</span>
-              </button>
-            ) : (
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onArchive();
-                  setMenuOpen(false);
-                }}
-              >
-                <Archive size={14} />
-                <span>归档</span>
               </button>
             )}
           </div>
@@ -5865,14 +6524,18 @@ function SidebarThreadRow({
 
 function ThreadHeader({
   thread,
+  contextRailOpen,
   onOpenLocation,
   onOpenTool,
+  onToggleContextRail,
   onRename,
   onArchive,
 }: {
   thread: Thread | null;
+  contextRailOpen: boolean;
   onOpenLocation(): void;
   onOpenTool(kind: ToolTabKind): void;
+  onToggleContextRail(): void;
   onRename(): void;
   onArchive(): void;
 }) {
@@ -6006,6 +6669,23 @@ function ThreadHeader({
             </div>
           )}
         </div>
+        <IconButton
+          className={`context-rail-toggle ${contextRailOpen ? "is-active" : ""}`}
+          size="compact"
+          variant="quiet"
+          aria-label={contextRailOpen ? "折叠右侧窗口" : "展开右侧窗口"}
+          aria-controls="workspace-context-rail"
+          aria-expanded={contextRailOpen}
+          disabled={!thread}
+          title={contextRailOpen ? "折叠右侧窗口" : "展开右侧窗口"}
+          onClick={onToggleContextRail}
+        >
+          {contextRailOpen ? (
+            <PanelRightClose size={15} aria-hidden="true" />
+          ) : (
+            <PanelRightOpen size={15} aria-hidden="true" />
+          )}
+        </IconButton>
       </div>
     </div>
   );
@@ -6177,6 +6857,48 @@ function goalStatusLabel(status: GoalStatus): string {
   return labels[status];
 }
 
+const initialRenderedMessageCount = 12;
+const messageRenderBatchSize = 12;
+const conversationScrollBottomThreshold = 24;
+
+function ConversationLoadingState() {
+  return (
+    <section
+      className="conversation-loading"
+      role="status"
+      aria-label="正在加载"
+      aria-live="polite"
+    >
+      <div className="conversation-loading__content">
+        <span className="conversation-loading__wordmark" aria-hidden="true">
+          <span className="conversation-loading__brand-open">Open</span>
+          <span>Topia</span>
+        </span>
+      </div>
+    </section>
+  );
+}
+
+function ConversationLoadErrorState({
+  error,
+  onRetry,
+}: {
+  error: string;
+  onRetry(): void;
+}) {
+  return (
+    <section className="conversation-load-error" role="alert">
+      <div className="conversation-load-error__content">
+        <strong>无法加载会话内容</strong>
+        <p>{error}</p>
+        <Button variant="secondary" size="compact" onClick={onRetry}>
+          重试
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 function MessageList({
   messages,
   events,
@@ -6201,60 +6923,144 @@ function MessageList({
   onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
   onUndoTurn(turnId: string): void;
   onReviewChanges(): void;
-  onOpenFileReview(path: string): void;
+  onOpenFileReview(path: string, file: TurnFileChange): void;
   onLoadTurnFilePreview(
     turnId: string,
     path: string,
     offset?: number,
   ): Promise<TurnFileDiffPreview>;
 }) {
-  const visibleMessages = messages.filter(
-    (message) => message.role === "user" || message.role === "assistant",
+  const visibleMessages = useMemo(
+    () =>
+      messages.filter(
+        (message) => message.role === "user" || message.role === "assistant",
+      ),
+    [messages],
   );
-  const eventsByTurn = new Map<string, AgentEvent[]>();
-  const turnIdsByUserMessage = new Map<string, string[]>();
-  const turnIdsByAssistantMessage = new Map<string, string[]>();
-  const changeSetsByTurn = new Map<string, TurnChangeSet>();
-  const revertedTurnIds = new Set<string>();
-  for (const event of events) {
-    if (event.turnId) {
-      const current = eventsByTurn.get(event.turnId) ?? [];
-      current.push(event);
-      eventsByTurn.set(event.turnId, current);
-    }
-    if (event.turnId && event.payload.type === "turn_started") {
-      const turnIds =
-        turnIdsByUserMessage.get(event.payload.user_message_id) ?? [];
-      if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
-      turnIdsByUserMessage.set(event.payload.user_message_id, turnIds);
-    }
-    if (event.turnId && event.payload.type === "assistant_message") {
-      const turnIds =
-        turnIdsByAssistantMessage.get(event.payload.message.id) ?? [];
-      if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
-      turnIdsByAssistantMessage.set(event.payload.message.id, turnIds);
-    }
-    if (event.turnId && event.payload.type === "turn_changes_recorded") {
-      changeSetsByTurn.set(event.turnId, event.payload.change_set);
-      if (event.payload.change_set.revertedAt) {
-        revertedTurnIds.add(event.turnId);
+  const [renderedMessageCount, setRenderedMessageCount] = useState(
+    initialRenderedMessageCount,
+  );
+  const messageListRef = useRef<HTMLDivElement>(null);
+  const previousScrollHeightRef = useRef<number | null>(null);
+  const [showScrollToEnd, setShowScrollToEnd] = useState(false);
+  const renderedMessages = visibleMessages.slice(-renderedMessageCount);
+  const hasPendingMessages = renderedMessages.length < visibleMessages.length;
+  const {
+    eventsByTurn,
+    turnIdsByUserMessage,
+    turnIdsByAssistantMessage,
+    changeSetsByTurn,
+    revertedTurnIds,
+    orphanTurnErrors,
+    turnsWithAssistantCards,
+  } = useMemo(() => {
+    const eventsByTurn = new Map<string, AgentEvent[]>();
+    const turnIdsByUserMessage = new Map<string, string[]>();
+    const turnIdsByAssistantMessage = new Map<string, string[]>();
+    const changeSetsByTurn = new Map<string, TurnChangeSet>();
+    const revertedTurnIds = new Set<string>();
+    for (const event of events) {
+      if (event.turnId) {
+        const current = eventsByTurn.get(event.turnId) ?? [];
+        current.push(event);
+        eventsByTurn.set(event.turnId, current);
+      }
+      if (event.turnId && event.payload.type === "turn_started") {
+        const turnIds =
+          turnIdsByUserMessage.get(event.payload.user_message_id) ?? [];
+        if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
+        turnIdsByUserMessage.set(event.payload.user_message_id, turnIds);
+      }
+      if (event.turnId && event.payload.type === "assistant_message") {
+        const turnIds =
+          turnIdsByAssistantMessage.get(event.payload.message.id) ?? [];
+        if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
+        turnIdsByAssistantMessage.set(event.payload.message.id, turnIds);
+      }
+      if (event.turnId && event.payload.type === "turn_changes_recorded") {
+        changeSetsByTurn.set(event.turnId, event.payload.change_set);
+        if (event.payload.change_set.revertedAt) {
+          revertedTurnIds.add(event.turnId);
+        }
+      }
+      if (event.payload.type === "turn_undo_completed") {
+        revertedTurnIds.add(event.payload.target_turn_id);
       }
     }
-    if (event.payload.type === "turn_undo_completed") {
-      revertedTurnIds.add(event.payload.target_turn_id);
-    }
-  }
-  const anchoredTurnIds = new Set(
-    [...turnIdsByUserMessage.values()].flatMap((turnIds) => turnIds),
-  );
-  const orphanTurnErrors = events.filter(
-    (event) =>
-      event.payload.type === "error" &&
-      (!event.turnId || !anchoredTurnIds.has(event.turnId)),
-  );
-  const turnsWithAssistantCards = new Set(
-    [...turnIdsByAssistantMessage.values()].flatMap((turnIds) => turnIds),
-  );
+    const anchoredTurnIds = new Set(
+      [...turnIdsByUserMessage.values()].flatMap((turnIds) => turnIds),
+    );
+    const orphanTurnErrors = events.filter(
+      (event) =>
+        event.payload.type === "error" &&
+        (!event.turnId || !anchoredTurnIds.has(event.turnId)),
+    );
+    const turnsWithAssistantCards = new Set(
+      [...turnIdsByAssistantMessage.values()].flatMap((turnIds) => turnIds),
+    );
+    return {
+      eventsByTurn,
+      turnIdsByUserMessage,
+      turnIdsByAssistantMessage,
+      changeSetsByTurn,
+      revertedTurnIds,
+      orphanTurnErrors,
+      turnsWithAssistantCards,
+    };
+  }, [events]);
+
+  useEffect(() => {
+    if (!hasPendingMessages) return;
+    const frame = window.requestAnimationFrame(() => {
+      previousScrollHeightRef.current = messageListRef.current?.scrollHeight ?? null;
+      setRenderedMessageCount((current) =>
+        Math.min(current + messageRenderBatchSize, visibleMessages.length),
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [hasPendingMessages, visibleMessages.length]);
+
+  useLayoutEffect(() => {
+    const previousScrollHeight = previousScrollHeightRef.current;
+    const list = messageListRef.current;
+    if (previousScrollHeight === null || !list) return;
+    list.scrollTop += list.scrollHeight - previousScrollHeight;
+    previousScrollHeightRef.current = null;
+  }, [renderedMessageCount]);
+
+  const updateScrollToEndVisibility = useCallback(() => {
+    const list = messageListRef.current;
+    if (!list) return;
+    const distanceFromBottom =
+      list.scrollHeight - list.clientHeight - list.scrollTop;
+    const shouldShow = distanceFromBottom > conversationScrollBottomThreshold;
+    setShowScrollToEnd(shouldShow);
+  }, []);
+
+  useEffect(() => {
+    const list = messageListRef.current;
+    if (!list) return;
+    list.addEventListener("scroll", updateScrollToEndVisibility, {
+      passive: true,
+    });
+    window.addEventListener("resize", updateScrollToEndVisibility);
+    updateScrollToEndVisibility();
+    return () => {
+      list.removeEventListener("scroll", updateScrollToEndVisibility);
+      window.removeEventListener("resize", updateScrollToEndVisibility);
+    };
+  }, [updateScrollToEndVisibility]);
+
+  useLayoutEffect(() => {
+    updateScrollToEndVisibility();
+  }, [events, messages, renderedMessageCount, updateScrollToEndVisibility]);
+
+  const scrollToEnd = useCallback(() => {
+    const list = messageListRef.current;
+    if (!list) return;
+    list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
+  }, []);
+
   const renderTurnChangeCard = (turnId: string) => {
     const changeSet = changeSetsByTurn.get(turnId);
     if (!changeSet) return null;
@@ -6275,7 +7081,13 @@ function MessageList({
     );
   };
   return (
-    <div className="message-list" onCopy={trimCopiedSelection}>
+    <div className="conversation-scroll-shell">
+      <div
+        className="message-list"
+        ref={messageListRef}
+        aria-busy={hasPendingMessages}
+        onCopy={trimCopiedSelection}
+      >
       {visibleMessages.length === 0 ? (
         <div className="empty-thread">
           <Bot size={42} />
@@ -6283,7 +7095,7 @@ function MessageList({
           <p>当前任务尚未产生消息。</p>
         </div>
       ) : (
-        visibleMessages.map((message) => {
+        renderedMessages.map((message) => {
           const turnIds =
             message.role === "user"
               ? (turnIdsByUserMessage.get(message.id) ?? [])
@@ -6333,6 +7145,18 @@ function MessageList({
           </div>
         </article>
       ))}
+      </div>
+      {showScrollToEnd ? (
+        <IconButton
+          className="conversation-scroll-to-end"
+          variant="secondary"
+          aria-label="滚动到对话末尾"
+          title="滚动到对话末尾"
+          onClick={scrollToEnd}
+        >
+          <ArrowDown size={18} aria-hidden="true" />
+        </IconButton>
+      ) : null}
     </div>
   );
 }
@@ -6353,7 +7177,7 @@ function trimCopiedSelection(event: ReactClipboardEvent<HTMLDivElement>) {
   event.preventDefault();
 }
 
-function MessageBubble({
+const MessageBubble = memo(function MessageBubble({
   message,
   threadId,
   artifacts,
@@ -6391,7 +7215,7 @@ function MessageBubble({
       </div>
     </article>
   );
-}
+});
 
 function MessagePartView({
   part,
@@ -6408,6 +7232,9 @@ function MessagePartView({
   onOpenArtifact(artifactId: string): void;
   onOpenMarkdownLink(href: string): void;
 }) {
+  if (part.type === "image") {
+    return <InlineImageMessagePart part={part} />;
+  }
   if (part.type === "text") {
     const refs = artifactReferencesFromText(part.text);
     return (
@@ -6441,7 +7268,7 @@ function MessagePartView({
         title={part.source.path}
         onClick={() => void openPath(part.source.path)}
       >
-        <Paperclip size={12} />
+        <ContextSourceIcon extension={fileExtension(part.source.name)} />
         <span>{part.source.name}</span>
         <small>{formatBytes(part.source.bytes)}</small>
       </button>
@@ -6462,6 +7289,28 @@ function MessagePartView({
     );
   }
   return null;
+}
+
+function InlineImageMessagePart({
+  part,
+}: {
+  part: Extract<MessagePart, { type: "image" }>;
+}) {
+  const previewUrl = useMemo(
+    () =>
+      URL.createObjectURL(
+        new Blob([new Uint8Array(part.data)], { type: part.contentType }),
+      ),
+    [part.contentType, part.data],
+  );
+
+  useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
+
+  return (
+    <div className="message-inline-image">
+      <img src={previewUrl} alt={part.name || "已发送图片"} />
+    </div>
+  );
 }
 
 function MessageArtifactLinks({
@@ -6604,6 +7453,100 @@ function ComposerPlanStepIcon({
   return <Circle size={11} />;
 }
 
+const MAX_COMPOSER_IMAGES = 10;
+const MAX_COMPOSER_IMAGE_BYTES = 25 * 1024 * 1024;
+
+type ComposerImageAttachment = InlineImageAttachment & {
+  id: string;
+  previewUrl: string;
+};
+
+function fileExtension(name: string): string {
+  const baseName = name.split(/[\\/]/).pop() ?? name;
+  const dotIndex = baseName.lastIndexOf(".");
+  return dotIndex > 0 ? baseName.slice(dotIndex + 1) : "";
+}
+
+function ContextSourceIcon({ extension }: { extension: string }) {
+  const value = extension.replace(/^\./, "").toLocaleLowerCase();
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(value)) {
+    return <FileImage size={12} aria-hidden="true" />;
+  }
+  if (["csv", "tsv", "xls", "xlsx", "xlsm", "xlsb", "ods"].includes(value)) {
+    return <Table2 size={12} aria-hidden="true" />;
+  }
+  if (["ppt", "pptx", "pps", "ppsx", "pot", "potx", "odp"].includes(value)) {
+    return <Presentation size={12} aria-hidden="true" />;
+  }
+  if (["json", "jsonc", "jsonl"].includes(value)) {
+    return <FileJson size={12} aria-hidden="true" />;
+  }
+  if (
+    [
+      "rs",
+      "ts",
+      "tsx",
+      "js",
+      "jsx",
+      "mjs",
+      "cjs",
+      "c",
+      "h",
+      "cc",
+      "cpp",
+      "hpp",
+      "py",
+      "go",
+      "java",
+      "kt",
+      "swift",
+      "rb",
+      "php",
+      "sh",
+      "ps1",
+      "bat",
+      "cmd",
+      "sql",
+      "graphql",
+      "gql",
+      "proto",
+      "diff",
+      "patch",
+      "xml",
+      "html",
+      "htm",
+      "css",
+      "scss",
+      "less",
+      "yaml",
+      "yml",
+      "toml",
+    ].includes(value)
+  ) {
+    return <FileCode2 size={12} aria-hidden="true" />;
+  }
+  if (
+    [
+      "pdf",
+      "doc",
+      "docx",
+      "odt",
+      "rtf",
+      "md",
+      "mdx",
+      "txt",
+      "log",
+      "ini",
+      "conf",
+      "config",
+      "properties",
+    ].includes(value)
+  ) {
+    return <FileText size={12} aria-hidden="true" />;
+  }
+  return <File size={12} aria-hidden="true" />;
+}
+
 function Composer({
   value,
   taskPlan,
@@ -6624,7 +7567,6 @@ function Composer({
   projectName,
   projects,
   launchMode,
-  canOpenThreadTools = false,
   onChange,
   onSubmit,
   onCancel,
@@ -6659,9 +7601,11 @@ function Composer({
   projectName: string | null;
   projects: Project[];
   launchMode?: NewTaskLaunchMode;
-  canOpenThreadTools?: boolean;
   onChange(value: string): void;
-  onSubmit(value: string): void;
+  onSubmit(
+    value: string,
+    imageAttachments: InlineImageAttachment[],
+  ): Promise<boolean>;
   onCancel(): void;
   onPickWorkspace(): void;
   onSelectProject(projectId: string): void;
@@ -6671,64 +7615,152 @@ function Composer({
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onChangeModelSelection(selection: ThreadModelSelection): void;
   onOpenSettings(): void;
-  onAddContextSources(): void;
+  onAddContextSources(files?: File[]): Promise<void>;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
 }) {
   const [openMenu, setOpenMenu] = useState<
     "actions" | "permission" | "model" | "workspace" | "environment" | null
   >(null);
-  const [activeToolTooltip, setActiveToolTooltip] = useState<{
-    id: string;
-    description: string;
-    left: number;
-    top: number;
-  } | null>(null);
   const closeMenus = () => {
     setOpenMenu(null);
-    setActiveToolTooltip(null);
   };
   const popoverRef = useDismissiblePopover(Boolean(openMenu), closeMenus);
   const [draft, setDraft] = useState(value);
+  const [imageAttachments, setImageAttachments] = useState<
+    ComposerImageAttachment[]
+  >([]);
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const dragDepthRef = useRef(0);
+  const imageAttachmentsRef = useRef(imageAttachments);
+
+  useEffect(() => {
+    imageAttachmentsRef.current = imageAttachments;
+  }, [imageAttachments]);
+
+  useEffect(
+    () => () => {
+      imageAttachmentsRef.current.forEach((attachment) =>
+        URL.revokeObjectURL(attachment.previewUrl),
+      );
+    },
+    [],
+  );
 
   useEffect(() => {
     setDraft(value);
   }, [value]);
 
-  const submitDraft = () => {
+  const submitDraft = async () => {
     if (isSending) return;
     const submittedValue = draft;
+    const submittedAttachments = imageAttachments.map(
+      ({ id: _id, previewUrl: _previewUrl, ...attachment }) => attachment,
+    );
+    const accepted = await onSubmit(submittedValue, submittedAttachments);
+    if (!accepted) return;
+    imageAttachments.forEach((attachment) =>
+      URL.revokeObjectURL(attachment.previewUrl),
+    );
+    setImageAttachments([]);
+    setPreviewIndex(null);
     setDraft("");
     onChange("");
-    onSubmit(submittedValue);
   };
 
-  const showToolTooltip = (
-    skill: SkillDescriptor,
-    target: HTMLButtonElement,
-  ) => {
-    if (!skill.description) return;
+  async function handlePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    const items = Array.from(event.clipboardData.items).filter(
+      (item) => item.kind === "file" && item.type.startsWith("image/"),
+    );
+    if (items.length === 0) return;
 
-    const anchor = target.getBoundingClientRect();
-    const width = Math.min(300, window.innerWidth - 24);
-    const height = Math.min(180, window.innerHeight - 24);
-    setActiveToolTooltip({
-      id: `composer-tool-tooltip-${skill.id}`,
-      description: skill.description,
-      left: Math.max(
-        12,
-        Math.min(anchor.right + 8, window.innerWidth - width - 12),
-      ),
-      top: Math.max(12, Math.min(anchor.top, window.innerHeight - height - 12)),
+    event.preventDefault();
+    const remaining = Math.max(
+      0,
+      MAX_COMPOSER_IMAGES - imageAttachments.length,
+    );
+    const next: ComposerImageAttachment[] = [];
+    for (const item of items.slice(0, remaining)) {
+      const file = item.getAsFile();
+      if (!file || file.size > MAX_COMPOSER_IMAGE_BYTES) continue;
+      const data = Array.from(new Uint8Array(await file.arrayBuffer()));
+      next.push({
+        id: `pasted-image-${Date.now()}-${next.length}`,
+        name: file.name || `pasted-image-${next.length + 1}.png`,
+        contentType: file.type || "image/png",
+        data,
+        previewUrl: URL.createObjectURL(file),
+      });
+    }
+    if (next.length > 0) {
+      setImageAttachments((current) => [...current, ...next]);
+    }
+  }
+
+  function removeImageAttachment(id: string) {
+    setImageAttachments((current) => {
+      const removedIndex = current.findIndex((attachment) => attachment.id === id);
+      const removed = removedIndex >= 0 ? current[removedIndex] : undefined;
+      if (removed) URL.revokeObjectURL(removed.previewUrl);
+      const next = current.filter((attachment) => attachment.id !== id);
+      if (previewIndex !== null) {
+        if (next.length === 0) {
+          setPreviewIndex(null);
+        } else if (removedIndex < previewIndex) {
+          setPreviewIndex(previewIndex - 1);
+        } else if (previewIndex >= next.length) {
+          setPreviewIndex(next.length - 1);
+        }
+      }
+      return next;
     });
-  };
+  }
+
+  function handleDragEnter(event: ReactDragEvent<HTMLDivElement>) {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setIsDraggingFiles(true);
+  }
+
+  function handleDragOver(event: ReactDragEvent<HTMLDivElement>) {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleDragLeave() {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+  }
+
+  function handleDrop(event: ReactDragEvent<HTMLDivElement>) {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length > 0) void onAddContextSources(files);
+  }
+
+  const hasSendableContent = Boolean(
+    draft.trim() ||
+      imageAttachments.length > 0 ||
+      contextSources.length > 0 ||
+      selectedSkillIds.length > 0,
+  );
 
   return (
     <div className="composer-shell">
       {taskPlan ? <ComposerTaskPlan plan={taskPlan} /> : null}
       <div
-        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""}`}
+        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || imageAttachments.length || selectedSkillIds.length ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
         ref={popoverRef}
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
       >
         {(workspaceRoot || projectName) && (
           <div className="composer-context">
@@ -6930,15 +7962,40 @@ function Composer({
             </button>
           </div>
         )}
-        {(contextSources.length > 0 || selectedSkillIds.length > 0) && (
+        {(contextSources.length > 0 ||
+          imageAttachments.length > 0 ||
+          selectedSkillIds.length > 0) && (
           <div className="composer-sources" aria-label="已添加来源">
+            {imageAttachments.map((attachment, index) => (
+              <span className="composer-image-attachment" key={attachment.id}>
+                <button
+                  className="composer-image-preview-button"
+                  type="button"
+                  title={`预览 ${attachment.name}`}
+                  aria-label={`预览 ${attachment.name}`}
+                  onClick={() => setPreviewIndex(index)}
+                >
+                  <img src={attachment.previewUrl} alt={attachment.name} />
+                </button>
+                <IconButton
+                  className="composer-image-remove"
+                  size="compact"
+                  type="button"
+                  aria-label={`移除 ${attachment.name}`}
+                  title={`移除 ${attachment.name}`}
+                  onClick={() => removeImageAttachment(attachment.id)}
+                >
+                  <X size={14} aria-hidden="true" />
+                </IconButton>
+              </span>
+            ))}
             {contextSources.map((source) => (
               <span
                 className="composer-source"
                 key={source.path}
                 title={source.path}
               >
-                <Paperclip size={12} />
+                <ContextSourceIcon extension={source.extension} />
                 <span>{source.name}</span>
                 <small>{formatBytes(source.bytes)}</small>
                 <button
@@ -6974,12 +8031,19 @@ function Composer({
               ))}
           </div>
         )}
+        {isDraggingFiles ? (
+          <div className="composer-drop-target" aria-hidden="true">
+            <Paperclip size={20} />
+            <span>释放以添加文件</span>
+          </div>
+        ) : null}
         <textarea
           value={draft}
           aria-label="消息"
           placeholder={collaborationModePlaceholder(collaborationMode)}
           onFocus={closeMenus}
           onPointerDown={closeMenus}
+          onPaste={(event) => void handlePaste(event)}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
             if (
@@ -7009,116 +8073,6 @@ function Composer({
             >
               <Plus size={16} />
             </button>
-            {openMenu === "actions" && (
-              <div
-                className="tool-popover composer-actions-popover"
-                role="menu"
-              >
-                <div className="composer-actions-section-label">添加</div>
-                <button
-                  role="menuitem"
-                  disabled={!canOpenThreadTools}
-                  title={
-                    canOpenThreadTools ? undefined : "创建任务后可浏览文件"
-                  }
-                  onClick={() => {
-                    onPickWorkspace();
-                    setOpenMenu(null);
-                  }}
-                >
-                  <Folder size={14} />
-                  <span>选择工作区</span>
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onAddContextSources();
-                    setOpenMenu(null);
-                  }}
-                >
-                  <Paperclip size={14} />
-                  <span>添加文件或图片</span>
-                </button>
-                <div className="tool-popover-separator" />
-                <div className="composer-actions-section-label">模式</div>
-                {collaborationModeOptions.map((option) => {
-                  const Icon = option.icon;
-                  const selected = collaborationMode === option.value;
-                  return (
-                    <button
-                      className={`composer-mode-option is-${option.value} ${selected ? "active" : ""}`}
-                      disabled={isRunning || isSending}
-                      key={option.value}
-                      role="menuitemcheckbox"
-                      aria-checked={selected}
-                      onClick={() => {
-                        onChangeCollaborationMode(
-                          selected ? "default" : option.value,
-                        );
-                        setOpenMenu(null);
-                      }}
-                    >
-                      <Icon size={15} aria-hidden="true" />
-                      <span className="composer-action-copy">
-                        <strong>{option.label}</strong>
-                        <small>{option.detail}</small>
-                      </span>
-                      {selected ? <Check size={14} aria-hidden="true" /> : null}
-                    </button>
-                  );
-                })}
-                {skills.length > 0 ? (
-                  <>
-                    <div className="tool-popover-separator" />
-                    <div className="composer-actions-section-label">工具</div>
-                    {skills.map((skill) => {
-                      const selected = selectedSkillIds.includes(skill.id);
-                      const descriptionId = `composer-tool-description-${skill.id}`;
-                      return (
-                        <button
-                          className={`composer-tool-option ${selected ? "active" : ""}`}
-                          key={skill.id}
-                          role="menuitemcheckbox"
-                          aria-checked={selected}
-                          aria-describedby={
-                            skill.description ? descriptionId : undefined
-                          }
-                          disabled={!selected && selectedSkillIds.length >= 5}
-                          onMouseEnter={(event) =>
-                            showToolTooltip(skill, event.currentTarget)
-                          }
-                          onMouseLeave={(event) => {
-                            if (
-                              document.activeElement !== event.currentTarget
-                            ) {
-                              setActiveToolTooltip(null);
-                            }
-                          }}
-                          onFocus={(event) =>
-                            showToolTooltip(skill, event.currentTarget)
-                          }
-                          onBlur={() => setActiveToolTooltip(null)}
-                          onClick={() => onToggleSkill(skill.id)}
-                        >
-                          <Plug size={14} aria-hidden="true" />
-                          <span className="composer-action-copy">
-                            <strong>{skill.name}</strong>
-                          </span>
-                          {skill.description ? (
-                            <span className="sr-only" id={descriptionId}>
-                              {skill.description}
-                            </span>
-                          ) : null}
-                          {selected ? (
-                            <Check size={14} aria-hidden="true" />
-                          ) : null}
-                        </button>
-                      );
-                    })}
-                  </>
-                ) : null}
-              </div>
-            )}
           </div>
           <div className="composer-menu-wrap">
             <button
@@ -7185,15 +8139,12 @@ function Composer({
           />
         </div>
         <button
-          className={`send-button${isRunning ? " is-running" : ""}`}
+          className={`send-button${hasSendableContent ? " has-content" : ""}${isSending ? " is-sending" : ""}${isRunning ? " is-running" : ""}`}
           type="button"
           disabled={
             isRunning
               ? isCancelling
-              : isSending ||
-                (!draft.trim() &&
-                  contextSources.length === 0 &&
-                  selectedSkillIds.length === 0)
+              : isSending || !hasSendableContent
           }
           onClick={isRunning ? onCancel : submitDraft}
           title={
@@ -7229,24 +8180,211 @@ function Composer({
             <ArrowUp size={18} strokeWidth={2.25} aria-hidden="true" />
           )}
         </button>
-        {activeToolTooltip
-          ? createPortal(
-              <div
-                className="composer-tool-tooltip"
-                id={activeToolTooltip.id}
-                role="tooltip"
-                style={{
-                  left: activeToolTooltip.left,
-                  top: activeToolTooltip.top,
-                }}
-              >
-                {activeToolTooltip.description}
-              </div>,
-              document.body,
-            )
-          : null}
+        {openMenu === "actions" && (
+          <div className="tool-popover composer-actions-popover" role="menu">
+            <div className="composer-actions-section-label">添加</div>
+            <button
+              role="menuitem"
+              onClick={() => {
+                void onAddContextSources();
+                setOpenMenu(null);
+              }}
+            >
+              <Paperclip size={14} />
+              <span>文件和文件夹</span>
+            </button>
+            <div className="tool-popover-separator" />
+            <div className="composer-actions-section-label">模式</div>
+            {collaborationModeOptions.map((option) => {
+              const Icon = option.icon;
+              const selected = collaborationMode === option.value;
+              return (
+                <button
+                  className={`composer-mode-option is-${option.value} ${selected ? "active" : ""}`}
+                  disabled={isRunning || isSending}
+                  key={option.value}
+                  role="menuitemcheckbox"
+                  aria-checked={selected}
+                  onClick={() => {
+                    onChangeCollaborationMode(
+                      selected ? "default" : option.value,
+                    );
+                    setOpenMenu(null);
+                  }}
+                >
+                  <Icon size={15} aria-hidden="true" />
+                  <span className="composer-action-copy">
+                    <strong>{option.label}</strong>
+                    <small>{option.detail}</small>
+                  </span>
+                  {selected ? <Check size={14} aria-hidden="true" /> : null}
+                </button>
+              );
+            })}
+            {skills.length > 0 ? (
+              <>
+                <div className="tool-popover-separator" />
+                <div className="composer-actions-section-label">插件</div>
+                {skills.map((skill) => {
+                  const selected = selectedSkillIds.includes(skill.id);
+                  return (
+                    <button
+                      className={`composer-tool-option ${selected ? "active" : ""}`}
+                      key={skill.id}
+                      role="menuitemcheckbox"
+                      aria-checked={selected}
+                      disabled={!selected && selectedSkillIds.length >= 5}
+                      onClick={() => onToggleSkill(skill.id)}
+                    >
+                      <Plug size={14} aria-hidden="true" />
+                      <span className="composer-action-copy">
+                        <strong>{skill.name}</strong>
+                        {skill.description ? (
+                          <small>{skill.description}</small>
+                        ) : null}
+                      </span>
+                      {selected ? <Check size={14} aria-hidden="true" /> : null}
+                    </button>
+                  );
+                })}
+              </>
+            ) : null}
+          </div>
+        )}
       </div>
+      {previewIndex !== null && imageAttachments[previewIndex] ? (
+        <ImageLightbox
+          attachments={imageAttachments}
+          activeIndex={previewIndex}
+          onChangeIndex={setPreviewIndex}
+          onClose={() => setPreviewIndex(null)}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function ImageLightbox({
+  attachments,
+  activeIndex,
+  onChangeIndex,
+  onClose,
+}: {
+  attachments: ComposerImageAttachment[];
+  activeIndex: number;
+  onChangeIndex(index: number): void;
+  onClose(): void;
+}) {
+  const [zoom, setZoom] = useState(1);
+  const active = attachments[activeIndex];
+
+  useEffect(() => {
+    setZoom(1);
+  }, [activeIndex]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft" && activeIndex > 0) {
+        onChangeIndex(activeIndex - 1);
+      }
+      if (event.key === "ArrowRight" && activeIndex < attachments.length - 1) {
+        onChangeIndex(activeIndex + 1);
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [activeIndex, attachments.length, onChangeIndex, onClose]);
+
+  if (!active) return null;
+
+  return createPortal(
+    <div
+      className="image-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`预览 ${active.name}`}
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="image-lightbox-dialog">
+        <header className="image-lightbox-header">
+          <strong>{active.name}</strong>
+          <span>
+            {activeIndex + 1} / {attachments.length}
+          </span>
+          <IconButton aria-label="关闭图片预览" title="关闭" onClick={onClose}>
+            <X size={18} aria-hidden="true" />
+          </IconButton>
+        </header>
+        <div className="image-lightbox-stage">
+          <IconButton
+            aria-label="上一张图片"
+            title="上一张"
+            disabled={activeIndex === 0}
+            onClick={() => onChangeIndex(activeIndex - 1)}
+          >
+            <ChevronLeft size={20} aria-hidden="true" />
+          </IconButton>
+          <div className="image-lightbox-canvas">
+            <img
+              src={active.previewUrl}
+              alt={active.name}
+              draggable={false}
+              style={{ transform: `scale(${zoom})` }}
+            />
+          </div>
+          <IconButton
+            aria-label="下一张图片"
+            title="下一张"
+            disabled={activeIndex === attachments.length - 1}
+            onClick={() => onChangeIndex(activeIndex + 1)}
+          >
+            <ChevronRight size={20} aria-hidden="true" />
+          </IconButton>
+        </div>
+        <footer className="image-lightbox-footer">
+          <button
+            className="image-lightbox-reset"
+            type="button"
+            onClick={() => setZoom(1)}
+            disabled={zoom === 1}
+          >
+            <RotateCcw size={16} aria-hidden="true" />
+            <span>重置</span>
+          </button>
+          <div className="image-lightbox-zoom-controls">
+            <IconButton
+              aria-label="缩小图片"
+              title="缩小"
+              disabled={zoom <= 0.5}
+              onClick={() => setZoom((current) => Math.max(0.5, current - 0.5))}
+            >
+              <ZoomOut size={16} aria-hidden="true" />
+            </IconButton>
+            <span>{Math.round(zoom * 100)}%</span>
+            <IconButton
+              aria-label="放大图片"
+              title="放大"
+              disabled={zoom >= 3}
+              onClick={() => setZoom((current) => Math.min(3, current + 0.5))}
+            >
+              <ZoomIn size={16} aria-hidden="true" />
+            </IconButton>
+          </div>
+          <a
+            className="image-lightbox-download"
+            href={active.previewUrl}
+            download={active.name}
+          >
+            <Download size={15} aria-hidden="true" />
+            <span>下载</span>
+          </a>
+        </footer>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -7265,7 +8403,7 @@ const collaborationModeOptions: Array<{
   {
     value: "plan",
     label: "计划模式",
-    detail: "先调研、确认方案并形成计划",
+    detail: "开启计划模式",
     icon: ListTodo,
   },
 ];
@@ -7340,6 +8478,8 @@ function RightPanel({
   toolTabs,
   activeToolTab,
   conversationCollapsed,
+  contextRailOpen,
+  contextRailAutoVisible,
   thread,
   workspaceRoot,
   subagentRuns,
@@ -7397,6 +8537,7 @@ function RightPanel({
   onActivateToolTab,
   onCloseToolTab,
   onToggleConversation,
+  onHideToolStage,
   onAddContextSources,
   onSpawnSubagent,
   onCancelSubagent,
@@ -7405,6 +8546,8 @@ function RightPanel({
   toolTabs: ToolTab[];
   activeToolTab: ToolTab | null;
   conversationCollapsed: boolean;
+  contextRailOpen: boolean;
+  contextRailAutoVisible: boolean;
   thread: Thread | null;
   workspaceRoot: string | null;
   messages: Message[];
@@ -7474,6 +8617,7 @@ function RightPanel({
   onActivateToolTab(tabId: string): void;
   onCloseToolTab(tabId: string): void;
   onToggleConversation(): void;
+  onHideToolStage(): void;
   onAddContextSources(): void;
   onSpawnSubagent(name: string, input: string): Promise<void>;
   onCancelSubagent(runId: string): void;
@@ -7548,6 +8692,7 @@ function RightPanel({
           onOpen={onOpenToolTab}
           conversationCollapsed={conversationCollapsed}
           onToggleConversation={onToggleConversation}
+          onHide={onHideToolStage}
         />
         <div className="tool-stage-body">
           {activeToolTab.kind === "browser" ? (
@@ -7582,8 +8727,12 @@ function RightPanel({
 
   return (
     <aside
-      className="right-panel context-rail-shell"
-      id="workspace-right-panel"
+      className={`context-rail-shell ${
+        contextRailOpen ? "is-visible" : ""
+      } ${contextRailOpen ? (contextRailAutoVisible ? "is-inline" : "is-menu") : ""}`}
+      id="workspace-context-rail"
+      aria-label="右侧上下文摘要"
+      aria-hidden={!contextRailOpen}
     >
       <RightContextRail
         client={client}
@@ -7599,6 +8748,7 @@ function RightPanel({
         onOpenDiff={() => onOpenToolTab("diff")}
         onOpenTerminal={() => onOpenToolTab("terminal")}
         onOpenFiles={() => onOpenToolTab("files")}
+        onOpenEnvironment={() => onOpenToolTab("sandbox")}
         onAddSource={onAddContextSources}
         onSpawnSubagent={onSpawnSubagent}
         onCancelSubagent={onCancelSubagent}
@@ -7616,6 +8766,7 @@ function ToolTabStrip({
   onOpen,
   conversationCollapsed,
   onToggleConversation,
+  onHide,
 }: {
   tabs: ToolTab[];
   activeTabId: string;
@@ -7624,6 +8775,7 @@ function ToolTabStrip({
   onOpen(kind: ToolTabKind): void;
   conversationCollapsed: boolean;
   onToggleConversation(): void;
+  onHide(): void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
@@ -7642,12 +8794,12 @@ function ToolTabStrip({
             <div
               className={`tool-stage-tab ${tab.id === activeTabId ? "active" : ""}`}
               key={tab.id}
-              role="tab"
-              aria-selected={tab.id === activeTabId}
             >
               <button
                 className="tool-tab-main"
                 type="button"
+                role="tab"
+                aria-selected={tab.id === activeTabId}
                 onClick={() => onActivate(tab.id)}
               >
                 <Icon size={13} />
@@ -7668,30 +8820,19 @@ function ToolTabStrip({
           );
         })}
       </div>
-      <button
-        className="tool-tab-layout-toggle"
-        type="button"
-        title={conversationCollapsed ? "显示对话" : "隐藏对话"}
-        aria-label={conversationCollapsed ? "显示对话" : "隐藏对话"}
-        onClick={onToggleConversation}
-      >
-        {conversationCollapsed ? (
-          <PanelLeftOpen size={14} />
-        ) : (
-          <PanelLeftClose size={14} />
-        )}
-      </button>
       <div className="tool-tab-add-wrap" ref={menuRef}>
-        <button
+        <IconButton
           className="tool-tab-add"
-          type="button"
+          size="compact"
+          variant="quiet"
           title="打开工具"
           aria-label="打开工具"
+          aria-haspopup="menu"
           aria-expanded={menuOpen}
           onClick={() => setMenuOpen((current) => !current)}
         >
-          <Plus size={14} />
-        </button>
+          <Plus size={14} aria-hidden="true" />
+        </IconButton>
         {menuOpen && (
           <div className="tool-popover tool-tab-add-popover" role="menu">
             {toolTabKinds.map((kind) => {
@@ -7705,6 +8846,35 @@ function ToolTabStrip({
             })}
           </div>
         )}
+      </div>
+      <div className="tool-tab-actions">
+        <IconButton
+          className="tool-tab-action"
+          size="compact"
+          variant="quiet"
+          title={conversationCollapsed ? "还原工具工作区" : "扩展工具工作区"}
+          aria-label={
+            conversationCollapsed ? "还原工具工作区" : "扩展工具工作区"
+          }
+          aria-pressed={conversationCollapsed}
+          onClick={onToggleConversation}
+        >
+          {conversationCollapsed ? (
+            <Minimize2 size={14} aria-hidden="true" />
+          ) : (
+            <Maximize2 size={14} aria-hidden="true" />
+          )}
+        </IconButton>
+        <IconButton
+          className="tool-tab-action"
+          size="compact"
+          variant="quiet"
+          title="隐藏工具窗口"
+          aria-label="隐藏工具窗口"
+          onClick={onHide}
+        >
+          <PanelRightClose size={14} aria-hidden="true" />
+        </IconButton>
       </div>
     </div>
   );
@@ -7766,10 +8936,13 @@ function NewTaskState({
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onChangeModelSelection(selection: ThreadModelSelection): void;
   onOpenSettings(): void;
-  onAddContextSources(): void;
+  onAddContextSources(files?: File[]): Promise<void>;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
-  onSubmit(value: string): void;
+  onSubmit(
+    value: string,
+    imageAttachments: InlineImageAttachment[],
+  ): Promise<boolean>;
 }) {
   const suggestions =
     experienceMode === "work"
@@ -8375,6 +9548,24 @@ function workspaceName(workspaceRoot: string): string {
   const trimmed = workspaceRoot.replace(/[\\\/]+$/, "");
   const parts = trimmed.split(/[\\\/]/).filter(Boolean);
   return parts.at(-1) || workspaceRoot;
+}
+
+function formatRelativeThreadTime(value: string): string {
+  const updatedAt = Date.parse(value);
+  if (Number.isNaN(updatedAt)) return "";
+
+  const elapsedMinutes = Math.max(
+    0,
+    Math.floor((Date.now() - updatedAt) / (60 * 1_000)),
+  );
+  if (elapsedMinutes < 1) return "刚刚";
+  if (elapsedMinutes < 60) return `${elapsedMinutes} 分`;
+
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours < 24) return `${elapsedHours} 小时`;
+
+  const elapsedDays = Math.floor(elapsedHours / 24);
+  return `${elapsedDays} 天`;
 }
 
 function workspaceRootKey(workspaceRoot: string): string {

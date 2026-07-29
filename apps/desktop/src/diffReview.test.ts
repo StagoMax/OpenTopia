@@ -15,6 +15,7 @@ const {
   buildSplitRows,
   buildUnifiedRows,
   changedRanges,
+  countDiffRows,
   diffLanguageFromPath,
   matchesPathQuery,
   parseUnifiedDiff,
@@ -242,6 +243,27 @@ test("orders unified rows as removals then additions", () => {
   ]);
 });
 
+test("counts full rows while only building the visible row budget", () => {
+  const [file] = parseUnifiedDiff(
+    [
+      "@@ -1,3 +1,3 @@",
+      "-one",
+      "-two",
+      "-three",
+      "+ONE",
+      "+TWO",
+      "+THREE",
+    ].join("\n"),
+    "sample.ts",
+  );
+  const blocks = buildDiffBlocks(file);
+
+  assert.equal(countDiffRows(blocks, "split"), 3);
+  assert.equal(countDiffRows(blocks, "unified"), 6);
+  assert.equal(buildSplitRows(blocks, {}, 2).length, 2);
+  assert.equal(buildUnifiedRows(blocks, {}, 2).length, 2);
+});
+
 test("hides whitespace-only edits when asked", () => {
   const [file] = parseUnifiedDiff(
     [
@@ -353,6 +375,19 @@ test("builds a copyable git apply command, or nothing to copy", () => {
   assert.ok(command?.startsWith("git apply <<'OPENTOPIA_PATCH'\n"));
   assert.ok(command?.endsWith("\nOPENTOPIA_PATCH"));
   assert.equal(buildGitApplyCommand("   \n"), null);
+});
+
+test("builds a PowerShell git apply command without embedding patch text", () => {
+  const patch = "diff --git a/你好.txt b/你好.txt\n+新内容\n";
+  const command = buildGitApplyCommand(patch, "powershell");
+  assert.ok(command?.includes("[Convert]::FromBase64String"));
+  assert.ok(command?.includes("git apply -- $opentopiaPatch"));
+  assert.ok(command?.includes("Remove-Item -LiteralPath $opentopiaPatch"));
+  assert.ok(!command?.includes("新内容"));
+
+  const payload = command?.match(/FromBase64String\('([^']+)'\)/)?.[1];
+  assert.ok(payload);
+  assert.equal(Buffer.from(payload, "base64").toString("utf8"), patch);
 });
 
 test("splits file content without inventing a trailing line", () => {

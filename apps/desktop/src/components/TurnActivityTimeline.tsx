@@ -272,9 +272,9 @@ export function TurnChangeCard({
     path: string,
     offset?: number,
   ): Promise<TurnFileDiffPreview>;
-  // Clicking a file row hands the file to the side review panel instead of
-  // pinning the hover preview. Without this the row falls back to pinning.
-  onOpenFileReview?(path: string): void;
+  // The caller decides whether a changed file belongs in the diff review or a
+  // format-aware preview tab. Without this the row falls back to pinning.
+  onOpenFileReview?(path: string, file: TurnFileChange): void;
 }) {
   const [showAll, setShowAll] = useState(false);
   const [filePreviewState, setFilePreviewState] =
@@ -467,7 +467,7 @@ export function TurnChangeCard({
               onOpenFileReview
                 ? () => {
                     const path = turnChangeFileRequestPath(file);
-                    if (path) onOpenFileReview(path);
+                    if (path) onOpenFileReview(path, file);
                   }
                 : undefined
             }
@@ -597,7 +597,9 @@ function TurnChangeFileRow({
         aria-controls={canPreview ? previewId : undefined}
         aria-label={
           onSelect
-            ? `在审阅面板中打开 ${path}`
+            ? file.binary
+              ? `在预览窗口中打开 ${path}`
+              : `在审阅面板中打开 ${path}`
             : `${expanded ? "收起" : "预览"} ${path} 的代码差异`
         }
         onKeyDown={(event) => {
@@ -607,8 +609,8 @@ function TurnChangeFileRow({
           onClose();
         }}
         onClick={() => {
-          // With a review panel wired up, a click belongs to it; the hover
-          // preview stays a hover affordance and gets out of the way.
+          // A caller-owned selection opens the appropriate destination while
+          // the hover preview remains a separate affordance.
           if (onSelect) {
             setPinned(false);
             onClose();
