@@ -60,8 +60,8 @@ try {
     if (-not $provider) {
       $provider = @($settings.providers)[0]
     }
-    if (-not $provider.apiKeyConfigured -or $provider.kind -ne "open_ai_compatible") {
-      throw "active provider is not configured for real context summarization"
+    if (-not $provider.apiKeyConfigured -or $provider.kind -eq "mock" -or $provider.kind -eq "codex_app_server") {
+      throw "active provider is not configured for direct context summarization"
     }
 
     $thread = Invoke-RestMethod `
@@ -102,8 +102,8 @@ try {
       -ContentType "application/json" `
       -Body "{}" `
       -TimeoutSec 100
-    if ($summary.metadata.mode -ne "llm") {
-      throw "expected LLM context compaction mode"
+    if ($summary.metadata.mode -ne "structured_local") {
+      throw "expected structured_local context compaction mode"
     }
     if ([string]::IsNullOrWhiteSpace($summary.summary)) {
       throw "real context summary was empty"
@@ -111,11 +111,77 @@ try {
     if ($summary.metadata.providerId -ne $provider.id -or $summary.metadata.model -ne $provider.model) {
       throw "context summary provider metadata does not match active settings"
     }
+    if (-not $summary.checkpoint -or $summary.checkpoint.schemaVersion -ne 1) {
+      throw "context summary did not return a schema-versioned checkpoint"
+    }
+    if ($summary.metadata.checkpointTokens -le 0 -or $summary.metadata.inputTokens -le 0) {
+      throw "context summary did not report token metrics"
+    }
+
+    $constraintId = "verify-constraint-$([Guid]::NewGuid().ToString('N'))"
+    $manualFirst = Invoke-RestMethod `
+      -Method Post `
+      -Uri "http://127.0.0.1:8802/api/threads/$($thread.id)/context/compact" `
+      -ContentType "application/json" `
+      -Body (@{
+        checkpoint = @{
+          goal = "Verify deterministic incremental checkpoint merging"
+          userConstraints = @(@{
+            id = $constraintId
+            text = "This unique constraint must survive the next delta"
+            status = "active"
+            sourceSeqs = @()
+            confidence = 100
+          })
+          decisions = @()
+          workspaceState = @{ branch = $null; gitStatus = $null; filesChanged = @() }
+          commandsAndValidation = @()
+          openIssues = @()
+          nextSteps = @()
+          pendingInteractions = @()
+          artifacts = @()
+        }
+      } | ConvertTo-Json -Depth 8) `
+      -TimeoutSec 10
+    if ($manualFirst.checkpoint.userConstraints[0].id -ne $constraintId) {
+      throw "first structured manual checkpoint lost the seeded constraint"
+    }
+
+    $manualSecond = Invoke-RestMethod `
+      -Method Post `
+      -Uri "http://127.0.0.1:8802/api/threads/$($thread.id)/context/compact" `
+      -ContentType "application/json" `
+      -Body (@{
+        checkpoint = @{
+          goal = "Verify deterministic incremental checkpoint merging"
+          userConstraints = @()
+          decisions = @(@{
+            id = "verify-decision"
+            text = "Use stable-key server-side merging"
+            status = "active"
+            sourceSeqs = @()
+            confidence = 100
+          })
+          workspaceState = @{ branch = $null; gitStatus = $null; filesChanged = @() }
+          commandsAndValidation = @()
+          openIssues = @()
+          nextSteps = @()
+          pendingInteractions = @()
+          artifacts = @()
+        }
+      } | ConvertTo-Json -Depth 8) `
+      -TimeoutSec 10
+    if (@($manualSecond.checkpoint.userConstraints | Where-Object { $_.id -eq $constraintId }).Count -ne 1) {
+      throw "second structured delta did not retain the prior user constraint"
+    }
+    if ($manualSecond.checkpoint.previousCheckpointId -ne $manualFirst.checkpoint.id) {
+      throw "structured checkpoint lineage is broken"
+    }
 
     $status = Invoke-RestMethod `
       -Uri "http://127.0.0.1:8802/api/threads/$($thread.id)/context" `
       -TimeoutSec 5
-    if ($status.latestSummary.id -ne $summary.id) {
+    if ($status.latestSummary.id -ne $manualSecond.id) {
       throw "context summary was not persisted as the latest durable summary"
     }
 
@@ -128,7 +194,11 @@ try {
       coveredMessages = $summary.messageCount
       coveredThroughSeq = $summary.coveredThroughSeq
       summaryCharacters = $summary.summary.Length
-      persisted = $status.latestSummary.id -eq $summary.id
+      checkpointTokens = $summary.metadata.checkpointTokens
+      tokenReductionPercent = $summary.metadata.tokenReductionPercent
+      factRetentionPercent = $summary.metadata.factRetentionPercent
+      incrementalConstraintRetained = $true
+      persisted = $status.latestSummary.id -eq $manualSecond.id
     }
   } finally {
     if ($server -and -not $server.HasExited) {

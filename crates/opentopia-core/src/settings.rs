@@ -34,6 +34,24 @@ pub enum PromptCachePolicy {
     Legacy24h,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCompactionProtocol {
+    OpenAiResponsesCompact,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapabilities {
+    pub supports_native_compaction: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_compaction_protocol: Option<NativeCompactionProtocol>,
+    pub supports_response_state: bool,
+    pub supports_previous_response_id: bool,
+    pub supports_provider_items: bool,
+    pub supports_prompt_cache: bool,
+}
+
 impl ProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -74,8 +92,11 @@ pub struct ProviderSettings {
     pub model_context_windows: BTreeMap<String, usize>,
     #[serde(default)]
     pub models_synced_at: Option<DateTime<Utc>>,
-    #[serde(default = "default_provider_temperature")]
-    pub temperature: f64,
+    /// `None` means "don't send temperature — let the model use its default."
+    /// This is important for reasoning models (o-series, GPT-5.x) that reject
+    /// explicit temperature, and for users who want the vendor default.
+    #[serde(default)]
+    pub temperature: Option<f64>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
     /// Optional user override. When omitted, the server resolves a known model
@@ -117,7 +138,7 @@ impl Default for ProviderSettings {
             synced_models: Vec::new(),
             model_context_windows: BTreeMap::new(),
             models_synced_at: None,
-            temperature: default_provider_temperature(),
+            temperature: None,
             max_output_tokens: None,
             context_window_tokens: None,
             reasoning_effort: None,
@@ -164,6 +185,26 @@ impl RolloutBudgetSettings {
 }
 
 impl ProviderSettings {
+    pub fn capabilities(&self) -> ProviderCapabilities {
+        match self.kind {
+            ProviderKind::OpenAiResponses => ProviderCapabilities {
+                supports_native_compaction: self.responses_compaction_threshold_tokens.is_some(),
+                native_compaction_protocol: Some(NativeCompactionProtocol::OpenAiResponsesCompact),
+                supports_response_state: self.store_responses,
+                supports_previous_response_id: self.store_responses,
+                supports_provider_items: true,
+                supports_prompt_cache: true,
+            },
+            ProviderKind::OpenAiCompatible => ProviderCapabilities {
+                supports_prompt_cache: true,
+                ..ProviderCapabilities::default()
+            },
+            ProviderKind::Mock | ProviderKind::CodexAppServer | ProviderKind::Anthropic => {
+                ProviderCapabilities::default()
+            }
+        }
+    }
+
     pub fn display_name(&self) -> &str {
         let name = self.name.trim();
         if name.is_empty() {
@@ -288,9 +329,9 @@ pub fn known_model_context_window_tokens(model: &str) -> Option<usize> {
 }
 
 fn context_window_for_base(model: &str) -> Option<usize> {
-    // OpenAI
+    // ── OpenAI ──────────────────────────────────────────────────────────
     if model.starts_with("gpt-5") {
-        return Some(400_000);
+        return Some(272_000);
     }
     if model.starts_with("gpt-4.1") {
         return Some(1_047_576);
@@ -302,12 +343,12 @@ fn context_window_for_base(model: &str) -> Option<usize> {
         return Some(200_000);
     }
 
-    // Anthropic
+    // ── Anthropic ───────────────────────────────────────────────────────
     if model.starts_with("claude-") || model.contains("claude") {
         return Some(200_000);
     }
 
-    // Google
+    // ── Google ──────────────────────────────────────────────────────────
     if model.starts_with("gemini-1.5") || model.starts_with("gemini-2") {
         return Some(1_000_000);
     }
@@ -315,31 +356,64 @@ fn context_window_for_base(model: &str) -> Option<usize> {
         return Some(128_000);
     }
 
-    // Moonshot
-    if model.starts_with("kimi") {
-        return Some(256_000);
-    }
-    if model.starts_with("moonshot-v1-128k") {
-        return Some(128_000);
+    // ── Moonshot / Kimi ─────────────────────────────────────────────────
+    // moonshot-v1-* has explicit context-tier suffixes.
+    if model.starts_with("moonshot-v1-8k") {
+        return Some(8_000);
     }
     if model.starts_with("moonshot-v1-32k") {
         return Some(32_000);
     }
+    if model.starts_with("moonshot-v1-128k") {
+        return Some(128_000);
+    }
     if model.starts_with("moonshot-v1") {
-        return Some(8_000);
+        return Some(8_000); // base tier
+    }
+    // kimi-k2.5 is the only 256K variant; everything else is 128K.
+    if model.starts_with("kimi-k2.5") {
+        return Some(256_000);
+    }
+    if model.starts_with("kimi") {
+        return Some(128_000);
     }
 
-    // DeepSeek / Qwen / Zhipu / xAI
+    // ── DeepSeek ────────────────────────────────────────────────────────
+    // V4 introduced 1M context; earlier models are 128K.
+    if model.starts_with("deepseek-v4") {
+        return Some(1_000_000);
+    }
     if model.starts_with("deepseek") {
         return Some(128_000);
     }
+
+    // ── Qwen / Alibaba ──────────────────────────────────────────────────
     if model.starts_with("qwen") || model.starts_with("qwq") || model.starts_with("qvq") {
         return Some(128_000);
     }
+
+    // ── Zhipu GLM ───────────────────────────────────────────────────────
     if model.starts_with("glm") || model.starts_with("chatglm") {
         return Some(128_000);
     }
+
+    // ── xAI Grok ────────────────────────────────────────────────────────
     if model.starts_with("grok") {
+        return Some(128_000);
+    }
+
+    // ── Mistral ─────────────────────────────────────────────────────────
+    if model.starts_with("mistral") || model.starts_with("mixtral") || model.starts_with("codestral") {
+        return Some(128_000);
+    }
+
+    // ── Meta Llama ──────────────────────────────────────────────────────
+    if model.starts_with("llama") || model.starts_with("codellama") {
+        return Some(128_000);
+    }
+
+    // ── MiniMax ─────────────────────────────────────────────────────────
+    if model.starts_with("minimax") || model.starts_with("abab") {
         return Some(128_000);
     }
 
@@ -391,10 +465,6 @@ fn is_openai_reasoning_model(model: &str) -> bool {
     // o1 / o3 / o4-mini and friends, but not `olmo` or `openai`.
     let mut chars = model.chars();
     chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit())
-}
-
-fn default_provider_temperature() -> f64 {
-    0.2
 }
 
 pub const MIN_PROVIDER_CONTEXT_WINDOW_TOKENS: usize = 4_096;
@@ -811,7 +881,7 @@ mod tests {
     fn context_window_table_covers_the_families_the_picker_offers() {
         assert_eq!(
             known_model_context_window_tokens("gpt-5.6-sol"),
-            Some(400_000)
+            Some(272_000)
         );
         assert_eq!(
             known_model_context_window_tokens("gpt-4.1-mini"),
@@ -822,13 +892,31 @@ mod tests {
             known_model_context_window_tokens("anthropic/claude-sonnet-4-5"),
             Some(200_000)
         );
+        // kimi-k2.5 is 256K; kimi-k2, kimi-k3 and others are 128K
         assert_eq!(
             known_model_context_window_tokens("kimi-k2.5"),
             Some(256_000)
         );
         assert_eq!(
+            known_model_context_window_tokens("kimi-k2"),
+            Some(128_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("kimi-k3"),
+            Some(128_000)
+        );
+        assert_eq!(
             known_model_context_window_tokens("moonshot-v1-32k"),
             Some(32_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("moonshot-v1-8k"),
+            Some(8_000)
+        );
+        // deepseek-v4 is 1M; earlier models are 128K
+        assert_eq!(
+            known_model_context_window_tokens("deepseek-v4"),
+            Some(1_000_000)
         );
         assert_eq!(
             known_model_context_window_tokens("deepseek-reasoner"),
@@ -941,7 +1029,7 @@ mod tests {
         )
         .expect("deserialize provider without generation settings");
 
-        assert_eq!(provider.temperature, 0.2);
+        assert_eq!(provider.temperature, None);
         assert_eq!(provider.name, "");
         assert_eq!(provider.display_name(), "legacy");
         assert_eq!(provider.max_output_tokens, None);
@@ -1080,6 +1168,35 @@ mod tests {
         assert!(!health.using_mock);
         assert_eq!(health.status, "local_codex");
         assert!(provider.supports_vision);
+    }
+
+    #[test]
+    fn responses_capabilities_distinguish_stored_and_opaque_state() {
+        let mut provider = ProviderSettings::default();
+        provider.kind = ProviderKind::OpenAiResponses;
+        provider.store_responses = false;
+        provider.responses_compaction_threshold_tokens = Some(96_000);
+
+        let stateless = provider.capabilities();
+        assert!(stateless.supports_native_compaction);
+        assert_eq!(
+            stateless.native_compaction_protocol,
+            Some(NativeCompactionProtocol::OpenAiResponsesCompact)
+        );
+        assert!(stateless.supports_provider_items);
+        assert!(!stateless.supports_response_state);
+        assert!(!stateless.supports_previous_response_id);
+
+        provider.store_responses = true;
+        let stateful = provider.capabilities();
+        assert!(stateful.supports_response_state);
+        assert!(stateful.supports_previous_response_id);
+
+        provider.kind = ProviderKind::OpenAiCompatible;
+        let chat = provider.capabilities();
+        assert!(!chat.supports_native_compaction);
+        assert_eq!(chat.native_compaction_protocol, None);
+        assert!(!chat.supports_provider_items);
     }
 
     #[test]

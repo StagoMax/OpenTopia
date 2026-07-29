@@ -14,6 +14,7 @@ pub enum ContextItemKind {
     WorldState,
     Skill,
     Summary,
+    Checkpoint,
     Conversation,
     User,
     ToolCall,
@@ -30,6 +31,7 @@ impl ContextItemKind {
             Self::WorldState => "world_state",
             Self::Skill => "skill",
             Self::Summary => "summary",
+            Self::Checkpoint => "checkpoint",
             Self::Conversation => "conversation",
             Self::User => "user",
             Self::ToolCall => "tool_call",
@@ -174,7 +176,10 @@ impl CompiledModelContext {
             .into_iter()
             .filter(|item| {
                 matches!(item.role, ContextRole::System | ContextRole::Developer)
-                    && !matches!(item.kind, ContextItemKind::Summary)
+                    && !matches!(
+                        item.kind,
+                        ContextItemKind::Summary | ContextItemKind::Checkpoint
+                    )
             })
             .filter_map(|item| {
                 let content = item.text_content();
@@ -331,7 +336,10 @@ impl WorldStateSnapshot {
                 json!({
                     "id": skill.id,
                     "name": skill.name,
-                    "description": skill.description,
+                    // The catalog is routing metadata. Full instructions are
+                    // loaded only after a Skill is selected, so long
+                    // descriptions needlessly expand the stable prefix.
+                    "description": compact_skill_description(&skill.description),
                     "scope": skill.scope,
                 })
             })
@@ -347,20 +355,57 @@ impl WorldStateSnapshot {
     /// by shrinking the fields themselves, not by omitting them.
     pub fn render_dynamic_for_model(&self) -> String {
         serde_json::to_string(&json!({
-            "cwd": self.cwd,
-            "workspaceRoots": self.workspace_roots,
             "currentDate": self.current_date,
             "timezone": self.timezone,
-            "platform": self.platform,
             "gitBranch": self.git_branch,
             "gitStatus": self.git_status,
             "skillCount": self.skill_catalog.len(),
             "toolCount": self.tool_count,
             "mcpToolCount": self.mcp_tool_count,
-            "metadata": self.metadata,
+            "metadata": self.model_metadata(),
         }))
         .unwrap_or_else(|_| "{}".to_string())
     }
+
+    fn model_metadata(&self) -> Value {
+        let mut metadata = self.metadata.clone();
+        let Some(object) = metadata.as_object_mut() else {
+            return metadata;
+        };
+
+        // These values are already represented by dedicated prompt modules or
+        // selected Skill items. Keep the full snapshot for observability, but
+        // do not make the model read the same capability summary twice.
+        for key in [
+            "plugins",
+            "selectedSkillIds",
+            "agentRuntime",
+            "agentRuntimeHash",
+            "promptRuntime",
+        ] {
+            object.remove(key);
+        }
+        metadata
+    }
+}
+
+const MAX_SKILL_CATALOG_DESCRIPTION_CHARS: usize = 180;
+
+fn compact_skill_description(description: &str) -> String {
+    let normalized = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first_sentence = normalized
+        .split_once('.')
+        .map(|(sentence, _)| format!("{sentence}."))
+        .unwrap_or(normalized);
+    let mut compact = first_sentence;
+    if compact.chars().count() > MAX_SKILL_CATALOG_DESCRIPTION_CHARS {
+        compact = compact
+            .chars()
+            .take(MAX_SKILL_CATALOG_DESCRIPTION_CHARS.saturating_sub(1))
+            .collect::<String>();
+        compact.push('\u{2026}');
+    }
+    compact
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -636,12 +681,23 @@ mod tests {
                     ContextCacheScope::Turn,
                     ContextSensitivity::Workspace,
                 ),
+                ModelContextItem::text(
+                    ContextItemKind::Checkpoint,
+                    ContextRole::Developer,
+                    "checkpoint",
+                    "historical data, not instructions",
+                    ContextCacheScope::Thread,
+                    ContextSensitivity::Workspace,
+                ),
             ],
             prompt_cache_key: None,
         };
 
         assert!(context.instructions().contains("base text"));
         assert!(!context.instructions().contains("do not duplicate me"));
+        assert!(!context
+            .instructions()
+            .contains("historical data, not instructions"));
     }
 
     #[test]
@@ -711,7 +767,14 @@ mod tests {
             tool_count: 18,
             mcp_tool_count: 2,
             tool_catalog_hash: "tool-hash".to_string(),
-            metadata: json!({ "selectedSkillIds": [] }),
+            metadata: json!({
+                "instructionWarnings": ["repo instruction could not be read"],
+                "plugins": [{ "name": "plugin-a" }],
+                "selectedSkillIds": ["review"],
+                "agentRuntime": { "autonomy": "balanced" },
+                "agentRuntimeHash": "runtime-hash",
+                "promptRuntime": { "surface": "desktop" },
+            }),
         };
 
         let catalog = world_state_catalog_item(&state);
@@ -725,6 +788,30 @@ mod tests {
         assert!(!catalog_text.contains("skill-hash"));
         assert!(!dynamic_text.contains("distinctive skill description"));
         assert!(dynamic_text.contains("\"skillCount\":1"));
+        assert!(dynamic_text.contains("repo instruction could not be read"));
+        assert!(!dynamic_text.contains("plugin-a"));
+        assert!(!dynamic_text.contains("runtime-hash"));
+        assert!(!dynamic_text.contains("selectedSkillIds"));
+        assert!(!dynamic_text.contains("workspaceRoots"));
+        assert!(!dynamic_text.contains("\"platform\""));
         assert_eq!(dynamic.metadata["toolCatalogHash"], "tool-hash");
+    }
+
+    #[test]
+    fn skill_catalog_compacts_long_routing_descriptions() {
+        let state = WorldStateSnapshot {
+            skill_catalog: vec![WorldStateSkill {
+                id: "long".to_string(),
+                name: "Long".to_string(),
+                description: format!("First sentence. {}", "repeated detail ".repeat(80)),
+                scope: "user".to_string(),
+                content_hash: "hash".to_string(),
+            }],
+            ..WorldStateSnapshot::default()
+        };
+        let text = world_state_catalog_item(&state).text_content();
+        assert!(text.contains("First sentence."));
+        assert!(!text.contains("repeated detail repeated detail"));
+        assert!(text.len() < 400);
     }
 }

@@ -5,6 +5,8 @@ param(
   [int]$Port = 8812,
   [string]$SummaryPath = "",
   [string]$TaskManifest = "scripts\fixtures\long-horizon\task.json",
+  [ValidateRange(0, 1048576)][int]$ContextWindowTokens = 0,
+  [ValidateRange(0, 95)][int]$CompactionThresholdPercent = 0,
   [switch]$SkipBuild
 )
 
@@ -361,6 +363,7 @@ foreach ($name in @(
   "OPENTOPIA_OPENAI_BASE_URL",
   "OPENTOPIA_MODEL",
   "OPENTOPIA_DB",
+  "OPENTOPIA_CONTEXT_COMPACT_THRESHOLD_PERCENT",
   "OPENTOPIA_SANDBOX_MODE",
   "OPENTOPIA_SANDBOX_ENFORCEMENT",
   "OPENTOPIA_SANDBOX_NETWORK"
@@ -370,6 +373,13 @@ foreach ($name in @(
 [Environment]::SetEnvironmentVariable("OPENTOPIA_API_KEY", $apiKey, "Process")
 [Environment]::SetEnvironmentVariable("OPENTOPIA_OPENAI_BASE_URL", $baseUrl, "Process")
 [Environment]::SetEnvironmentVariable("OPENTOPIA_MODEL", $model, "Process")
+if ($CompactionThresholdPercent -gt 0) {
+  [Environment]::SetEnvironmentVariable(
+    "OPENTOPIA_CONTEXT_COMPACT_THRESHOLD_PERCENT",
+    [string]$CompactionThresholdPercent,
+    "Process"
+  )
+}
 [Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_MODE", "workspace-write", "Process")
 [Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_ENFORCEMENT", "best-effort", "Process")
 [Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_NETWORK", "deny", "Process")
@@ -480,8 +490,21 @@ try {
   if (-not $activeProvider) {
     $activeProvider = @($settings.providers)[0]
   }
+  if ($ContextWindowTokens -gt 0) {
+    $activeProvider.contextWindowTokens = $ContextWindowTokens
+    if (-not $activeProvider.maxOutputTokens -or $activeProvider.maxOutputTokens -gt 4096) {
+      $activeProvider.maxOutputTokens = 4096
+    }
+    $settings = Invoke-EvalApi "Patch" "/api/settings" @{
+      providers = @($settings.providers)
+      activeProviderId = $settings.activeProviderId
+    }
+    $activeProvider = @($settings.providers | Where-Object {
+      $_.id -eq $settings.activeProviderId
+    })[0]
+  }
   if (
-    $activeProvider.kind -ne "open_ai_compatible" -or
+    $activeProvider.kind -ne "openai_compatible" -or
     $activeProvider.model -ne $ExpectedModel -or
     $activeProvider.baseUrl.TrimEnd("/") -ne $baseUrl
   ) {
@@ -697,6 +720,15 @@ $result = [ordered]@{
     streamToolsForced = if ($providerProbe) { $providerProbe.streamToolsForced.status } else { $null }
     openTopiaHealthReachable = if ($providerHealth) { $providerHealth.reachable } else { $false }
     openTopiaModelAvailable = if ($providerHealth) { $providerHealth.modelAvailable } else { $false }
+  }
+  contextCompaction = [ordered]@{
+    contextWindowTokens = if ($ContextWindowTokens -gt 0) { $ContextWindowTokens } else { $null }
+    thresholdPercent = if ($CompactionThresholdPercent -gt 0) {
+      $CompactionThresholdPercent
+    } else { $null }
+    compactionEvents = @($eventsFinal | Where-Object {
+      $_.payload.type -eq "context_compacted"
+    }).Count
   }
   timing = [ordered]@{
     totalMs = [int64]((Get-Date) - $startedAt).TotalMilliseconds

@@ -50,7 +50,7 @@ Treat destructive or history-rewriting Git operations as requiring clear user au
 
 ## Skills and specialized instructions
 
-Use an available skill when the user names it or the task clearly matches its declared purpose. Read the selected skill's complete instruction resource before acting, then read only the referenced material required for this task. Follow its workflow while it remains consistent with higher-priority instructions and the user's scope. Do not treat a skill catalog entry as if its full instructions were already loaded, and do not carry a skill into later turns unless it remains selected or is triggered again.
+Use an available skill when the user names it or the task clearly matches its declared purpose. A catalog entry is routing metadata, not its full instructions. When several skills apply, use the smallest set that covers the request. The agent applying a skill must read its complete instruction resource before acting, then read only the referenced material required for this task; a child may perform delegated task work but cannot substitute a summary for that reading. Follow its workflow while it remains consistent with higher-priority instructions and the user's scope. Treat a skill already present in context as loaded rather than fetching it again, and do not carry a skill into later turns unless it remains selected or is triggered again.
 
 ## Tool loop and long-running work
 

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -27,26 +27,30 @@ use opentopia_core::{
     BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
     BrowserWaitRequest, ChangedFile, CodexAppServerProvider, CollaborationMode,
     CompiledModelContext, ComputerRuntime, ComputerRuntimeConfig, ComputerSessionId,
-    ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity, ContextSourcePolicy,
-    ContextSourceRef, ContextSummary, DesktopBrowserRuntime, ExecRequest, ExecutionContext,
-    ExperienceMode, GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus,
-    LoadedSkill, LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment,
-    McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart,
-    MessageRole, ModelContentPart, ModelContextItem, ModelConversationMessage,
-    ModelConversationRole, ModelProvider, ModelRequest, ObserveOptions, OpenAiCompatibleProvider,
-    OpenAiResponsesProvider, PermissionMode, PluginDescriptor, PluginError, PolicyDecision,
-    PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest,
-    PreviewTarget, PreviewWorkbook, ProviderConversationCursor, ProviderConversationState,
-    ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent,
-    ResolvedPreview, ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxSettings,
-    SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
-    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
-    SubagentScope, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot,
-    ThreadMcpServer, ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult,
-    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus,
-    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff,
-    WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
+    ContextCacheScope, ContextCheckpoint, ContextCheckpointArtifact, ContextCheckpointCommand,
+    ContextCheckpointCoverage, ContextCheckpointFact, ContextCheckpointInteraction,
+    ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
+    ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextItemKind,
+    ContextProjection, ContextRole, ContextSensitivity, ContextSourcePolicy, ContextSourceRef,
+    ContextSummary, DesktopBrowserRuntime, ExecRequest, ExecutionContext, ExperienceMode,
+    GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill,
+    LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment, McpCallResult,
+    McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole,
+    ModelContentPart, ModelContextItem, ModelConversationMessage, ModelConversationRole,
+    ModelProvider, ModelRequest, ObserveOptions, OpenAiCompatibleProvider, OpenAiResponsesProvider,
+    PermissionMode, PluginDescriptor, PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor,
+    PreviewError, PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook,
+    ProviderConversationCursor, ProviderConversationState, ProviderHealth, ProviderHealthCheck,
+    ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit,
+    RuntimeSurface, SandboxDescriptor, SandboxSettings, SessionStore, SkillDescriptor, SkillRef,
+    SpawnSubagentRequest, SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver,
+    SubagentRun, SubagentScheduler, SubagentSchedulerConfig, SubagentScope, TaskPlan,
+    TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer,
+    ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult, TurnChangeSet,
+    TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus, UserInputRecord,
+    UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff, WorkspaceDiffHunk,
+    WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
+    WorldStateSkill, WorldStateSnapshot, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
     MAX_PREVIEW_CONTENT_BYTES, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -60,7 +64,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -339,7 +343,9 @@ fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/threads/:thread_id/messages",
-            get(list_messages).post(send_message),
+            get(list_messages)
+                .post(send_message)
+                .layer(DefaultBodyLimit::max(MAX_INLINE_IMAGE_BYTES * 5)),
         )
         .route("/api/threads/:thread_id/events", get(list_events))
         .route("/api/threads/:thread_id/events/stream", get(stream_events))
@@ -625,6 +631,18 @@ impl SubagentExecutor for ServerSubagentExecutor {
                 run.parent_thread_id,
                 &run.agent_path,
             )?;
+            if let Some(invalidation) = provider_cursor.invalidation {
+                self.store.append_event(AgentEvent::new(
+                    run.parent_thread_id,
+                    None,
+                    0,
+                    AgentEventPayload::ProviderContextStateInvalidated {
+                        provider_id: Some(invalidation.provider_id),
+                        model: Some(invalidation.model),
+                        reason: invalidation.reason,
+                    },
+                ))?;
+            }
             let result = agent
                 .run_turn_detailed_streaming_with_context(
                     AgentTurnInput {
@@ -637,7 +655,7 @@ impl SubagentExecutor for ServerSubagentExecutor {
                         conversation: conversation.clone(),
                         permission_mode: settings.permission_mode,
                         context_budget: None,
-                        provider_cursor,
+                        provider_cursor: provider_cursor.cursor,
                         store: Some(self.store.clone()),
                         cancellation: Some(cancellation.clone()),
                     },
@@ -645,13 +663,25 @@ impl SubagentExecutor for ServerSubagentExecutor {
                     None,
                 )
                 .await;
-            persist_provider_cursor(
+            if let Some(persisted) = persist_provider_cursor(
                 &self.store,
                 &settings,
                 run.parent_thread_id,
                 &run.agent_path,
                 &result,
-            )?;
+            )? {
+                if let Some(summary) = persisted.native_checkpoint {
+                    self.store.append_event(AgentEvent::new(
+                        run.parent_thread_id,
+                        None,
+                        0,
+                        AgentEventPayload::ContextCompacted {
+                            summary,
+                            details: None,
+                        },
+                    ))?;
+                }
+            }
             let result = result?;
             if matches!(
                 result.outcome,
@@ -791,6 +821,7 @@ const SENSITIVE_CHILD_ENV_KEYS: &[&str] = &[
     "CREDIT_REVIEW_LLM_API_KEY",
 ];
 const MAX_TERMINAL_TIMEOUT_MS: u64 = 3_600_000;
+const MAX_CONTEXT_COMPACTION_PASSES: usize = 12;
 
 #[derive(Clone, Default)]
 struct TerminalBus {
@@ -1784,7 +1815,7 @@ async fn summarize_thread_title(state: &AppState, prompt: &str) -> Result<String
             "thread title generation requires a configured model provider",
         ));
     }
-    active.temperature = active.temperature.min(0.2);
+    active.temperature = active.temperature.map(|temperature| temperature.min(0.2));
     active.max_output_tokens = Some(active.max_output_tokens.unwrap_or(64).min(64));
     let provider: Box<dyn ModelProvider> = match active.kind {
         ProviderKind::Mock => None,
@@ -2028,6 +2059,8 @@ async fn send_message(
     Json(request): Json<SendMessageRequest>,
 ) -> Result<(HeaderMap, Json<Message>), ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
+    let image_attachments = request.image_attachments;
+    validate_inline_image_attachments(&image_attachments)?;
     if let Some(command) = legacy_direct_tool_command(&request.content) {
         return Err(ApiError::bad_request(format!(
             "{command} is a direct tool command. Use the terminal or file workspace API instead of sending it to the agent."
@@ -2036,6 +2069,7 @@ async fn send_message(
     if request.content.trim().is_empty()
         && request.source_paths.is_empty()
         && request.skill_ids.is_empty()
+        && image_attachments.is_empty()
     {
         return Err(ApiError::bad_request("message content cannot be empty"));
     }
@@ -2106,6 +2140,15 @@ async fn send_message(
         .extend(sources.iter().map(|source| MessagePart::SourceRef {
             source: ContextSourceRef::from(source),
         }));
+    pending_message.parts.extend(
+        image_attachments
+            .into_iter()
+            .map(|image| MessagePart::Image {
+                content_type: image.content_type,
+                data: image.data,
+                name: image.name,
+            }),
+    );
     pending_message.parts.extend(
         pinned_skills
             .into_iter()
@@ -2414,6 +2457,12 @@ fn launch_next_queued_turn(state: &AppState, thread_id: Uuid) {
     let user_content = sources
         .iter()
         .flat_map(|source| source.content_or_legacy_text())
+        .chain(user_message.parts.iter().filter_map(|part| match part {
+            MessagePart::Image {
+                content_type, data, ..
+            } => Some(ModelContentPart::image(content_type.clone(), data.clone())),
+            _ => None,
+        }))
         .collect::<Vec<_>>();
     let run_state = state.clone();
     tokio::spawn(async move {
@@ -3348,25 +3397,24 @@ async fn apply_workspace_diff_hunk(
 }
 
 async fn get_workspace_diff_inner(workspace_root: &FsPath) -> anyhow::Result<WorkspaceDiff> {
-    let branch = run_git(workspace_root, ["symbolic-ref", "--short", "HEAD"])
-        .await
+    let (branch_output, remote_output, status_output, staged_output, unstaged_output) = tokio::join!(
+        run_git(workspace_root, ["symbolic-ref", "--short", "HEAD"]),
+        run_git(workspace_root, ["remote", "get-url", "origin"]),
+        run_git(workspace_root, ["status", "--porcelain=v1"]),
+        run_git(workspace_root, ["diff", "--cached", "--"]),
+        run_git(workspace_root, ["diff", "--"]),
+    );
+    let branch = branch_output
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let remote_url = run_git(workspace_root, ["remote", "get-url", "origin"])
-        .await
+    let remote_url = remote_output
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let status_output = run_git(workspace_root, ["status", "--porcelain=v1"])
-        .await
-        .unwrap_or_else(|_| String::new());
-    let staged_output = run_git(workspace_root, ["diff", "--cached", "--"])
-        .await
-        .unwrap_or_else(|_| String::new());
-    let unstaged_output = run_git(workspace_root, ["diff", "--"])
-        .await
-        .unwrap_or_else(|_| String::new());
+    let status_output = status_output.unwrap_or_else(|_| String::new());
+    let staged_output = staged_output.unwrap_or_else(|_| String::new());
+    let unstaged_output = unstaged_output.unwrap_or_else(|_| String::new());
     let files = parse_git_status(&status_output);
     let (staged_diff, staged_truncated) = truncate_with_flag(&staged_output, 80_000);
     let (unstaged_diff, unstaged_truncated) = truncate_with_flag(&unstaged_output, 80_000);
@@ -3417,25 +3465,124 @@ async fn compact_context(
         .filter(|message| !queued.contains(&message.id))
         .collect::<Vec<_>>();
     let events = state.store.list_events(thread_id, None)?;
-    let supplied_summary = request
-        .summary
+    let ContextCompactRequest {
+        summary: supplied_summary,
+        checkpoint: supplied_checkpoint,
+    } = request;
+    let supplied_summary = supplied_summary
         .map(|summary| summary.trim().to_string())
         .filter(|summary| !summary.is_empty());
-    let summary = if let Some(summary_text) = supplied_summary {
-        let covered_through_seq = events.last().map(|event| event.seq).unwrap_or_default();
+    let covered_through_seq = events.last().map(|event| event.seq).unwrap_or_default();
+    let previous_summary = latest_context_summary_event(&events);
+    let coverage = ContextCheckpointCoverage {
+        through_seq: covered_through_seq,
+        through_message_count: messages.len(),
+    };
+    let summary = if let Some(draft) = supplied_checkpoint {
+        let redacted = serde_json::to_value(draft)
+            .map(|value| redact_model_observation(&value))
+            .map_err(|error| ApiError::bad_request(format!("invalid checkpoint: {error}")))?;
+        let mut draft: ContextCheckpointDraft = serde_json::from_value(redacted)
+            .map_err(|error| ApiError::bad_request(format!("invalid checkpoint: {error}")))?;
+        sanitize_checkpoint_draft(&mut draft, covered_through_seq)
+            .map_err(|error| ApiError::bad_request(error.message))?;
+        validate_checkpoint_draft(&draft, &events)
+            .map_err(|error| ApiError::bad_request(error.message))?;
+        let active_provider = current_settings(&state).active_provider().clone();
+        let provider_compatibility_hash = state
+            .store
+            .get_provider_conversation_state(thread_id, "/root")?
+            .filter(|provider_state| {
+                provider_state.provider_id == active_provider.id
+                    && provider_state.model == active_provider.model
+            })
+            .map(|provider_state| provider_state.compatibility_hash);
+        let mut checkpoint = merge_context_checkpoint(
+            previous_summary
+                .as_ref()
+                .and_then(|summary| summary.checkpoint.as_ref()),
+            draft,
+            thread_id,
+            coverage,
+            provider_compatibility_hash,
+        );
+        checkpoint.mode = ContextCheckpointMode::Manual;
+        let checkpoint_budget =
+            checkpoint_token_budget(active_provider.resolved_context_window_tokens());
+        trim_checkpoint_to_budget(&mut checkpoint, checkpoint_budget);
+        let rendered = render_context_checkpoint(&checkpoint);
+        let checkpoint_tokens = estimate_tokens(&rendered);
+        if checkpoint_tokens > checkpoint_budget {
+            return Err(ApiError::bad_request(format!(
+                "manual checkpoint exceeds its token budget ({checkpoint_tokens} > {checkpoint_budget})"
+            )));
+        }
         let mut summary =
-            ContextSummary::new(thread_id, covered_through_seq, messages.len(), summary_text);
+            ContextSummary::new(thread_id, covered_through_seq, messages.len(), rendered);
+        summary.token_estimate = Some(checkpoint_tokens);
+        summary.metadata = json!({
+            "mode": "manual",
+            "source": "context_compact_api_structured",
+            "checkpointId": checkpoint.id,
+            "checkpointTokens": checkpoint_tokens,
+            "checkpointBudgetTokens": checkpoint_budget,
+            "inputTokens": checkpoint_tokens,
+            "tokenReductionPercent": 0,
+            "latencyMs": 0,
+            "factRetentionPercent": 100,
+            "activeConstraintRetentionPercent": 100,
+            "coveredThroughSeq": covered_through_seq,
+            "coveredMessageCount": messages.len(),
+        });
+        summary.checkpoint = Some(checkpoint);
+        summary
+    } else if let Some(summary_text) = supplied_summary {
+        let previous_checkpoint_id = previous_summary
+            .as_ref()
+            .and_then(|summary| summary.checkpoint.as_ref())
+            .map(|checkpoint| checkpoint.id);
+        let mut summary = ContextSummary::new(
+            thread_id,
+            covered_through_seq,
+            messages.len(),
+            &summary_text,
+        );
+        let mut checkpoint = ContextCheckpoint::manual(thread_id, coverage, summary_text);
+        checkpoint.previous_checkpoint_id = previous_checkpoint_id;
+        let checkpoint_budget = checkpoint_token_budget(context_window_tokens(&state));
+        trim_checkpoint_to_budget(&mut checkpoint, checkpoint_budget);
+        let checkpoint_tokens = checkpoint_token_estimate(&checkpoint);
+        if checkpoint_tokens > checkpoint_budget {
+            return Err(ApiError::bad_request(format!(
+                "manual summary exceeds its checkpoint token budget ({checkpoint_tokens} > {checkpoint_budget})"
+            )));
+        }
+        summary.checkpoint = Some(checkpoint);
         summary.token_estimate = Some(estimate_tokens(&summary.summary));
         summary.metadata = json!({
             "mode": "manual",
             "source": "context_compact_api",
+            "checkpointTokens": checkpoint_tokens,
+            "checkpointBudgetTokens": checkpoint_budget,
+            "inputTokens": estimate_tokens(&summary.summary),
+            "tokenReductionPercent": 0,
+            "latencyMs": 0,
+            "factRetentionPercent": 100,
+            "activeConstraintRetentionPercent": 100,
             "coveredThroughSeq": covered_through_seq,
             "coveredMessageCount": messages.len(),
         });
         summary
     } else {
-        generate_context_summary(&state, thread_id, &messages, &events, "context_compact_api")
-            .await?
+        generate_context_summary(
+            &state,
+            thread_id,
+            &messages,
+            &events,
+            "context_compact_api",
+            None,
+        )
+        .await?
     };
 
     publish_payload(
@@ -3444,6 +3591,7 @@ async fn compact_context(
         Some(Uuid::new_v4()),
         AgentEventPayload::ContextCompacted {
             summary: summary.clone(),
+            details: Some(context_compaction_details(&state, thread_id, &summary)),
         },
     );
     Ok(Json(summary))
@@ -5466,6 +5614,14 @@ async fn run_new_agent_turn(
             return;
         }
     };
+    publish_payload(
+        &state,
+        thread_id,
+        Some(turn_id),
+        AgentEventPayload::ContextProjectionBuilt {
+            projection: prepared.projection.clone(),
+        },
+    );
     let input = AgentTurnInput {
         thread_id,
         user_message_id: user_message.id,
@@ -5477,7 +5633,21 @@ async fn run_new_agent_turn(
         permission_mode: settings.permission_mode,
         context_budget: Some(prepared.budget),
         provider_cursor: match take_provider_cursor(&state.store, &settings, thread_id, "/root") {
-            Ok(cursor) => cursor,
+            Ok(taken) => {
+                if let Some(invalidation) = taken.invalidation {
+                    publish_payload(
+                        &state,
+                        thread_id,
+                        Some(turn_id),
+                        AgentEventPayload::ProviderContextStateInvalidated {
+                            provider_id: Some(invalidation.provider_id),
+                            model: Some(invalidation.model),
+                            reason: invalidation.reason,
+                        },
+                    );
+                }
+                taken.cursor
+            }
             Err(error) => {
                 let message = format!("failed to load provider conversation state: {error}");
                 publish_payload(
@@ -5594,6 +5764,9 @@ async fn run_new_agent_turn(
     let continuation_persistence = persist_suspended_continuation(&state, thread_id, &result);
     let provider_state_persistence =
         persist_provider_cursor(&state.store, &settings, thread_id, "/root", &result);
+    if let Ok(Some(persisted)) = &provider_state_persistence {
+        publish_persisted_provider_context(&state, thread_id, turn_id, persisted);
+    }
     for payload in deferred_approval_events {
         publish_payload(&state, thread_id, Some(turn_id), payload);
     }
@@ -5788,6 +5961,9 @@ async fn run_resumed_agent_turn(
     let continuation_persistence = persist_suspended_continuation(&state, thread_id, &result);
     let provider_state_persistence =
         persist_provider_cursor(&state.store, &settings, thread_id, "/root", &result);
+    if let Ok(Some(persisted)) = &provider_state_persistence {
+        publish_persisted_provider_context(&state, thread_id, turn_id, persisted);
+    }
     for payload in deferred_approval_events {
         publish_payload(&state, thread_id, Some(turn_id), payload);
     }
@@ -5878,7 +6054,20 @@ fn finish_agent_result(
 
 fn provider_state_enabled(settings: &AppSettings) -> bool {
     let provider = settings.active_provider();
-    provider.kind == ProviderKind::OpenAiResponses && provider.store_responses
+    let capabilities = provider.capabilities();
+    provider.kind == ProviderKind::OpenAiResponses
+        && (capabilities.supports_response_state || capabilities.supports_native_compaction)
+}
+
+struct TakenProviderCursor {
+    cursor: Option<ProviderConversationCursor>,
+    invalidation: Option<ProviderStateInvalidation>,
+}
+
+struct ProviderStateInvalidation {
+    provider_id: String,
+    model: String,
+    reason: String,
 }
 
 fn take_provider_cursor(
@@ -5886,18 +6075,48 @@ fn take_provider_cursor(
     settings: &AppSettings,
     thread_id: Uuid,
     agent_path: &str,
-) -> anyhow::Result<Option<ProviderConversationCursor>> {
+) -> anyhow::Result<TakenProviderCursor> {
     let state = store.take_provider_conversation_state(thread_id, agent_path)?;
+    let Some(state) = state else {
+        return Ok(TakenProviderCursor {
+            cursor: None,
+            invalidation: None,
+        });
+    };
     if !provider_state_enabled(settings) {
-        return Ok(None);
+        return Ok(TakenProviderCursor {
+            cursor: None,
+            invalidation: Some(ProviderStateInvalidation {
+                provider_id: state.provider_id,
+                model: state.model,
+                reason: "active provider protocol does not support persisted response state; rebuilt from the local checkpoint and recent history".to_string(),
+            }),
+        });
     }
     let provider = settings.active_provider();
-    Ok(state
-        .filter(|state| state.provider_id == provider.id && state.model == provider.model)
-        .map(|state| ProviderConversationCursor {
+    if state.provider_id != provider.id || state.model != provider.model {
+        return Ok(TakenProviderCursor {
+            cursor: None,
+            invalidation: Some(ProviderStateInvalidation {
+                provider_id: state.provider_id,
+                model: state.model,
+                reason: format!(
+                    "provider or model changed to '{}'/'{}'; rebuilt from the local checkpoint and recent history",
+                    provider.id, provider.model
+                ),
+            }),
+        });
+    }
+    Ok(TakenProviderCursor {
+        cursor: Some(ProviderConversationCursor {
             response_id: state.response_id,
             compatibility_hash: state.compatibility_hash,
-        }))
+            response_items: state.response_items,
+            state_kind: state.state_kind,
+            compaction_item_count: state.compaction_item_count,
+        }),
+        invalidation: None,
+    })
 }
 
 fn persist_provider_cursor(
@@ -5906,29 +6125,172 @@ fn persist_provider_cursor(
     thread_id: Uuid,
     agent_path: &str,
     result: &anyhow::Result<opentopia_core::AgentTurnResult>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<PersistedProviderCursor>> {
     if !provider_state_enabled(settings) {
-        return Ok(());
+        return Ok(None);
     }
     let Ok(result) = result else {
-        return Ok(());
+        return Ok(None);
     };
     if !matches!(result.outcome, AgentTurnOutcome::Completed) {
-        return Ok(());
+        return Ok(None);
     }
     let Some(cursor) = result.provider_cursor.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let provider = settings.active_provider();
-    store.save_provider_conversation_state(&ProviderConversationState {
+    let native_checkpoint = build_native_provider_checkpoint(store, settings, thread_id, cursor)?;
+    let checkpoint_id = native_checkpoint
+        .as_ref()
+        .and_then(|summary| summary.checkpoint.as_ref())
+        .map(|checkpoint| checkpoint.id)
+        .or_else(|| {
+            store
+                .list_events(thread_id, None)
+                .ok()
+                .and_then(|events| latest_context_summary_event(&events))
+                .and_then(|summary| summary.checkpoint.map(|checkpoint| checkpoint.id))
+        });
+    let state = ProviderConversationState {
         thread_id,
         agent_path: agent_path.to_string(),
         provider_id: provider.id.clone(),
         model: provider.model.clone(),
         response_id: cursor.response_id.clone(),
         compatibility_hash: cursor.compatibility_hash.clone(),
+        response_items: cursor.response_items.clone(),
+        state_kind: cursor.state_kind.clone(),
+        compaction_item_count: cursor.compaction_item_count,
+        checkpoint_id,
         updated_at: Utc::now(),
-    })
+    };
+    store.save_provider_conversation_state(&state)?;
+    Ok(Some(PersistedProviderCursor {
+        state,
+        native_checkpoint,
+    }))
+}
+
+struct PersistedProviderCursor {
+    state: ProviderConversationState,
+    native_checkpoint: Option<ContextSummary>,
+}
+
+fn publish_persisted_provider_context(
+    app_state: &AppState,
+    thread_id: Uuid,
+    turn_id: Uuid,
+    persisted: &PersistedProviderCursor,
+) {
+    if let Some(summary) = &persisted.native_checkpoint {
+        publish_payload(
+            app_state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::ContextCompacted {
+                summary: summary.clone(),
+                details: Some(context_compaction_details(app_state, thread_id, summary)),
+            },
+        );
+    }
+    let provider_state = &persisted.state;
+    publish_payload(
+        app_state,
+        thread_id,
+        Some(turn_id),
+        AgentEventPayload::ProviderContextStateUpdated {
+            provider_id: provider_state.provider_id.clone(),
+            model: provider_state.model.clone(),
+            state_kind: provider_state.state_kind.as_str().to_string(),
+            response_item_count: provider_state.response_items.len(),
+            compaction_item_count: provider_state.compaction_item_count,
+        },
+    );
+}
+
+fn build_native_provider_checkpoint(
+    store: &SqliteSessionStore,
+    settings: &AppSettings,
+    thread_id: Uuid,
+    cursor: &ProviderConversationCursor,
+) -> anyhow::Result<Option<ContextSummary>> {
+    if cursor.compaction_item_count == 0 {
+        return Ok(None);
+    }
+    let events = store.list_events(thread_id, None)?;
+    let previous_summary = latest_context_summary_event(&events);
+    let provider_state_fingerprint = content_fingerprint(&serde_json::to_vec(&(
+        &cursor.response_id,
+        &cursor.response_items,
+        &cursor.compatibility_hash,
+    ))?);
+    let prior_native_fingerprint = previous_summary
+        .as_ref()
+        .and_then(|summary| summary.metadata.get("nativeProviderStateFingerprint"))
+        .and_then(Value::as_str);
+    if prior_native_fingerprint == Some(provider_state_fingerprint.as_str()) {
+        return Ok(None);
+    }
+
+    let messages = store.list_messages(thread_id)?;
+    let previous_checkpoint = previous_summary
+        .as_ref()
+        .and_then(|summary| summary.checkpoint.as_ref());
+    let fallback_goal = previous_summary
+        .as_ref()
+        .map(|summary| summary.summary.clone())
+        .or_else(|| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::User)
+                .map(render_message_for_summary)
+        })
+        .unwrap_or_else(|| "Continue the active thread from durable local history.".to_string());
+    let fallback_coverage = previous_summary
+        .as_ref()
+        .map(|summary| ContextCheckpointCoverage {
+            through_seq: summary.covered_through_seq,
+            through_message_count: summary_message_cursor(summary),
+        })
+        .unwrap_or_default();
+    let mut checkpoint = previous_checkpoint
+        .cloned()
+        .unwrap_or_else(|| ContextCheckpoint::manual(thread_id, fallback_coverage, fallback_goal));
+    checkpoint.previous_checkpoint_id = previous_checkpoint.map(|checkpoint| checkpoint.id);
+    checkpoint.id = Uuid::new_v4();
+    checkpoint.mode = ContextCheckpointMode::NativeProvider;
+    checkpoint.provider_compatibility_hash = Some(cursor.compatibility_hash.clone());
+    checkpoint.created_at = Utc::now();
+    let checkpoint_tokens = checkpoint_token_estimate(&checkpoint);
+    let mut summary = ContextSummary::new(
+        thread_id,
+        checkpoint.coverage.through_seq,
+        checkpoint.coverage.through_message_count,
+        render_context_checkpoint(&checkpoint),
+    );
+    summary.token_estimate = Some(checkpoint_tokens);
+    summary.metadata = json!({
+        "mode": "native_provider",
+        "source": "provider_native_compaction",
+        "providerId": settings.active_provider().id,
+        "model": settings.active_provider().model,
+        "checkpointId": checkpoint.id,
+        "checkpointTokens": checkpoint_tokens,
+        "inputTokens": 0,
+        "tokenReductionPercent": 0,
+        "latencyMs": 0,
+        "factRetentionPercent": 100,
+        "activeConstraintRetentionPercent": 100,
+        "nativeCompactionItemCount": cursor.compaction_item_count,
+        "nativeProviderStateFingerprint": provider_state_fingerprint,
+        "providerResponseIdPresent": !cursor.response_id.is_empty(),
+        "observedThroughSeq": events.last().map(|event| event.seq).unwrap_or_default(),
+        "coveredThroughSeq": checkpoint.coverage.through_seq,
+        "coveredMessageCount": checkpoint.coverage.through_message_count,
+    });
+    summary.checkpoint = Some(checkpoint);
+    Ok(Some(summary))
 }
 
 fn persist_suspended_continuation(
@@ -6097,6 +6459,7 @@ struct PreparedTurnContext {
     summary: Option<String>,
     conversation: Vec<ModelConversationMessage>,
     budget: AgentContextBudget,
+    projection: ContextProjection,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6601,53 +6964,113 @@ async fn prepare_turn_context(
         .map(|plan| estimate_tokens(&plan.render_for_model()))
         .unwrap_or_default();
     let prior_messages = prior_messages_for_turn(&messages, current_message_id)?;
-    let covered = summary
+    let mut covered = summary
         .as_ref()
         .map(summary_message_cursor)
         .unwrap_or_default()
         .min(prior_messages.len());
+    let mut covered_seq = summary
+        .as_ref()
+        .map(|summary| summary.covered_through_seq)
+        .unwrap_or_default();
+    let target_seq = events.last().map(|event| event.seq).unwrap_or_default();
     let unsummarized_tokens = prior_messages
         .iter()
         .skip(covered)
         .map(message_token_estimate)
         .sum::<usize>();
+    let projected_recent_tail_tokens = summary
+        .as_ref()
+        .map(|_| {
+            recent_conversation_tail(
+                &prior_messages,
+                (context_window_tokens(state) / 10).clamp(2_048, 16_384),
+            )
+            .1
+        })
+        .unwrap_or_default();
     let summary_tokens = summary
         .as_ref()
         .map(|summary| estimate_tokens(&summary.summary))
         .unwrap_or_default()
         .saturating_add(active_plan_tokens);
-    let context_window = context_window_tokens(state);
+    let settings = current_settings(state);
+    let active_provider = settings.active_provider();
+    let context_window = active_provider.resolved_context_window_tokens();
     let usage_percent = reservation
         .fixed_input_tokens
         .saturating_add(reservation.current_input_tokens)
         .saturating_add(reservation.generation_reserve_tokens)
         .saturating_add(summary_tokens)
+        .saturating_add(projected_recent_tail_tokens)
         .saturating_add(unsummarized_tokens)
         .saturating_mul(100)
         / context_window.max(1);
-    if prior_messages.len().saturating_sub(covered) >= 6
-        && usage_percent >= context_compact_threshold_percent()
-        && current_settings(state).active_provider().kind != ProviderKind::Mock
-    {
+    let provider_is_compactable = active_provider.kind != ProviderKind::Mock;
+    let mut compaction_passes = 0usize;
+    loop {
+        let remaining_messages = prior_messages.len().saturating_sub(covered);
+        let remaining_events = events
+            .iter()
+            .filter(|event| event.seq > covered_seq)
+            .count();
+        let soft_trigger = (remaining_messages >= 6 || remaining_events >= 12)
+            && usage_percent >= context_compact_threshold_percent();
+        let catch_up_trigger =
+            compaction_passes > 0 && (remaining_messages > 0 || remaining_events > 0);
+        if !provider_is_compactable
+            || (!soft_trigger && !catch_up_trigger)
+            || compaction_passes >= MAX_CONTEXT_COMPACTION_PASSES
+        {
+            break;
+        }
+        let previous_summary = summary.clone();
         match generate_context_summary(
             state,
             thread_id,
             &prior_messages,
             &events,
             "automatic_threshold",
+            previous_summary.as_ref(),
         )
         .await
         {
             Ok(compacted) => {
+                let next_covered = summary_message_cursor(&compacted);
+                let next_covered_seq = compacted.covered_through_seq;
+                if next_covered <= covered && next_covered_seq <= covered_seq {
+                    publish_payload(
+                        state,
+                        thread_id,
+                        Some(turn_id),
+                        AgentEventPayload::ContextWarning {
+                            stage: "automatic_compaction_stalled".to_string(),
+                            message: "checkpoint coverage did not advance; retaining the previous projection".to_string(),
+                        },
+                    );
+                    break;
+                }
                 publish_payload(
                     state,
                     thread_id,
                     None,
                     AgentEventPayload::ContextCompacted {
                         summary: compacted.clone(),
+                        details: Some(context_compaction_details(state, thread_id, &compacted)),
                     },
                 );
                 summary = Some(compacted);
+                compaction_passes += 1;
+                let new_covered = summary
+                    .as_ref()
+                    .map(summary_message_cursor)
+                    .unwrap_or_default()
+                    .min(prior_messages.len());
+                covered = new_covered;
+                covered_seq = next_covered_seq;
+                if new_covered >= prior_messages.len() && covered_seq >= target_seq {
+                    break;
+                }
             }
             Err(err) => {
                 error!(message = %err.message, "automatic context compaction failed");
@@ -6660,8 +7083,26 @@ async fn prepare_turn_context(
                         message: err.message,
                     },
                 );
+                break;
             }
         }
+    }
+    if compaction_passes >= MAX_CONTEXT_COMPACTION_PASSES
+        && (covered < prior_messages.len() || covered_seq < target_seq)
+    {
+        publish_payload(
+            state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::ContextWarning {
+                stage: "automatic_compaction_pass_limit".to_string(),
+                message: format!(
+                    "automatic compaction stopped after {MAX_CONTEXT_COMPACTION_PASSES} passes with {} messages and {} events still outside checkpoint coverage",
+                    prior_messages.len().saturating_sub(covered),
+                    events.iter().filter(|event| event.seq > covered_seq).count()
+                ),
+            },
+        );
     }
     let covered_messages = summary
         .as_ref()
@@ -6677,26 +7118,43 @@ async fn prepare_turn_context(
         .map(|summary| estimate_tokens(&summary.summary))
         .unwrap_or_default()
         .saturating_add(active_plan_tokens);
-    let mut conversation = Vec::new();
-    for message in prior_messages.iter().skip(covered_messages).rev() {
-        let tokens = message_token_estimate(message).saturating_add(8);
-        let Some(message) = model_conversation_message(message) else {
-            continue;
-        };
-        if history_used.saturating_add(tokens) > history_limit {
-            break;
-        }
-        history_used = history_used.saturating_add(tokens);
-        conversation.push(message);
-    }
-    conversation.reverse();
+    let available_tail_tokens = history_limit.saturating_sub(history_used);
+    let recent_tail_limit = if summary.is_some() {
+        available_tail_tokens.min((context_window / 10).clamp(2_048, 16_384))
+    } else {
+        available_tail_tokens
+    };
+    let tail_messages = if summary.is_some() {
+        &prior_messages[..]
+    } else {
+        &prior_messages[covered_messages..]
+    };
+    let (conversation, recent_tail_tokens) =
+        recent_conversation_tail(tail_messages, recent_tail_limit);
+    history_used = history_used.saturating_add(recent_tail_tokens);
 
     let mut budget = AgentContextBudget::new(context_window);
     budget.record_tokens(reservation.fixed_input_tokens.saturating_add(history_used));
+    let provider_state = state
+        .store
+        .get_provider_conversation_state(thread_id, "/root")?
+        .filter(|provider_state| {
+            provider_state.provider_id == active_provider.id
+                && provider_state.model == active_provider.model
+        });
+    let projection = build_context_projection(
+        summary.as_ref(),
+        prior_messages.len(),
+        &events,
+        recent_tail_tokens,
+        active_provider,
+        provider_state.as_ref(),
+    );
     Ok(PreparedTurnContext {
         summary: durable_context(summary.map(|summary| summary.summary), active_plan.as_ref()),
         conversation,
         budget,
+        projection,
     })
 }
 
@@ -6725,15 +7183,20 @@ fn model_conversation_message(message: &Message) -> Option<ModelConversationMess
         .parts
         .iter()
         .filter_map(|part| match part {
-            MessagePart::Text { text } => Some(text.clone()),
+            MessagePart::Text { text } => Some(truncate_chars(text, 24_000)),
             MessagePart::ToolCall { call } => Some(format!(
                 "Tool call `{}` with input {}",
                 call.name, call.input
             )),
-            MessagePart::ToolResult { result } => Some(format!(
-                "Tool result for call {} follows as typed content.",
-                result.call_id
-            )),
+            MessagePart::ToolResult { result } => {
+                let artifact = historical_tool_artifact_reference(&result.metadata)
+                    .map(|value| format!(" Artifact reference: {value}."))
+                    .unwrap_or_default();
+                Some(format!(
+                    "Tool result for call {} follows as a bounded historical observation.{artifact}",
+                    result.call_id
+                ))
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -6757,7 +7220,10 @@ fn model_conversation_message(message: &Message) -> Option<ModelConversationMess
 
 fn message_model_content_parts(part: &MessagePart) -> Vec<ModelContentPart> {
     match part {
-        MessagePart::ToolResult { result } => result.content_or_legacy_text(),
+        MessagePart::Image {
+            content_type, data, ..
+        } => vec![ModelContentPart::image(content_type.clone(), data.clone())],
+        MessagePart::ToolResult { result } => bounded_historical_tool_content(result),
         MessagePart::SourceRef { source } => vec![ModelContentPart::resource(
             source.path.to_string_lossy(),
             Some(source.content_type.clone()),
@@ -6765,6 +7231,119 @@ fn message_model_content_parts(part: &MessagePart) -> Vec<ModelContentPart> {
         )],
         _ => Vec::new(),
     }
+}
+
+fn bounded_historical_tool_content(result: &ToolResult) -> Vec<ModelContentPart> {
+    const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+    let mut remaining = MAX_TOOL_RESULT_CHARS;
+    let mut bounded = Vec::new();
+    for part in result.content_or_legacy_text() {
+        if remaining == 0 {
+            break;
+        }
+        match part {
+            ModelContentPart::Text { text } => {
+                let excerpt = truncate_chars(&text, remaining);
+                remaining = remaining.saturating_sub(excerpt.chars().count());
+                bounded.push(ModelContentPart::text(excerpt));
+            }
+            ModelContentPart::Json { value } => {
+                let rendered = value.to_string();
+                if rendered.chars().count() <= remaining {
+                    remaining = remaining.saturating_sub(rendered.chars().count());
+                    bounded.push(ModelContentPart::json(value));
+                } else {
+                    let excerpt = truncate_chars(&rendered, remaining);
+                    remaining = 0;
+                    bounded.push(ModelContentPart::text(format!(
+                        "Truncated JSON tool output: {excerpt}"
+                    )));
+                }
+            }
+            ModelContentPart::Image { .. } => bounded.push(ModelContentPart::text(
+                "Historical image tool output omitted; reopen the artifact if needed.",
+            )),
+            ModelContentPart::Resource {
+                uri,
+                content_type,
+                name,
+            } => bounded.push(ModelContentPart::resource(uri, content_type, name)),
+        }
+    }
+    if let Some(reference) = historical_tool_artifact_reference(&result.metadata) {
+        bounded.push(ModelContentPart::text(format!(
+            "Full output reference: {reference}"
+        )));
+    }
+    bounded
+}
+
+fn historical_tool_artifact_reference(metadata: &Value) -> Option<String> {
+    ["artifactId", "artifact_id", "outputArtifactId", "path"]
+        .into_iter()
+        .find_map(|key| metadata.get(key))
+        .and_then(|value| match value {
+            Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+}
+
+fn recent_conversation_tail(
+    messages: &[Message],
+    token_budget: usize,
+) -> (Vec<ModelConversationMessage>, usize) {
+    if messages.is_empty() || token_budget == 0 {
+        return (Vec::new(), 0);
+    }
+    let turn_starts = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == MessageRole::User).then_some(index))
+        .collect::<Vec<_>>();
+    if turn_starts.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    let mut selected_turns = Vec::new();
+    let mut used = 0usize;
+    for turn_index in (0..turn_starts.len()).rev() {
+        let start = turn_starts[turn_index];
+        let end = turn_starts
+            .get(turn_index + 1)
+            .copied()
+            .unwrap_or(messages.len());
+        let projected = messages[start..end]
+            .iter()
+            .filter_map(model_conversation_message)
+            .collect::<Vec<_>>();
+        let tokens = projected
+            .iter()
+            .map(model_conversation_message_token_estimate)
+            .sum::<usize>();
+        if projected.is_empty() {
+            continue;
+        }
+        if used.saturating_add(tokens) > token_budget {
+            break;
+        }
+        used = used.saturating_add(tokens);
+        selected_turns.push(projected);
+    }
+    selected_turns.reverse();
+    (selected_turns.into_iter().flatten().collect(), used)
+}
+
+fn model_conversation_message_token_estimate(message: &ModelConversationMessage) -> usize {
+    estimate_tokens(&message.content)
+        .saturating_add(
+            message
+                .content_parts
+                .iter()
+                .map(model_content_part_token_estimate)
+                .sum::<usize>(),
+        )
+        .saturating_add(12)
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -6870,10 +7449,12 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
         if provider.kind != ProviderKind::CodexAppServer && provider.model.trim().is_empty() {
             return Err(ApiError::bad_request("provider model cannot be empty"));
         }
-        if !provider.temperature.is_finite() || !(0.0..=2.0).contains(&provider.temperature) {
-            return Err(ApiError::bad_request(
-                "provider temperature must be between 0 and 2",
-            ));
+        if let Some(temperature) = provider.temperature {
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                return Err(ApiError::bad_request(
+                    "provider temperature must be between 0 and 2",
+                ));
+            }
         }
         if provider.max_output_tokens == Some(0) {
             return Err(ApiError::bad_request(
@@ -6937,6 +7518,58 @@ fn current_settings(state: &AppState) -> AppSettings {
         .clone()
 }
 
+fn build_context_projection(
+    summary: Option<&ContextSummary>,
+    total_message_count: usize,
+    events: &[AgentEvent],
+    recent_tail_tokens: usize,
+    provider: &ProviderSettings,
+    provider_state: Option<&ProviderConversationState>,
+) -> ContextProjection {
+    let covered_message_count = summary
+        .map(summary_message_cursor)
+        .unwrap_or_default()
+        .min(total_message_count);
+    let covered_through_seq = summary
+        .map(|summary| summary.covered_through_seq)
+        .unwrap_or_default();
+    let capabilities = provider.capabilities();
+    ContextProjection {
+        checkpoint_id: summary
+            .and_then(|summary| summary.checkpoint.as_ref())
+            .map(|checkpoint| checkpoint.id),
+        checkpoint_mode: summary.map(|summary| {
+            summary
+                .metadata
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("legacy_text")
+                .to_string()
+        }),
+        checkpoint_tokens: summary
+            .and_then(|summary| summary.token_estimate)
+            .unwrap_or_default(),
+        covered_through_seq,
+        covered_message_count,
+        unsummarized_message_count: total_message_count.saturating_sub(covered_message_count),
+        unsummarized_event_count: events
+            .iter()
+            .filter(|event| event.seq > covered_through_seq)
+            .count(),
+        recent_tail_tokens,
+        native_compaction_supported: capabilities.supports_native_compaction,
+        provider_state_available: provider_state.is_some(),
+        provider_state_kind: provider_state
+            .map(|provider_state| provider_state.state_kind.as_str().to_string()),
+        provider_item_count: provider_state
+            .map(|provider_state| provider_state.response_items.len())
+            .unwrap_or_default(),
+        native_compaction_item_count: provider_state
+            .map(|provider_state| provider_state.compaction_item_count)
+            .unwrap_or_default(),
+    }
+}
+
 fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResponse, ApiError> {
     let mut budget = state.store.get_context_budget(thread_id)?;
     budget.total_tokens = context_window_tokens(state);
@@ -6949,6 +7582,17 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
     }
     budget.estimated_usage = budget.used_tokens.saturating_mul(100) / budget.total_tokens.max(1);
     let latest_summary = latest_context_summary_event(&events);
+    let messages = state.store.list_messages(thread_id)?;
+    let (_, recent_tail_tokens) =
+        recent_conversation_tail(&messages, (budget.total_tokens / 10).clamp(2_048, 16_384));
+    let active_provider = current_settings(state).active_provider().clone();
+    let provider_state = state
+        .store
+        .get_provider_conversation_state(thread_id, "/root")?
+        .filter(|provider_state| {
+            provider_state.provider_id == active_provider.id
+                && provider_state.model == active_provider.model
+        });
     let mut usage = ContextUsageMetrics::default();
     for event in &events {
         match &event.payload {
@@ -6971,21 +7615,67 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
                     .reasoning_tokens
                     .saturating_add(reasoning_tokens.unwrap_or_default());
             }
-            AgentEventPayload::ContextCompacted { .. } => usage.compactions += 1,
+            AgentEventPayload::ContextCompacted { details, .. } => {
+                usage.compactions += 1;
+                if let Some(metrics) = details
+                    .as_ref()
+                    .and_then(|details| details.metrics.as_ref())
+                {
+                    usage.compaction_input_tokens = usage
+                        .compaction_input_tokens
+                        .saturating_add(metrics.input_tokens);
+                    usage.checkpoint_tokens = usage
+                        .checkpoint_tokens
+                        .saturating_add(metrics.checkpoint_tokens);
+                    usage.compaction_latency_ms = usage
+                        .compaction_latency_ms
+                        .saturating_add(metrics.latency_ms);
+                    usage.last_fact_retention_percent = metrics.fact_retention_percent;
+                    usage.last_active_constraint_retention_percent =
+                        metrics.active_constraint_retention_percent;
+                }
+            }
+            AgentEventPayload::ProviderResponseReceived { body, .. } => {
+                usage.native_compactions = usage.native_compactions.saturating_add(
+                    body.get("providerItems")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter(|item| {
+                                    item.get("type").and_then(Value::as_str) == Some("compaction")
+                                })
+                                .count()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+            AgentEventPayload::ProviderContextStateInvalidated { .. } => {
+                usage.provider_fallbacks += 1;
+            }
             AgentEventPayload::ContextWarning { .. } => usage.warnings += 1,
             _ => {}
         }
     }
+    let projection = build_context_projection(
+        latest_summary.as_ref(),
+        messages.len(),
+        &events,
+        recent_tail_tokens,
+        &active_provider,
+        provider_state.as_ref(),
+    );
     Ok(ContextStatusResponse {
         budget,
         latest_summary,
         usage,
+        projection,
     })
 }
 
 fn latest_context_summary_event(events: &[AgentEvent]) -> Option<ContextSummary> {
     events.iter().rev().find_map(|event| {
-        if let AgentEventPayload::ContextCompacted { summary } = &event.payload {
+        if let AgentEventPayload::ContextCompacted { summary, .. } = &event.payload {
             Some(summary.clone())
         } else {
             None
@@ -6995,10 +7685,16 @@ fn latest_context_summary_event(events: &[AgentEvent]) -> Option<ContextSummary>
 
 fn summary_message_cursor(summary: &ContextSummary) -> usize {
     summary
-        .metadata
-        .get("coveredMessageCount")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.coverage.through_message_count)
+        .or_else(|| {
+            summary
+                .metadata
+                .get("coveredMessageCount")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+        })
         .or_else(|| {
             (summary.metadata.get("mode").and_then(Value::as_str) == Some("manual"))
                 .then_some(summary.message_count)
@@ -7033,6 +7729,7 @@ async fn generate_context_summary(
     messages: &[Message],
     events: &[AgentEvent],
     source: &str,
+    previous_summary_override: Option<&ContextSummary>,
 ) -> Result<ContextSummary, ApiError> {
     let settings = current_settings(state);
     let active = settings.active_provider().clone();
@@ -7058,8 +7755,17 @@ async fn generate_context_summary(
             active.id
         ))
     })?;
-    let previous_summary = latest_context_summary_event(events);
-    let snapshot = build_context_snapshot(messages, events, previous_summary.as_ref());
+    let previous_summary = previous_summary_override
+        .cloned()
+        .or_else(|| latest_context_summary_event(events));
+    let snapshot = build_context_snapshot_with_limit(
+        messages,
+        events,
+        previous_summary.as_ref(),
+        context_snapshot_char_budget(active.resolved_context_window_tokens()),
+    );
+    let snapshot_input_tokens = estimate_tokens(&snapshot.prompt);
+    let compaction_started = Instant::now();
     let request = ModelRequest {
         system_prompt: context_summary_system_prompt().to_string(),
         conversation: Vec::new(),
@@ -7073,7 +7779,7 @@ async fn generate_context_summary(
         previous_response_id: None,
         branch_developer_instructions: None,
         prompt_cache_key: None,
-        final_output_json_schema: None,
+        final_output_json_schema: Some(context_checkpoint_schema()),
     };
     let request_id = Uuid::new_v4();
     let request_snapshot = serde_json::to_value(&request)
@@ -7165,27 +7871,766 @@ async fn generate_context_summary(
         ));
     }
 
+    let checkpoint_value = parse_checkpoint_response(&response.text)?;
+    let checkpoint_value = redact_model_observation(&checkpoint_value);
+    let mut draft: ContextCheckpointDraft = serde_json::from_value(checkpoint_value)
+        .map_err(|error| ApiError::bad_gateway(format!("invalid checkpoint payload: {error}")))?;
+    sanitize_checkpoint_draft(&mut draft, snapshot.covered_through_seq)?;
+    validate_checkpoint_draft(&draft, events)?;
+    let provider_compatibility_hash = state
+        .store
+        .get_provider_conversation_state(thread_id, "/root")
+        .ok()
+        .flatten()
+        .filter(|provider_state| {
+            provider_state.provider_id == active.id && provider_state.model == active.model
+        })
+        .map(|provider_state| provider_state.compatibility_hash);
+    let mut checkpoint = merge_context_checkpoint(
+        previous_summary
+            .as_ref()
+            .and_then(|summary| summary.checkpoint.as_ref()),
+        draft,
+        thread_id,
+        ContextCheckpointCoverage {
+            through_seq: snapshot.covered_through_seq,
+            through_message_count: snapshot.covered_message_count,
+        },
+        provider_compatibility_hash,
+    );
+    let checkpoint_budget = checkpoint_token_budget(active.resolved_context_window_tokens());
+    trim_checkpoint_to_budget(&mut checkpoint, checkpoint_budget);
+    let checkpoint_tokens =
+        estimate_tokens(&serde_json::to_string(&checkpoint).map_err(|error| {
+            ApiError::internal(format!("checkpoint serialization failed: {error}"))
+        })?);
+    if checkpoint_tokens > checkpoint_budget {
+        return Err(ApiError::bad_gateway(format!(
+            "checkpoint exceeds its token budget ({checkpoint_tokens} > {checkpoint_budget})"
+        )));
+    }
+    let (fact_retention_percent, active_constraint_retention_percent) =
+        checkpoint_retention_percentages(
+            previous_summary
+                .as_ref()
+                .and_then(|summary| summary.checkpoint.as_ref()),
+            &checkpoint,
+        );
+    let rendered_summary = render_context_checkpoint(&checkpoint);
+    let latency_ms = compaction_started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let token_reduction_percent = snapshot_input_tokens
+        .saturating_sub(checkpoint_tokens)
+        .saturating_mul(100)
+        / snapshot_input_tokens.max(1);
+
     let mut summary = ContextSummary::new(
         thread_id,
         snapshot.covered_through_seq,
         snapshot.covered_message_count,
-        response.text.trim(),
+        rendered_summary,
     );
     summary.token_estimate = Some(estimate_tokens(&summary.summary));
     summary.metadata = json!({
-        "mode": "llm",
+        "mode": "structured_local",
+        "schemaVersion": CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+        "checkpointId": checkpoint.id,
+        "checkpointTokens": checkpoint_tokens,
+        "checkpointBudgetTokens": checkpoint_budget,
+        "inputTokens": snapshot_input_tokens,
+        "tokenReductionPercent": token_reduction_percent,
+        "latencyMs": latency_ms,
+        "factRetentionPercent": fact_retention_percent,
+        "activeConstraintRetentionPercent": active_constraint_retention_percent,
         "source": source,
         "providerId": active.id,
         "model": active.model,
         "coveredThroughSeq": snapshot.covered_through_seq,
         "coveredMessageCount": snapshot.covered_message_count,
-        "previousSummaryId": previous_summary.map(|summary| summary.id),
+        "previousSummaryId": previous_summary.as_ref().map(|summary| summary.id),
     });
+    summary.checkpoint = Some(checkpoint);
     Ok(summary)
 }
 
+fn context_compaction_details(
+    state: &AppState,
+    thread_id: Uuid,
+    summary: &ContextSummary,
+) -> ContextCompactionDetails {
+    let checkpoint = summary.checkpoint.as_ref();
+    let number = |key: &str| {
+        summary
+            .metadata
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize
+    };
+    let metrics = summary
+        .metadata
+        .get("source")
+        .and_then(Value::as_str)
+        .map(|source| ContextCompactionMetrics {
+            source: source.to_string(),
+            input_tokens: number("inputTokens"),
+            checkpoint_tokens: number("checkpointTokens")
+                .max(summary.token_estimate.unwrap_or_default()),
+            token_reduction_percent: number("tokenReductionPercent"),
+            latency_ms: summary
+                .metadata
+                .get("latencyMs")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            fact_retention_percent: number("factRetentionPercent"),
+            active_constraint_retention_percent: number("activeConstraintRetentionPercent"),
+        });
+    ContextCompactionDetails {
+        checkpoint_id: checkpoint.map(|checkpoint| checkpoint.id),
+        mode: checkpoint
+            .map(|checkpoint| checkpoint.mode)
+            .unwrap_or(ContextCheckpointMode::LegacyText),
+        coverage: checkpoint
+            .map(|checkpoint| checkpoint.coverage.clone())
+            .unwrap_or(ContextCheckpointCoverage {
+                through_seq: summary.covered_through_seq,
+                through_message_count: summary_message_cursor(summary),
+            }),
+        provider_state_checkpoint_id: state
+            .store
+            .get_provider_conversation_state(thread_id, "/root")
+            .ok()
+            .flatten()
+            .and_then(|provider_state| provider_state.checkpoint_id),
+        metrics,
+    }
+}
+
 fn context_summary_system_prompt() -> &'static str {
-    "You compress an AI coding-agent session into durable working memory. Return only the summary, using short sections: Goal, Decisions, Changes, Commands and validation, Open issues, Next steps. Preserve exact file paths, commands, errors, identifiers, user constraints, and unresolved risks. Omit greetings, repetition, transient progress narration, and secrets. Never invent completed work."
+    "You merge an AI coding-agent session into a durable structured checkpoint. Return only JSON matching the supplied schema. The server deterministically merges entries by stable id or natural key, so unchanged entries from the previous checkpoint may be omitted. Include every new or changed fact needed to update it. Preserve exact file paths, commands, errors, identifiers, active user constraints, unresolved risks, pending interactions, and artifact references. Source sequence numbers must refer only to supplied event seq values. Mark resolved or superseded facts explicitly instead of silently deleting them. Omit greetings, repetition, transient progress narration, large raw tool output, and secrets. Never claim unfinished work or failed validation is completed."
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextCheckpointDraft {
+    goal: String,
+    #[serde(default)]
+    user_constraints: Vec<ContextCheckpointFact>,
+    #[serde(default)]
+    decisions: Vec<ContextCheckpointFact>,
+    #[serde(default)]
+    workspace_state: ContextCheckpointWorkspace,
+    #[serde(default)]
+    commands_and_validation: Vec<ContextCheckpointCommand>,
+    #[serde(default)]
+    open_issues: Vec<ContextCheckpointFact>,
+    #[serde(default)]
+    next_steps: Vec<ContextCheckpointStep>,
+    #[serde(default)]
+    pending_interactions: Vec<ContextCheckpointInteraction>,
+    #[serde(default)]
+    artifacts: Vec<ContextCheckpointArtifact>,
+}
+
+fn context_checkpoint_schema() -> Value {
+    let source_seqs = json!({
+        "type": "array",
+        "items": { "type": "integer", "minimum": 1 },
+        "maxItems": 32
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "goal", "userConstraints", "decisions", "workspaceState",
+            "commandsAndValidation", "openIssues", "nextSteps",
+            "pendingInteractions", "artifacts"
+        ],
+        "properties": {
+            "goal": { "type": "string", "maxLength": 12000 },
+            "userConstraints": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/fact" } },
+            "decisions": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/fact" } },
+            "workspaceState": { "$ref": "#/$defs/workspace" },
+            "commandsAndValidation": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/command" } },
+            "openIssues": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/fact" } },
+            "nextSteps": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/step" } },
+            "pendingInteractions": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/interaction" } },
+            "artifacts": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/artifact" } }
+        },
+        "$defs": {
+            "fact": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "text", "status", "sourceSeqs", "confidence"],
+                "properties": {
+                    "id": { "type": "string", "maxLength": 160 },
+                    "text": { "type": "string", "maxLength": 4000 },
+                    "status": { "type": "string", "enum": ["active", "resolved", "superseded"] },
+                    "sourceSeqs": source_seqs.clone(),
+                    "confidence": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }
+                }
+            },
+            "file": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["path", "status", "summary", "sourceSeqs"],
+                "properties": {
+                    "path": { "type": "string", "maxLength": 2000 },
+                    "status": { "type": "string", "maxLength": 160 },
+                    "summary": { "type": "string", "maxLength": 4000 },
+                    "sourceSeqs": source_seqs.clone()
+                }
+            },
+            "workspace": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["branch", "gitStatus", "filesChanged"],
+                "properties": {
+                    "branch": { "type": ["string", "null"], "maxLength": 500 },
+                    "gitStatus": { "type": ["string", "null"], "maxLength": 4000 },
+                    "filesChanged": { "type": "array", "maxItems": 160, "items": { "$ref": "#/$defs/file" } }
+                }
+            },
+            "command": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["command", "outcome", "summary", "sourceSeqs"],
+                "properties": {
+                    "command": { "type": "string", "maxLength": 4000 },
+                    "outcome": { "type": "string", "maxLength": 160 },
+                    "summary": { "type": "string", "maxLength": 4000 },
+                    "sourceSeqs": source_seqs.clone()
+                }
+            },
+            "step": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "text", "status", "sourceSeqs"],
+                "properties": {
+                    "id": { "type": "string", "maxLength": 160 },
+                    "text": { "type": "string", "maxLength": 4000 },
+                    "status": { "type": "string", "maxLength": 160 },
+                    "sourceSeqs": source_seqs.clone()
+                }
+            },
+            "interaction": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "summary", "sourceSeqs"],
+                "properties": {
+                    "kind": { "type": "string", "maxLength": 160 },
+                    "summary": { "type": "string", "maxLength": 4000 },
+                    "sourceSeqs": source_seqs.clone()
+                }
+            },
+            "artifact": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "path", "kind", "summary", "sourceSeqs"],
+                "properties": {
+                    "id": { "type": ["string", "null"], "format": "uuid" },
+                    "path": { "type": ["string", "null"], "maxLength": 2000 },
+                    "kind": { "type": "string", "maxLength": 160 },
+                    "summary": { "type": "string", "maxLength": 4000 },
+                    "sourceSeqs": source_seqs
+                }
+            }
+        }
+    })
+}
+
+fn parse_checkpoint_response(text: &str) -> Result<Value, ApiError> {
+    let mut candidate = text.trim();
+    if candidate.starts_with("```") {
+        candidate = candidate
+            .split_once('\n')
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        candidate = candidate
+            .strip_suffix("```")
+            .map(str::trim)
+            .unwrap_or(candidate);
+    }
+    serde_json::from_str(candidate)
+        .map_err(|error| ApiError::bad_gateway(format!("checkpoint response is not JSON: {error}")))
+}
+
+fn sanitize_checkpoint_draft(
+    draft: &mut ContextCheckpointDraft,
+    covered_through_seq: i64,
+) -> Result<(), ApiError> {
+    draft.goal = truncate_chars(draft.goal.trim(), 12_000);
+    if draft.goal.is_empty() {
+        return Err(ApiError::bad_gateway("checkpoint goal cannot be empty"));
+    }
+    draft.user_constraints.truncate(96);
+    draft.decisions.truncate(96);
+    draft.commands_and_validation.truncate(96);
+    draft.open_issues.truncate(96);
+    draft.next_steps.truncate(64);
+    draft.pending_interactions.truncate(64);
+    draft.artifacts.truncate(96);
+    draft.workspace_state.files_changed.truncate(160);
+
+    for fact in draft
+        .user_constraints
+        .iter_mut()
+        .chain(draft.decisions.iter_mut())
+        .chain(draft.open_issues.iter_mut())
+    {
+        fact.id = truncate_chars(fact.id.trim(), 160);
+        fact.text = truncate_chars(fact.text.trim(), 4_000);
+        fact.confidence = fact.confidence.map(|value| value.min(100));
+        sanitize_source_seqs(&mut fact.source_seqs, covered_through_seq);
+        if fact.id.is_empty() || fact.text.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "checkpoint facts require non-empty id and text",
+            ));
+        }
+    }
+    for file in &mut draft.workspace_state.files_changed {
+        file.status = truncate_chars(file.status.trim(), 160);
+        file.summary = truncate_chars(file.summary.trim(), 4_000);
+        sanitize_source_seqs(&mut file.source_seqs, covered_through_seq);
+        if file.path.as_os_str().is_empty() {
+            return Err(ApiError::bad_gateway(
+                "checkpoint file entries require a path",
+            ));
+        }
+    }
+    for command in &mut draft.commands_and_validation {
+        command.command = truncate_chars(command.command.trim(), 4_000);
+        command.outcome = truncate_chars(command.outcome.trim(), 160);
+        command.summary = truncate_chars(command.summary.trim(), 4_000);
+        sanitize_source_seqs(&mut command.source_seqs, covered_through_seq);
+        if command.command.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "checkpoint command entries require a command",
+            ));
+        }
+    }
+    for step in &mut draft.next_steps {
+        step.id = truncate_chars(step.id.trim(), 160);
+        step.text = truncate_chars(step.text.trim(), 4_000);
+        step.status = truncate_chars(step.status.trim(), 160);
+        sanitize_source_seqs(&mut step.source_seqs, covered_through_seq);
+        if step.id.is_empty() || step.text.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "checkpoint steps require non-empty id and text",
+            ));
+        }
+    }
+    for interaction in &mut draft.pending_interactions {
+        interaction.kind = truncate_chars(interaction.kind.trim(), 160);
+        interaction.summary = truncate_chars(interaction.summary.trim(), 4_000);
+        sanitize_source_seqs(&mut interaction.source_seqs, covered_through_seq);
+        if interaction.kind.is_empty() || interaction.summary.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "checkpoint interactions require non-empty kind and summary",
+            ));
+        }
+    }
+    for artifact in &mut draft.artifacts {
+        artifact.kind = truncate_chars(artifact.kind.trim(), 160);
+        artifact.summary = truncate_chars(artifact.summary.trim(), 4_000);
+        sanitize_source_seqs(&mut artifact.source_seqs, covered_through_seq);
+        if artifact.kind.is_empty() || artifact.summary.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "checkpoint artifacts require non-empty kind and summary",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_source_seqs(source_seqs: &mut Vec<i64>, covered_through_seq: i64) {
+    source_seqs.retain(|seq| *seq > 0 && *seq <= covered_through_seq);
+    source_seqs.sort_unstable();
+    source_seqs.dedup();
+    source_seqs.truncate(32);
+}
+
+fn validate_checkpoint_draft(
+    draft: &ContextCheckpointDraft,
+    events: &[AgentEvent],
+) -> Result<(), ApiError> {
+    let mut command_by_call = HashMap::<Uuid, String>::new();
+    let mut command_success = HashMap::<String, bool>::new();
+    for event in events {
+        match &event.payload {
+            AgentEventPayload::ToolCallStarted { call } => {
+                if let Some(command) = call
+                    .input
+                    .get("cmd")
+                    .or_else(|| call.input.get("command"))
+                    .and_then(Value::as_str)
+                {
+                    command_by_call.insert(call.id, command.trim().to_string());
+                }
+            }
+            AgentEventPayload::ToolCallFinished { result } => {
+                let Some(command) = command_by_call.get(&result.call_id) else {
+                    continue;
+                };
+                let succeeded = result
+                    .metadata
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+                    && result
+                        .metadata
+                        .get("exitCode")
+                        .and_then(Value::as_i64)
+                        .is_none_or(|exit_code| exit_code == 0);
+                command_success.insert(command.clone(), succeeded);
+            }
+            _ => {}
+        }
+    }
+    for command in &draft.commands_and_validation {
+        if checkpoint_status_is_resolved(&command.outcome)
+            && command_success.get(command.command.trim()) == Some(&false)
+        {
+            return Err(ApiError::bad_gateway(format!(
+                "checkpoint incorrectly marks failed command '{}' as successful",
+                command.command
+            )));
+        }
+    }
+    let Some(active_plan) = latest_active_plan_event(events) else {
+        return Ok(());
+    };
+    for step in &draft.next_steps {
+        let Some(runtime_step) = active_plan
+            .steps
+            .iter()
+            .find(|candidate| candidate.id == step.id)
+        else {
+            continue;
+        };
+        if runtime_step.status.is_actionable() && checkpoint_status_is_resolved(&step.status) {
+            return Err(ApiError::bad_gateway(format!(
+                "checkpoint incorrectly marks active plan step '{}' as resolved",
+                step.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_status_is_resolved(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed" | "complete" | "done" | "resolved" | "succeeded" | "passed"
+    )
+}
+
+fn checkpoint_token_budget(context_window: usize) -> usize {
+    (context_window / 10)
+        .clamp(1_024, 16_384)
+        .min((context_window / 4).max(1_024))
+}
+
+fn merge_context_checkpoint(
+    previous: Option<&ContextCheckpoint>,
+    draft: ContextCheckpointDraft,
+    thread_id: Uuid,
+    coverage: ContextCheckpointCoverage,
+    provider_compatibility_hash: Option<String>,
+) -> ContextCheckpoint {
+    let previous_id = previous.map(|checkpoint| checkpoint.id);
+    let mut checkpoint = previous.cloned().unwrap_or_else(|| ContextCheckpoint {
+        id: Uuid::new_v4(),
+        thread_id,
+        schema_version: CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+        mode: ContextCheckpointMode::StructuredLocal,
+        previous_checkpoint_id: None,
+        coverage: ContextCheckpointCoverage::default(),
+        provider_compatibility_hash: None,
+        goal: String::new(),
+        user_constraints: Vec::new(),
+        decisions: Vec::new(),
+        workspace_state: ContextCheckpointWorkspace::default(),
+        commands_and_validation: Vec::new(),
+        open_issues: Vec::new(),
+        next_steps: Vec::new(),
+        pending_interactions: Vec::new(),
+        artifacts: Vec::new(),
+        created_at: Utc::now(),
+    });
+
+    checkpoint.id = Uuid::new_v4();
+    checkpoint.thread_id = thread_id;
+    checkpoint.schema_version = CONTEXT_CHECKPOINT_SCHEMA_VERSION;
+    checkpoint.mode = ContextCheckpointMode::StructuredLocal;
+    checkpoint.previous_checkpoint_id = previous_id;
+    checkpoint.coverage = coverage;
+    checkpoint.provider_compatibility_hash = provider_compatibility_hash
+        .or_else(|| previous.and_then(|checkpoint| checkpoint.provider_compatibility_hash.clone()));
+    checkpoint.created_at = Utc::now();
+    if !draft.goal.trim().is_empty() {
+        checkpoint.goal = draft.goal;
+    }
+
+    checkpoint.user_constraints = merge_checkpoint_entries(
+        checkpoint.user_constraints,
+        draft.user_constraints,
+        |fact| checkpoint_fact_key(fact),
+    );
+    checkpoint.decisions =
+        merge_checkpoint_entries(checkpoint.decisions, draft.decisions, |fact| {
+            checkpoint_fact_key(fact)
+        });
+    checkpoint.open_issues =
+        merge_checkpoint_entries(checkpoint.open_issues, draft.open_issues, |fact| {
+            checkpoint_fact_key(fact)
+        });
+    checkpoint.commands_and_validation = merge_checkpoint_entries(
+        checkpoint.commands_and_validation,
+        draft.commands_and_validation,
+        |command| command.command.trim().to_owned(),
+    );
+    checkpoint.next_steps =
+        merge_checkpoint_entries(checkpoint.next_steps, draft.next_steps, |step| {
+            if step.id.trim().is_empty() {
+                step.text.trim().to_owned()
+            } else {
+                step.id.trim().to_owned()
+            }
+        });
+    checkpoint.pending_interactions = merge_checkpoint_entries(
+        checkpoint.pending_interactions,
+        draft.pending_interactions,
+        |interaction| {
+            format!(
+                "{}\u{0}{}",
+                interaction.kind.trim(),
+                interaction.summary.trim()
+            )
+        },
+    );
+    checkpoint.artifacts =
+        merge_checkpoint_entries(checkpoint.artifacts, draft.artifacts, |artifact| {
+            artifact
+                .id
+                .map(|id| format!("id:{id}"))
+                .or_else(|| {
+                    artifact
+                        .path
+                        .as_ref()
+                        .map(|path| format!("path:{}", path.to_string_lossy()))
+                })
+                .unwrap_or_else(|| {
+                    format!("{}\u{0}{}", artifact.kind.trim(), artifact.summary.trim())
+                })
+        });
+    checkpoint.workspace_state.branch = draft
+        .workspace_state
+        .branch
+        .or(checkpoint.workspace_state.branch);
+    checkpoint.workspace_state.git_status = draft
+        .workspace_state
+        .git_status
+        .or(checkpoint.workspace_state.git_status);
+    checkpoint.workspace_state.files_changed = merge_checkpoint_entries(
+        checkpoint.workspace_state.files_changed,
+        draft.workspace_state.files_changed,
+        |file| file.path.to_string_lossy().into_owned(),
+    );
+    checkpoint
+}
+
+fn checkpoint_fact_key(fact: &ContextCheckpointFact) -> String {
+    if fact.id.trim().is_empty() {
+        fact.text.trim().to_owned()
+    } else {
+        fact.id.trim().to_owned()
+    }
+}
+
+fn checkpoint_retention_percentages(
+    previous: Option<&ContextCheckpoint>,
+    current: &ContextCheckpoint,
+) -> (usize, usize) {
+    let Some(previous) = previous else {
+        return (100, 100);
+    };
+    let previous_keys = checkpoint_retention_keys(previous, false);
+    let current_keys = checkpoint_retention_keys(current, false);
+    let previous_constraints = checkpoint_retention_keys(previous, true);
+    let current_constraints = checkpoint_retention_keys(current, true);
+    (
+        retained_percent(&previous_keys, &current_keys),
+        retained_percent(&previous_constraints, &current_constraints),
+    )
+}
+
+fn checkpoint_retention_keys(
+    checkpoint: &ContextCheckpoint,
+    active_constraints_only: bool,
+) -> HashSet<String> {
+    if active_constraints_only {
+        return checkpoint
+            .user_constraints
+            .iter()
+            .filter(|fact| fact.status == ContextFactStatus::Active)
+            .map(|fact| format!("constraint:{}", checkpoint_fact_key(fact)))
+            .collect();
+    }
+    let mut keys = HashSet::new();
+    for fact in &checkpoint.user_constraints {
+        keys.insert(format!("constraint:{}", checkpoint_fact_key(fact)));
+    }
+    for fact in &checkpoint.decisions {
+        keys.insert(format!("decision:{}", checkpoint_fact_key(fact)));
+    }
+    for fact in &checkpoint.open_issues {
+        keys.insert(format!("issue:{}", checkpoint_fact_key(fact)));
+    }
+    for file in &checkpoint.workspace_state.files_changed {
+        keys.insert(format!("file:{}", file.path.to_string_lossy()));
+    }
+    for command in &checkpoint.commands_and_validation {
+        keys.insert(format!("command:{}", command.command.trim()));
+    }
+    for step in &checkpoint.next_steps {
+        keys.insert(format!("step:{}", step.id.trim()));
+    }
+    for artifact in &checkpoint.artifacts {
+        let key = artifact
+            .id
+            .map(|id| format!("id:{id}"))
+            .or_else(|| {
+                artifact
+                    .path
+                    .as_ref()
+                    .map(|path| format!("path:{}", path.to_string_lossy()))
+            })
+            .unwrap_or_else(|| format!("{}:{}", artifact.kind, artifact.summary));
+        keys.insert(format!("artifact:{key}"));
+    }
+    keys
+}
+
+fn retained_percent(previous: &HashSet<String>, current: &HashSet<String>) -> usize {
+    if previous.is_empty() {
+        return 100;
+    }
+    previous.intersection(current).count().saturating_mul(100) / previous.len()
+}
+
+fn merge_checkpoint_entries<T, F>(previous: Vec<T>, current: Vec<T>, key: F) -> Vec<T>
+where
+    F: Fn(&T) -> String,
+{
+    let mut merged = previous;
+    let mut indexes = merged
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (key(item), index))
+        .collect::<BTreeMap<_, _>>();
+    for item in current {
+        let item_key = key(&item);
+        if let Some(index) = indexes.get(&item_key).copied() {
+            merged[index] = item;
+        } else {
+            indexes.insert(item_key, merged.len());
+            merged.push(item);
+        }
+    }
+    merged
+}
+
+fn trim_checkpoint_to_budget(checkpoint: &mut ContextCheckpoint, token_budget: usize) {
+    if checkpoint_token_estimate(checkpoint) <= token_budget {
+        return;
+    }
+
+    compact_checkpoint_text(checkpoint, 1_000, 4_000);
+    while checkpoint_token_estimate(checkpoint) > token_budget
+        && remove_lowest_priority_checkpoint_entry(checkpoint)
+    {}
+    if checkpoint_token_estimate(checkpoint) > token_budget {
+        compact_checkpoint_text(checkpoint, 400, 2_000);
+        while checkpoint_token_estimate(checkpoint) > token_budget
+            && remove_lowest_priority_checkpoint_entry(checkpoint)
+        {}
+    }
+}
+
+fn checkpoint_token_estimate(checkpoint: &ContextCheckpoint) -> usize {
+    serde_json::to_string(checkpoint)
+        .map(|serialized| estimate_tokens(&serialized))
+        .unwrap_or(usize::MAX)
+}
+
+fn compact_checkpoint_text(
+    checkpoint: &mut ContextCheckpoint,
+    item_char_limit: usize,
+    goal_char_limit: usize,
+) {
+    checkpoint.goal = truncate_chars(&checkpoint.goal, goal_char_limit);
+    checkpoint.workspace_state.git_status = checkpoint
+        .workspace_state
+        .git_status
+        .as_deref()
+        .map(|value| truncate_chars(value, item_char_limit));
+    for fact in checkpoint
+        .user_constraints
+        .iter_mut()
+        .chain(checkpoint.decisions.iter_mut())
+        .chain(checkpoint.open_issues.iter_mut())
+    {
+        fact.text = truncate_chars(&fact.text, item_char_limit);
+    }
+    for file in &mut checkpoint.workspace_state.files_changed {
+        file.summary = truncate_chars(&file.summary, item_char_limit);
+    }
+    for command in &mut checkpoint.commands_and_validation {
+        command.command = truncate_chars(&command.command, item_char_limit);
+        command.summary = truncate_chars(&command.summary, item_char_limit);
+    }
+    for step in &mut checkpoint.next_steps {
+        step.text = truncate_chars(&step.text, item_char_limit);
+    }
+    for interaction in &mut checkpoint.pending_interactions {
+        interaction.summary = truncate_chars(&interaction.summary, item_char_limit);
+    }
+    for artifact in &mut checkpoint.artifacts {
+        artifact.summary = truncate_chars(&artifact.summary, item_char_limit);
+    }
+}
+
+fn remove_lowest_priority_checkpoint_entry(checkpoint: &mut ContextCheckpoint) -> bool {
+    if checkpoint.artifacts.pop().is_some() {
+        return true;
+    }
+    if remove_inactive_fact(&mut checkpoint.open_issues)
+        || remove_inactive_fact(&mut checkpoint.decisions)
+    {
+        return true;
+    }
+    if checkpoint.pending_interactions.pop().is_some() {
+        return true;
+    }
+    false
+}
+
+fn remove_inactive_fact(facts: &mut Vec<ContextCheckpointFact>) -> bool {
+    let Some(index) = facts
+        .iter()
+        .rposition(|fact| fact.status != ContextFactStatus::Active)
+    else {
+        return false;
+    };
+    facts.remove(index);
+    true
+}
+
+fn render_context_checkpoint(checkpoint: &ContextCheckpoint) -> String {
+    serde_json::to_string_pretty(checkpoint)
+        .unwrap_or_else(|_| format!("{{\"goal\":{}}}", json!(checkpoint.goal)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7195,12 +8640,22 @@ struct ContextSnapshotInput {
     covered_through_seq: i64,
 }
 
+#[cfg(test)]
 fn build_context_snapshot(
     messages: &[Message],
     events: &[AgentEvent],
     previous_summary: Option<&ContextSummary>,
 ) -> ContextSnapshotInput {
-    const MAX_SNAPSHOT_CHARS: usize = 96_000;
+    build_context_snapshot_with_limit(messages, events, previous_summary, 96_000)
+}
+
+fn build_context_snapshot_with_limit(
+    messages: &[Message],
+    events: &[AgentEvent],
+    previous_summary: Option<&ContextSummary>,
+    max_snapshot_chars: usize,
+) -> ContextSnapshotInput {
+    let max_snapshot_chars = max_snapshot_chars.max(2_048);
     let mut sections = Vec::new();
     let mut used = 0usize;
     let message_cursor = previous_summary
@@ -7212,9 +8667,14 @@ fn build_context_snapshot(
         .unwrap_or_default();
 
     if let Some(previous) = previous_summary {
+        let previous_state = previous
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| serde_json::to_string(checkpoint).ok())
+            .unwrap_or_else(|| previous.summary.clone());
         let rendered = format!(
-            "PREVIOUS DURABLE SUMMARY (continue from this; do not discard unresolved facts)\n{}",
-            truncate_chars(&previous.summary, MAX_SNAPSHOT_CHARS / 4)
+            "PREVIOUS DURABLE CHECKPOINT (merge with new evidence; preserve unresolved facts and statuses)\n{}",
+            truncate_chars(&previous_state, max_snapshot_chars / 4)
         );
         used = rendered.chars().count();
         sections.push(rendered);
@@ -7222,9 +8682,9 @@ fn build_context_snapshot(
 
     let mut covered_message_count = message_cursor;
     for message in messages.iter().skip(message_cursor) {
-        let rendered = truncate_chars(&render_message_for_summary(message), MAX_SNAPSHOT_CHARS / 2);
+        let rendered = truncate_chars(&render_message_for_summary(message), max_snapshot_chars / 2);
         let chars = rendered.chars().count();
-        let remaining = MAX_SNAPSHOT_CHARS.saturating_sub(used);
+        let remaining = max_snapshot_chars.saturating_sub(used);
         if remaining == 0 || chars > remaining {
             break;
         }
@@ -7249,9 +8709,12 @@ fn build_context_snapshot(
             | AgentEventPayload::ProviderRequestRetried { .. }
             | AgentEventPayload::ProviderResponseReceived { .. }
             | AgentEventPayload::ModelDelta { .. }
+            | AgentEventPayload::ReasoningDelta { .. }
             | AgentEventPayload::AssistantMessage { .. }
             | AgentEventPayload::TurnStarted { .. }
             | AgentEventPayload::ContextCompacted { .. }
+            | AgentEventPayload::ContextProjectionBuilt { .. }
+            | AgentEventPayload::ProviderContextStateUpdated { .. }
             | AgentEventPayload::ContextWarning { .. } => {
                 covered_through_seq = event.seq;
                 continue;
@@ -7261,7 +8724,7 @@ fn build_context_snapshot(
         };
         let line = format!("seq={} {}", event.seq, truncate_chars(&rendered, 2_000));
         let line_chars = line.chars().count();
-        if used.saturating_add(line_chars) > MAX_SNAPSHOT_CHARS {
+        if used.saturating_add(line_chars) > max_snapshot_chars {
             break;
         }
         used = used.saturating_add(line_chars);
@@ -7280,21 +8743,31 @@ fn build_context_snapshot(
     }
 }
 
+fn context_snapshot_char_budget(context_window: usize) -> usize {
+    (context_window / 2).clamp(2_048, 384_000)
+}
+
 fn render_message_for_summary(message: &Message) -> String {
     let parts = message
         .parts
         .iter()
         .map(|part| match part {
             MessagePart::Text { text } => truncate_chars(text, 12_000),
+            MessagePart::Image {
+                content_type, data, ..
+            } => format!("image {} ({} bytes)", content_type, data.len()),
             MessagePart::ToolCall { call } => format!(
                 "tool_call {} {}",
                 call.name,
                 truncate_chars(&call.input.to_string(), 4_000)
             ),
             MessagePart::ToolResult { result } => format!(
-                "tool_result {} {}",
+                "tool_result {}{} {}",
                 result.call_id,
-                truncate_chars(&result.output, 12_000)
+                historical_tool_artifact_reference(&result.metadata)
+                    .map(|reference| format!(" artifact={reference}"))
+                    .unwrap_or_default(),
+                truncate_chars(&result.output, 4_000)
             ),
             MessagePart::FileRef { path } => format!("file_ref {}", path.display()),
             MessagePart::SourceRef { source } => format!(
@@ -7952,6 +9425,50 @@ struct SendMessageRequest {
     collaboration_mode: CollaborationMode,
     #[serde(default)]
     goal_id: Option<Uuid>,
+    #[serde(default)]
+    image_attachments: Vec<InlineImageAttachmentRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InlineImageAttachmentRequest {
+    content_type: String,
+    data: Vec<u8>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+const MAX_INLINE_IMAGE_ATTACHMENTS: usize = 10;
+const MAX_INLINE_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+
+fn validate_inline_image_attachments(
+    attachments: &[InlineImageAttachmentRequest],
+) -> Result<(), ApiError> {
+    if attachments.len() > MAX_INLINE_IMAGE_ATTACHMENTS {
+        return Err(ApiError::bad_request(format!(
+            "too many image attachments; maximum is {MAX_INLINE_IMAGE_ATTACHMENTS}"
+        )));
+    }
+    let mut total_bytes = 0usize;
+    for attachment in attachments {
+        if !attachment.content_type.starts_with("image/") {
+            return Err(ApiError::bad_request(
+                "image attachments must use an image content type",
+            ));
+        }
+        if attachment.data.is_empty() || attachment.data.len() > MAX_INLINE_IMAGE_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "image attachments must be between 1 byte and {MAX_INLINE_IMAGE_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(attachment.data.len());
+        if total_bytes > MAX_INLINE_IMAGE_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "combined image attachments exceed {MAX_INLINE_IMAGE_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -8252,6 +9769,7 @@ struct ContextStatusResponse {
     budget: opentopia_core::ContextBudget,
     latest_summary: Option<ContextSummary>,
     usage: ContextUsageMetrics,
+    projection: ContextProjection,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -8263,13 +9781,21 @@ struct ContextUsageMetrics {
     cache_write_tokens: usize,
     reasoning_tokens: usize,
     compactions: usize,
+    native_compactions: usize,
+    provider_fallbacks: usize,
     warnings: usize,
+    compaction_input_tokens: usize,
+    checkpoint_tokens: usize,
+    compaction_latency_ms: u64,
+    last_fact_retention_percent: usize,
+    last_active_constraint_retention_percent: usize,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ContextCompactRequest {
     summary: Option<String>,
+    checkpoint: Option<ContextCheckpointDraft>,
 }
 
 #[derive(Debug, Serialize)]
@@ -8511,6 +10037,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepts_bounded_inline_images_and_rejects_non_images() {
+        let valid = vec![InlineImageAttachmentRequest {
+            content_type: "image/png".to_string(),
+            data: vec![1, 2, 3],
+            name: Some("pasted.png".to_string()),
+        }];
+        assert!(validate_inline_image_attachments(&valid).is_ok());
+
+        let invalid = vec![InlineImageAttachmentRequest {
+            content_type: "text/plain".to_string(),
+            data: vec![1],
+            name: None,
+        }];
+        assert!(validate_inline_image_attachments(&invalid).is_err());
+    }
+
+    #[test]
+    fn maps_inline_message_images_to_model_content() {
+        let part = MessagePart::Image {
+            content_type: "image/png".to_string(),
+            data: vec![0x89, b'P', b'N', b'G'],
+            name: Some("pasted.png".to_string()),
+        };
+        assert_eq!(
+            message_model_content_parts(&part),
+            vec![ModelContentPart::image(
+                "image/png",
+                vec![0x89, b'P', b'N', b'G']
+            )]
+        );
+    }
+
+    #[test]
     fn model_catalog_reads_ids_from_every_shape_relays_return() {
         let openai = json!({"data": [{"id": "gpt-4.1-mini"}, {"id": "o3-mini"}]});
         assert_eq!(
@@ -8663,6 +10222,31 @@ mod tests {
     }
 
     #[test]
+    fn summary_snapshot_continues_until_the_event_cursor_catches_up() {
+        let thread_id = Uuid::new_v4();
+        let events = (1..=220)
+            .map(|seq| {
+                AgentEvent::new(
+                    thread_id,
+                    None,
+                    seq,
+                    AgentEventPayload::TurnStarted {
+                        user_message_id: Uuid::new_v4(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let first = build_context_snapshot(&[], &events, None);
+        assert_eq!(first.covered_message_count, 0);
+        assert_eq!(first.covered_through_seq, 160);
+        let mut previous = ContextSummary::new(thread_id, 160, 0, "event checkpoint");
+        previous.metadata = json!({ "coveredMessageCount": 0 });
+        let second = build_context_snapshot(&[], &events, Some(&previous));
+        assert_eq!(second.covered_through_seq, 220);
+    }
+
+    #[test]
     fn legacy_automatic_summaries_do_not_skip_unverified_messages() {
         let thread_id = Uuid::new_v4();
         let mut legacy = ContextSummary::new(thread_id, 42, 9, "legacy");
@@ -8672,6 +10256,344 @@ mod tests {
         let mut manual = ContextSummary::new(thread_id, 42, 9, "manual");
         manual.metadata = json!({ "mode": "manual" });
         assert_eq!(summary_message_cursor(&manual), 9);
+    }
+
+    #[test]
+    fn structured_checkpoint_coverage_is_server_owned_and_monotonic() {
+        let thread_id = Uuid::new_v4();
+        let mut summary = ContextSummary::new(thread_id, 99, 12, "rendered");
+        summary.metadata = json!({ "coveredMessageCount": 2 });
+        let mut checkpoint = ContextCheckpoint::manual(
+            thread_id,
+            ContextCheckpointCoverage {
+                through_seq: 99,
+                through_message_count: 10,
+            },
+            "goal",
+        );
+        checkpoint.mode = ContextCheckpointMode::StructuredLocal;
+        summary.checkpoint = Some(checkpoint);
+
+        assert_eq!(summary_message_cursor(&summary), 10);
+    }
+
+    #[test]
+    fn checkpoint_response_is_parsed_sanitized_and_bounded() {
+        let payload = json!({
+            "goal": "  preserve the current implementation  ",
+            "userConstraints": [{
+                "id": "constraint-1",
+                "text": "keep compatibility",
+                "status": "active",
+                "sourceSeqs": [4, 4, 999],
+                "confidence": 200
+            }],
+            "decisions": [],
+            "workspaceState": { "branch": null, "gitStatus": null, "filesChanged": [] },
+            "commandsAndValidation": [],
+            "openIssues": [],
+            "nextSteps": [],
+            "pendingInteractions": [],
+            "artifacts": []
+        });
+        let fenced = format!("```json\n{}\n```", payload);
+        let value = parse_checkpoint_response(&fenced).expect("parse fenced JSON");
+        let mut draft: ContextCheckpointDraft =
+            serde_json::from_value(value).expect("deserialize draft");
+        sanitize_checkpoint_draft(&mut draft, 10).expect("sanitize draft");
+
+        assert_eq!(draft.goal, "preserve the current implementation");
+        assert_eq!(draft.user_constraints[0].source_seqs, vec![4]);
+        assert_eq!(draft.user_constraints[0].confidence, Some(100));
+        assert_eq!(checkpoint_token_budget(128_000), 12_800);
+        assert_eq!(checkpoint_token_budget(4_096), 1_024);
+    }
+
+    #[test]
+    fn checkpoint_cannot_relabel_a_known_failed_command_as_successful() {
+        let thread_id = Uuid::new_v4();
+        let call = ToolCall::new("exec_command", json!({ "cmd": "cargo test" }));
+        let events = vec![
+            AgentEvent::new(
+                thread_id,
+                None,
+                1,
+                AgentEventPayload::ToolCallStarted { call: call.clone() },
+            ),
+            AgentEvent::new(
+                thread_id,
+                None,
+                2,
+                AgentEventPayload::ToolCallFinished {
+                    result: ToolResult::text(
+                        call.id,
+                        "tests failed",
+                        json!({ "success": false, "exitCode": 1 }),
+                    ),
+                },
+            ),
+        ];
+        let draft = ContextCheckpointDraft {
+            goal: "fix the tests".to_string(),
+            commands_and_validation: vec![ContextCheckpointCommand {
+                command: "cargo test".to_string(),
+                outcome: "passed".to_string(),
+                summary: "all tests passed".to_string(),
+                source_seqs: vec![2],
+            }],
+            ..ContextCheckpointDraft::default()
+        };
+
+        let error = validate_checkpoint_draft(&draft, &events)
+            .expect_err("failed command must remain failed");
+        assert!(error.message.contains("marks failed command"));
+    }
+
+    #[test]
+    fn checkpoint_delta_merge_preserves_unmentioned_facts_and_updates_stable_keys() {
+        let thread_id = Uuid::new_v4();
+        let mut previous = ContextCheckpoint::manual(
+            thread_id,
+            ContextCheckpointCoverage {
+                through_seq: 10,
+                through_message_count: 3,
+            },
+            "implement compaction",
+        );
+        previous.user_constraints.push(ContextCheckpointFact {
+            id: "constraint-language".to_string(),
+            text: "keep the API backward compatible".to_string(),
+            status: ContextFactStatus::Active,
+            source_seqs: vec![2],
+            confidence: Some(100),
+        });
+        previous.decisions.push(ContextCheckpointFact {
+            id: "decision-format".to_string(),
+            text: "use plain text".to_string(),
+            status: ContextFactStatus::Active,
+            source_seqs: vec![4],
+            confidence: Some(80),
+        });
+        let previous_id = previous.id;
+        let draft = ContextCheckpointDraft {
+            goal: "implement compaction fully".to_string(),
+            decisions: vec![ContextCheckpointFact {
+                id: "decision-format".to_string(),
+                text: "use structured JSON".to_string(),
+                status: ContextFactStatus::Active,
+                source_seqs: vec![12],
+                confidence: Some(100),
+            }],
+            open_issues: vec![ContextCheckpointFact {
+                id: "issue-eval".to_string(),
+                text: "run the long-context fixture".to_string(),
+                status: ContextFactStatus::Active,
+                source_seqs: vec![13],
+                confidence: Some(90),
+            }],
+            ..ContextCheckpointDraft::default()
+        };
+
+        let merged = merge_context_checkpoint(
+            Some(&previous),
+            draft,
+            thread_id,
+            ContextCheckpointCoverage {
+                through_seq: 14,
+                through_message_count: 6,
+            },
+            Some("hash-2".to_string()),
+        );
+
+        assert_eq!(merged.previous_checkpoint_id, Some(previous_id));
+        assert_eq!(merged.user_constraints, previous.user_constraints);
+        assert_eq!(merged.decisions.len(), 1);
+        assert_eq!(merged.decisions[0].text, "use structured JSON");
+        assert_eq!(merged.open_issues[0].id, "issue-eval");
+        assert_eq!(merged.coverage.through_message_count, 6);
+        assert_eq!(
+            checkpoint_retention_percentages(Some(&previous), &merged),
+            (100, 100)
+        );
+    }
+
+    #[test]
+    fn checkpoint_budget_trimming_never_silently_drops_critical_recovery_keys() {
+        let thread_id = Uuid::new_v4();
+        let mut checkpoint = ContextCheckpoint::manual(
+            thread_id,
+            ContextCheckpointCoverage::default(),
+            "goal ".repeat(4_000),
+        );
+        checkpoint.user_constraints.push(ContextCheckpointFact {
+            id: "constraint-keep".to_string(),
+            text: "constraint ".repeat(1_000),
+            status: ContextFactStatus::Active,
+            source_seqs: vec![1],
+            confidence: Some(100),
+        });
+        checkpoint
+            .workspace_state
+            .files_changed
+            .push(opentopia_core::ContextCheckpointFile {
+                path: PathBuf::from("src/critical.rs"),
+                status: "modified".to_string(),
+                summary: "file summary ".repeat(1_000),
+                source_seqs: vec![2],
+            });
+        checkpoint
+            .commands_and_validation
+            .push(ContextCheckpointCommand {
+                command: "cargo test --workspace".to_string(),
+                outcome: "passed".to_string(),
+                summary: "validation ".repeat(1_000),
+                source_seqs: vec![3],
+            });
+        for index in 0..40 {
+            checkpoint.artifacts.push(ContextCheckpointArtifact {
+                id: None,
+                path: Some(PathBuf::from(format!("tmp/artifact-{index}.log"))),
+                kind: "log".to_string(),
+                summary: "noise ".repeat(1_000),
+                source_seqs: vec![4],
+            });
+        }
+
+        trim_checkpoint_to_budget(&mut checkpoint, 4_096);
+
+        assert_eq!(checkpoint.user_constraints[0].id, "constraint-keep");
+        assert_eq!(
+            checkpoint.workspace_state.files_changed[0].path,
+            PathBuf::from("src/critical.rs")
+        );
+        assert_eq!(
+            checkpoint.commands_and_validation[0].command,
+            "cargo test --workspace"
+        );
+        assert!(checkpoint.artifacts.len() < 40);
+        assert!(checkpoint_token_estimate(&checkpoint) <= 4_096);
+    }
+
+    #[test]
+    fn native_provider_checkpoint_does_not_advance_local_coverage() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let thread = store
+            .create_thread(None, std::env::current_dir().expect("cwd"))
+            .expect("create thread");
+        let mut previous = ContextSummary::new(thread.id, 8, 2, "durable");
+        previous.metadata = json!({
+            "mode": "structured_local",
+            "coveredMessageCount": 2,
+        });
+        let mut checkpoint = ContextCheckpoint::manual(
+            thread.id,
+            ContextCheckpointCoverage {
+                through_seq: 8,
+                through_message_count: 2,
+            },
+            "durable goal",
+        );
+        checkpoint.mode = ContextCheckpointMode::StructuredLocal;
+        previous.checkpoint = Some(checkpoint);
+        store
+            .append_event(AgentEvent::new(
+                thread.id,
+                None,
+                0,
+                AgentEventPayload::ContextCompacted {
+                    summary: previous,
+                    details: None,
+                },
+            ))
+            .expect("append checkpoint");
+        let cursor = ProviderConversationCursor {
+            response_id: "response-1".to_string(),
+            compatibility_hash: "compat-1".to_string(),
+            response_items: vec![json!({"type": "compaction", "id": "compact-1"})],
+            state_kind: opentopia_core::ProviderContextStateKind::Hybrid,
+            compaction_item_count: 1,
+        };
+
+        let settings = AppSettings::from_env(PermissionMode::Auto);
+        let native = build_native_provider_checkpoint(&store, &settings, thread.id, &cursor)
+            .expect("build native checkpoint")
+            .expect("native checkpoint");
+        let checkpoint = native.checkpoint.expect("checkpoint");
+        assert_eq!(checkpoint.mode, ContextCheckpointMode::NativeProvider);
+        assert_eq!(checkpoint.coverage.through_seq, 8);
+        assert_eq!(checkpoint.coverage.through_message_count, 2);
+        assert_eq!(
+            checkpoint.provider_compatibility_hash.as_deref(),
+            Some("compat-1")
+        );
+    }
+
+    #[test]
+    fn provider_model_change_invalidates_persisted_cursor_with_a_reason() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let thread = store
+            .create_thread(None, std::env::current_dir().expect("cwd"))
+            .expect("create thread");
+        let mut settings = AppSettings::from_env(PermissionMode::Auto);
+        let provider = settings.active_provider_mut();
+        provider.kind = ProviderKind::OpenAiResponses;
+        provider.store_responses = true;
+        provider.model = "new-model".to_string();
+        store
+            .save_provider_conversation_state(&ProviderConversationState {
+                thread_id: thread.id,
+                agent_path: "/root".to_string(),
+                provider_id: provider.id.clone(),
+                model: "old-model".to_string(),
+                response_id: "response-1".to_string(),
+                compatibility_hash: "hash".to_string(),
+                response_items: Vec::new(),
+                state_kind: opentopia_core::ProviderContextStateKind::StoredResponse,
+                compaction_item_count: 0,
+                checkpoint_id: None,
+                updated_at: Utc::now(),
+            })
+            .expect("save cursor");
+
+        let taken =
+            take_provider_cursor(&store, &settings, thread.id, "/root").expect("take cursor");
+        assert!(taken.cursor.is_none());
+        let invalidation = taken.invalidation.expect("invalidation");
+        assert!(invalidation.reason.contains("provider or model changed"));
+        assert!(invalidation.reason.contains("new-model"));
+    }
+
+    #[test]
+    fn recent_tail_keeps_complete_turns_and_bounds_historical_tools() {
+        let thread_id = Uuid::new_v4();
+        let messages = vec![
+            Message::text(thread_id, MessageRole::User, "old ".repeat(200)),
+            Message::text(thread_id, MessageRole::Assistant, "old answer ".repeat(200)),
+            Message::text(thread_id, MessageRole::User, "latest request"),
+            Message::text(thread_id, MessageRole::Assistant, "latest answer"),
+        ];
+        let (tail, _) = recent_conversation_tail(&messages, 100);
+        assert_eq!(tail.len(), 2);
+        assert!(tail[0].content.contains("latest request"));
+        assert!(tail[1].content.contains("latest answer"));
+
+        let result = ToolResult {
+            call_id: Uuid::new_v4(),
+            output: "x".repeat(40_000),
+            content: Vec::new(),
+            metadata: json!({ "artifactId": "artifact-123" }),
+        };
+        let bounded = bounded_historical_tool_content(&result);
+        let rendered = bounded
+            .iter()
+            .map(|part| match part {
+                ModelContentPart::Text { text } => text.clone(),
+                other => serde_json::to_string(other).unwrap_or_default(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("artifact-123"));
+        assert!(rendered.len() < result.output.len());
     }
 
     #[test]

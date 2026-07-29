@@ -177,6 +177,11 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         &self,
         state: &ProviderConversationState,
     ) -> anyhow::Result<()>;
+    fn get_provider_conversation_state(
+        &self,
+        thread_id: Uuid,
+        agent_path: &str,
+    ) -> anyhow::Result<Option<ProviderConversationState>>;
     fn take_provider_conversation_state(
         &self,
         thread_id: Uuid,
@@ -338,6 +343,39 @@ pub struct ContextBudget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderContextStateKind {
+    StoredResponse,
+    CompactionItems,
+    Hybrid,
+}
+
+impl Default for ProviderContextStateKind {
+    fn default() -> Self {
+        Self::StoredResponse
+    }
+}
+
+impl ProviderContextStateKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StoredResponse => "stored_response",
+            Self::CompactionItems => "compaction_items",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "stored_response" => Ok(Self::StoredResponse),
+            "compaction_items" => Ok(Self::CompactionItems),
+            "hybrid" => Ok(Self::Hybrid),
+            other => anyhow::bail!("unknown provider context state kind: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConversationState {
     pub thread_id: Uuid,
@@ -346,6 +384,14 @@ pub struct ProviderConversationState {
     pub model: String,
     pub response_id: String,
     pub compatibility_hash: String,
+    #[serde(default)]
+    pub response_items: Vec<Value>,
+    #[serde(default)]
+    pub state_kind: ProviderContextStateKind,
+    #[serde(default)]
+    pub compaction_item_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<Uuid>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -623,6 +669,10 @@ impl SqliteSessionStore {
                 model TEXT NOT NULL,
                 response_id TEXT NOT NULL,
                 compatibility_hash TEXT NOT NULL,
+                response_items_json TEXT NOT NULL DEFAULT '[]',
+                state_kind TEXT NOT NULL DEFAULT 'stored_response',
+                compaction_item_count INTEGER NOT NULL DEFAULT 0,
+                checkpoint_id TEXT,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(thread_id, agent_path),
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
@@ -789,6 +839,21 @@ impl SqliteSessionStore {
             conn.execute("ALTER TABLE threads ADD COLUMN model_selection TEXT", [])?;
         }
         for (column, definition) in [
+            ("response_items_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("state_kind", "TEXT NOT NULL DEFAULT 'stored_response'"),
+            ("compaction_item_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("checkpoint_id", "TEXT"),
+        ] {
+            if !table_has_column(&conn, "provider_conversation_states", column)? {
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE provider_conversation_states ADD COLUMN {column} {definition}"
+                    ),
+                    [],
+                )?;
+            }
+        }
+        for (column, definition) in [
             ("agent_path", "TEXT NOT NULL DEFAULT ''"),
             ("parent_agent_path", "TEXT NOT NULL DEFAULT '/root'"),
             ("agent_type", "TEXT NOT NULL DEFAULT 'default'"),
@@ -821,8 +886,8 @@ impl SqliteSessionStore {
         if schema_version < 1 {
             backfill_thread_projects(&mut conn)?;
         }
-        if schema_version < 7 {
-            conn.execute_batch("PRAGMA user_version = 7;")?;
+        if schema_version < 8 {
+            conn.execute_batch("PRAGMA user_version = 8;")?;
         }
         let recovered_at = Utc::now().to_rfc3339();
         conn.execute(
@@ -2525,17 +2590,23 @@ impl SessionStore for SqliteSessionStore {
         state: &ProviderConversationState,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let response_items_json = serde_json::to_string(&state.response_items)?;
         conn.execute(
             r#"
             INSERT INTO provider_conversation_states (
                 thread_id, agent_path, provider_id, model, response_id,
-                compatibility_hash, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                compatibility_hash, response_items_json, state_kind,
+                compaction_item_count, checkpoint_id, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(thread_id, agent_path) DO UPDATE SET
                 provider_id = excluded.provider_id,
                 model = excluded.model,
                 response_id = excluded.response_id,
                 compatibility_hash = excluded.compatibility_hash,
+                response_items_json = excluded.response_items_json,
+                state_kind = excluded.state_kind,
+                compaction_item_count = excluded.compaction_item_count,
+                checkpoint_id = excluded.checkpoint_id,
                 updated_at = excluded.updated_at
             "#,
             params![
@@ -2545,10 +2616,23 @@ impl SessionStore for SqliteSessionStore {
                 &state.model,
                 &state.response_id,
                 &state.compatibility_hash,
+                response_items_json,
+                state.state_kind.as_str(),
+                state.compaction_item_count as i64,
+                state.checkpoint_id.map(|id| id.to_string()),
                 state.updated_at.to_rfc3339(),
             ],
         )?;
         Ok(())
+    }
+
+    fn get_provider_conversation_state(
+        &self,
+        thread_id: Uuid,
+        agent_path: &str,
+    ) -> anyhow::Result<Option<ProviderConversationState>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        load_provider_conversation_state(&conn, thread_id, agent_path)
     }
 
     fn take_provider_conversation_state(
@@ -2558,27 +2642,7 @@ impl SessionStore for SqliteSessionStore {
     ) -> anyhow::Result<Option<ProviderConversationState>> {
         let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
         let transaction = conn.transaction()?;
-        let state = transaction
-            .query_row(
-                r#"
-                SELECT provider_id, model, response_id, compatibility_hash, updated_at
-                FROM provider_conversation_states
-                WHERE thread_id = ?1 AND agent_path = ?2
-                "#,
-                params![thread_id.to_string(), agent_path],
-                |row| {
-                    Ok(ProviderConversationState {
-                        thread_id,
-                        agent_path: agent_path.to_string(),
-                        provider_id: row.get(0)?,
-                        model: row.get(1)?,
-                        response_id: row.get(2)?,
-                        compatibility_hash: row.get(3)?,
-                        updated_at: parse_datetime(row.get::<_, String>(4)?, 4)?,
-                    })
-                },
-            )
-            .optional()?;
+        let state = load_provider_conversation_state(&transaction, thread_id, agent_path)?;
         transaction.execute(
             "DELETE FROM provider_conversation_states WHERE thread_id = ?1 AND agent_path = ?2",
             params![thread_id.to_string(), agent_path],
@@ -3880,6 +3944,58 @@ fn parse_uuid(value: String, column: usize) -> rusqlite::Result<Uuid> {
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(err)))
 }
 
+fn load_provider_conversation_state(
+    conn: &Connection,
+    thread_id: Uuid,
+    agent_path: &str,
+) -> anyhow::Result<Option<ProviderConversationState>> {
+    Ok(conn
+        .query_row(
+            r#"
+            SELECT provider_id, model, response_id, compatibility_hash,
+                   response_items_json, state_kind, compaction_item_count,
+                   checkpoint_id, updated_at
+            FROM provider_conversation_states
+            WHERE thread_id = ?1 AND agent_path = ?2
+            "#,
+            params![thread_id.to_string(), agent_path],
+            |row| {
+                let response_items_json = row.get::<_, String>(4)?;
+                let response_items =
+                    serde_json::from_str(&response_items_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error))
+                    })?;
+                let state_kind_text = row.get::<_, String>(5)?;
+                let state_kind =
+                    ProviderContextStateKind::from_str(&state_kind_text).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            Type::Text,
+                            error.into_boxed_dyn_error(),
+                        )
+                    })?;
+                let checkpoint_id = row
+                    .get::<_, Option<String>>(7)?
+                    .map(|value| parse_uuid(value, 7))
+                    .transpose()?;
+                Ok(ProviderConversationState {
+                    thread_id,
+                    agent_path: agent_path.to_string(),
+                    provider_id: row.get(0)?,
+                    model: row.get(1)?,
+                    response_id: row.get(2)?,
+                    compatibility_hash: row.get(3)?,
+                    response_items,
+                    state_kind,
+                    compaction_item_count: row.get::<_, i64>(6)?.max(0) as usize,
+                    checkpoint_id,
+                    updated_at: parse_datetime(row.get::<_, String>(8)?, 8)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 fn parse_artifact_storage_metadata(
     storage_kind: &str,
     path: Option<String>,
@@ -4894,12 +5010,22 @@ mod tests {
             model: "gpt-test".to_string(),
             response_id: "resp_123".to_string(),
             compatibility_hash: "compatible".to_string(),
+            response_items: vec![serde_json::json!({ "type": "compaction", "id": "cmp_123" })],
+            state_kind: ProviderContextStateKind::Hybrid,
+            compaction_item_count: 1,
+            checkpoint_id: Some(Uuid::new_v4()),
             updated_at: Utc::now(),
         };
 
         store
             .save_provider_conversation_state(&state)
             .expect("save state");
+        assert_eq!(
+            store
+                .get_provider_conversation_state(thread.id, "/root")
+                .expect("read state without consuming it"),
+            Some(state.clone())
+        );
         assert_eq!(
             store
                 .take_provider_conversation_state(thread.id, "/root")

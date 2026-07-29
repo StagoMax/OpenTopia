@@ -225,7 +225,8 @@ Run the integration smoke test:
 .\scripts\verify-integration.cmd
 ```
 
-Run the real-provider context compaction smoke test (this makes one model request):
+Run the real-provider context compaction smoke test, followed by two local
+structured-delta retention checks (this consumes provider API tokens):
 
 ```powershell
 .\scripts\verify-context-summary.cmd

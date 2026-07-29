@@ -84,14 +84,18 @@ pub use mcp::{
 pub use mcp_host::{McpExtensionHost, McpHostError, McpToolRoute};
 pub use model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    ArtifactStorage, ArtifactStorageMetadata, CollaborationMode, ContextSourceRef, ContextSummary,
-    ExperienceMode, GoalAttemptStatus, GoalRecord, GoalSnapshot, GoalStatus, GoalTask,
-    GoalTaskAttempt, GoalTaskStatus, Message, MessagePart, MessageRole, ModelContentPart, Project,
-    SkillRef, TaskPlan, TaskPlanStep, TaskPlanStepStatus, TerminalCommandHistory,
-    TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet,
-    TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord, TurnStatus,
-    UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord, UserInputRequest,
-    UserInputResponse, UserInputStatus,
+    ArtifactStorage, ArtifactStorageMetadata, CollaborationMode, ContextCheckpoint,
+    ContextCheckpointArtifact, ContextCheckpointCommand, ContextCheckpointCoverage,
+    ContextCheckpointFact, ContextCheckpointFile, ContextCheckpointInteraction,
+    ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
+    ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextProjection,
+    ContextSourceRef, ContextSummary, ExperienceMode, GoalAttemptStatus, GoalRecord, GoalSnapshot,
+    GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart, MessageRole,
+    ModelContentPart, Project, SkillRef, TaskPlan, TaskPlanStep, TaskPlanStepStatus,
+    TerminalCommandHistory, TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall,
+    ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord,
+    TurnStatus, UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord,
+    UserInputRequest, UserInputResponse, UserInputStatus, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };
 pub use model_context::{
     content_fingerprint, estimate_tokens as estimate_model_context_tokens,
@@ -134,8 +138,9 @@ pub use sandbox::{
     SandboxCommandPlan, SandboxCommandStatus, SandboxDescriptor, SandboxLifecycle, SandboxMode,
 };
 pub use settings::{
-    AppSettings, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
-    RolloutBudgetSettings, SandboxEnforcement, SandboxSettings, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
+    AppSettings, NativeCompactionProtocol, ProviderCapabilities, ProviderHealth,
+    ProviderHealthCheck, ProviderKind, ProviderSettings, RolloutBudgetSettings, SandboxEnforcement,
+    SandboxSettings, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,
@@ -149,8 +154,8 @@ pub use spreadsheet::{
     MAX_OUTPUT_FILE_BYTES as MAX_SPREADSHEET_OUTPUT_BYTES,
 };
 pub use store::{
-    normalize_workspace_key, ContextBudget, ProviderConversationState, SessionStore,
-    SqliteSessionStore, StoreError,
+    normalize_workspace_key, ContextBudget, ProviderContextStateKind, ProviderConversationState,
+    SessionStore, SqliteSessionStore, StoreError,
 };
 pub use subagents::{
     AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDelivery, AgentWaitActivity,

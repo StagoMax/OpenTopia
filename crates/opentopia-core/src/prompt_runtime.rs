@@ -199,18 +199,11 @@ pub fn compile_runtime_prompt_modules(
             progress_instruction(settings.progress_updates),
         ),
         prompt_module(
-            "skills_protocol",
-            "fixed",
-            "runtime.skills",
-            "enabled",
-            skills_protocol_instruction(),
-        ),
-        prompt_module(
             "output_contract",
             "conditional",
             "runtime.surface",
             capabilities.surface.as_str(),
-            output_contract_instruction(capabilities.surface),
+            output_contract_instruction_compact(capabilities.surface),
         ),
         prompt_module(
             "clarification_policy",
@@ -221,7 +214,7 @@ pub fn compile_runtime_prompt_modules(
             } else {
                 "unavailable"
             },
-            clarification_policy_instruction(capabilities.request_user_input_available),
+            clarification_policy_instruction_compact(capabilities.request_user_input_available),
         ),
     ];
 
@@ -231,7 +224,7 @@ pub fn compile_runtime_prompt_modules(
             "conditional",
             "runtime.surface",
             capabilities.surface.as_str(),
-            desktop_protocol_instruction(),
+            desktop_protocol_instruction_compact(),
         ));
     }
 
@@ -241,7 +234,7 @@ pub fn compile_runtime_prompt_modules(
             "conditional",
             "agentRuntime.multiAgent",
             settings.multi_agent.as_str(),
-            multi_agent_instruction(settings.multi_agent, capabilities),
+            multi_agent_instruction_compact(settings.multi_agent, capabilities),
         )
         .with_metadata(json!({
             "promptModuleId": "multi_agent_policy",
@@ -376,10 +369,12 @@ fn progress_instruction(mode: ProgressUpdateMode) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn skills_protocol_instruction() -> &'static str {
     "<skills_protocol>\nThe runtime may provide a compact Skill catalog. A catalog entry is routing metadata, not the Skill's full instructions. When the user names a Skill or the request clearly matches one, use the Skill tools to load its complete instruction resource before acting. Select the smallest set that covers the task, read only task-relevant linked references after the main resource, reuse supplied scripts and assets, and report a concise fallback if loading fails. User intent and higher-priority runtime policy remain controlling.\n\nA Skill whose full instructions are already present in your context is loaded; do not call a Skill tool to fetch it again. Load only the linked references that this task actually needs. Do not carry a Skill into later turns unless it is still selected or the user triggers it again.\n\nRead a Skill's instructions yourself. Do not delegate reading, summarizing, or interpreting them to a child agent: a summary is not the instruction, and the agent that acts under a Skill is the agent that has to have read it. A child may still perform the task work the Skill describes. When several Skills apply, use the smallest set that covers the request and say in what order you are applying them.\n</skills_protocol>"
 }
 
+#[allow(dead_code)]
 fn output_contract_instruction(surface: RuntimeSurface) -> String {
     let reference_rule = match surface {
         RuntimeSurface::Desktop => {
@@ -413,6 +408,7 @@ fn output_contract_instruction(surface: RuntimeSurface) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn clarification_policy_instruction(request_user_input_available: bool) -> &'static str {
     if request_user_input_available {
         "<clarification_policy>\nThe structured `request_user_input` tool is available this turn. Strongly prefer making a reasonable, reversible assumption and carrying the request forward over stopping to ask. Ask only when the answer cannot be determined from the workspace and a wrong assumption would materially change architecture, product behavior, scope, risk, cost, or authority. When you do ask, use `request_user_input` with one to three concise questions and concrete trade-offs for each option, then continue once the answers return. Do not ask about routine implementation details you can decide and later revise.\n</clarification_policy>"
@@ -421,10 +417,12 @@ fn clarification_policy_instruction(request_user_input_available: bool) -> &'sta
     }
 }
 
+#[allow(dead_code)]
 fn desktop_protocol_instruction() -> &'static str {
     "<desktop_protocol>\nYou are running inside the OpenTopia desktop workbench. Use workspace-relative paths when identifying project files and rely on typed artifacts, previews, event records, approvals, and tool results as the source of UI truth. Do not emit Codex-specific `::directive` tokens or pretend that Markdown alone changed application state. Create or open previews through available tools and report only states observed from OpenTopia. The activity timeline separates logical model context, provider transport, tool execution, approvals, and final output; keep those distinctions accurate.\n</desktop_protocol>"
 }
 
+#[allow(dead_code)]
 fn multi_agent_instruction(
     mode: MultiAgentMode,
     capabilities: PromptRuntimeCapabilities,
@@ -453,6 +451,73 @@ fn multi_agent_instruction(
     };
     format!(
         "<multi_agent_policy>\nInternal agent tools are available with up to {capacity} active child tasks per parent. {activation} {depth_rule}\n\nEvery child inherits this workspace, permission mode, and sandbox boundary. Capability never changes user authorization, permission policy, or sandbox boundaries, and a child cannot be used to reach something you are not allowed to reach yourself.\n\nControl how much of your conversation a child starts with using `fork_turns`: `none` gives it only the task message you write, a positive integer copies that many of the most recent turns, and `all` copies the full history. Prefer `none` with a self-contained task description; it keeps the child's context small and its result easier to trust. Copy history only when the task genuinely depends on earlier discussion, and remember that a large fork costs tokens on every round the child runs.\n\nA child runs on the same model and reasoning effort as you unless its `agent_type` profile overrides them. Choose a non-default profile only when the user, an applicable repository instruction, or a Skill calls for that specialization, or when the subtask is clearly cheaper or harder than the main line of work. Do not pair a large history fork with a lighter profile: a child given full context is expected to reason at the parent's level.\n\nGive each child a disjoint scope and enough context to act without guessing. Prefer read-only exploration, or separate file ownership when children write. All agents share one working tree, so edits are immediately visible and overlapping writes must be sequenced rather than run in parallel. Review a child's returned evidence before relying on it; a terminal status is not by itself proof the work is correct. Do not finish your turn while required child work is still running or child results and mailbox messages remain unread.\n</multi_agent_policy>"
+    )
+}
+
+// The legacy protocol builders above remain available for compatibility with
+// callers that inspect them in older integrations. Runtime assembly uses the
+// compact variants below so the stable base prompt is not repeated by every
+// developer module.
+#[allow(dead_code)]
+fn skills_protocol_instruction_compact() -> &'static str {
+    "<skills_protocol>\nThe Skill catalog is routing metadata, not full instructions. When a Skill is named or clearly matches the request, load its complete resource before acting; choose the smallest applicable set and read only needed references. A loaded Skill needs no second fetch and is not carried into later turns unless selected again. Read the instructions yourself; a child may do the work but may not replace that reading with a summary.\n</skills_protocol>"
+}
+
+fn output_contract_instruction_compact(surface: RuntimeSurface) -> String {
+    let (format_rule, reference_rule, media_rule) = match surface {
+        RuntimeSurface::Desktop => (
+            "Responses render as GitHub-flavored Markdown; leave a blank line before lists and after headings.",
+            "Use workspace-relative Markdown links for local files; never use absolute, drive-letter, file://, or vscode:// targets.",
+            "Images render only from http(s) URLs; reference local images as links. Mermaid is shown as code, so use a table or compact text instead.",
+        ),
+        RuntimeSurface::Cli => (
+            "Responses have limited Markdown rendering; prefer concise paragraphs and plain punctuation.",
+            "Use typed workspace paths and path:line for code references; do not emit local Markdown links.",
+            "Do not emit image syntax or Mermaid; give the artifact path and describe it.",
+        ),
+        RuntimeSurface::Core => (
+            "Prefer concise structure and do not rely on rich Markdown rendering.",
+            "Use workspace paths and path:line for specific code references.",
+            "Describe non-rendered images or diagrams by artifact path.",
+        ),
+    };
+    format!(
+        "<output_contract>\n{format_rule}\n{reference_rule}\n{media_rule}\nUse the smallest structure that improves clarity. Only observed tool results prove that an artifact or state change exists.\n</output_contract>"
+    )
+}
+
+fn clarification_policy_instruction_compact(request_user_input_available: bool) -> &'static str {
+    if request_user_input_available {
+        "<clarification_policy>\nThe structured `request_user_input` tool is available. Prefer a reversible assumption; ask only when workspace evidence cannot determine a choice whose wrong value would materially change behavior, scope, risk, cost, or authority.\n</clarification_policy>"
+    } else {
+        "<clarification_policy>\nNo structured input tool is available. Prefer a reversible assumption; if the user alone must decide a material issue, ask one short plain-text question in the final response. Never present an ordinary-text multiple-choice prompt.\n</clarification_policy>"
+    }
+}
+
+fn desktop_protocol_instruction_compact() -> &'static str {
+    "<desktop_protocol>\nUse workspace-relative paths and treat typed artifacts, previews, events, approvals, and tool results as UI truth. Do not emit Codex `::directive` tokens or claim Markdown changed state. Keep model context, provider transport, tool execution, approvals, and final output distinct.\n</desktop_protocol>"
+}
+
+fn multi_agent_instruction_compact(
+    mode: MultiAgentMode,
+    capabilities: PromptRuntimeCapabilities,
+) -> String {
+    if !capabilities.multi_agent_available || mode == MultiAgentMode::Off {
+        return "<multi_agent_policy>\nInternal delegation is disabled. Complete the task in the current agent and do not claim to have spawned children.\n</multi_agent_policy>".to_string();
+    }
+    let capacity = capabilities.max_parallel_agents.max(1);
+    let activation = match mode {
+        MultiAgentMode::Explicit => "Delegate only when the user or an applicable repository/Skill instruction explicitly requires it.",
+        MultiAgentMode::Adaptive => "Delegate only bounded work that benefits from independent execution or context isolation.",
+        MultiAgentMode::Off => unreachable!(),
+    };
+    let depth = if capabilities.max_agent_depth <= 1 {
+        "Children cannot spawn grandchildren."
+    } else {
+        "Respect the configured child depth."
+    };
+    format!(
+        "<multi_agent_policy>\nUp to {capacity} child tasks are available. {activation} {depth} Children inherit this workspace, permissions, and sandbox; capability never expands authorization. Prefer a self-contained task with `fork_turns: none`, disjoint scopes, sequenced writes, and evidence review before trusting completion. Do not finish while required child work or unread results remain.\n</multi_agent_policy>"
     )
 }
 
@@ -504,11 +569,11 @@ mod tests {
         assert_eq!(multi_agent.metadata["maxAgentDepth"], 1);
         assert!(multi_agent
             .text_content()
-            .contains("Mere availability is not authorization"));
+            .contains("explicitly requires it"));
         assert!(multi_agent
             .text_content()
-            .contains("a child cannot spawn its own children"));
-        assert!(multi_agent.text_content().contains("`fork_turns`"));
+            .contains("Children cannot spawn grandchildren"));
+        assert!(multi_agent.text_content().contains("fork_turns: none"));
     }
 
     #[test]
@@ -530,27 +595,18 @@ mod tests {
         assert_eq!(output.metadata["assemblyClass"], "conditional");
         assert_eq!(output.metadata["settingValue"], "desktop");
         assert!(output.text_content().contains("workspace-relative"));
-        assert!(output
-            .text_content()
-            .contains("never use a filesystem-absolute path"));
+        assert!(output.text_content().contains("never use absolute"));
         // The renderer only accepts http(s) image targets and has no mermaid
         // plugin, so both rules have to say what actually happens instead of
         // copying a contract written for another renderer.
         assert!(output
             .text_content()
-            .contains("Images render only from http or https URLs"));
-        assert!(output.text_content().contains("Mermaid is not rendered"));
+            .contains("Images render only from http(s) URLs"));
+        assert!(output.text_content().contains("Mermaid is shown as code"));
 
-        let skills = desktop
+        assert!(!desktop
             .iter()
-            .find(|item| item.metadata["promptModuleId"] == "skills_protocol")
-            .expect("skills protocol module");
-        assert!(skills.text_content().contains(
-            "Do not delegate reading, summarizing, or interpreting them to a child agent"
-        ));
-        // Paging past a truncated read is the read_skill tool's job. The module
-        // must not carry a rule for coping with a capability the tool should have.
-        assert!(!skills.text_content().contains("truncated"));
+            .any(|item| item.metadata["promptModuleId"] == "skills_protocol"));
 
         let clarification = desktop
             .iter()
@@ -579,10 +635,10 @@ mod tests {
             .contains("clickable Markdown links"));
         assert!(cli_output
             .text_content()
-            .contains("Terminals do not render"));
+            .contains("limited Markdown rendering"));
         assert!(cli_output
             .text_content()
-            .contains("Images and diagram markup do not render"));
+            .contains("Do not emit image syntax or Mermaid"));
         assert!(!cli_output.text_content().contains("http or https URLs"));
 
         let cli_clarification = cli
@@ -592,7 +648,7 @@ mod tests {
         assert_eq!(cli_clarification.metadata["settingValue"], "unavailable");
         assert!(cli_clarification
             .text_content()
-            .contains("Never render a multiple-choice prompt as ordinary assistant text"));
+            .contains("Never present an ordinary-text multiple-choice prompt"));
     }
 
     #[test]

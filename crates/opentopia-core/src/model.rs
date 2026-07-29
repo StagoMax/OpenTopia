@@ -221,6 +221,12 @@ pub enum MessagePart {
     Text {
         text: String,
     },
+    Image {
+        content_type: String,
+        data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     ToolCall {
         call: ToolCall,
     },
@@ -911,6 +917,216 @@ pub enum ArtifactStorageMetadata {
     Path { path: PathBuf },
 }
 
+pub const CONTEXT_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCheckpointMode {
+    #[default]
+    LegacyText,
+    Manual,
+    StructuredLocal,
+    NativeProvider,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextFactStatus {
+    #[default]
+    Active,
+    Resolved,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointCoverage {
+    pub through_seq: i64,
+    pub through_message_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointFact {
+    pub id: String,
+    pub text: String,
+    #[serde(default)]
+    pub status: ContextFactStatus,
+    #[serde(default)]
+    pub source_seqs: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<u8>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointFile {
+    pub path: PathBuf,
+    pub status: String,
+    pub summary: String,
+    #[serde(default)]
+    pub source_seqs: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointWorkspace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<String>,
+    #[serde(default)]
+    pub files_changed: Vec<ContextCheckpointFile>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointCommand {
+    pub command: String,
+    pub outcome: String,
+    pub summary: String,
+    #[serde(default)]
+    pub source_seqs: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointStep {
+    pub id: String,
+    pub text: String,
+    pub status: String,
+    #[serde(default)]
+    pub source_seqs: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointInteraction {
+    pub kind: String,
+    pub summary: String,
+    #[serde(default)]
+    pub source_seqs: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointArtifact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    pub kind: String,
+    pub summary: String,
+    #[serde(default)]
+    pub source_seqs: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpoint {
+    pub id: Uuid,
+    pub thread_id: Uuid,
+    pub schema_version: u32,
+    pub mode: ContextCheckpointMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_checkpoint_id: Option<Uuid>,
+    pub coverage: ContextCheckpointCoverage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_compatibility_hash: Option<String>,
+    pub goal: String,
+    #[serde(default)]
+    pub user_constraints: Vec<ContextCheckpointFact>,
+    #[serde(default)]
+    pub decisions: Vec<ContextCheckpointFact>,
+    #[serde(default)]
+    pub workspace_state: ContextCheckpointWorkspace,
+    #[serde(default)]
+    pub commands_and_validation: Vec<ContextCheckpointCommand>,
+    #[serde(default)]
+    pub open_issues: Vec<ContextCheckpointFact>,
+    #[serde(default)]
+    pub next_steps: Vec<ContextCheckpointStep>,
+    #[serde(default)]
+    pub pending_interactions: Vec<ContextCheckpointInteraction>,
+    #[serde(default)]
+    pub artifacts: Vec<ContextCheckpointArtifact>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ContextCheckpoint {
+    pub fn manual(
+        thread_id: Uuid,
+        coverage: ContextCheckpointCoverage,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            thread_id,
+            schema_version: CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+            mode: ContextCheckpointMode::Manual,
+            previous_checkpoint_id: None,
+            coverage,
+            provider_compatibility_hash: None,
+            goal: summary.into(),
+            user_constraints: Vec::new(),
+            decisions: Vec::new(),
+            workspace_state: ContextCheckpointWorkspace::default(),
+            commands_and_validation: Vec::new(),
+            open_issues: Vec::new(),
+            next_steps: Vec::new(),
+            pending_interactions: Vec::new(),
+            artifacts: Vec::new(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_mode: Option<String>,
+    pub checkpoint_tokens: usize,
+    pub covered_through_seq: i64,
+    pub covered_message_count: usize,
+    pub unsummarized_message_count: usize,
+    pub unsummarized_event_count: usize,
+    pub recent_tail_tokens: usize,
+    pub native_compaction_supported: bool,
+    pub provider_state_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state_kind: Option<String>,
+    pub provider_item_count: usize,
+    pub native_compaction_item_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCompactionMetrics {
+    pub source: String,
+    pub input_tokens: usize,
+    pub checkpoint_tokens: usize,
+    pub token_reduction_percent: usize,
+    pub latency_ms: u64,
+    pub fact_retention_percent: usize,
+    pub active_constraint_retention_percent: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCompactionDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<Uuid>,
+    pub mode: ContextCheckpointMode,
+    pub coverage: ContextCheckpointCoverage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state_checkpoint_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<ContextCompactionMetrics>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextSummary {
@@ -922,6 +1138,8 @@ pub struct ContextSummary {
     pub token_estimate: Option<usize>,
     pub created_at: DateTime<Utc>,
     pub metadata: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<ContextCheckpoint>,
 }
 
 impl ContextSummary {
@@ -940,6 +1158,7 @@ impl ContextSummary {
             token_estimate: None,
             created_at: Utc::now(),
             metadata: Value::Null,
+            checkpoint: None,
         }
     }
 }
@@ -1465,6 +1684,25 @@ pub enum AgentEventPayload {
     },
     ContextCompacted {
         summary: ContextSummary,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<ContextCompactionDetails>,
+    },
+    ContextProjectionBuilt {
+        projection: ContextProjection,
+    },
+    ProviderContextStateUpdated {
+        provider_id: String,
+        model: String,
+        state_kind: String,
+        response_item_count: usize,
+        compaction_item_count: usize,
+    },
+    ProviderContextStateInvalidated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        reason: String,
     },
     ContextWarning {
         stage: String,
@@ -1529,6 +1767,9 @@ impl AgentEventPayload {
             Self::AutomaticApprovalReviewCompleted { .. } => "automatic_approval_review_completed",
             Self::AutoReviewInterruptionWarning { .. } => "auto_review_interruption_warning",
             Self::ContextCompacted { .. } => "context_compacted",
+            Self::ContextProjectionBuilt { .. } => "context_projection_built",
+            Self::ProviderContextStateUpdated { .. } => "provider_context_state_updated",
+            Self::ProviderContextStateInvalidated { .. } => "provider_context_state_invalidated",
             Self::ContextWarning { .. } => "context_warning",
             Self::TokenUsage { .. } => "token_usage",
             Self::SubagentUpdated { .. } => "subagent_updated",
@@ -1545,6 +1786,22 @@ impl AgentEventPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn legacy_context_compacted_events_deserialize_without_details() {
+        let thread_id = Uuid::new_v4();
+        let summary = ContextSummary::new(thread_id, 4, 2, "legacy summary");
+        let payload = json!({
+            "type": "context_compacted",
+            "summary": summary,
+        });
+
+        let parsed: AgentEventPayload = serde_json::from_value(payload).expect("deserialize");
+        assert!(matches!(
+            parsed,
+            AgentEventPayload::ContextCompacted { details: None, .. }
+        ));
+    }
 
     #[test]
     fn legacy_tool_output_remains_typed_text_content() {
@@ -1685,5 +1942,36 @@ mod tests {
         assert!(deferred_plan.is_active());
         assert!(!deferred_plan.has_actionable_steps());
         assert!(deferred_plan.next_runnable_step().is_none());
+    }
+
+    #[test]
+    fn context_summary_checkpoint_is_backward_compatible() {
+        let thread_id = Uuid::new_v4();
+        let legacy = ContextSummary::new(thread_id, 7, 3, "legacy summary");
+        let legacy_value = serde_json::to_value(&legacy).expect("serialize legacy summary");
+        assert!(legacy_value.get("checkpoint").is_none());
+        let restored: ContextSummary =
+            serde_json::from_value(legacy_value).expect("restore legacy summary");
+        assert!(restored.checkpoint.is_none());
+
+        let mut structured = ContextSummary::new(thread_id, 9, 4, "structured summary");
+        structured.checkpoint = Some(ContextCheckpoint::manual(
+            thread_id,
+            ContextCheckpointCoverage {
+                through_seq: 9,
+                through_message_count: 4,
+            },
+            "finish the implementation",
+        ));
+        let value = serde_json::to_value(&structured).expect("serialize checkpoint");
+        let restored: ContextSummary = serde_json::from_value(value).expect("restore checkpoint");
+        assert_eq!(
+            restored
+                .checkpoint
+                .expect("checkpoint")
+                .coverage
+                .through_message_count,
+            4
+        );
     }
 }

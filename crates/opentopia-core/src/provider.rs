@@ -15,6 +15,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -427,12 +431,13 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: String,
     model: String,
-    temperature: f64,
+    temperature: Option<f64>,
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     parallel_tool_calls: bool,
     prompt_cache_key: Option<String>,
     supports_vision: bool,
+    compatibility_messages: Arc<AtomicBool>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -441,17 +446,21 @@ impl OpenAiCompatibleProvider {
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let model = model.into();
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.into(),
             api_key: api_key.into(),
-            model: model.into(),
-            temperature: 0.2,
+            model: model.clone(),
+            temperature: None,
             max_output_tokens: None,
             reasoning_effort: None,
             parallel_tool_calls: false,
             prompt_cache_key: None,
             supports_vision: true,
+            compatibility_messages: Arc::new(AtomicBool::new(
+                model_prefers_compatibility_messages(&model),
+            )),
         }
     }
 
@@ -508,7 +517,9 @@ impl OpenAiCompatibleProvider {
     }
 
     fn with_generation_settings(mut self, settings: &ProviderSettings) -> Self {
-        self.temperature = settings.temperature;
+        if let Some(temperature) = settings.temperature {
+            self.temperature = Some(temperature);
+        }
         self.max_output_tokens = settings.max_output_tokens;
         self.reasoning_effort = settings.reasoning_effort.clone();
         self.parallel_tool_calls = settings.parallel_tool_calls;
@@ -518,7 +529,7 @@ impl OpenAiCompatibleProvider {
     }
 
     pub(crate) fn for_guardian(mut self) -> Self {
-        self.temperature = 0.0;
+        self.temperature = Some(0.0);
         self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
         if self.reasoning_effort.is_some() {
             self.reasoning_effort = Some("low".to_string());
@@ -534,16 +545,25 @@ impl OpenAiCompatibleProvider {
     ) -> anyhow::Result<PreparedProviderRequest> {
         ensure_visual_input_supported(&request, self.supports_vision)?;
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let messages = if self.compatibility_messages.load(Ordering::Acquire)
+            && chat_request_needs_message_compatibility_fallback(&request)
+        {
+            openai_compatibility_messages(&request)
+        } else {
+            openai_messages(&request)
+        };
         let mut payload = json!({
             "model": self.model,
-            "messages": openai_messages(&request),
+            "messages": messages,
             "stream": true,
             "stream_options": { "include_usage": true }
         });
         // Reasoning models reject any explicit temperature with a 400, so the
         // field is omitted rather than clamped.
         if model_accepts_temperature(&self.model) {
-            payload["temperature"] = json!(self.temperature);
+            if let Some(temperature) = self.temperature {
+                payload["temperature"] = json!(temperature);
+            }
         }
         if let Some(max_output_tokens) = self.max_output_tokens {
             payload["max_tokens"] = json!(max_output_tokens);
@@ -606,11 +626,37 @@ impl OpenAiCompatibleProvider {
             .send()
             .await?;
         if response.status().as_u16() == 400
-            && chat_request_has_compatibility_fallback(&prepared.logical_request)
+            && (chat_request_has_compatibility_fallback(&prepared.logical_request)
+                || request_image_part_count(&prepared.logical_request) > 0)
         {
             let rejected_body = response.text().await?;
             attempt = 2;
             let mut changes = Vec::new();
+            let image_parts = request_image_part_count(&prepared.logical_request);
+            if image_parts > 0 && provider_rejected_image_input(&rejected_body) {
+                on_transport(ProviderTransportEvent::Response {
+                    attempt: 1,
+                    status: Some(400),
+                    response_id: None,
+                    body: json!({
+                        "error": truncate_observation_text(&rejected_body),
+                        "imageParts": image_parts,
+                    }),
+                })?;
+                anyhow::bail!(
+                    "provider does not support image input (imageParts={image_parts}); choose a vision-capable model or disable image attachments: {}",
+                    truncate_observation_text(&rejected_body)
+                );
+            }
+            if !chat_request_has_compatibility_fallback(&prepared.logical_request) {
+                on_transport(ProviderTransportEvent::Response {
+                    attempt: 1,
+                    status: Some(400),
+                    response_id: None,
+                    body: json!({ "error": truncate_observation_text(&rejected_body) }),
+                })?;
+                anyhow::bail!("provider request failed (400): {rejected_body}");
+            }
             if prepared.logical_request.final_output_json_schema.is_some() {
                 if let Some(body) = prepared.body.as_object_mut() {
                     body.remove("response_format");
@@ -625,8 +671,8 @@ impl OpenAiCompatibleProvider {
             on_transport(ProviderTransportEvent::Retry {
                 attempt,
                 reason: truncate_observation_text(&format!(
-                    "provider rejected {} with HTTP 400: {rejected_body}",
-                    changes.join(" and ")
+                    "provider rejected {} with HTTP 400 (imageParts={image_parts}): {rejected_body}",
+                    changes.join(" and "),
                 )),
                 body: redact_transport_value(&prepared.body),
             })?;
@@ -651,6 +697,7 @@ impl OpenAiCompatibleProvider {
                     "provider request failed (400): {rejected_body}; compatibility retry failed ({retry_status}): {retry_body}"
                 );
             }
+            self.compatibility_messages.store(true, Ordering::Release);
             response = retry;
         }
         let status = response.status();
@@ -706,7 +753,7 @@ pub struct OpenAiResponsesProvider {
     base_url: String,
     api_key: String,
     model: String,
-    temperature: f64,
+    temperature: Option<f64>,
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     store_responses: bool,
@@ -750,7 +797,7 @@ impl OpenAiResponsesProvider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
-            temperature: 0.2,
+            temperature: None,
             max_output_tokens: None,
             reasoning_effort: None,
             store_responses: false,
@@ -769,7 +816,9 @@ impl OpenAiResponsesProvider {
         }
         let api_key = provider_api_key(settings)?;
         let mut provider = Self::new(settings.base_url.clone(), api_key, settings.model.clone());
-        provider.temperature = settings.temperature;
+        if let Some(temperature) = settings.temperature {
+            provider.temperature = Some(temperature);
+        }
         provider.max_output_tokens = settings.max_output_tokens;
         provider.reasoning_effort = settings.reasoning_effort.clone();
         provider.store_responses = settings.store_responses;
@@ -782,7 +831,7 @@ impl OpenAiResponsesProvider {
     }
 
     pub(crate) fn for_guardian(mut self) -> Self {
-        self.temperature = 0.0;
+        self.temperature = Some(0.0);
         self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
         if self.reasoning_effort.is_some() {
             self.reasoning_effort = Some("low".to_string());
@@ -807,9 +856,10 @@ impl OpenAiResponsesProvider {
             "parallel_tool_calls": self.parallel_tool_calls,
         });
         // Reasoning models reject any explicit temperature with a 400, so the
-        // field is omitted rather than clamped.
-        if model_accepts_temperature(&self.model) {
-            payload["temperature"] = json!(self.temperature);
+        // field is omitted rather than clamped. `None` also omits it — letting
+        // the model use its vendor default.
+        if let Some(temperature) = self.temperature.filter(|_| model_accepts_temperature(&self.model)) {
+            payload["temperature"] = json!(temperature);
         }
         let mut system_instructions = responses_system_instructions(&request);
         if self.native_web_search {
@@ -973,7 +1023,7 @@ pub struct AnthropicMessagesProvider {
     base_url: String,
     api_key: String,
     model: String,
-    temperature: f64,
+    temperature: Option<f64>,
     max_output_tokens: Option<u32>,
     supports_vision: bool,
 }
@@ -989,7 +1039,7 @@ impl AnthropicMessagesProvider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
-            temperature: 0.2,
+            temperature: None,
             max_output_tokens: None,
             supports_vision: true,
         }
@@ -1001,14 +1051,16 @@ impl AnthropicMessagesProvider {
         }
         let api_key = provider_api_key(settings)?;
         let mut provider = Self::new(settings.base_url.clone(), api_key, settings.model.clone());
-        provider.temperature = settings.temperature;
+        if let Some(temperature) = settings.temperature {
+            provider.temperature = Some(temperature);
+        }
         provider.max_output_tokens = settings.max_output_tokens;
         provider.supports_vision = settings.supports_vision;
         Some(provider)
     }
 
     pub(crate) fn for_guardian(mut self) -> Self {
-        self.temperature = 0.0;
+        self.temperature = Some(0.0);
         self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
         self
     }
@@ -1023,10 +1075,12 @@ impl AnthropicMessagesProvider {
         let mut payload = json!({
             "model": self.model,
             "max_tokens": self.max_output_tokens.unwrap_or(4_096),
-            "temperature": self.temperature,
             "stream": true,
             "messages": anthropic_messages(&request),
         });
+        if let Some(temperature) = self.temperature {
+            payload["temperature"] = json!(temperature);
+        }
         let instructions = anthropic_system_instructions(&request);
         if !instructions.trim().is_empty() {
             payload["system"] = json!(instructions);
@@ -1845,7 +1899,13 @@ fn ensure_visual_input_supported(
     Ok(())
 }
 
-fn request_has_image_input(request: &ModelRequest) -> bool {
+fn model_prefers_compatibility_messages(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    model.starts_with("glm") || model.starts_with("chatglm")
+}
+
+fn request_image_part_count(request: &ModelRequest) -> usize {
     request
         .conversation
         .iter()
@@ -1857,7 +1917,22 @@ fn request_has_image_input(request: &ModelRequest) -> bool {
                 .iter()
                 .flat_map(|result| result.content.iter()),
         )
-        .any(|part| matches!(part, ModelContentPart::Image { .. }))
+        .filter(|part| matches!(part, ModelContentPart::Image { .. }))
+        .count()
+}
+
+fn request_has_image_input(request: &ModelRequest) -> bool {
+    request_image_part_count(request) > 0
+}
+
+fn provider_rejected_image_input(body: &str) -> bool {
+    let body_lower = body.to_ascii_lowercase();
+    body.contains("图片")
+        || body.contains("图像")
+        || body.contains("多模态")
+        || body_lower.contains("image")
+        || body_lower.contains("vision")
+        || body_lower.contains("multimodal")
 }
 
 impl ProviderEnv {
@@ -4738,6 +4813,44 @@ mod tests {
     }
 
     #[test]
+    fn glm_starts_in_compatibility_message_mode() {
+        let provider =
+            OpenAiCompatibleProvider::new("https://api.example.test/v1", "test-key", "glm-5.2");
+        let prepared = provider
+            .prepare(Uuid::nil(), layered_model_request())
+            .unwrap();
+        let messages = prepared.body["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "system");
+        assert!(!messages
+            .iter()
+            .any(|message| message["role"] == "developer"));
+    }
+
+    #[test]
+    fn compatibility_retry_diagnostics_report_actual_image_count() {
+        let request = model_request();
+        assert_eq!(request_image_part_count(&request), 0);
+
+        let mut request_with_image = request;
+        request_with_image.user_content = vec![ModelContentPart::image("image/png", vec![1])];
+        assert_eq!(request_image_part_count(&request_with_image), 1);
+    }
+
+    #[test]
+    fn detects_provider_image_capability_rejection() {
+        assert!(provider_rejected_image_input(
+            r#"{"message":"当前请求包含图片内容，上游不支持"}"#
+        ));
+        assert!(provider_rejected_image_input(
+            r#"{"error":"vision input is not supported"}"#
+        ));
+        assert!(!provider_rejected_image_input(
+            r#"{"error":"unsupported developer role"}"#
+        ));
+    }
+
+    #[test]
     fn serializes_native_user_images_and_structured_tool_content() {
         let mut request = model_request();
         request.user_content = vec![
@@ -5156,7 +5269,7 @@ mod tests {
         });
         let mut provider =
             OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
-        provider.temperature = 0.7;
+        provider.temperature = Some(0.7);
         provider.max_output_tokens = Some(2048);
         provider.reasoning_effort = Some("high".to_string());
         let mut request = model_request();
@@ -5208,6 +5321,70 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn chat_provider_fails_fast_when_upstream_rejects_image_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_count_tx, request_count_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            let rejected = r#"{"error":{"message":"当前请求包含图片内容，上游不支持","type":"invalid_request"}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        rejected.len(),
+                        rejected
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            let second_request =
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_ok();
+            request_count_tx
+                .send(if second_request { 2 } else { 1 })
+                .unwrap();
+        });
+
+        let provider =
+            OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+        let mut request = model_request();
+        request.user_content = vec![ModelInputContent::image("image/png", vec![1, 2, 3])];
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        let mut transport = Vec::new();
+
+        let error = provider
+            .stream_prepared(prepared, &mut |_| Ok(()), &mut |event| {
+                transport.push(event);
+                Ok(())
+            })
+            .await
+            .expect_err("unsupported image input should fail before compatibility retry");
+        server.await.unwrap();
+
+        assert_eq!(request_count_rx.await.unwrap(), 1);
+        assert!(
+            error.to_string().contains("does not support image input"),
+            "unexpected provider error: {error:#}"
+        );
+        assert!(transport.iter().any(|event| matches!(
+            event,
+            ProviderTransportEvent::Response {
+                attempt: 1,
+                status: Some(400),
+                ..
+            }
+        )));
+        assert!(!transport
+            .iter()
+            .any(|event| matches!(event, ProviderTransportEvent::Retry { .. })));
     }
 
     #[tokio::test]

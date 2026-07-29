@@ -1,6 +1,6 @@
 # OpenTopia 上下文压缩设计
 
-- 状态：Proposed
+- 状态：Implemented (2026-07-27)
 - 日期：2026-07-25
 - 适用范围：OpenTopia server、core agent、provider adapter、SQLite session store
 
@@ -479,29 +479,37 @@ SQLite 原始事件
 
 ### Phase 0：协议和可观测性
 
+- 已实现：`ContextCheckpoint`、双 coverage 游标、`ContextProjection`、provider state schema、SQLite migration 及状态 API/UI。
 - 增加 `ContextCheckpoint` 和 `ProviderContextState` 类型；
-- 扩展 `ContextCompacted` 事件；
-- 增加 checkpoint、provider state、projection 的 token 统计；
+- `ContextCompacted` 事件包含 checkpoint、mode、coverage、provider state reference 和质量指标；
+- 增加 `ContextProjectionBuilt`、`ProviderContextStateInvalidated` 事件；
+- 增加 checkpoint、provider state、projection 的 token、延迟和事实保留率统计；
 - 保留现有文本摘要作为兼容 fallback。
 
 ### Phase 1：结构化本地压缩
 
+- 已实现：严格 JSON Schema checkpoint、服务端 coverage 校验/脱敏/预算、分层增量 snapshot、完整 recent tail、历史工具输出有界 observation。
 - 使用 JSON Schema 生成 checkpoint；
-- 服务端计算 coverage；
+- 服务端计算消息和事件 coverage，并在单次快照无法覆盖时进行有上限的连续追赶；
+- checkpoint delta 按稳定 ID/自然键确定性合并，未提及的旧事实不会被模型输出覆盖；
 - 增加 schema 校验、敏感信息过滤和原子持久化；
+- 预算收缩不静默删除活跃用户约束、文件路径、命令和未解决问题；
 - 工具结果改为 bounded excerpt + artifact reference。
 
 ### Phase 2：原生 provider 状态
 
+- 已实现：Responses `response_id`、opaque `compaction`/encrypted reasoning items 的持久化与回放、兼容性失效及远端 cursor 400/404 fallback。
 - 完善 Responses compaction item 捕获和持久化；
 - 将 response id、provider items 和 compatibility hash 绑定；
-- 实现状态过期、provider 切换和 hash 不匹配时的本地 fallback。
+- 原生 compaction 发生时写入不冒进本地 coverage 的轻量 checkpoint；
+- 实现状态过期、provider 切换和 hash 不匹配时的本地 fallback，并记录明确失效原因。
 
 ### Phase 3：评测与参数调优
 
-- 加入长上下文、工具密集和中断恢复测试；
-- 比较 native、structured local 和 legacy text 三种路径；
-- 根据事实保留率和下一步动作准确率调整阈值，而不是只看压缩比例。
+- 已加入多轮 delta、消息/事件双游标、预算收缩、provider/model 失效和原生 checkpoint 的确定性测试；
+- `scripts/verify-context-summary.cmd` 执行真实 provider 结构化压缩 smoke，并验证两次手动 delta 的事实保留和 lineage；
+- context status API 汇总输入/checkpoint token、延迟、fallback、事实和活跃约束保留率；
+- native、structured local、legacy text 的跨模型语义质量对比属于发布评测运行，不在单元测试中伪造结论；需要使用目标 provider 凭据采集基线后再调整阈值。
 
 ## 14. 最终决策
 

@@ -1,7 +1,9 @@
-//! CPU and memory quotas for spawned sandbox processes.
+//! Process-tree cleanup and resource quotas for spawned sandbox processes.
 //!
 //! On Windows this is a job object owned by OpenTopia and wrapped around the process it
 //! spawns, which for sandboxed execution is the `codex sandbox` helper.
+//! The job is always created on Windows so closing OpenTopia also closes the command tree;
+//! a memory quota is applied unless the caller supplies a different one.
 //!
 //! The helper creates a job object of its own, so this is deliberately an *outer* job. That
 //! works because nested job limits intersect: a process bound by both jobs cannot exceed
@@ -26,6 +28,17 @@
 
 use crate::execution::ResourceLimit;
 
+#[cfg(windows)]
+const FALLBACK_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+#[cfg(windows)]
+const MIN_DEFAULT_MEMORY_BYTES: u64 = 1 * 1024 * 1024 * 1024;
+#[cfg(windows)]
+const MAX_DEFAULT_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Positive decimal bytes override the default; `0` keeps cleanup enabled but removes the
+/// memory cap for troubleshooting or unusually large local builds.
+#[cfg(windows)]
+const MAX_MEMORY_ENV: &str = "OPENTOPIA_MAX_MEMORY_BYTES";
+
 /// A resource quota bound to one spawned process tree.
 ///
 /// Dropping this terminates the processes assigned to it.
@@ -36,27 +49,35 @@ pub struct ProcessQuota {
 }
 
 impl ProcessQuota {
-    /// Builds a quota for `limits`, or `None` when neither a CPU nor a memory limit is set.
+    /// Builds the Windows process-tree job for `limits`.
     ///
-    /// `max_output_bytes` is not a process limit and is enforced by the output reader.
+    /// On Windows this is always `Some`, even when no explicit CPU or memory limit is set,
+    /// because the job also owns process-tree cleanup. An explicit memory limit wins over
+    /// the dynamic default and the [`MAX_MEMORY_ENV`] override.
+    ///
+    /// On other platforms this remains `None`; `max_output_bytes` is enforced by the output
+    /// reader everywhere.
     pub fn prepare(limits: &ResourceLimit) -> anyhow::Result<Option<Self>> {
-        if limits.max_cpu_time.is_none() && limits.max_memory_bytes.is_none() {
-            return Ok(None);
-        }
         #[cfg(windows)]
         {
+            let mut effective_limits = limits.clone();
+            if effective_limits.max_memory_bytes.is_none() {
+                effective_limits.max_memory_bytes = default_memory_limit_bytes();
+            }
             Ok(Some(Self {
-                job: imp::OwnedJob::create(limits)?,
+                job: imp::OwnedJob::create(&effective_limits)?,
             }))
         }
         #[cfg(not(windows))]
         {
-            // Only Windows is in scope for the current delivery target. Refusing here would
-            // break local development on other platforms, so the limit is reported as
-            // unenforced instead of silently claimed.
-            tracing::warn!(
-                "process CPU/memory quotas are only enforced on Windows; running unmetered"
-            );
+            if limits.max_cpu_time.is_some() || limits.max_memory_bytes.is_some() {
+                // Only Windows is in scope for the current delivery target. Refusing here would
+                // break local development on other platforms, so the limit is reported as
+                // unenforced instead of silently claimed.
+                tracing::warn!(
+                    "process CPU/memory quotas are only enforced on Windows; running unmetered"
+                );
+            }
             Ok(None)
         }
     }
@@ -83,9 +104,78 @@ impl ProcessQuota {
     }
 }
 
+#[cfg(windows)]
+fn default_memory_limit_bytes() -> Option<u64> {
+    let default_bytes = physical_memory_bytes()
+        .map(default_memory_limit_for_total)
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                fallback_bytes = FALLBACK_MEMORY_BYTES,
+                "could not determine physical memory; using the fallback process memory limit"
+            );
+            FALLBACK_MEMORY_BYTES
+        });
+    let configured = std::env::var(MAX_MEMORY_ENV).ok();
+    resolve_memory_limit(None, configured.as_deref(), default_bytes)
+}
+
+#[cfg(windows)]
+fn physical_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: `status` is initialized with the required structure size and a valid pointer.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        None
+    } else {
+        Some(status.ullTotalPhys)
+    }
+}
+
+#[cfg(windows)]
+fn default_memory_limit_for_total(total_memory_bytes: u64) -> u64 {
+    (total_memory_bytes / 2).clamp(MIN_DEFAULT_MEMORY_BYTES, MAX_DEFAULT_MEMORY_BYTES)
+}
+
+#[cfg(windows)]
+fn resolve_memory_limit(
+    explicit: Option<u64>,
+    env_value: Option<&str>,
+    default_bytes: u64,
+) -> Option<u64> {
+    if explicit.is_some() {
+        return explicit;
+    }
+
+    match env_value {
+        Some(value) if value.trim() == "0" => None,
+        Some(value) => match parse_memory_limit(value) {
+            Some(bytes) => Some(bytes),
+            None => {
+                tracing::warn!(
+                    variable = MAX_MEMORY_ENV,
+                    default_bytes,
+                    "invalid memory limit; using the default"
+                );
+                Some(default_bytes)
+            }
+        },
+        None => Some(default_bytes),
+    }
+}
+
+#[cfg(windows)]
+fn parse_memory_limit(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().filter(|bytes| *bytes > 0)
+}
+
 /// Creation flags required so a process can be assigned before it runs any code.
 ///
-/// Returns `0` when no quota applies, so the caller can pass the result unconditionally.
+/// Returns `0` on non-Windows or when no process-tree job is present, so the caller can pass
+/// the result unconditionally.
 #[cfg(windows)]
 pub fn suspended_creation_flags(quota: Option<&ProcessQuota>) -> u32 {
     if quota.is_some() {
@@ -139,6 +229,9 @@ mod imp {
             let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
             if let Some(memory) = limits.max_memory_bytes {
+                if memory == 0 {
+                    return Err(anyhow!("memory quota must be greater than zero"));
+                }
                 // Job-wide rather than per-process: the limit should cover the command and
                 // everything it spawns, not reset for each descendant.
                 flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
@@ -262,20 +355,72 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(not(windows))]
     #[test]
-    fn no_limits_produce_no_quota() {
+    fn no_limits_produce_no_quota_on_non_windows() {
         let quota = ProcessQuota::prepare(&ResourceLimit::default()).expect("prepare");
         assert!(quota.is_none());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn output_limit_alone_is_not_a_process_quota() {
-        // Output truncation is enforced while reading the pipes, not by the OS.
+    fn no_limits_still_create_a_cleanup_job() {
+        let quota = ProcessQuota::prepare(&ResourceLimit::default()).expect("prepare");
+        assert!(quota.is_some());
+    }
+
+    #[test]
+    fn output_limit_alone_does_not_add_a_resource_limit() {
+        // Output truncation is enforced while reading the pipes, not by the OS. Windows still
+        // creates its cleanup job even though this limit does not add a resource quota.
         let limits = ResourceLimit {
             max_output_bytes: Some(1024),
             ..ResourceLimit::default()
         };
+        #[cfg(windows)]
+        assert!(ProcessQuota::prepare(&limits).expect("prepare").is_some());
+        #[cfg(not(windows))]
         assert!(ProcessQuota::prepare(&limits).expect("prepare").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn memory_limit_configuration_is_positive_and_explicit_values_win() {
+        assert_eq!(parse_memory_limit("134217728"), Some(128 * 1024 * 1024));
+        assert_eq!(parse_memory_limit("0"), None);
+        assert_eq!(parse_memory_limit("not-a-number"), None);
+        assert_eq!(
+            resolve_memory_limit(None, Some("134217728"), 4 * 1024 * 1024 * 1024),
+            Some(128 * 1024 * 1024)
+        );
+        assert_eq!(
+            resolve_memory_limit(
+                Some(256 * 1024 * 1024),
+                Some("134217728"),
+                4 * 1024 * 1024 * 1024,
+            ),
+            Some(256 * 1024 * 1024)
+        );
+        assert_eq!(
+            resolve_memory_limit(None, Some("0"), 4 * 1024 * 1024 * 1024),
+            None
+        );
+        assert_eq!(
+            resolve_memory_limit(None, Some("not-a-number"), 4 * 1024 * 1024 * 1024),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            default_memory_limit_for_total(4 * 1024 * 1024 * 1024),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            default_memory_limit_for_total(16 * 1024 * 1024 * 1024),
+            MAX_DEFAULT_MEMORY_BYTES
+        );
+        assert_eq!(
+            default_memory_limit_for_total(1 * 1024 * 1024 * 1024),
+            MIN_DEFAULT_MEMORY_BYTES
+        );
     }
 
     #[cfg(windows)]
@@ -303,6 +448,16 @@ mod tests {
     fn zero_cpu_limit_is_rejected_rather_than_silently_unbounded() {
         let limits = ResourceLimit {
             max_cpu_time: Some(Duration::ZERO),
+            ..ResourceLimit::default()
+        };
+        assert!(ProcessQuota::prepare(&limits).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_memory_limit_is_rejected_rather_than_silently_unbounded() {
+        let limits = ResourceLimit {
+            max_memory_bytes: Some(0),
             ..ResourceLimit::default()
         };
         assert!(ProcessQuota::prepare(&limits).is_err());

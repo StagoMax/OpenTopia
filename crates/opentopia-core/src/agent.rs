@@ -34,7 +34,7 @@ use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::settings::{AppSettings, RolloutBudgetSettings};
 use crate::skill_authoring::skill_target_path;
 use crate::skills::SkillScope;
-use crate::store::SessionStore;
+use crate::store::{ProviderContextStateKind, SessionStore};
 use crate::subagents::{SubagentScheduler, SubagentScope};
 use crate::tools::{
     browser_domain_approval_action, browser_domain_from_url, McpToolWrapper, ToolContext,
@@ -97,6 +97,12 @@ pub struct AgentTurnResult {
 pub struct ProviderConversationCursor {
     pub response_id: String,
     pub compatibility_hash: String,
+    #[serde(default)]
+    pub response_items: Vec<Value>,
+    #[serde(default)]
+    pub state_kind: ProviderContextStateKind,
+    #[serde(default)]
+    pub compaction_item_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1361,11 +1367,24 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             &tool_candidates,
             branch_developer_instructions.as_deref(),
         );
-        let previous_response_id = input
+        let compatible_cursor = input
             .provider_cursor
             .as_ref()
-            .filter(|cursor| cursor.compatibility_hash == provider_compatibility_hash)
+            .filter(|cursor| cursor.compatibility_hash == provider_compatibility_hash);
+        if input.provider_cursor.is_some() && compatible_cursor.is_none() {
+            events.push(AgentEventPayload::ProviderContextStateInvalidated {
+                provider_id: None,
+                model: None,
+                reason: "provider context compatibility hash changed; rebuilt from the local checkpoint and recent history".to_string(),
+            });
+        }
+        let previous_response_id = compatible_cursor
+            .filter(|cursor| !cursor.response_id.is_empty())
             .map(|cursor| cursor.response_id.clone());
+        let previous_response_items = compatible_cursor
+            .filter(|cursor| cursor.response_id.is_empty())
+            .map(|cursor| cursor.response_items.clone())
+            .unwrap_or_default();
         // Work left running by an earlier turn has to be visible on the very first
         // round of this one: a user who starts a build and then asks whether it is done
         // should not have to wait for a second round to hear the answer.
@@ -1399,7 +1418,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     tool_candidates.clone(),
                     Vec::new(),
                     Vec::new(),
-                    Vec::new(),
+                    previous_response_items.clone(),
                     previous_response_id,
                     branch_developer_instructions.clone(),
                 ),
@@ -1414,6 +1433,8 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
         }
         record_rollout_usage(&mut rollout_budget, response.usage.as_ref())?;
+        let mut opening_provider_response_items = previous_response_items.clone();
+        opening_provider_response_items.extend(response.provider_items.iter().cloned());
         match response.decision() {
             ModelDecision::Incomplete(reason) => {
                 return Err(incomplete_model_response(reason, &response));
@@ -1421,7 +1442,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             ModelDecision::Final(_) => {
                 let mut provider_tool_calls = Vec::new();
                 let mut provider_tool_results = Vec::new();
-                let mut provider_response_items = Vec::new();
+                let mut provider_response_items = opening_provider_response_items;
                 if let Some(intervention) = self.apply_finalization_guard(
                     input.thread_id,
                     input.user_message_id,
@@ -1472,6 +1493,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 return Ok(finalize_provider_turn(
                     input.thread_id,
                     response,
+                    previous_response_items,
                     provider_tool_results,
                     budget,
                     events,
@@ -1505,7 +1527,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             Vec::new(),
             response.tool_calls,
             String::new(),
-            response.provider_items,
+            opening_provider_response_items,
             branch_developer_instructions,
             provider_compatibility_hash,
             None,
@@ -2199,6 +2221,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     return Ok(finalize_provider_turn(
                         thread_id,
                         response,
+                        provider_response_items,
                         provider_tool_results,
                         budget,
                         std::mem::replace(events, TurnEvents::new(None)),
@@ -2294,13 +2317,22 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     attempt,
                     reason,
                     body,
-                } => events.push(AgentEventPayload::ProviderRequestRetried {
-                    request_id,
-                    round,
-                    attempt,
-                    reason,
-                    body,
-                }),
+                } => {
+                    if reason.contains("stored response cursor unavailable") {
+                        events.push(AgentEventPayload::ProviderContextStateInvalidated {
+                            provider_id: None,
+                            model: None,
+                            reason: reason.clone(),
+                        });
+                    }
+                    events.push(AgentEventPayload::ProviderRequestRetried {
+                        request_id,
+                        round,
+                        attempt,
+                        reason,
+                        body,
+                    });
+                }
                 ProviderTransportEvent::Response {
                     attempt,
                     status,
@@ -2644,6 +2676,7 @@ fn insert_approval_execution_metadata(
 fn finalize_provider_turn(
     thread_id: Uuid,
     response: ModelResponse,
+    mut prior_provider_items: Vec<Value>,
     provider_tool_results: Vec<ProviderToolResult>,
     mut budget: Option<ContextBudget>,
     mut events: TurnEvents,
@@ -2658,14 +2691,28 @@ fn finalize_provider_turn(
         }
     }
 
-    let provider_cursor = response
-        .response_id
-        .clone()
-        .filter(|value| !value.is_empty())
-        .map(|response_id| ProviderConversationCursor {
+    let response_id = response.response_id.clone().unwrap_or_default();
+    prior_provider_items.extend(response.provider_items.iter().cloned());
+    let response_items = replayable_provider_state_items(&prior_provider_items);
+    let compaction_item_count = response_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+        .count();
+    let provider_cursor = (!response_id.is_empty() || !response_items.is_empty()).then(|| {
+        let state_kind = match (response_id.is_empty(), response_items.is_empty()) {
+            (false, false) => ProviderContextStateKind::Hybrid,
+            (false, true) => ProviderContextStateKind::StoredResponse,
+            (true, false) => ProviderContextStateKind::CompactionItems,
+            (true, true) => unreachable!("cursor requires provider state"),
+        };
+        ProviderConversationCursor {
             response_id,
             compatibility_hash: provider_compatibility_hash,
-        });
+            response_items,
+            state_kind,
+            compaction_item_count,
+        }
+    });
     debug_assert!(matches!(response.decision(), ModelDecision::Final(_)));
     let assistant_message = Message::text(thread_id, MessageRole::Assistant, response.text);
     events.push(AgentEventPayload::AssistantMessage {
@@ -2691,6 +2738,35 @@ fn finalize_provider_turn(
         outcome,
         provider_cursor,
     }
+}
+
+fn replayable_provider_state_items(items: &[Value]) -> Vec<Value> {
+    let mut replayable = items
+        .iter()
+        .filter(|item| match item.get("type").and_then(Value::as_str) {
+            Some("compaction") => true,
+            Some("reasoning") => item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+            _ => false,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(last_compaction) = replayable
+        .iter()
+        .rposition(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+    {
+        replayable.drain(..last_compaction);
+    }
+    let mut seen_ids = HashSet::new();
+    replayable.retain(|item| {
+        item.get("id")
+            .and_then(Value::as_str)
+            .map(|id| seen_ids.insert(id.to_string()))
+            .unwrap_or(true)
+    });
+    replayable
 }
 
 fn finalize_reviewer_stopped_turn(
@@ -3219,7 +3295,7 @@ pub fn agent_model_context_with_runtime(
     context
 }
 
-pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-07-26.2";
+pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-07-29.1";
 pub const BASE_AGENT_PROMPT: &str = include_str!("base_agent_prompt.md");
 
 pub fn base_agent_prompt_hash() -> String {
@@ -3238,7 +3314,7 @@ fn provider_system_prompt(workspace_root: &Path, sandbox_config: &LocalSandboxCo
 #[allow(clippy::too_many_arguments)]
 fn build_model_request(
     model_context: &CompiledModelContext,
-    context_summary: Option<&str>,
+    _context_summary: Option<&str>,
     conversation: Vec<ModelConversationMessage>,
     user_message: String,
     user_content: Vec<ModelContentPart>,
@@ -3250,16 +3326,10 @@ fn build_model_request(
     branch_developer_instructions: Option<String>,
 ) -> ModelRequest {
     let mut context_items = model_context.items.clone();
-    if let Some(summary) = context_summary.filter(|value| !value.trim().is_empty()) {
-        context_items.push(ModelContextItem::text(
-            ContextItemKind::Summary,
-            ContextRole::Developer,
-            "opentopia:durable_context",
-            summary,
-            ContextCacheScope::Thread,
-            ContextSensitivity::Workspace,
-        ));
-    }
+    // `provider_user_message` embeds the durable checkpoint ahead of the
+    // current request. Mirroring it here made observability and token estimates
+    // count the same plan twice even though providers dispatch only the user
+    // message. Keep one canonical model-facing representation.
     context_items.extend(conversation.iter().enumerate().map(|(index, message)| {
         let role = match message.role {
             ModelConversationRole::System => ContextRole::System,
@@ -3355,8 +3425,10 @@ fn workspace_scope_instruction(
         ""
     };
     format!(
-        "The thread workspace root is '{}'. Resolve every relative file path and shell working directory against this root; the default shell working directory is this root. Begin with the workspace and complete the task there whenever it contains enough information. Do not list, search, read, or probe parent directories or unrelated absolute paths for context. Access outside the workspace only when the user explicitly requests it or the path is an additional configured readable root. Configured additional readable roots: {additional_roots}.{full_access_note}",
-        workspace_root.display()
+        "The thread workspace root is '{}'. Resolve every relative file path and shell working directory against this root; the default shell working directory is this root. Runtime platform: {}-{}. Begin with the workspace and complete the task there whenever it contains enough information. Do not list, search, read, or probe parent directories or unrelated absolute paths for context. Access outside the workspace only when the user explicitly requests it or the path is an additional configured readable root. Configured additional readable roots: {additional_roots}.{full_access_note}",
+        workspace_root.display(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
     )
 }
 
@@ -3708,7 +3780,7 @@ mod tests {
         assert_eq!(module.metadata["settingValue"], "unavailable");
         assert!(module
             .text_content()
-            .contains("Never render a multiple-choice prompt as ordinary assistant text"));
+            .contains("Never present an ordinary-text multiple-choice prompt"));
     }
 
     #[test]
@@ -4049,6 +4121,8 @@ mod tests {
             "Do not claim a complete call graph from text search alone",
             "Git safety",
             "Skills and specialized instructions",
+            "A catalog entry is routing metadata, not its full instructions",
+            "child may perform delegated task work but cannot substitute a summary",
             "A tool call, including a plan or completion tool, never ends the turn by itself",
             "finalization-guard result",
             "Validation",
@@ -4109,6 +4183,11 @@ mod tests {
             workspace.canonicalize().unwrap().display()
         )));
         assert!(prompt.contains("default shell working directory is this root"));
+        assert!(prompt.contains(&format!(
+            "Runtime platform: {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )));
         assert!(prompt.contains("complete the task there whenever it contains enough information"));
         assert!(prompt.contains("Do not list, search, read, or probe parent directories"));
         assert!(prompt.contains(&additional_root.display().to_string()));
@@ -7465,6 +7544,17 @@ mod tests {
         assert!(requests[0]
             .user_message
             .contains("keep the Rust sidecar API stable"));
+        let checkpoint_items = requests[0]
+            .context_items
+            .iter()
+            .filter(|item| item.text_content().contains("keep the Rust sidecar API stable"))
+            .collect::<Vec<_>>();
+        assert_eq!(checkpoint_items.len(), 1);
+        assert_eq!(checkpoint_items[0].kind, ContextItemKind::User);
+        assert!(!requests[0]
+            .context_items
+            .iter()
+            .any(|item| item.kind == ContextItemKind::Checkpoint));
 
         // The summary is compacted history, not a new instruction. It must carry
         // continuity framing and an untrusted-content boundary, and it must not
@@ -7520,6 +7610,9 @@ mod tests {
                     provider_cursor: Some(ProviderConversationCursor {
                         response_id: "resp_previous".to_string(),
                         compatibility_hash: compatibility_hash.clone(),
+                        response_items: Vec::new(),
+                        state_kind: ProviderContextStateKind::StoredResponse,
+                        compaction_item_count: 0,
                     }),
                     store: None,
                     cancellation: None,
@@ -7538,6 +7631,9 @@ mod tests {
             Some(ProviderConversationCursor {
                 response_id: "resp_next".to_string(),
                 compatibility_hash,
+                response_items: Vec::new(),
+                state_kind: ProviderContextStateKind::StoredResponse,
+                compaction_item_count: 0,
             })
         );
 
@@ -7561,6 +7657,9 @@ mod tests {
                 provider_cursor: Some(ProviderConversationCursor {
                     response_id: "resp_stale".to_string(),
                     compatibility_hash: "stale".to_string(),
+                    response_items: Vec::new(),
+                    state_kind: ProviderContextStateKind::StoredResponse,
+                    compaction_item_count: 0,
                 }),
                 store: None,
                 cancellation: None,
@@ -7572,6 +7671,108 @@ mod tests {
             .is_none());
 
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn stateless_provider_cursor_replays_only_opaque_context_items() {
+        let workspace = test_workspace("provider-state-items");
+        let sandbox = LocalSandboxConfig::danger_full_access();
+        let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse {
+            text: "Continued from opaque state.".to_string(),
+            tool_calls: Vec::new(),
+            usage: None,
+            response_id: None,
+            provider_items: vec![
+                json!({ "type": "compaction", "id": "cmp_next", "encrypted_content": "opaque" }),
+                json!({ "type": "reasoning", "id": "rs_next", "encrypted_content": "opaque" }),
+                json!({ "type": "message", "id": "msg_next", "content": [] }),
+            ],
+            finish_reason: ModelFinishReason::Stop,
+        }]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
+            .with_sandbox_config(sandbox.clone());
+        let model_context = default_agent_model_context(&workspace, &sandbox);
+        let compatibility_hash = provider_compatibility_hash(
+            &model_context,
+            None,
+            &agent.provider_tool_candidates(),
+            None,
+        );
+        let previous_item = json!({
+            "type": "compaction",
+            "id": "cmp_previous",
+            "encrypted_content": "opaque"
+        });
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "Continue.".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    provider_cursor: Some(ProviderConversationCursor {
+                        response_id: String::new(),
+                        compatibility_hash,
+                        response_items: vec![previous_item.clone()],
+                        state_kind: ProviderContextStateKind::CompactionItems,
+                        compaction_item_count: 1,
+                    }),
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("turn succeeds");
+
+        let request = &provider.requests()[0];
+        assert!(request.previous_response_id.is_none());
+        assert_eq!(request.previous_response_items, vec![previous_item]);
+        let cursor = result.provider_cursor.expect("opaque cursor is retained");
+        assert_eq!(cursor.state_kind, ProviderContextStateKind::CompactionItems);
+        assert_eq!(cursor.compaction_item_count, 1);
+        assert_eq!(cursor.response_items.len(), 2);
+        assert!(cursor
+            .response_items
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("message")));
+        assert!(cursor
+            .response_items
+            .iter()
+            .any(|item| { item.get("id").and_then(Value::as_str) == Some("cmp_next") }));
+        assert!(!cursor
+            .response_items
+            .iter()
+            .any(|item| { item.get("id").and_then(Value::as_str) == Some("cmp_previous") }));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn opaque_provider_state_survives_until_a_new_compaction_supersedes_it() {
+        let retained = replayable_provider_state_items(&[
+            json!({ "type": "compaction", "id": "cmp_old" }),
+            json!({ "type": "reasoning", "id": "reasoning_new", "encrypted_content": "opaque" }),
+        ]);
+        assert_eq!(retained.len(), 2);
+
+        let superseded = replayable_provider_state_items(&[
+            json!({ "type": "compaction", "id": "cmp_old" }),
+            json!({ "type": "reasoning", "id": "reasoning_old", "encrypted_content": "opaque" }),
+            json!({ "type": "compaction", "id": "cmp_new" }),
+            json!({ "type": "reasoning", "id": "reasoning_new", "encrypted_content": "opaque" }),
+        ]);
+        assert_eq!(superseded.len(), 2);
+        assert_eq!(
+            superseded[0].get("id").and_then(Value::as_str),
+            Some("cmp_new")
+        );
     }
 
     #[tokio::test]
