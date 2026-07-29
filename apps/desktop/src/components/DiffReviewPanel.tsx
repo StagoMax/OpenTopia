@@ -397,7 +397,8 @@ export function DiffReviewPanel({
               left.boundingClientRect.top - right.boundingClientRect.top,
           );
         const path = visible[0]?.target.getAttribute("data-file-path");
-        if (path) setActivePath((current) => (current === path ? current : path));
+        if (path)
+          setActivePath((current) => (current === path ? current : path));
         setRenderedPaths((current) => {
           const next = new Set(current);
           let changed = false;
@@ -420,15 +421,18 @@ export function DiffReviewPanel({
   const allCollapsed =
     files.length > 0 && files.every((file) => collapsedFiles.has(file.path));
 
-  const toggleFile = useCallback((path: string) => {
-    renderFile(path);
-    setCollapsedFiles((current) => {
-      const next = new Set(current);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }, [renderFile]);
+  const toggleFile = useCallback(
+    (path: string) => {
+      renderFile(path);
+      setCollapsedFiles((current) => {
+        const next = new Set(current);
+        if (next.has(path)) next.delete(path);
+        else next.add(path);
+        return next;
+      });
+    },
+    [renderFile],
+  );
 
   const toggleAllFiles = useCallback(() => {
     setCollapsedFiles((current) => {
@@ -451,22 +455,25 @@ export function DiffReviewPanel({
     [requestContent],
   );
 
-  const scrollToFile = useCallback((path: string) => {
-    renderFile(path);
-    setCollapsedFiles((current) => {
-      if (!current.has(path)) return current;
-      const next = new Set(current);
-      next.delete(path);
-      return next;
-    });
-    setActivePath(path);
-    // The section may have just been expanded, so wait for the paint.
-    requestAnimationFrame(() =>
-      sectionRefs.current
-        .get(path)
-        ?.scrollIntoView({ block: "start", behavior: "smooth" }),
-    );
-  }, [renderFile]);
+  const scrollToFile = useCallback(
+    (path: string) => {
+      renderFile(path);
+      setCollapsedFiles((current) => {
+        if (!current.has(path)) return current;
+        const next = new Set(current);
+        next.delete(path);
+        return next;
+      });
+      setActivePath(path);
+      // The section may have just been expanded, so wait for the paint.
+      requestAnimationFrame(() =>
+        sectionRefs.current
+          .get(path)
+          ?.scrollIntoView({ block: "start", behavior: "smooth" }),
+      );
+    },
+    [renderFile],
+  );
 
   // A "review this file" request names a working-tree path, so it always
   // resolves against the workspace baseline rather than a recorded turn.
@@ -649,11 +656,15 @@ export function DiffReviewPanel({
               {scope?.kind === "turn" && turnState?.status === "loading" ? (
                 <p className="diff-review__empty compact" role="status">
                   <Loader2 className="spin" size={14} aria-hidden="true" />
-                  正在加载 {turnState.loadedFileCount}/{turnState.totalFileCount} 个文件…
+                  正在加载 {turnState.loadedFileCount}/
+                  {turnState.totalFileCount} 个文件…
                 </p>
               ) : null}
               {turnState?.error ? (
-                <p className="diff-review__empty compact is-error" role="status">
+                <p
+                  className="diff-review__empty compact is-error"
+                  role="status"
+                >
                   <AlertCircle size={14} aria-hidden="true" />
                   {turnState.error}
                 </p>
@@ -690,7 +701,8 @@ export function DiffReviewPanel({
                     setRowLimits((current) => ({
                       ...current,
                       [file.path]:
-                        (current[file.path] ?? defaultRowLimit) + defaultRowLimit,
+                        (current[file.path] ?? defaultRowLimit) +
+                        defaultRowLimit,
                     }))
                   }
                 />
