@@ -503,8 +503,16 @@ try {
       $_.id -eq $settings.activeProviderId
     })[0]
   }
+  # The settings UI exposes one OpenAI-compatible `/v1` connection. A
+  # successful capability probe may select either internal adapter, so the
+  # benchmark must validate the connection identity rather than pinning the
+  # legacy Chat Completions implementation detail.
+  $usesOpenAiAdapter = $activeProvider.kind -in @(
+    "openai_compatible",
+    "openai_responses"
+  )
   if (
-    $activeProvider.kind -ne "openai_compatible" -or
+    -not $usesOpenAiAdapter -or
     $activeProvider.model -ne $ExpectedModel -or
     $activeProvider.baseUrl.TrimEnd("/") -ne $baseUrl
   ) {
