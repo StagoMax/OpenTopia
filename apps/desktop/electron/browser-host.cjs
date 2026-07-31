@@ -287,7 +287,6 @@ function serializeError(error) {
 function createDesktopBrowserHost(options) {
   const { app, WebContentsView, getMainWindow, logger = () => {} } = options;
   const sessions = new Map();
-  const partitionNonce = crypto.randomBytes(16).toString("hex");
   const bearerToken = crypto.randomBytes(32).toString("base64url");
   let brokerServer = null;
   let brokerUrl = null;
@@ -396,62 +395,9 @@ function createDesktopBrowserHost(options) {
   function configureRemoteContents(entry) {
     const webContents = entry.view.webContents;
     const browserSession = webContents.session;
-    browserSession.setPermissionRequestHandler(
-      (_contents, _permission, callback) => callback(false),
-    );
-    browserSession.setPermissionCheckHandler(() => false);
 
     webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     webContents.on("will-attach-webview", (event) => event.preventDefault());
-    webContents.on("will-navigate", (event, targetUrl) => {
-      const navigationUrl = event?.url || targetUrl;
-      try {
-        const normalized = normalizeUrl(navigationUrl);
-        const host = new URL(normalized).hostname.toLowerCase();
-        if (!entry.allowedNavigationHosts.has(host)) {
-          throw new BrowserHostError(
-            "unapproved_navigation_host",
-            `Navigation to '${host}' requires an explicit address-bar or Agent navigation.`,
-            403,
-          );
-        }
-      } catch (error) {
-        event.preventDefault();
-        entry.lastError = serializeError(error).message;
-        emitState(entry);
-        log("warn", "browser.navigation.blocked", {
-          sessionId: entry.sessionId,
-          url: navigationUrl,
-          error: serializeError(error),
-        });
-      }
-    });
-    webContents.on("will-redirect", (event, targetUrl) => {
-      const navigationUrl = event?.url || targetUrl;
-      try {
-        const normalized = normalizeUrl(navigationUrl);
-        const host = new URL(normalized).hostname.toLowerCase();
-        if (
-          !entry.allowAddressBarRedirects &&
-          !entry.allowedNavigationHosts.has(host)
-        ) {
-          throw new BrowserHostError(
-            "unapproved_redirect_host",
-            `Redirect to '${host}' requires a separate approved navigation.`,
-            403,
-          );
-        }
-      } catch (error) {
-        event.preventDefault();
-        entry.lastError = serializeError(error).message;
-        emitState(entry);
-        log("warn", "browser.redirect.blocked", {
-          sessionId: entry.sessionId,
-          url: navigationUrl,
-          error: serializeError(error),
-        });
-      }
-    });
 
     const updateEvents = [
       "did-start-loading",
@@ -471,11 +417,8 @@ function createDesktopBrowserHost(options) {
       emitState(entry);
     });
 
-    browserSession.on("will-download", (event, item, sourceContents) => {
-      if (sourceContents !== webContents || !entry.pendingDownload) {
-        event.preventDefault();
-        return;
-      }
+    browserSession.on("will-download", (_event, item, sourceContents) => {
+      if (sourceContents !== webContents || !entry.pendingDownload) return;
       const pending = entry.pendingDownload;
       entry.pendingDownload = null;
       pending.accept(item);
@@ -494,14 +437,9 @@ function createDesktopBrowserHost(options) {
       );
     }
 
-    const partitionHash = crypto
-      .createHash("sha256")
-      .update(`${partitionNonce}:${normalized}`)
-      .digest("hex")
-      .slice(0, 24);
     const view = new WebContentsView({
       webPreferences: {
-        partition: `opentopia-browser-${partitionHash}`,
+        partition: "persist:opentopia-browser",
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
@@ -520,8 +458,6 @@ function createDesktopBrowserHost(options) {
       destroyed: false,
       pendingDownload: null,
       activeDownloadItem: null,
-      allowedNavigationHosts: new Set(),
-      allowAddressBarRedirects: false,
       lastError: null,
       observations: new Map(),
       queue: Promise.resolve(),
@@ -569,43 +505,29 @@ function createDesktopBrowserHost(options) {
     }
   }
 
-  async function navigate(
-    entry,
-    rawUrl,
-    waitOptions,
-    { allowAddressBarRedirects = false } = {},
-  ) {
+  async function navigate(entry, rawUrl, waitOptions) {
     const targetUrl = normalizeUrl(rawUrl);
-    entry.allowedNavigationHosts.add(new URL(targetUrl).hostname.toLowerCase());
     entry.lastError = null;
     const webContents = entry.view.webContents;
-    const previousAllowAddressBarRedirects = entry.allowAddressBarRedirects;
-    entry.allowAddressBarRedirects = allowAddressBarRedirects;
-    try {
-      const load = webContents.loadURL(targetUrl);
-      await Promise.race([load, timeoutAfter(MAX_WAIT_MS, "Navigation")]);
-      if (waitOptions) await waitFor(entry, {}, waitOptions);
-      return browserOutput(
-        webContents,
-        "navigate",
-        [
-          jsonContent({
-            url: webContents.getURL(),
-            title: webContents.getTitle(),
-          }),
-        ],
-        { requested_url: targetUrl },
-      );
-    } finally {
-      entry.allowAddressBarRedirects = previousAllowAddressBarRedirects;
-    }
+    const load = webContents.loadURL(targetUrl);
+    await Promise.race([load, timeoutAfter(MAX_WAIT_MS, "Navigation")]);
+    if (waitOptions) await waitFor(entry, {}, waitOptions);
+    return browserOutput(
+      webContents,
+      "navigate",
+      [
+        jsonContent({
+          url: webContents.getURL(),
+          title: webContents.getTitle(),
+        }),
+      ],
+      { requested_url: targetUrl },
+    );
   }
 
   function navigateFromAddressBar(sessionId, url) {
     const entry = requireSession(sessionId);
-    return runExclusive(entry, () =>
-      navigate(entry, url, null, { allowAddressBarRedirects: true }),
-    );
+    return runExclusive(entry, () => navigate(entry, url, null));
   }
 
   async function snapshot(entry) {
@@ -652,18 +574,44 @@ function createDesktopBrowserHost(options) {
           a: "link", button: "button", textarea: "textbox", select: "combobox",
           input: element.type === "checkbox" ? "checkbox" : element.type === "radio" ? "radio" : "textbox"
         })[element.localName] || element.localName;
+        const handoffReason = (element, name, inputType, formMethod) => {
+          const normalized = [
+            name,
+            element.getAttribute("aria-label") || "",
+            element.getAttribute("title") || "",
+          ].join(" ").toLowerCase();
+          if (inputType === "file") return "Please choose and upload the file yourself in the visible browser, then tell me to continue.";
+          if (inputType === "password" || /sign[ -]?in|log[ -]?in|password|passkey|verification|verify|captcha|one[ -]?time code|security code/.test(normalized)) {
+            return "Please complete the sign-in or verification step yourself in the visible browser, then tell me to continue.";
+          }
+          if (/pay|payment|checkout|purchase|buy now|place order|subscribe/.test(normalized)) {
+            return "Please review and complete the payment or purchase yourself in the visible browser, then tell me to continue.";
+          }
+          if (/send|publish|post|share|upload|delete|remove|submit|save changes|confirm/.test(normalized) && formMethod !== "get") {
+            return "Please review and complete this external action yourself in the visible browser, then tell me to continue.";
+          }
+          return null;
+        };
         const interactiveElements = candidates
           .filter((element) => !element.disabled && element.getClientRects().length)
           .map((element) => {
             const rect = element.getBoundingClientRect();
+            const name = truncate(element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("placeholder") || "", 2048).value;
+            const inputType = (element.getAttribute("type") || "").toLowerCase() || null;
+            const formMethod = (element.getAttribute("formmethod") || element.form?.getAttribute("method") || "get").toLowerCase();
+            const userActionReason = handoffReason(element, name, inputType, formMethod);
             return {
               selector: selectorFor(element),
               tagName: element.localName,
               role: roleFor(element),
-              name: truncate(element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("placeholder") || "", 2048).value,
+              name,
               href: element.href || null,
               formAction: element.getAttribute("formaction") || (element.form && element.form.getAttribute("action")) || null,
+              formMethod,
+              inputType,
               editable: Boolean(element.isContentEditable || (["input", "textarea", "select"].includes(element.localName) && !element.readOnly)),
+              requiresUserAction: Boolean(userActionReason),
+              userActionReason,
               bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
             };
           });
@@ -749,7 +697,11 @@ function createDesktopBrowserHost(options) {
         bounds: raw.bounds || { x: 0, y: 0, width: 0, height: 0 },
         href: typeof raw.href === "string" ? raw.href : null,
         formAction: typeof raw.formAction === "string" ? raw.formAction : null,
+        formMethod: typeof raw.formMethod === "string" ? raw.formMethod : null,
+        inputType: typeof raw.inputType === "string" ? raw.inputType : null,
         editable: Boolean(raw.editable),
+        requiresUserAction: Boolean(raw.requiresUserAction),
+        userActionReason: typeof raw.userActionReason === "string" ? raw.userActionReason : null,
       };
       nodes.push(node);
       bindings.set(nodeRef, { node, selector: raw.selector });
@@ -812,7 +764,11 @@ function createDesktopBrowserHost(options) {
       expected.tagName === current.tagName &&
       expected.href === current.href &&
       expected.formAction === current.formAction &&
+      expected.formMethod === current.formMethod &&
+      expected.inputType === current.inputType &&
       expected.editable === current.editable &&
+      expected.requiresUserAction === current.requiresUserAction &&
+      expected.userActionReason === current.userActionReason &&
       Math.abs(Number(bounds.x) - Number(currentBounds.x)) <= MAX_NODE_POSITION_DRIFT &&
       Math.abs(Number(bounds.y) - Number(currentBounds.y)) <= MAX_NODE_POSITION_DRIFT &&
       Math.abs(Number(bounds.width) - Number(currentBounds.width)) <= MAX_NODE_POSITION_DRIFT &&
@@ -842,7 +798,11 @@ function createDesktopBrowserHost(options) {
       nodeRef: binding.node.nodeRef,
       href: typeof current.href === "string" ? current.href : null,
       formAction: typeof current.formAction === "string" ? current.formAction : null,
+      formMethod: typeof current.formMethod === "string" ? current.formMethod : null,
+      inputType: typeof current.inputType === "string" ? current.inputType : null,
       editable: Boolean(current.editable),
+      requiresUserAction: Boolean(current.requiresUserAction),
+      userActionReason: typeof current.userActionReason === "string" ? current.userActionReason : null,
     };
     if (!nodesMatch(binding.node, currentNode)) {
       throw staleObservation("The observed element changed or moved.");
@@ -1129,13 +1089,8 @@ function createDesktopBrowserHost(options) {
       );
     }
     const downloadDirectory = path.join(
-      app.getPath("temp"),
-      "opentopia-browser-downloads",
-      crypto
-        .createHash("sha256")
-        .update(entry.sessionId)
-        .digest("hex")
-        .slice(0, 16),
+      app.getPath("downloads"),
+      "OpenTopia",
     );
     fs.mkdirSync(downloadDirectory, { recursive: true });
 

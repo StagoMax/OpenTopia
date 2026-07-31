@@ -17,7 +17,7 @@ use crate::execution::{
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    ApprovalStatus, CollaborationMode, ModelContentPart, TaskPlan, TaskPlanStep,
+    CollaborationMode, ModelContentPart, TaskPlan, TaskPlanStep,
     TaskPlanStepStatus, ToolCall, ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
 };
 use crate::model_context::CompiledModelContext;
@@ -49,6 +49,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -2036,6 +2037,39 @@ fn skill_display_name(name: &str) -> String {
 
 pub struct BrowserTool;
 
+/// Signals that a browser interaction must be completed by the user in the visible page.
+/// This is distinct from an approval: the agent must stop controlling the page rather than retry
+/// the same operation after a yes/no decision.
+#[derive(Debug, Clone, Error)]
+#[error("{reason}")]
+pub struct BrowserHandoffRequired {
+    pub action: String,
+    pub reason: String,
+    pub url: Option<String>,
+}
+
+pub fn browser_handoff_required(error: &anyhow::Error) -> Option<&BrowserHandoffRequired> {
+    error.downcast_ref::<BrowserHandoffRequired>()
+}
+
+pub fn browser_handoff_for_node(
+    action: &str,
+    node: &crate::browser::BrowserNode,
+    url: Option<String>,
+) -> Option<BrowserHandoffRequired> {
+    if !node.requires_user_action {
+        return None;
+    }
+    Some(BrowserHandoffRequired {
+        action: action.to_string(),
+        reason: node.user_action_reason.clone().unwrap_or_else(|| {
+            "This page requires you to complete the action yourself before I continue."
+                .to_string()
+        }),
+        url,
+    })
+}
+
 #[async_trait]
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
@@ -2043,7 +2077,7 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Use an isolated local browser. Observe before every click or type, then use the returned observationId and nodeRef. The runtime rejects stale observations. The first visit to each domain requires user approval."
+        "Use the shared local browser. Observe before every click or type, then use the returned observationId and nodeRef. The runtime rejects stale observations. Navigate and follow ordinary links normally. When a page requires a login, verification, upload, payment, publication, or irreversible submission, stop controlling the page and tell the user to complete it in the visible browser. After the user says to continue, observe the page again before interacting."
     }
 
     fn schema(&self) -> Value {
@@ -2088,7 +2122,6 @@ impl Tool for BrowserTool {
         let output = match action.as_str() {
             "navigate" => {
                 let url = required_string(&call.input, "url")?;
-                inspect_browser_url(&ctx, &url)?;
                 let mut request = BrowserNavigateRequest::new(url);
                 if let Some(wait) = request.wait.as_mut() {
                     wait.timeout = timeout;
@@ -2123,8 +2156,12 @@ impl Tool for BrowserTool {
                 let target = runtime
                     .observation_node(session, observation_id, node_ref)
                     .await?;
-                if let Some(url) = target.href.as_deref() {
-                    inspect_browser_url(&ctx, url)?;
+                if let Some(handoff) = browser_handoff_for_node(
+                    &action,
+                    &target,
+                    target.href.clone(),
+                ) {
+                    return Err(handoff.into());
                 }
                 let receipt = runtime
                     .perform(session, observation_id, node_ref, BrowserAction::Click)
@@ -2143,6 +2180,12 @@ impl Tool for BrowserTool {
                 inspect_browser_interaction(&ctx)?;
                 let observation_id = browser_observation_id(&call.input)?;
                 let node_ref = browser_node_ref(&call.input)?;
+                let target = runtime
+                    .observation_node(session, observation_id, node_ref)
+                    .await?;
+                if let Some(handoff) = browser_handoff_for_node(&action, &target, None) {
+                    return Err(handoff.into());
+                }
                 let receipt = runtime
                     .perform(
                         session,
@@ -2195,7 +2238,6 @@ impl Tool for BrowserTool {
             }
             "download" => {
                 let url = required_string(&call.input, "url")?;
-                inspect_browser_url(&ctx, &url)?;
                 runtime
                     .download(
                         session,
@@ -2216,7 +2258,7 @@ impl Tool for BrowserTool {
                 runtime.close_session(session).await?;
                 return Ok(ToolResult::text(
                     call.id,
-                    "Closed the isolated browser session for this thread.",
+                    "Closed this browser tab.",
                     json!({ "sessionId": session.to_string(), "action": action }),
                 ));
             }
@@ -2485,68 +2527,6 @@ fn browser_timeout(input: &Value) -> Option<Duration> {
         .get("timeoutMs")
         .and_then(Value::as_u64)
         .map(|milliseconds| Duration::from_millis(milliseconds.clamp(1, 120_000)))
-}
-
-const BROWSER_DOMAIN_APPROVAL_PREFIX: &str = "browser:domain:";
-
-/// Parse a browser URL into the normalized host used for policy checks and persisted approvals.
-pub fn browser_domain_from_url(raw_url: &str) -> anyhow::Result<String> {
-    let url = reqwest::Url::parse(raw_url).context("browser URL is invalid")?;
-    let host = url.host_str().context("browser URL must include a host")?;
-    Ok(host.trim_end_matches('.').to_ascii_lowercase())
-}
-
-/// Keep domain grants in the existing approval history so they survive runtime restarts and are
-/// scoped by the approval's thread ID.
-pub fn browser_domain_approval_action(host: &str) -> String {
-    format!(
-        "{BROWSER_DOMAIN_APPROVAL_PREFIX}{}",
-        host.trim_end_matches('.').to_ascii_lowercase()
-    )
-}
-
-pub fn browser_domain_from_approval_action(action: &str) -> Option<String> {
-    action
-        .strip_prefix(BROWSER_DOMAIN_APPROVAL_PREFIX)
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
-}
-
-pub fn browser_domain_is_approved(
-    store: &dyn SessionStore,
-    thread_id: Uuid,
-    host: &str,
-) -> anyhow::Result<bool> {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    Ok(store
-        .list_approvals(thread_id, Some(ApprovalStatus::Approved))?
-        .into_iter()
-        .filter_map(|approval| browser_domain_from_approval_action(&approval.action))
-        .any(|approved_host| approved_host == host))
-}
-
-fn inspect_browser_url(ctx: &ToolContext, raw_url: &str) -> anyhow::Result<()> {
-    let host = browser_domain_from_url(raw_url)?;
-    enforce_policy_decision(ctx.policy.inspect_network(&host), ctx.approval_granted)?;
-
-    if ctx.approval_granted
-        || ctx
-            .store
-            .as_deref()
-            .map(|store| {
-                browser_domain_is_approved(store, ctx.thread_id.unwrap_or_default(), &host)
-            })
-            .transpose()?
-            .unwrap_or(false)
-    {
-        return Ok(());
-    }
-
-    Err(ApprovalRequired::new(format!(
-        "Browser access to the new domain `{host}` requires approval."
-    ))
-    .into())
 }
 
 fn inspect_browser_interaction(ctx: &ToolContext) -> anyhow::Result<()> {
@@ -5179,36 +5159,27 @@ mod tests {
     }
 
     #[test]
-    fn browser_domain_grants_are_thread_scoped_and_normalized() {
-        let store = SqliteSessionStore::open(":memory:").expect("open store");
-        let first_thread = store
-            .create_thread(Some("first".to_string()), PathBuf::from("."))
-            .expect("create first thread");
-        let second_thread = store
-            .create_thread(Some("second".to_string()), PathBuf::from("."))
-            .expect("create second thread");
-        let host =
-            browser_domain_from_url("https://Example.COM:8443/path").expect("parse browser URL");
-        assert_eq!(host, "example.com");
+    fn browser_handoff_classifies_sensitive_page_controls() {
+        let node: crate::browser::BrowserNode = serde_json::from_value(json!({
+            "nodeRef": Uuid::new_v4().to_string(),
+            "role": "button",
+            "name": "Place order",
+            "tagName": "button",
+            "bounds": { "x": 0.0, "y": 0.0, "width": 20.0, "height": 20.0 },
+            "href": null,
+            "formAction": "/checkout",
+            "formMethod": "post",
+            "inputType": null,
+            "editable": false,
+            "requiresUserAction": true,
+            "userActionReason": "Please review and complete the payment yourself."
+        }))
+        .expect("deserialize browser node");
 
-        let approval = Approval::pending(
-            Uuid::new_v4(),
-            first_thread.id,
-            browser_domain_approval_action(&host),
-            "test domain approval",
-        );
-        let approval_id = approval.approval_id;
-        store.insert_approval(approval).expect("persist approval");
-        store
-            .update_approval_status(approval_id, ApprovalStatus::Approved)
-            .expect("approve domain");
-
-        assert!(
-            browser_domain_is_approved(&store, first_thread.id, "EXAMPLE.COM.")
-                .expect("read grant")
-        );
-        assert!(!browser_domain_is_approved(&store, second_thread.id, &host)
-            .expect("grants do not cross threads"));
+        let handoff = browser_handoff_for_node("click", &node, None)
+            .expect("sensitive control requires handoff");
+        assert_eq!(handoff.action, "click");
+        assert!(handoff.reason.contains("payment"));
     }
 
     #[test]

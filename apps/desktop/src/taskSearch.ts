@@ -1,7 +1,7 @@
 import type { Project, Thread } from "./types";
 
 export type TaskSearchActivityStatus =
-  "processing" | "succeeded" | "failed" | "approval";
+  "processing" | "succeeded" | "failed" | "approval" | "user_action";
 
 export type TaskSearchResult = {
   projectName: string;
@@ -11,9 +11,10 @@ export type TaskSearchResult = {
 
 const statusPriority: Record<TaskSearchActivityStatus, number> = {
   approval: 0,
-  failed: 1,
-  processing: 2,
-  succeeded: 3,
+  user_action: 1,
+  failed: 2,
+  processing: 3,
+  succeeded: 4,
 };
 
 function normalizeSearchText(value: string) {

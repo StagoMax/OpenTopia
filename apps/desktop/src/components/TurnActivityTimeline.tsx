@@ -120,6 +120,15 @@ type PrimitiveActivity =
       action: string;
       createdAt: string;
     }
+  | {
+      kind: "browser-handoff";
+      seq: number;
+      action: string;
+      reason: string;
+      url?: string | null;
+      createdAt: string;
+    }
+  | { kind: "browser-handoff-completed"; seq: number; createdAt: string }
   | { kind: "error"; seq: number; message: string; createdAt: string }
   | { kind: "cancelled"; seq: number; reason: string; createdAt: string }
   | { kind: "suspended"; seq: number; reason: string; createdAt: string };
@@ -1054,6 +1063,28 @@ function ActivityEntryView({
       />
     );
   }
+  if (entry.kind === "browser-handoff") {
+    const details = [entry.reason, entry.url, "完成后在对话中告诉我继续。"]
+      .filter((value): value is string => Boolean(value))
+      .join("\n");
+    return (
+      <ActivityNotice
+        icon={<Clock3 size={13} />}
+        tone="waiting"
+        title="需要手动完成浏览器操作"
+        detail={details}
+      />
+    );
+  }
+  if (entry.kind === "browser-handoff-completed") {
+    return (
+      <ActivityNotice
+        icon={<Clock3 size={13} />}
+        title="已继续浏览器任务"
+        detail="正在根据当前页面状态继续执行。"
+      />
+    );
+  }
   if (entry.kind === "cancelled") {
     return (
       <ActivityNotice
@@ -1692,6 +1723,21 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         action: payload.action,
         createdAt: event.createdAt,
       });
+    } else if (payload.type === "browser_handoff_required") {
+      primitives.push({
+        kind: "browser-handoff",
+        seq: event.seq,
+        action: payload.action,
+        reason: payload.reason,
+        url: payload.url,
+        createdAt: event.createdAt,
+      });
+    } else if (payload.type === "browser_handoff_completed") {
+      primitives.push({
+        kind: "browser-handoff-completed",
+        seq: event.seq,
+        createdAt: event.createdAt,
+      });
     } else if (payload.type === "error") {
       primitives.push({
         kind: "error",
@@ -1909,13 +1955,18 @@ function activityState(events: AgentEvent[], isActive: boolean): ActivityState {
   const terminal = [...events]
     .sort((left, right) => right.seq - left.seq)
     .find((event) =>
-      ["turn_finished", "turn_cancelled", "turn_suspended", "error"].includes(
-        event.payload.type,
-      ),
+      [
+        "turn_finished",
+        "turn_cancelled",
+        "turn_suspended",
+        "browser_handoff_required",
+        "error",
+      ].includes(event.payload.type),
     )?.payload;
   if (terminal?.type === "error") return "error";
   if (terminal?.type === "turn_cancelled") return "cancelled";
   if (terminal?.type === "turn_suspended") return "waiting";
+  if (terminal?.type === "browser_handoff_required") return "waiting";
   return "complete";
 }
 

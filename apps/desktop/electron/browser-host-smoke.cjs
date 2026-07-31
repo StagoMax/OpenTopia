@@ -110,18 +110,17 @@ async function main() {
       );
     }
 
-    let redirectBlocked = false;
-    try {
-      await executeAction("cross-host redirect", {
-        sessionId,
-        action: "navigate",
-        url: `${url}redirect`,
-      });
-    } catch {
-      redirectBlocked = true;
+    const redirectNavigation = await executeAction("cross-host redirect", {
+      sessionId,
+      action: "navigate",
+      url: `${url}redirect`,
+    });
+    const redirectUrl = redirectNavigation.contents.find(
+      (content) => content.type === "json",
+    )?.value?.url;
+    if (new URL(redirectUrl).hostname !== "localhost") {
+      throw new Error("ordinary cross-host redirect did not reach its destination");
     }
-    if (!redirectBlocked)
-      throw new Error("cross-host redirect was not blocked");
 
     const addressBarSessionId = "00000000-0000-4000-8000-000000000002";
     await executeAction("prepare address-bar navigation", {
@@ -160,7 +159,7 @@ async function main() {
       `${JSON.stringify({
         snapshot: text.text.trim(),
         screenshotBytes: image.bytes.length,
-        redirectBlocked,
+        crossHostRedirected: true,
         addressBarRedirectAllowed: true,
         unauthorizedStatus: unauthorized.status,
         healthyStatus: healthy.status,

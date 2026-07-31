@@ -14,23 +14,18 @@ import type {
   BrowserNavigationRequest,
   WebPreviewState,
 } from "../types";
+import { activeBrowserHandoff, type BrowserHandoff } from "../browserHandoff";
 import { BrowserPanel } from "./BrowserPanel";
 
 export function WebPreviewSurface({
   client,
   threadId,
   events,
-  pendingApprovalIds,
-  decidingApprovalId,
-  onDecideApproval,
   navigationRequest,
 }: {
   client: ApiClient | null;
   threadId: string | null;
   events: AgentEvent[];
-  pendingApprovalIds: string[];
-  decidingApprovalId: string | null;
-  onDecideApproval(approvalId: string, approved: boolean): void;
   navigationRequest: BrowserNavigationRequest | null;
 }) {
   const nativeApi = window.opentopia?.browserHost;
@@ -40,33 +35,17 @@ export function WebPreviewSurface({
         client={client}
         threadId={threadId}
         events={events}
-        pendingApprovalIds={pendingApprovalIds}
-        decidingApprovalId={decidingApprovalId}
-        onDecideApproval={onDecideApproval}
         navigationRequest={navigationRequest}
       />
     );
   }
 
-  const pendingBrowserApproval = [...events]
-    .reverse()
-    .find(
-      (event) =>
-        event.payload.type === "approval_requested" &&
-        event.payload.action.startsWith("browser:domain:") &&
-        pendingApprovalIds.includes(event.payload.approval_id),
-    );
-  const approval =
-    pendingBrowserApproval?.payload.type === "approval_requested"
-      ? pendingBrowserApproval.payload
-      : null;
+  const handoff = activeBrowserHandoff(events, threadId);
 
   return (
     <NativeWebPreview
       threadId={threadId}
-      approval={approval}
-      decidingApprovalId={decidingApprovalId}
-      onDecideApproval={onDecideApproval}
+      handoff={handoff}
       navigationRequest={navigationRequest}
     />
   );
@@ -74,18 +53,11 @@ export function WebPreviewSurface({
 
 function NativeWebPreview({
   threadId,
-  approval,
-  decidingApprovalId,
-  onDecideApproval,
+  handoff,
   navigationRequest,
 }: {
   threadId: string | null;
-  approval: Extract<
-    AgentEvent["payload"],
-    { type: "approval_requested" }
-  > | null;
-  decidingApprovalId: string | null;
-  onDecideApproval(approvalId: string, approved: boolean): void;
+  handoff: BrowserHandoff | null;
   navigationRequest: BrowserNavigationRequest | null;
 }) {
   const api = window.opentopia!.browserHost!;
@@ -111,7 +83,6 @@ function NativeWebPreview({
     const visible =
       visibleRef.current &&
       hasUrlRef.current &&
-      !approval &&
       document.visibilityState === "visible" &&
       rect.width > 0 &&
       rect.height > 0;
@@ -126,7 +97,7 @@ function NativeWebPreview({
       api.setBounds(sessionId, bounds),
       api.setVisibility(sessionId, visible),
     ]).catch((cause) => setError(errorMessage(cause)));
-  }, [api, approval, sessionId]);
+  }, [api, sessionId]);
 
   useEffect(() => {
     if (!threadId) {
@@ -310,28 +281,11 @@ function NativeWebPreview({
           {error}
         </div>
       )}
-      {approval && (
-        <div className="web-preview-approval" role="alert">
-          <div>
-            <strong>Allow this domain?</strong>
-            <span>{approval.reason}</span>
-          </div>
-          <button
-            className="secondary-button compact"
-            disabled={decidingApprovalId === approval.approval_id}
-            onClick={() => onDecideApproval(approval.approval_id, false)}
-            type="button"
-          >
-            Deny
-          </button>
-          <button
-            className="primary-button compact"
-            disabled={decidingApprovalId === approval.approval_id}
-            onClick={() => onDecideApproval(approval.approval_id, true)}
-            type="button"
-          >
-            Allow
-          </button>
+      {handoff && (
+        <div className="web-preview-handoff" role="status">
+          <strong>需要你在当前页面完成操作</strong>
+          <span>{handoff.reason}</span>
+          <span>完成后在对话中告诉我继续。</span>
         </div>
       )}
       <div className="web-preview-native-surface" ref={containerRef} />

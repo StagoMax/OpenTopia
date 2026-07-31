@@ -12,8 +12,7 @@ use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    agent_model_context_with_runtime, browser_domain_approval_action,
-    browser_domain_from_approval_action, browser_domain_from_url, browser_domain_is_approved,
+    agent_model_context_with_runtime, browser_handoff_for_node,
     build_local_sandbox_command, content_fingerprint, discover_plugins, discover_skills,
     execute_git_workflow, experience_mode_module, install_plugin, load_context_sources,
     load_plugin_mcp_servers, load_selected_skills, permission_policy_module,
@@ -2164,6 +2163,11 @@ async fn send_message(
     Json(request): Json<SendMessageRequest>,
 ) -> Result<(HeaderMap, Json<Message>), ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
+    let resuming_browser_handoff = state
+        .turns
+        .status(thread_id)?
+        .filter(|turn| turn.status == TurnStatus::WaitingUserAction)
+        .map(|turn| turn.turn_id);
     let image_attachments = request.image_attachments;
     validate_inline_image_attachments(&image_attachments)?;
     if let Some(command) = legacy_direct_tool_command(&request.content) {
@@ -2290,6 +2294,14 @@ async fn send_message(
             return Err(err.into());
         }
     };
+    if let Some(prior_turn_id) = resuming_browser_handoff {
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::BrowserHandoffCompleted { prior_turn_id },
+        );
+    }
 
     let run_state = state.clone();
     let run_message = user_message.clone();
@@ -2598,20 +2610,6 @@ fn fail_queued_turn(state: &AppState, thread_id: Uuid, turn_id: Uuid, message: S
     finish_turn(state, thread_id, turn_id, TurnStatus::Failed, Some(message));
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApprovalExecution {
-    BrowserPanelGrant,
-    ResumeAgent,
-}
-
-fn approval_execution(action: &str, has_continuation: bool) -> ApprovalExecution {
-    if browser_domain_from_approval_action(action).is_some() && !has_continuation {
-        ApprovalExecution::BrowserPanelGrant
-    } else {
-        ApprovalExecution::ResumeAgent
-    }
-}
-
 async fn decide_approval(
     State(state): State<AppState>,
     Path((thread_id, approval_id)): Path<(Uuid, Uuid)>,
@@ -2636,27 +2634,6 @@ async fn decide_approval(
     let continuation_value = state
         .store
         .get_approval_continuation(approval_id, thread_id)?;
-    if approval_execution(&pending.action, continuation_value.is_some())
-        == ApprovalExecution::BrowserPanelGrant
-    {
-        let status = if request.approved {
-            ApprovalStatus::Approved
-        } else {
-            ApprovalStatus::Denied
-        };
-        state
-            .store
-            .update_approval_status(approval_id, status)?
-            .ok_or_else(|| ApiError::not_found(format!("approval not found: {approval_id}")))?;
-        let _ = state.turn_queue.send(thread_id);
-        return Ok(Json(ApprovalDecisionResponse {
-            accepted: true,
-            // Browser-panel commands are intentionally not replayed implicitly. The approved
-            // domain grant lets the user or model make the next explicit navigation.
-            executed: false,
-        }));
-    }
-
     let continuation_value = continuation_value
         .ok_or_else(|| ApiError::conflict("approval continuation is not available"))?;
     let continuation: AgentContinuation = serde_json::from_value(continuation_value)
@@ -3775,10 +3752,7 @@ async fn run_browser_command(
     Json(request): Json<BrowserCommandRequest>,
 ) -> Result<Json<BrowserOutput>, ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
-    let policy = BasicPolicyEngine::new(
-        thread.workspace_root,
-        current_settings(&state).permission_mode,
-    );
+    let _workspace_root = thread.workspace_root;
     let session = BrowserSessionId::from_thread(thread_id);
     let timeout = request
         .timeout_ms
@@ -3786,7 +3760,6 @@ async fn run_browser_command(
     let result = match request.action.as_str() {
         "navigate" => {
             let url = browser_required(&request.url, "url")?;
-            inspect_browser_url_policy(&state, thread_id, &policy, url)?;
             let mut command = BrowserNavigateRequest::new(url);
             if let Some(timeout) = timeout {
                 command.wait = Some(BrowserWaitRequest {
@@ -3812,7 +3785,6 @@ async fn run_browser_command(
         }
         "screenshot" => state.browser.screenshot(session).await,
         "click" => {
-            inspect_browser_interaction_policy(&policy)?;
             let observation_id = browser_observation_required(request.observation_id)?;
             let node_ref = browser_node_required(request.node_ref)?;
             let target = state
@@ -3820,8 +3792,12 @@ async fn run_browser_command(
                 .observation_node(session, observation_id, node_ref)
                 .await
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
-            if let Some(url) = target.href.as_deref() {
-                inspect_browser_url_policy(&state, thread_id, &policy, url)?;
+            if let Some(handoff) = browser_handoff_for_node(
+                "click",
+                &target,
+                target.href.clone(),
+            ) {
+                return Err(ApiError::conflict(handoff.reason));
             }
             let receipt = state
                 .browser
@@ -3836,9 +3812,16 @@ async fn run_browser_command(
             return Ok(Json(browser_observation_output(observation, Some(receipt))));
         }
         "type" => {
-            inspect_browser_interaction_policy(&policy)?;
             let observation_id = browser_observation_required(request.observation_id)?;
             let node_ref = browser_node_required(request.node_ref)?;
+            let target = state
+                .browser
+                .observation_node(session, observation_id, node_ref)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            if let Some(handoff) = browser_handoff_for_node("type", &target, None) {
+                return Err(ApiError::conflict(handoff.reason));
+            }
             let receipt = state
                 .browser
                 .perform(
@@ -3889,7 +3872,6 @@ async fn run_browser_command(
         }
         "download" => {
             let url = browser_required(&request.url, "url")?;
-            inspect_browser_url_policy(&state, thread_id, &policy, url)?;
             state
                 .browser
                 .download(
@@ -3981,70 +3963,6 @@ fn browser_observation_output(
     }
 }
 
-fn inspect_browser_url_policy(
-    state: &AppState,
-    thread_id: Uuid,
-    policy: &BasicPolicyEngine,
-    raw_url: &str,
-) -> Result<(), ApiError> {
-    let host = browser_domain_from_url(raw_url)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    match policy.inspect_network(&host) {
-        PolicyDecision::Deny { reason } => return Err(ApiError::bad_request(reason)),
-        // An explicit network approval policy and a first-visit domain policy both lead to the
-        // same persisted, thread-scoped domain grant below.
-        PolicyDecision::Allow | PolicyDecision::Ask { .. } => {}
-    }
-
-    if browser_domain_is_approved(state.store.as_ref(), thread_id, &host)? {
-        return Ok(());
-    }
-
-    let action = browser_domain_approval_action(&host);
-    let has_pending = state
-        .store
-        .list_approvals(thread_id, Some(ApprovalStatus::Pending))?
-        .into_iter()
-        .any(|approval| approval.action == action);
-    if !has_pending {
-        let approval_id = Uuid::new_v4();
-        let reason =
-            format!("Browser access to the new domain `{host}` requires approval for this thread.");
-        state.store.insert_approval(Approval::pending(
-            approval_id,
-            thread_id,
-            action.clone(),
-            reason.clone(),
-        ))?;
-        publish_payload(
-            state,
-            thread_id,
-            None,
-            AgentEventPayload::ApprovalRequested {
-                approval_id,
-                action,
-                reason,
-            },
-        );
-    }
-
-    Err(ApiError::conflict(format!(
-        "approval required: Browser access to the new domain `{host}` is waiting for approval"
-    )))
-}
-
-fn inspect_browser_interaction_policy(policy: &BasicPolicyEngine) -> Result<(), ApiError> {
-    inspect_browser_policy_decision(policy.inspect_network("browser-interaction"))
-}
-
-fn inspect_browser_policy_decision(decision: PolicyDecision) -> Result<(), ApiError> {
-    match decision {
-        PolicyDecision::Allow => Ok(()),
-        PolicyDecision::Deny { reason } | PolicyDecision::Ask { reason } => {
-            Err(ApiError::bad_request(reason))
-        }
-    }
-}
 
 async fn run_git_workflow(
     State(state): State<AppState>,
@@ -6121,6 +6039,7 @@ fn finish_agent_result(
             AgentTurnOutcome::Stopped { reason } => (TurnStatus::Failed, Some(reason)),
             AgentTurnOutcome::Suspended { .. } => (TurnStatus::WaitingApproval, None),
             AgentTurnOutcome::AwaitingInput { .. } => (TurnStatus::WaitingApproval, None),
+            AgentTurnOutcome::WaitingUserAction { .. } => (TurnStatus::WaitingUserAction, None),
         },
         Err(err) => {
             let message = err.to_string();
@@ -10987,20 +10906,10 @@ mod tests {
     }
 
     #[test]
-    fn browser_model_approval_with_continuation_resumes_agent() {
-        let action = browser_domain_approval_action("example.com");
-        assert_eq!(
-            approval_execution(&action, false),
-            ApprovalExecution::BrowserPanelGrant
-        );
-        assert_eq!(
-            approval_execution(&action, true),
-            ApprovalExecution::ResumeAgent
-        );
-        assert_eq!(
-            approval_execution("shell:run", false),
-            ApprovalExecution::ResumeAgent
-        );
+    fn browser_handoff_turns_are_paused_but_can_be_followed_by_a_new_turn() {
+        assert!(!TurnStatus::WaitingUserAction.is_active());
+        assert!(!TurnStatus::WaitingUserAction.is_terminal());
+        assert_eq!(TurnStatus::WaitingUserAction.as_str(), "waiting_user_action");
     }
 
     #[test]

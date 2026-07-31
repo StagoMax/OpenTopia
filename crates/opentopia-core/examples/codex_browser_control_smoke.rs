@@ -1,7 +1,7 @@
 use anyhow::Context;
 use opentopia_core::{
-    browser_domain_approval_action, AgentCore, AgentEventPayload, AgentProfile, AgentTurnInput,
-    Approval, ApprovalStatus, BrowserObserveOptions, BrowserRuntime, BrowserRuntimeConfig,
+    AgentCore, AgentEventPayload, AgentProfile, AgentTurnInput, BrowserObserveOptions,
+    BrowserRuntime, BrowserRuntimeConfig,
     BrowserSessionId, CodexAppServerProvider, LocalBrowserRuntime, MessagePart, PermissionMode,
     ProviderKind, ProviderSettings, SessionStore, SqliteSessionStore, ToolRegistry,
 };
@@ -54,17 +54,6 @@ async fn main() -> anyhow::Result<()> {
         workspace_root.clone(),
     )?;
     let browser_session = BrowserSessionId::from_thread(thread.id);
-    let approval = Approval::pending(
-        Uuid::new_v4(),
-        thread.id,
-        browser_domain_approval_action("127.0.0.1"),
-        "Allow the smoke test's isolated local web server.",
-    );
-    store.insert_approval(approval.clone())?;
-    store
-        .update_approval_status(approval.approval_id, ApprovalStatus::Approved)?
-        .context("the local browser domain approval was not persisted")?;
-
     let result = async {
         let mut settings = ProviderSettings::default();
         settings.kind = ProviderKind::CodexAppServer;

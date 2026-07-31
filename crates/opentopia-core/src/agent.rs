@@ -37,8 +37,7 @@ use crate::skills::SkillScope;
 use crate::store::{ProviderContextStateKind, SessionStore};
 use crate::subagents::{SubagentScheduler, SubagentScope};
 use crate::tools::{
-    browser_domain_approval_action, browser_domain_from_url, McpToolWrapper, ToolContext,
-    ToolRegistry,
+    browser_handoff_required, McpToolWrapper, ToolContext, ToolRegistry,
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -124,6 +123,11 @@ pub enum AgentTurnOutcome {
     AwaitingInput {
         request: UserInputRequest,
         continuation: AgentContinuation,
+    },
+    WaitingUserAction {
+        action: String,
+        reason: String,
+        url: Option<String>,
     },
 }
 
@@ -1843,6 +1847,24 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                             });
                         }
                     }
+                    Err(err) if browser_handoff_required(&err).is_some() => {
+                        let handoff = browser_handoff_required(&err)
+                            .expect("browser handoff error guard");
+                        events.push(AgentEventPayload::BrowserHandoffRequired {
+                            action: handoff.action.clone(),
+                            reason: handoff.reason.clone(),
+                            url: handoff.url.clone(),
+                        });
+                        return Ok(AgentTurnResult {
+                            events: std::mem::replace(events, TurnEvents::new(None)).into_vec(),
+                            outcome: AgentTurnOutcome::WaitingUserAction {
+                                action: handoff.action.clone(),
+                                reason: handoff.reason.clone(),
+                                url: handoff.url.clone(),
+                            },
+                            provider_cursor: None,
+                        });
+                    }
                     Err(err) if approval_required(&err).is_some() => {
                         let reason = approval_required(&err)
                             .expect("approval error guard")
@@ -3560,13 +3582,7 @@ fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
                 .unwrap_or("session");
             format!("computer:{action}:{target}")
         }
-        "browser" => call
-            .arguments
-            .get("url")
-            .and_then(Value::as_str)
-            .and_then(|url| browser_domain_from_url(url).ok())
-            .map(|host| browser_domain_approval_action(&host))
-            .unwrap_or_else(|| format!("browser {}", call.arguments)),
+        "browser" => format!("browser {}", call.arguments),
         _ => format!("/mcp {} {}", call.name, call.arguments),
     }
 }
@@ -6736,6 +6752,9 @@ mod tests {
                 panic!("protected write should not reach terminal finalization")
             }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::WaitingUserAction { .. } => {
+                panic!("protected write should wait for approval, not browser input")
+            }
             AgentTurnOutcome::AwaitingInput { .. } => {
                 panic!("turn should not wait for user input")
             }
@@ -6822,6 +6841,9 @@ mod tests {
                 panic!("external write should not reach terminal finalization")
             }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::WaitingUserAction { .. } => {
+                panic!("external write should wait for approval, not browser input")
+            }
             AgentTurnOutcome::AwaitingInput { .. } => {
                 panic!("turn should not wait for user input")
             }
@@ -6901,6 +6923,9 @@ mod tests {
                 panic!("sandbox denial should not reach terminal finalization")
             }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::WaitingUserAction { .. } => {
+                panic!("sandbox denial should wait for approval, not browser input")
+            }
             AgentTurnOutcome::AwaitingInput { .. } => {
                 panic!("turn should not wait for user input")
             }
@@ -6975,6 +7000,9 @@ mod tests {
                 panic!("approval denial should not reach terminal finalization")
             }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::WaitingUserAction { .. } => {
+                panic!("approval denial should wait for approval, not browser input")
+            }
             AgentTurnOutcome::AwaitingInput { .. } => {
                 panic!("turn should not wait for user input")
             }
@@ -7038,6 +7066,9 @@ mod tests {
                 panic!("protected write should not reach terminal finalization")
             }
             AgentTurnOutcome::Stopped { .. } => panic!("turn should not be rollout-stopped"),
+            AgentTurnOutcome::WaitingUserAction { .. } => {
+                panic!("protected write should wait for approval, not browser input")
+            }
             AgentTurnOutcome::AwaitingInput { .. } => {
                 panic!("turn should not wait for user input")
             }

@@ -2,7 +2,6 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
   Download,
-  FolderOpen,
   Keyboard,
   Loader2,
   MousePointer2,
@@ -10,7 +9,7 @@ import {
   Square,
 } from "lucide-react";
 import { ApiClient } from "../api/client";
-import { openPath } from "../platform";
+import { activeBrowserHandoff } from "../browserHandoff";
 import type {
   AgentEvent,
   BrowserContent,
@@ -35,17 +34,11 @@ export function BrowserPanel({
   client,
   threadId,
   events,
-  pendingApprovalIds,
-  decidingApprovalId,
-  onDecideApproval,
   navigationRequest,
 }: {
   client: ApiClient | null;
   threadId: string | null;
   events: AgentEvent[];
-  pendingApprovalIds: string[];
-  decidingApprovalId: string | null;
-  onDecideApproval(approvalId: string, approved: boolean): void;
   navigationRequest: BrowserNavigationRequest | null;
 }) {
   const [url, setUrl] = useState("");
@@ -188,17 +181,9 @@ export function BrowserPanel({
         : (observation?.nodes[0]?.nodeRef ?? ""),
     );
   }, [observation]);
-  const pendingBrowserApproval = useMemo(
-    () =>
-      [...events]
-        .reverse()
-        .find(
-          (event) =>
-            event.payload.type === "approval_requested" &&
-            event.payload.action.startsWith("browser:domain:") &&
-            pendingApprovalIds.includes(event.payload.approval_id),
-        )?.payload,
-    [events, pendingApprovalIds],
+  const handoff = useMemo(
+    () => activeBrowserHandoff(events, threadId),
+    [events, threadId],
   );
 
   async function run(action: BrowserAction, requestedUrl = url) {
@@ -254,15 +239,6 @@ export function BrowserPanel({
       };
       manualOperationRunningRef.current = false;
       setIsRunning(false);
-    }
-  }
-
-  async function openBrowserPath(path: string) {
-    setError(null);
-    try {
-      await openPath(path);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
     }
   }
 
@@ -393,35 +369,11 @@ export function BrowserPanel({
           {error}
         </p>
       )}
-      {pendingBrowserApproval?.type === "approval_requested" && (
-        <div className="browser-approval">
-          <p>{pendingBrowserApproval.reason}</p>
-          <div>
-            <button
-              className="secondary-button"
-              disabled={
-                decidingApprovalId === pendingBrowserApproval.approval_id
-              }
-              onClick={() =>
-                onDecideApproval(pendingBrowserApproval.approval_id, false)
-              }
-              type="button"
-            >
-              Deny
-            </button>
-            <button
-              className="primary-button"
-              disabled={
-                decidingApprovalId === pendingBrowserApproval.approval_id
-              }
-              onClick={() =>
-                onDecideApproval(pendingBrowserApproval.approval_id, true)
-              }
-              type="button"
-            >
-              Allow Domain
-            </button>
-          </div>
+      {handoff && (
+        <div className="browser-handoff" role="status">
+          <strong>需要手动完成浏览器操作</strong>
+          <span>{handoff.reason}</span>
+          <span>完成后在对话中告诉我继续。</span>
         </div>
       )}
       {screenshot && (
@@ -436,17 +388,12 @@ export function BrowserPanel({
         <div className="browser-downloads">
           {downloads.map((download) =>
             download.type === "file" ? (
-              <button
-                aria-label={`Open ${download.path}`}
+              <span
                 className="browser-download-path"
                 key={download.path}
-                onClick={() => void openBrowserPath(download.path)}
-                title={`Open ${download.path}`}
-                type="button"
               >
-                <FolderOpen size={13} />
                 <code>{download.path}</code>
-              </button>
+              </span>
             ) : null,
           )}
         </div>

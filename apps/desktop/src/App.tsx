@@ -258,6 +258,8 @@ function resolveThreadActivityStatus(
       return "processing";
     case "waiting_approval":
       return "approval";
+    case "waiting_user_action":
+      return "user_action";
     case "succeeded":
       return "succeeded";
     case "failed":
@@ -1183,6 +1185,11 @@ export function App() {
         );
       }
 
+      if (event.payload.type === "browser_handoff_required") {
+        setThreadActivityStatus(event.threadId, "user_action");
+        setConversationCollapsed(false);
+      }
+
       if (event.payload.type === "user_input_requested") {
         const request = event.payload.request;
         setUserInputError(null);
@@ -1228,6 +1235,13 @@ export function App() {
         );
       } else if (event.payload.type === "turn_suspended") {
         setThreadActivityStatus(event.threadId, "approval");
+        setActiveTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+        setCancellingTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+      } else if (event.payload.type === "browser_handoff_required") {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
@@ -6593,7 +6607,9 @@ function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
         ? "已完成"
         : status === "failed"
           ? "失败"
-          : "需要审批";
+          : status === "user_action"
+            ? "需要手动操作"
+            : "需要审批";
 
   return (
     <span
@@ -9000,6 +9016,9 @@ function SideTaskConversation({
         );
         onSetThreadActivity(threadId, "approval");
       }
+      if (event.payload.type === "browser_handoff_required") {
+        onSetThreadActivity(threadId, "user_action");
+      }
       if (event.payload.type === "user_input_requested") {
         const request = event.payload.request;
         setPendingUserInput((current) =>
@@ -9039,6 +9058,12 @@ function SideTaskConversation({
         );
         setCancellingTurnId(null);
         onSetThreadActivity(threadId, "approval");
+      } else if (event.payload.type === "browser_handoff_required") {
+        setActiveTurnId((current) =>
+          !event.turnId || current === event.turnId ? null : current,
+        );
+        setCancellingTurnId(null);
+        setPendingTurnFeedback(null);
       } else if (event.payload.type === "turn_cancelled") {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
@@ -9765,9 +9790,6 @@ function RightPanel({
               client={client}
               threadId={thread?.id ?? null}
               events={events}
-              pendingApprovalIds={pendingApprovalIds}
-              decidingApprovalId={decidingApprovalId}
-              onDecideApproval={onDecideApproval}
               navigationRequest={activeToolTab.browserNavigation ?? null}
             />
           ) : activeToolTab.kind === "computer" ? (

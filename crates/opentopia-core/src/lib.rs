@@ -165,8 +165,8 @@ pub use subagents::{
     SubagentScope,
 };
 pub use tools::{
-    browser_domain_approval_action, browser_domain_from_approval_action, browser_domain_from_url,
-    browser_domain_is_approved, ApplyPatchTool, BrowserTool, ComputerTool, GitDiffTool,
+    browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
+    BrowserTool, ComputerTool, GitDiffTool,
     ListFilesTool, ListSkillsTool, McpToolWrapper, ReadFileTool, ReadSkillTool,
     RequestUserInputTool, SetPlanTool, ShellTool, SpreadsheetTool, Tool, ToolContext, ToolRegistry,
     UpdatePlanTool, WaitAgentsTool, WriteFileTool,

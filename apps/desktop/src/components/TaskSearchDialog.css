@@ -122,7 +122,8 @@
   color: var(--accent);
 }
 
-.task-search-status.is-approval {
+.task-search-status.is-approval,
+.task-search-status.is-user_action {
   color: var(--warning);
 }
 

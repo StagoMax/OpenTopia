@@ -1397,6 +1397,13 @@ export type AgentEventPayload =
       action: string;
     }
   | {
+      type: "browser_handoff_required";
+      action: string;
+      reason: string;
+      url?: string | null;
+    }
+  | { type: "browser_handoff_completed"; prior_turn_id: string }
+  | {
       type: "automatic_approval_review_started";
       review_id: string;
       target_item_id: string;
@@ -1479,6 +1486,7 @@ export type TurnStatus = {
   status:
     | "running"
     | "waiting_approval"
+    | "waiting_user_action"
     | "cancelling"
     | "succeeded"
     | "failed"

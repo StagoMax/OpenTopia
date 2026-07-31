@@ -29,6 +29,7 @@ function statusLabel(status?: TaskSearchActivityStatus) {
   if (status === "succeeded") return "已完成";
   if (status === "failed") return "运行失败";
   if (status === "approval") return "等待审批";
+  if (status === "user_action") return "等待手动操作";
   return null;
 }
 
@@ -44,6 +45,9 @@ function StatusIcon({ status }: { status?: TaskSearchActivityStatus }) {
   }
   if (status === "approval") {
     return <ShieldAlert size={14} aria-hidden="true" />;
+  }
+  if (status === "user_action") {
+    return <AlertCircle size={14} aria-hidden="true" />;
   }
   return <Circle size={8} aria-hidden="true" />;
 }

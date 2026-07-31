@@ -1,4 +1,4 @@
-//! A bounded, session-isolated Chromium runtime.
+//! A bounded Chromium runtime with one shared browser profile and tab-scoped sessions.
 //!
 //! This module intentionally stops at the browser boundary: callers decide whether a URL or an
 //! interaction needs approval, while this runtime owns the browser process and its per-session
@@ -22,7 +22,13 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{
-    connect_async, tungstenite::Message as WebSocketMessage, MaybeTlsStream, WebSocketStream,
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{header::ORIGIN, HeaderValue},
+        Message as WebSocketMessage,
+    },
+    MaybeTlsStream, WebSocketStream,
 };
 use uuid::Uuid;
 
@@ -35,8 +41,8 @@ const OBSERVATION_TTL: Duration = Duration::from_secs(120);
 const MAX_OBSERVATIONS_PER_SESSION: usize = 12;
 const MAX_NODE_POSITION_DRIFT: f64 = 24.0;
 
-/// An opaque ID that should normally be derived from a thread ID. A session gets its own browser
-/// process, user-data directory, cookie jar, cache, and download directory.
+/// An opaque ID that should normally be derived from a thread ID. A session identifies one tab;
+/// all sessions in the runtime share the browser profile, cookie jar, cache, and downloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BrowserSessionId(Uuid);
@@ -127,7 +133,11 @@ impl BrowserNode {
             && self.tag_name == current.tag_name
             && self.href == current.href
             && self.form_action == current.form_action
+            && self.form_method == current.form_method
+            && self.input_type == current.input_type
             && self.editable == current.editable
+            && self.requires_user_action == current.requires_user_action
+            && self.user_action_reason == current.user_action_reason
             && !self.bounds.materially_differs_from(&current.bounds)
     }
 }
@@ -142,7 +152,15 @@ pub struct BrowserNode {
     pub bounds: BrowserRect,
     pub href: Option<String>,
     pub form_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
     pub editable: bool,
+    #[serde(default)]
+    pub requires_user_action: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_action_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,7 +220,7 @@ pub struct BrowserRuntimeConfig {
     /// Use a specific Chrome/Edge executable. When omitted, Chrome and Edge are discovered from
     /// standard platform locations and `PATH` when a session is first used.
     pub executable: Option<PathBuf>,
-    /// Browser state is stored below this directory in a directory named after the session ID.
+    /// Browser state is stored below this directory in one shared profile directory.
     pub data_root: PathBuf,
     pub headless: bool,
     pub startup_timeout: Duration,
@@ -212,8 +230,8 @@ pub struct BrowserRuntimeConfig {
     /// Navigation and direct-download URLs are restricted to these schemes. Domain approval is
     /// deliberately left to the caller's policy layer.
     pub allowed_schemes: Vec<String>,
-    /// Preserve browser profiles and downloads after `close_session`. Defaults to false so thread
-    /// cookies and downloaded files do not become an unbounded local data store.
+    /// Preserve the shared browser profile and downloads after closing a tab. Defaults to true so
+    /// browser login state behaves like a normal browser session.
     pub retain_session_data: bool,
 }
 
@@ -228,7 +246,7 @@ impl Default for BrowserRuntimeConfig {
             max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
             max_screenshot_bytes: DEFAULT_MAX_SCREENSHOT_BYTES,
             allowed_schemes: vec!["http".to_string(), "https".to_string()],
-            retain_session_data: false,
+            retain_session_data: true,
         }
     }
 }
@@ -468,6 +486,7 @@ pub trait BrowserRuntime: Send + Sync {
 pub struct LocalBrowserRuntime {
     config: Arc<BrowserRuntimeConfig>,
     sessions: Arc<Mutex<HashMap<BrowserSessionId, Arc<Mutex<LocalBrowserSession>>>>>,
+    process: Arc<Mutex<Option<Arc<Mutex<LocalBrowserProcess>>>>>,
 }
 
 impl LocalBrowserRuntime {
@@ -475,6 +494,7 @@ impl LocalBrowserRuntime {
         Self {
             config: Arc::new(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            process: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -491,11 +511,22 @@ impl LocalBrowserRuntime {
             return Ok(session.clone());
         }
 
+        let process = self.process().await?;
         let session = Arc::new(Mutex::new(
-            LocalBrowserSession::start(session_id, self.config.clone()).await?,
+            LocalBrowserSession::start(self.config.clone(), process).await?,
         ));
         sessions.insert(session_id, session.clone());
         Ok(session)
+    }
+
+    async fn process(&self) -> Result<Arc<Mutex<LocalBrowserProcess>>, BrowserError> {
+        let mut process = self.process.lock().await;
+        if let Some(process) = process.as_ref() {
+            return Ok(process.clone());
+        }
+        let started = Arc::new(Mutex::new(LocalBrowserProcess::start(self.config.clone()).await?));
+        *process = Some(started.clone());
+        Ok(started)
     }
 
     fn validate_url(&self, raw_url: &str) -> Result<(), BrowserError> {
@@ -596,29 +627,141 @@ impl BrowserRuntime for LocalBrowserRuntime {
             return Err(BrowserError::SessionNotFound(session_id));
         };
 
-        let (session_dir, retain_session_data) = {
+        {
             let mut session = session.lock().await;
-            let session_dir = session.session_dir.clone();
-            let retain_session_data = session.retain_session_data;
             session.shutdown().await?;
-            (session_dir, retain_session_data)
-        };
-        if !retain_session_data && session_dir.exists() {
-            tokio::fs::remove_dir_all(session_dir).await?;
+        }
+        if !self.config.retain_session_data && self.sessions.lock().await.is_empty() {
+            if let Some(process) = self.process.lock().await.take() {
+                process.lock().await.shutdown().await?;
+            }
+            if self.config.data_root.exists() {
+                tokio::fs::remove_dir_all(&self.config.data_root).await?;
+            }
         }
         Ok(())
     }
 }
 
+struct LocalBrowserProcess {
+    child: Child,
+    download_dir: PathBuf,
+    port: u16,
+}
+
+impl LocalBrowserProcess {
+    async fn start(config: Arc<BrowserRuntimeConfig>) -> Result<Self, BrowserError> {
+        let executable = discover_browser_executable(config.executable.as_deref())?;
+        let profile_dir = config.data_root.join("profile");
+        let download_dir = config.data_root.join("downloads");
+        tokio::fs::create_dir_all(&profile_dir).await?;
+        tokio::fs::create_dir_all(&download_dir).await?;
+
+        let mut command = Command::new(executable);
+        command
+            .arg("--remote-debugging-address=127.0.0.1")
+            .arg("--remote-debugging-port=0")
+            .arg("--remote-allow-origins=*")
+            .arg(format!("--user-data-dir={}", profile_dir.display()))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--disable-background-networking")
+            .arg("--disable-component-update")
+            .arg("--disable-sync")
+            .arg("--disable-extensions")
+            .arg("--disable-popup-blocking")
+            .arg("--disable-features=Translate,MediaRouter")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("OPENTOPIA_API_KEY")
+            .env_remove("OPENTOPIA_API_TOKEN");
+        if config.headless {
+            command.arg("--headless=new");
+        }
+        command.arg("about:blank");
+        let child = command.spawn()?;
+        let port = match wait_for_devtools_port(&profile_dir, config.startup_timeout).await {
+            Ok(port) => port,
+            Err(error) => {
+                let mut child = child;
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
+        let browser_ws_url = match browser_websocket_url(port, config.startup_timeout).await {
+            Ok(url) => url,
+            Err(error) => {
+                let mut child = child;
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
+        let download_configuration = async {
+            let mut browser = CdpPage::connect(&browser_ws_url, config.command_timeout)
+                .await
+                .map_err(|error| {
+                    BrowserError::Protocol(format!(
+                        "connecting to the browser DevTools endpoint: {error}"
+                    ))
+                })?;
+            browser
+                .command(
+                    "Browser.setDownloadBehavior",
+                    json!({
+                        "behavior": "allow",
+                        "downloadPath": download_dir,
+                        "eventsEnabled": true,
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    BrowserError::Protocol(format!(
+                        "configuring the shared browser download directory: {error}"
+                    ))
+                })
+        }
+        .await;
+        if let Err(error) = download_configuration {
+            let mut child = child;
+            let _ = child.kill().await;
+            return Err(error);
+        }
+
+        Ok(Self {
+            child,
+            download_dir,
+            port,
+        })
+    }
+
+    async fn shutdown(&mut self) -> Result<(), BrowserError> {
+        match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
+            Ok(result) => {
+                let _ = result?;
+            }
+            Err(_) => {
+                self.child.kill().await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LocalBrowserProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
 struct LocalBrowserSession {
     page: CdpPage,
-    child: Child,
-    session_dir: PathBuf,
     download_dir: PathBuf,
     command_timeout: Duration,
     max_snapshot_bytes: usize,
     max_screenshot_bytes: usize,
-    retain_session_data: bool,
     observations: HashMap<BrowserObservationId, LocalBrowserObservation>,
 }
 
@@ -645,94 +788,37 @@ struct CapturedBrowserNode {
     bounds: BrowserRect,
     href: Option<String>,
     form_action: Option<String>,
+    form_method: Option<String>,
+    input_type: Option<String>,
     editable: bool,
+    #[serde(default)]
+    requires_user_action: bool,
+    user_action_reason: Option<String>,
 }
 
 impl LocalBrowserSession {
     async fn start(
-        id: BrowserSessionId,
         config: Arc<BrowserRuntimeConfig>,
+        process: Arc<Mutex<LocalBrowserProcess>>,
     ) -> Result<Self, BrowserError> {
-        let executable = discover_browser_executable(config.executable.as_deref())?;
-        let session_dir = config.data_root.join(id.as_uuid().to_string());
-        let profile_dir = session_dir.join("profile");
-        let download_dir = session_dir.join("downloads");
-        tokio::fs::create_dir_all(&profile_dir).await?;
-        tokio::fs::create_dir_all(&download_dir).await?;
-
-        let mut command = Command::new(executable);
-        command
-            .arg("--remote-debugging-address=127.0.0.1")
-            .arg("--remote-debugging-port=0")
-            .arg(format!("--user-data-dir={}", profile_dir.display()))
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--disable-background-networking")
-            .arg("--disable-component-update")
-            .arg("--disable-sync")
-            .arg("--disable-extensions")
-            .arg("--disable-popup-blocking")
-            .arg("--disable-features=Translate,MediaRouter")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("OPENTOPIA_API_KEY")
-            .env_remove("OPENTOPIA_API_TOKEN");
-        if config.headless {
-            command.arg("--headless=new");
-        }
-        command.arg("about:blank");
-        let child = command.spawn()?;
-
-        let result = async {
-            let port = wait_for_devtools_port(&profile_dir, config.startup_timeout).await?;
-            let websocket_url = wait_for_page_websocket_url(port, config.startup_timeout).await?;
-            let mut page = CdpPage::connect(&websocket_url, config.command_timeout).await?;
-            if page
-                .command(
-                    "Browser.setDownloadBehavior",
-                    json!({
-                        "behavior": "allow",
-                        "downloadPath": download_dir,
-                        "eventsEnabled": true,
-                    }),
-                )
-                .await
-                .is_err()
-            {
-                page.command(
-                    "Page.setDownloadBehavior",
-                    json!({"behavior":"allow", "downloadPath": download_dir}),
-                )
-                .await?;
-            }
-            Ok::<_, BrowserError>(page)
-        }
-        .await;
-
-        match result {
-            Ok(page) => Ok(Self {
-                page,
-                child,
-                session_dir,
-                download_dir,
-                command_timeout: config.command_timeout,
-                max_snapshot_bytes: config.max_snapshot_bytes,
-                max_screenshot_bytes: config.max_screenshot_bytes,
-                retain_session_data: config.retain_session_data,
-                observations: HashMap::new(),
-            }),
-            Err(error) => {
-                let mut child = child;
-                let _ = child.kill().await;
-                if !config.retain_session_data && session_dir.exists() {
-                    let _ = tokio::fs::remove_dir_all(&session_dir).await;
-                }
-                Err(error)
-            }
-        }
+        let (port, download_dir) = {
+            let process = process.lock().await;
+            (process.port, process.download_dir.clone())
+        };
+        let websocket_url = create_page_websocket_url(port, config.startup_timeout).await?;
+        let page = CdpPage::connect(&websocket_url, config.command_timeout)
+            .await
+            .map_err(|error| {
+                BrowserError::Protocol(format!("connecting to the new browser tab: {error}"))
+            })?;
+        Ok(Self {
+            page,
+            download_dir,
+            command_timeout: config.command_timeout,
+            max_snapshot_bytes: config.max_snapshot_bytes,
+            max_screenshot_bytes: config.max_screenshot_bytes,
+            observations: HashMap::new(),
+        })
     }
 
     async fn navigate(
@@ -802,7 +888,11 @@ impl LocalBrowserSession {
                     bounds: capture.bounds,
                     href: capture.href,
                     form_action: capture.form_action,
+                    form_method: capture.form_method,
+                    input_type: capture.input_type,
                     editable: capture.editable,
+                    requires_user_action: capture.requires_user_action,
+                    user_action_reason: capture.user_action_reason,
                 };
                 stored_nodes.insert(
                     node_ref,
@@ -947,7 +1037,11 @@ impl LocalBrowserSession {
                 bounds: node.bounds,
                 href: node.href,
                 form_action: node.form_action,
+                form_method: node.form_method,
+                input_type: node.input_type,
                 editable: node.editable,
+                requires_user_action: node.requires_user_action,
+                user_action_reason: node.user_action_reason,
             })
             .ok_or_else(|| BrowserError::StaleObservation {
                 reason: "the observed element no longer exists".to_string(),
@@ -1223,22 +1317,8 @@ impl LocalBrowserSession {
     }
 
     async fn shutdown(&mut self) -> Result<(), BrowserError> {
-        let _ = self.page.command("Browser.close", json!({})).await;
-        match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
-            Ok(result) => {
-                let _ = result?;
-            }
-            Err(_) => {
-                self.child.kill().await?;
-            }
-        }
+        let _ = self.page.command("Page.close", json!({})).await;
         Ok(())
-    }
-}
-
-impl Drop for LocalBrowserSession {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
     }
 }
 
@@ -1253,7 +1333,13 @@ struct CdpPage {
 
 impl CdpPage {
     async fn connect(websocket_url: &str, command_timeout: Duration) -> Result<Self, BrowserError> {
-        let (socket, _) = tokio::time::timeout(command_timeout, connect_async(websocket_url))
+        let mut request = websocket_url
+            .into_client_request()
+            .map_err(|error| BrowserError::Protocol(error.to_string()))?;
+        request
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("http://localhost"));
+        let (socket, _) = tokio::time::timeout(command_timeout, connect_async(request))
             .await
             .map_err(|_| BrowserError::Timeout("connecting to the local browser".to_string()))?
             .map_err(|error| BrowserError::Protocol(error.to_string()))?;
@@ -1345,38 +1431,36 @@ async fn wait_for_devtools_port(
     }
 }
 
-async fn wait_for_page_websocket_url(port: u16, timeout: Duration) -> Result<String, BrowserError> {
+async fn create_page_websocket_url(port: u16, timeout: Duration) -> Result<String, BrowserError> {
     let client = reqwest::Client::builder().no_proxy().build()?;
-    let endpoint = format!("http://127.0.0.1:{port}/json/list");
     let create_endpoint = format!("http://127.0.0.1:{port}/json/new?about:blank");
     let started = tokio::time::Instant::now();
-    let mut created_target = false;
+    loop {
+        if let Ok(response) = client.put(&create_endpoint).send().await {
+            if let Ok(target) = response.json::<Value>().await {
+                if let Some(websocket_url) =
+                    target.get("webSocketDebuggerUrl").and_then(Value::as_str)
+                {
+                    return Ok(websocket_url.to_string());
+                }
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Err(BrowserError::StartupTimeout(timeout));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn browser_websocket_url(port: u16, timeout: Duration) -> Result<String, BrowserError> {
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let endpoint = format!("http://127.0.0.1:{port}/json/version");
+    let started = tokio::time::Instant::now();
     loop {
         if let Ok(response) = client.get(&endpoint).send().await {
-            if let Ok(targets) = response.json::<Vec<Value>>().await {
-                if !created_target {
-                    created_target = true;
-                    if let Ok(response) = client.put(&create_endpoint).send().await {
-                        if let Ok(target) = response.json::<Value>().await {
-                            if let Some(websocket_url) =
-                                target.get("webSocketDebuggerUrl").and_then(Value::as_str)
-                            {
-                                return Ok(websocket_url.to_string());
-                            }
-                        }
-                    }
-                }
-                let page_targets = targets
-                    .iter()
-                    .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
-                    .collect::<Vec<_>>();
-                let target = page_targets
-                    .iter()
-                    .copied()
-                    .find(|target| target.get("url").and_then(Value::as_str) == Some("about:blank"))
-                    .or_else(|| page_targets.first().copied());
-                if let Some(websocket_url) = target
-                    .and_then(|target| target.get("webSocketDebuggerUrl").and_then(Value::as_str))
+            if let Ok(target) = response.json::<Value>().await {
+                if let Some(websocket_url) =
+                    target.get("webSocketDebuggerUrl").and_then(Value::as_str)
                 {
                     return Ok(websocket_url.to_string());
                 }
@@ -1558,15 +1642,37 @@ const INTERACTIVE_SNAPSHOT_SCRIPT: &str = r#"
     }
     return `body > ${parts.join(' > ')}`;
   };
+  const handoffReason = (element, label, inputType, formMethod) => {
+    const normalized = `${label} ${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`.toLowerCase();
+    if (inputType === 'file') return 'Please choose and upload the file yourself in the visible browser, then tell me to continue.';
+    if (inputType === 'password' || /sign[ -]?in|log[ -]?in|password|passkey|verification|verify|captcha|one[ -]?time code|security code/.test(normalized)) {
+      return 'Please complete the sign-in or verification step yourself in the visible browser, then tell me to continue.';
+    }
+    if (/pay|payment|checkout|purchase|buy now|place order|subscribe/.test(normalized)) {
+      return 'Please review and complete the payment or purchase yourself in the visible browser, then tell me to continue.';
+    }
+    if (/send|publish|post|share|upload|delete|remove|submit|save changes|confirm/.test(normalized) && formMethod !== 'get') {
+      return 'Please review and complete this external action yourself in the visible browser, then tell me to continue.';
+    }
+    return null;
+  };
   return Array.from(document.querySelectorAll('a, button, input, textarea, select, [role="button"], [contenteditable="true"]'))
     .filter((element) => !element.disabled && element.getClientRects().length)
     .slice(0, max)
-    .map((element) => ({
-      selector: cssPath(element), tagName: element.tagName.toLowerCase(), role: role(element), name: text(element),
-      href: element.href || null, formAction: element.getAttribute('formaction') || (element.form && element.form.getAttribute('action')) || null,
-      editable: Boolean(element.isContentEditable || ['input', 'textarea', 'select'].includes(element.tagName.toLowerCase()) && !element.readOnly),
-      bounds: (() => { const rect = element.getBoundingClientRect(); return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; })()
-    }));
+    .map((element) => {
+      const inputType = (element.getAttribute('type') || '').toLowerCase() || null;
+      const formMethod = (element.getAttribute('formmethod') || element.form?.getAttribute('method') || 'get').toLowerCase();
+      const name = text(element);
+      const userActionReason = handoffReason(element, name, inputType, formMethod);
+      return {
+        selector: cssPath(element), tagName: element.tagName.toLowerCase(), role: role(element), name,
+        href: element.href || null, formAction: element.getAttribute('formaction') || (element.form && element.form.getAttribute('action')) || null,
+        formMethod, inputType,
+        editable: Boolean(element.isContentEditable || ['input', 'textarea', 'select'].includes(element.tagName.toLowerCase()) && !element.readOnly),
+        requiresUserAction: Boolean(userActionReason), userActionReason,
+        bounds: (() => { const rect = element.getBoundingClientRect(); return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; })()
+      };
+    });
 })()
 "#;
 

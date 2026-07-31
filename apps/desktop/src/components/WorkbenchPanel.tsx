@@ -411,9 +411,7 @@ export function WorkbenchPanel({
                 onDecideApproval(latestApprovalPayload.approval_id, true)
               }
             >
-              {latestApprovalPayload.action.startsWith("browser:domain:")
-                ? "Allow Domain"
-                : "Allow Once"}
+              Allow Once
             </button>
           </div>
         </section>

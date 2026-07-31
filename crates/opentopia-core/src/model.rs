@@ -1309,6 +1309,7 @@ impl Approval {
 pub enum TurnStatus {
     Running,
     WaitingApproval,
+    WaitingUserAction,
     Cancelling,
     Succeeded,
     Failed,
@@ -1321,6 +1322,7 @@ impl TurnStatus {
         match self {
             Self::Running => "running",
             Self::WaitingApproval => "waiting_approval",
+            Self::WaitingUserAction => "waiting_user_action",
             Self::Cancelling => "cancelling",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -1333,6 +1335,7 @@ impl TurnStatus {
         match value {
             "running" => Ok(Self::Running),
             "waiting_approval" => Ok(Self::WaitingApproval),
+            "waiting_user_action" => Ok(Self::WaitingUserAction),
             "cancelling" => Ok(Self::Cancelling),
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
@@ -1729,6 +1732,15 @@ pub enum AgentEventPayload {
         approval_id: Uuid,
         reason: String,
     },
+    BrowserHandoffRequired {
+        action: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    BrowserHandoffCompleted {
+        prior_turn_id: Uuid,
+    },
     TurnAwaitingInput {
         request_id: Uuid,
     },
@@ -1775,6 +1787,8 @@ impl AgentEventPayload {
             Self::SubagentUpdated { .. } => "subagent_updated",
             Self::TurnFinished { .. } => "turn_finished",
             Self::TurnSuspended { .. } => "turn_suspended",
+            Self::BrowserHandoffRequired { .. } => "browser_handoff_required",
+            Self::BrowserHandoffCompleted { .. } => "browser_handoff_completed",
             Self::TurnAwaitingInput { .. } => "turn_awaiting_input",
             Self::TurnCancelled { .. } => "turn_cancelled",
             Self::Error { .. } => "error",
