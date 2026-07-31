@@ -170,7 +170,14 @@ function validateGraders(graders, issues) {
     }
   }
   if (graders.trajectory !== undefined) {
-    assertObject(graders.trajectory, "graders.trajectory", issues);
+    if (assertObject(graders.trajectory, "graders.trajectory", issues)) {
+      if (
+        graders.trajectory.requireThreadReuse !== undefined &&
+        typeof graders.trajectory.requireThreadReuse !== "boolean"
+      ) {
+        issues.push("graders.trajectory.requireThreadReuse must be a boolean");
+      }
+    }
   }
   if (graders.security !== undefined) {
     if (assertObject(graders.security, "graders.security", issues)) {

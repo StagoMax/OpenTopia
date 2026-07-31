@@ -32,6 +32,7 @@ test("long-horizon tasks preserve phase graders and controlled restart", async (
     assert.equal(task.phases[1].restartBefore, true, `${task.id} must restart before phase two`);
     assert.equal(task.phases[0].graders.commands[0].args.at(-1), "library");
     assert.equal(task.phases[1].graders.commands[0].args.at(-1), "full");
+    assert.equal(task.graders.trajectory.requireThreadReuse, true);
     assert.deepEqual(task.graders.security.protectedPaths, ["SPEC.md", "test"]);
   }
 });

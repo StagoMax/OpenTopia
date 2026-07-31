@@ -84,6 +84,12 @@ export async function validateDefinitions(suitePath, targetPath) {
     if (entry.task.phases?.some((phase) => phase.restartBefore) && !definitions.target.lifecycle?.restart) {
       throw new Error(`Task ${entry.task.id} requires a restart, but target ${definitions.target.id} has no lifecycle.restart`);
     }
+    if (
+      entry.task.graders.trajectory?.requireThreadReuse &&
+      !entry.task.phases?.some((phase) => phase.restartBefore)
+    ) {
+      throw new Error(`Task ${entry.task.id} requires thread reuse, but has no restart phase`);
+    }
   }
   return definitions;
 }
@@ -266,7 +272,13 @@ async function runTrial({
     workspace,
     trialDir: trialDirectory,
     taskDir: taskDirectory,
-    targetDir: targetDirectory
+    targetDir: targetDirectory,
+    // Browser suites are started by the evaluation supervisor. These values are deliberately
+    // explicit placeholders rather than inherited by graders, which keeps grader environments
+    // minimal while still allowing hidden backend-state checks.
+    browserFixtureUrl: process.env.OPENTOPIA_EVAL_BROWSER_FIXTURE_URL ?? "",
+    browserDataRoot: process.env.OPENTOPIA_EVAL_BROWSER_DATA_ROOT ?? "",
+    browserFixtureState: process.env.OPENTOPIA_EVAL_BROWSER_FIXTURE_STATE ?? ""
   };
   const harnessEvents = [makeHarnessEvent(context, "application.launch.started", { targetId: target.id })];
   const parsedErrors = [];
@@ -365,6 +377,10 @@ async function runTrial({
     const byTime = Date.parse(left.timestamp) - Date.parse(right.timestamp);
     return byTime !== 0 ? byTime : (left.monotonicMs ?? 0) - (right.monotonicMs ?? 0);
   });
+
+  // Command graders may verify a trajectory in addition to backend state. Materialize the
+  // normalized event stream before invoking them; it is rewritten with redaction below.
+  await writeEvents(eventsFile, events);
 
   const checks = [
     {

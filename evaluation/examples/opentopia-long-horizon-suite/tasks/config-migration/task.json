@@ -49,6 +49,7 @@
     "trajectory": {
       "requireValidEvents": true,
       "requireCompletionClaim": true,
+      "requireThreadReuse": true,
       "minimumPhaseCompletions": 2
     },
     "security": {

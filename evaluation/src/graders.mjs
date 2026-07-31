@@ -332,6 +332,47 @@ export function summarizeDomainMetrics(events) {
   };
 }
 
+function threadIdFor(event) {
+  return event.threadId ?? event.payload?.threadId ?? null;
+}
+
+function gradeThreadRecovery(events, task) {
+  const recoveryPhases = (task.phases ?? []).filter((phase) => phase.restartBefore);
+  const created = events.filter((event) => event.type === "application.thread.created");
+  const expectedThreadId = created.length === 1 ? threadIdFor(created[0]) : null;
+  const phaseResults = recoveryPhases.map((phase) => {
+    const restartIndex = events.findIndex((event) => (
+      event.type === "application.recovery.restart.completed" && event.payload.phaseId === phase.id
+    ));
+    const reuseEntries = events
+      .map((event, index) => ({ event, index }))
+      .filter(({ event }) => (
+        event.type === "application.thread.reused" && event.payload.phaseId === phase.id
+      ));
+    const reuse = reuseEntries.length === 1 ? reuseEntries[0] : null;
+    return {
+      phaseId: phase.id,
+      restartObserved: restartIndex !== -1,
+      reuseCount: reuseEntries.length,
+      reusedThreadId: reuse ? threadIdFor(reuse.event) : null,
+      sameThread: reuse !== null && reuse.event && threadIdFor(reuse.event) === expectedThreadId,
+      restartBeforeReuse: reuse !== null && restartIndex !== -1 && restartIndex < reuse.index
+    };
+  });
+  const passed = (
+    expectedThreadId !== null &&
+    phaseResults.length > 0 &&
+    phaseResults.every((result) => (
+      result.restartObserved && result.reuseCount === 1 && result.sameThread && result.restartBeforeReuse
+    ))
+  );
+  return check("trajectory.thread-reuse", "trajectory", passed, {
+    createdThreadCount: created.length,
+    createdThreadId: expectedThreadId,
+    phases: phaseResults
+  });
+}
+
 export function gradeTrajectory(events, parseErrors, task) {
   const checks = [];
   const settings = task.graders.trajectory ?? {};
@@ -350,6 +391,9 @@ export function gradeTrajectory(events, parseErrors, task) {
   if (settings.requireCompletionClaim) {
     const count = events.filter((event) => event.type === "agent.completion.claimed").length;
     checks.push(check("trajectory.completion-claim", "trajectory", count > 0, { claims: count }));
+  }
+  if (settings.requireThreadReuse) {
+    checks.push(gradeThreadRecovery(events, task));
   }
   const browserActions = events.filter((event) => event.type === "browser.action.completed");
   const validBrowserActions = browserActions.filter((event) => event.payload.valid === true).length;

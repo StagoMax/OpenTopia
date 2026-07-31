@@ -8,7 +8,9 @@ param(
   [string]$TargetPath = "",
   [string]$OutputDirectory = "",
   [string]$SummaryPath = "",
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  [switch]$BrowserFixture,
+  [ValidateRange(1024, 65535)][int]$BrowserFixturePort = 8999
 )
 
 $ErrorActionPreference = "Stop"
@@ -193,6 +195,44 @@ function Stop-EvalServer {
   }
 }
 
+function Start-BrowserFixture {
+  param(
+    [Parameter(Mandatory = $true)][string]$FixturePath,
+    [Parameter(Mandatory = $true)][string]$StatePath,
+    [Parameter(Mandatory = $true)][string]$RunRoot
+  )
+
+  $nodePath = (Get-Command node -ErrorAction Stop).Source
+  $stdoutPath = Join-Path $RunRoot "browser-fixture.stdout.log"
+  $stderrPath = Join-Path $RunRoot "browser-fixture.stderr.log"
+  $process = Start-Process `
+    -FilePath $nodePath `
+    -ArgumentList @($FixturePath, "--host", "127.0.0.1", "--port", $BrowserFixturePort, "--state", $StatePath) `
+    -RedirectStandardOutput $stdoutPath `
+    -RedirectStandardError $stderrPath `
+    -PassThru `
+    -WindowStyle Hidden
+
+  $deadline = (Get-Date).AddSeconds(15)
+  $fixtureUrl = "http://127.0.0.1:$BrowserFixturePort"
+  while ((Get-Date) -lt $deadline) {
+    $process.Refresh()
+    if ($process.HasExited) {
+      throw "Browser fixture exited before becoming healthy"
+    }
+    Start-Sleep -Milliseconds 150
+    try {
+      $health = Invoke-RestMethod -Uri "$fixtureUrl/health" -TimeoutSec 2
+      if ($health.ok -and $health.service -eq "opentopia-browser-fixture") {
+        return $process
+      }
+    } catch {
+    }
+  }
+  Stop-EvalServer $process
+  throw "Browser fixture did not become healthy within 15 seconds"
+}
+
 function Read-RestartControl {
   param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -348,7 +388,11 @@ foreach ($name in @(
   "OPENTOPIA_SANDBOX_MODE",
   "OPENTOPIA_SANDBOX_ENFORCEMENT",
   "OPENTOPIA_SANDBOX_NETWORK",
-  "OPENTOPIA_EVAL_RESTART_CONTROL"
+  "OPENTOPIA_EVAL_RESTART_CONTROL",
+  "OPENTOPIA_BROWSER_DATA_ROOT",
+  "OPENTOPIA_EVAL_BROWSER_FIXTURE_URL",
+  "OPENTOPIA_EVAL_BROWSER_FIXTURE_STATE",
+  "OPENTOPIA_EVAL_BROWSER_DATA_ROOT"
 )) {
   $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
 }
@@ -382,6 +426,7 @@ $harnessStdoutPath = Join-Path $runRoot "harness.stdout.log"
 $harnessStderrPath = Join-Path $runRoot "harness.stderr.log"
 $resultPath = Join-Path $runRoot "runner-result.json"
 $script:ServerProcess = $null
+$script:BrowserFixtureProcess = $null
 $script:RestartCount = 0
 $harnessProcess = $null
 $providerHealth = $null
@@ -396,6 +441,19 @@ New-Item -ItemType Directory -Path $harnessOutput -Force | Out-Null
   $restartControlPath,
   "Process"
 )
+if ($BrowserFixture) {
+  $browserDataRoot = Join-Path $runRoot "browser-data"
+  $browserFixtureStatePath = Join-Path $runRoot "browser-fixture-state.json"
+  New-Item -ItemType Directory -Path $browserDataRoot -Force | Out-Null
+  [Environment]::SetEnvironmentVariable("OPENTOPIA_BROWSER_DATA_ROOT", $browserDataRoot, "Process")
+  [Environment]::SetEnvironmentVariable("OPENTOPIA_EVAL_BROWSER_DATA_ROOT", $browserDataRoot, "Process")
+  [Environment]::SetEnvironmentVariable(
+    "OPENTOPIA_EVAL_BROWSER_FIXTURE_URL",
+    "http://127.0.0.1:$BrowserFixturePort",
+    "Process"
+  )
+  [Environment]::SetEnvironmentVariable("OPENTOPIA_EVAL_BROWSER_FIXTURE_STATE", $browserFixtureStatePath, "Process")
+}
 
 try {
   $targetDir = Join-Path $repoRoot ".opentopia\verify-target"
@@ -417,6 +475,14 @@ try {
   }
   if (-not (Test-Path -LiteralPath $serverPath -PathType Leaf)) {
     throw "opentopia-server debug binary was not found"
+  }
+
+  if ($BrowserFixture) {
+    $fixturePath = Join-Path $repoRoot "evaluation\fixtures\browser-fixture-server.mjs"
+    if (-not (Test-Path -LiteralPath $fixturePath -PathType Leaf)) {
+      throw "Browser fixture server was not found: $fixturePath"
+    }
+    $script:BrowserFixtureProcess = Start-BrowserFixture $fixturePath $browserFixtureStatePath $runRoot
   }
 
   New-RuntimeTarget $targetPath $runtimeTargetPath $adapterPath
@@ -482,9 +548,12 @@ try {
   }
 } finally {
   Stop-EvalServer $script:ServerProcess
+  Stop-EvalServer $script:BrowserFixtureProcess
   Protect-File $harnessStdoutPath $script:Secrets
   Protect-File $harnessStderrPath $script:Secrets
   Get-ChildItem -LiteralPath $runRoot -File -Filter "server-*.log" -ErrorAction SilentlyContinue |
+    ForEach-Object { Protect-File $_.FullName $script:Secrets }
+  Get-ChildItem -LiteralPath $runRoot -File -Filter "browser-fixture*.log" -ErrorAction SilentlyContinue |
     ForEach-Object { Protect-File $_.FullName $script:Secrets }
   Protect-HarnessArtifacts $harnessOutput $script:Secrets
   foreach ($name in $savedEnvironment.Keys) {
@@ -525,6 +594,15 @@ $result = [ordered]@{
     repetitions = $Repetitions
     port = $Port
     database = ".opentopia/evaluations/$runId/evaluation.db"
+    browserFixture = if ($BrowserFixture) {
+      [ordered]@{
+        url = "http://127.0.0.1:$BrowserFixturePort"
+        state = ".opentopia/evaluations/$runId/browser-fixture-state.json"
+        dataRoot = ".opentopia/evaluations/$runId/browser-data"
+      }
+    } else {
+      $null
+    }
     sandbox = [ordered]@{
       mode = "workspace-write"
       enforcement = "best-effort"

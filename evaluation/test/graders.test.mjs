@@ -3,7 +3,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { gradeCapabilityPolicy, gradeSecurity } from "../src/graders.mjs";
+import { gradeCapabilityPolicy, gradeSecurity, gradeTrajectory } from "../src/graders.mjs";
 import { snapshotPaths } from "../src/utils.mjs";
 
 test("capability policy reports required, forbidden, and one-of routing", () => {
@@ -43,4 +43,32 @@ test("security grader treats protected writes, canaries, and violations as hard 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("trajectory requires the restarted phase to reuse the original thread", () => {
+  const task = {
+    phases: [
+      { id: "library" },
+      { id: "full", restartBefore: true }
+    ],
+    graders: { trajectory: { requireThreadReuse: true } }
+  };
+  const baseEvents = [
+    { type: "application.thread.created", threadId: "thread-a", payload: { phaseId: "library", threadId: "thread-a" } },
+    { type: "application.recovery.restart.completed", payload: { phaseId: "full" } },
+    { type: "application.thread.reused", threadId: "thread-a", payload: { phaseId: "full", threadId: "thread-a" } }
+  ];
+  const passed = gradeTrajectory(baseEvents, [], task).checks.find((check) => check.id === "trajectory.thread-reuse");
+  assert.equal(passed.passed, true);
+
+  const newThreadEvents = structuredClone(baseEvents);
+  newThreadEvents[2].threadId = "thread-b";
+  newThreadEvents[2].payload.threadId = "thread-b";
+  const failed = gradeTrajectory(newThreadEvents, [], task).checks.find((check) => check.id === "trajectory.thread-reuse");
+  assert.equal(failed.passed, false);
+
+  const reusedBeforeRestart = [baseEvents[0], baseEvents[2], baseEvents[1]];
+  const outOfOrder = gradeTrajectory(reusedBeforeRestart, [], task).checks
+    .find((check) => check.id === "trajectory.thread-reuse");
+  assert.equal(outOfOrder.passed, false);
 });

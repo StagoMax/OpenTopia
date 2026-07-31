@@ -63,6 +63,7 @@
             "requireValidEvents": { "type": "boolean" },
             "minimumPhaseCompletions": { "type": "integer", "minimum": 0 },
             "requireCompletionClaim": { "type": "boolean" },
+            "requireThreadReuse": { "type": "boolean" },
             "minimumBrowserActions": { "type": "integer", "minimum": 0 },
             "minimumValidBrowserActions": { "type": "integer", "minimum": 0 },
             "minimumMemoryAssertions": { "type": "integer", "minimum": 0 },
