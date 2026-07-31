@@ -9,6 +9,12 @@ const browserHost = Object.freeze({
     ipcRenderer.invoke("browser-host:get-state", sessionId),
   navigate: (sessionId, url) =>
     ipcRenderer.invoke("browser-host:navigate", sessionId, url),
+  navigateFromAddressBar: (sessionId, url) =>
+    ipcRenderer.invoke(
+      "browser-host:navigate-from-address-bar",
+      sessionId,
+      url,
+    ),
   back: (sessionId) => ipcRenderer.invoke("browser-host:back", sessionId),
   forward: (sessionId) => ipcRenderer.invoke("browser-host:forward", sessionId),
   reload: (sessionId) => ipcRenderer.invoke("browser-host:reload", sessionId),
@@ -74,5 +80,7 @@ contextBridge.exposeInMainWorld("opentopia", {
   listLogFiles: () => ipcRenderer.invoke("logs:list"),
   readLogFile: (path, offset, limit) =>
     ipcRenderer.invoke("logs:read", path, offset, limit),
+  recordConversationRenderTrace: (trace) =>
+    ipcRenderer.send("logs:conversation-render-trace", trace),
   browserHost,
 });

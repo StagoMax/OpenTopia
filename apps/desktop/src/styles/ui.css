@@ -192,22 +192,18 @@
 }
 
 .ot-popover-surface {
-  position: absolute;
-  bottom: calc(100% + var(--space-2));
+  position: fixed;
+  right: auto;
+  bottom: auto;
   z-index: var(--z-popover);
   min-width: 260px;
+  max-width: calc(100vw - var(--space-8));
+  max-height: calc(100vh - var(--space-8));
+  overflow: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--shadow-float);
-}
-
-.ot-popover-surface--start {
-  left: 0;
-}
-
-.ot-popover-surface--end {
-  right: 0;
 }
 
 /* Switch */

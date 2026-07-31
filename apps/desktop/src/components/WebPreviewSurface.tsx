@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ExternalLink,
+  Globe2,
   Loader2,
   RefreshCw,
 } from "lucide-react";
@@ -100,6 +101,7 @@ function NativeWebPreview({
   });
   const [error, setError] = useState<string | null>(null);
   const visibleRef = useRef(true);
+  const hasUrlRef = useRef(false);
   const handledNavigationIdRef = useRef<string | null>(null);
 
   const reportBounds = useCallback(() => {
@@ -108,6 +110,7 @@ function NativeWebPreview({
     const rect = element.getBoundingClientRect();
     const visible =
       visibleRef.current &&
+      hasUrlRef.current &&
       !approval &&
       document.visibilityState === "visible" &&
       rect.width > 0 &&
@@ -139,10 +142,12 @@ function NativeWebPreview({
       canGoBack: false,
       canGoForward: false,
     });
+    hasUrlRef.current = false;
     void api
       .createSession({ sessionId, visible: false })
       .then((next) => {
         if (disposed) return;
+        hasUrlRef.current = Boolean(next.url);
         setState(next);
         setAddress(next.url);
         window.requestAnimationFrame(reportBounds);
@@ -152,9 +157,11 @@ function NativeWebPreview({
       });
     const unsubscribe = api.onStateChanged((next) => {
       if (next.sessionId !== sessionId || disposed) return;
+      hasUrlRef.current = Boolean(next.url);
       setState(next);
       setAddress(next.url);
       setError(next.error ?? null);
+      window.requestAnimationFrame(reportBounds);
     });
     return () => {
       disposed = true;
@@ -221,7 +228,7 @@ function NativeWebPreview({
       const url = normalizeWebUrl(address);
       setError(null);
       setAddress(url);
-      await api.navigate(sessionId, url);
+      await api.navigateFromAddressBar(sessionId, url);
     } catch (cause) {
       setError(errorMessage(cause));
     }
@@ -266,6 +273,7 @@ function NativeWebPreview({
           type="button"
           title="Reload"
           aria-label="Reload page"
+          disabled={!state.url}
           onClick={() => void run("reload")}
         >
           {state.loading ? (
@@ -280,7 +288,7 @@ function NativeWebPreview({
           autoCorrect="off"
           spellCheck={false}
           value={address}
-          placeholder="https://"
+          placeholder="输入 URL"
           onChange={(event) => setAddress(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter") void navigate();
@@ -327,6 +335,13 @@ function NativeWebPreview({
         </div>
       )}
       <div className="web-preview-native-surface" ref={containerRef} />
+      {!state.url ? (
+        <div className="web-preview-empty">
+          <Globe2 size={32} aria-hidden="true" />
+          <strong>开始浏览</strong>
+          <span>输入 URL 以打开页面</span>
+        </div>
+      ) : null}
     </section>
   );
 }

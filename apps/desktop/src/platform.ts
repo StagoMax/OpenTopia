@@ -1,4 +1,7 @@
 import type {
+  ConversationRenderTrace,
+} from "./conversationRenderTrace";
+import type {
   ContextSourcePickResult,
   KeyringMetadata,
   LogFileInfo,
@@ -214,6 +217,12 @@ export async function readLogFile(
     return window.opentopia.readLogFile(path, offset, limit);
   }
   return { lines: [], total: 0 };
+}
+
+export function recordConversationRenderTrace(
+  trace: ConversationRenderTrace,
+): void {
+  window.opentopia?.recordConversationRenderTrace?.(trace);
 }
 
 function readBrowserRecentWorkspaces(): RecentWorkspace[] {

@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type FormEvent,
 } from "react";
 import {
@@ -17,6 +18,7 @@ import {
   Folder,
   FolderOpen,
   GitBranch,
+  Loader2,
   Pencil,
   PackagePlus,
   Plus,
@@ -58,6 +60,7 @@ import type {
   WorkspaceFilePreview,
   WorkspaceTree,
 } from "../types";
+import type { ApiClient } from "../api/client";
 import { ArtifactGallery } from "./ArtifactGallery";
 import {
   DiffReviewPanel,
@@ -67,12 +70,14 @@ import {
 } from "./DiffReviewPanel";
 import type { XtermTerminalHandle } from "./XtermTerminal";
 import { XtermTerminal } from "./XtermTerminal";
-import { Badge, Button } from "./ui";
+import { detectLanguage, MonacoEditor } from "./MonacoEditor";
+import { Badge, Button, IconButton } from "./ui";
 
 export type WorkbenchTab =
   "files" | "diff" | "terminal" | "extensions" | "sandbox";
 
 type WorkbenchPanelProps = {
+  client: ApiClient | null;
   mode?: "panel" | "stage";
   activeTab?: WorkbenchTab;
   thread: Thread | null;
@@ -152,6 +157,7 @@ const tabs: Array<{
 ];
 
 export function WorkbenchPanel({
+  client,
   mode = "panel",
   activeTab: controlledActiveTab,
   thread,
@@ -220,6 +226,8 @@ export function WorkbenchPanel({
     <>
       {activeTab === "files" && (
         <FilesView
+          client={client}
+          threadId={thread?.id ?? null}
           workspaceRoot={shownWorkspaceRoot}
           workspaceTree={workspaceTree}
           filePreview={filePreview}
@@ -232,6 +240,8 @@ export function WorkbenchPanel({
       )}
       {activeTab === "diff" && (
         <DiffView
+          client={client}
+          threadId={thread?.id ?? null}
           events={events}
           workspaceDiff={workspaceDiff}
           reviewFileRequest={reviewFileRequest ?? null}
@@ -286,9 +296,15 @@ export function WorkbenchPanel({
 
   if (mode === "stage") {
     return (
-      <section className="workbench-stage-panel">
+      <section
+        className={`workbench-stage-panel ${workbenchError ? "has-error" : ""}`}
+      >
         {workbenchError && <p className="workspace-error">{workbenchError}</p>}
-        <div className="workbench-tab-panel stage">{tabContent}</div>
+        <div
+          className={`workbench-tab-panel stage workbench-tab-panel--${activeTab}`}
+        >
+          {tabContent}
+        </div>
       </section>
     );
   }
@@ -521,6 +537,8 @@ function ContextCard({
 }
 
 function FilesView({
+  client,
+  threadId,
   workspaceRoot,
   workspaceTree,
   filePreview,
@@ -530,6 +548,8 @@ function FilesView({
   onOpenWorkspaceEntry,
   onOpenPath,
 }: {
+  client: ApiClient | null;
+  threadId: string | null;
   workspaceRoot: string | null;
   workspaceTree: WorkspaceTree | null;
   filePreview: WorkspaceFilePreview | null;
@@ -541,49 +561,227 @@ function FilesView({
 }) {
   const currentPath = workspaceTree?.path ?? "";
   const entries = workspaceTree?.entries ?? [];
+  const [query, setQuery] = useState("");
+  const [expandedPaths, setExpandedPaths] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
+  const [childrenByPath, setChildrenByPath] = useState<
+    Readonly<Record<string, WorkspaceEntry[]>>
+  >({});
+  const [loadingPaths, setLoadingPaths] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
+  const [treeError, setTreeError] = useState<string | null>(null);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const treeRows = useMemo(
+    () => flattenWorkspaceTree(entries, expandedPaths, childrenByPath),
+    [childrenByPath, entries, expandedPaths],
+  );
+  const visibleRows = normalizedQuery
+    ? treeRows.filter(({ entry }) =>
+        `${entry.name} ${entry.path}`
+          .toLocaleLowerCase()
+          .includes(normalizedQuery),
+      )
+    : treeRows;
+
+  useEffect(() => {
+    setExpandedPaths(new Set());
+    setChildrenByPath({});
+    setLoadingPaths(new Set());
+    setTreeError(null);
+  }, [currentPath, threadId]);
+
+  const toggleDirectory = useCallback(
+    async (entry: WorkspaceEntry) => {
+      if (entry.kind !== "directory") return;
+      if (expandedPaths.has(entry.path)) {
+        setExpandedPaths((current) => {
+          const next = new Set(current);
+          next.delete(entry.path);
+          return next;
+        });
+        return;
+      }
+
+      setExpandedPaths((current) => new Set(current).add(entry.path));
+      if (childrenByPath[entry.path] || !client || !threadId) return;
+
+      setLoadingPaths((current) => new Set(current).add(entry.path));
+      setTreeError(null);
+      try {
+        const tree = await client.listWorkspaceTree(threadId, entry.path);
+        setChildrenByPath((current) => ({
+          ...current,
+          [entry.path]: tree.entries,
+        }));
+      } catch (cause) {
+        setExpandedPaths((current) => {
+          const next = new Set(current);
+          next.delete(entry.path);
+          return next;
+        });
+        setTreeError(errorMessage(cause));
+      } finally {
+        setLoadingPaths((current) => {
+          const next = new Set(current);
+          next.delete(entry.path);
+          return next;
+        });
+      }
+    },
+    [childrenByPath, client, expandedPaths, threadId],
+  );
+
+  const refreshTree = useCallback(() => {
+    setExpandedPaths(new Set());
+    setChildrenByPath({});
+    setLoadingPaths(new Set());
+    setTreeError(null);
+    onRefresh();
+  }, [onRefresh]);
 
   return (
     <div className="files-view">
-      <div className="workbench-section-header">
-        <Breadcrumb path={currentPath} onOpenPath={onOpenWorkspacePath} />
-        <button
-          className="icon-button small"
-          type="button"
-          aria-label="Refresh files"
+      <div className="file-browser-toolbar">
+        <Breadcrumb
+          path={filePreview?.path ?? currentPath}
+          rootLabel={workspaceRoot ? workspaceName(workspaceRoot) : "工作区"}
+          leafIsFile={Boolean(filePreview)}
+          onOpenPath={onOpenWorkspacePath}
+        />
+        {filePreview?.truncated ? (
+          <Badge variant="warning">已截断</Badge>
+        ) : null}
+        {filePreview?.readonly ? <Badge>只读</Badge> : null}
+        <IconButton
+          size="compact"
+          variant="quiet"
+          aria-label="刷新文件"
+          title="刷新文件"
           disabled={isRefreshing}
-          onClick={onRefresh}
+          onClick={refreshTree}
         >
           <RefreshCw size={13} className={isRefreshing ? "spin" : ""} />
-        </button>
+        </IconButton>
+        <IconButton
+          size="compact"
+          variant="quiet"
+          aria-label="在系统中打开工作区"
+          title="在系统中打开工作区"
+          disabled={!workspaceRoot}
+          onClick={() => workspaceRoot && onOpenPath(workspaceRoot)}
+        >
+          <FolderOpen size={14} aria-hidden="true" />
+        </IconButton>
+        {filePreview ? (
+          <Button
+            className="file-browser-open"
+            size="compact"
+            variant="secondary"
+            disabled={!workspaceRoot}
+            title={`打开 ${filePreview.path}`}
+            onClick={() =>
+              workspaceRoot &&
+              onOpenPath(
+                toWorkspaceAbsolutePath(workspaceRoot, filePreview.path),
+              )
+            }
+          >
+            <ExternalLink size={14} aria-hidden="true" />
+            <span>打开</span>
+          </Button>
+        ) : null}
       </div>
 
-      <div className="workbench-file-list">
-        {entries.length ? (
-          entries.map((entry) => (
-            <button
-              className={`file-row workbench-file-row ${
-                filePreview?.path === entry.path ? "active" : ""
-              }`}
-              key={entry.path}
-              type="button"
-              title={entry.path}
-              onClick={() => onOpenWorkspaceEntry(entry)}
-            >
-              {entry.kind === "directory" ? (
-                <Folder size={14} />
-              ) : (
-                <FileText size={14} />
-              )}
-              <span>{entry.name}</span>
-              <small>
-                {entry.kind === "directory" ? "dir" : formatBytes(entry.size)}
-              </small>
-              {entry.kind === "directory" && <ChevronRight size={13} />}
-            </button>
-          ))
-        ) : (
-          <span className="muted">No files loaded.</span>
-        )}
+      <div className="file-browser-layout">
+        <section className="file-preview-workspace" aria-label="文件预览">
+          {filePreview ? (
+            <div className="workbench-file-editor">
+              <MonacoEditor
+                value={filePreview.content}
+                language={detectLanguage(filePreview.path)}
+                readOnly
+                theme={
+                  document.documentElement.dataset.theme === "dark"
+                    ? "vs-dark"
+                    : "vs"
+                }
+              />
+            </div>
+          ) : (
+            <div className="file-preview-empty">
+              <FolderOpen size={32} aria-hidden="true" />
+              <strong>打开文件</strong>
+              <span>从工作区目录树中选择文件</span>
+            </div>
+          )}
+        </section>
+
+        <aside className="file-explorer-pane" aria-label="工作区目录树">
+          <label className="file-explorer-search">
+            <Search size={14} aria-hidden="true" />
+            <span className="sr-only">筛选文件</span>
+            <input
+              value={query}
+              placeholder="筛选文件..."
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          <div className="workbench-file-list">
+            {visibleRows.length ? (
+              visibleRows.map(({ entry, depth }) => {
+                const isDirectory = entry.kind === "directory";
+                const expanded = expandedPaths.has(entry.path);
+                const loading = loadingPaths.has(entry.path);
+                return (
+                  <button
+                    className={`file-row workbench-file-row ${
+                      filePreview?.path === entry.path ? "active" : ""
+                    }`}
+                    key={entry.path}
+                    type="button"
+                    title={entry.path}
+                    aria-expanded={isDirectory ? expanded : undefined}
+                    style={{ "--file-tree-depth": depth } as CSSProperties}
+                    onClick={() => {
+                      if (isDirectory) void toggleDirectory(entry);
+                      else onOpenWorkspaceEntry(entry);
+                    }}
+                  >
+                    {loading ? (
+                      <Loader2 className="spin" size={14} aria-hidden="true" />
+                    ) : isDirectory ? (
+                      <ChevronRight
+                        className={expanded ? "is-expanded" : ""}
+                        size={14}
+                        aria-hidden="true"
+                      />
+                    ) : (
+                      <span className="file-explorer-indent" />
+                    )}
+                    {isDirectory ? (
+                      <Folder size={14} aria-hidden="true" />
+                    ) : (
+                      <FileText size={14} aria-hidden="true" />
+                    )}
+                    <span>{entry.name}</span>
+                    <small>{isDirectory ? "" : formatBytes(entry.size)}</small>
+                  </button>
+                );
+              })
+            ) : (
+              <span className="file-explorer-empty">
+                {entries.length ? "没有匹配的文件。" : "当前目录为空。"}
+              </span>
+            )}
+          </div>
+          {treeError ? (
+            <p className="file-explorer-error" role="alert">
+              {treeError}
+            </p>
+          ) : null}
+        </aside>
       </div>
     </div>
   );
@@ -591,9 +789,13 @@ function FilesView({
 
 function Breadcrumb({
   path,
+  rootLabel,
+  leafIsFile = false,
   onOpenPath,
 }: {
   path: string;
+  rootLabel: string;
+  leafIsFile?: boolean;
   onOpenPath(path?: string): void;
 }) {
   const parts = splitWorkspacePath(path);
@@ -601,27 +803,72 @@ function Breadcrumb({
   return (
     <nav className="path-breadcrumb" aria-label="Current folder">
       <button type="button" onClick={() => onOpenPath(undefined)}>
-        root
+        {rootLabel}
       </button>
-      {parts.map((part, index) => (
-        <span key={`${part}-${index}`} className="breadcrumb-part">
-          <ChevronRight size={12} />
-          <button
-            type="button"
-            title={parts.slice(0, index + 1).join("/")}
-            onClick={() => onOpenPath(parts.slice(0, index + 1).join("/"))}
-          >
-            {part}
-          </button>
-        </span>
-      ))}
+      {parts.map((part, index) => {
+        const partPath = parts.slice(0, index + 1).join("/");
+        const isFileLeaf = leafIsFile && index === parts.length - 1;
+        return (
+          <span key={`${part}-${index}`} className="breadcrumb-part">
+            <ChevronRight size={12} aria-hidden="true" />
+            {isFileLeaf ? (
+              <strong title={partPath}>{part}</strong>
+            ) : (
+              <button
+                type="button"
+                title={partPath}
+                onClick={() => onOpenPath(partPath)}
+              >
+                {part}
+              </button>
+            )}
+          </span>
+        );
+      })}
     </nav>
   );
+}
+
+function workspaceName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+}
+
+type WorkspaceTreeRow = {
+  entry: WorkspaceEntry;
+  depth: number;
+};
+
+function flattenWorkspaceTree(
+  entries: WorkspaceEntry[],
+  expandedPaths: ReadonlySet<string>,
+  childrenByPath: Readonly<Record<string, WorkspaceEntry[]>>,
+  depth = 0,
+): WorkspaceTreeRow[] {
+  const rows: WorkspaceTreeRow[] = [];
+  for (const entry of entries) {
+    rows.push({ entry, depth });
+    if (entry.kind !== "directory" || !expandedPaths.has(entry.path)) continue;
+    rows.push(
+      ...flattenWorkspaceTree(
+        childrenByPath[entry.path] ?? [],
+        expandedPaths,
+        childrenByPath,
+        depth + 1,
+      ),
+    );
+  }
+  return rows;
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }
 
 type DiffSubTab = "diff" | "review";
 
 function DiffView({
+  client,
+  threadId,
   events,
   workspaceDiff,
   reviewFileRequest,
@@ -637,6 +884,8 @@ function DiffView({
   onRevertDiffFile,
   onApplyDiffHunk,
 }: {
+  client: ApiClient | null;
+  threadId: string | null;
   events: AgentEvent[];
   workspaceDiff: WorkspaceDiff | null;
   reviewFileRequest: ReviewFileRequest | null;
@@ -730,25 +979,6 @@ function DiffView({
 
   return (
     <div className="diff-view">
-      <div className="diff-sub-tabs">
-        <button
-          className={`diff-sub-tab ${diffSubTab === "diff" ? "active" : ""}`}
-          type="button"
-          onClick={() => setDiffSubTab("diff")}
-        >
-          <FileCode2 size={13} />
-          审阅
-        </button>
-        <button
-          className={`diff-sub-tab ${diffSubTab === "review" ? "active" : ""}`}
-          type="button"
-          onClick={() => setDiffSubTab("review")}
-        >
-          <ShieldAlert size={13} />
-          补丁
-        </button>
-      </div>
-
       {diffSubTab === "diff" && (
         <DiffReviewPanel
           workspaceDiff={workspaceDiff}
@@ -764,6 +994,21 @@ function DiffView({
           onRevertFile={onRevertDiffFile}
           revertBlockedReason={revertBlockedReason}
           onGitAction={onGitAction}
+          onListGitBranches={() =>
+            client && threadId
+              ? client.listGitBranches(threadId)
+              : Promise.resolve([])
+          }
+          onSwitchGitBranch={async (branch) => {
+            if (!client || !threadId) {
+              throw new Error("当前任务没有可用的 Git 工作区。");
+            }
+            await client.runGitWorkflow(threadId, {
+              type: "switch_branch",
+              request: { branch },
+            });
+            onRefresh();
+          }}
         />
       )}
 
@@ -1117,39 +1362,44 @@ function TerminalView({
 
   return (
     <div className="terminal-view">
-      <div className="terminal-toolbar">
-        <span>
+      <div className="terminal-toolbar" role="toolbar" aria-label="终端控制">
+        <span className="terminal-session-label">
+          <TerminalSquare size={14} aria-hidden="true" />
           {terminalSession
-            ? `${terminalSession.shell} · persistent`
-            : "shell closed"}
+            ? `${terminalSession.shell} · 持久会话`
+            : "终端未启动"}
         </span>
+        <span className="terminal-toolbar-spacer" />
         {thread && terminalSession ? (
-          <button
-            className="secondary-button compact"
-            type="button"
+          <IconButton
+            size="compact"
+            variant="quiet"
+            title="关闭终端会话"
+            aria-label="关闭终端会话"
             onClick={() => onCloseSession(thread.id, terminalSession.sessionId)}
           >
-            <Square size={12} />
-            Close shell
-          </button>
+            <Square size={14} aria-hidden="true" />
+          </IconButton>
         ) : (
-          <button
-            className="secondary-button compact"
-            type="button"
+          <Button
+            size="compact"
+            variant="quiet"
             disabled={!thread || isStartingSession}
             onClick={handleRestart}
           >
-            <TerminalSquare size={12} />
-            {isStartingSession ? "Starting" : "Start shell"}
-          </button>
+            <TerminalSquare size={14} aria-hidden="true" />
+            {isStartingSession ? "启动中" : "启动终端"}
+          </Button>
         )}
-        <button
-          className="secondary-button compact"
-          type="button"
+        <IconButton
+          size="compact"
+          variant="quiet"
+          title="清空终端"
+          aria-label="清空终端"
           onClick={() => xtermRef.current?.clear()}
         >
-          Clear
-        </button>
+          <Trash2 size={14} aria-hidden="true" />
+        </IconButton>
       </div>
       <div className="xterm-wrapper">
         <XtermTerminal
@@ -1161,7 +1411,7 @@ function TerminalView({
       </div>
       <details className="terminal-history">
         <summary>
-          History ({terminalRows.length} events)
+          命令历史（{terminalRows.length}）
           <ChevronDown size={12} />
         </summary>
         <div className="terminal-screen" role="log" aria-live="polite">
@@ -1183,7 +1433,7 @@ function TerminalView({
               </div>
             ))
           ) : (
-            <span className="muted">No events yet.</span>
+            <span className="muted">暂无命令历史。</span>
           )}
         </div>
       </details>

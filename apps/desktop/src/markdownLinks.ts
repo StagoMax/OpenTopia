@@ -98,9 +98,9 @@ function resolveLiteralFilePath(
 }
 
 export function markdownStreamInterval(textLength: number): number {
-  if (textLength >= 64 * 1024) return 200;
-  if (textLength >= 16 * 1024) return 120;
-  return 60;
+  if (textLength >= 64 * 1024) return 100;
+  if (textLength >= 16 * 1024) return 64;
+  return 32;
 }
 
 function resolveAbsoluteUrl(value: string): MarkdownLinkTarget {

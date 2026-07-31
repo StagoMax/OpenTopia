@@ -9,6 +9,7 @@ const IPC_CHANNELS = Object.freeze({
   destroy: "browser-host:destroy",
   getState: "browser-host:get-state",
   navigate: "browser-host:navigate",
+  navigateFromAddressBar: "browser-host:navigate-from-address-bar",
   back: "browser-host:back",
   forward: "browser-host:forward",
   reload: "browser-host:reload",
@@ -430,7 +431,10 @@ function createDesktopBrowserHost(options) {
       try {
         const normalized = normalizeUrl(navigationUrl);
         const host = new URL(normalized).hostname.toLowerCase();
-        if (!entry.allowedNavigationHosts.has(host)) {
+        if (
+          !entry.allowAddressBarRedirects &&
+          !entry.allowedNavigationHosts.has(host)
+        ) {
           throw new BrowserHostError(
             "unapproved_redirect_host",
             `Redirect to '${host}' requires a separate approved navigation.`,
@@ -517,6 +521,7 @@ function createDesktopBrowserHost(options) {
       pendingDownload: null,
       activeDownloadItem: null,
       allowedNavigationHosts: new Set(),
+      allowAddressBarRedirects: false,
       lastError: null,
       observations: new Map(),
       queue: Promise.resolve(),
@@ -564,24 +569,42 @@ function createDesktopBrowserHost(options) {
     }
   }
 
-  async function navigate(entry, rawUrl, waitOptions) {
+  async function navigate(
+    entry,
+    rawUrl,
+    waitOptions,
+    { allowAddressBarRedirects = false } = {},
+  ) {
     const targetUrl = normalizeUrl(rawUrl);
     entry.allowedNavigationHosts.add(new URL(targetUrl).hostname.toLowerCase());
     entry.lastError = null;
     const webContents = entry.view.webContents;
-    const load = webContents.loadURL(targetUrl);
-    await Promise.race([load, timeoutAfter(MAX_WAIT_MS, "Navigation")]);
-    if (waitOptions) await waitFor(entry, {}, waitOptions);
-    return browserOutput(
-      webContents,
-      "navigate",
-      [
-        jsonContent({
-          url: webContents.getURL(),
-          title: webContents.getTitle(),
-        }),
-      ],
-      { requested_url: targetUrl },
+    const previousAllowAddressBarRedirects = entry.allowAddressBarRedirects;
+    entry.allowAddressBarRedirects = allowAddressBarRedirects;
+    try {
+      const load = webContents.loadURL(targetUrl);
+      await Promise.race([load, timeoutAfter(MAX_WAIT_MS, "Navigation")]);
+      if (waitOptions) await waitFor(entry, {}, waitOptions);
+      return browserOutput(
+        webContents,
+        "navigate",
+        [
+          jsonContent({
+            url: webContents.getURL(),
+            title: webContents.getTitle(),
+          }),
+        ],
+        { requested_url: targetUrl },
+      );
+    } finally {
+      entry.allowAddressBarRedirects = previousAllowAddressBarRedirects;
+    }
+  }
+
+  function navigateFromAddressBar(sessionId, url) {
+    const entry = requireSession(sessionId);
+    return runExclusive(entry, () =>
+      navigate(entry, url, null, { allowAddressBarRedirects: true }),
     );
   }
 
@@ -1487,6 +1510,9 @@ function createDesktopBrowserHost(options) {
       const entry = requireSession(sessionId);
       return runExclusive(entry, () => navigate(entry, url, null));
     });
+    handle(IPC_CHANNELS.navigateFromAddressBar, (sessionId, url) =>
+      navigateFromAddressBar(sessionId, url),
+    );
     handle(IPC_CHANNELS.back, async (sessionId) => {
       const entry = requireSession(sessionId);
       return runExclusive(entry, async () => {
@@ -1608,6 +1634,7 @@ function createDesktopBrowserHost(options) {
     attachWindow,
     close,
     executeAction,
+    navigateFromAddressBar,
     registerIpc,
     startBroker,
   };

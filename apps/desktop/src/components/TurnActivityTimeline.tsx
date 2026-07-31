@@ -43,6 +43,15 @@ import {
   type ToolActivityGroup as ToolGroupKey,
   type ToolActivityKind,
 } from "../toolActivity";
+import {
+  rendererTraceTime,
+  type ConversationRenderTrace,
+} from "../conversationRenderTrace";
+import { recordConversationRenderTrace } from "../platform";
+import {
+  activeTurnStatusLabel,
+  type ActiveTurnPhase,
+} from "../turnActivityStatus";
 import { MarkdownContent } from "./MarkdownContent";
 import { ToolActivityCard, toolActivityIcon } from "./ToolActivityCard";
 import "./TurnActivityTimeline.css";
@@ -161,7 +170,13 @@ export function TurnActivityTimeline({
   formatError?(message: string): string;
   onOpenMarkdownLink?(href: string): void;
 }) {
-  const entries = useMemo(() => buildActivityEntries(events), [events]);
+  const entries = useMemo(
+    () =>
+      buildActivityEntries(events).filter(
+        (entry) => entry.kind !== "reasoning",
+      ),
+    [events],
+  );
   const state = activityState(events, isActive);
   const [expanded, setExpanded] = useState(isActive);
   const bodyId = useId();
@@ -171,6 +186,15 @@ export function TurnActivityTimeline({
     isActive || (state === "running" && hasRunningEntry),
   );
   const turnTiming = formatTurnTiming(events, isActive, now, mountedAt);
+  const statusLabel = isActive
+    ? activeTurnStatusLabel(events)
+    : activityStateLabel(state);
+  const traceEvent = events.at(-1);
+  useStatusPaintTrace(
+    isActive ? statusLabel : null,
+    traceEvent?.threadId,
+    traceEvent?.turnId,
+  );
 
   useEffect(() => {
     if (isActive || state === "error" || state === "waiting") {
@@ -209,8 +233,15 @@ export function TurnActivityTimeline({
         aria-controls={bodyId}
         onClick={() => setExpanded((current) => !current)}
       >
-        <span className="turn-activity-heading">
-          <strong>{activityStateLabel(state, isActive)}</strong>
+        <span
+          className="turn-activity-heading"
+          aria-live={isActive ? "polite" : undefined}
+        >
+          <strong
+            className={isActive ? "conversation-status-shimmer" : undefined}
+          >
+            {statusLabel}
+          </strong>
           {turnTiming && <small>{turnTiming}</small>}
         </span>
         <span className="turn-activity-chevron" aria-hidden="true">
@@ -224,18 +255,14 @@ export function TurnActivityTimeline({
           id={bodyId}
           aria-live={isActive ? "polite" : undefined}
         >
-          {entries.length === 0 && isActive && (
-            <div className="turn-activity-pending" role="status">
-              <ActivityFlow />
-              <span>正在连接模型并准备执行步骤</span>
-            </div>
-          )}
           {entries.map((entry) => (
             <ActivityEntryView
               key={activityEntryKey(entry)}
               entry={entry}
               isActive={isActive}
               now={now}
+              traceThreadId={traceEvent?.threadId}
+              traceTurnId={traceEvent?.turnId}
               formatError={formatError}
               onOpenMarkdownLink={onOpenMarkdownLink}
             />
@@ -248,6 +275,32 @@ export function TurnActivityTimeline({
           )}
         </div>
       )}
+    </section>
+  );
+}
+
+export function PendingTurnStatus({
+  phase,
+  threadId,
+  turnId,
+}: {
+  phase: ActiveTurnPhase;
+  threadId: string;
+  turnId?: string | null;
+}) {
+  const label = phase === "thinking" ? "正在思考" : "处理中";
+  useStatusPaintTrace(label, threadId, turnId);
+  return (
+    <section className="turn-activity" data-state="running">
+      <div
+        className="turn-activity-header is-static"
+        role="status"
+        aria-live="polite"
+      >
+        <span className="turn-activity-heading">
+          <strong className="conversation-status-shimmer">{label}</strong>
+        </span>
+      </div>
     </section>
   );
 }
@@ -935,12 +988,16 @@ function ActivityEntryView({
   entry,
   isActive,
   now,
+  traceThreadId,
+  traceTurnId,
   formatError,
   onOpenMarkdownLink,
 }: {
   entry: ActivityEntry;
   isActive: boolean;
   now: number;
+  traceThreadId?: string;
+  traceTurnId?: string | null;
   formatError(message: string): string;
   onOpenMarkdownLink?(href: string): void;
 }) {
@@ -958,22 +1015,16 @@ function ActivityEntryView({
     return <FileActivityGroup files={entry.files} defaultExpanded={isActive} />;
   }
   if (entry.kind === "reasoning") {
-    return (
-      <NarrativeActivity
-        kind="reasoning"
-        onOpenMarkdownLink={onOpenMarkdownLink}
-        streaming={isActive}
-        text={entry.text}
-      />
-    );
+    return null;
   }
   if (entry.kind === "commentary") {
     return (
       <NarrativeActivity
-        kind="commentary"
         onOpenMarkdownLink={onOpenMarkdownLink}
         streaming={isActive}
         text={entry.text}
+        traceThreadId={traceThreadId}
+        traceTurnId={traceTurnId}
       />
     );
   }
@@ -1232,25 +1283,36 @@ function FileChangeStatsView({ change }: { change: FileChangeSummary }) {
 }
 
 function NarrativeActivity({
-  kind,
   onOpenMarkdownLink,
   streaming,
   text,
+  traceThreadId,
+  traceTurnId,
 }: {
-  kind: "reasoning" | "commentary";
   onOpenMarkdownLink?(href: string): void;
   streaming: boolean;
   text: string;
+  traceThreadId?: string;
+  traceTurnId?: string | null;
 }) {
   return (
     <div
       className="activity-narrative"
-      data-kind={kind}
-      aria-label={kind === "reasoning" ? "思考过程" : "处理说明"}
+      data-kind="commentary"
+      aria-label="处理说明"
     >
       <MarkdownContent
         className="activity-narrative-markdown"
         onOpenLink={onOpenMarkdownLink}
+        renderTrace={
+          traceThreadId
+            ? {
+                channel: "commentary",
+                threadId: traceThreadId,
+                turnId: traceTurnId,
+              }
+            : undefined
+        }
         streaming={streaming}
         text={redactText(text)}
       />
@@ -1471,12 +1533,45 @@ function ActivityFlow({ compact = false }: { compact?: boolean }) {
   );
 }
 
-function activityStateLabel(state: ActivityState, isActive: boolean) {
-  if (isActive) return "处理中";
+function activityStateLabel(state: ActivityState) {
   if (state === "error") return "执行失败";
   if (state === "cancelled") return "已取消";
   if (state === "waiting") return "等待继续";
   return "已处理";
+}
+
+function useStatusPaintTrace(
+  label: string | null,
+  threadId: string | undefined,
+  turnId: string | null | undefined,
+) {
+  const paintedLabelRef = useRef("");
+
+  useEffect(() => {
+    if (!label || !threadId || paintedLabelRef.current === label) return;
+    let timer: number | null = null;
+    const frame = window.requestAnimationFrame(() => {
+      timer = window.setTimeout(() => {
+        paintedLabelRef.current = label;
+        const trace: ConversationRenderTrace = {
+          stage: "painted",
+          channel: "status",
+          threadId,
+          turnId,
+          ...rendererTraceTime(),
+          change: "replace",
+          text: label,
+          textLength: label.length,
+          visible: true,
+        };
+        recordConversationRenderTrace(trace);
+      }, 0);
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [label, threadId, turnId]);
 }
 
 function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {

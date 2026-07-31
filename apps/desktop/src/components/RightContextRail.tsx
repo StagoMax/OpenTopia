@@ -7,7 +7,6 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
-  File,
   FileCode2,
   FileImage,
   FileText,
@@ -54,7 +53,6 @@ export type RightContextRailProps = {
   onOpenFiles(): void;
   onOpenEnvironment(): void;
   onAddSource(): void;
-  onSpawnSubagent(name: string, input: string): Promise<void>;
   onCancelSubagent(runId: string): void;
   onGitChanged(): void;
 };
@@ -113,15 +111,9 @@ export function RightContextRail({
   onOpenFiles,
   onOpenEnvironment,
   onAddSource,
-  onSpawnSubagent,
   onCancelSubagent,
   onGitChanged,
 }: RightContextRailProps) {
-  const [subagentDialogOpen, setSubagentDialogOpen] = useState(false);
-  const [subagentName, setSubagentName] = useState("worker");
-  const [subagentInput, setSubagentInput] = useState("");
-  const [isSpawningSubagent, setIsSpawningSubagent] = useState(false);
-  const [subagentError, setSubagentError] = useState<string | null>(null);
   const [gitStatus, setGitStatus] = useState<GitStatusSummary | null>(null);
   const [gitRepositoryState, setGitRepositoryState] =
     useState<GitRepositoryState>("unknown");
@@ -224,40 +216,33 @@ export function RightContextRail({
           </button>
         }
       >
-        <RailRow
-          icon={FileCode2}
-          label="变更"
-          title={
-            workspaceDiff
-              ? `${workspaceDiff.files.length} 个变更文件`
-              : "暂无变更数据"
-          }
-          onClick={onOpenDiff}
-          value={
-            workspaceDiff ? (
+        {workspaceDiff && (
+          <RailRow
+            icon={FileCode2}
+            label="变更"
+            title={`${workspaceDiff.files.length} 个变更文件`}
+            onClick={onOpenDiff}
+            value={
               <span className="right-context-rail__diff-stats">
                 <span className="is-addition">+{diffStats.additions}</span>
                 <span className="is-deletion">-{diffStats.deletions}</span>
               </span>
-            ) : (
-              <StatusText muted>暂无</StatusText>
-            )
-          }
-        />
-        <RailRow
-          icon={Laptop}
-          label="本地"
-          title={workspaceRoot ?? "暂无工作区"}
-          onClick={onOpenFiles}
-          value={
-            <span className="right-context-rail__inline-value">
-              <StatusText muted={!workspaceRoot}>
-                {workspaceRoot ? "" : "暂无"}
-              </StatusText>
-              {workspaceRoot && <ChevronDown size={13} aria-hidden="true" />}
-            </span>
-          }
-        />
+            }
+          />
+        )}
+        {workspaceRoot && (
+          <RailRow
+            icon={Laptop}
+            label="本地"
+            title={workspaceRoot}
+            onClick={onOpenFiles}
+            value={
+              <span className="right-context-rail__inline-value">
+                <ChevronDown size={13} aria-hidden="true" />
+              </span>
+            }
+          />
+        )}
         {gitAvailable && (
           <>
             <RailRow
@@ -352,22 +337,9 @@ export function RightContextRail({
           document.body,
         )}
 
-      <RailSection
-        title={`子智能体 ${subagents.length}`}
-        action={
-          <button
-            className="right-context-rail__header-action"
-            type="button"
-            title="启动子智能体"
-            aria-label="启动子智能体"
-            onClick={() => setSubagentDialogOpen(true)}
-          >
-            <Plus size={14} aria-hidden="true" />
-          </button>
-        }
-      >
-        {subagents.length ? (
-          subagents.slice(0, 4).map((agent) => (
+      {subagents.length > 0 && (
+        <RailSection title={`子智能体 ${subagents.length}`}>
+          {subagents.slice(0, 4).map((agent) => (
             <RailRow
               key={agent.id}
               icon={Bot}
@@ -387,96 +359,13 @@ export function RightContextRail({
                   : undefined
               }
             />
-          ))
-        ) : (
-          <EmptyRow icon={Bot} label="暂无" />
-        )}
-      </RailSection>
-      {subagentDialogOpen &&
-        createPortal(
-          <div
-            className="right-context-rail__dialog-backdrop"
-            role="presentation"
-            onClick={() => setSubagentDialogOpen(false)}
-          >
-            <form
-              className="right-context-rail__dialog"
-              role="dialog"
-              aria-modal="true"
-              aria-label="启动子智能体"
-              onClick={(event) => event.stopPropagation()}
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (
-                  !subagentName.trim() ||
-                  !subagentInput.trim() ||
-                  isSpawningSubagent
-                )
-                  return;
-                setIsSpawningSubagent(true);
-                setSubagentError(null);
-                void onSpawnSubagent(subagentName.trim(), subagentInput.trim())
-                  .then(() => {
-                    setSubagentDialogOpen(false);
-                    setSubagentInput("");
-                  })
-                  .catch((error) =>
-                    setSubagentError(
-                      error instanceof Error ? error.message : String(error),
-                    ),
-                  )
-                  .finally(() => setIsSpawningSubagent(false));
-              }}
-            >
-              <header>
-                <strong>启动子智能体</strong>
-                <span>继承当前工作区、沙箱、权限和模型</span>
-              </header>
-              <label>
-                名称
-                <input
-                  value={subagentName}
-                  maxLength={64}
-                  pattern="[a-z0-9_]+"
-                  title="使用小写字母、数字和下划线"
-                  onChange={(event) => setSubagentName(event.target.value)}
-                />
-              </label>
-              <label>
-                任务
-                <textarea
-                  value={subagentInput}
-                  rows={5}
-                  onChange={(event) => setSubagentInput(event.target.value)}
-                />
-              </label>
-              {subagentError && <p>{subagentError}</p>}
-              <footer>
-                <button
-                  type="button"
-                  onClick={() => setSubagentDialogOpen(false)}
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  disabled={
-                    !subagentName.trim() ||
-                    !subagentInput.trim() ||
-                    isSpawningSubagent
-                  }
-                >
-                  {isSpawningSubagent ? "启动中..." : "启动"}
-                </button>
-              </footer>
-            </form>
-          </div>,
-          document.body,
-        )}
+          ))}
+        </RailSection>
+      )}
 
-      <RailSection title={`后台进程 ${activeProcesses.length}`}>
-        {activeProcesses.length ? (
-          activeProcesses.map((process) => (
+      {activeProcesses.length > 0 && (
+        <RailSection title={`后台进程 ${activeProcesses.length}`}>
+          {activeProcesses.map((process) => (
             <RailRow
               key={process.id}
               icon={process.kind === "session" ? SquareTerminal : CircleDot}
@@ -485,28 +374,26 @@ export function RightContextRail({
               onClick={onOpenTerminal}
               value={<StatusText active>运行中</StatusText>}
             />
-          ))
-        ) : (
-          <EmptyRow icon={SquareTerminal} label="暂无" />
-        )}
-      </RailSection>
+          ))}
+        </RailSection>
+      )}
 
-      <RailSection
-        title="来源"
-        action={
-          <button
-            className="right-context-rail__header-action"
-            type="button"
-            title="添加来源"
-            aria-label="添加来源"
-            onClick={onAddSource}
-          >
-            <Plus size={14} aria-hidden="true" />
-          </button>
-        }
-      >
-        {sources.length ? (
-          sources.map((source) => (
+      {sources.length > 0 && (
+        <RailSection
+          title="来源"
+          action={
+            <button
+              className="right-context-rail__header-action"
+              type="button"
+              title="添加来源"
+              aria-label="添加来源"
+              onClick={onAddSource}
+            >
+              <Plus size={14} aria-hidden="true" />
+            </button>
+          }
+        >
+          {sources.map((source) => (
             <RailRow
               key={source.id}
               icon={source.icon}
@@ -515,25 +402,18 @@ export function RightContextRail({
               onClick={onOpenFiles}
               className="is-source"
             />
-          ))
-        ) : (
-          <EmptyRow icon={File} label="暂无" />
-        )}
-        <button
-          className="right-context-rail__view-all"
-          type="button"
-          disabled={allSources.length === 0}
-          title={
-            allSources.length
-              ? `查看全部 ${allSources.length} 个来源`
-              : "暂无来源"
-          }
-          onClick={onOpenFiles}
-        >
-          <span>查看全部</span>
-          <ChevronRight size={13} aria-hidden="true" />
-        </button>
-      </RailSection>
+          ))}
+          <button
+            className="right-context-rail__view-all"
+            type="button"
+            title={`查看全部 ${allSources.length} 个来源`}
+            onClick={onOpenFiles}
+          >
+            <span>查看全部</span>
+            <ChevronRight size={13} aria-hidden="true" />
+          </button>
+        </RailSection>
+      )}
     </div>
   );
 }
@@ -820,10 +700,6 @@ function StatusText({
       {children}
     </span>
   );
-}
-
-function EmptyRow({ icon, label }: { icon: LucideIcon; label: string }) {
-  return <RailRow icon={icon} label={label} className="is-empty" />;
 }
 
 function countDiffLines(diff: string): {

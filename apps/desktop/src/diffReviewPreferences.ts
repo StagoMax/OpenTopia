@@ -26,11 +26,11 @@ export type DiffReviewPreferences = {
 };
 
 export const defaultDiffReviewPreferences: DiffReviewPreferences = {
-  view: "split",
+  view: "unified",
   wrapLines: false,
   loadFullFile: false,
   richPreview: false,
-  wordDiff: true,
+  wordDiff: false,
   hideWhitespace: false,
   showFilePanel: false,
 };

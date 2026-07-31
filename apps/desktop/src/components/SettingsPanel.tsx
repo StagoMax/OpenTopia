@@ -34,7 +34,7 @@ import {
   classifyModelFamily,
 } from "../modelCatalog";
 import { ModelInputDropdown } from "./ModelInputDropdown";
-import { Button, SegmentedControl, Select, Switch } from "./ui";
+import { Badge, Button, Panel, SegmentedControl, Select, Switch } from "./ui";
 import { SettingsGroup, SettingsPage, SettingsRow } from "./SettingsLayout";
 import { AppearanceSettingsView } from "./AppearanceSettings";
 import { PersonalizationSettingsView } from "./PersonalizationSettings";
@@ -56,10 +56,13 @@ import type { TaskNotificationPreferences } from "../taskNotifications";
 import type {
   AgentRuntimeSettings,
   AppSettings,
+  CodexAccountStatus,
+  CodexLoginStart,
   PlatformInfo,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
+  ProviderModelSyncResult,
   ProviderSecretOutcome,
   ProviderSettings,
   SecretSources,
@@ -94,6 +97,9 @@ type SettingsPanelProps = {
   platform: PlatformInfo | null;
   settings: AppSettings | null;
   providerHealth: ProviderHealth[];
+  codexAccount: CodexAccountStatus | null;
+  codexAccountLoading: boolean;
+  codexAccountError: string | null;
   providerTest: {
     providerId: string;
     status: "testing" | "complete";
@@ -113,13 +119,19 @@ type SettingsPanelProps = {
   onSave(input: SettingsSaveInput): Promise<boolean>;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
   // Pulls the connection's model list so families can be picked from what the
-  // endpoint actually serves. Resolves to the ids, or null when it failed.
-  onSyncProviderModels(providerId: string): Promise<string[] | null>;
+  // endpoint actually serves. Includes any context limits it advertises.
+  onSyncProviderModels(
+    providerId: string,
+  ): Promise<ProviderModelSyncResult | null>;
   onStoreProviderApiKey(
     providerId: string,
     value: string,
   ): Promise<ProviderSecretOutcome>;
   onDeleteProviderApiKey(providerId: string): Promise<ProviderSecretOutcome>;
+  onRefreshCodexAccount(): void;
+  onStartCodexLogin(): Promise<CodexLoginStart | null>;
+  onCancelCodexLogin(): Promise<void>;
+  onLogoutCodexAccount(): Promise<void>;
   onNotificationPreferencesChange(
     preferences: TaskNotificationPreferences,
   ): void;
@@ -211,6 +223,9 @@ export function SettingsPanel({
   platform,
   settings,
   providerHealth,
+  codexAccount,
+  codexAccountLoading,
+  codexAccountError,
   providerTest,
   secretSources,
   notificationPreferences,
@@ -228,6 +243,10 @@ export function SettingsPanel({
   onSyncProviderModels,
   onStoreProviderApiKey,
   onDeleteProviderApiKey,
+  onRefreshCodexAccount,
+  onStartCodexLogin,
+  onCancelCodexLogin,
+  onLogoutCodexAccount,
   onNotificationPreferencesChange,
   onTestNotification,
   onOpenLogs,
@@ -365,7 +384,15 @@ export function SettingsPanel({
   ) {
     setProviders((current) =>
       current.map((provider) =>
-        provider.id === id ? { ...provider, [field]: value } : provider,
+        provider.id === id
+          ? {
+              ...provider,
+              [field]: value,
+              ...(["baseUrl", "model", "kind"].includes(field as string)
+                ? { openaiCompatibility: null }
+                : {}),
+            }
+          : provider,
       ),
     );
   }
@@ -482,6 +509,32 @@ export function SettingsPanel({
         setStatusMessage("保存设置失败，请检查连接后重试。");
         return;
       }
+      const providerToDiscover = nextProviders.find(
+        (provider) => provider.id === editingProviderId,
+      );
+      let discovery: ProviderModelSyncResult | null = null;
+      if (
+        providerToDiscover &&
+        providerToDiscover.apiKeyConfigured &&
+        providerToDiscover.kind !== "mock" &&
+        providerToDiscover.kind !== "codex_app_server"
+      ) {
+        const synced = await onSyncProviderModels(providerToDiscover.id);
+        discovery = synced;
+        if (synced) {
+          nextProviders = nextProviders.map((provider) =>
+            provider.id === providerToDiscover.id
+              ? {
+                  ...provider,
+                  syncedModels: synced.models,
+                  modelContextWindows: synced.modelContextWindows,
+                  modelsSyncedAt: synced.syncedAt,
+                }
+              : provider,
+          );
+          setProviders(nextProviders);
+        }
+      }
       setPendingApiKeys({});
       baselineRef.current = settingsSnapshot(
         nextProviders,
@@ -493,7 +546,9 @@ export function SettingsPanel({
       setStatusMessage(
         backendWarnings.length > 0
           ? `设置已保存，密钥也已写入系统密钥库；但本地后端未能重启：${backendWarnings[0]} 请重启应用后再发起对话。`
-          : "设置已保存。",
+          : discovery
+            ? `设置已保存，已同步 ${discovery.models.length} 个模型的能力信息。`
+            : "设置已保存。如果服务端不提供 /models，可手动同步模型列表。",
       );
     } finally {
       setIsApplyingSave(false);
@@ -634,6 +689,9 @@ export function SettingsPanel({
                 editingProvider={editingProvider}
                 activeProviderId={activeProviderId}
                 providerHealth={providerHealth}
+                codexAccount={codexAccount}
+                codexAccountLoading={codexAccountLoading}
+                codexAccountError={codexAccountError}
                 providerTest={providerTest}
                 secretSources={secretSources}
                 pendingApiKey={
@@ -680,6 +738,10 @@ export function SettingsPanel({
                 }}
                 onTestProvider={onTestProvider}
                 onSyncProviderModels={onSyncProviderModels}
+                onRefreshCodexAccount={onRefreshCodexAccount}
+                onStartCodexLogin={onStartCodexLogin}
+                onCancelCodexLogin={onCancelCodexLogin}
+                onLogoutCodexAccount={onLogoutCodexAccount}
               />
             ) : null}
             {activeTab === "permissions" ? (
@@ -1084,6 +1146,9 @@ function ProviderSettingsView({
   editingProvider,
   activeProviderId,
   providerHealth,
+  codexAccount,
+  codexAccountLoading,
+  codexAccountError,
   providerTest,
   secretSources,
   pendingApiKey,
@@ -1100,12 +1165,19 @@ function ProviderSettingsView({
   onDeleteProviderApiKey,
   onTestProvider,
   onSyncProviderModels,
+  onRefreshCodexAccount,
+  onStartCodexLogin,
+  onCancelCodexLogin,
+  onLogoutCodexAccount,
 }: {
   platform: PlatformInfo | null;
   providers: ProviderSettings[];
   editingProvider: ProviderSettings | null;
   activeProviderId: string;
   providerHealth: ProviderHealth[];
+  codexAccount: CodexAccountStatus | null;
+  codexAccountLoading: boolean;
+  codexAccountError: string | null;
   providerTest: SettingsPanelProps["providerTest"];
   secretSources: SecretSources | null;
   pendingApiKey: string;
@@ -1125,7 +1197,13 @@ function ProviderSettingsView({
   onToggleApiKeyVisibility(): void;
   onDeleteProviderApiKey(providerId: string): Promise<void>;
   onTestProvider(providerId: string, providers: ProviderSettings[]): void;
-  onSyncProviderModels(providerId: string): Promise<string[] | null>;
+  onSyncProviderModels(
+    providerId: string,
+  ): Promise<ProviderModelSyncResult | null>;
+  onRefreshCodexAccount(): void;
+  onStartCodexLogin(): Promise<CodexLoginStart | null>;
+  onCancelCodexLogin(): Promise<void>;
+  onLogoutCodexAccount(): Promise<void>;
 }) {
   const usesCodexAppServer = editingProvider?.kind === "codex_app_server";
   const [manualModelProviderId, setManualModelProviderId] = useState<
@@ -1152,6 +1230,12 @@ function ProviderSettingsView({
         editingProvider.reasoningEffort,
       )
     : null;
+  const reportedContextWindow = editingProvider
+    ? editingProvider.modelContextWindows?.[editingProvider.model.trim()]
+    : undefined;
+  const providerProtocolHint = editingProvider
+    ? providerProtocolDescription(editingProvider.kind)
+    : "";
   const modelSourceUrl =
     selectedModelPreset?.sourceUrl ?? reasoningCapability?.sourceUrl ?? null;
   const modelDescription = selectedModelPreset
@@ -1179,34 +1263,45 @@ function ProviderSettingsView({
     if (!editingProvider) return;
     setModelSyncing(true);
     try {
-      const ids = await onSyncProviderModels(editingProvider.id);
-      if (ids && ids.length > 0) {
-        onUpdateProvider(editingProvider.id, "syncedModels", ids);
+      const result = await onSyncProviderModels(editingProvider.id);
+      if (result) {
+        onUpdateProvider(editingProvider.id, "syncedModels", result.models);
+        onUpdateProvider(
+          editingProvider.id,
+          "modelContextWindows",
+          result.modelContextWindows,
+        );
       }
     } finally {
       setModelSyncing(false);
     }
   }
 
-  function updateProviderKind(kind: ProviderKind) {
+  function updateProviderKind(kind: ProviderKind | "openai") {
     if (!editingProvider) return;
+    const resolvedKind: ProviderKind =
+      kind === "openai"
+        ? isOpenAiProviderKind(editingProvider.kind)
+          ? editingProvider.kind
+          : "openai_compatible"
+        : kind;
     const model =
-      kind === "codex_app_server"
+      resolvedKind === "codex_app_server"
         ? ""
         : editingProvider.model.trim() || "gpt-4.1-mini";
-    onUpdateProvider(editingProvider.id, "kind", kind);
+    onUpdateProvider(editingProvider.id, "kind", resolvedKind);
     if (model !== editingProvider.model) {
       onUpdateProvider(editingProvider.id, "model", model);
     }
     const reasoningEffort = normalizeReasoningEffortForModel(
-      kind,
+      resolvedKind,
       model,
       editingProvider.reasoningEffort,
     );
     if (reasoningEffort !== (editingProvider.reasoningEffort ?? null)) {
       onUpdateProvider(editingProvider.id, "reasoningEffort", reasoningEffort);
     }
-    if (kind === "codex_app_server") setManualModelProviderId(null);
+    if (resolvedKind === "codex_app_server") setManualModelProviderId(null);
   }
 
   return (
@@ -1319,16 +1414,15 @@ function ProviderSettingsView({
               <label>
                 <span>供应商类型</span>
                 <select
-                  value={editingProvider.kind}
+                  value={providerTypeSelection(editingProvider.kind)}
                   onChange={(event) =>
-                    updateProviderKind(event.target.value as ProviderKind)
+                    updateProviderKind(
+                      event.target.value as ProviderKind | "openai",
+                    )
                   }
                 >
-                  <option value="openai_compatible">
-                    OpenAI Chat Completions (compatible)
-                  </option>
-                  <option value="openai_responses">
-                    OpenAI Responses (native)
+                  <option value="openai">
+                    OpenAI Compatible（自动识别）
                   </option>
                   <option value="anthropic">Anthropic Messages</option>
                   <option value="codex_app_server">
@@ -1336,6 +1430,7 @@ function ProviderSettingsView({
                   </option>
                   <option value="mock">Mock</option>
                 </select>
+                <small>{providerProtocolHint}</small>
               </label>
               {!usesCodexAppServer ? (
                 <div className="settings-field-wide">
@@ -1355,7 +1450,7 @@ function ProviderSettingsView({
                       <button
                         type="button"
                         className="settings-source-link"
-                        title={`OpenAI 官方资料，${OPENAI_MODEL_CATALOG_VERIFIED_AT} 核对`}
+                        title={`官方资料，${OPENAI_MODEL_CATALOG_VERIFIED_AT} 核对`}
                         onClick={() => void openExternal(modelSourceUrl)}
                       >
                         官方资料
@@ -1368,8 +1463,16 @@ function ProviderSettingsView({
               {usesCodexAppServer ? (
                 <div
                   className="settings-field-wide settings-provider-local-note"
-                  role="status"
                 >
+                  <CodexAccountSettings
+                    account={codexAccount}
+                    loading={codexAccountLoading}
+                    error={codexAccountError}
+                    onRefresh={onRefreshCodexAccount}
+                    onStartLogin={onStartCodexLogin}
+                    onCancelLogin={onCancelCodexLogin}
+                    onLogout={onLogoutCodexAccount}
+                  />
                   使用本机已安装的 Codex 及其模型配置处理本地附件；不需要 Base
                   URL、API 密钥、模型名或图片服务器。
                 </div>
@@ -1510,29 +1613,50 @@ function ProviderSettingsView({
                       }
                     />
                   </label>
-                  <label>
-                    <span>上下文窗口</span>
-                    <input
-                      type="number"
-                      min="4096"
-                      step="1024"
-                      value={editingProvider.contextWindowTokens ?? ""}
-                      placeholder="自动识别"
-                      title="留空时按模型能力自动识别，未知模型使用 128K 保守默认"
-                      onChange={(event) =>
-                        onUpdateProvider(
-                          editingProvider.id,
-                          "contextWindowTokens",
-                          event.target.value
-                            ? Number(event.target.value)
-                            : null,
-                        )
-                      }
-                    />
-                    <small>
-                      留空则自动使用已知模型上限；未知模型使用 128K 保守默认。
-                    </small>
-                  </label>
+                  <div className="settings-field-wide">
+                    <label>
+                      <span>上下文窗口覆盖值</span>
+                      <input
+                        type="number"
+                        min="4096"
+                        step="1024"
+                        value={editingProvider.contextWindowTokens ?? ""}
+                        placeholder="自动识别"
+                        title="仅在特殊网关或套餐需要时手动填写；留空则自动使用 API 报告、内置表或 128K 兜底"
+                        onChange={(event) =>
+                          onUpdateProvider(
+                            editingProvider.id,
+                            "contextWindowTokens",
+                            event.target.value
+                              ? Number(event.target.value)
+                              : null,
+                          )
+                        }
+                      />
+                      <small role="status">
+                        {editingProvider.contextWindowTokens !== null
+                          ? `正在使用手动覆盖：${editingProvider.contextWindowTokens.toLocaleString()} tokens。它会压过 API 探测与内置模型表。`
+                          : reportedContextWindow
+                            ? `API /models 已报告此模型为 ${reportedContextWindow.toLocaleString()} tokens，将作为上下文上限。`
+                            : "未从 API 获得此模型的上限；会依次使用内置模型表、未知模型 128K 兜底。"}
+                      </small>
+                    </label>
+                    {editingProvider.contextWindowTokens !== null ? (
+                      <Button
+                        size="compact"
+                        variant="quiet"
+                        onClick={() =>
+                          onUpdateProvider(
+                            editingProvider.id,
+                            "contextWindowTokens",
+                            null,
+                          )
+                        }
+                      >
+                        改为自动识别
+                      </Button>
+                    ) : null}
+                  </div>
                   {reasoningCapability?.status === "unsupported" ? (
                     <div
                       className="settings-field-wide settings-reasoning-unavailable"
@@ -1719,6 +1843,11 @@ function ProviderSettingsView({
             {providerTest?.providerId === editingProvider.id &&
             providerTest.status === "complete" ? (
               <ProviderTestResult result={providerTest.result} />
+            ) : editingProvider.openaiCompatibility ? (
+              <OpenAiCompatibilityDetails
+                report={editingProvider.openaiCompatibility}
+                stored
+              />
             ) : null}
           </div>
         ) : (
@@ -1882,6 +2011,137 @@ function PermissionSettings({
         ) : null}
       </SettingsGroup>
     </SettingsPage>
+  );
+}
+
+function CodexAccountSettings({
+  account,
+  loading,
+  error,
+  onRefresh,
+  onStartLogin,
+  onCancelLogin,
+  onLogout,
+}: {
+  account: CodexAccountStatus | null;
+  loading: boolean;
+  error: string | null;
+  onRefresh(): void;
+  onStartLogin(): Promise<CodexLoginStart | null>;
+  onCancelLogin(): Promise<void>;
+  onLogout(): Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const loginUrl = account?.verificationUrl ?? account?.authUrl ?? null;
+
+  async function startLogin() {
+    setBusy(true);
+    try {
+      const login = await onStartLogin();
+      const url = login?.verificationUrl ?? login?.authUrl;
+      if (url) void openExternal(url);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelLogin() {
+    setBusy(true);
+    try {
+      await onCancelLogin();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function logout() {
+    setBusy(true);
+    try {
+      await onLogout();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Panel
+      className="settings-codex-account"
+      title="ChatGPT / Codex 账号"
+      actions={
+        <Button
+          size="compact"
+          variant="quiet"
+          disabled={loading || busy}
+          onClick={onRefresh}
+        >
+          刷新
+        </Button>
+      }
+    >
+      <div className="settings-codex-account-status">
+        <Badge variant={account?.loggedIn ? "success" : "warning"}>
+          {account?.loggedIn ? "已登录" : "未登录"}
+        </Badge>
+        {account?.planType ? <span>{account.planType}</span> : null}
+        {account?.email ? <span>{account.email}</span> : null}
+        {account?.rateLimits ? <span>额度已同步</span> : null}
+        {account?.usage ? <span>用量已同步</span> : null}
+      </div>
+
+      {account?.loginPending ? (
+        <div className="settings-codex-login-instructions">
+          <strong>请完成 ChatGPT 登录</strong>
+          {account.userCode ? <code>{account.userCode}</code> : null}
+          {loginUrl ? (
+            <Button
+              size="compact"
+              variant="primary"
+              disabled={busy}
+              onClick={() => void openExternal(loginUrl)}
+            >
+              打开登录页面
+              <ExternalLink size={14} aria-hidden="true" />
+            </Button>
+          ) : null}
+          <Button
+            size="compact"
+            variant="quiet"
+            disabled={busy}
+            onClick={() => void cancelLogin()}
+          >
+            取消
+          </Button>
+        </div>
+      ) : account?.loggedIn ? (
+        <Button
+          size="compact"
+          variant="danger"
+          disabled={busy}
+          onClick={() => void logout()}
+        >
+          退出登录
+        </Button>
+      ) : (
+        <Button
+          size="compact"
+          variant="primary"
+          disabled={busy || loading}
+          onClick={() => void startLogin()}
+        >
+          登录 ChatGPT 账号
+        </Button>
+      )}
+
+      {error ? (
+        <p className="settings-codex-account-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+      <small className="settings-codex-account-hint">
+        登录后，Codex Provider 会使用该账号可用的 ChatGPT/Codex 额度；API
+        Key 模式仍使用 API 平台额度。
+      </small>
+    </Panel>
   );
 }
 
@@ -2179,9 +2439,98 @@ function ProviderTestResult({
       className={`settings-test-result ${success ? "success" : "error"}`}
       role="status"
     >
-      {success
-        ? `连接成功${result?.latencyMs ? ` · ${result.latencyMs} ms` : ""}`
-        : (result?.error ?? "连接失败，请检查地址、模型和密钥。")}
+      <div>
+        {success
+          ? `连接成功${result?.latencyMs ? ` · ${result.latencyMs} ms` : ""}`
+          : (result?.error ?? "连接失败，请检查地址、模型和密钥。")}
+      </div>
+      {result?.openaiCompatibility ? (
+        <OpenAiCompatibilityDetails report={result.openaiCompatibility} />
+      ) : null}
+    </div>
+  );
+}
+
+function OpenAiCompatibilityDetails({
+  report,
+  stored = false,
+}: {
+  report: NonNullable<ProviderSettings["openaiCompatibility"]>;
+  stored?: boolean;
+}) {
+  return (
+    <div
+      className={`settings-compatibility-report${stored ? " stored" : ""}`}
+      role={stored ? "status" : undefined}
+    >
+      <div className="settings-compatibility-heading">
+        {stored ? "已缓存的兼容性检测" : "兼容性检测结果"}
+        <span>{new Date(report.checkedAt).toLocaleString()}</span>
+      </div>
+      <div className="settings-compatibility-grid">
+        <CompatibilityItem
+          label="采用协议"
+          value={
+            report.selectedProtocol === "responses"
+              ? "Responses"
+              : "Chat Completions"
+          }
+          state="supported"
+        />
+        <CompatibilityItem
+          label="Chat Completions"
+          value={providerFeatureSupportLabel(report.chatCompletions)}
+          state={report.chatCompletions}
+        />
+        <CompatibilityItem
+          label="Chat function tools"
+          value={providerFeatureSupportLabel(report.chatFunctionTools)}
+          state={report.chatFunctionTools}
+        />
+        <CompatibilityItem
+          label="Responses"
+          value={providerFeatureSupportLabel(report.responses)}
+          state={report.responses}
+        />
+        <CompatibilityItem
+          label="Responses native tools"
+          value={providerFeatureSupportLabel(report.responsesNativeTools)}
+          state={report.responsesNativeTools}
+        />
+        <CompatibilityItem
+          label="developer 角色"
+          value={providerFeatureSupportLabel(report.developerMessages)}
+          state={report.developerMessages}
+        />
+      </div>
+      <div
+        className={`settings-compatibility-mode ${
+          report.messageCompatibility ? "compatibility" : "native"
+        }`}
+      >
+        {report.selectedProtocol === "responses"
+          ? "已选择 Responses 适配器；系统与开发者指令会通过 Responses 原生 instructions 发送。"
+          : report.messageCompatibility
+            ? "已启用兼容模式：运行时会直接合并 developer 指令并扁平化结构化工具历史，避免每轮先触发 400。"
+            : "使用原生 Chat 消息格式；若运行时首次遇到同类 400，会自动学习并缓存兼容模式。"}
+      </div>
+    </div>
+  );
+}
+
+function CompatibilityItem({
+  label,
+  value,
+  state,
+}: {
+  label: string;
+  value: string;
+  state: "supported" | "unsupported" | "unknown";
+}) {
+  return (
+    <div className="settings-compatibility-item">
+      <span>{label}</span>
+      <strong className={state}>{value}</strong>
     </div>
   );
 }
@@ -2210,6 +2559,7 @@ function createProviderSettings(
     responsesCompactionThresholdTokens: null,
     rolloutBudget: null,
     supportsVision: true,
+    openaiCompatibility: null,
     apiKeySource: "OPENTOPIA_API_KEY",
     apiKeyConfigured: false,
     healthStatus: null,
@@ -2279,9 +2629,37 @@ function parsePathList(value: string): string[] {
 function providerKindLabel(kind: ProviderKind): string {
   if (kind === "codex_app_server") return "Codex App Server";
   if (kind === "anthropic") return "Anthropic Messages";
-  if (kind === "openai_responses") return "OpenAI Responses";
-  if (kind === "openai_compatible") return "OpenAI Compatible";
+  if (isOpenAiProviderKind(kind)) return "OpenAI Compatible";
   return "Mock";
+}
+
+function providerProtocolDescription(kind: ProviderKind): string {
+  if (isOpenAiProviderKind(kind)) {
+    return "填写统一的 /v1 Base URL；连接测试会自动识别 Chat Completions、Responses 与消息格式兼容性。";
+  }
+  if (kind === "anthropic") {
+    return "Anthropic Messages：请求会发到 Base URL + /v1/messages，并使用 x-api-key 认证。";
+  }
+  if (kind === "codex_app_server") {
+    return "使用本机 Codex App Server，不需要 URL 或 API 密钥。";
+  }
+  return "仅用于本地模拟，不会调用远程 API。";
+}
+
+function isOpenAiProviderKind(kind: ProviderKind): boolean {
+  return kind === "openai_compatible" || kind === "openai_responses";
+}
+
+function providerTypeSelection(kind: ProviderKind): ProviderKind | "openai" {
+  return isOpenAiProviderKind(kind) ? "openai" : kind;
+}
+
+function providerFeatureSupportLabel(
+  support: "supported" | "unsupported" | "unknown",
+): string {
+  if (support === "supported") return "支持";
+  if (support === "unsupported") return "不支持";
+  return "未确认";
 }
 
 function providerStatusChips(

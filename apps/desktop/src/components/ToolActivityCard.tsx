@@ -78,7 +78,7 @@ export function ToolActivityCard({
         </span>
         <span
           className="tool-activity-title"
-          data-flow={streaming || undefined}
+          data-flow={running || undefined}
           title={view.detail ? `${view.title} · ${view.detail}` : view.title}
         >
           {view.title}

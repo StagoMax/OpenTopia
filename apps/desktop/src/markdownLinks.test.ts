@@ -84,7 +84,7 @@ test("blocks unsafe protocols and workspace traversal", () => {
 });
 
 test("uses adaptive streaming intervals for long markdown", () => {
-  assert.equal(markdownStreamInterval(1_000), 60);
-  assert.equal(markdownStreamInterval(16 * 1024), 120);
-  assert.equal(markdownStreamInterval(64 * 1024), 200);
+  assert.equal(markdownStreamInterval(1_000), 32);
+  assert.equal(markdownStreamInterval(16 * 1024), 64);
+  assert.equal(markdownStreamInterval(64 * 1024), 100);
 });

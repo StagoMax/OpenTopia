@@ -2125,6 +2125,15 @@ function registerIpc() {
     }
   });
 
+  ipcMain.on("logs:conversation-render-trace", (event, trace) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return;
+    if (!trace || typeof trace !== "object" || Array.isArray(trace)) return;
+    const stage = ["received", "committed", "painted"].includes(trace.stage)
+      ? trace.stage
+      : "unknown";
+    writeLog("info", `conversation.render.${stage}`, trace);
+  });
+
   ipcMain.handle("platform:open-external", async (_event, rawUrl) => {
     const url = new URL(rawUrl);
     if (!["http:", "https:", "mailto:"].includes(url.protocol)) {
@@ -2327,6 +2336,8 @@ function registerIpc() {
     return [];
   });
 }
+
+ensureLoggingInitialized();
 
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) {

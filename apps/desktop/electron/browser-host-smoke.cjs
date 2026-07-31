@@ -123,6 +123,25 @@ async function main() {
     if (!redirectBlocked)
       throw new Error("cross-host redirect was not blocked");
 
+    const addressBarSessionId = "00000000-0000-4000-8000-000000000002";
+    await executeAction("prepare address-bar navigation", {
+      sessionId: addressBarSessionId,
+      action: "navigate",
+      url,
+    });
+    const addressBarNavigation = await runStep(
+      "address-bar cross-host redirect",
+      () => host.navigateFromAddressBar(addressBarSessionId, `${url}redirect`),
+    );
+    const finalUrl = addressBarNavigation.contents.find(
+      (content) => content.type === "json",
+    )?.value?.url;
+    if (new URL(finalUrl).hostname !== "localhost") {
+      throw new Error(
+        "address-bar redirect did not reach its final destination",
+      );
+    }
+
     const broker = await runStep("start broker", () => host.startBroker());
     const unauthorized = await fetch(`${broker.url}/health`);
     const healthy = await fetch(`${broker.url}/health`, {
@@ -133,11 +152,16 @@ async function main() {
     }
 
     await executeAction("close session", { sessionId, action: "close" });
+    await executeAction("close address-bar session", {
+      sessionId: addressBarSessionId,
+      action: "close",
+    });
     process.stdout.write(
       `${JSON.stringify({
         snapshot: text.text.trim(),
         screenshotBytes: image.bytes.length,
         redirectBlocked,
+        addressBarRedirectAllowed: true,
         unauthorizedStatus: unauthorized.status,
         healthyStatus: healthy.status,
       })}\n`,

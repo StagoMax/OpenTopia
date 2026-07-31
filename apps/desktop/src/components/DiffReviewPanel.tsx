@@ -19,6 +19,7 @@ import {
   FileText,
   FoldVertical,
   Folder,
+  GitBranch,
   GitCommitHorizontal,
   Loader2,
   MoreHorizontal,
@@ -29,7 +30,12 @@ import {
   Search,
   UnfoldVertical,
 } from "lucide-react";
-import type { ChangedFile, ReviewFileRequest, WorkspaceDiff } from "../types";
+import type {
+  ChangedFile,
+  GitBranchInfo,
+  ReviewFileRequest,
+  WorkspaceDiff,
+} from "../types";
 import {
   buildDiffBlocks,
   buildDiffFileTree,
@@ -92,6 +98,8 @@ export type DiffReviewPanelProps = {
   /** Why this path cannot be restored, or null when it can. */
   revertBlockedReason(path: string): string | null;
   onGitAction(action: DiffReviewGitAction, message: string): Promise<string>;
+  onListGitBranches(): Promise<GitBranchInfo[]>;
+  onSwitchGitBranch(branch: string): Promise<void>;
 };
 
 const workspaceScopeId = "workspace";
@@ -110,6 +118,8 @@ type ContentState = {
   truncated?: boolean;
   error?: string;
 };
+
+type DiffSplitPane = "left" | "right";
 
 type TurnFilesState = {
   status: "loading" | "ready" | "error";
@@ -133,17 +143,15 @@ export function DiffReviewPanel({
   onRevertFile,
   revertBlockedReason,
   onGitAction,
+  onListGitBranches,
+  onSwitchGitBranch,
 }: DiffReviewPanelProps) {
-  const [preferences, setPreferences] = useState<DiffReviewPreferences>(
-    readDiffReviewPreferences,
-  );
-  const [scopeId, setScopeId] = useState<string>(
-    focusRequest
-      ? workspaceScopeId
-      : turnScopes[0]
-        ? `turn:${turnScopes[0].turnId}`
-        : workspaceScopeId,
-  );
+  const [preferences, setPreferences] = useState<DiffReviewPreferences>(() => ({
+    ...readDiffReviewPreferences(),
+    view: "unified",
+    wordDiff: false,
+  }));
+  const [scopeId, setScopeId] = useState<string>(workspaceScopeId);
   const [collapsedFiles, setCollapsedFiles] = useState<ReadonlySet<string>>(
     new Set(),
   );
@@ -155,6 +163,7 @@ export function DiffReviewPanel({
     {},
   );
   const [rowLimits, setRowLimits] = useState<Record<string, number>>({});
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [renderedPaths, setRenderedPaths] = useState<ReadonlySet<string>>(
     new Set(),
   );
@@ -195,9 +204,8 @@ export function DiffReviewPanel({
     scopes.at(-1) ??
     null;
 
-  // Until the reader picks a baseline, the panel follows the newest recorded
-  // turn — which is usually what "review my changes" means, and which is not
-  // known yet when the panel mounts ahead of the event stream.
+  // The review entry point is always the current workspace, never a single
+  // agent turn. Individual files are selected from that complete change set.
   const scopePickedRef = useRef(false);
   const selectScope = useCallback((id: string) => {
     scopePickedRef.current = true;
@@ -205,9 +213,8 @@ export function DiffReviewPanel({
   }, []);
 
   useEffect(() => {
-    if (scopePickedRef.current || !turnScopes[0]) return;
-    setScopeId(`turn:${turnScopes[0].turnId}`);
-  }, [turnScopes]);
+    setScopeId(workspaceScopeId);
+  }, []);
 
   const workspaceFiles = useMemo(
     () => buildWorkspaceFiles(workspaceDiff),
@@ -309,6 +316,18 @@ export function DiffReviewPanel({
   const files =
     scope?.kind === "turn" ? (turnState?.files ?? []) : workspaceFiles;
   const stats = useMemo(() => summarizeDiffStats(files), [files]);
+  const selectedFile =
+    files.find((file) => file.path === selectedPath) ?? files[0] ?? null;
+
+  useEffect(() => {
+    if (!files.length) {
+      setSelectedPath(null);
+      return;
+    }
+    if (!files.some((file) => file.path === selectedPath)) {
+      setSelectedPath(files[0].path);
+    }
+  }, [files, selectedPath]);
 
   const requestContent = useCallback(
     (path: string) => {
@@ -457,6 +476,7 @@ export function DiffReviewPanel({
 
   const scrollToFile = useCallback(
     (path: string) => {
+      setSelectedPath(path);
       renderFile(path);
       setCollapsedFiles((current) => {
         if (!current.has(path)) return current;
@@ -480,6 +500,7 @@ export function DiffReviewPanel({
   useEffect(() => {
     if (!focusRequest) return;
     selectScope(workspaceScopeId);
+    setSelectedPath(focusRequest.path);
     setFocusPath(focusRequest.path);
   }, [focusRequest, selectScope]);
 
@@ -540,9 +561,9 @@ export function DiffReviewPanel({
   const buildOptions = useMemo<DiffBuildOptions>(
     () => ({
       ignoreWhitespace: preferences.hideWhitespace,
-      wordDiff: preferences.wordDiff,
+      wordDiff: false,
     }),
-    [preferences.hideWhitespace, preferences.wordDiff],
+    [preferences.hideWhitespace],
   );
 
   return (
@@ -552,85 +573,109 @@ export function DiffReviewPanel({
       data-wrap={preferences.wrapLines ? "on" : "off"}
     >
       <header className="diff-review__toolbar">
-        <ScopePicker
-          scopes={scopes}
-          activeId={scope?.id ?? workspaceScopeId}
-          onSelect={selectScope}
-        />
-        <span
-          className="diff-review__stats"
-          aria-label={`增加 ${stats.additions} 行，删除 ${stats.deletions} 行`}
-        >
-          <span className="is-addition">+{stats.additions}</span>
-          <span className="is-deletion">-{stats.deletions}</span>
-        </span>
-        {workspaceDiff?.truncated && scope?.kind === "workspace" ? (
-          <span className="diff-review__pill">差异已截断</span>
-        ) : null}
-        <span className="diff-review__spacer" />
-        {notice ? (
-          <span className="diff-review__notice" role="status">
-            {notice}
-          </span>
-        ) : null}
-        <OptionsMenu
-          preferences={preferences}
-          isRefreshing={isRefreshing}
-          canCopyPatch={Boolean(buildGitApplyCommand(patchText))}
-          onUpdate={update}
-          onRefresh={onRefresh}
-          onCopyGitApply={copyGitApply}
-        />
-        <IconButton
-          aria-label={allCollapsed ? "展开全部差异" : "折叠全部差异"}
-          title={allCollapsed ? "展开全部差异" : "折叠全部差异"}
-          size="compact"
-          disabled={!files.length}
-          onClick={toggleAllFiles}
-        >
-          {allCollapsed ? (
-            <UnfoldVertical size={14} />
-          ) : (
-            <FoldVertical size={14} />
-          )}
-        </IconButton>
-        <JumpToFilePicker files={files} onSelect={scrollToFile} />
-        <IconButton
-          aria-label={
-            preferences.view === "split"
-              ? "切换到统一差异视图"
-              : "切换到拆分差异视图"
-          }
-          title={
-            preferences.view === "split"
-              ? "切换到统一差异视图"
-              : "切换到拆分差异视图"
-          }
-          size="compact"
-          onClick={() =>
-            update({ view: preferences.view === "split" ? "unified" : "split" })
-          }
-        >
-          {preferences.view === "split" ? (
-            <Rows3 size={14} />
-          ) : (
-            <Columns2 size={14} />
-          )}
-        </IconButton>
-        <IconButton
-          aria-label={preferences.showFilePanel ? "隐藏文件" : "显示文件"}
-          title={preferences.showFilePanel ? "隐藏文件" : "显示文件"}
-          size="compact"
-          aria-pressed={preferences.showFilePanel}
-          onClick={() => update({ showFilePanel: !preferences.showFilePanel })}
-        >
-          <PanelRight size={14} />
-        </IconButton>
-        <CommitMenu
-          canRunGit={canRunGit}
-          changedFiles={files.length}
-          onGitAction={onGitAction}
-        />
+        <div className="diff-review__toolbar-main">
+          <div className="diff-review__toolbar-context">
+            <span className="diff-review__all-changes">全部修改</span>
+            <ScopePicker
+              scopes={scopes}
+              activeId={scope?.id ?? workspaceScopeId}
+              onSelect={selectScope}
+            />
+            <span
+              className="diff-review__stats"
+              aria-label={`增加 ${stats.additions} 行，删除 ${stats.deletions} 行`}
+            >
+              <span className="is-addition">+{stats.additions}</span>
+              <span className="is-deletion">-{stats.deletions}</span>
+            </span>
+            {workspaceDiff?.truncated && scope?.kind === "workspace" ? (
+              <span className="diff-review__pill">差异已截断</span>
+            ) : null}
+          </div>
+          <div className="diff-review__toolbar-actions">
+            {notice ? (
+              <span className="diff-review__notice" role="status">
+                {notice}
+              </span>
+            ) : null}
+            <OptionsMenu
+              preferences={preferences}
+              isRefreshing={isRefreshing}
+              canCopyPatch={false}
+              onUpdate={update}
+              onRefresh={onRefresh}
+              onCopyGitApply={copyGitApply}
+            />
+            <IconButton
+              aria-label={allCollapsed ? "展开全部差异" : "折叠全部差异"}
+              title={allCollapsed ? "展开全部差异" : "折叠全部差异"}
+              className="diff-review__legacy-control"
+              size="compact"
+              disabled={!files.length}
+              onClick={toggleAllFiles}
+            >
+              {allCollapsed ? (
+                <UnfoldVertical size={14} />
+              ) : (
+                <FoldVertical size={14} />
+              )}
+            </IconButton>
+            <JumpToFilePicker
+              files={files}
+              selectedPath={selectedFile?.path ?? null}
+              onSelect={scrollToFile}
+            />
+            <IconButton
+              aria-label={
+                preferences.view === "split"
+                  ? "切换到统一差异视图"
+                  : "切换到拆分差异视图"
+              }
+              title={
+                preferences.view === "split"
+                  ? "切换到统一差异视图"
+                  : "切换到拆分差异视图"
+              }
+              size="compact"
+              onClick={() =>
+                update({
+                  view: preferences.view === "split" ? "unified" : "split",
+                })
+              }
+            >
+              {preferences.view === "split" ? (
+                <Rows3 size={14} />
+              ) : (
+                <Columns2 size={14} />
+              )}
+            </IconButton>
+            <IconButton
+              aria-label={preferences.showFilePanel ? "隐藏文件" : "显示文件"}
+              title={preferences.showFilePanel ? "隐藏文件" : "显示文件"}
+              className="diff-review__file-panel-toggle"
+              size="compact"
+              aria-pressed={preferences.showFilePanel}
+              onClick={() =>
+                update({ showFilePanel: !preferences.showFilePanel })
+              }
+            >
+              <PanelRight size={14} />
+            </IconButton>
+            <CommitMenu
+              canRunGit={canRunGit}
+              changedFiles={files.length}
+              onGitAction={onGitAction}
+            />
+          </div>
+        </div>
+        <div className="diff-review__branch-row">
+          <BranchPicker
+            currentBranch={workspaceDiff?.branch?.trim() || "HEAD"}
+            disabled={!canRunGit}
+            onList={onListGitBranches}
+            onSwitch={onSwitchGitBranch}
+          />
+        </div>
       </header>
 
       <div className="diff-review__body">
@@ -669,44 +714,46 @@ export function DiffReviewPanel({
                   {turnState.error}
                 </p>
               ) : null}
-              {files.map((file) => (
-                <DeferredDiffFileSection
-                  key={file.path}
-                  file={file}
-                  content={contents[file.path] ?? null}
-                  collapsed={collapsedFiles.has(file.path)}
-                  active={activePath === file.path}
-                  renderBody={renderedPaths.has(file.path)}
-                  preferences={preferences}
-                  buildOptions={buildOptions}
-                  expandedGaps={expandedGaps}
-                  rowLimit={rowLimits[file.path] ?? defaultRowLimit}
-                  isReverting={revertingPath === file.path}
-                  revertBlockedReason={
-                    scope?.kind === "workspace"
-                      ? revertBlockedReason(file.path)
-                      : "只有工作区改动可以还原。"
-                  }
-                  registerSection={(element) => {
-                    if (element) sectionRefs.current.set(file.path, element);
-                    else sectionRefs.current.delete(file.path);
-                  }}
-                  onToggle={() => toggleFile(file.path)}
-                  onRender={() => renderFile(file.path)}
-                  onOpenFileTab={() => onOpenFileTab(file.path)}
-                  onRevert={() => onRevertFile(file.path)}
-                  onExpandGap={(gapId) => expandGap(file.path, gapId)}
-                  onRequestContent={() => requestContent(file.path)}
-                  onShowMoreRows={() =>
-                    setRowLimits((current) => ({
-                      ...current,
-                      [file.path]:
-                        (current[file.path] ?? defaultRowLimit) +
-                        defaultRowLimit,
-                    }))
-                  }
-                />
-              ))}
+              {files
+                .filter((file) => file.path === selectedFile?.path)
+                .map((file) => (
+                  <DeferredDiffFileSection
+                    key={file.path}
+                    file={file}
+                    content={contents[file.path] ?? null}
+                    collapsed={false}
+                    active
+                    renderBody
+                    preferences={preferences}
+                    buildOptions={buildOptions}
+                    expandedGaps={expandedGaps}
+                    rowLimit={rowLimits[file.path] ?? defaultRowLimit}
+                    isReverting={revertingPath === file.path}
+                    revertBlockedReason={
+                      scope?.kind === "workspace"
+                        ? revertBlockedReason(file.path)
+                        : "只有工作区改动可以还原。"
+                    }
+                    registerSection={(element) => {
+                      if (element) sectionRefs.current.set(file.path, element);
+                      else sectionRefs.current.delete(file.path);
+                    }}
+                    onToggle={() => undefined}
+                    onRender={() => renderFile(file.path)}
+                    onOpenFileTab={() => onOpenFileTab(file.path)}
+                    onRevert={() => onRevertFile(file.path)}
+                    onExpandGap={(gapId) => expandGap(file.path, gapId)}
+                    onRequestContent={() => requestContent(file.path)}
+                    onShowMoreRows={() =>
+                      setRowLimits((current) => ({
+                        ...current,
+                        [file.path]:
+                          (current[file.path] ?? defaultRowLimit) +
+                          defaultRowLimit,
+                      }))
+                    }
+                  />
+                ))}
             </>
           )}
         </div>
@@ -762,10 +809,11 @@ function ScopePicker({
 }) {
   const active = scopes.find((scope) => scope.id === activeId) ?? scopes[0];
   return (
-    <div className="diff-review__menu">
+    <div className="diff-review__menu diff-review__scope-menu">
       <Popover
         label="选择审阅范围"
         align="start"
+        placement="bottom"
         trigger={(props) => (
           <button className="diff-review__scope" type="button" {...props}>
             <span>{active?.label ?? "审阅范围"}</span>
@@ -799,6 +847,162 @@ function ScopePicker({
                 ) : null}
               </button>
             ))}
+          </div>
+        )}
+      </Popover>
+    </div>
+  );
+}
+
+function BranchPicker({
+  currentBranch,
+  disabled,
+  onList,
+  onSwitch,
+}: {
+  currentBranch: string;
+  disabled: boolean;
+  onList(): Promise<GitBranchInfo[]>;
+  onSwitch(branch: string): Promise<void>;
+}) {
+  const [branches, setBranches] = useState<GitBranchInfo[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [switching, setSwitching] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const current = branches.find((branch) => branch.current);
+  const localBranches = useMemo(
+    () => branches.filter((branch) => !branch.remote && !branch.symbolicTarget),
+    [branches],
+  );
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleBranches = normalizedQuery
+    ? localBranches.filter((branch) =>
+        `${branch.name} ${branch.upstream ?? ""}`
+          .toLocaleLowerCase()
+          .includes(normalizedQuery),
+      )
+    : localBranches;
+
+  const load = useCallback(() => {
+    if (loading) return;
+    setLoading(true);
+    setError(null);
+    void onList()
+      .then(setBranches)
+      .catch((cause: unknown) => setError(errorMessage(cause)))
+      .finally(() => setLoading(false));
+  }, [loading, onList]);
+  const loadRef = useRef(load);
+  loadRef.current = load;
+
+  useEffect(() => {
+    if (!disabled) loadRef.current();
+  }, [disabled]);
+
+  return (
+    <div className="diff-review__menu">
+      <Popover
+        label="选择 Git 分支"
+        align="start"
+        placement="bottom"
+        trigger={(props) => (
+          <button
+            className="diff-review__branch"
+            type="button"
+            disabled={disabled}
+            title={`当前分支：${currentBranch}`}
+            {...props}
+            onClick={() => {
+              load();
+              props.onClick();
+            }}
+          >
+            <GitBranch size={14} aria-hidden="true" />
+            <span>{currentBranch}</span>
+            {current?.upstream ? (
+              <span className="diff-review__branch-upstream">
+                → {current.upstream}
+              </span>
+            ) : null}
+            <ChevronDown size={14} aria-hidden="true" />
+          </button>
+        )}
+      >
+        {({ close }) => (
+          <div className="diff-review__branch-menu">
+            <label className="diff-review__filter diff-review__branch-filter">
+              <Search size={13} aria-hidden="true" />
+              <input
+                autoFocus
+                value={query}
+                placeholder="搜索分支"
+                aria-label="搜索分支"
+                onChange={(event) => setQuery(event.target.value)}
+              />
+            </label>
+            <div className="diff-review__branch-heading">
+              <span>分支</span>
+              <IconButton
+                aria-label="刷新分支"
+                title="刷新分支"
+                size="compact"
+                variant="quiet"
+                disabled={loading || switching !== null}
+                onClick={load}
+              >
+                <RefreshCw
+                  className={loading ? "spin" : ""}
+                  size={14}
+                  aria-hidden="true"
+                />
+              </IconButton>
+            </div>
+            <div className="diff-review__menu-list" role="menu">
+              {visibleBranches.map((branch) => (
+                <button
+                  className="diff-review__menu-item diff-review__branch-item"
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={branch.current}
+                  disabled={switching !== null}
+                  key={branch.fullRef}
+                  onClick={() => {
+                    if (branch.current) {
+                      close();
+                      return;
+                    }
+                    setSwitching(branch.name);
+                    setError(null);
+                    void onSwitch(branch.name)
+                      .then(() => close())
+                      .catch((cause: unknown) => setError(errorMessage(cause)))
+                      .finally(() => setSwitching(null));
+                  }}
+                >
+                  <span className="diff-review__menu-check" aria-hidden="true">
+                    {branch.current ? <Check size={13} /> : null}
+                  </span>
+                  <span className="diff-review__branch-copy">
+                    <strong>{branch.name}</strong>
+                    {branch.upstream ? <small>{branch.upstream}</small> : null}
+                  </span>
+                  {switching === branch.name ? (
+                    <Loader2 className="spin" size={14} aria-hidden="true" />
+                  ) : null}
+                </button>
+              ))}
+              {!loading && visibleBranches.length === 0 ? (
+                <p className="diff-review__empty compact">
+                  {localBranches.length ? "没有匹配的分支。" : "没有可用分支。"}
+                </p>
+              ) : null}
+            </div>
+            {error ? (
+              <p className="diff-review__branch-error" role="alert">
+                {error}
+              </p>
+            ) : null}
           </div>
         )}
       </Popover>
@@ -864,6 +1068,7 @@ function OptionsMenu({
       <Popover
         label="差异显示选项"
         align="end"
+        placement="bottom"
         trigger={(props) => (
           <IconButton aria-label="差异显示选项" size="compact" {...props}>
             <MoreHorizontal size={14} />
@@ -887,24 +1092,26 @@ function OptionsMenu({
               </span>
               <span>刷新</span>
             </button>
-            {toggles.map((toggle) => (
-              <button
-                key={toggle.key}
-                className="diff-review__menu-item"
-                type="button"
-                role="menuitemcheckbox"
-                aria-checked={toggle.checked}
-                title={toggle.hint}
-                onClick={() => onUpdate({ [toggle.key]: !toggle.checked })}
-              >
-                <span className="diff-review__menu-check" aria-hidden="true">
-                  {toggle.checked ? <Check size={13} /> : null}
-                </span>
-                <span>{toggle.label}</span>
-              </button>
-            ))}
+            {toggles
+              .filter((toggle) => toggle.key !== "wordDiff")
+              .map((toggle) => (
+                <button
+                  key={toggle.key}
+                  className="diff-review__menu-item"
+                  type="button"
+                  role="menuitemcheckbox"
+                  aria-checked={toggle.checked}
+                  title={toggle.hint}
+                  onClick={() => onUpdate({ [toggle.key]: !toggle.checked })}
+                >
+                  <span className="diff-review__menu-check" aria-hidden="true">
+                    {toggle.checked ? <Check size={13} /> : null}
+                  </span>
+                  <span>{toggle.label}</span>
+                </button>
+              ))}
             <button
-              className="diff-review__menu-item"
+              className="diff-review__menu-item diff-review__menu-item--patch"
               type="button"
               role="menuitem"
               disabled={!canCopyPatch}
@@ -932,9 +1139,11 @@ function OptionsMenu({
 
 function JumpToFilePicker({
   files,
+  selectedPath,
   onSelect,
 }: {
   files: ParsedDiffFile[];
+  selectedPath: string | null;
   onSelect(path: string): void;
 }) {
   const [query, setQuery] = useState("");
@@ -945,6 +1154,7 @@ function JumpToFilePicker({
       <Popover
         label="跳转到文件"
         align="end"
+        placement="bottom"
         trigger={(props) => (
           <IconButton
             aria-label="跳转到文件"
@@ -982,7 +1192,7 @@ function JumpToFilePicker({
                     className="diff-review__jump-item"
                     type="button"
                     role="option"
-                    aria-selected={false}
+                    aria-selected={file.path === selectedPath}
                     onClick={() => {
                       onSelect(file.path);
                       close();
@@ -1043,17 +1253,23 @@ function CommitMenu({
       <Popover
         label="提交或推送"
         align="end"
+        placement="bottom"
         trigger={(props) => (
           <button
             className="diff-review__commit"
             type="button"
             disabled={!canRunGit}
             title={canRunGit ? "提交或推送" : "当前工作区不是 Git 仓库"}
+            aria-label="提交或推送"
             {...props}
           >
             <GitCommitHorizontal size={14} aria-hidden="true" />
-            <span>提交或推送</span>
-            <ChevronDown size={14} aria-hidden="true" />
+            <span className="diff-review__commit-text">提交或推送</span>
+            <ChevronDown
+              className="diff-review__commit-chevron"
+              size={14}
+              aria-hidden="true"
+            />
           </button>
         )}
       >
@@ -1301,6 +1517,26 @@ function DiffFileSection({
     preferences.richPreview &&
     isRichPreviewPath(file.path) &&
     content?.status === "ready";
+  const rowsRef = useRef<HTMLDivElement>(null);
+  const splitScrollContent = useMemo(
+    () =>
+      preferences.view === "split" && !preferences.wrapLines
+        ? {
+            left: splitScrollbarText(rows, "left"),
+            right: splitScrollbarText(rows, "right"),
+          }
+        : null,
+    [preferences.view, preferences.wrapLines, rows],
+  );
+  const setSplitScroll = useCallback(
+    (pane: DiffSplitPane, scrollLeft: number) => {
+      rowsRef.current?.style.setProperty(
+        `--diff-review-${pane}-scroll`,
+        `-${scrollLeft}px`,
+      );
+    },
+    [],
+  );
 
   return (
     <section
@@ -1379,6 +1615,7 @@ function DiffFileSection({
             className="diff-review__rows"
             role="table"
             aria-label={file.path}
+            ref={rowsRef}
           >
             <div className="diff-review__grid">
               {rows.map((row) =>
@@ -1399,9 +1636,9 @@ function DiffFileSection({
                 ) : row.type === "pair" ? (
                   <div className="diff-review__row" role="row" key={row.id}>
                     <LineNumber side={row.left} />
-                    <CodeCell side={row.left} />
+                    <CodeCell side={row.left} pane="left" />
                     <LineNumber side={row.right} />
-                    <CodeCell side={row.right} />
+                    <CodeCell side={row.right} pane="right" />
                   </div>
                 ) : (
                   <div className="diff-review__row" role="row" key={row.id}>
@@ -1417,6 +1654,12 @@ function DiffFileSection({
               )}
             </div>
           </div>
+          {splitScrollContent ? (
+            <SplitScrollbars
+              content={splitScrollContent}
+              onScroll={setSplitScroll}
+            />
+          ) : null}
           {hiddenRows > 0 ? (
             <button
               className="diff-review__more"
@@ -1477,7 +1720,13 @@ function LineNumber({ side }: { side: DiffRowSide | null }) {
   );
 }
 
-function CodeCell({ side }: { side: DiffRowSide | null }) {
+function CodeCell({
+  side,
+  pane,
+}: {
+  side: DiffRowSide | null;
+  pane?: DiffSplitPane;
+}) {
   if (!side) {
     return (
       <span
@@ -1488,17 +1737,67 @@ function CodeCell({ side }: { side: DiffRowSide | null }) {
     );
   }
   return (
-    <span className="diff-review__code" role="cell" data-kind={side.kind}>
-      <span className="diff-review__sign" aria-hidden="true">
-        {side.kind === "added" ? "+" : side.kind === "removed" ? "-" : " "}
-      </span>
-      {side.spans.map((span, index) => (
-        <span key={index} className={spanClassName(span)}>
-          {span.text}
+    <span
+      className="diff-review__code"
+      role="cell"
+      data-kind={side.kind}
+      data-pane={pane}
+    >
+      <span className="diff-review__code-content">
+        <span className="diff-review__sign" aria-hidden="true">
+          {side.kind === "added" ? "+" : side.kind === "removed" ? "-" : " "}
         </span>
-      ))}
+        {side.spans.map((span, index) => (
+          <span key={index} className={spanClassName(span)}>
+            {span.text}
+          </span>
+        ))}
+      </span>
     </span>
   );
+}
+
+function SplitScrollbars({
+  content,
+  onScroll,
+}: {
+  content: Record<DiffSplitPane, string>;
+  onScroll(pane: DiffSplitPane, scrollLeft: number): void;
+}) {
+  return (
+    <div
+      className="diff-review__split-scrollbars"
+      role="group"
+      aria-label="分栏代码横向滚动条"
+    >
+      {(["left", "right"] as const).map((pane) => (
+        <div
+          className="diff-review__split-scrollbar"
+          data-pane={pane}
+          key={pane}
+          tabIndex={0}
+          title={pane === "left" ? "原始内容横向滚动" : "修改内容横向滚动"}
+          aria-label={
+            pane === "left" ? "原始内容横向滚动条" : "修改内容横向滚动条"
+          }
+          onScroll={(event) => onScroll(pane, event.currentTarget.scrollLeft)}
+        >
+          <span className="diff-review__split-scrollbar-track" aria-hidden="true">
+            {content[pane]}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function splitScrollbarText(
+  rows: Array<DiffSplitRow | DiffUnifiedRow>,
+  pane: DiffSplitPane,
+): string {
+  return rows
+    .map((row) => (row.type === "pair" ? (row[pane]?.text ?? "") : ""))
+    .join("\n");
 }
 
 function spanClassName(span: DiffSpan): string {

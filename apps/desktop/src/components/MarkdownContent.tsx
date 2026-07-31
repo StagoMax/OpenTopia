@@ -2,10 +2,10 @@ import { FileText } from "lucide-react";
 import {
   createContext,
   memo,
-  startTransition,
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type AnchorHTMLAttributes,
@@ -18,12 +18,19 @@ import ReactMarkdown, {
 } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  renderedTextChange,
+  rendererTraceTime,
+  type ConversationMarkdownTraceContext,
+  type ConversationRenderTrace,
+} from "../conversationRenderTrace";
+import {
   decodeFilePathHref,
   FILE_PATH_LINK_SCHEME,
   isWindowsDrivePath,
   remarkFilePathLinks,
 } from "../filePathLinks";
 import { markdownStreamInterval } from "../markdownLinks";
+import { recordConversationRenderTrace } from "../platform";
 import { useWorkspacePathStatus } from "./WorkspacePathProvider";
 import "./MarkdownContent.css";
 
@@ -32,6 +39,7 @@ export type MarkdownContentProps = {
   className?: string;
   streaming?: boolean;
   onOpenLink?(href: string): void;
+  renderTrace?: ConversationMarkdownTraceContext;
 };
 
 type RemarkPlugins = Options["remarkPlugins"];
@@ -52,8 +60,10 @@ export function MarkdownContent({
   className = "",
   streaming = false,
   onOpenLink,
+  renderTrace,
 }: MarkdownContentProps) {
   const renderedText = useThrottledMarkdown(text, streaming);
+  useConversationMarkdownTrace(renderedText, renderTrace);
   const instanceId = useId().replaceAll(":", "");
   return (
     <MarkdownLinkHandlerContext.Provider value={onOpenLink}>
@@ -194,16 +204,107 @@ function useThrottledMarkdown(text: string, streaming: boolean): string {
     if (timerRef.current) return;
     timerRef.current = setTimeout(() => {
       timerRef.current = null;
-      startTransition(() => setRenderedText(latestTextRef.current));
+      setRenderedText(latestTextRef.current);
     }, markdownStreamInterval(text.length));
   }, [streaming, text]);
 
   useEffect(
     () => () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
     },
     [],
   );
 
-  return renderedText;
+  // The terminal event can arrive before a scheduled streaming paint. Render
+  // the authoritative final value immediately instead of showing a stale tail
+  // for one more effect cycle.
+  return streaming ? renderedText : text;
+}
+
+function useConversationMarkdownTrace(
+  text: string,
+  context: ConversationMarkdownTraceContext | undefined,
+) {
+  const contextRef = useRef(context);
+  const latestTextRef = useRef(text);
+  const committedTextRef = useRef("");
+  const paintedTextRef = useRef("");
+  const paintJobRef = useRef<{
+    frame: number | null;
+    timer: number | null;
+  }>({ frame: null, timer: null });
+
+  contextRef.current = context;
+  latestTextRef.current = text;
+
+  useLayoutEffect(() => {
+    const activeContext = contextRef.current;
+    if (!activeContext) return;
+    const change = renderedTextChange(committedTextRef.current, text);
+    committedTextRef.current = text;
+    if (change) {
+      recordConversationRenderTrace({
+        ...traceBase(activeContext, "committed"),
+        ...change,
+        visible: true,
+      });
+    }
+
+    const job = paintJobRef.current;
+    if (job.frame !== null || job.timer !== null) return;
+    job.frame = window.requestAnimationFrame(() => {
+      job.frame = null;
+      job.timer = window.setTimeout(() => {
+        job.timer = null;
+        const paintedText = latestTextRef.current;
+        const paintedChange = renderedTextChange(
+          paintedTextRef.current,
+          paintedText,
+        );
+        paintedTextRef.current = paintedText;
+        const latestContext = contextRef.current;
+        if (!paintedChange || !latestContext) return;
+        recordConversationRenderTrace({
+          ...traceBase(latestContext, "painted"),
+          ...paintedChange,
+          visible: true,
+        });
+      }, 0);
+    });
+  }, [text]);
+
+  useEffect(
+    () => () => {
+      const job = paintJobRef.current;
+      if (job.frame !== null) {
+        window.cancelAnimationFrame(job.frame);
+        job.frame = null;
+      }
+      if (job.timer !== null) {
+        window.clearTimeout(job.timer);
+        job.timer = null;
+      }
+    },
+    [],
+  );
+}
+
+function traceBase(
+  context: ConversationMarkdownTraceContext,
+  stage: ConversationRenderTrace["stage"],
+): Omit<
+  ConversationRenderTrace,
+  "change" | "text" | "textLength" | "visible"
+> {
+  return {
+    stage,
+    channel: context.channel,
+    threadId: context.threadId,
+    turnId: context.turnId,
+    messageId: context.messageId,
+    ...rendererTraceTime(),
+  };
 }

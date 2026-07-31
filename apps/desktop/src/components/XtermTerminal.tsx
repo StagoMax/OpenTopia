@@ -5,7 +5,7 @@ import {
   useImperativeHandle,
   useRef,
 } from "react";
-import { Terminal } from "xterm";
+import { Terminal, type ITheme } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import "xterm/css/xterm.css";
 
@@ -69,24 +69,13 @@ export const XtermTerminal = forwardRef<
 
     const fitAddon = new FitAddon();
     const terminal = new Terminal({
-      theme: {
-        background: "#1e1e1e",
-        foreground: "#d4d4d4",
-        cursor: "#d4d4d4",
-        selectionBackground: "#264f78",
-        black: "#252935",
-        red: "#f48771",
-        green: "#8bd8bd",
-        yellow: "#ffd59a",
-        blue: "#7ab7ef",
-        magenta: "#c9c3ff",
-        cyan: "#4ec9b0",
-        white: "#d4d4d4",
-      },
+      theme: readTerminalTheme(),
       cursorBlink: true,
       cursorStyle: "bar",
-      fontSize: 13,
-      fontFamily: "'Cascadia Code', 'SFMono-Regular', Consolas, monospace",
+      fontSize: readCssNumber("--font-size-code", 12),
+      fontFamily: readCssToken("--font-mono"),
+      lineHeight: readCssNumber("--line-height-body", 1.45),
+      letterSpacing: 0,
       scrollback: 10_000,
       convertEol: false,
       cols: 100,
@@ -110,9 +99,20 @@ export const XtermTerminal = forwardRef<
 
     const resizeObserver = new ResizeObserver(() => fitTerminal());
     resizeObserver.observe(containerRef.current);
+    const themeObserver = new MutationObserver(() => {
+      terminal.options.theme = readTerminalTheme();
+      terminal.options.fontFamily = readCssToken("--font-mono");
+      terminal.options.fontSize = readCssNumber("--font-size-code", 12);
+      fitTerminal();
+    });
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
 
     return () => {
       resizeObserver.disconnect();
+      themeObserver.disconnect();
       dataDisposable.dispose();
       resizeDisposable.dispose();
       terminalRef.current = null;
@@ -129,3 +129,39 @@ export const XtermTerminal = forwardRef<
 
   return <div ref={containerRef} className="xterm-container" />;
 });
+
+function readCssToken(name: string): string {
+  return getComputedStyle(document.documentElement)
+    .getPropertyValue(name)
+    .trim();
+}
+
+function readCssNumber(name: string, fallback: number): number {
+  return Number.parseFloat(readCssToken(name)) || fallback;
+}
+
+function readTerminalTheme(): ITheme {
+  return {
+    background: readCssToken("--surface"),
+    foreground: readCssToken("--text"),
+    cursor: readCssToken("--text"),
+    cursorAccent: readCssToken("--surface"),
+    selectionBackground: readCssToken("--accent-subtle"),
+    black: readCssToken("--surface-chrome"),
+    brightBlack: readCssToken("--text-muted"),
+    red: readCssToken("--danger"),
+    brightRed: readCssToken("--danger"),
+    green: readCssToken("--success"),
+    brightGreen: readCssToken("--success"),
+    yellow: readCssToken("--warning"),
+    brightYellow: readCssToken("--warning"),
+    blue: readCssToken("--accent"),
+    brightBlue: readCssToken("--accent-hover"),
+    magenta: readCssToken("--syntax-keyword"),
+    brightMagenta: readCssToken("--syntax-keyword"),
+    cyan: readCssToken("--syntax-type"),
+    brightCyan: readCssToken("--syntax-type"),
+    white: readCssToken("--text-secondary"),
+    brightWhite: readCssToken("--text"),
+  };
+}
