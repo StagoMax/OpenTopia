@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-http-browser-fixture",
+  "description": "Connects to an evaluation OpenTopia server and supplies the isolated local browser fixture URL to the adapter.",
+  "command": "node",
+  "args": ["{targetDir}/../../adapters/opentopia-http.mjs"],
+  "cwd": "{targetDir}",
+  "env": {
+    "OPENTOPIA_EVAL_BASE_URL": "http://127.0.0.1:8812",
+    "OPENTOPIA_EVAL_APPROVAL_MODE": "deny",
+    "OPENTOPIA_EVAL_TIMEOUT_MS": "300000"
+  },
+  "passEnvironment": ["OPENTOPIA_API_TOKEN", "OPENTOPIA_EVAL_BROWSER_FIXTURE_URL"],
+  "inheritEnvironment": false,
+  "promptTransport": "stdin",
+  "eventTransport": "jsonl-file"
+}

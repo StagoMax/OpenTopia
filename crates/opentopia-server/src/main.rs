@@ -311,7 +311,14 @@ async fn initialize_browser_runtime() -> Arc<dyn BrowserRuntime> {
         }
     }
 
-    Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default()))
+    let mut config = BrowserRuntimeConfig::default();
+    if let Some(data_root) = std::env::var_os("OPENTOPIA_BROWSER_DATA_ROOT")
+        .filter(|value| !value.is_empty())
+    {
+        config.data_root = PathBuf::from(data_root);
+        info!(path = %config.data_root.display(), "using configured local browser data root");
+    }
+    Arc::new(LocalBrowserRuntime::new(config))
 }
 
 fn build_router(state: AppState) -> Router {

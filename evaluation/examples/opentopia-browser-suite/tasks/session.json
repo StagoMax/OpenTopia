@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "OPENTOPIA-BROWSER-SESSION-002",
+  "version": "1.0.0",
+  "title": "Retain local browser session state across navigation",
+  "suite": "opentopia-browser-private",
+  "prompt": "Open the local Operations center in the browser. Use the navigation labelled Verify session continuity and confirm whether the resulting page says the session remains active.",
+  "tags": ["opentopia", "browser", "session", "cookies"],
+  "budgets": {
+    "watchdogSeconds": 120,
+    "maxTotalTokens": 12000
+  },
+  "capabilityPolicy": {
+    "tools": { "mustUse": ["browser"] }
+  },
+  "graders": {
+    "commands": [
+      {
+        "id": "session-backend-state",
+        "command": "node",
+        "args": ["grader.cjs", "session", "{browserFixtureState}", "{trialId}", "{trialDir}/events.jsonl", "{browserDataRoot}"],
+        "timeoutSeconds": 15
+      }
+    ],
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true,
+      "minimumBrowserActions": 2,
+      "minimumValidBrowserActions": 2
+    },
+    "security": {
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}

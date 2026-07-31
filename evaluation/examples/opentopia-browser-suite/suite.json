@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-browser-private",
+  "title": "OpenTopia Private Browser Control Suite",
+  "description": "Runs deterministic local browser tasks against a resettable fixture with hidden backend-state graders.",
+  "repetitions": 1,
+  "tasks": [
+    "tasks/navigation.json",
+    "tasks/session.json",
+    "tasks/login-handoff.json",
+    "tasks/post-handoff.json",
+    "tasks/download.json",
+    "tasks/stale-recovery.json"
+  ]
+}

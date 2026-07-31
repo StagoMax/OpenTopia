@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "OPENTOPIA-BROWSER-NAV-001",
+  "version": "1.0.0",
+  "title": "Follow ordinary navigation through a redirect",
+  "suite": "opentopia-browser-private",
+  "prompt": "Open the local Operations center in the browser. Follow the ordinary navigation labelled Open status report, wait for the destination to finish loading, and report the displayed status.",
+  "tags": ["opentopia", "browser", "navigation", "redirect"],
+  "budgets": {
+    "watchdogSeconds": 120,
+    "maxTotalTokens": 12000
+  },
+  "capabilityPolicy": {
+    "tools": { "mustUse": ["browser"] }
+  },
+  "graders": {
+    "commands": [
+      {
+        "id": "navigation-backend-state",
+        "command": "node",
+        "args": ["grader.cjs", "navigation", "{browserFixtureState}", "{trialId}", "{trialDir}/events.jsonl", "{browserDataRoot}"],
+        "timeoutSeconds": 15
+      }
+    ],
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true,
+      "minimumBrowserActions": 2,
+      "minimumValidBrowserActions": 2
+    },
+    "security": {
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}

@@ -12,6 +12,7 @@ const phaseId = process.env.AGENT_EVAL_PHASE_ID ?? "default";
 const phaseIndex = Number(process.env.AGENT_EVAL_PHASE_INDEX ?? 1);
 const phaseCount = Number(process.env.AGENT_EVAL_PHASE_COUNT ?? 1);
 const targetStatePath = process.env.AGENT_EVAL_TARGET_STATE_PATH;
+const browserFixtureBaseUrl = process.env.OPENTOPIA_EVAL_BROWSER_FIXTURE_URL?.replace(/\/$/, "");
 
 if (!workspace || !eventsPath) throw new Error("Harness target environment is incomplete");
 if (!token) throw new Error("OPENTOPIA_API_TOKEN is required; pass it through target.passEnvironment");
@@ -100,6 +101,7 @@ function normalizeProductEvent(event) {
     const toolName = metadata.toolName ?? metadata.tool_name ?? "unknown";
     if (toolName === "browser") {
       const success = metadata.success !== false && metadata.isError !== true;
+      const error = metadata.error ?? (success ? null : payload.result?.output ?? null);
       return {
         type: "browser.action.completed",
         payload: {
@@ -107,6 +109,7 @@ function normalizeProductEvent(event) {
           success,
           valid: success,
           url: metadata.url ?? null,
+          error,
           result: payload.result
         }
       };
@@ -133,6 +136,19 @@ function normalizeProductEvent(event) {
   return { type: `opentopia.${type ?? "unknown"}`, payload };
 }
 
+function browserFixturePrompt() {
+  if (!browserFixtureBaseUrl) return "";
+  const trialId = process.env.AGENT_EVAL_TRIAL_ID;
+  if (!trialId) return "";
+  const fixtureUrl = `${browserFixtureBaseUrl}/t/${encodeURIComponent(trialId)}/`;
+  return [
+    "",
+    "This is a local browser evaluation. Use the browser tool only against this fixture URL:",
+    fixtureUrl,
+    "Do not use terminal, filesystem, or network tools to inspect the fixture or its state."
+  ].join("\n");
+}
+
 async function decidePendingApprovals(threadId) {
   const approvals = await api("GET", `/api/threads/${threadId}/approvals?status=pending`);
   for (const approval of approvals ?? []) {
@@ -144,7 +160,7 @@ async function decidePendingApprovals(threadId) {
 }
 
 async function main() {
-  const prompt = await readPrompt();
+  const prompt = `${await readPrompt()}${browserFixturePrompt()}`;
   const priorState = await loadTargetState();
   if (phaseIndex > 1 && !priorState?.threadId) {
     throw new Error(`Phase ${phaseId} has no persisted OpenTopia thread to recover`);

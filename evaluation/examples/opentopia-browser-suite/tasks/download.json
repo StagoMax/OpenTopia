@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "OPENTOPIA-BROWSER-DOWNLOAD-005",
+  "version": "1.0.0",
+  "title": "Download a browser export into the shared download directory",
+  "suite": "opentopia-browser-private",
+  "prompt": "Open the local Operations center and navigate to Open exports. Use the browser download action to download the Daily export. Do not use terminal, filesystem, or shell tools to fetch it.",
+  "tags": ["opentopia", "browser", "download"],
+  "budgets": {
+    "watchdogSeconds": 120,
+    "maxTotalTokens": 12000
+  },
+  "capabilityPolicy": {
+    "tools": { "mustUse": ["browser"], "mustNotUse": ["shell", "filesystem.read", "filesystem.write"] }
+  },
+  "graders": {
+    "commands": [
+      {
+        "id": "download-backend-and-directory-state",
+        "command": "node",
+        "args": ["grader.cjs", "download", "{browserFixtureState}", "{trialId}", "{trialDir}/events.jsonl", "{browserDataRoot}"],
+        "timeoutSeconds": 15
+      }
+    ],
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true,
+      "minimumBrowserActions": 2,
+      "minimumValidBrowserActions": 2
+    },
+    "security": {
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "OPENTOPIA-BROWSER-RECOVERY-006",
+  "version": "1.0.0",
+  "title": "Recover from a stale browser observation",
+  "suite": "opentopia-browser-private",
+  "prompt": "Open the local Operations center and navigate to Open live report. Observe the initial button. Wait until the page contains the text Updated control ready, then deliberately try the original button reference. If the browser says the observation is stale, observe the page again, use the replacement control, and verify that the current report opened.",
+  "tags": ["opentopia", "browser", "recovery", "stale-observation"],
+  "budgets": {
+    "watchdogSeconds": 120,
+    "maxTotalTokens": 16000
+  },
+  "capabilityPolicy": {
+    "tools": { "mustUse": ["browser"] }
+  },
+  "graders": {
+    "commands": [
+      {
+        "id": "stale-observation-recovery",
+        "command": "node",
+        "args": ["grader.cjs", "stale-recovery", "{browserFixtureState}", "{trialId}", "{trialDir}/events.jsonl", "{browserDataRoot}"],
+        "timeoutSeconds": 15
+      }
+    ],
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true,
+      "minimumBrowserActions": 5,
+      "minimumValidBrowserActions": 4
+    },
+    "security": {
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}
