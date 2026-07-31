@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "CUSE-PROFILE-001",
+  "title": "Desktop profile editor",
+  "fixtureScript": "fixture.ps1",
+  "graderPath": "grader.cjs",
+  "fixture": {
+    "title": "OpenTopia Computer Use - Profile Editor",
+    "expected": {
+      "workspaceName": "Northwind Operations",
+      "operationMode": "Balanced",
+      "keepLocalHistory": true
+    }
+  },
+  "prompt": "A controlled desktop Computer Use evaluation is running. Use only the computer tool to operate the window titled OpenTopia Computer Use - Profile Editor. Do not use browser, shell, filesystem, terminal, or any other tool to inspect or alter the evaluation. Set Workspace name to Northwind Operations. Set Operation mode to Balanced. Enable Keep local history. Select Save profile. Then observe the window again and verify that it says Profile saved. Do not operate any other desktop window. Finish only after the visual confirmation is observed.",
+  "process": {
+    "maxTurnSeconds": 300,
+    "requiredComputerActions": [
+      "list_windows",
+      "observe",
+      "click",
+      "type"
+    ],
+    "requirePostSaveObservation": true
+  }
+}

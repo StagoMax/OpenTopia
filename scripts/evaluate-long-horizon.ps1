@@ -208,38 +208,92 @@ function Invoke-HiddenGrader {
 function Get-TrajectoryMetrics {
   param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Events)
 
-  $Events = @(Expand-EvalItems $Events)
-  $toolStarts = @($Events | Where-Object { $_.payload.type -eq "tool_call_started" })
-  $toolFinishes = @($Events | Where-Object { $_.payload.type -eq "tool_call_finished" })
-  $planEvents = @($Events | Where-Object { $_.payload.type -eq "plan_updated" })
-  $usageEvents = @($Events | Where-Object { $_.payload.type -eq "token_usage" })
+  # Callers normalize API responses with Expand-EvalItems before invoking this
+  # function. Do not recursively re-enumerate every streamed-delta event here.
   $toolByName = [ordered]@{}
-  foreach ($event in $toolStarts) {
-    $name = [string]$event.payload.call.name
-    if (-not $toolByName.Contains($name)) {
-      $toolByName[$name] = 0
+  $toolCallsStarted = 0
+  $toolCallsFinished = 0
+  $planUpdates = 0
+  $testToolCalls = 0
+  $completionToolCalls = 0
+  $verifiedPlanCompletionCalls = 0
+  [int64]$inputTokens = 0
+  [int64]$outputTokens = 0
+  [int64]$totalTokens = 0
+  $errorEvents = 0
+  $transientProviderErrors = 0
+  $latestPlan = $null
+  $turnIds = [System.Collections.Generic.HashSet[string]]::new()
+
+  # Trajectories contain one event per streamed delta. Aggregate all metrics
+  # in one pass so long evaluations do not repeatedly walk 100+ MB exports.
+  foreach ($event in $Events) {
+    if ($event.turnId) {
+      [void]$turnIds.Add([string]$event.turnId)
     }
-    $toolByName[$name] += 1
-  }
-  $testToolCalls = @($toolStarts | Where-Object {
-    $_.payload.call.name -eq "shell" -and
-    [string]$_.payload.call.input.command -match '(?i)(npm\s+test|node\s+--test)'
-  }).Count
-  $completionToolCalls = @($toolStarts | Where-Object {
-    $_.payload.call.name -eq "complete_task"
-  }).Count
-  $verifiedPlanCompletionCalls = @($toolFinishes | Where-Object {
-    $_.payload.result.metadata.toolName -eq "update_plan" -and
-    $_.payload.result.metadata.success -eq $true -and
-    (
-      $_.payload.result.metadata.currentScopeComplete -eq $true -or
-      $_.payload.result.metadata.allStepsComplete -eq $true
-    )
-  }).Count
-  $latestPlan = if ($planEvents.Count -gt 0) {
-    $planEvents[$planEvents.Count - 1].payload.plan
-  } else {
-    $null
+    $payload = $event.payload
+    if ($null -eq $payload) {
+      continue
+    }
+    switch ([string]$payload.type) {
+      "tool_call_started" {
+        $toolCallsStarted += 1
+        $call = $payload.call
+        $name = [string]$call.name
+        if (-not $toolByName.Contains($name)) {
+          $toolByName[$name] = 0
+        }
+        $toolByName[$name] += 1
+        if (
+          $name -eq "shell" -and
+          [string]$call.input.command -match '(?i)(npm\s+test|node\s+--test)'
+        ) {
+          $testToolCalls += 1
+        }
+        if ($name -eq "complete_task") {
+          $completionToolCalls += 1
+        }
+      }
+      "tool_call_finished" {
+        $toolCallsFinished += 1
+        $metadata = $payload.result.metadata
+        if (
+          $metadata.toolName -eq "update_plan" -and
+          $metadata.success -eq $true -and
+          (
+            $metadata.currentScopeComplete -eq $true -or
+            $metadata.allStepsComplete -eq $true
+          )
+        ) {
+          $verifiedPlanCompletionCalls += 1
+        }
+      }
+      "plan_updated" {
+        $planUpdates += 1
+        $latestPlan = $payload.plan
+      }
+      "token_usage" {
+        if ($null -ne $payload.input_tokens) {
+          $inputTokens += [int64]$payload.input_tokens
+        }
+        if ($null -ne $payload.output_tokens) {
+          $outputTokens += [int64]$payload.output_tokens
+        }
+        if ($null -ne $payload.total_tokens) {
+          $totalTokens += [int64]$payload.total_tokens
+        }
+      }
+      "error" {
+        $errorEvents += 1
+        $message = [string]$payload.message
+        if (
+          $message -match '(?i)provider request failed \((429|502|503|504)\b' -or
+          $message -match '(?i)(upstream_temporarily_unavailable|region_maintenance)'
+        ) {
+          $transientProviderErrors += 1
+        }
+      }
+    }
   }
   $planStatus = [ordered]@{ pending = 0; inProgress = 0; completed = 0 }
   if ($latestPlan) {
@@ -251,23 +305,13 @@ function Get-TrajectoryMetrics {
       }
     }
   }
-  $inputTokens = [int64](($usageEvents | ForEach-Object {
-    $_.payload.input_tokens
-  } | Measure-Object -Sum).Sum)
-  $outputTokens = [int64](($usageEvents | ForEach-Object {
-    $_.payload.output_tokens
-  } | Measure-Object -Sum).Sum)
-  $totalTokens = [int64](($usageEvents | ForEach-Object {
-    $_.payload.total_tokens
-  } | Measure-Object -Sum).Sum)
   return [ordered]@{
     eventCount = $Events.Count
-    turnCount = @($Events | ForEach-Object { $_.turnId } | Where-Object { $_ } |
-      Select-Object -Unique).Count
-    toolCallsStarted = $toolStarts.Count
-    toolCallsFinished = $toolFinishes.Count
+    turnCount = $turnIds.Count
+    toolCallsStarted = $toolCallsStarted
+    toolCallsFinished = $toolCallsFinished
     toolCallsByName = $toolByName
-    planUpdates = $planEvents.Count
+    planUpdates = $planUpdates
     latestPlan = $planStatus
     testToolCalls = $testToolCalls
     completionToolCalls = $completionToolCalls
@@ -275,8 +319,41 @@ function Get-TrajectoryMetrics {
     inputTokens = $inputTokens
     outputTokens = $outputTokens
     totalTokens = $totalTokens
-    errorEvents = @($Events | Where-Object { $_.payload.type -eq "error" }).Count
+    errorEvents = $errorEvents
+    transientProviderErrors = $transientProviderErrors
   }
+}
+
+function Get-ProviderFailureCategory {
+  param(
+    [AllowNull()][object]$Probe,
+    [Parameter(Mandatory = $true)][object]$Metrics,
+    [Parameter(Mandatory = $true)][bool]$TurnsPassed
+  )
+
+  if ($Probe -and -not $Probe.compatibleWithOpenTopia) {
+    # Chat completion and automatic function calling are the two mandatory
+    # paths. Forced-tool support is diagnostic only: relays can vary there
+    # while an upstream region is unavailable.
+    $requiredStatuses = @(
+      $Probe.streamChat.status,
+      $Probe.streamToolsAuto.status
+    ) | Where-Object { $null -ne $_ }
+    $allTransient =
+      $requiredStatuses.Count -eq 2 -and
+      @($requiredStatuses | Where-Object {
+        [int]$_ -notin @(429, 502, 503, 504)
+      }).Count -eq 0
+    if ($allTransient) {
+      return "provider_preflight_unavailable"
+    }
+    return "provider_incompatible"
+  }
+
+  if (-not $TurnsPassed -and $Metrics.transientProviderErrors -gt 0) {
+    return "provider_runtime_unavailable"
+  }
+  return $null
 }
 
 function Test-FilesForSecret {
@@ -285,23 +362,14 @@ function Test-FilesForSecret {
     [Parameter(Mandatory = $true)][string]$Secret
   )
 
-  $secretBytes = [Text.Encoding]::UTF8.GetBytes($Secret)
   foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse) {
-    $bytes = [IO.File]::ReadAllBytes($file.FullName)
-    if ($bytes.Length -lt $secretBytes.Length) {
-      continue
-    }
-    for ($offset = 0; $offset -le $bytes.Length - $secretBytes.Length; $offset += 1) {
-      $match = $true
-      for ($index = 0; $index -lt $secretBytes.Length; $index += 1) {
-        if ($bytes[$offset + $index] -ne $secretBytes[$index]) {
-          $match = $false
-          break
-        }
-      }
-      if ($match) {
-        return $false
-      }
+    # API keys are ASCII-compatible strings. Decoding a SQLite/WAL or JSON
+    # artifact as UTF-8 preserves any exact key bytes while letting .NET use
+    # its optimized ordinal substring search instead of an O(files * bytes *
+    # keyLength) PowerShell loop on large trajectories.
+    $content = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($file.FullName))
+    if ($content.IndexOf($Secret, [StringComparison]::Ordinal) -ge 0) {
+      return $false
     }
   }
   return $true
@@ -688,6 +756,10 @@ $turnsPassed =
   $null -ne $phase2Turn -and
   $phase1Turn.status -eq "succeeded" -and
   $phase2Turn.status -eq "succeeded"
+$failureCategory = Get-ProviderFailureCategory `
+  $providerProbe `
+  $metrics `
+  $turnsPassed
 $secretAuditPassed = Test-FilesForSecret $runRoot $apiKey
 $overallPassed =
   $providerPassed -and
@@ -704,7 +776,14 @@ $result = [ordered]@{
   runId = $runId
   startedAt = $startedAt.ToUniversalTime().ToString("o")
   completedAt = (Get-Date).ToUniversalTime().ToString("o")
-  status = if ($overallPassed) { "passed" } else { "failed" }
+  status = if ($overallPassed) {
+    "passed"
+  } elseif ($failureCategory -match '^provider_.*_unavailable$') {
+    # No model score is valid when an upstream outage prevented a turn.
+    "inconclusive"
+  } else {
+    "failed"
+  }
   objectiveScoringOnly = $true
   task = [ordered]@{
     id = [string]$task.id
@@ -787,6 +866,7 @@ $result = [ordered]@{
     final = $finalGrade
   }
   secretAuditPassed = $secretAuditPassed
+  failureCategory = $failureCategory
   error = $runError
   artifacts = [ordered]@{
     runDirectory = ".opentopia/evaluations/$runId"

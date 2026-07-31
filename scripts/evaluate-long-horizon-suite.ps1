@@ -103,16 +103,30 @@ foreach ($manifest in $TaskManifests) {
 }
 
 $validRuns = @($runs | Where-Object { $null -ne $_.result })
-$passedRuns = @($validRuns | Where-Object { $_.result.status -eq "passed" })
+$inconclusiveRuns = @($validRuns | Where-Object {
+  $_.result.failureCategory -match '^provider_.*_unavailable$'
+})
+$scoredRuns = @($validRuns | Where-Object {
+  $_.result.failureCategory -notmatch '^provider_.*_unavailable$'
+})
+$passedRuns = @($scoredRuns | Where-Object { $_.result.status -eq "passed" })
 $taskSummaries = @($validRuns | Group-Object taskId | ForEach-Object {
   $taskRuns = @($_.Group)
-  $taskPassed = @($taskRuns | Where-Object { $_.result.status -eq "passed" })
+  $taskInconclusive = @($taskRuns | Where-Object {
+    $_.result.failureCategory -match '^provider_.*_unavailable$'
+  })
+  $taskScored = @($taskRuns | Where-Object {
+    $_.result.failureCategory -notmatch '^provider_.*_unavailable$'
+  })
+  $taskPassed = @($taskScored | Where-Object { $_.result.status -eq "passed" })
   [ordered]@{
     taskId = $_.Name
-    validRuns = $taskRuns.Count
+    executedRuns = $taskRuns.Count
+    scoredRuns = $taskScored.Count
+    inconclusiveRuns = $taskInconclusive.Count
     passedRuns = $taskPassed.Count
-    passRate = if ($taskRuns.Count -gt 0) {
-      [double]$taskPassed.Count / [double]$taskRuns.Count
+    passRate = if ($taskScored.Count -gt 0) {
+      [double]$taskPassed.Count / [double]$taskScored.Count
     } else { $null }
     runs = @($taskRuns | ForEach-Object {
       [ordered]@{
@@ -125,6 +139,7 @@ $taskSummaries = @($validRuns | Group-Object taskId | ForEach-Object {
         verifiedPlanCompletionCalls = $_.result.trajectoryMetrics.verifiedPlanCompletionCalls
         recoveryPassed = $_.result.recoveryPassed
         processContractPassed = $_.result.processContractPassed
+        failureCategory = $_.result.failureCategory
         error = $_.result.error
       }
     })
@@ -134,13 +149,25 @@ $taskSummaries = @($validRuns | Group-Object taskId | ForEach-Object {
 $allSucceeded =
   $runs.Count -gt 0 -and
   $validRuns.Count -eq $runs.Count -and
+  $inconclusiveRuns.Count -eq 0 -and
   $passedRuns.Count -eq $runs.Count
+$hasScoredFailure = @($scoredRuns | Where-Object {
+  $_.result.status -ne "passed"
+}).Count -gt 0
+$suiteStatus = if ($allSucceeded) {
+  "passed"
+} elseif ($inconclusiveRuns.Count -gt 0 -and -not $hasScoredFailure) {
+  # An unavailable upstream cannot be scored as a model or task failure.
+  "inconclusive"
+} else {
+  "failed"
+}
 $summary = [ordered]@{
   schemaVersion = 1
   suiteId = $suiteId
   startedAt = $startedAt.ToUniversalTime().ToString("o")
   completedAt = (Get-Date).ToUniversalTime().ToString("o")
-  status = if ($allSucceeded) { "passed" } else { "failed" }
+  status = $suiteStatus
   provider = [ordered]@{
     profile = $Profile
     expectedModel = $ExpectedModel
@@ -153,20 +180,33 @@ $summary = [ordered]@{
   aggregate = [ordered]@{
     requestedRuns = $runs.Count
     validRuns = $validRuns.Count
+    scoredRuns = $scoredRuns.Count
+    inconclusiveRuns = $inconclusiveRuns.Count
     passedRuns = $passedRuns.Count
-    passRate = if ($validRuns.Count -gt 0) {
-      [double]$passedRuns.Count / [double]$validRuns.Count
+    passRate = if ($scoredRuns.Count -gt 0) {
+      [double]$passedRuns.Count / [double]$scoredRuns.Count
     } else { $null }
   }
   tasks = $taskSummaries
-  infrastructureFailures = @($runs | Where-Object { $null -eq $_.result } | ForEach-Object {
+  infrastructureFailures = @(
+    $runs | Where-Object { $null -eq $_.result } | ForEach-Object {
     [ordered]@{
       taskId = $_.taskId
       repetition = $_.repetition
       exitCode = $_.exitCode
       output = $_.runnerOutput
     }
-  })
+  }
+    $inconclusiveRuns | ForEach-Object {
+      [ordered]@{
+        taskId = $_.taskId
+        repetition = $_.repetition
+        exitCode = $_.exitCode
+        failureCategory = $_.result.failureCategory
+        output = $_.result.error
+      }
+    }
+  )
 }
 
 $summaryJson = $summary | ConvertTo-Json -Depth 60

@@ -59,22 +59,43 @@ function Invoke-JsonPost {
   param(
     [Parameter(Mandatory = $true)][System.Net.Http.HttpClient]$Client,
     [Parameter(Mandatory = $true)][string]$Url,
-    [Parameter(Mandatory = $true)][object]$Payload
+    [Parameter(Mandatory = $true)][object]$Payload,
+    [ValidateRange(1, 5)][int]$MaxAttempts = 3
   )
 
   $json = $Payload | ConvertTo-Json -Depth 40 -Compress
-  $content = [System.Net.Http.StringContent]::new(
-    $json,
-    [Text.Encoding]::UTF8,
-    "application/json"
-  )
-  $response = $Client.PostAsync($Url, $content).GetAwaiter().GetResult()
-  $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-  return [PSCustomObject]@{
-    Status = [int]$response.StatusCode
-    Success = $response.IsSuccessStatusCode
-    ContentType = [string]$response.Content.Headers.ContentType
-    Body = $body
+  for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+    # HttpContent is single-use.  A fresh instance is also required for retries.
+    $content = [System.Net.Http.StringContent]::new(
+      $json,
+      [Text.Encoding]::UTF8,
+      "application/json"
+    )
+    try {
+      $response = $Client.PostAsync($Url, $content).GetAwaiter().GetResult()
+      $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+      $status = [int]$response.StatusCode
+      $retryable = $status -eq 429 -or $status -eq 502 -or $status -eq 503 -or $status -eq 504
+      if (-not $retryable -or $attempt -eq $MaxAttempts) {
+        return [PSCustomObject]@{
+          Status = $status
+          Success = $response.IsSuccessStatusCode
+          ContentType = [string]$response.Content.Headers.ContentType
+          Body = $body
+          Attempts = $attempt
+        }
+      }
+    } catch {
+      if ($attempt -eq $MaxAttempts) {
+        throw
+      }
+    } finally {
+      $content.Dispose()
+    }
+
+    # A bounded retry prevents a momentary relay outage from being labelled a
+    # protocol incompatibility while keeping permanent 4xx failures immediate.
+    Start-Sleep -Seconds ($attempt * 2)
   }
 }
 
@@ -123,6 +144,7 @@ function Measure-StreamResponse {
   $usage = @($sse.Events | Where-Object { $null -ne $_.usage }).Count -gt 0
   return [ordered]@{
     status = $Response.Status
+    attempts = $Response.Attempts
     contentType = $Response.ContentType
     bodyBytes = [Text.Encoding]::UTF8.GetByteCount($Response.Body)
     sseEvents = $sse.Events.Count
