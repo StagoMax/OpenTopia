@@ -125,12 +125,12 @@ pub use prompt_runtime::{
     PromptRuntimeCapabilities, RuntimeSurface,
 };
 pub use provider::{
-    redact_model_observation, AnthropicMessagesProvider, CodexAppServerProvider, IncompleteReason,
-    MockProvider, ModelConversationMessage, ModelConversationRole, ModelDecision,
-    ModelFinishReason, ModelInputContent, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider, OpenAiResponsesProvider,
-    PreparedProviderRequest, ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
-    ProviderTransportEvent,
+    redact_model_observation, AnthropicMessagesProvider, CodexAccountManager, CodexAccountStatus,
+    CodexAppServerProvider, CodexLoginStart, IncompleteReason, MockProvider,
+    ModelConversationMessage, ModelConversationRole, ModelDecision, ModelFinishReason,
+    ModelInputContent, ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
+    OpenAiCompatibleProvider, OpenAiResponsesProvider, PreparedProviderRequest, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolResult, ProviderTransportEvent,
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,
@@ -138,9 +138,10 @@ pub use sandbox::{
     SandboxCommandPlan, SandboxCommandStatus, SandboxDescriptor, SandboxLifecycle, SandboxMode,
 };
 pub use settings::{
-    AppSettings, NativeCompactionProtocol, ProviderCapabilities, ProviderHealth,
-    ProviderHealthCheck, ProviderKind, ProviderSettings, RolloutBudgetSettings, SandboxEnforcement,
-    SandboxSettings, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
+    AppSettings, NativeCompactionProtocol, OpenAiCompatibilityReport, OpenAiProtocol,
+    ProviderCapabilities, ProviderFeatureSupport, ProviderHealth, ProviderHealthCheck,
+    ProviderKind, ProviderSettings, RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
+    MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,

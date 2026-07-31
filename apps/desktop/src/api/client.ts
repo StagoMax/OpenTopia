@@ -6,6 +6,8 @@ import type {
   ArtifactDescriptor,
   BrowserOutput,
   CollaborationMode,
+  CodexAccountStatus,
+  CodexLoginStart,
   ComputerObservation,
   ComputerWindowTarget,
   ContextStatus,
@@ -155,6 +157,22 @@ export class ApiClient {
 
   async getProviderHealth(): Promise<ProviderHealth[]> {
     return this.get("/api/provider/health");
+  }
+
+  async getCodexAccount(): Promise<CodexAccountStatus> {
+    return this.get("/api/codex/account");
+  }
+
+  async startCodexLogin(deviceCode = true): Promise<CodexLoginStart> {
+    return this.post("/api/codex/account/login", { deviceCode });
+  }
+
+  async cancelCodexLogin(): Promise<void> {
+    await this.post("/api/codex/account/login/cancel", {});
+  }
+
+  async logoutCodexAccount(): Promise<void> {
+    await this.post("/api/codex/account/logout", {});
   }
 
   async listSkills(workspaceRoot?: string | null): Promise<SkillDescriptor[]> {

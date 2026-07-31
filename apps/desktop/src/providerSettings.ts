@@ -6,7 +6,13 @@ export const OPENAI_MODEL_GUIDE_URL =
   "https://developers.openai.com/api/docs/guides/latest-model";
 export const OPENAI_REASONING_GUIDE_URL =
   "https://developers.openai.com/api/docs/guides/reasoning#reasoning-effort";
-export const OPENAI_MODEL_CATALOG_VERIFIED_AT = "2026-07-26";
+export const ANTHROPIC_EFFORT_GUIDE_URL =
+  "https://platform.claude.com/docs/en/build-with-claude/effort";
+export const KIMI_K3_MODEL_GUIDE_URL =
+  "https://www.kimi.com/code/docs/en/kimi-code/models.html";
+export const GLM_THINKING_GUIDE_URL =
+  "https://docs.bigmodel.cn/cn/guide/capabilities/thinking";
+export const OPENAI_MODEL_CATALOG_VERIFIED_AT = "2026-07-30";
 
 export type OfficialModelPreset = {
   model: string;
@@ -79,6 +85,27 @@ const GPT_5_EFFORTS = [
   "medium",
   "high",
 ] as const satisfies readonly ReasoningEffort[];
+const KIMI_K3_EFFORTS = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const satisfies readonly ReasoningEffort[];
+const CLAUDE_46_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "max",
+] as const satisfies readonly ReasoningEffort[];
+const CLAUDE_XHIGH_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const satisfies readonly ReasoningEffort[];
 
 export const OFFICIAL_OPENAI_MODEL_PRESETS: readonly OfficialModelPreset[] = [
   {
@@ -129,6 +156,53 @@ const modelCapabilityRules: ReadonlyArray<{
   pattern: RegExp;
   capability: ModelReasoningCapability;
 }> = [
+  {
+    // Kimi maps `medium` to high and `xhigh` to max. `none` is its explicit
+    // thinking-off control; `minimal` is not an accepted K3 effort value.
+    pattern: /(?:^|[/\.])(?:kimi-)?k3(?:-256k)?(?:$|[-\[])/,
+    capability: officialCapability(
+      KIMI_K3_EFFORTS,
+      "high",
+      KIMI_K3_MODEL_GUIDE_URL,
+    ),
+  },
+  {
+    pattern: /(?:^|[/\.])glm-5\.2(?:$|[-\[])/,
+    capability: officialCapability(
+      ALL_REASONING_EFFORTS,
+      "max",
+      GLM_THINKING_GUIDE_URL,
+    ),
+  },
+  {
+    pattern:
+      /(?:^|[/\.])claude-(?:(?:opus-(?:4-(?:7|8)|5))|(?:sonnet-5)|(?:fable-5)|(?:mythos-(?:5|preview)))(?:$|-)/,
+    capability: officialCapability(
+      CLAUDE_XHIGH_EFFORTS,
+      "high",
+      ANTHROPIC_EFFORT_GUIDE_URL,
+    ),
+  },
+  {
+    pattern: /(?:^|[/\.])claude-(?:opus|sonnet)-4-6(?:$|-)/,
+    capability: officialCapability(
+      CLAUDE_46_EFFORTS,
+      "high",
+      ANTHROPIC_EFFORT_GUIDE_URL,
+    ),
+  },
+  {
+    // Earlier Claude versions use manual `thinking: { type: "enabled",
+    // budget_tokens }`, not the effort parameter exposed by this setting.
+    pattern: /(?:^|[/\.])claude-(?:$|[-\d])/,
+    capability: {
+      status: "unsupported",
+      supportedEfforts: [],
+      defaultEffort: null,
+      sourceUrl: ANTHROPIC_EFFORT_GUIDE_URL,
+      official: true,
+    },
+  },
   {
     pattern: /^gpt-5\.6(?:-(?:sol|terra|luna))?(?:$|-\d{4}-\d{2}-\d{2})/,
     capability: officialCapability(
@@ -250,11 +324,7 @@ export function resolveModelReasoningCapability(
   providerKind: ProviderKind,
   model: string,
 ): ModelReasoningCapability {
-  if (
-    providerKind === "anthropic" ||
-    providerKind === "codex_app_server" ||
-    providerKind === "mock"
-  ) {
+  if (providerKind === "codex_app_server" || providerKind === "mock") {
     return NOT_APPLICABLE_REASONING_CAPABILITY;
   }
 

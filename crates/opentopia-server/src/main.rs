@@ -25,7 +25,8 @@ use opentopia_core::{
     BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
     BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
     BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
-    BrowserWaitRequest, ChangedFile, CodexAppServerProvider, CollaborationMode,
+    BrowserWaitRequest, ChangedFile, CodexAccountManager, CodexAccountStatus,
+    CodexAppServerProvider, CodexLoginStart, CollaborationMode,
     CompiledModelContext, ComputerRuntime, ComputerRuntimeConfig, ComputerSessionId,
     ContextCacheScope, ContextCheckpoint, ContextCheckpointArtifact, ContextCheckpointCommand,
     ContextCheckpointCoverage, ContextCheckpointFact, ContextCheckpointInteraction,
@@ -37,9 +38,10 @@ use opentopia_core::{
     LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment, McpCallResult,
     McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole,
     ModelContentPart, ModelContextItem, ModelConversationMessage, ModelConversationRole,
-    ModelProvider, ModelRequest, ObserveOptions, OpenAiCompatibleProvider, OpenAiResponsesProvider,
-    PermissionMode, PluginDescriptor, PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor,
-    PreviewError, PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook,
+    ModelProvider, ModelRequest, ObserveOptions, OpenAiCompatibleProvider, OpenAiProtocol,
+    OpenAiResponsesProvider, PermissionMode, PluginDescriptor, PluginError, PolicyDecision,
+    PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest, PreviewTarget,
+    PreviewWorkbook,
     ProviderConversationCursor, ProviderConversationState, ProviderHealth, ProviderHealthCheck,
     ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit,
     RuntimeSurface, SandboxDescriptor, SandboxSettings, SessionStore, SkillDescriptor, SkillRef,
@@ -178,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         store: store.clone(),
         agent,
         settings,
+        codex_account: Arc::new(CodexAccountManager::default()),
         events: EventBus::default(),
         terminals: TerminalBus::default(),
         ptys: PtyManager::default(),
@@ -325,6 +328,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/threads/:thread_id/plugins", put(set_thread_plugin))
         .route("/api/provider/health", get(provider_health))
         .route("/api/provider/test", post(test_provider_connection))
+        .route("/api/codex/account", get(get_codex_account))
+        .route("/api/codex/account/login", post(start_codex_login))
+        .route("/api/codex/account/login/cancel", post(cancel_codex_login))
+        .route("/api/codex/account/logout", post(logout_codex_account))
         .route(
             "/api/provider/:provider_id/models/sync",
             post(sync_provider_models),
@@ -531,6 +538,7 @@ struct AppState {
     store: Arc<SqliteSessionStore>,
     agent: Arc<RwLock<AgentCore>>,
     settings: Arc<RwLock<AppSettings>>,
+    codex_account: Arc<CodexAccountManager>,
     events: EventBus,
     terminals: TerminalBus,
     ptys: PtyManager,
@@ -1230,6 +1238,38 @@ async fn provider_health(State(state): State<AppState>) -> Json<Vec<ProviderHeal
     )
 }
 
+async fn get_codex_account(
+    State(state): State<AppState>,
+) -> Result<Json<CodexAccountStatus>, ApiError> {
+    Ok(Json(state.codex_account.status().await?))
+}
+
+async fn start_codex_login(
+    State(state): State<AppState>,
+    Json(request): Json<CodexLoginRequest>,
+) -> Result<Json<CodexLoginStart>, ApiError> {
+    Ok(Json(
+        state
+            .codex_account
+            .start_chatgpt_login(request.device_code)
+            .await?,
+    ))
+}
+
+async fn cancel_codex_login(
+    State(state): State<AppState>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    state.codex_account.cancel_login().await?;
+    Ok(Json(DeleteResponse { deleted: true }))
+}
+
+async fn logout_codex_account(
+    State(state): State<AppState>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    state.codex_account.logout().await?;
+    Ok(Json(DeleteResponse { deleted: true }))
+}
+
 async fn list_skills(
     State(state): State<AppState>,
     Query(query): Query<SkillsQuery>,
@@ -1491,26 +1531,70 @@ async fn test_provider_connection(
             .ok_or_else(|| ApiError::not_found(format!("provider not found: {provider_id}")))?
     } else {
         settings.active_provider()
-    };
-    let provider: Box<dyn ModelProvider> = match provider_settings.kind {
-        ProviderKind::Mock => {
-            return Err(ApiError::bad_request(
-                "mock provider has no remote connection",
-            ))
-        }
-        ProviderKind::OpenAiCompatible => {
-            OpenAiCompatibleProvider::from_settings(provider_settings)
-                .map(|provider| Box::new(provider) as Box<dyn ModelProvider>)
-        }
-        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(provider_settings)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(provider_settings)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(provider_settings)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
     }
-    .ok_or_else(|| ApiError::bad_request("provider is not configured"))?;
-    let result = provider.check_health().await?;
+    .clone();
+    let result = if matches!(
+        &provider_settings.kind,
+        &ProviderKind::OpenAiCompatible | &ProviderKind::OpenAiResponses
+    ) {
+        OpenAiCompatibleProvider::probe_settings(&provider_settings).await?
+    } else {
+        let provider: Box<dyn ModelProvider> = match provider_settings.kind.clone() {
+            ProviderKind::Mock => {
+                return Err(ApiError::bad_request(
+                    "mock provider has no remote connection",
+                ))
+            }
+            ProviderKind::OpenAiCompatible | ProviderKind::OpenAiResponses => unreachable!(),
+            ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(&provider_settings)
+                .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
+            ProviderKind::CodexAppServer => {
+                CodexAppServerProvider::from_settings(&provider_settings)
+                    .map(|provider| Box::new(provider) as Box<dyn ModelProvider>)
+            }
+        }
+        .ok_or_else(|| ApiError::bad_request("provider is not configured"))?;
+        provider.check_health().await?
+    };
+
+    if result.reachable && result.model_available {
+        if let Some(report) = result.openai_compatibility.as_ref() {
+            let mut latest = current_settings(&state);
+            if let Some(target) = latest
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == provider_settings.id)
+                .filter(|provider| {
+                    report.applies_to(&provider.base_url, &provider.model)
+                        && matches!(
+                            &provider.kind,
+                            &ProviderKind::OpenAiCompatible | &ProviderKind::OpenAiResponses
+                        )
+                })
+            {
+                target.kind = match report.selected_protocol {
+                    OpenAiProtocol::ChatCompletions => ProviderKind::OpenAiCompatible,
+                    OpenAiProtocol::Responses => ProviderKind::OpenAiResponses,
+                };
+                target.openai_compatibility = Some(report.clone());
+                let latest = state.store.save_settings(latest)?;
+                {
+                    let mut settings_guard =
+                        state.settings.write().expect("settings lock poisoned");
+                    *settings_guard = latest.clone();
+                }
+                {
+                    let mut agent_guard = state.agent.write().expect("agent lock poisoned");
+                    let mut agent = AgentCore::from_settings(&latest);
+                    agent.set_browser_runtime(state.browser.clone());
+                    agent.set_computer_runtime(state.computer.clone());
+                    agent.set_subagent_scheduler(state.subagents.clone());
+                    agent.set_background_processes(state.background.clone());
+                    *agent_guard = agent;
+                }
+            }
+        }
+    }
     Ok(Json(result))
 }
 
@@ -1545,7 +1629,7 @@ async fn sync_provider_models(
             ))
         })?;
 
-    let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+    let url = provider_model_catalog_url(&provider);
     let mut request = reqwest::Client::new()
         .get(&url)
         .timeout(Duration::from_secs(20));
@@ -1603,7 +1687,7 @@ async fn sync_provider_models(
         )));
     };
     target.synced_models = models.clone();
-    target.model_context_windows = context_windows;
+    target.model_context_windows = context_windows.clone();
     target.models_synced_at = Some(synced_at);
     let settings = state.store.save_settings(settings)?;
     {
@@ -1614,8 +1698,18 @@ async fn sync_provider_models(
     Ok(Json(ProviderModelSyncResult {
         provider_id,
         models,
+        model_context_windows: context_windows,
         synced_at,
     }))
+}
+
+fn provider_model_catalog_url(provider: &ProviderSettings) -> String {
+    let base_url = provider.base_url.trim_end_matches('/');
+    if provider.kind == ProviderKind::Anthropic {
+        format!("{base_url}/v1/models")
+    } else {
+        format!("{base_url}/models")
+    }
 }
 
 /// Model ids paired with the context window the endpoint reported, when it
@@ -1659,22 +1753,33 @@ fn extract_model_catalog(payload: &Value) -> Vec<(String, Option<usize>)> {
 /// sanity-checked so a bogus catalog cannot inflate the window and overflow the
 /// real limit mid-conversation.
 fn extract_context_window(entry: &Value) -> Option<usize> {
-    const CONTEXT_WINDOW_FIELDS: [&str; 5] = [
+    const CONTEXT_WINDOW_FIELDS: [&str; 8] = [
         "context_length",   // OpenRouter, many relay panels
         "max_model_len",    // vLLM
         "context_window",   // assorted gateways
         "max_input_tokens", // LiteLLM
         "context_size",
+        "max_context_length",
+        "max_context_tokens",
+        "max_sequence_length",
     ];
 
-    let direct = CONTEXT_WINDOW_FIELDS
-        .iter()
-        .find_map(|field| entry.get(*field).and_then(Value::as_u64));
-    // OpenRouter nests the authoritative value under `top_provider`.
-    let nested = entry
-        .get("top_provider")
-        .and_then(|provider| provider.get("context_length"))
-        .and_then(Value::as_u64);
+    let read_window = |object: &Value| {
+        CONTEXT_WINDOW_FIELDS.iter().find_map(|field| {
+            object.get(*field).and_then(|value| {
+                value.as_u64().or_else(|| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+            })
+        })
+    };
+    let direct = read_window(entry);
+    // OpenRouter and several relay catalogs nest provider-specific limits.
+    let nested = entry.get("top_provider").and_then(read_window);
 
     direct
         .or(nested)
@@ -6380,8 +6485,14 @@ fn persist_and_publish_payload(
     }
     let goal_projection = match &payload {
         AgentEventPayload::PlanUpdated { plan } => {
-            match state.store.apply_goal_plan(thread_id, turn_id, plan) {
-                Ok(snapshot) => Some(snapshot),
+            // Default collaboration mode keeps a runtime task plan, but does
+            // not create a persistent GoalRecord. Its stable `goal_id` is a
+            // plan namespace rather than a UUID, so projecting it into the
+            // goals table would emit a false persistence error after every
+            // successful update_plan call.
+            let projection = project_plan_to_thread_goal(&state.store, thread_id, turn_id, plan);
+            match projection {
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     error!(?error, %thread_id, %turn_id, "failed to project plan into goal state");
                     publish_payload(
@@ -6420,6 +6531,21 @@ fn persist_and_publish_payload(
             AgentEventPayload::GoalUpdated { snapshot },
         );
     }
+}
+
+fn project_plan_to_thread_goal(
+    store: &SqliteSessionStore,
+    thread_id: Uuid,
+    turn_id: Uuid,
+    plan: &TaskPlan,
+) -> anyhow::Result<Option<GoalSnapshot>> {
+    // A task plan is valid in default collaboration mode even though no goal
+    // exists. Only plan/goal mode creates a GoalRecord that can receive the
+    // stricter UUID-backed projection.
+    if store.get_thread_goal(thread_id)?.is_none() {
+        return Ok(None);
+    }
+    store.apply_goal_plan(thread_id, turn_id, plan).map(Some)
 }
 
 fn is_approval_boundary(payload: &AgentEventPayload) -> bool {
@@ -9274,11 +9400,23 @@ struct ProviderTestRequest {
     provider_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexLoginRequest {
+    #[serde(default = "default_codex_device_code")]
+    device_code: bool,
+}
+
+fn default_codex_device_code() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderModelSyncResult {
     provider_id: String,
     models: Vec<String>,
+    model_context_windows: BTreeMap<String, usize>,
     synced_at: DateTime<Utc>,
 }
 
@@ -10097,12 +10235,26 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_uses_anthropics_versioned_models_endpoint() {
+        let provider = ProviderSettings {
+            kind: ProviderKind::Anthropic,
+            base_url: "https://api.anthropic.com/".to_string(),
+            ..ProviderSettings::default()
+        };
+        assert_eq!(
+            provider_model_catalog_url(&provider),
+            "https://api.anthropic.com/v1/models"
+        );
+    }
+
+    #[test]
     fn model_catalog_picks_up_whichever_context_field_the_endpoint_uses() {
         let payload = json!({"data": [
             {"id": "a", "context_length": 200_000},
             {"id": "b", "max_model_len": 32_768},
             {"id": "c", "max_input_tokens": 128_000},
             {"id": "d", "top_provider": {"context_length": 1_000_000}},
+            {"id": "e", "max_context_tokens": "256000"},
         ]});
         assert_eq!(
             extract_model_catalog(&payload),
@@ -10111,6 +10263,7 @@ mod tests {
                 ("b".to_string(), Some(32_768)),
                 ("c".to_string(), Some(128_000)),
                 ("d".to_string(), Some(1_000_000)),
+                ("e".to_string(), Some(256_000)),
             ]
         );
     }
@@ -10121,7 +10274,7 @@ mod tests {
         let payload = json!({"data": [
             {"id": "tiny", "context_length": 8},
             {"id": "huge", "context_length": 999_000_000_u64},
-            {"id": "text", "context_length": "200000"},
+            {"id": "text", "context_length": "not-a-number"},
         ]});
         assert_eq!(
             extract_model_catalog(&payload),
@@ -10628,13 +10781,13 @@ mod tests {
         provider.id = "custom-glm".to_string();
         provider.name = "Custom GLM".to_string();
         provider.base_url = "https://example.test/v1".to_string();
-        provider.temperature = 0.7;
+        provider.temperature = Some(0.7);
         provider.max_output_tokens = Some(8_192);
         provider.context_window_tokens = Some(128_000);
         provider.reasoning_effort = Some("high".to_string());
         validate_provider_settings(&[provider.clone()]).expect("valid provider settings");
 
-        provider.temperature = 3.0;
+        provider.temperature = Some(3.0);
         let error = validate_provider_settings(&[provider]).expect_err("reject temperature");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
 
@@ -10848,6 +11001,25 @@ mod tests {
             approval_execution("shell:run", false),
             ApprovalExecution::ResumeAgent
         );
+    }
+
+    #[test]
+    fn default_task_plan_is_not_projected_without_a_goal_record() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let thread = store
+            .create_thread(None, std::env::current_dir().expect("cwd"))
+            .expect("create thread");
+        let plan = TaskPlan {
+            plan_revision: 1,
+            goal_id: "long-evaluation-run".to_string(),
+            change_reason: None,
+            steps: Vec::new(),
+        };
+
+        let projection = project_plan_to_thread_goal(&store, thread.id, Uuid::new_v4(), &plan)
+            .expect("default task plan is valid without a GoalRecord");
+
+        assert!(projection.is_none());
     }
 
     #[test]

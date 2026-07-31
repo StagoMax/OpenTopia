@@ -130,7 +130,7 @@ test("official OpenAI reasoning rules stay authoritative", () => {
   assert.equal(capability.defaultEffort, "medium");
 });
 
-test("family rules cover models the official table does not know", () => {
+test("Kimi K3 uses its documented compatibility effort mapping", () => {
   const capability = resolveReasoningOptions("openai_compatible", "kimi-k3");
   assert.equal(capability.status, "supported");
   assert.deepEqual(capability.supportedEfforts, [
@@ -138,6 +138,8 @@ test("family rules cover models the official table does not know", () => {
     "low",
     "medium",
     "high",
+    "xhigh",
+    "max",
   ]);
 });
 

@@ -3867,6 +3867,7 @@ mod tests {
                 latency_ms: None,
                 model_available: true,
                 error: None,
+                openai_compatibility: None,
             })
         }
     }
@@ -4094,6 +4095,7 @@ mod tests {
                 latency_ms: None,
                 model_available: true,
                 error: None,
+                openai_compatibility: None,
             })
         }
     }

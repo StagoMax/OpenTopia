@@ -1240,6 +1240,7 @@ mod tests {
                 latency_ms: Some(100),
                 model_available: true,
                 error: None,
+                openai_compatibility: None,
             })
         }
     }
@@ -1278,6 +1279,7 @@ mod tests {
                 latency_ms: Some(0),
                 model_available: true,
                 error: None,
+                openai_compatibility: None,
             })
         }
     }

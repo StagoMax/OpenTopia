@@ -25,6 +25,48 @@ pub enum ProviderKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum OpenAiProtocol {
+    ChatCompletions,
+    Responses,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFeatureSupport {
+    Supported,
+    Unsupported,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAiCompatibilityReport {
+    pub base_url: String,
+    pub model: String,
+    pub selected_protocol: OpenAiProtocol,
+    pub chat_completions: ProviderFeatureSupport,
+    #[serde(default)]
+    pub chat_function_tools: ProviderFeatureSupport,
+    pub responses: ProviderFeatureSupport,
+    #[serde(default)]
+    pub responses_native_tools: ProviderFeatureSupport,
+    pub developer_messages: ProviderFeatureSupport,
+    pub message_compatibility: bool,
+    pub checked_at: DateTime<Utc>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl OpenAiCompatibilityReport {
+    pub fn applies_to(&self, base_url: &str, model: &str) -> bool {
+        self.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+            && self.model.trim() == model.trim()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PromptCachePolicy {
     /// GPT-5.6 and later: cache only prefixes ending at explicit breakpoints.
     Explicit30m,
@@ -121,6 +163,11 @@ pub struct ProviderSettings {
     /// capability users need to declare; transport support is probed at use.
     #[serde(default = "default_provider_supports_vision")]
     pub supports_vision: bool,
+    /// Last explicit compatibility probe for an OpenAI-compatible `/v1`
+    /// connection. The endpoint and model are included so stale results are
+    /// ignored after either setting changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_compatibility: Option<OpenAiCompatibilityReport>,
     pub api_key_source: String,
     pub api_key_configured: bool,
     pub health_status: Option<String>,
@@ -149,6 +196,7 @@ impl Default for ProviderSettings {
             responses_compaction_threshold_tokens: None,
             rollout_budget: None,
             supports_vision: default_provider_supports_vision(),
+            openai_compatibility: None,
             api_key_source: "OPENTOPIA_API_KEY".to_string(),
             api_key_configured: false,
             health_status: None,
@@ -330,6 +378,9 @@ pub fn known_model_context_window_tokens(model: &str) -> Option<usize> {
 
 fn context_window_for_base(model: &str) -> Option<usize> {
     // ── OpenAI ──────────────────────────────────────────────────────────
+    if model.starts_with("gpt-5.6") {
+        return Some(1_047_576);
+    }
     if model.starts_with("gpt-5") {
         return Some(272_000);
     }
@@ -344,6 +395,9 @@ fn context_window_for_base(model: &str) -> Option<usize> {
     }
 
     // ── Anthropic ───────────────────────────────────────────────────────
+    if claude_model_has_one_million_context(model) {
+        return Some(1_000_000);
+    }
     if model.starts_with("claude-") || model.contains("claude") {
         return Some(200_000);
     }
@@ -370,7 +424,15 @@ fn context_window_for_base(model: &str) -> Option<usize> {
     if model.starts_with("moonshot-v1") {
         return Some(8_000); // base tier
     }
-    // kimi-k2.5 is the only 256K variant; everything else is 128K.
+    // K3 has a tier-dependent 1M variant and an explicit 256K variant. A
+    // reported connection limit or manual override takes precedence here.
+    if model.starts_with("k3-256k") || model.starts_with("kimi-k3-256k") {
+        return Some(256_000);
+    }
+    if model == "k3" || model.starts_with("k3-") || model.starts_with("kimi-k3") {
+        return Some(1_000_000);
+    }
+    // kimi-k2.5 is a 256K variant; other legacy Kimi IDs are 128K.
     if model.starts_with("kimi-k2.5") {
         return Some(256_000);
     }
@@ -393,6 +455,9 @@ fn context_window_for_base(model: &str) -> Option<usize> {
     }
 
     // ── Zhipu GLM ───────────────────────────────────────────────────────
+    if model.starts_with("glm-5.2") {
+        return Some(1_000_000);
+    }
     if model.starts_with("glm") || model.starts_with("chatglm") {
         return Some(128_000);
     }
@@ -418,6 +483,22 @@ fn context_window_for_base(model: &str) -> Option<usize> {
     }
 
     None
+}
+
+fn claude_model_has_one_million_context(model: &str) -> bool {
+    [
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-mythos-preview",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
 }
 
 /// Whether a model accepts a caller-supplied `temperature`.
@@ -782,6 +863,8 @@ pub struct ProviderHealthCheck {
     pub latency_ms: Option<u64>,
     pub model_available: bool,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_compatibility: Option<OpenAiCompatibilityReport>,
 }
 
 fn first_env<const N: usize>(keys: [&str; N]) -> Option<String> {
@@ -881,7 +964,7 @@ mod tests {
     fn context_window_table_covers_the_families_the_picker_offers() {
         assert_eq!(
             known_model_context_window_tokens("gpt-5.6-sol"),
-            Some(272_000)
+            Some(1_047_576)
         );
         assert_eq!(
             known_model_context_window_tokens("gpt-4.1-mini"),
@@ -892,7 +975,8 @@ mod tests {
             known_model_context_window_tokens("anthropic/claude-sonnet-4-5"),
             Some(200_000)
         );
-        // kimi-k2.5 is 256K; kimi-k2, kimi-k3 and others are 128K
+        // K3 has a 1M tier and an explicit 256K model ID; per-connection
+        // entitlement still wins through detected or manually set values.
         assert_eq!(
             known_model_context_window_tokens("kimi-k2.5"),
             Some(256_000)
@@ -902,8 +986,20 @@ mod tests {
             Some(128_000)
         );
         assert_eq!(
+            known_model_context_window_tokens("k3-256k"),
+            Some(256_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("glm-5.2"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("claude-sonnet-4-6"),
+            Some(1_000_000)
+        );
+        assert_eq!(
             known_model_context_window_tokens("kimi-k3"),
-            Some(128_000)
+            Some(1_000_000)
         );
         assert_eq!(
             known_model_context_window_tokens("moonshot-v1-32k"),
@@ -1045,6 +1141,35 @@ mod tests {
         assert_eq!(provider.prompt_cache_policy, None);
         assert_eq!(provider.responses_compaction_threshold_tokens, None);
         assert_eq!(provider.rollout_budget, None);
+        assert_eq!(provider.openai_compatibility, None);
+    }
+
+    #[test]
+    fn openai_compatibility_report_round_trips_and_rejects_stale_settings() {
+        let mut provider = ProviderSettings::default();
+        provider.base_url = "https://relay.example/v1".to_string();
+        provider.model = "relay-model".to_string();
+        provider.openai_compatibility = Some(OpenAiCompatibilityReport {
+            base_url: provider.base_url.clone(),
+            model: provider.model.clone(),
+            selected_protocol: OpenAiProtocol::ChatCompletions,
+            chat_completions: ProviderFeatureSupport::Supported,
+            chat_function_tools: ProviderFeatureSupport::Supported,
+            responses: ProviderFeatureSupport::Unsupported,
+            responses_native_tools: ProviderFeatureSupport::Unsupported,
+            developer_messages: ProviderFeatureSupport::Unsupported,
+            message_compatibility: true,
+            checked_at: Utc::now(),
+            notes: vec!["developer messages: HTTP 400".to_string()],
+        });
+
+        let encoded = serde_json::to_string(&provider).unwrap();
+        let restored: ProviderSettings = serde_json::from_str(&encoded).unwrap();
+        let report = restored.openai_compatibility.unwrap();
+
+        assert!(report.applies_to("https://relay.example/v1/", "relay-model"));
+        assert!(!report.applies_to("https://other.example/v1", "relay-model"));
+        assert!(!report.applies_to("https://relay.example/v1", "other-model"));
     }
 
     #[test]

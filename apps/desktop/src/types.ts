@@ -165,6 +165,8 @@ export type ThreadModelSelection = {
 export type ProviderModelSyncResult = {
   providerId: string;
   models: string[];
+  /** Context windows advertised alongside model ids, when the endpoint exposes them. */
+  modelContextWindows: Record<string, number>;
   syncedAt: string;
 };
 
@@ -194,6 +196,24 @@ export type ProviderKind =
   | "openai_responses"
   | "anthropic"
   | "codex_app_server";
+
+export type OpenAiProtocol = "chat_completions" | "responses";
+
+export type ProviderFeatureSupport = "supported" | "unsupported" | "unknown";
+
+export type OpenAiCompatibilityReport = {
+  baseUrl: string;
+  model: string;
+  selectedProtocol: OpenAiProtocol;
+  chatCompletions: ProviderFeatureSupport;
+  chatFunctionTools: ProviderFeatureSupport;
+  responses: ProviderFeatureSupport;
+  responsesNativeTools: ProviderFeatureSupport;
+  developerMessages: ProviderFeatureSupport;
+  messageCompatibility: boolean;
+  checkedAt: string;
+  notes: string[];
+};
 
 export type AppSettings = {
   providers: ProviderSettings[];
@@ -255,6 +275,7 @@ export type ProviderSettings = {
   responsesCompactionThresholdTokens?: number | null;
   rolloutBudget?: RolloutBudgetSettings | null;
   supportsVision: boolean;
+  openaiCompatibility?: OpenAiCompatibilityReport | null;
   apiKeySource: string;
   apiKeyConfigured: boolean;
   healthStatus?: string | null;
@@ -282,6 +303,31 @@ export type ProviderHealthCheckResult = {
   latencyMs?: number | null;
   modelAvailable: boolean;
   error?: string | null;
+  openaiCompatibility?: OpenAiCompatibilityReport | null;
+};
+
+export type CodexAccountStatus = {
+  loggedIn: boolean;
+  authMode?: string | null;
+  planType?: string | null;
+  email?: string | null;
+  accountId?: string | null;
+  loginPending: boolean;
+  loginId?: string | null;
+  loginType?: string | null;
+  authUrl?: string | null;
+  verificationUrl?: string | null;
+  userCode?: string | null;
+  rateLimits?: unknown;
+  usage?: unknown;
+};
+
+export type CodexLoginStart = {
+  loginId: string;
+  loginType: string;
+  authUrl?: string | null;
+  verificationUrl?: string | null;
+  userCode?: string | null;
 };
 
 export type LogFileInfo = {
@@ -1505,6 +1551,23 @@ declare global {
         offset?: number,
         limit?: number,
       ): Promise<{ lines: string[]; total: number }>;
+      recordConversationRenderTrace?(trace: {
+        stage: "received" | "committed" | "painted";
+        channel: "assistant" | "commentary" | "reasoning" | "status";
+        threadId: string;
+        turnId?: string | null;
+        eventId?: string;
+        messageId?: string;
+        seq?: number;
+        sourceCreatedAt?: string;
+        rendererAt: string;
+        rendererClockMs: number;
+        latencyMs?: number;
+        change: "append" | "replace";
+        text: string;
+        textLength: number;
+        visible: boolean;
+      }): void;
       browserHost?: {
         createSession(input: {
           sessionId: string;
@@ -1515,6 +1578,10 @@ declare global {
         destroySession(sessionId: string): Promise<void>;
         getState(sessionId: string): Promise<WebPreviewState>;
         navigate(sessionId: string, url: string): Promise<unknown>;
+        navigateFromAddressBar(
+          sessionId: string,
+          url: string,
+        ): Promise<unknown>;
         back(sessionId: string): Promise<unknown>;
         forward(sessionId: string): Promise<unknown>;
         reload(sessionId: string): Promise<unknown>;

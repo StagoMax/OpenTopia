@@ -118,13 +118,13 @@ test("drops invalid known-model effort values but preserves custom compatibility
   );
 });
 
-test("clears reasoning effort for providers that do not map the parameter", () => {
+test("keeps Claude effort when its model supports Anthropic's effort parameter", () => {
   const provider = normalizeProviderReasoningEffort({
     id: "anthropic",
     name: "Anthropic",
     kind: "anthropic",
     baseUrl: "https://api.anthropic.com",
-    model: "claude-sonnet-4-20250514",
+    model: "claude-sonnet-4-6",
     enabledFamilies: [],
     syncedModels: [],
     modelsSyncedAt: null,
@@ -144,7 +144,22 @@ test("clears reasoning effort for providers that do not map the parameter", () =
     healthStatus: null,
   });
 
-  assert.equal(provider.reasoningEffort, null);
+  assert.equal(provider.reasoningEffort, "high");
+  assert.deepEqual(
+    resolveModelReasoningCapability("anthropic", "claude-opus-4-7")
+      .supportedEfforts,
+    ["low", "medium", "high", "xhigh", "max"],
+  );
+  assert.deepEqual(
+    resolveModelReasoningCapability("openai_compatible", "k3-256k")
+      .supportedEfforts,
+    ["none", "low", "medium", "high", "xhigh", "max"],
+  );
+  assert.equal(
+    resolveModelReasoningCapability("openai_compatible", "glm-5.2")
+      .defaultEffort,
+    "max",
+  );
   assert.equal(
     resolveModelReasoningCapability("openai_responses", "gpt-4.1-mini").status,
     "unsupported",

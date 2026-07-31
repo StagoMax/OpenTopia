@@ -34,17 +34,10 @@ export type ProviderImportPreset = {
 export const PROVIDER_IMPORT_PRESETS: readonly ProviderImportPreset[] = [
   {
     id: "openai-compatible",
-    name: "OpenAI Chat Completions",
-    description: "Any service exposing the OpenAI Chat Completions API.",
+    name: "OpenAI Compatible",
+    description:
+      "One /v1 connection; protocol and message compatibility are detected when tested.",
     kind: "openai_compatible",
-    baseUrl: "https://api.openai.com/v1",
-    model: "gpt-4.1-mini",
-  },
-  {
-    id: "openai-responses",
-    name: "OpenAI Responses (native)",
-    description: "OpenAI's Responses API with reasoning and response storage.",
-    kind: "openai_responses",
     baseUrl: "https://api.openai.com/v1",
     model: "gpt-4.1-mini",
   },
@@ -653,7 +646,7 @@ function suggestNameFromUrl(
     const url = new URL(baseUrl);
     const host = url.hostname.toLowerCase();
     if (host === "api.openai.com") {
-      return kind === "openai_responses" ? "OpenAI Responses" : "OpenAI";
+      return "OpenAI";
     }
     if (host === "api.anthropic.com") return "Anthropic Messages";
     if (

@@ -3,11 +3,12 @@ use crate::model_context::{
     CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ModelContextItem,
 };
 use crate::settings::{
-    model_accepts_temperature, PromptCachePolicy, ProviderHealthCheck, ProviderKind,
-    ProviderSettings,
+    model_accepts_temperature, OpenAiCompatibilityReport, OpenAiProtocol, PromptCachePolicy,
+    ProviderFeatureSupport, ProviderHealthCheck, ProviderKind, ProviderSettings,
 };
 use anyhow::Context;
 use async_trait::async_trait;
+use chrono::Utc;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock, RwLock as StdRwLock,
 };
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -440,16 +441,25 @@ pub struct OpenAiCompatibleProvider {
     compatibility_messages: Arc<AtomicBool>,
 }
 
+#[derive(Debug)]
+struct OpenAiProbeOutcome {
+    support: ProviderFeatureSupport,
+    detail: Option<String>,
+}
+
 impl OpenAiCompatibleProvider {
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let base_url = base_url.into();
         let model = model.into();
+        let compatibility_messages = model_prefers_compatibility_messages(&model)
+            || openai_message_compatibility_cached(&base_url, &model);
         Self {
             client: reqwest::Client::new(),
-            base_url: base_url.into(),
+            base_url,
             api_key: api_key.into(),
             model: model.clone(),
             temperature: None,
@@ -458,9 +468,7 @@ impl OpenAiCompatibleProvider {
             parallel_tool_calls: false,
             prompt_cache_key: None,
             supports_vision: true,
-            compatibility_messages: Arc::new(AtomicBool::new(
-                model_prefers_compatibility_messages(&model),
-            )),
+            compatibility_messages: Arc::new(AtomicBool::new(compatibility_messages)),
         }
     }
 
@@ -496,6 +504,10 @@ impl OpenAiCompatibleProvider {
         if settings.kind != ProviderKind::OpenAiCompatible {
             return None;
         }
+        Self::from_openai_settings(settings)
+    }
+
+    fn from_openai_settings(settings: &ProviderSettings) -> Option<Self> {
         let api_key = std::env::var(&settings.api_key_source)
             .ok()
             .filter(|value| !value.is_empty())
@@ -525,7 +537,262 @@ impl OpenAiCompatibleProvider {
         self.parallel_tool_calls = settings.parallel_tool_calls;
         self.prompt_cache_key = settings.prompt_cache_key.clone();
         self.supports_vision = settings.supports_vision;
+        if settings.kind == ProviderKind::OpenAiCompatible {
+            if let Some(report) = settings
+                .openai_compatibility
+                .as_ref()
+                .filter(|report| report.applies_to(&settings.base_url, &settings.model))
+            {
+                self.compatibility_messages
+                    .store(report.message_compatibility, Ordering::Release);
+                remember_openai_message_compatibility(
+                    &settings.base_url,
+                    &settings.model,
+                    report.message_compatibility,
+                );
+            }
+        }
         self
+    }
+
+    pub async fn probe_settings(
+        settings: &ProviderSettings,
+    ) -> anyhow::Result<ProviderHealthCheck> {
+        if !matches!(
+            &settings.kind,
+            &ProviderKind::OpenAiCompatible | &ProviderKind::OpenAiResponses
+        ) {
+            anyhow::bail!("compatibility probing requires an OpenAI-compatible provider");
+        }
+        let provider = Self::from_openai_settings(settings)
+            .context("OpenAI-compatible provider is not configured")?;
+        provider.probe_compatibility(settings.kind.clone()).await
+    }
+
+    async fn probe_compatibility(
+        &self,
+        preferred_kind: ProviderKind,
+    ) -> anyhow::Result<ProviderHealthCheck> {
+        let start = std::time::Instant::now();
+        let chat_payload = json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "System compatibility probe."},
+                {"role": "user", "content": "Reply with OK."}
+            ],
+            "max_tokens": 16,
+            "stream": false
+        });
+        let responses_payload = json!({
+            "model": self.model,
+            "input": "Reply with OK.",
+            "max_output_tokens": 16,
+            "stream": false,
+            "store": false
+        });
+        let chat_tools_payload = json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "System compatibility probe."},
+                {"role": "user", "content": "Reply with OK."}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "compatibility_probe",
+                    "description": "Validates function tool support without invoking a tool.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }],
+            "tool_choice": "none",
+            "max_tokens": 16,
+            "stream": false
+        });
+        let responses_native_tools_payload = json!({
+            "model": self.model,
+            "input": "Reply with OK.",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "none",
+            "max_output_tokens": 16,
+            "stream": false,
+            "store": false
+        });
+        let (chat, responses, chat_function_tools, responses_native_tools) = tokio::join!(
+            self.probe_openai_endpoint("/chat/completions", chat_payload, false),
+            self.probe_openai_endpoint("/responses", responses_payload, false),
+            self.probe_openai_endpoint("/chat/completions", chat_tools_payload, true),
+            self.probe_openai_endpoint("/responses", responses_native_tools_payload, true),
+        );
+
+        let developer = if chat.support == ProviderFeatureSupport::Supported {
+            self.probe_openai_endpoint(
+                "/chat/completions",
+                json!({
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": "System compatibility probe."},
+                        {"role": "developer", "content": "Developer compatibility probe."},
+                        {"role": "user", "content": "Reply with OK."}
+                    ],
+                    "max_tokens": 16,
+                    "stream": false
+                }),
+                true,
+            )
+            .await
+        } else {
+            OpenAiProbeOutcome {
+                support: ProviderFeatureSupport::Unknown,
+                detail: Some(
+                    "developer messages were not probed because Chat Completions was unavailable"
+                        .to_string(),
+                ),
+            }
+        };
+
+        // Selecting `/responses` from a bare text request is unsafe for relay
+        // endpoints: some gateways accept the request and later translate it to
+        // Chat Completions, but reject native Responses tools such as
+        // `web_search` during a real agent turn. Prefer Chat whenever it has
+        // native developer messages; otherwise only switch to Responses after
+        // its native-tool probe has explicitly succeeded.
+        let chat_agent_compatible = chat.support == ProviderFeatureSupport::Supported
+            && chat_function_tools.support != ProviderFeatureSupport::Unsupported;
+        let responses_agent_compatible = responses.support == ProviderFeatureSupport::Supported
+            && responses_native_tools.support != ProviderFeatureSupport::Unsupported;
+        let selected_protocol = if chat_agent_compatible
+            && developer.support == ProviderFeatureSupport::Supported
+        {
+            OpenAiProtocol::ChatCompletions
+        } else if responses.support == ProviderFeatureSupport::Supported
+            && responses_native_tools.support == ProviderFeatureSupport::Supported
+        {
+            OpenAiProtocol::Responses
+        } else if chat_agent_compatible {
+            OpenAiProtocol::ChatCompletions
+        } else if responses_agent_compatible {
+            OpenAiProtocol::Responses
+        } else if chat.support == ProviderFeatureSupport::Supported {
+            OpenAiProtocol::ChatCompletions
+        } else if responses.support == ProviderFeatureSupport::Supported {
+            OpenAiProtocol::Responses
+        } else if preferred_kind == ProviderKind::OpenAiResponses {
+            OpenAiProtocol::Responses
+        } else {
+            OpenAiProtocol::ChatCompletions
+        };
+        let message_compatibility = selected_protocol == OpenAiProtocol::ChatCompletions
+            && developer.support != ProviderFeatureSupport::Supported;
+        remember_openai_message_compatibility(&self.base_url, &self.model, message_compatibility);
+
+        let mut notes = Vec::new();
+        if let Some(detail) = chat.detail {
+            notes.push(format!("Chat Completions: {detail}"));
+        }
+        if let Some(detail) = chat_function_tools.detail {
+            notes.push(format!("Chat function tools: {detail}"));
+        }
+        if let Some(detail) = responses.detail {
+            notes.push(format!("Responses: {detail}"));
+        }
+        if let Some(detail) = responses_native_tools.detail {
+            notes.push(format!("Responses native tools: {detail}"));
+        }
+        if let Some(detail) = developer.detail {
+            notes.push(format!("developer messages: {detail}"));
+        }
+        if message_compatibility {
+            notes.push(
+                "Compatibility mode enabled: developer instructions and structured tool history will be flattened before sending."
+                    .to_string(),
+            );
+        }
+
+        let reachable = chat.support == ProviderFeatureSupport::Supported
+            || responses.support == ProviderFeatureSupport::Supported;
+        let report = OpenAiCompatibilityReport {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            selected_protocol,
+            chat_completions: chat.support,
+            chat_function_tools: chat_function_tools.support,
+            responses: responses.support,
+            responses_native_tools: responses_native_tools.support,
+            developer_messages: developer.support,
+            message_compatibility,
+            checked_at: Utc::now(),
+            notes,
+        };
+        Ok(ProviderHealthCheck {
+            reachable,
+            latency_ms: Some(start.elapsed().as_millis() as u64),
+            model_available: reachable,
+            error: (!reachable).then(|| {
+                report
+                    .notes
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "no supported OpenAI endpoint was detected".to_string())
+            }),
+            openai_compatibility: Some(report),
+        })
+    }
+
+    async fn probe_openai_endpoint(
+        &self,
+        path: &str,
+        payload: Value,
+        role_probe: bool,
+    ) -> OpenAiProbeOutcome {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let response = tokio::time::timeout(
+            Duration::from_secs(20),
+            self.client
+                .post(url)
+                .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                .header(CONTENT_TYPE, "application/json")
+                .json(&payload)
+                .send(),
+        )
+        .await;
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return OpenAiProbeOutcome {
+                    support: ProviderFeatureSupport::Unknown,
+                    detail: Some(error.to_string()),
+                }
+            }
+            Err(_) => {
+                return OpenAiProbeOutcome {
+                    support: ProviderFeatureSupport::Unknown,
+                    detail: Some("request timed out after 20 seconds".to_string()),
+                }
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            return OpenAiProbeOutcome {
+                support: ProviderFeatureSupport::Supported,
+                detail: None,
+            };
+        }
+        let body = response.text().await.unwrap_or_default();
+        let support = if role_probe && matches!(status.as_u16(), 400 | 422) {
+            ProviderFeatureSupport::Unsupported
+        } else if matches!(status.as_u16(), 404 | 405 | 501) {
+            ProviderFeatureSupport::Unsupported
+        } else {
+            ProviderFeatureSupport::Unknown
+        };
+        OpenAiProbeOutcome {
+            support,
+            detail: Some(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                truncate_observation_text(body.trim())
+            )),
+        }
     }
 
     pub(crate) fn for_guardian(mut self) -> Self {
@@ -545,7 +812,12 @@ impl OpenAiCompatibleProvider {
     ) -> anyhow::Result<PreparedProviderRequest> {
         ensure_visual_input_supported(&request, self.supports_vision)?;
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let messages = if self.compatibility_messages.load(Ordering::Acquire)
+        let compatibility_messages = self.compatibility_messages.load(Ordering::Acquire)
+            || openai_message_compatibility_cached(&self.base_url, &self.model);
+        if compatibility_messages {
+            self.compatibility_messages.store(true, Ordering::Release);
+        }
+        let messages = if compatibility_messages
             && chat_request_needs_message_compatibility_fallback(&request)
         {
             openai_compatibility_messages(&request)
@@ -573,7 +845,13 @@ impl OpenAiCompatibleProvider {
             .as_deref()
             .filter(|value| !value.is_empty())
         {
-            payload["reasoning_effort"] = json!(reasoning_effort);
+            if model_uses_glm_thinking_control(&self.model)
+                && matches!(reasoning_effort, "none" | "minimal")
+            {
+                payload["thinking"] = json!({ "type": "disabled" });
+            } else {
+                payload["reasoning_effort"] = json!(reasoning_effort);
+            }
         }
         if !request.tool_candidates.is_empty() {
             payload["tools"] = json!(openai_tools(&request.tool_candidates));
@@ -663,10 +941,12 @@ impl OpenAiCompatibleProvider {
                 }
                 changes.push("structured response format");
             }
+            let mut used_message_compatibility = false;
             if chat_request_needs_message_compatibility_fallback(&prepared.logical_request) {
                 prepared.body["messages"] =
                     json!(openai_compatibility_messages(&prepared.logical_request));
                 changes.push("native developer messages or structured tool history");
+                used_message_compatibility = true;
             }
             on_transport(ProviderTransportEvent::Retry {
                 attempt,
@@ -697,7 +977,10 @@ impl OpenAiCompatibleProvider {
                     "provider request failed (400): {rejected_body}; compatibility retry failed ({retry_status}): {retry_body}"
                 );
             }
-            self.compatibility_messages.store(true, Ordering::Release);
+            if used_message_compatibility {
+                self.compatibility_messages.store(true, Ordering::Release);
+                remember_openai_message_compatibility(&self.base_url, &self.model, true);
+            }
             response = retry;
         }
         let status = response.status();
@@ -1025,6 +1308,7 @@ pub struct AnthropicMessagesProvider {
     model: String,
     temperature: Option<f64>,
     max_output_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
     supports_vision: bool,
 }
 
@@ -1041,6 +1325,7 @@ impl AnthropicMessagesProvider {
             model: model.into(),
             temperature: None,
             max_output_tokens: None,
+            reasoning_effort: None,
             supports_vision: true,
         }
     }
@@ -1055,6 +1340,7 @@ impl AnthropicMessagesProvider {
             provider.temperature = Some(temperature);
         }
         provider.max_output_tokens = settings.max_output_tokens;
+        provider.reasoning_effort = settings.reasoning_effort.clone();
         provider.supports_vision = settings.supports_vision;
         Some(provider)
     }
@@ -1062,6 +1348,9 @@ impl AnthropicMessagesProvider {
     pub(crate) fn for_guardian(mut self) -> Self {
         self.temperature = Some(0.0);
         self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
+        if self.reasoning_effort.is_some() {
+            self.reasoning_effort = Some("low".to_string());
+        }
         self
     }
 
@@ -1080,6 +1369,20 @@ impl AnthropicMessagesProvider {
         });
         if let Some(temperature) = self.temperature {
             payload["temperature"] = json!(temperature);
+        }
+        if let Some(reasoning_effort) = self
+            .reasoning_effort
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            if reasoning_effort == "none" {
+                payload["thinking"] = json!({ "type": "disabled" });
+            } else if model_supports_anthropic_adaptive_thinking(&self.model)
+                && anthropic_effort_value(reasoning_effort).is_some()
+            {
+                payload["thinking"] = json!({ "type": "adaptive" });
+                payload["output_config"] = json!({ "effort": reasoning_effort });
+            }
         }
         let instructions = anthropic_system_instructions(&request);
         if !instructions.trim().is_empty() {
@@ -1213,6 +1516,7 @@ impl ModelProvider for AnthropicMessagesProvider {
                     latency_ms: Some(start.elapsed().as_millis() as u64),
                     model_available: reachable,
                     error: (!reachable).then(|| format!("HTTP {}", response.status())),
+                    openai_compatibility: None,
                 })
             }
             Ok(Err(error)) => Ok(ProviderHealthCheck {
@@ -1220,12 +1524,14 @@ impl ModelProvider for AnthropicMessagesProvider {
                 latency_ms: Some(start.elapsed().as_millis() as u64),
                 model_available: false,
                 error: Some(error.to_string()),
+                openai_compatibility: None,
             }),
             Err(_) => Ok(ProviderHealthCheck {
                 reachable: false,
                 latency_ms: None,
                 model_available: false,
                 error: Some("timeout".to_string()),
+                openai_compatibility: None,
             }),
         }
     }
@@ -1903,6 +2209,65 @@ fn model_prefers_compatibility_messages(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
     let model = model.rsplit('/').next().unwrap_or(&model);
     model.starts_with("glm") || model.starts_with("chatglm")
+}
+
+static OPENAI_MESSAGE_COMPATIBILITY_CACHE: OnceLock<StdRwLock<HashSet<String>>> = OnceLock::new();
+
+fn openai_compatibility_cache_key(base_url: &str, model: &str) -> String {
+    format!(
+        "{}\n{}",
+        base_url.trim().trim_end_matches('/'),
+        model.trim()
+    )
+}
+
+fn openai_message_compatibility_cached(base_url: &str, model: &str) -> bool {
+    OPENAI_MESSAGE_COMPATIBILITY_CACHE
+        .get()
+        .and_then(|cache| cache.read().ok())
+        .is_some_and(|cache| cache.contains(&openai_compatibility_cache_key(base_url, model)))
+}
+
+fn remember_openai_message_compatibility(base_url: &str, model: &str, required: bool) {
+    let cache = OPENAI_MESSAGE_COMPATIBILITY_CACHE.get_or_init(|| StdRwLock::new(HashSet::new()));
+    let Ok(mut cache) = cache.write() else {
+        return;
+    };
+    let key = openai_compatibility_cache_key(base_url, model);
+    if required {
+        cache.insert(key);
+    } else {
+        cache.remove(&key);
+    }
+}
+
+fn model_uses_glm_thinking_control(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    model.starts_with("glm") || model.starts_with("chatglm")
+}
+
+fn model_supports_anthropic_adaptive_thinking(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    let model = model.strip_prefix("anthropic.").unwrap_or(model);
+    [
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-mythos-preview",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+}
+
+fn anthropic_effort_value(value: &str) -> Option<&str> {
+    matches!(value, "low" | "medium" | "high" | "xhigh" | "max").then_some(value)
 }
 
 fn request_image_part_count(request: &ModelRequest) -> usize {
@@ -3233,6 +3598,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                     } else {
                         Some(format!("HTTP {}", response.status()))
                     },
+                    openai_compatibility: None,
                 })
             }
             Ok(Err(_)) => {
@@ -3264,6 +3630,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                             } else {
                                 Some(format!("HTTP {}", resp.status()))
                             },
+                            openai_compatibility: None,
                         })
                     }
                     Ok(Err(err)) => {
@@ -3273,6 +3640,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                             latency_ms: Some(latency),
                             model_available: false,
                             error: Some(err.to_string()),
+                            openai_compatibility: None,
                         })
                     }
                     Err(_) => Ok(ProviderHealthCheck {
@@ -3280,6 +3648,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                         latency_ms: None,
                         model_available: false,
                         error: Some("timeout".to_string()),
+                        openai_compatibility: None,
                     }),
                 }
             }
@@ -3288,6 +3657,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 latency_ms: None,
                 model_available: false,
                 error: Some("timeout".to_string()),
+                openai_compatibility: None,
             }),
         }
     }
@@ -3372,6 +3742,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                     latency_ms: Some(start.elapsed().as_millis() as u64),
                     model_available: reachable,
                     error: (!reachable).then(|| format!("HTTP {}", response.status())),
+                    openai_compatibility: None,
                 })
             }
             Ok(Err(error)) => Ok(ProviderHealthCheck {
@@ -3379,12 +3750,14 @@ impl ModelProvider for OpenAiResponsesProvider {
                 latency_ms: Some(start.elapsed().as_millis() as u64),
                 model_available: false,
                 error: Some(error.to_string()),
+                openai_compatibility: None,
             }),
             Err(_) => Ok(ProviderHealthCheck {
                 reachable: false,
                 latency_ms: None,
                 model_available: false,
                 error: Some("timeout".to_string()),
+                openai_compatibility: None,
             }),
         }
     }
@@ -3400,6 +3773,250 @@ pub struct CodexAppServerProvider {
     supports_vision: bool,
     native_web_search: bool,
     sessions: Mutex<HashMap<String, CodexAppServerSession>>,
+}
+
+/// Public account controls for the local Codex App Server.
+///
+/// The server owns the child process and keeps authentication inside Codex.
+/// OpenTopia only exposes non-secret account metadata and the documented login
+/// instructions to its UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountStatus {
+    pub logged_in: bool,
+    pub auth_mode: Option<String>,
+    pub plan_type: Option<String>,
+    pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub login_pending: bool,
+    pub login_id: Option<String>,
+    pub login_type: Option<String>,
+    pub auth_url: Option<String>,
+    pub verification_url: Option<String>,
+    pub user_code: Option<String>,
+    pub rate_limits: Option<Value>,
+    pub usage: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexLoginStart {
+    pub login_id: String,
+    pub login_type: String,
+    pub auth_url: Option<String>,
+    pub verification_url: Option<String>,
+    pub user_code: Option<String>,
+}
+
+struct CodexAccountSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    login: Option<CodexLoginStart>,
+}
+
+/// A serialized controller for account/login and account/rateLimits calls.
+///
+/// Login must remain attached to the same App Server process until the
+/// completion notification arrives. Turn providers may start their own App
+/// Server children; Codex persists the resulting login in its normal local
+/// credential store, so those children use the same account.
+#[derive(Default)]
+pub struct CodexAccountManager {
+    session: Mutex<Option<CodexAccountSession>>,
+}
+
+impl CodexAccountManager {
+    async fn ensure_session(
+        &self,
+    ) -> anyhow::Result<tokio::sync::MutexGuard<'_, Option<CodexAccountSession>>> {
+        let mut guard = self.session.lock().await;
+        let needs_restart = guard
+            .as_mut()
+            .is_some_and(|session| session.child.try_wait().ok().flatten().is_some());
+        if needs_restart {
+            if let Some(mut session) = guard.take() {
+                session.cleanup().await;
+            }
+        }
+        if guard.is_none() {
+            let mut command = codex_app_server_command();
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let mut child = command.spawn().context(
+                "failed to start the local Codex App Server; install Codex or add it to PATH",
+            )?;
+            let stdin = child
+                .stdin
+                .take()
+                .context("Codex App Server did not expose stdin")?;
+            let stdout = child
+                .stdout
+                .take()
+                .context("Codex App Server did not expose stdout")?;
+            let mut session = CodexAccountSession {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout).lines(),
+                login: None,
+            };
+            codex_write_rpc(
+                &mut session.stdin,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": { "name": "OpenTopia", "version": env!("CARGO_PKG_VERSION") },
+                        "capabilities": { "experimentalApi": true }
+                    }
+                }),
+            )
+            .await?;
+            if let Err(error) = codex_wait_for_response(&mut session.stdout, 1).await {
+                session.cleanup().await;
+                return Err(error);
+            }
+            *guard = Some(session);
+        }
+        Ok(guard)
+    }
+
+    pub async fn status(&self) -> anyhow::Result<CodexAccountStatus> {
+        let mut guard = self.ensure_session().await?;
+        let session = guard
+            .as_mut()
+            .context("Codex account session unavailable")?;
+        let account = codex_account_request(session, 2, "account/read", json!({})).await?;
+        let auth_mode = account_string(&account, "authMode");
+        let plan_type = account_string(&account, "planType");
+        let email = account_string(&account, "email");
+        let account_id = account_string(&account, "accountId");
+        let logged_in = auth_mode
+            .as_deref()
+            .is_some_and(|mode| !mode.is_empty() && mode != "null");
+        if logged_in {
+            session.login = None;
+        }
+        let rate_limits = if logged_in {
+            codex_account_request(session, 3, "account/rateLimits/read", json!({}))
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let usage = if logged_in {
+            codex_account_request(session, 4, "account/usage/read", json!({}))
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let login = session.login.clone();
+        Ok(CodexAccountStatus {
+            logged_in,
+            auth_mode,
+            plan_type,
+            email,
+            account_id,
+            login_pending: login.is_some(),
+            login_id: login.as_ref().map(|value| value.login_id.clone()),
+            login_type: login.as_ref().map(|value| value.login_type.clone()),
+            auth_url: login.as_ref().and_then(|value| value.auth_url.clone()),
+            verification_url: login
+                .as_ref()
+                .and_then(|value| value.verification_url.clone()),
+            user_code: login.as_ref().and_then(|value| value.user_code.clone()),
+            rate_limits,
+            usage,
+        })
+    }
+
+    pub async fn start_chatgpt_login(&self, device_code: bool) -> anyhow::Result<CodexLoginStart> {
+        let mut guard = self.ensure_session().await?;
+        let session = guard
+            .as_mut()
+            .context("Codex account session unavailable")?;
+        if let Some(login) = &session.login {
+            return Ok(login.clone());
+        }
+        let login_type = if device_code {
+            "chatgptDeviceCode"
+        } else {
+            "chatgpt"
+        };
+        let result = codex_account_request(
+            session,
+            5,
+            "account/login/start",
+            json!({ "type": login_type }),
+        )
+        .await?;
+        let login = CodexLoginStart {
+            login_id: result
+                .get("loginId")
+                .and_then(Value::as_str)
+                .context("Codex login response omitted loginId")?
+                .to_string(),
+            login_type: result
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or(login_type)
+                .to_string(),
+            auth_url: result
+                .get("authUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            verification_url: result
+                .get("verificationUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            user_code: result
+                .get("userCode")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        session.login = Some(login.clone());
+        Ok(login)
+    }
+
+    pub async fn cancel_login(&self) -> anyhow::Result<()> {
+        let mut guard = self.ensure_session().await?;
+        let session = guard
+            .as_mut()
+            .context("Codex account session unavailable")?;
+        if let Some(login) = session.login.take() {
+            codex_account_request(
+                session,
+                6,
+                "account/login/cancel",
+                json!({ "loginId": login.login_id }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn logout(&self) -> anyhow::Result<()> {
+        let mut guard = self.ensure_session().await?;
+        let session = guard
+            .as_mut()
+            .context("Codex account session unavailable")?;
+        codex_account_request(session, 7, "account/logout", json!({})).await?;
+        session.login = None;
+        Ok(())
+    }
+}
+
+impl CodexAccountSession {
+    async fn cleanup(&mut self) {
+        let _ = self.stdin.shutdown().await;
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
 }
 
 struct CodexAppServerSession {
@@ -3814,6 +4431,7 @@ impl ModelProvider for CodexAppServerProvider {
             latency_ms: Some(start.elapsed().as_millis() as u64),
             model_available: true,
             error: None,
+            openai_compatibility: None,
         })
     }
 }
@@ -3879,6 +4497,33 @@ async fn codex_next_event(stdout: &mut Lines<BufReader<ChildStdout>>) -> anyhow:
         .await?
         .context("Codex App Server closed its output stream")?;
     serde_json::from_str(&line).context("Codex App Server emitted malformed JSON-RPC output")
+}
+
+async fn codex_account_request(
+    session: &mut CodexAccountSession,
+    request_id: u64,
+    method: &str,
+    params: Value,
+) -> anyhow::Result<Value> {
+    codex_write_rpc(
+        &mut session.stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }),
+    )
+    .await?;
+    codex_wait_for_response(&mut session.stdout, request_id).await
+}
+
+fn account_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .or_else(|| value.get("account").and_then(|account| account.get(key)))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 async fn codex_wait_for_response(
@@ -4114,6 +4759,7 @@ impl ModelProvider for MockProvider {
             latency_ms: None,
             model_available: false,
             error: None,
+            openai_compatibility: None,
         })
     }
 }
@@ -4391,6 +5037,21 @@ mod tests {
             prepared.body["messages"][0]["content"][1]["source"]["type"],
             "base64"
         );
+    }
+
+    #[test]
+    fn anthropic_adaptive_thinking_uses_output_config_effort() {
+        let mut provider = AnthropicMessagesProvider::new(
+            "https://api.anthropic.com",
+            "test-key",
+            "claude-sonnet-4-6",
+        );
+        provider.reasoning_effort = Some("max".to_string());
+
+        let prepared = provider.prepare(Uuid::nil(), model_request()).unwrap();
+
+        assert_eq!(prepared.body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(prepared.body["output_config"], json!({ "effort": "max" }));
     }
 
     #[test]
@@ -4825,6 +5486,18 @@ mod tests {
         assert!(!messages
             .iter()
             .any(|message| message["role"] == "developer"));
+    }
+
+    #[test]
+    fn glm_disables_thinking_with_native_control() {
+        let mut provider =
+            OpenAiCompatibleProvider::new("https://api.example.test/v1", "test-key", "glm-5.2");
+        provider.reasoning_effort = Some("none".to_string());
+
+        let prepared = provider.prepare(Uuid::nil(), model_request()).unwrap();
+
+        assert_eq!(prepared.body["thinking"], json!({ "type": "disabled" }));
+        assert!(prepared.body.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -5466,6 +6139,197 @@ mod tests {
         assert!(transport
             .iter()
             .any(|event| matches!(event, ProviderTransportEvent::Retry { attempt: 2, .. })));
+
+        let fresh_provider =
+            OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+        let cached = fresh_provider
+            .prepare(Uuid::nil(), layered_model_request())
+            .unwrap();
+        assert!(!cached.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "developer"));
+    }
+
+    #[tokio::test]
+    async fn compatibility_probe_selects_chat_and_caches_unsupported_developer_role() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                let is_responses = request.starts_with("POST /v1/responses ");
+                let has_developer = request.contains(r#""role":"developer""#);
+                let (status, body) = if is_responses {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                } else if has_developer {
+                    ("400 Bad Request", r#"{"error":"unsupported developer role"}"#)
+                } else {
+                    ("200 OK", "{}")
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let base_url = format!("http://{address}/v1");
+        let provider =
+            OpenAiCompatibleProvider::new(&base_url, "test-key", "probe-test-model");
+        let health = provider
+            .probe_compatibility(ProviderKind::OpenAiCompatible)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert!(health.reachable);
+        assert!(health.model_available);
+        let report = health.openai_compatibility.unwrap();
+        assert_eq!(report.selected_protocol, OpenAiProtocol::ChatCompletions);
+        assert_eq!(
+            report.chat_completions,
+            ProviderFeatureSupport::Supported
+        );
+        assert_eq!(
+            report.chat_function_tools,
+            ProviderFeatureSupport::Supported
+        );
+        assert_eq!(report.responses, ProviderFeatureSupport::Unsupported);
+        assert_eq!(
+            report.responses_native_tools,
+            ProviderFeatureSupport::Unsupported
+        );
+        assert_eq!(
+            report.developer_messages,
+            ProviderFeatureSupport::Unsupported
+        );
+        assert!(report.message_compatibility);
+
+        let fresh =
+            OpenAiCompatibleProvider::new(&base_url, "test-key", "probe-test-model");
+        let prepared = fresh
+            .prepare(Uuid::nil(), layered_model_request())
+            .unwrap();
+        assert!(!prepared.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "developer"));
+    }
+
+    #[tokio::test]
+    async fn compatibility_probe_prefers_responses_over_lossy_chat_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                let has_developer = request.contains(r#""role":"developer""#);
+                let (status, body) = if has_developer {
+                    ("400 Bad Request", r#"{"error":"unsupported developer role"}"#)
+                } else {
+                    ("200 OK", "{}")
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1"),
+            "test-key",
+            "responses-probe-model",
+        );
+        let health = provider
+            .probe_compatibility(ProviderKind::OpenAiCompatible)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let report = health.openai_compatibility.unwrap();
+
+        assert_eq!(report.selected_protocol, OpenAiProtocol::Responses);
+        assert_eq!(report.responses, ProviderFeatureSupport::Supported);
+        assert_eq!(
+            report.responses_native_tools,
+            ProviderFeatureSupport::Supported
+        );
+        assert_eq!(
+            report.developer_messages,
+            ProviderFeatureSupport::Unsupported
+        );
+        assert!(!report.message_compatibility);
+    }
+
+    #[tokio::test]
+    async fn compatibility_probe_uses_chat_when_responses_rejects_native_tools() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                let is_responses = request.starts_with("POST /v1/responses ");
+                let has_native_web_search = request.contains(r#""type":"web_search""#);
+                let has_developer = request.contains(r#""role":"developer""#);
+                let (status, body) = if is_responses && has_native_web_search {
+                    ("400 Bad Request", r#"{"error":"native Responses tools unsupported"}"#)
+                } else if has_developer {
+                    ("400 Bad Request", r#"{"error":"unsupported developer role"}"#)
+                } else {
+                    ("200 OK", "{}")
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1"),
+            "test-key",
+            "relay-model",
+        );
+        let health = provider
+            .probe_compatibility(ProviderKind::OpenAiCompatible)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let report = health.openai_compatibility.unwrap();
+
+        assert_eq!(report.selected_protocol, OpenAiProtocol::ChatCompletions);
+        assert_eq!(
+            report.responses_native_tools,
+            ProviderFeatureSupport::Unsupported
+        );
+        assert!(report.message_compatibility);
     }
 
     #[tokio::test]

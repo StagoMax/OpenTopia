@@ -61,7 +61,7 @@ test("parses OPENAI-style JSON keys and recognizes the Responses API", () => {
   assert.equal(draft.baseUrl, "https://api.openai.com/v1");
   assert.equal(draft.model, "gpt-4.1");
   assert.equal(draft.apiKey, "secret-openai-key");
-  assert.equal(draft.name, "OpenAI Responses");
+  assert.equal(draft.name, "OpenAI");
 });
 
 test("parses dotenv, export, and PowerShell assignment syntax", () => {
@@ -159,12 +159,7 @@ test("returns usable defaults and warnings for unknown or incomplete input", () 
 test("exposes stable presets and creates independent editable drafts", () => {
   assert.deepEqual(
     PROVIDER_IMPORT_PRESETS.map((preset) => preset.id),
-    [
-      "openai-compatible",
-      "openai-responses",
-      "anthropic-messages",
-      "ollama-local",
-    ],
+    ["openai-compatible", "anthropic-messages", "ollama-local"],
   );
 
   const draft = createProviderDraftFromPreset("ollama-local");
