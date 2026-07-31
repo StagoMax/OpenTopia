@@ -1,4 +1,4 @@
-import { appendFile } from "node:fs/promises";
+import { appendFile, readFile, writeFile } from "node:fs/promises";
 
 const baseUrl = (process.env.OPENTOPIA_EVAL_BASE_URL ?? "http://127.0.0.1:8812").replace(/\/$/, "");
 const token = process.env.OPENTOPIA_API_TOKEN ?? process.env.OPENTOPIA_EVAL_API_TOKEN;
@@ -8,6 +8,10 @@ const title = process.env.AGENT_EVAL_TASK_ID ?? "application evaluation";
 const approvalMode = process.env.OPENTOPIA_EVAL_APPROVAL_MODE ?? "deny";
 const pollMs = Number(process.env.OPENTOPIA_EVAL_POLL_MS ?? 500);
 const timeoutMs = Number(process.env.OPENTOPIA_EVAL_TIMEOUT_MS ?? 1_800_000);
+const phaseId = process.env.AGENT_EVAL_PHASE_ID ?? "default";
+const phaseIndex = Number(process.env.AGENT_EVAL_PHASE_INDEX ?? 1);
+const phaseCount = Number(process.env.AGENT_EVAL_PHASE_COUNT ?? 1);
+const targetStatePath = process.env.AGENT_EVAL_TARGET_STATE_PATH;
 
 if (!workspace || !eventsPath) throw new Error("Harness target environment is incomplete");
 if (!token) throw new Error("OPENTOPIA_API_TOKEN is required; pass it through target.passEnvironment");
@@ -35,8 +39,13 @@ async function api(method, route, body) {
 }
 
 async function readPrompt() {
+  if (process.env.AGENT_EVAL_PROMPT_FILE && process.stdin.isTTY) {
+    return readFile(process.env.AGENT_EVAL_PROMPT_FILE, "utf8");
+  }
   let prompt = "";
   for await (const chunk of process.stdin) prompt += chunk;
+  if (prompt) return prompt;
+  if (process.env.AGENT_EVAL_PROMPT_FILE) return readFile(process.env.AGENT_EVAL_PROMPT_FILE, "utf8");
   return prompt;
 }
 
@@ -45,9 +54,25 @@ async function emit(type, payload = {}, metadata = {}) {
     schemaVersion: 1,
     timestamp: metadata.createdAt ?? new Date().toISOString(),
     source: "opentopia-http-adapter",
+    threadId: metadata.threadId,
     type,
     payload
   })}\n`, "utf8");
+}
+
+async function loadTargetState() {
+  if (!targetStatePath) return null;
+  try {
+    return JSON.parse(await readFile(targetStatePath, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new Error(`Unable to read target state: ${error.message}`);
+  }
+}
+
+async function saveTargetState(state) {
+  if (!targetStatePath) return;
+  await writeFile(targetStatePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
 function normalizeProductEvent(event) {
@@ -71,10 +96,25 @@ function normalizeProductEvent(event) {
     return { type: "tool.call.started", payload: { name: payload.call?.name ?? "unknown", call: payload.call } };
   }
   if (type === "tool_call_finished") {
+    const metadata = payload.result?.metadata ?? {};
+    const toolName = metadata.toolName ?? metadata.tool_name ?? "unknown";
+    if (toolName === "browser") {
+      const success = metadata.success !== false && metadata.isError !== true;
+      return {
+        type: "browser.action.completed",
+        payload: {
+          action: metadata.action ?? "unknown",
+          success,
+          valid: success,
+          url: metadata.url ?? null,
+          result: payload.result
+        }
+      };
+    }
     return {
       type: "tool.call.completed",
       payload: {
-        name: payload.result?.metadata?.toolName ?? payload.result?.metadata?.tool_name ?? "unknown",
+        name: toolName,
         success: payload.result?.metadata?.success,
         result: payload.result
       }
@@ -82,6 +122,8 @@ function normalizeProductEvent(event) {
   }
   if (type === "context_compacted") return { type: "context.compaction.completed", payload };
   if (type === "approval_requested") return { type: "approval.requested", payload };
+  if (type === "browser_handoff_required") return { type: "browser.handoff.required", payload };
+  if (type === "browser_handoff_completed") return { type: "browser.handoff.completed", payload };
   if (type === "error") return { type: "application.error", payload };
   if (type === "subagent_updated") {
     const status = payload.run?.status;
@@ -103,28 +145,69 @@ async function decidePendingApprovals(threadId) {
 
 async function main() {
   const prompt = await readPrompt();
-  const thread = await api("POST", "/api/threads", { title, workspaceRoot: workspace });
+  const priorState = await loadTargetState();
+  if (phaseIndex > 1 && !priorState?.threadId) {
+    throw new Error(`Phase ${phaseId} has no persisted OpenTopia thread to recover`);
+  }
+  const thread = priorState?.threadId
+    ? { id: priorState.threadId }
+    : await api("POST", "/api/threads", { title, workspaceRoot: workspace });
+  if (priorState?.threadId) {
+    await emit("application.thread.reused", { phaseId, threadId: thread.id }, { threadId: thread.id });
+  } else {
+    await emit("application.thread.created", { phaseId, threadId: thread.id }, { threadId: thread.id });
+  }
+  await saveTargetState({
+    schemaVersion: 1,
+    threadId: thread.id,
+    workspace,
+    lastEventSequence: priorState?.lastEventSequence ?? 0
+  });
   const message = await api("POST", `/api/threads/${thread.id}/messages`, { content: prompt });
   const deadline = Date.now() + timeoutMs;
   let turn = null;
+  const terminalTurnStatuses = ["succeeded", "failed", "cancelled", "interrupted"];
   while (Date.now() < deadline) {
     turn = await api("GET", `/api/threads/${thread.id}/turn`);
     if (turn?.status === "waiting_approval") await decidePendingApprovals(thread.id);
-    if (turn && ["succeeded", "failed", "cancelled", "interrupted"].includes(turn.status)) break;
+    if (turn && [...terminalTurnStatuses, "waiting_user_action"].includes(turn.status)) break;
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
-  if (!turn || !["succeeded", "failed", "cancelled", "interrupted"].includes(turn.status)) {
+  if (!turn || ![...terminalTurnStatuses, "waiting_user_action"].includes(turn.status)) {
     throw new Error("OpenTopia turn exceeded adapter timeout");
   }
 
-  const productEvents = await api("GET", `/api/threads/${thread.id}/events`);
-  for (const event of productEvents ?? []) {
+  const priorSequence = priorState?.lastEventSequence ?? 0;
+  const productEvents = await api("GET", `/api/threads/${thread.id}/events?since=${priorSequence}`);
+  const newEvents = productEvents ?? [];
+  for (const event of newEvents) {
     const normalized = normalizeProductEvent(event);
-    await emit(normalized.type, normalized.payload, { createdAt: event.createdAt });
+    await emit(normalized.type, normalized.payload, { createdAt: event.createdAt, threadId: thread.id });
   }
-  await emit("application.turn.completed", { status: turn.status, turnId: turn.turnId, messageId: message.id });
-  if (turn.status === "succeeded") {
-    await emit("agent.completion.claimed", { verifiedBy: "turn.status" });
+  const lastEventSequence = (productEvents ?? []).reduce((maximum, event) => {
+    return Number.isInteger(event.seq) ? Math.max(maximum, event.seq) : maximum;
+  }, priorSequence);
+  await saveTargetState({
+    schemaVersion: 1,
+    threadId: thread.id,
+    workspace,
+    lastEventSequence
+  });
+  const turnPayload = {
+    phaseId,
+    status: turn.status,
+    turnId: turn.turnId,
+    messageId: message.id
+  };
+  await emit(
+    turn.status === "waiting_user_action"
+      ? "application.turn.awaiting_user_action"
+      : "application.turn.completed",
+    turnPayload,
+    { threadId: thread.id }
+  );
+  if (turn.status === "succeeded" && phaseIndex === phaseCount) {
+    await emit("agent.completion.claimed", { verifiedBy: "final-turn.status", phaseId }, { threadId: thread.id });
   }
 }
 

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-long-horizon",
+  "title": "OpenTopia Long-Horizon Recovery Evaluation Suite",
+  "description": "Evaluates coding tasks that must survive a controlled OpenTopia Server restart while retaining the same thread, workspace, plan, and git state.",
+  "repetitions": 1,
+  "tasks": [
+    "tasks/ledger/task.json",
+    "tasks/config-migration/task.json",
+    "tasks/dependency-planner/task.json"
+  ]
+}

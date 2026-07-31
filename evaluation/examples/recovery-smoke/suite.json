@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "id": "recovery-smoke",
+  "title": "Staged Recovery Smoke Suite",
+  "tasks": ["task.json"]
+}

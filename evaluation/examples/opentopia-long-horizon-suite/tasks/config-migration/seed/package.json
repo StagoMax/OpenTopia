@@ -1,0 +1,9 @@
+{
+  "name": "opentopia-config-migration-eval",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/contract.test.js"
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "RECOVERY-SMOKE-001",
+  "title": "Controlled restart retains workspace and target state",
+  "suite": "recovery-smoke",
+  "prompt": "Complete the staged recovery smoke task.",
+  "fixture": {
+    "source": "fixture"
+  },
+  "phases": [
+    {
+      "id": "prepare",
+      "prompt": "Write phase-one progress.",
+      "graders": {
+        "commands": [
+          {
+            "id": "phase-one-progress",
+            "command": "node",
+            "args": ["grader.mjs", "{workspace}", "phase-one"],
+            "timeoutSeconds": 10
+          }
+        ]
+      }
+    },
+    {
+      "id": "resume",
+      "restartBefore": true,
+      "prompt": "Resume from phase-one progress and finish.",
+      "graders": {
+        "commands": [
+          {
+            "id": "final-progress",
+            "command": "node",
+            "args": ["grader.mjs", "{workspace}", "complete"],
+            "timeoutSeconds": 10
+          }
+        ]
+      }
+    }
+  ],
+  "graders": {
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true,
+      "minimumPhaseCompletions": 2
+    },
+    "security": {
+      "protectedPaths": ["protected.txt"],
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}

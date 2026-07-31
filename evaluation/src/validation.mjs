@@ -55,6 +55,60 @@ function assertPositiveInteger(value, field, issues, { allowZero = false, maximu
   }
 }
 
+function validateTaskPhases(phases, issues) {
+  if (phases === undefined) return;
+  if (!Array.isArray(phases) || phases.length === 0) {
+    issues.push("phases must be a non-empty array");
+    return;
+  }
+  const ids = new Set();
+  phases.forEach((phase, index) => {
+    const prefix = `phases[${index}]`;
+    if (!assertObject(phase, prefix, issues)) return;
+    assertString(phase.id, `${prefix}.id`, issues);
+    assertString(phase.prompt, `${prefix}.prompt`, issues);
+    if (phase.id && ids.has(phase.id)) issues.push(`${prefix}.id must be unique`);
+    if (phase.id) ids.add(phase.id);
+    if (phase.restartBefore !== undefined && typeof phase.restartBefore !== "boolean") {
+      issues.push(`${prefix}.restartBefore must be a boolean`);
+    }
+    validatePhaseGraders(phase.graders, `${prefix}.graders`, issues);
+  });
+}
+
+function validatePhaseGraders(graders, prefix, issues) {
+  if (graders === undefined) return;
+  if (!assertObject(graders, prefix, issues)) return;
+  if (graders.commands !== undefined) {
+    if (!Array.isArray(graders.commands)) {
+      issues.push(`${prefix}.commands must be an array`);
+    } else {
+      graders.commands.forEach((grader, index) => {
+        const graderPrefix = `${prefix}.commands[${index}]`;
+        if (!assertObject(grader, graderPrefix, issues)) return;
+        assertString(grader.id, `${graderPrefix}.id`, issues);
+        assertString(grader.command, `${graderPrefix}.command`, issues);
+        if (grader.args !== undefined) assertStringArray(grader.args, `${graderPrefix}.args`, issues);
+        if (grader.timeoutSeconds !== undefined) {
+          assertPositiveInteger(grader.timeoutSeconds, `${graderPrefix}.timeoutSeconds`, issues);
+        }
+      });
+    }
+  }
+  if (graders.files !== undefined) {
+    if (!Array.isArray(graders.files)) {
+      issues.push(`${prefix}.files must be an array`);
+    } else {
+      graders.files.forEach((grader, index) => {
+        const graderPrefix = `${prefix}.files[${index}]`;
+        if (!assertObject(grader, graderPrefix, issues)) return;
+        assertString(grader.id, `${graderPrefix}.id`, issues);
+        assertString(grader.path, `${graderPrefix}.path`, issues);
+      });
+    }
+  }
+}
+
 function validateCapabilityPolicy(policy, issues) {
   if (policy === undefined) return;
   if (!assertObject(policy, "capabilityPolicy", issues)) return;
@@ -152,6 +206,7 @@ export function validateTask(task) {
   if (task.version !== undefined) assertString(task.version, "version", issues);
   if (task.tags !== undefined) assertStringArray(task.tags, "tags", issues);
   if (task.repetitions !== undefined) assertPositiveInteger(task.repetitions, "repetitions", issues, { maximum: 100 });
+  validateTaskPhases(task.phases, issues);
   if (task.fixture !== undefined && assertObject(task.fixture, "fixture", issues)) {
     assertString(task.fixture.source, "fixture.source", issues);
   }
@@ -206,6 +261,28 @@ export function validateTarget(target) {
   }
   if (target.eventTransport !== undefined && target.eventTransport !== "jsonl-file") {
     issues.push("eventTransport must be jsonl-file");
+  }
+  if (target.lifecycle !== undefined) {
+    if (assertObject(target.lifecycle, "target.lifecycle", issues) && target.lifecycle.restart !== undefined) {
+      const restart = target.lifecycle.restart;
+      if (!assertObject(restart, "target.lifecycle.restart", issues)) {
+        // The object assertion already recorded the issue.
+      } else if (!["command", "control-file"].includes(restart.kind)) {
+        issues.push("target.lifecycle.restart.kind must be command or control-file");
+      } else if (restart.kind === "command") {
+        assertString(restart.command, "target.lifecycle.restart.command", issues);
+        if (restart.args !== undefined) assertStringArray(restart.args, "target.lifecycle.restart.args", issues);
+        if (restart.cwd !== undefined) assertString(restart.cwd, "target.lifecycle.restart.cwd", issues);
+      } else {
+        assertString(restart.pathEnvironment, "target.lifecycle.restart.pathEnvironment", issues);
+      }
+      if (restart.timeoutSeconds !== undefined) {
+        assertPositiveInteger(restart.timeoutSeconds, "target.lifecycle.restart.timeoutSeconds", issues);
+      }
+      if (restart.pollMs !== undefined) {
+        assertPositiveInteger(restart.pollMs, "target.lifecycle.restart.pollMs", issues);
+      }
+    }
   }
   if (issues.length > 0) throw new ValidationError("Target", issues);
   return target;

@@ -8,6 +8,7 @@ import { runSuite, validateDefinitions } from "../src/runner.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const example = path.resolve(here, "../examples/smoke");
+const recoveryExample = path.resolve(here, "../examples/recovery-smoke");
 
 test("validates the example without loading product code", async () => {
   const definitions = await validateDefinitions(
@@ -42,6 +43,30 @@ test("runs a black-box trial and produces separated scores and cache metrics", a
     const report = await readFile(result.reports.markdownPath, "utf8");
     assert.match(report, /Strict success: 1\/1/);
     assert.doesNotMatch(report, /EVAL_CANARY_DO_NOT_LEAK_8421/);
+  } finally {
+    await rm(output, { recursive: true, force: true });
+  }
+});
+
+test("runs staged recovery with hidden graders before and after restart", async () => {
+  const output = await mkdtemp(path.join(os.tmpdir(), "agent-eval-recovery-test-"));
+  try {
+    const result = await runSuite({
+      suitePath: path.join(recoveryExample, "suite.json"),
+      targetPath: path.join(recoveryExample, "target.json"),
+      outputDirectory: output,
+      repetitions: 1
+    });
+    const trial = result.summary.results[0];
+    assert.equal(result.summary.status, "passed");
+    assert.equal(trial.status, "passed");
+    assert.equal(trial.process.stages.length, 2);
+    assert.deepEqual(trial.process.stages.map((stage) => stage.graderPassed), [true, true]);
+    assert.equal(trial.metrics.longHorizon.successfulRecoveries, 1);
+    assert.ok(trial.checks.some((check) => check.id === "phase.prepare.phase-one-progress" && check.passed));
+    assert.ok(trial.checks.some((check) => check.id === "phase.resume.final-progress" && check.passed));
+    const events = await readFile(trial.artifacts.events, "utf8");
+    assert.match(events, /application\.recovery\.restart\.completed/);
   } finally {
     await rm(output, { recursive: true, force: true });
   }

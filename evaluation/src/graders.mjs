@@ -287,7 +287,9 @@ export function summarizeDomainMetrics(events) {
   const phaseCompleted = events.filter((event) => event.type === "phase.completed").length;
   const completionClaims = events.filter((event) => event.type === "agent.completion.claimed").length;
   const compactions = events.filter((event) => event.type === "context.compaction.completed").length;
-  const recoveries = events.filter((event) => event.type === "application.recovery.completed");
+  const recoveries = events.filter((event) => (
+    event.type === "application.recovery.completed" || event.type === "application.recovery.restart.completed"
+  ));
 
   const browserActions = events.filter((event) => event.type === "browser.action.completed");
   const validBrowserActions = browserActions.filter((event) => event.payload.valid === true).length;
@@ -307,7 +309,9 @@ export function summarizeDomainMetrics(events) {
       phaseCompletions: phaseCompleted,
       completionClaims,
       contextCompactions: compactions,
-      successfulRecoveries: recoveries.filter((event) => event.payload.success === true).length
+      successfulRecoveries: recoveries.filter((event) => (
+        event.type === "application.recovery.restart.completed" || event.payload.success === true
+      )).length
     },
     browser: {
       actions: browserActions.length,

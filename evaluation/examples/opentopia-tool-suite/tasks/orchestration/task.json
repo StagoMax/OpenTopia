@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "GLM-TOOL-ORCH-001",
+  "id": "OPENTOPIA-TOOL-ORCH-001",
   "version": "1.0.0",
   "title": "Multi-tool orchestration workflow",
-  "suite": "glm-tool-eval",
+  "suite": "opentopia-core-tools",
   "prompt": "Read the file items.txt from the workspace. It contains inventory data in CSV format. Calculate the total value for each item (quantity * price) and the grand total. Create a file called inventory-report.txt in the workspace root that lists each item with its total value and the grand total at the bottom. Format the report clearly with headers and proper number formatting.",
-  "tags": ["glm", "tool", "orchestration", "multi-step"],
+  "tags": ["opentopia", "tool", "orchestration", "multi-step"],
   "fixture": {
     "source": "seed"
   },

@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "GLM-TOOL-SEARCH-001",
+  "id": "OPENTOPIA-TOOL-SEARCH-001",
   "version": "1.0.0",
   "title": "Search tool usage for information retrieval",
-  "suite": "glm-tool-eval",
+  "suite": "opentopia-core-tools",
   "prompt": "Use the search tool to find information about the 'SafetyGuard' component in the workspace file data.txt. Create a file called safety-summary.txt in the workspace root that describes what SafetyGuard does and how it enforces boundaries.",
-  "tags": ["glm", "tool", "search", "information-retrieval"],
+  "tags": ["opentopia", "tool", "search", "information-retrieval"],
   "fixture": {
     "source": "seed"
   },

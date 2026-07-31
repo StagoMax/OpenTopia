@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-core-tools",
+  "title": "OpenTopia Core Tool Evaluation Suite",
+  "description": "Evaluates OpenTopia's ability to use deterministic tools correctly, safely, and efficiently. Covers file operations, search, safety compliance, and multi-tool orchestration.",
+  "repetitions": 1,
+  "tasks": [
+    "tasks/file-tool/task.json",
+    "tasks/search-tool/task.json",
+    "tasks/safe-tool/task.json",
+    "tasks/orchestration/task.json"
+  ]
+}

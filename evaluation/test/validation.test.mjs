@@ -7,6 +7,10 @@ import {
   validateTarget,
   validateTask
 } from "../src/validation.mjs";
+import { validateDefinitions } from "../src/runner.mjs";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 const validTask = () => ({
   schemaVersion: 1,
@@ -57,4 +61,36 @@ test("rejects malformed suite and target definitions", () => {
     () => validateTarget({ schemaVersion: 1, id: "target", command: "node", promptTransport: "socket" }),
     /promptTransport/
   );
+});
+
+test("rejects restart tasks without a target lifecycle", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "agent-eval-invalid-recovery-"));
+  try {
+    await mkdir(path.join(directory, "task"));
+    await writeFile(path.join(directory, "suite.json"), JSON.stringify({
+      schemaVersion: 1,
+      id: "recovery-suite",
+      title: "Recovery Suite",
+      tasks: ["task/task.json"]
+    }), "utf8");
+    await writeFile(path.join(directory, "target.json"), JSON.stringify({
+      schemaVersion: 1,
+      id: "no-lifecycle",
+      command: "node"
+    }), "utf8");
+    await writeFile(path.join(directory, "task/task.json"), JSON.stringify({
+      ...validTask(),
+      suite: "recovery-suite",
+      phases: [
+        { id: "initial", prompt: "Start" },
+        { id: "resume", prompt: "Resume", restartBefore: true }
+      ]
+    }), "utf8");
+    await assert.rejects(
+      validateDefinitions(path.join(directory, "suite.json"), path.join(directory, "target.json")),
+      /requires a restart.*no lifecycle\.restart/
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

@@ -19,7 +19,37 @@
     },
     "inheritEnvironment": { "type": "boolean", "default": false },
     "promptTransport": { "enum": ["stdin", "file", "none"], "default": "stdin" },
-    "eventTransport": { "const": "jsonl-file", "default": "jsonl-file" }
+    "eventTransport": { "const": "jsonl-file", "default": "jsonl-file" },
+    "lifecycle": {
+      "type": "object",
+      "properties": {
+        "restart": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["command", "control-file"] },
+            "command": { "type": "string", "minLength": 1 },
+            "args": { "type": "array", "items": { "type": "string" } },
+            "cwd": { "type": "string" },
+            "pathEnvironment": { "type": "string", "minLength": 1 },
+            "timeoutSeconds": { "type": "integer", "minimum": 1 },
+            "pollMs": { "type": "integer", "minimum": 10 }
+          },
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": { "properties": { "kind": { "const": "command" } } },
+              "then": { "required": ["command"] }
+            },
+            {
+              "if": { "properties": { "kind": { "const": "control-file" } } },
+              "then": { "required": ["pathEnvironment"] }
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": false
 }

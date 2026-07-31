@@ -666,6 +666,7 @@ docs/evaluations/<date>-<suite>-<model>.md
 - `scripts/probe-openai-compatible.ps1`：模型列表、SSE、工具调用、continuation、严格历史和 compacted-history fallback。
 - `scripts/evaluate-long-horizon.ps1`：干净 Git Fixture、基线失败、隐藏 Grader、两阶段任务、硬超时、计划/工具/Token 轨迹、重启恢复设计、受保护文件和密钥扫描。
 - `scripts/evaluate-long-horizon-suite.ps1`：任务清单驱动、重复运行、独立端口与工作区、聚合成功率和基础设施失败分类。
+- `scripts/evaluate-opentopia-tool-suite.ps1`：为中立的 OpenTopia Suite 启动隔离 Server/SQLite、固定运行 profile、运行 Harness，并通过控制文件处理同库 Server 重启；默认工具 Suite，也可通过 `-SuitePath` 运行长程恢复 Suite。
 - `crates/opentopia-core/src/agent.rs`：单切片/总工具预算、等价调用保护、实施模式、收尾模式、显式完成和验证兜底终态。
 - `scripts/fixtures/long-horizon/`：账本、配置迁移和依赖规划三类两阶段任务与外部隐藏 Grader。
 - `docs/evaluations/glm-5.2-long-horizon-2026-07-16.md`：中文基线、失败迭代和最终三任务闭环报告。

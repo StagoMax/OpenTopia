@@ -29,6 +29,15 @@ node evaluation/src/cli.mjs run `
   --output evaluation/.runs
 ```
 
+OpenTopia application suites are model-neutral. Select and freeze the provider,
+model, reasoning settings, and context limits in the external run profile; the
+result manifest records that run configuration without changing fixture IDs.
+
+Tasks can declare ordered `phases`. A phase with `restartBefore: true` asks the
+target lifecycle supervisor to restart the application before the next prompt;
+the target keeps only the task's persisted state needed to resume the same
+workspace and thread.
+
 也可以在 `evaluation/` 目录中执行 `npm test`。Harness 只使用 Node 22+ 内置模块，不需要把依赖加入根 `package.json` 或 pnpm workspace。
 
 ## 接入任意应用
@@ -131,7 +140,28 @@ node evaluation/src/cli.mjs run `
 
 该 Adapter 默认拒绝审批（`OPENTOPIA_EVAL_APPROVAL_MODE=deny`）。安全任务应保持默认值；只有明确测试“批准后行为”的 Task 才使用独立的显式配置打开批准。
 
-现有 `scripts/evaluate-long-horizon*.ps1` 保持不变。迁移旧 Fixture 时，应把它们转换成新 Task/Grader 格式，而不是让新 Harness import 或修改旧脚本。
+仓库提供了 OpenTopia suite 的真实产品入口。它从指定的 Provider profile 读取运行时配置，生成独立数据库和本地 API token，启动 Server 后调用 Harness；模型信息只记录在运行结果中，不属于 Fixture ID。默认运行 `examples/opentopia-tool-suite`；`ExpectedModel` 是可选的 profile 断言：
+
+```powershell
+.\scripts\evaluate-opentopia-tool-suite.ps1 `
+  -EnvFile "J:\path\to\.env" `
+  -Profile AUDIT_COPILOT_LLM `
+  -ExpectedModel <configured-model> `
+  -Repetitions 1
+```
+
+默认产物位于 `.opentopia/evaluations/<run-id>/`，其中保留 Harness 输出、Server 日志和脱敏后的入口摘要。阶段任务可通过 Target 的 `lifecycle.restart` 控制文件请求 Server 使用同一数据库重启。
+
+两阶段编码恢复使用 `examples/opentopia-long-horizon-suite`，可用同一入口运行：
+
+```powershell
+.\scripts\evaluate-opentopia-tool-suite.ps1 `
+  -EnvFile "J:\path\to\.env" `
+  -Profile AUDIT_COPILOT_LLM `
+  -SuitePath evaluation\examples\opentopia-long-horizon-suite\suite.json
+```
+
+旧的 `scripts/evaluate-long-horizon*.ps1` 保持兼容；新 Harness 不会 import 它们。
 
 ## 结果和安全属性
 

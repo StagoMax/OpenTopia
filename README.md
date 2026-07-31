@@ -257,7 +257,28 @@ or run the deterministic two-phase long-horizon evaluation without printing the 
   -Profile AUDIT_COPILOT_LLM `
   -ExpectedModel glm-5.2 `
   -Repetitions 1
+
+.\scripts\evaluate-opentopia-tool-suite.ps1 `
+  -EnvFile "J:\Project\信贷审核助手\.env" `
+  -Profile AUDIT_COPILOT_LLM `
+  -ExpectedModel <configured-model> `
+  -Repetitions 1
 ```
+
+Run the native Windows Computer Use fixture only from a dedicated evaluation
+desktop or VM with no unrelated windows, accounts, or personal data. It launches
+a real desktop application and automatically approves only `computer` tool calls:
+
+```powershell
+.\scripts\evaluate-computer-use.ps1 `
+  -EnvFile "J:\path\to\.env" `
+  -Profile AUDIT_COPILOT_LLM `
+  -ExpectedModel glm-5.2 `
+  -IsolatedDesktop
+```
+
+This is an OpenTopia-private fixture runner, not an OSWorld result. Its task
+definitions are under `scripts/fixtures/computer-use/`.
 
 The latest methodology, closure design, and three-task result are documented in
 `docs/evaluations/glm-5.2-long-horizon-2026-07-16.md`. This local harness follows
