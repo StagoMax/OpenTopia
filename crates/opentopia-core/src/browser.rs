@@ -524,7 +524,9 @@ impl LocalBrowserRuntime {
         if let Some(process) = process.as_ref() {
             return Ok(process.clone());
         }
-        let started = Arc::new(Mutex::new(LocalBrowserProcess::start(self.config.clone()).await?));
+        let started = Arc::new(Mutex::new(
+            LocalBrowserProcess::start(self.config.clone()).await?,
+        ));
         *process = Some(started.clone());
         Ok(started)
     }

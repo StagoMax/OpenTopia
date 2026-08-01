@@ -660,27 +660,26 @@ impl OpenAiCompatibleProvider {
             && chat_function_tools.support != ProviderFeatureSupport::Unsupported;
         let responses_agent_compatible = responses.support == ProviderFeatureSupport::Supported
             && responses_native_tools.support != ProviderFeatureSupport::Unsupported;
-        let selected_protocol = if chat_agent_compatible
-            && developer.support == ProviderFeatureSupport::Supported
-        {
-            OpenAiProtocol::ChatCompletions
-        } else if responses.support == ProviderFeatureSupport::Supported
-            && responses_native_tools.support == ProviderFeatureSupport::Supported
-        {
-            OpenAiProtocol::Responses
-        } else if chat_agent_compatible {
-            OpenAiProtocol::ChatCompletions
-        } else if responses_agent_compatible {
-            OpenAiProtocol::Responses
-        } else if chat.support == ProviderFeatureSupport::Supported {
-            OpenAiProtocol::ChatCompletions
-        } else if responses.support == ProviderFeatureSupport::Supported {
-            OpenAiProtocol::Responses
-        } else if preferred_kind == ProviderKind::OpenAiResponses {
-            OpenAiProtocol::Responses
-        } else {
-            OpenAiProtocol::ChatCompletions
-        };
+        let selected_protocol =
+            if chat_agent_compatible && developer.support == ProviderFeatureSupport::Supported {
+                OpenAiProtocol::ChatCompletions
+            } else if responses.support == ProviderFeatureSupport::Supported
+                && responses_native_tools.support == ProviderFeatureSupport::Supported
+            {
+                OpenAiProtocol::Responses
+            } else if chat_agent_compatible {
+                OpenAiProtocol::ChatCompletions
+            } else if responses_agent_compatible {
+                OpenAiProtocol::Responses
+            } else if chat.support == ProviderFeatureSupport::Supported {
+                OpenAiProtocol::ChatCompletions
+            } else if responses.support == ProviderFeatureSupport::Supported {
+                OpenAiProtocol::Responses
+            } else if preferred_kind == ProviderKind::OpenAiResponses {
+                OpenAiProtocol::Responses
+            } else {
+                OpenAiProtocol::ChatCompletions
+            };
         let message_compatibility = selected_protocol == OpenAiProtocol::ChatCompletions
             && developer.support != ProviderFeatureSupport::Supported;
         remember_openai_message_compatibility(&self.base_url, &self.model, message_compatibility);
@@ -1141,7 +1140,10 @@ impl OpenAiResponsesProvider {
         // Reasoning models reject any explicit temperature with a 400, so the
         // field is omitted rather than clamped. `None` also omits it — letting
         // the model use its vendor default.
-        if let Some(temperature) = self.temperature.filter(|_| model_accepts_temperature(&self.model)) {
+        if let Some(temperature) = self
+            .temperature
+            .filter(|_| model_accepts_temperature(&self.model))
+        {
             payload["temperature"] = json!(temperature);
         }
         let mut system_instructions = responses_system_instructions(&request);
@@ -6165,7 +6167,10 @@ mod tests {
                 let (status, body) = if is_responses {
                     ("404 Not Found", r#"{"error":"not found"}"#)
                 } else if has_developer {
-                    ("400 Bad Request", r#"{"error":"unsupported developer role"}"#)
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"unsupported developer role"}"#,
+                    )
                 } else {
                     ("200 OK", "{}")
                 };
@@ -6184,8 +6189,7 @@ mod tests {
         });
 
         let base_url = format!("http://{address}/v1");
-        let provider =
-            OpenAiCompatibleProvider::new(&base_url, "test-key", "probe-test-model");
+        let provider = OpenAiCompatibleProvider::new(&base_url, "test-key", "probe-test-model");
         let health = provider
             .probe_compatibility(ProviderKind::OpenAiCompatible)
             .await
@@ -6196,10 +6200,7 @@ mod tests {
         assert!(health.model_available);
         let report = health.openai_compatibility.unwrap();
         assert_eq!(report.selected_protocol, OpenAiProtocol::ChatCompletions);
-        assert_eq!(
-            report.chat_completions,
-            ProviderFeatureSupport::Supported
-        );
+        assert_eq!(report.chat_completions, ProviderFeatureSupport::Supported);
         assert_eq!(
             report.chat_function_tools,
             ProviderFeatureSupport::Supported
@@ -6215,11 +6216,8 @@ mod tests {
         );
         assert!(report.message_compatibility);
 
-        let fresh =
-            OpenAiCompatibleProvider::new(&base_url, "test-key", "probe-test-model");
-        let prepared = fresh
-            .prepare(Uuid::nil(), layered_model_request())
-            .unwrap();
+        let fresh = OpenAiCompatibleProvider::new(&base_url, "test-key", "probe-test-model");
+        let prepared = fresh.prepare(Uuid::nil(), layered_model_request()).unwrap();
         assert!(!prepared.body["messages"]
             .as_array()
             .unwrap()
@@ -6237,7 +6235,10 @@ mod tests {
                 let request = read_http_request(&mut socket).await;
                 let has_developer = request.contains(r#""role":"developer""#);
                 let (status, body) = if has_developer {
-                    ("400 Bad Request", r#"{"error":"unsupported developer role"}"#)
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"unsupported developer role"}"#,
+                    )
                 } else {
                     ("200 OK", "{}")
                 };
@@ -6292,9 +6293,15 @@ mod tests {
                 let has_native_web_search = request.contains(r#""type":"web_search""#);
                 let has_developer = request.contains(r#""role":"developer""#);
                 let (status, body) = if is_responses && has_native_web_search {
-                    ("400 Bad Request", r#"{"error":"native Responses tools unsupported"}"#)
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"native Responses tools unsupported"}"#,
+                    )
                 } else if has_developer {
-                    ("400 Bad Request", r#"{"error":"unsupported developer role"}"#)
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"unsupported developer role"}"#,
+                    )
                 } else {
                     ("200 OK", "{}")
                 };

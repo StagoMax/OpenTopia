@@ -468,7 +468,10 @@ fn context_window_for_base(model: &str) -> Option<usize> {
     }
 
     // ── Mistral ─────────────────────────────────────────────────────────
-    if model.starts_with("mistral") || model.starts_with("mixtral") || model.starts_with("codestral") {
+    if model.starts_with("mistral")
+        || model.starts_with("mixtral")
+        || model.starts_with("codestral")
+    {
         return Some(128_000);
     }
 
@@ -981,14 +984,8 @@ mod tests {
             known_model_context_window_tokens("kimi-k2.5"),
             Some(256_000)
         );
-        assert_eq!(
-            known_model_context_window_tokens("kimi-k2"),
-            Some(128_000)
-        );
-        assert_eq!(
-            known_model_context_window_tokens("k3-256k"),
-            Some(256_000)
-        );
+        assert_eq!(known_model_context_window_tokens("kimi-k2"), Some(128_000));
+        assert_eq!(known_model_context_window_tokens("k3-256k"), Some(256_000));
         assert_eq!(
             known_model_context_window_tokens("glm-5.2"),
             Some(1_000_000)
