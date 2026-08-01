@@ -1,5 +1,5 @@
 param(
-  [string[]]$Tasks = @("miniwob.click-test", "miniwob.click-button", "miniwob.button-delay"),
+  [string[]]$Tasks = @("miniwob.click-test", "miniwob.click-button", "miniwob.click-button-sequence"),
   [int]$Seed = 0,
   [ValidateRange(1024, 65535)][int]$Port = 8820,
   [ValidateRange(60000, 1800000)][int]$TimeoutMs = 300000,
@@ -11,7 +11,12 @@ $ErrorActionPreference = "Stop"
 
 function New-Token {
   $bytes = [byte[]]::new(32)
-  [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+  $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $random.GetBytes($bytes)
+  } finally {
+    $random.Dispose()
+  }
   return [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
 }
 
@@ -28,6 +33,9 @@ function Get-FreeLoopbackPort {
 function Stop-ChildProcess {
   param([AllowNull()][Diagnostics.Process]$Process)
 
+  if ($Process) {
+    $Process.Refresh()
+  }
   if ($Process -and -not $Process.HasExited) {
     Stop-Process -Id $Process.Id -Force
     $Process.WaitForExit(5000) | Out-Null
@@ -67,15 +75,37 @@ function Get-TaskEvents {
   if (-not (Test-Path -LiteralPath $EventsPath -PathType Leaf)) {
     return @()
   }
-  return @(
-    Get-Content -LiteralPath $EventsPath |
-      Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-      ForEach-Object { $_ | ConvertFrom-Json }
-  )
+  return @([IO.File]::ReadAllLines($EventsPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
+function Import-EvaluationEnv {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  Get-Content -LiteralPath $Path | ForEach-Object {
+    $line = $_.Trim()
+    if (-not $line -or $line.StartsWith("#")) { return }
+    if ($line.StartsWith("export ")) { $line = $line.Substring(7).Trim() }
+    $separator = $line.IndexOf("=")
+    if ($separator -le 0) { return }
+    $name = $line.Substring(0, $separator).Trim()
+    $value = $line.Substring($separator + 1).Trim()
+    if ($value.Length -ge 2 -and (
+      ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+      ($value.StartsWith("'") -and $value.EndsWith("'"))
+    )) {
+      $value = $value.Substring(1, $value.Length - 2)
+    }
+    if ($name -and -not [Environment]::GetEnvironmentVariable($name, "Process")) {
+      [Environment]::SetEnvironmentVariable($name, $value, "Process")
+    }
+  }
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-. "$PSScriptRoot\dev-env.ps1"
+$envFile = if ($env:OPENTOPIA_ENV_FILE) { $env:OPENTOPIA_ENV_FILE } else { Join-Path $repoRoot ".env" }
+if (Test-Path -LiteralPath $envFile -PathType Leaf) {
+  Import-EvaluationEnv (Resolve-Path -LiteralPath $envFile).Path
+}
 if (-not $env:OPENTOPIA_API_KEY -and $env:OPENTOPIA_MODEL_KEY) {
   $env:OPENTOPIA_API_KEY = $env:OPENTOPIA_MODEL_KEY
 }
@@ -178,6 +208,7 @@ try {
     $taskError = $null
     $brokerResult = $null
     $events = @()
+    $adapterExitCode = $null
     try {
       $brokerArguments = "evaluation/adapters/browsergym_miniwob_broker.py --task $task --seed $Seed --miniwob-root `"$miniwobRoot`" --port 0 --token $brokerToken --result-path `"$brokerResultPath`""
       if ($browserExecutable) {
@@ -235,7 +266,7 @@ try {
       Wait-Healthy -Url "http://127.0.0.1:$serverPort" -Headers $apiHeaders -Process $serverProcess -ExpectedService "opentopia-server"
       $providerHealth = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$serverPort/api/provider/test" -Headers $apiHeaders -ContentType "application/json" -Body "{}" -TimeoutSec 20
       if (-not $providerHealth.reachable -or -not $providerHealth.modelAvailable) {
-        throw "OpenTopia provider health check failed"
+        throw "OpenTopia provider health check failed (reachable=$($providerHealth.reachable), modelAvailable=$($providerHealth.modelAvailable), detail=$($providerHealth.detail))"
       }
 
       $env:AGENT_EVAL_WORKSPACE = $repoRoot
@@ -252,14 +283,27 @@ try {
         -RedirectStandardError $adapterStderr `
         -PassThru `
         -WindowStyle Hidden
-      $adapterProcess.WaitForExit($TimeoutMs + 30000) | Out-Null
-      if (-not $adapterProcess.HasExited) {
+      $adapterFinished = $adapterProcess.WaitForExit($TimeoutMs + 30000)
+      $adapterProcess.Refresh()
+      if (-not $adapterFinished -or -not $adapterProcess.HasExited) {
         throw "OpenTopia adapter exceeded the benchmark timeout"
       }
-      if ($adapterProcess.ExitCode -ne 0) {
-        throw "OpenTopia adapter exited with code $($adapterProcess.ExitCode)"
+      try {
+        $adapterExitCode = $adapterProcess.ExitCode
+      } catch {
+        $adapterExitCode = $null
+      }
+      if ($null -ne $adapterExitCode -and $adapterExitCode -ne 0) {
+        throw "OpenTopia adapter exited with code $adapterExitCode"
       }
       $events = Get-TaskEvents $eventsPath
+      if (-not ($events | Where-Object { $_.Contains('"type":"application.turn.completed"') })) {
+        throw "OpenTopia adapter exited without recording a completed turn"
+      }
+      if ($null -eq $adapterExitCode) {
+        # Some Windows Start-Process instances do not retain ExitCode after asynchronous redirection.
+        $adapterExitCode = 0
+      }
       $brokerResult = Invoke-RestMethod -Uri "$brokerUrl/results" -Headers $brokerHeaders -TimeoutSec 10
     } catch {
       $taskError = $_.Exception.Message.Replace($apiToken, "<redacted>").Replace($brokerToken, "<redacted>")
@@ -274,7 +318,7 @@ try {
       Stop-ChildProcess $serverProcess
       Stop-ChildProcess $brokerProcess
     }
-    $browserActions = @($events | Where-Object { $_.type -eq "browser.action.completed" })
+    $browserActions = @($events | Where-Object { $_.Contains('"type":"browser.action.completed"') })
     $taskResults += [ordered]@{
       task = $task
       seed = $Seed
@@ -282,15 +326,15 @@ try {
       browsergym = $brokerResult
       browserActions = [ordered]@{
         total = $browserActions.Count
-        succeeded = @($browserActions | Where-Object { $_.payload.success }).Count
+        succeeded = @($browserActions | Where-Object { $_.Contains('"success":true') }).Count
       }
       adapter = [ordered]@{
-        exitCode = if ($adapterProcess) { $adapterProcess.ExitCode } else { $null }
+        exitCode = $adapterExitCode
         events = $events.Count
       }
       paths = [ordered]@{
-        root = $taskRoot.Substring($repoRoot.Length).TrimStart("\\", "/")
-        brokerResult = if (Test-Path -LiteralPath $brokerResultPath) { $brokerResultPath.Substring($repoRoot.Length).TrimStart("\\", "/") } else { $null }
+        root = $taskRoot.Substring($repoRoot.Length).TrimStart('\', '/')
+        brokerResult = if (Test-Path -LiteralPath $brokerResultPath) { $brokerResultPath.Substring($repoRoot.Length).TrimStart('\', '/') } else { $null }
       }
       error = $taskError
     }

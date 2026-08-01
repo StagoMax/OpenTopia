@@ -40,13 +40,12 @@ async function api(method, route, body) {
 }
 
 async function readPrompt() {
-  if (process.env.AGENT_EVAL_PROMPT_FILE && process.stdin.isTTY) {
+  if (process.env.AGENT_EVAL_PROMPT_FILE) {
     return readFile(process.env.AGENT_EVAL_PROMPT_FILE, "utf8");
   }
   let prompt = "";
   for await (const chunk of process.stdin) prompt += chunk;
   if (prompt) return prompt;
-  if (process.env.AGENT_EVAL_PROMPT_FILE) return readFile(process.env.AGENT_EVAL_PROMPT_FILE, "utf8");
   return prompt;
 }
 
