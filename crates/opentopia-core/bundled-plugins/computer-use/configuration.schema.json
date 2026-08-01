@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "opentopia://plugins/computer-use/configuration.schema.json",
+  "title": "Computer Use",
+  "type": "object",
+  "properties": {
+    "allowedApplications": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true,
+      "default": [],
+      "description": "Application executable names the user has selected for window-scoped control. Protected-window and approval policy still apply."
+    }
+  },
+  "additionalProperties": false
+}

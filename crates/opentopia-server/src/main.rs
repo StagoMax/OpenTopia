@@ -12,22 +12,23 @@ use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    agent_model_context_with_runtime, browser_handoff_for_node,
-    build_local_sandbox_command, content_fingerprint, discover_plugins, discover_skills,
-    execute_git_workflow, experience_mode_module, install_plugin, load_context_sources,
-    load_plugin_mcp_servers, load_selected_skills, permission_policy_module,
-    redact_model_observation, resolve_instruction_documents, uninstall_plugin,
-    world_state_catalog_item, world_state_item, AgentContextBudget, AgentContinuation, AgentCore,
-    AgentEvent, AgentEventPayload, AgentProfileRegistry, AgentRuntimeSettings, AgentTurnInput,
-    AgentTurnOutcome, AnthropicMessagesProvider, AppSettings, Approval, ApprovalStatus, Artifact,
-    ArtifactMetadata, BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction,
-    BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
-    BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
-    BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
+    agent_model_context_with_runtime, browser_handoff_for_node, build_local_sandbox_command,
+    bundled_plugin_metadata, bundled_plugins_path, content_fingerprint, discover_plugins,
+    discover_skills, ensure_bundled_plugins_installed, execute_git_workflow,
+    experience_mode_module, install_plugin, load_context_sources, load_plugin_mcp_servers,
+    load_selected_skills, permission_policy_module, redact_model_observation,
+    resolve_instruction_documents, uninstall_plugin, world_state_catalog_item, world_state_item,
+    AgentContextBudget, AgentContinuation, AgentCore, AgentEvent, AgentEventPayload,
+    AgentProfileRegistry, AgentRuntimeSettings, AgentTurnInput, AgentTurnOutcome,
+    AnthropicMessagesProvider, AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
+    BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction, BrowserActionReceipt,
+    BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest, BrowserNodeRef,
+    BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserRuntime,
+    BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
     BrowserWaitRequest, ChangedFile, CodexAccountManager, CodexAccountStatus,
-    CodexAppServerProvider, CodexLoginStart, CollaborationMode,
-    CompiledModelContext, ComputerRuntime, ComputerRuntimeConfig, ComputerSessionId,
-    ContextCacheScope, ContextCheckpoint, ContextCheckpointArtifact, ContextCheckpointCommand,
+    CodexAppServerProvider, CodexLoginStart, CollaborationMode, CompiledModelContext,
+    ComputerRuntime, ComputerRuntimeConfig, ComputerSessionId, ContextCacheScope,
+    ContextCheckpoint, ContextCheckpointArtifact, ContextCheckpointCommand,
     ContextCheckpointCoverage, ContextCheckpointFact, ContextCheckpointInteraction,
     ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
     ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextItemKind,
@@ -39,20 +40,20 @@ use opentopia_core::{
     ModelContentPart, ModelContextItem, ModelConversationMessage, ModelConversationRole,
     ModelProvider, ModelRequest, ObserveOptions, OpenAiCompatibleProvider, OpenAiProtocol,
     OpenAiResponsesProvider, PermissionMode, PluginDescriptor, PluginError, PolicyDecision,
-    PolicyEngine, PreviewDescriptor, PreviewError, PreviewRange, PreviewRangeRequest, PreviewTarget,
-    PreviewWorkbook,
-    ProviderConversationCursor, ProviderConversationState, ProviderHealth, ProviderHealthCheck,
-    ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit,
-    RuntimeSurface, SandboxDescriptor, SandboxSettings, SessionStore, SkillDescriptor, SkillRef,
-    SpawnSubagentRequest, SqliteSessionStore, StoreError, SubagentExecutor, SubagentObserver,
-    SubagentRun, SubagentScheduler, SubagentSchedulerConfig, SubagentScope, TaskPlan,
-    TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer,
-    ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult, TurnChangeSet,
-    TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus, UserInputRecord,
-    UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff, WorkspaceDiffHunk,
-    WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,
-    WorldStateSkill, WorldStateSnapshot, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
-    MAX_PREVIEW_CONTENT_BYTES, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
+    PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest,
+    PreviewTarget, PreviewWorkbook, ProviderConversationCursor, ProviderConversationState,
+    ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent,
+    ResolvedPreview, ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxSettings,
+    SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
+    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
+    SubagentScope, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot,
+    ThreadMcpServer, ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult,
+    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus,
+    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff,
+    WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
+    WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
+    CONTEXT_CHECKPOINT_SCHEMA_VERSION, MAX_PREVIEW_CONTENT_BYTES,
+    MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,15 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let auth = ApiAuth::from_env()?;
+    for outcome in ensure_bundled_plugins_installed(&bundled_plugins_path())? {
+        info!(
+            plugin = %outcome.name,
+            version = %outcome.version,
+            status = ?outcome.status,
+            path = %outcome.path.display(),
+            "bundled plugin package ready"
+        );
+    }
     let store = Arc::new(SqliteSessionStore::open(&args.db)?);
     let interrupted_turns = store.interrupt_active_turns()?;
     if interrupted_turns > 0 {
@@ -632,6 +642,7 @@ impl SubagentExecutor for ServerSubagentExecutor {
             agent.apply_agent_profile(&profile);
             agent.set_mcp_host(self.mcp_host.clone());
             agent.set_subagent_identity(run.id, run.depth, run.agent_path.clone());
+            sync_thread_bundled_plugin_activations(&self.store, run.parent_thread_id, &mut agent);
             sync_thread_mcp_tools(
                 &self.store,
                 &self.mcp_host,
@@ -1316,9 +1327,13 @@ async fn list_plugins(
         .into_iter()
         .map(|binding| (binding.server_id, binding.enabled))
         .collect::<HashMap<_, _>>();
+    let activations = match thread_id {
+        Some(thread_id) => Some(state.store.list_thread_plugin_activations(thread_id)?),
+        None => None,
+    };
     let mut views = Vec::with_capacity(plugins.len());
     for plugin in plugins {
-        views.push(plugin_view(&state, plugin, &skills, &bindings).await?);
+        views.push(plugin_view(&state, plugin, &skills, &bindings, activations.as_ref()).await?);
     }
     Ok(Json(views))
 }
@@ -1334,7 +1349,7 @@ async fn install_local_plugin(
         .map_err(plugin_bad_request)?;
     sync_plugin_mcp_configs(&state, &plugin).await?;
     let skills = discover_skills(None);
-    let view = plugin_view(&state, plugin, &skills, &HashMap::new()).await?;
+    let view = plugin_view(&state, plugin, &skills, &HashMap::new(), None).await?;
     Ok(Json(view))
 }
 
@@ -1370,6 +1385,11 @@ async fn set_thread_plugin(
         .find(|plugin| plugin.id == request.plugin_id)
         .ok_or_else(|| ApiError::not_found("plugin is not available in this workspace"))?;
     let servers = sync_plugin_mcp_configs(&state, &plugin).await?;
+    if !plugin.native_capabilities.is_empty() {
+        state
+            .store
+            .set_thread_plugin_activation(thread_id, &plugin.name, request.enabled)?;
+    }
     for server in &servers {
         state
             .store
@@ -1384,8 +1404,11 @@ async fn set_thread_plugin(
         .into_iter()
         .map(|binding| (binding.server_id, binding.enabled))
         .collect::<HashMap<_, _>>();
+    let activations = state.store.list_thread_plugin_activations(thread_id)?;
     let skills = discover_skills(Some(&thread.workspace_root));
-    Ok(Json(plugin_view(&state, plugin, &skills, &bindings).await?))
+    Ok(Json(
+        plugin_view(&state, plugin, &skills, &bindings, Some(&activations)).await?,
+    ))
 }
 
 async fn plugin_view(
@@ -1393,6 +1416,7 @@ async fn plugin_view(
     plugin: PluginDescriptor,
     skills: &[SkillDescriptor],
     bindings: &HashMap<Uuid, bool>,
+    activations: Option<&HashMap<String, bool>>,
 ) -> Result<PluginView, ApiError> {
     let skill_ids = skills
         .iter()
@@ -1400,10 +1424,21 @@ async fn plugin_view(
         .map(|skill| skill.id.clone())
         .collect::<Vec<_>>();
     let servers = state.store.list_plugin_mcp_servers(&plugin.id)?;
-    let thread_enabled = !servers.is_empty()
-        && servers
-            .iter()
-            .all(|server| bindings.get(&server.server_id).copied().unwrap_or(false));
+    let has_native_tools = !plugin.native_capabilities.is_empty();
+    let native_tools_enabled = activations.is_some_and(|activations| {
+        activations
+            .get(&plugin.name)
+            .copied()
+            .unwrap_or(plugin.default_enabled)
+    });
+    let has_mcp_tools = !servers.is_empty();
+    let mcp_tools_enabled = servers
+        .iter()
+        .all(|server| bindings.get(&server.server_id).copied().unwrap_or(false));
+    let thread_enabled = activations.is_some()
+        && (has_native_tools || has_mcp_tools)
+        && (!has_native_tools || native_tools_enabled)
+        && (!has_mcp_tools || mcp_tools_enabled);
     let mut mcp_servers = Vec::with_capacity(servers.len());
     for server in servers {
         let status = state.mcp_host.status_for_config(&server).await;
@@ -3136,7 +3171,13 @@ async fn resolve_preview(
 ) -> Result<Json<PreviewDescriptor>, ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
     let preview = resolve_preview_target(&state.store, &thread, &target)?;
-    Ok(Json(preview.descriptor))
+    let mut descriptor = preview.descriptor;
+    if descriptor.kind == PreviewKind::Spreadsheet
+        && !bundled_plugin_enabled_for_thread(&state.store, thread_id, "spreadsheet")?
+    {
+        descriptor.kind = PreviewKind::Unsupported;
+    }
+    Ok(Json(descriptor))
 }
 
 async fn read_preview_content(
@@ -3205,6 +3246,7 @@ async fn get_preview_workbook(
     State(state): State<AppState>,
     Path((thread_id, preview_id)): Path<(Uuid, String)>,
 ) -> Result<Json<PreviewWorkbook>, ApiError> {
+    require_bundled_plugin_for_thread(&state.store, thread_id, "spreadsheet")?;
     let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
     let workbook = tokio::task::spawn_blocking(move || opentopia_core::preview_workbook(&preview))
         .await
@@ -3218,6 +3260,7 @@ async fn read_preview_range(
     Path((thread_id, preview_id)): Path<(Uuid, String)>,
     Query(query): Query<PreviewRangeQuery>,
 ) -> Result<Json<PreviewRange>, ApiError> {
+    require_bundled_plugin_for_thread(&state.store, thread_id, "spreadsheet")?;
     let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
     let request = PreviewRangeRequest {
         sheet: query.sheet,
@@ -3233,6 +3276,34 @@ async fn read_preview_range(
     .map_err(|error| ApiError::internal(format!("spreadsheet preview worker failed: {error}")))?
     .map_err(preview_api_error)?;
     Ok(Json(range))
+}
+
+fn bundled_plugin_enabled_for_thread(
+    store: &SqliteSessionStore,
+    thread_id: Uuid,
+    plugin_name: &str,
+) -> Result<bool, ApiError> {
+    let metadata = bundled_plugin_metadata(plugin_name)
+        .ok_or_else(|| ApiError::internal(format!("unknown bundled plugin: {plugin_name}")))?;
+    Ok(store
+        .list_thread_plugin_activations(thread_id)?
+        .get(plugin_name)
+        .copied()
+        .unwrap_or(metadata.default_enabled))
+}
+
+fn require_bundled_plugin_for_thread(
+    store: &SqliteSessionStore,
+    thread_id: Uuid,
+    plugin_name: &str,
+) -> Result<(), ApiError> {
+    if bundled_plugin_enabled_for_thread(store, thread_id, plugin_name)? {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "bundled plugin {plugin_name} is disabled for this thread"
+        )))
+    }
 }
 
 fn resolve_preview_id_for_thread(
@@ -5350,6 +5421,20 @@ async fn sync_thread_mcp_tools(
     agent.sync_mcp_tools_for_servers(&ready_server_ids).await;
 }
 
+fn sync_thread_bundled_plugin_activations(
+    store: &SqliteSessionStore,
+    thread_id: Uuid,
+    agent: &mut AgentCore,
+) {
+    match store.list_thread_plugin_activations(thread_id) {
+        Ok(activations) => agent.set_bundled_plugin_activations(&activations),
+        Err(err) => {
+            error!(?err, %thread_id, "failed to load bundled plugin activations");
+            agent.disable_all_bundled_plugins();
+        }
+    }
+}
+
 fn publish_payload(
     state: &AppState,
     thread_id: Uuid,
@@ -5558,6 +5643,7 @@ async fn run_new_agent_turn(
     }
     agent.set_mcp_host(state.mcp_host.clone());
     agent.set_subagent_context(turn_id, 0);
+    sync_thread_bundled_plugin_activations(&state.store, thread_id, &mut agent);
     sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
     let built_context = build_turn_model_context(
         &state,
@@ -5895,6 +5981,7 @@ async fn run_resumed_agent_turn(
     }
     agent.set_mcp_host(state.mcp_host.clone());
     agent.set_subagent_context(turn_id, 0);
+    sync_thread_bundled_plugin_activations(&state.store, thread_id, &mut agent);
     sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let resolved_approval_id = match &resume {
@@ -6742,15 +6829,21 @@ async fn build_turn_model_context(
             },
         })
         .collect::<Vec<_>>();
-    let plugin_catalog = discover_plugins(Some(&cwd));
+    let plugin_catalog = discover_plugins(Some(&cwd))
+        .into_iter()
+        .filter(|plugin| {
+            plugin.native_capabilities.is_empty() || agent.bundled_plugin_enabled(&plugin.name)
+        })
+        .collect::<Vec<_>>();
     if !plugin_catalog.is_empty() {
         let available = plugin_catalog
             .iter()
             .map(|plugin| {
                 format!(
-                    "- {} ({}): {} Skill(s), {} supported MCP server(s){}",
+                    "- {} ({}): {} native tool(s), {} Skill(s), {} supported MCP server(s){}",
                     plugin.name,
                     plugin.display_name,
+                    plugin.native_capabilities.len(),
                     plugin.skill_count,
                     plugin.supported_mcp_server_count,
                     if plugin.has_apps {
@@ -10099,6 +10192,29 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_plugin_activation_uses_default_and_persisted_thread_override() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let thread = store
+            .create_thread(None, std::env::current_dir().expect("cwd"))
+            .expect("create thread");
+
+        assert!(
+            bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
+                .expect("default activation")
+        );
+        store
+            .set_thread_plugin_activation(thread.id, "spreadsheet", false)
+            .expect("disable spreadsheet");
+        assert!(
+            !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
+                .expect("persisted activation")
+        );
+        let error = require_bundled_plugin_for_thread(&store, thread.id, "spreadsheet")
+            .expect_err("disabled preview capability must be rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn accepts_bounded_inline_images_and_rejects_non_images() {

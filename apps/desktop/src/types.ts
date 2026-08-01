@@ -1043,7 +1043,11 @@ export type PluginDescriptor = {
   path: string;
   manifestPath: string;
   scope: "workspace" | "user" | "codex";
+  source: "workspace" | "user" | "codex" | "bundled";
   managed: boolean;
+  trust: "standard" | "official" | "privileged" | "trusted_driver";
+  defaultEnabled: boolean;
+  nativeCapabilities: string[];
   skillRoot?: string;
   skillCount: number;
   mcpServerCount: number;

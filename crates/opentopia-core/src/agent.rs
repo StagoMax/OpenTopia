@@ -1,6 +1,7 @@
 use crate::agent_profiles::AgentProfile;
 use crate::background::{BackgroundProcessRegistry, BackgroundScope};
 use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
+use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime};
 use crate::guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext,
@@ -37,12 +38,12 @@ use crate::skills::SkillScope;
 use crate::store::{ProviderContextStateKind, SessionStore};
 use crate::subagents::{SubagentScheduler, SubagentScope};
 use crate::tools::{
-    browser_handoff_required, McpToolWrapper, ToolContext, ToolRegistry,
+    browser_handoff_required, McpToolWrapper, ToolContext, ToolRegistry, ToolSource,
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -448,10 +449,18 @@ pub struct AgentCore {
     additional_developer_instructions: Option<String>,
     allowed_tools: Option<HashSet<String>>,
     denied_tools: HashSet<String>,
+    enabled_bundled_plugins: HashSet<String>,
     rollout_budget_settings: Option<RolloutBudgetSettings>,
     agent_runtime_settings: AgentRuntimeSettings,
     collaboration_mode: CollaborationMode,
     goal: Option<GoalRecord>,
+}
+
+fn default_enabled_bundled_plugins() -> HashSet<String> {
+    bundled_plugin_catalog()
+        .filter(|plugin| plugin.default_enabled)
+        .map(|plugin| plugin.name.to_string())
+        .collect()
 }
 
 impl Default for AgentCore {
@@ -473,6 +482,7 @@ impl Default for AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            enabled_bundled_plugins: default_enabled_bundled_plugins(),
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
@@ -506,6 +516,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            enabled_bundled_plugins: default_enabled_bundled_plugins(),
             rollout_budget_settings: provider_settings.rollout_budget,
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
@@ -533,6 +544,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            enabled_bundled_plugins: default_enabled_bundled_plugins(),
             rollout_budget_settings: active.rollout_budget.clone(),
             agent_runtime_settings: settings.agent_runtime.clone(),
             collaboration_mode: CollaborationMode::Default,
@@ -557,6 +569,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            enabled_bundled_plugins: default_enabled_bundled_plugins(),
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
@@ -589,6 +602,26 @@ impl AgentCore {
 
     pub fn set_computer_runtime(&mut self, computer: Arc<dyn ComputerRuntime>) {
         self.computer = computer;
+    }
+
+    pub fn set_bundled_plugin_activations(&mut self, activations: &HashMap<String, bool>) {
+        self.enabled_bundled_plugins = bundled_plugin_catalog()
+            .filter(|plugin| {
+                activations
+                    .get(plugin.name)
+                    .copied()
+                    .unwrap_or(plugin.default_enabled)
+            })
+            .map(|plugin| plugin.name.to_string())
+            .collect();
+    }
+
+    pub fn bundled_plugin_enabled(&self, plugin_name: &str) -> bool {
+        self.enabled_bundled_plugins.contains(plugin_name)
+    }
+
+    pub fn disable_all_bundled_plugins(&mut self) {
+        self.enabled_bundled_plugins.clear();
     }
 
     /// Shares one background job registry across an agent tree so a parent can see
@@ -1284,7 +1317,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             let wrapper = McpToolWrapper::new(host.clone(), desc);
             let name = wrapper.descriptor().public_name.clone();
             registered.push(name.clone());
-            self.tools.insert(name, Arc::new(wrapper));
+            self.tools.insert_mcp(name, Arc::new(wrapper));
         }
         registered
     }
@@ -1300,7 +1333,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 let wrapper = McpToolWrapper::new(host.clone(), desc);
                 let name = wrapper.descriptor().public_name.clone();
                 registered.push(name.clone());
-                self.tools.insert(name, Arc::new(wrapper));
+                self.tools.insert_mcp(name, Arc::new(wrapper));
             }
         }
         registered
@@ -1848,8 +1881,8 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                         }
                     }
                     Err(err) if browser_handoff_required(&err).is_some() => {
-                        let handoff = browser_handoff_required(&err)
-                            .expect("browser handoff error guard");
+                        let handoff =
+                            browser_handoff_required(&err).expect("browser handoff error guard");
                         events.push(AgentEventPayload::BrowserHandoffRequired {
                             action: handoff.action.clone(),
                             reason: handoff.reason.clone(),
@@ -2404,12 +2437,49 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
     }
 
     fn tool_is_allowed(&self, name: &str) -> bool {
-        !self.denied_tools.contains(name)
+        let plugin_enabled = match self.tools.source(name) {
+            Some(ToolSource::BundledPlugin { plugin_name }) => {
+                self.enabled_bundled_plugins.contains(&plugin_name)
+            }
+            _ => true,
+        };
+        plugin_enabled
+            && !self.denied_tools.contains(name)
             && self
                 .allowed_tools
                 .as_ref()
                 .map(|allowed| allowed.contains(name))
                 .unwrap_or(true)
+    }
+
+    fn tool_disabled_message(&self, name: &str) -> String {
+        match self.tools.source(name) {
+            Some(ToolSource::BundledPlugin { plugin_name })
+                if !self.enabled_bundled_plugins.contains(&plugin_name) =>
+            {
+                format!("{name} is disabled because bundled plugin {plugin_name} is disabled for this thread")
+            }
+            _ => format!("{name} is disabled by the active agent profile"),
+        }
+    }
+
+    fn insert_tool_source_metadata(&self, name: &str, metadata: &mut Value) {
+        let Some(object) = metadata.as_object_mut() else {
+            return;
+        };
+        match self.tools.source(name) {
+            Some(ToolSource::Core) => {
+                object.insert("toolSource".to_string(), json!("core"));
+            }
+            Some(ToolSource::BundledPlugin { plugin_name }) => {
+                object.insert("toolSource".to_string(), json!("bundled_plugin"));
+                object.insert("pluginName".to_string(), json!(plugin_name));
+            }
+            Some(ToolSource::Mcp) => {
+                object.insert("toolSource".to_string(), json!("mcp"));
+            }
+            None => {}
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2457,18 +2527,20 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 let output = format!(
                     "The approved tool call remained blocked by the configured sandbox: {error}"
                 );
+                let mut metadata = json!({
+                    "approvalGranted": true,
+                    "approvalSource": approval_source,
+                    "sandboxEscalation": "denied",
+                    "sandboxEscalationDenied": true,
+                });
+                self.insert_tool_source_metadata(&call.name, &mut metadata);
                 Ok(ProviderToolResult {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                     output: output.clone(),
                     content: vec![ModelContentPart::text(output)],
                     is_error: true,
-                    metadata: json!({
-                        "approvalGranted": true,
-                        "approvalSource": approval_source,
-                        "sandboxEscalation": "denied",
-                        "sandboxEscalationDenied": true,
-                    }),
+                    metadata,
                 })
             }
             Err(error) => Err(error),
@@ -2506,19 +2578,23 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             }
             Err(err) if approval_required(&err).is_some() => Err(err),
             Err(err) if err.to_string().contains("cancelled") => Err(err),
-            Err(err) => Ok(ProviderToolResult {
-                call_id: provider_call.id.clone(),
-                name: provider_call.name.clone(),
-                output: err.to_string(),
-                content: vec![ModelContentPart::text(err.to_string())],
-                is_error: true,
-                metadata: json!({
+            Err(err) => {
+                let mut metadata = json!({
                     "toolName": &provider_call.name,
                     "providerToolCallId": &provider_call.id,
                     "success": false,
                     "error": err.to_string()
-                }),
-            }),
+                });
+                self.insert_tool_source_metadata(&provider_call.name, &mut metadata);
+                Ok(ProviderToolResult {
+                    call_id: provider_call.id.clone(),
+                    name: provider_call.name.clone(),
+                    output: err.to_string(),
+                    content: vec![ModelContentPart::text(err.to_string())],
+                    is_error: true,
+                    metadata,
+                })
+            }
         }
     }
 
@@ -2568,6 +2644,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 "error": err.to_string(),
                 "nextRunnableStep": next_runnable_step,
             });
+            self.insert_tool_source_metadata(&name, &mut metadata);
             insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
             merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
             events.push(AgentEventPayload::ToolCallFinished {
@@ -2581,12 +2658,13 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             return Err(err);
         }
         if !self.tool_is_allowed(&name) {
-            let err = anyhow::anyhow!("{name} is disabled by the active agent profile");
+            let err = anyhow::anyhow!(self.tool_disabled_message(&name));
             let mut metadata = json!({
                 "toolName": &name,
                 "success": false,
                 "error": err.to_string()
             });
+            self.insert_tool_source_metadata(&name, &mut metadata);
             insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
             merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
             insert_task_plan_step_metadata(&mut metadata, active_plan_step_id.as_deref());
@@ -2609,6 +2687,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     "success": false,
                     "error": err.to_string()
                 });
+                self.insert_tool_source_metadata(&name, &mut metadata);
                 insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
                 merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
                 insert_task_plan_step_metadata(&mut metadata, active_plan_step_id.as_deref());
@@ -2631,6 +2710,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     "success": false,
                     "error": err.to_string()
                 });
+                self.insert_tool_source_metadata(&name, &mut metadata);
                 insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
                 merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
                 insert_task_plan_step_metadata(&mut metadata, active_plan_step_id.as_deref());
@@ -2648,6 +2728,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         if let Some(object) = result.metadata.as_object_mut() {
             object.insert("toolName".to_string(), json!(&name));
         }
+        self.insert_tool_source_metadata(&name, &mut result.metadata);
         insert_approval_execution_metadata(&mut result.metadata, approval_granted, None);
         merge_metadata_overlay(&mut result.metadata, metadata_overlay.as_ref());
         insert_task_plan_step_metadata(&mut result.metadata, active_plan_step_id.as_deref());
@@ -3715,6 +3796,36 @@ mod tests {
         SubagentRunStatus, SubagentSchedulerConfig,
     };
     use std::collections::VecDeque;
+
+    #[test]
+    fn thread_activation_filters_bundled_tools_from_catalog_and_execution_guard() {
+        let mut agent = AgentCore::default();
+        assert!(agent
+            .provider_tool_catalog()
+            .iter()
+            .any(|tool| tool.name == "browser"));
+
+        agent.set_bundled_plugin_activations(&HashMap::from([
+            ("browser-automation".to_string(), false),
+            ("computer-use".to_string(), true),
+        ]));
+
+        let tools = agent
+            .provider_tool_catalog()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+        assert!(!tools.contains("browser"));
+        assert!(tools.contains("computer"));
+        assert!(tools.contains("spreadsheet"));
+        assert!(!agent.tool_is_allowed("browser"));
+        assert!(agent.tool_is_allowed("computer"));
+
+        let mut metadata = json!({});
+        agent.insert_tool_source_metadata("computer", &mut metadata);
+        assert_eq!(metadata["toolSource"], "bundled_plugin");
+        assert_eq!(metadata["pluginName"], "computer-use");
+    }
 
     #[test]
     fn plan_mode_exposes_only_read_only_inspection_and_atomic_planning_tools() {
@@ -7580,7 +7691,10 @@ mod tests {
         let checkpoint_items = requests[0]
             .context_items
             .iter()
-            .filter(|item| item.text_content().contains("keep the Rust sidecar API stable"))
+            .filter(|item| {
+                item.text_content()
+                    .contains("keep the Rust sidecar API stable")
+            })
             .collect::<Vec<_>>();
         assert_eq!(checkpoint_items.len(), 1);
         assert_eq!(checkpoint_items[0].kind, ContextItemKind::User);

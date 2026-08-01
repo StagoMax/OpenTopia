@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "opentopia://plugins/spreadsheet/configuration.schema.json",
+  "title": "Spreadsheet",
+  "type": "object",
+  "properties": {
+    "defaultOutputDirectory": {
+      "type": "string",
+      "default": ".",
+      "description": "Workspace-relative directory suggested for newly created workbooks."
+    }
+  },
+  "additionalProperties": false
+}

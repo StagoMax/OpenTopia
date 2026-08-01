@@ -1,0 +1,54 @@
+{
+  "name": "computer-use",
+  "version": "1.0.0",
+  "description": "Observe and operate a user-approved desktop window.",
+  "author": {
+    "name": "OpenTopia Contributors"
+  },
+  "interface": {
+    "displayName": "Computer Use",
+    "shortDescription": "Observe and control approved application windows.",
+    "longDescription": "Use OpenTopia's trusted computer driver to enumerate, capture, and operate a single approved application window while preserving observation freshness, protected-window checks, and per-action approval.",
+    "developerName": "OpenTopia",
+    "category": "Automation",
+    "defaultPrompt": "Use Computer Use only when the task requires observing or operating a user-approved application window.",
+    "capabilities": [
+      "Window discovery",
+      "Window observation",
+      "Screenshot capture",
+      "Approved keyboard and pointer input"
+    ]
+  },
+  "opentopia": {
+    "apiVersion": "1",
+    "requires": {
+      "hostCapabilities": [
+        "computer.driver.v1",
+        "policy.approval.v1",
+        "nativeTool.computer.v1"
+      ]
+    },
+    "permissions": {
+      "filesystem": [],
+      "network": [],
+      "secrets": [],
+      "desktop": [
+        "window:enumerate",
+        "window:capture",
+        "window:input"
+      ]
+    },
+    "contributes": {
+      "nativeTools": [
+        {
+          "id": "computer",
+          "runtime": "builtin:computer",
+          "driverCapability": "computer.driver.v1"
+        }
+      ]
+    },
+    "configuration": {
+      "schema": "./configuration.schema.json"
+    }
+  }
+}

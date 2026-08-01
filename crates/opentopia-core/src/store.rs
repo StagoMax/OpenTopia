@@ -730,6 +730,15 @@ impl SqliteSessionStore {
                 FOREIGN KEY(server_id) REFERENCES mcp_servers(server_id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS thread_plugin_activations (
+                thread_id TEXT NOT NULL,
+                plugin_name TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(thread_id, plugin_name),
+                FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS mcp_server_tools (
                 server_id TEXT NOT NULL,
                 public_name TEXT NOT NULL,
@@ -797,6 +806,9 @@ impl SqliteSessionStore {
 
             CREATE INDEX IF NOT EXISTS idx_thread_mcp_servers_thread
                 ON thread_mcp_servers(thread_id, updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_thread_plugin_activations_thread
+                ON thread_plugin_activations(thread_id, updated_at);
 
             CREATE INDEX IF NOT EXISTS idx_projects_order
                 ON projects(pinned DESC, sort_order ASC, created_at ASC);
@@ -1145,6 +1157,57 @@ impl SqliteSessionStore {
             ],
         )?;
         Ok(binding)
+    }
+
+    pub fn list_thread_plugin_activations(
+        &self,
+        thread_id: Uuid,
+    ) -> anyhow::Result<HashMap<String, bool>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT plugin_name, enabled
+            FROM thread_plugin_activations
+            WHERE thread_id = ?1
+            ORDER BY plugin_name ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![thread_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        })?;
+        let mut activations = HashMap::new();
+        for row in rows {
+            let (plugin_name, enabled) = row?;
+            activations.insert(plugin_name, enabled);
+        }
+        Ok(activations)
+    }
+
+    pub fn set_thread_plugin_activation(
+        &self,
+        thread_id: Uuid,
+        plugin_name: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        let plugin_name = plugin_name.trim();
+        anyhow::ensure!(!plugin_name.is_empty(), "plugin name cannot be empty");
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO thread_plugin_activations (thread_id, plugin_name, enabled, updated_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(thread_id, plugin_name) DO UPDATE SET
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                thread_id.to_string(),
+                plugin_name,
+                enabled as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Replaces the persisted tool catalog for one MCP server.
@@ -4116,6 +4179,41 @@ mod tests {
             annotations: serde_json::json!({ "readOnlyHint": true }),
             permission_labels: vec!["read".to_string()],
         }
+    }
+
+    #[test]
+    fn thread_plugin_activation_defaults_to_absent_and_round_trips() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(Some("bundled plugins".to_string()), std::env::temp_dir())
+            .expect("create thread");
+
+        assert!(store
+            .list_thread_plugin_activations(thread.id)
+            .expect("list default activations")
+            .is_empty());
+
+        store
+            .set_thread_plugin_activation(thread.id, "browser-automation", false)
+            .expect("disable bundled plugin");
+        assert_eq!(
+            store
+                .list_thread_plugin_activations(thread.id)
+                .expect("list disabled activation")
+                .get("browser-automation"),
+            Some(&false)
+        );
+
+        store
+            .set_thread_plugin_activation(thread.id, "browser-automation", true)
+            .expect("enable bundled plugin");
+        assert_eq!(
+            store
+                .list_thread_plugin_activations(thread.id)
+                .expect("list enabled activation")
+                .get("browser-automation"),
+            Some(&true)
+        );
     }
 
     #[test]

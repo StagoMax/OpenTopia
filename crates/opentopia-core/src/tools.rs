@@ -6,6 +6,7 @@ use crate::browser::{
     BrowserObserveOptions, BrowserRuntime, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
     BrowserWaitRequest,
 };
+use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{
     ComputerAction, ComputerMouseButton, ComputerPolicyContext, ComputerRuntime, ComputerSessionId,
     ObserveOptions,
@@ -17,8 +18,8 @@ use crate::execution::{
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    CollaborationMode, ModelContentPart, TaskPlan, TaskPlanStep,
-    TaskPlanStepStatus, ToolCall, ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
+    CollaborationMode, ModelContentPart, TaskPlan, TaskPlanStep, TaskPlanStepStatus, ToolCall,
+    ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
 };
 use crate::model_context::CompiledModelContext;
 use crate::policy::{ApprovalRequired, PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
@@ -174,10 +175,24 @@ pub trait Tool: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: Arc<BTreeMap<String, Arc<dyn Tool>>>,
+    sources: Arc<BTreeMap<String, ToolSource>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSource {
+    Core,
+    BundledPlugin { plugin_name: String },
+    Mcp,
 }
 
 impl ToolRegistry {
     pub fn with_builtins() -> Self {
+        let mut registry = Self::with_core_tools();
+        registry.register_bundled_plugins();
+        registry
+    }
+
+    pub fn with_core_tools() -> Self {
         let mut tools: BTreeMap<String, Arc<dyn Tool>> = BTreeMap::new();
         tools.insert("list_files".to_string(), Arc::new(ListFilesTool));
         tools.insert("read_file".to_string(), Arc::new(ReadFileTool));
@@ -209,11 +224,34 @@ impl ToolRegistry {
         tools.insert("list_skills".to_string(), Arc::new(ListSkillsTool));
         tools.insert("read_skill".to_string(), Arc::new(ReadSkillTool));
         tools.insert("create_skill".to_string(), Arc::new(CreateSkillTool));
-        tools.insert("browser".to_string(), Arc::new(BrowserTool));
-        tools.insert("computer".to_string(), Arc::new(ComputerTool));
-        tools.insert("spreadsheet".to_string(), Arc::new(SpreadsheetTool));
+        let sources = tools
+            .keys()
+            .cloned()
+            .map(|name| (name, ToolSource::Core))
+            .collect();
         Self {
             tools: Arc::new(tools),
+            sources: Arc::new(sources),
+        }
+    }
+
+    fn register_bundled_plugins(&mut self) {
+        for plugin in bundled_plugin_catalog() {
+            for capability in plugin.native_capabilities {
+                let tool: Arc<dyn Tool> = match *capability {
+                    "browser" => Arc::new(BrowserTool),
+                    "computer" => Arc::new(ComputerTool),
+                    "spreadsheet" => Arc::new(SpreadsheetTool),
+                    _ => continue,
+                };
+                self.insert_with_source(
+                    (*capability).to_string(),
+                    tool,
+                    ToolSource::BundledPlugin {
+                        plugin_name: plugin.name.to_string(),
+                    },
+                );
+            }
         }
     }
 
@@ -222,12 +260,25 @@ impl ToolRegistry {
     }
 
     pub fn insert(&mut self, name: String, tool: Arc<dyn Tool>) {
+        self.insert_with_source(name, tool, ToolSource::Core);
+    }
+
+    pub fn insert_mcp(&mut self, name: String, tool: Arc<dyn Tool>) {
+        self.insert_with_source(name, tool, ToolSource::Mcp);
+    }
+
+    fn insert_with_source(&mut self, name: String, tool: Arc<dyn Tool>, source: ToolSource) {
         let tools = Arc::make_mut(&mut self.tools);
-        tools.insert(name, tool);
+        tools.insert(name.clone(), tool);
+        Arc::make_mut(&mut self.sources).insert(name, source);
     }
 
     pub fn list(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
+    }
+
+    pub fn source(&self, name: &str) -> Option<ToolSource> {
+        self.sources.get(name).cloned()
     }
 }
 
@@ -2063,8 +2114,7 @@ pub fn browser_handoff_for_node(
     Some(BrowserHandoffRequired {
         action: action.to_string(),
         reason: node.user_action_reason.clone().unwrap_or_else(|| {
-            "This page requires you to complete the action yourself before I continue."
-                .to_string()
+            "This page requires you to complete the action yourself before I continue.".to_string()
         }),
         url,
     })
@@ -2156,11 +2206,9 @@ impl Tool for BrowserTool {
                 let target = runtime
                     .observation_node(session, observation_id, node_ref)
                     .await?;
-                if let Some(handoff) = browser_handoff_for_node(
-                    &action,
-                    &target,
-                    target.href.clone(),
-                ) {
+                if let Some(handoff) =
+                    browser_handoff_for_node(&action, &target, target.href.clone())
+                {
                     return Err(handoff.into());
                 }
                 let receipt = runtime
@@ -4727,13 +4775,40 @@ fn decode_mcp_base64(value: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Approval;
     use crate::policy::{BasicPolicyEngine, PermissionMode};
-    use crate::store::SqliteSessionStore;
     use crate::subagents::{
         NoopSubagentObserver, SubagentExecutor, SubagentRun, SubagentSchedulerConfig,
     };
     use tokio::sync::mpsc;
+
+    #[test]
+    fn bundled_native_tools_are_not_core_tools_and_keep_their_plugin_source() {
+        let core = ToolRegistry::with_core_tools();
+        assert!(core.get("browser").is_none());
+        assert!(core.get("computer").is_none());
+        assert!(core.get("spreadsheet").is_none());
+
+        let defaults = ToolRegistry::with_builtins();
+        assert_eq!(
+            defaults.source("browser"),
+            Some(ToolSource::BundledPlugin {
+                plugin_name: "browser-automation".to_string(),
+            })
+        );
+        assert_eq!(
+            defaults.source("computer"),
+            Some(ToolSource::BundledPlugin {
+                plugin_name: "computer-use".to_string(),
+            })
+        );
+        assert_eq!(
+            defaults.source("spreadsheet"),
+            Some(ToolSource::BundledPlugin {
+                plugin_name: "spreadsheet".to_string(),
+            })
+        );
+        assert_eq!(defaults.source("read_file"), Some(ToolSource::Core));
+    }
 
     struct PendingExecutor;
 

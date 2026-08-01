@@ -1,3 +1,6 @@
+use crate::bundled_plugins::{
+    ensure_bundled_plugins_installed, verified_bundled_plugin_metadata, BundledPluginTrust,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +24,15 @@ pub enum PluginScope {
     Codex,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginSource {
+    Workspace,
+    User,
+    Codex,
+    Bundled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginDescriptor {
@@ -35,7 +47,11 @@ pub struct PluginDescriptor {
     pub path: PathBuf,
     pub manifest_path: PathBuf,
     pub scope: PluginScope,
+    pub source: PluginSource,
     pub managed: bool,
+    pub trust: BundledPluginTrust,
+    pub default_enabled: bool,
+    pub native_capabilities: Vec<String>,
     pub skill_root: Option<PathBuf>,
     pub skill_count: usize,
     pub mcp_server_count: usize,
@@ -49,7 +65,9 @@ pub struct PluginDescriptor {
 
 impl PluginDescriptor {
     pub fn is_compatible(&self) -> bool {
-        self.skill_count > 0 || self.supported_mcp_server_count > 0
+        self.skill_count > 0
+            || self.supported_mcp_server_count > 0
+            || !self.native_capabilities.is_empty()
     }
 }
 
@@ -167,41 +185,51 @@ pub fn discover_plugins(workspace_root: Option<&Path>) -> Vec<PluginDescriptor> 
         roots.push((
             workspace_root.join(".opentopia/plugins"),
             PluginScope::Workspace,
+            PluginSource::Workspace,
         ));
         roots.push((
             workspace_root.join(".agents/plugins"),
             PluginScope::Workspace,
+            PluginSource::Workspace,
         ));
         roots.push((
             workspace_root.join(".codex/plugins"),
             PluginScope::Workspace,
+            PluginSource::Workspace,
         ));
     }
-    roots.push((user_plugin_root(), PluginScope::User));
+    roots.push((user_plugin_root(), PluginScope::User, PluginSource::User));
+    let bundled_root = bundled_plugin_root();
+    let _ = ensure_bundled_plugins_installed(&bundled_root);
+    roots.push((bundled_root, PluginScope::User, PluginSource::Bundled));
     if let Some(codex_home) = codex_home() {
-        roots.push((codex_home.join("plugins/cache"), PluginScope::Codex));
+        roots.push((
+            codex_home.join("plugins/cache"),
+            PluginScope::Codex,
+            PluginSource::Codex,
+        ));
     }
 
     let managed_root = user_plugin_root().canonicalize().ok();
     let mut manifests = Vec::new();
-    for (root, scope) in roots {
-        collect_manifests(&root, scope, 0, &mut manifests);
+    for (root, scope, source) in roots {
+        collect_manifests(&root, scope, source, 0, &mut manifests);
     }
 
     let mut seen = HashSet::new();
     let mut plugins = manifests
         .into_iter()
-        .filter_map(|(manifest_path, scope)| {
+        .filter_map(|(manifest_path, scope, source)| {
             let canonical = manifest_path.canonicalize().ok()?;
             if !seen.insert(canonical.clone()) {
                 return None;
             }
-            descriptor_from_manifest(&canonical, scope, managed_root.as_deref()).ok()
+            descriptor_from_manifest(&canonical, scope, source, managed_root.as_deref()).ok()
         })
         .collect::<Vec<_>>();
     plugins.sort_by(|left, right| {
-        scope_rank(left.scope)
-            .cmp(&scope_rank(right.scope))
+        source_rank(left.source)
+            .cmp(&source_rank(right.source))
             .then_with(|| {
                 left.display_name
                     .to_lowercase()
@@ -212,15 +240,28 @@ pub fn discover_plugins(workspace_root: Option<&Path>) -> Vec<PluginDescriptor> 
     plugins
 }
 
+/// Returns the root where host-owned bundled packages are materialized.
+///
+/// This is separate from [`user_plugin_root`] so bundled packages cannot be
+/// removed through the ordinary user-plugin uninstall path.
+pub fn bundled_plugins_path() -> PathBuf {
+    bundled_plugin_root()
+}
+
 pub fn inspect_plugin(source: &Path) -> Result<PluginDescriptor, PluginError> {
     let manifest = locate_source_manifest(source)?;
-    descriptor_from_manifest(&manifest, PluginScope::User, None)
+    descriptor_from_manifest(&manifest, PluginScope::User, PluginSource::User, None)
 }
 
 pub fn install_plugin(source: &Path) -> Result<PluginDescriptor, PluginError> {
     let source_manifest = locate_source_manifest(source)?;
     let source_root = plugin_root_from_manifest(&source_manifest)?;
-    let source_descriptor = descriptor_from_manifest(&source_manifest, PluginScope::User, None)?;
+    let source_descriptor = descriptor_from_manifest(
+        &source_manifest,
+        PluginScope::User,
+        PluginSource::User,
+        None,
+    )?;
     let destination_root = user_plugin_root();
     fs::create_dir_all(&destination_root).map_err(io_error)?;
     let destination_root = destination_root.canonicalize().map_err(io_error)?;
@@ -241,11 +282,17 @@ pub fn install_plugin(source: &Path) -> Result<PluginDescriptor, PluginError> {
         let mut budget = CopyBudget::default();
         copy_plugin_tree(&source_root, &staging, &mut budget)?;
         let staged_manifest = staging.join(MANIFEST_RELATIVE_PATH);
-        descriptor_from_manifest(&staged_manifest, PluginScope::User, Some(&destination_root))?;
+        descriptor_from_manifest(
+            &staged_manifest,
+            PluginScope::User,
+            PluginSource::User,
+            Some(&destination_root),
+        )?;
         fs::rename(&staging, &destination).map_err(io_error)?;
         descriptor_from_manifest(
             &destination.join(MANIFEST_RELATIVE_PATH),
             PluginScope::User,
+            PluginSource::User,
             Some(&destination_root),
         )
     })();
@@ -307,6 +354,7 @@ pub fn load_plugin_mcp_servers(
 fn descriptor_from_manifest(
     manifest_path: &Path,
     scope: PluginScope,
+    source: PluginSource,
     managed_root: Option<&Path>,
 ) -> Result<PluginDescriptor, PluginError> {
     let manifest_path = manifest_path.canonicalize().map_err(io_error)?;
@@ -317,6 +365,24 @@ fn descriptor_from_manifest(
     let managed = managed_root
         .and_then(|root| root.canonicalize().ok())
         .is_some_and(|root| plugin_root.parent() == Some(root.as_path()));
+    let bundled = if source == PluginSource::Bundled {
+        let metadata =
+            verified_bundled_plugin_metadata(&manifest.name, &plugin_root).ok_or_else(|| {
+                PluginError::InvalidManifest(format!(
+                    "bundled plugin {} does not match its host-owned package receipt",
+                    manifest.name
+                ))
+            })?;
+        if manifest.version != metadata.version {
+            return Err(PluginError::InvalidManifest(format!(
+                "bundled plugin {} manifest version {} does not match packaged version {}",
+                manifest.name, manifest.version, metadata.version
+            )));
+        }
+        Some(metadata)
+    } else {
+        None
+    };
     let mut issues = Vec::new();
     let skill_root = match manifest.skills.as_deref() {
         Some(path) => match resolve_declared_path(&plugin_root, path, true) {
@@ -343,7 +409,11 @@ fn descriptor_from_manifest(
     if has_apps {
         issues.push("Plugin app bridges are detected but not supported yet.".to_string());
     }
-    if skill_count == 0 && mcp_server_count == 0 && !has_apps {
+    if skill_count == 0
+        && mcp_server_count == 0
+        && !has_apps
+        && bundled.is_none_or(|metadata| metadata.native_capabilities.is_empty())
+    {
         issues.push("The plugin does not declare Skills, MCP servers, or apps.".to_string());
     }
 
@@ -354,7 +424,7 @@ fn descriptor_from_manifest(
     let manifest_author = manifest.author.map(PluginAuthor::name).unwrap_or_default();
     let author = non_empty(interface.developer_name, &manifest_author);
     let website_url = interface.website_url.or(manifest.homepage);
-    let id = plugin_id(scope, &manifest_path);
+    let id = plugin_id(source, &manifest_path);
 
     Ok(PluginDescriptor {
         id,
@@ -368,7 +438,23 @@ fn descriptor_from_manifest(
         path: plugin_root,
         manifest_path,
         scope,
+        source,
         managed,
+        trust: bundled
+            .map(|metadata| metadata.trust)
+            .unwrap_or(BundledPluginTrust::Standard),
+        default_enabled: bundled
+            .map(|metadata| metadata.default_enabled)
+            .unwrap_or(false),
+        native_capabilities: bundled
+            .map(|metadata| {
+                metadata
+                    .native_capabilities
+                    .iter()
+                    .map(|capability| (*capability).to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
         skill_root,
         skill_count,
         mcp_server_count,
@@ -566,7 +652,13 @@ fn locate_source_manifest(source: &Path) -> Result<PathBuf, PluginError> {
         }
     }
     let mut found = Vec::new();
-    collect_manifests(&source, PluginScope::User, 0, &mut found);
+    collect_manifests(
+        &source,
+        PluginScope::User,
+        PluginSource::User,
+        0,
+        &mut found,
+    );
     match found.len() {
         0 => Err(PluginError::ManifestNotFound(source.display().to_string())),
         1 => found[0].0.canonicalize().map_err(io_error),
@@ -592,8 +684,9 @@ fn plugin_root_from_manifest(manifest_path: &Path) -> Result<PathBuf, PluginErro
 fn collect_manifests(
     directory: &Path,
     scope: PluginScope,
+    source: PluginSource,
     depth: usize,
-    output: &mut Vec<(PathBuf, PluginScope)>,
+    output: &mut Vec<(PathBuf, PluginScope, PluginSource)>,
 ) {
     if depth > MAX_DISCOVERY_DEPTH || !directory.is_dir() {
         return;
@@ -618,17 +711,19 @@ fn collect_manifests(
                 .and_then(Path::file_name)
                 .is_some_and(|name| name.eq_ignore_ascii_case(".codex-plugin"))
         {
-            output.push((path, scope));
+            output.push((path, scope, source));
             continue;
         }
         if file_type.is_dir() && !ignored_directory(&entry.file_name().to_string_lossy()) {
-            collect_manifests(&path, scope, depth + 1, output);
+            collect_manifests(&path, scope, source, depth + 1, output);
         }
     }
 }
 
 fn ignored_directory(name: &str) -> bool {
     matches!(name, ".git" | "node_modules" | "target" | "dist" | "build")
+        || name.starts_with(".bundled-installing-")
+        || name.starts_with(".bundled-backup-")
 }
 
 fn resolve_declared_path(
@@ -757,23 +852,25 @@ fn non_empty(value: String, fallback: &str) -> String {
     }
 }
 
-fn plugin_id(scope: PluginScope, manifest_path: &Path) -> String {
+fn plugin_id(source: PluginSource, manifest_path: &Path) -> String {
     format!(
         "{}:{}",
-        match scope {
-            PluginScope::Workspace => "workspace",
-            PluginScope::User => "user",
-            PluginScope::Codex => "codex",
+        match source {
+            PluginSource::Workspace => "workspace",
+            PluginSource::User => "user",
+            PluginSource::Codex => "codex",
+            PluginSource::Bundled => "bundled",
         },
         manifest_path.to_string_lossy().replace('\\', "/")
     )
 }
 
-fn scope_rank(scope: PluginScope) -> u8 {
-    match scope {
-        PluginScope::Workspace => 0,
-        PluginScope::User => 1,
-        PluginScope::Codex => 2,
+fn source_rank(source: PluginSource) -> u8 {
+    match source {
+        PluginSource::Workspace => 0,
+        PluginSource::User => 1,
+        PluginSource::Codex => 2,
+        PluginSource::Bundled => 3,
     }
 }
 
@@ -782,6 +879,21 @@ fn user_plugin_root() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".opentopia/plugins")))
         .unwrap_or_else(|| PathBuf::from(".opentopia/plugins"))
+}
+
+fn bundled_plugin_root() -> PathBuf {
+    std::env::var_os("OPENTOPIA_BUNDLED_PLUGIN_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("OPENTOPIA_PLUGIN_HOME").map(|root| {
+                let root = PathBuf::from(root);
+                root.parent()
+                    .map(|parent| parent.join("bundled-plugins"))
+                    .unwrap_or_else(|| root.join(".bundled-plugins"))
+            })
+        })
+        .or_else(|| home_dir().map(|home| home.join(".opentopia/bundled-plugins")))
+        .unwrap_or_else(|| PathBuf::from(".opentopia/bundled-plugins"))
 }
 
 fn codex_home() -> Option<PathBuf> {
@@ -890,5 +1002,30 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.contains("escapes")));
+    }
+
+    #[test]
+    fn discovers_verified_bundled_plugins_as_native_capabilities() {
+        let dir = TestDir::new();
+        let outcomes = ensure_bundled_plugins_installed(&dir.0).unwrap();
+        assert_eq!(outcomes.len(), 3);
+
+        for metadata in crate::bundled_plugins::bundled_plugin_catalog() {
+            let manifest = dir.0.join(metadata.name).join(MANIFEST_RELATIVE_PATH);
+            let descriptor =
+                descriptor_from_manifest(&manifest, PluginScope::User, PluginSource::Bundled, None)
+                    .unwrap();
+            assert_eq!(descriptor.source, PluginSource::Bundled);
+            assert_eq!(descriptor.trust, metadata.trust);
+            assert_eq!(descriptor.default_enabled, metadata.default_enabled);
+            assert_eq!(descriptor.native_capabilities, metadata.native_capabilities);
+            assert!(!descriptor.managed);
+            assert!(descriptor.is_compatible());
+            assert!(descriptor.id.starts_with("bundled:"));
+            assert!(!descriptor
+                .issues
+                .iter()
+                .any(|issue| issue.contains("does not declare")));
+        }
     }
 }

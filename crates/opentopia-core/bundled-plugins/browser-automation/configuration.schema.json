@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "opentopia://plugins/browser-automation/configuration.schema.json",
+  "title": "Browser Automation",
+  "type": "object",
+  "properties": {
+    "allowedDomains": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true,
+      "default": [],
+      "description": "Domains the user has chosen to make available to browser automation. Host policy remains authoritative."
+    },
+    "downloadDirectory": {
+      "type": "string",
+      "default": ".",
+      "description": "Workspace-relative directory suggested for browser downloads."
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,56 @@
+{
+  "name": "browser-automation",
+  "version": "1.0.0",
+  "description": "Observe and automate a bounded OpenTopia browser session.",
+  "author": {
+    "name": "OpenTopia Contributors"
+  },
+  "interface": {
+    "displayName": "Browser Automation",
+    "shortDescription": "Navigate, inspect, and interact with web pages.",
+    "longDescription": "Operate OpenTopia's bounded browser runtime through fresh observations, stable node references, protected downloads, and explicit user handoff for sensitive page actions.",
+    "developerName": "OpenTopia",
+    "category": "Automation",
+    "defaultPrompt": "Use Browser Automation when the task requires navigating, observing, or interacting with a web page.",
+    "capabilities": [
+      "Browser navigation",
+      "Page observation",
+      "Bounded interaction",
+      "Screenshots and downloads"
+    ]
+  },
+  "opentopia": {
+    "apiVersion": "1",
+    "requires": {
+      "hostCapabilities": [
+        "browser.runtime.v1",
+        "policy.network.v1",
+        "nativeTool.browser.v1"
+      ]
+    },
+    "permissions": {
+      "filesystem": [
+        "workspace:write"
+      ],
+      "network": [
+        "user-approved-domains"
+      ],
+      "secrets": [],
+      "desktop": [
+        "browser:visible-surface"
+      ]
+    },
+    "contributes": {
+      "nativeTools": [
+        {
+          "id": "browser",
+          "runtime": "builtin:browser",
+          "driverCapability": "browser.runtime.v1"
+        }
+      ]
+    },
+    "configuration": {
+      "schema": "./configuration.schema.json"
+    }
+  }
+}

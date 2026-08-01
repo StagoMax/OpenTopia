@@ -1575,7 +1575,7 @@ function ExtensionsView({
 }) {
   const [view, setView] = useState<"plugins" | "mcp">("plugins");
   const [query, setQuery] = useState("");
-  const [scope, setScope] = useState<"all" | PluginView["plugin"]["scope"]>(
+  const [source, setSource] = useState<"all" | PluginView["plugin"]["source"]>(
     "all",
   );
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -1584,13 +1584,13 @@ function ExtensionsView({
   const filteredPlugins = useMemo(
     () =>
       plugins.filter(({ plugin }) => {
-        if (scope !== "all" && plugin.scope !== scope) return false;
+        if (source !== "all" && plugin.source !== source) return false;
         if (!normalizedQuery) return true;
         return `${plugin.displayName} ${plugin.name} ${plugin.description} ${plugin.author} ${plugin.category}`
           .toLocaleLowerCase()
           .includes(normalizedQuery);
       }),
-    [normalizedQuery, plugins, scope],
+    [normalizedQuery, plugins, source],
   );
   const activeCount = plugins.filter(
     (plugin) =>
@@ -1690,12 +1690,13 @@ function ExtensionsView({
             <label className="plugin-scope-filter">
               <span className="sr-only">Plugin source</span>
               <select
-                value={scope}
+                value={source}
                 onChange={(event) =>
-                  setScope(event.target.value as typeof scope)
+                  setSource(event.target.value as typeof source)
                 }
               >
                 <option value="all">All sources</option>
+                <option value="bundled">Bundled</option>
                 <option value="workspace">Project</option>
                 <option value="user">OpenTopia</option>
                 <option value="codex">Codex</option>
@@ -1734,12 +1735,14 @@ function ExtensionsView({
                         <strong>{plugin.displayName}</strong>
                         <span>{plugin.description || plugin.name}</span>
                       </div>
-                      <span className={`plugin-source is-${plugin.scope}`}>
-                        {plugin.scope === "workspace"
-                          ? "Project"
-                          : plugin.scope === "codex"
-                            ? "Codex"
-                            : "OpenTopia"}
+                      <span className={`plugin-source is-${plugin.source}`}>
+                        {plugin.source === "bundled"
+                          ? "Bundled"
+                          : plugin.source === "workspace"
+                            ? "Project"
+                            : plugin.source === "codex"
+                              ? "Codex"
+                              : "OpenTopia"}
                       </span>
                     </div>
                     <div
@@ -1755,6 +1758,21 @@ function ExtensionsView({
                         <span>
                           <Wrench size={12} /> {plugin.supportedMcpServerCount}/
                           {plugin.mcpServerCount} MCP
+                        </span>
+                      )}
+                      {plugin.nativeCapabilities.length > 0 && (
+                        <span>
+                          <Wrench size={12} />{" "}
+                          {plugin.nativeCapabilities.length} native
+                        </span>
+                      )}
+                      {plugin.source === "bundled" && (
+                        <span>
+                          {plugin.trust === "trusted_driver"
+                            ? "Trusted driver"
+                            : plugin.trust === "privileged"
+                              ? "Privileged"
+                              : "Official"}
                         </span>
                       )}
                       {plugin.hasApps && <span>App</span>}
@@ -1795,13 +1813,14 @@ function ExtensionsView({
                             {skillsSelected ? "Skills added" : "Use Skills"}
                           </button>
                         )}
-                        {plugin.supportedMcpServerCount > 0 && (
+                        {(plugin.supportedMcpServerCount > 0 ||
+                          plugin.nativeCapabilities.length > 0) && (
                           <label
                             className="plugin-task-toggle"
                             title={
                               hasThread
-                                ? "Enable all supported MCP tools for this task"
-                                : "Open a task to enable MCP tools"
+                                ? "Enable this plugin's tools for this task"
+                                : "Open a task to enable plugin tools"
                             }
                           >
                             <input

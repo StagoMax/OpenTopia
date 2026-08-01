@@ -2,6 +2,7 @@ pub mod agent;
 pub mod agent_profiles;
 pub mod background;
 pub mod browser;
+pub mod bundled_plugins;
 pub mod computer;
 pub mod context_sources;
 pub mod desktop_browser;
@@ -46,6 +47,11 @@ pub use browser::{
     BrowserRuntime, BrowserRuntimeConfig, BrowserScreenshot, BrowserSelector, BrowserSessionId,
     BrowserSnapshot, BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest,
     LocalBrowserRuntime,
+};
+pub use bundled_plugins::{
+    bundled_plugin_catalog, bundled_plugin_metadata, ensure_bundled_plugins_installed,
+    BundledPluginInstallOutcome, BundledPluginInstallStatus, BundledPluginMetadata,
+    BundledPluginTrust,
 };
 pub use computer::{
     ComputerAction, ComputerActionReceipt, ComputerError, ComputerMouseButton, ComputerObservation,
@@ -104,8 +110,9 @@ pub use model_context::{
     ThreadContextSnapshot, TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
 };
 pub use plugins::{
-    discover_plugins, inspect_plugin, install_plugin, load_plugin_mcp_servers, uninstall_plugin,
-    PluginDescriptor, PluginError, PluginMcpServerDefinition, PluginScope,
+    bundled_plugins_path, discover_plugins, inspect_plugin, install_plugin,
+    load_plugin_mcp_servers, uninstall_plugin, PluginDescriptor, PluginError,
+    PluginMcpServerDefinition, PluginScope, PluginSource,
 };
 pub use policy::{
     approval_required, ApprovalPolicy, ApprovalRequired, ApprovalsReviewer, BasicPolicyEngine,
@@ -166,10 +173,9 @@ pub use subagents::{
 };
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
-    BrowserTool, ComputerTool, GitDiffTool,
-    ListFilesTool, ListSkillsTool, McpToolWrapper, ReadFileTool, ReadSkillTool,
-    RequestUserInputTool, SetPlanTool, ShellTool, SpreadsheetTool, Tool, ToolContext, ToolRegistry,
-    UpdatePlanTool, WaitAgentsTool, WriteFileTool,
+    BrowserTool, ComputerTool, GitDiffTool, ListFilesTool, ListSkillsTool, McpToolWrapper,
+    ReadFileTool, ReadSkillTool, RequestUserInputTool, SetPlanTool, ShellTool, SpreadsheetTool,
+    Tool, ToolContext, ToolRegistry, ToolSource, UpdatePlanTool, WaitAgentsTool, WriteFileTool,
 };
 pub use workspace::{
     ChangedFile, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,
