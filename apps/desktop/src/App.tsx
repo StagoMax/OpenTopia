@@ -3823,432 +3823,455 @@ export function App() {
             </button>
           </div>
         )}
-        <main
-          ref={workspaceRef}
-          className={`workspace ${toolStageOpen ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
-          style={workspaceStyle}
-        >
-          <Sidebar
-            client={client}
-            projects={projects}
-            threads={threads}
-            threadActivityStatuses={threadActivityStatuses}
-            activeThreadId={activeThreadId}
-            activeProjectId={activeThread?.projectId ?? draftProjectId}
-            activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
-            workspaceError={workspaceError}
-            isPickingWorkspace={isPickingWorkspace}
-            experienceMode={experienceMode}
-            onExperienceModeChange={changeExperienceMode}
-            onSelect={selectThread}
-            onNew={beginNewThread}
-            onPickWorkspace={() => void chooseWorkspace()}
-            onCreateProject={createBlankProject}
-            onRemoveProject={(project) => void removeProject(project)}
-            onRenameProject={(project) =>
-              setRenameTarget({
-                kind: "project",
-                id: project.id,
-                name: project.name,
-              })
-            }
-            onToggleProjectPinned={(project) =>
-              void toggleProjectPinned(project)
-            }
-            onSelectProject={beginProjectDraft}
-            onNewThreadForProject={handleNewThreadForProject}
-            onRenameThread={(thread) =>
-              setRenameTarget({
-                kind: "thread",
-                id: thread.id,
-                name: thread.title,
-              })
-            }
-            onRestoreThread={(thread) => void restoreThread(thread)}
-            onOpenThreadWorkspace={(workspaceRoot) =>
-              void openWorkspaceRoot(workspaceRoot)
-            }
-            onOpenExtensions={() => openToolTab("extensions")}
-            onOpenTaskSearch={() => setTaskSearchOpen(true)}
-            onSettings={() => setSettingsOpen(true)}
-          />
-          {!settingsOpen && !sidebarCollapsed ? (
-            <div
-              className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
-              role="separator"
-              tabIndex={0}
-              aria-label="调整左侧栏宽度"
-              aria-controls="workspace-sidebar"
-              aria-orientation="vertical"
-              aria-valuemin={workspaceLayout.leftMin}
-              aria-valuemax={workspaceLayout.leftMax}
-              aria-valuenow={workspaceLayout.left}
-              aria-valuetext={`${workspaceLayout.left} 像素`}
-              onPointerDown={(event) => beginWorkspaceResize("left", event)}
-              onPointerMove={(event) => continueWorkspaceResize("left", event)}
-              onPointerUp={(event) => finishWorkspaceResize("left", event)}
-              onPointerCancel={(event) => finishWorkspaceResize("left", event)}
-              onLostPointerCapture={(event) =>
-                finishWorkspaceResize("left", event)
-              }
-              onDoubleClick={() => resetWorkspacePanelSize("left")}
-              onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
-            />
-          ) : null}
-          <section
-            className={`center-pane ${
-              activeApproval
-                ? "has-approval"
-                : activeUserInput
-                  ? "has-plan-choice"
-                  : ""
-            }`}
-            id="workspace-center-pane"
+        {!settingsOpen ? (
+          <main
+            ref={workspaceRef}
+            className={`workspace ${toolStageOpen ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
+            style={workspaceStyle}
           >
-            <ThreadHeader
-              thread={activeThread}
-              toolStageOpen={toolStageOpen}
-              contextRailOpen={contextRailVisible}
-              onOpenLocation={() =>
-                activeThread &&
-                void openWorkspaceRoot(activeThread.workspaceRoot)
-              }
-              onOpenTool={openToolTab}
-              onToggleContextRail={() => {
-                if (toolStageOpen) {
-                  setToolStageOpen(false);
-                  setContextRailCollapsed(false);
-                  setContextRailOpen(true);
-                  return;
-                }
-                if (contextRailAutoVisible) {
-                  setContextRailOpen(false);
-                  setContextRailCollapsed((current) => !current);
-                  return;
-                }
-                setContextRailCollapsed(false);
-                setContextRailOpen((current) => !current);
-              }}
-              onToggleToolStage={() => {
-                setConversationCollapsed(false);
-                setToolStageOpen((current) => !current);
-              }}
-              onRename={() =>
-                activeThread &&
+            <Sidebar
+              client={client}
+              projects={projects}
+              threads={threads}
+              threadActivityStatuses={threadActivityStatuses}
+              activeThreadId={activeThreadId}
+              activeProjectId={activeThread?.projectId ?? draftProjectId}
+              activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
+              workspaceError={workspaceError}
+              isPickingWorkspace={isPickingWorkspace}
+              experienceMode={experienceMode}
+              onExperienceModeChange={changeExperienceMode}
+              onSelect={selectThread}
+              onNew={beginNewThread}
+              onPickWorkspace={() => void chooseWorkspace()}
+              onCreateProject={createBlankProject}
+              onRemoveProject={(project) => void removeProject(project)}
+              onRenameProject={(project) =>
                 setRenameTarget({
-                  kind: "thread",
-                  id: activeThread.id,
-                  name: activeThread.title,
+                  kind: "project",
+                  id: project.id,
+                  name: project.name,
                 })
               }
-              onArchive={() => activeThread && void archiveThread(activeThread)}
-            />
-            {serverStatus === "offline" ? (
-              <OfflineState
-                backendUrl={platform?.backendUrl}
-                error={serverError}
-                attempt={bootstrapAttempt}
-                isProbing={serverProbing}
-                onRetry={() => setBootstrapAttempt((attempt) => attempt + 1)}
-              />
-            ) : activeThread ? (
-              <>
-                {conversationGoalSnapshot ? (
-                  <GoalStrip
-                    snapshot={conversationGoalSnapshot}
-                    isRunning={Boolean(conversationActiveTurnId)}
-                    action={goalAction}
-                    onRun={() => void runGoal()}
-                    onPause={() => void changeGoalStatus("paused")}
-                    onCancel={() => void changeGoalStatus("cancelled")}
-                  />
-                ) : null}
-                {conversationLoadError ? (
-                  <ConversationLoadErrorState
-                    error={conversationLoadError}
-                    onRetry={() =>
-                      setConversationLoadAttempt((attempt) => attempt + 1)
-                    }
-                  />
-                ) : isConversationLoading ? (
-                  <ConversationLoadingState />
-                ) : (
-                  <MessageList
-                    key={activeThread.id}
-                    messages={conversationMessages}
-                    events={conversationEvents}
-                    activeTurnId={conversationActiveTurnId}
-                    pendingTurnFeedback={conversationPendingTurnFeedback}
-                    undoingTurnId={
-                      turnUndoDialog?.loading || turnUndoDialog?.applying
-                        ? turnUndoDialog.turnId
-                        : null
-                    }
-                    threadId={activeThread.id}
-                    artifacts={artifacts}
-                    onOpenArtifact={(artifactId) =>
-                      void openArtifact(activeThread.id, artifactId)
-                    }
-                    onOpenMarkdownLink={openMarkdownLink}
-                    onUndoTurn={(turnId) => void openTurnUndo(turnId)}
-                    onReviewChanges={() => {
-                      openToolTab("diff");
-                      void refreshWorkbench();
-                    }}
-                    onOpenFileReview={openFileReview}
-                    onLoadTurnFilePreview={(turnId, path, offset) => {
-                      if (!client) {
-                        return Promise.reject(new Error("服务尚未连接"));
-                      }
-                      return client.getTurnFileDiffPreview(
-                        activeThread.id,
-                        turnId,
-                        path,
-                        offset,
-                      );
-                    }}
-                  />
-                )}
-                {activeApproval ? (
-                  <ApprovalDialog
-                    key={activeApproval.approval_id}
-                    request={activeApproval}
-                    queuePosition={1}
-                    queueLength={pendingApprovalQueue.length}
-                    isSubmitting={
-                      decidingApprovalId === activeApproval.approval_id
-                    }
-                    error={approvalDecisionError}
-                    onDecision={(approved) =>
-                      void decideApproval(activeApproval.approval_id, approved)
-                    }
-                  />
-                ) : activeUserInput ? (
-                  <PlanChoiceCard
-                    key={activeUserInput.request.requestId}
-                    request={activeUserInput.request}
-                    isSubmitting={
-                      submittingUserInputId ===
-                      activeUserInput.request.requestId
-                    }
-                    error={userInputError}
-                    onSubmit={(response) =>
-                      void submitUserInput(
-                        activeUserInput.request.requestId,
-                        response,
-                      )
-                    }
-                  />
-                ) : (
-                  <Composer
-                    value={composer}
-                    taskPlan={composerTaskPlan}
-                    isSending={isSending}
-                    isRunning={Boolean(conversationActiveTurnId)}
-                    isCancelling={
-                      Boolean(conversationActiveTurnId) &&
-                      cancellingTurnId === conversationActiveTurnId
-                    }
-                    queuedMessageCount={
-                      isConversationReady ? queuedMessageCount : 0
-                    }
-                    modelSelection={activeThread?.modelSelection ?? null}
-                    providers={settings?.providers ?? []}
-                    activeProviderId={settings?.activeProviderId ?? ""}
-                    permissionMode={settings?.permissionMode ?? "auto"}
-                    collaborationMode={collaborationMode}
-                    sandboxMode={
-                      settings?.sandbox.sandboxMode ?? "workspace-write"
-                    }
-                    contextSources={contextSources}
-                    skills={skills}
-                    selectedSkillIds={selectedSkillIds}
-                    workspaceRoot={null}
-                    projectName={null}
-                    projects={projects}
-                    onChange={setComposer}
-                    onSubmit={submitMessage}
-                    onCancel={() => void cancelTurn()}
-                    onPickWorkspace={() => void chooseWorkspace()}
-                    onSelectProject={selectProject}
-                    onChangePermissionMode={changeExecutionPreset}
-                    onChangeCollaborationMode={setCollaborationMode}
-                    onChangeSandboxMode={changeSandboxMode}
-                    onChangeModelSelection={changeModelSelection}
-                    onOpenSettings={() => setSettingsOpen(true)}
-                    onAddContextSources={addContextSources}
-                    onRemoveContextSource={removeContextSource}
-                    onToggleSkill={toggleSkill}
-                  />
-                )}
-              </>
-            ) : (
-              <NewTaskState
-                value={composer}
-                workspaceRoot={currentWorkspaceRoot}
-                projectName={draftProject?.name ?? null}
-                projects={projects}
-                modelSelection={draftModelSelection}
-                providers={settings?.providers ?? []}
-                activeProviderId={settings?.activeProviderId ?? ""}
-                permissionMode={settings?.permissionMode ?? "auto"}
-                collaborationMode={collaborationMode}
-                sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
-                contextSources={contextSources}
-                skills={skills}
-                selectedSkillIds={selectedSkillIds}
-                isSending={isSending}
-                launchMode={newTaskLaunchMode}
-                experienceMode={experienceMode}
-                onChange={setComposer}
-                onChangeLaunchMode={setNewTaskLaunchMode}
-                onPickWorkspace={() => void chooseWorkspace(true)}
-                onSelectProject={selectProject}
-                onChangePermissionMode={changeExecutionPreset}
-                onChangeCollaborationMode={setCollaborationMode}
-                onChangeSandboxMode={changeSandboxMode}
-                onChangeModelSelection={changeModelSelection}
-                onOpenSettings={() => setSettingsOpen(true)}
-                onAddContextSources={addContextSources}
-                onRemoveContextSource={removeContextSource}
-                onToggleSkill={toggleSkill}
-                onSubmit={createThread}
-              />
-            )}
-          </section>
-          {toolStageOpen && !settingsOpen ? (
-            <div
-              className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
-              role="separator"
-              tabIndex={0}
-              aria-label="调整右侧栏宽度"
-              aria-controls="workspace-right-panel"
-              aria-orientation="vertical"
-              aria-valuemin={workspaceLayout.rightMin}
-              aria-valuemax={workspaceLayout.rightMax}
-              aria-valuenow={workspaceLayout.right}
-              aria-valuetext={`${workspaceLayout.right} 像素`}
-              onPointerDown={(event) => beginWorkspaceResize("right", event)}
-              onPointerMove={(event) => continueWorkspaceResize("right", event)}
-              onPointerUp={(event) => finishWorkspaceResize("right", event)}
-              onPointerCancel={(event) => finishWorkspaceResize("right", event)}
-              onLostPointerCapture={(event) =>
-                finishWorkspaceResize("right", event)
+              onToggleProjectPinned={(project) =>
+                void toggleProjectPinned(project)
               }
-              onDoubleClick={() => resetWorkspacePanelSize("right")}
-              onKeyDown={(event) => resizeWorkspaceWithKeyboard("right", event)}
+              onSelectProject={beginProjectDraft}
+              onNewThreadForProject={handleNewThreadForProject}
+              onRenameThread={(thread) =>
+                setRenameTarget({
+                  kind: "thread",
+                  id: thread.id,
+                  name: thread.title,
+                })
+              }
+              onRestoreThread={(thread) => void restoreThread(thread)}
+              onOpenThreadWorkspace={(workspaceRoot) =>
+                void openWorkspaceRoot(workspaceRoot)
+              }
+              onOpenExtensions={() => openToolTab("extensions")}
+              onOpenTaskSearch={() => setTaskSearchOpen(true)}
+              onSettings={() => setSettingsOpen(true)}
             />
-          ) : null}
-          <RightPanel
-            client={client}
-            threads={threads}
-            toolTabs={toolTabs}
-            activeToolTab={activeToolTab}
-            toolStageOpen={toolStageOpen}
-            conversationCollapsed={conversationCollapsed}
-            contextRailOpen={contextRailVisible}
-            contextRailAutoVisible={contextRailAutoVisible}
-            thread={activeThread}
-            settings={settings}
-            projects={projects}
-            skills={skills}
-            collaborationMode={collaborationMode}
-            workspaceRoot={currentWorkspaceRoot}
-            messages={conversationMessages}
-            events={conversationEvents.filter(
-              (event) =>
-                event.payload.type !== "approval_requested" ||
-                pendingApprovalIds.includes(event.payload.approval_id),
-            )}
-            subagentRuns={isConversationReady ? subagentRuns : []}
-            terminalEvents={terminalEvents}
-            terminalSession={terminalSession}
-            workspaceTree={workspaceTree}
-            filePreview={filePreview}
-            workspaceDiff={workspaceDiff}
-            sandbox={sandbox}
-            plugins={plugins}
-            selectedSkillIds={selectedSkillIds}
-            mcpServers={mcpServers}
-            threadMcpServers={threadMcpServers}
-            workbenchError={workbenchError}
-            isRefreshingWorkbench={isRefreshingWorkbench}
-            pendingApprovalIds={pendingApprovalIds}
-            decidingApprovalId={decidingApprovalId}
-            artifacts={artifacts}
-            contextStatus={contextStatus}
-            isCompactingContext={isCompactingContext}
-            revertingDiffPath={revertingDiffPath}
-            hunkActionKey={hunkActionKey}
-            reviewFileRequest={reviewFileRequest}
-            onDecideApproval={decideApproval}
-            onRefreshWorkbench={() => void refreshWorkbench()}
-            onOpenWorkspacePath={(path) => void openWorkspacePath(path)}
-            onOpenWorkspaceEntry={(entry) => void openWorkspaceEntry(entry)}
-            onToggleThreadMcp={(serverId, enabled) =>
-              void toggleThreadMcp(serverId, enabled)
-            }
-            onCreateMcpServer={createMcpServer}
-            onUpdateMcpServer={updateMcpServer}
-            onRestartMcpServer={restartMcpServer}
-            onDeleteMcpServer={deleteMcpServer}
-            onInstallPlugin={installLocalPlugin}
-            onUninstallPlugin={uninstallLocalPlugin}
-            onToggleThreadPlugin={toggleThreadPlugin}
-            onUsePluginSkills={usePluginSkills}
-            onOpenWorkspace={(workspaceRoot) =>
-              void openWorkspaceRoot(workspaceRoot)
-            }
-            onEnsureTerminalSession={ensureTerminalSession}
-            onWriteTerminalSession={(threadId, sessionId, data) =>
-              void writeTerminalSession(threadId, sessionId, data)
-            }
-            onResizeTerminalSession={(threadId, sessionId, cols, rows) =>
-              void resizeTerminalSession(threadId, sessionId, cols, rows)
-            }
-            onCloseTerminalSession={(threadId, sessionId) =>
-              void closeTerminalSession(threadId, sessionId)
-            }
-            onCompactContext={() => void compactContext()}
-            onOpenArtifact={(threadId, artifactId) =>
-              void openArtifact(threadId, artifactId)
-            }
-            onOpenMarkdownLink={openMarkdownLink}
-            onRevertDiffFile={(path) => void revertDiffFile(path)}
-            onApplyDiffHunk={(hunk, action) => void applyDiffHunk(hunk, action)}
-            onOpenFileTab={openReviewFileTab}
-            onLoadFileContent={loadReviewFileContent}
-            onLoadTurnFileDiff={loadReviewTurnFileDiff}
-            onGitAction={runReviewGitAction}
-            onGetArtifact={(threadId, artifactId) =>
-              getArtifact(threadId, artifactId)
-            }
-            onOpenToolTab={openToolTab}
-            onOpenSideTask={() => void openSideTask()}
-            onThreadUpdated={(updatedThread) =>
-              setThreads((current) =>
-                current.map((thread) =>
-                  thread.id === updatedThread.id ? updatedThread : thread,
-                ),
-              )
-            }
-            onSetThreadActivity={setThreadActivityStatus}
-            onChangePermissionMode={changeExecutionPreset}
-            onChangeSandboxMode={changeSandboxMode}
-            onOpenSettings={() => setSettingsOpen(true)}
-            onActivateToolTab={setActiveToolTabId}
-            onCloseToolTab={closeToolTab}
-            onToggleConversation={() =>
-              setConversationCollapsed((current) => !current)
-            }
-            onHideToolStage={() => {
-              setToolStageOpen(false);
-              setConversationCollapsed(false);
-            }}
-            onAddContextSources={() => void addContextSources()}
-            onCancelSubagent={(runId) => void cancelSubagent(runId)}
-          />
-        </main>
+            {!settingsOpen && !sidebarCollapsed ? (
+              <div
+                className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
+                role="separator"
+                tabIndex={0}
+                aria-label="调整左侧栏宽度"
+                aria-controls="workspace-sidebar"
+                aria-orientation="vertical"
+                aria-valuemin={workspaceLayout.leftMin}
+                aria-valuemax={workspaceLayout.leftMax}
+                aria-valuenow={workspaceLayout.left}
+                aria-valuetext={`${workspaceLayout.left} 像素`}
+                onPointerDown={(event) => beginWorkspaceResize("left", event)}
+                onPointerMove={(event) =>
+                  continueWorkspaceResize("left", event)
+                }
+                onPointerUp={(event) => finishWorkspaceResize("left", event)}
+                onPointerCancel={(event) =>
+                  finishWorkspaceResize("left", event)
+                }
+                onLostPointerCapture={(event) =>
+                  finishWorkspaceResize("left", event)
+                }
+                onDoubleClick={() => resetWorkspacePanelSize("left")}
+                onKeyDown={(event) =>
+                  resizeWorkspaceWithKeyboard("left", event)
+                }
+              />
+            ) : null}
+            <section
+              className={`center-pane ${
+                activeApproval
+                  ? "has-approval"
+                  : activeUserInput
+                    ? "has-plan-choice"
+                    : ""
+              }`}
+              id="workspace-center-pane"
+            >
+              <ThreadHeader
+                thread={activeThread}
+                toolStageOpen={toolStageOpen}
+                contextRailOpen={contextRailVisible}
+                onOpenLocation={() =>
+                  activeThread &&
+                  void openWorkspaceRoot(activeThread.workspaceRoot)
+                }
+                onOpenTool={openToolTab}
+                onToggleContextRail={() => {
+                  if (toolStageOpen) {
+                    setToolStageOpen(false);
+                    setContextRailCollapsed(false);
+                    setContextRailOpen(true);
+                    return;
+                  }
+                  if (contextRailAutoVisible) {
+                    setContextRailOpen(false);
+                    setContextRailCollapsed((current) => !current);
+                    return;
+                  }
+                  setContextRailCollapsed(false);
+                  setContextRailOpen((current) => !current);
+                }}
+                onToggleToolStage={() => {
+                  setConversationCollapsed(false);
+                  setToolStageOpen((current) => !current);
+                }}
+                onRename={() =>
+                  activeThread &&
+                  setRenameTarget({
+                    kind: "thread",
+                    id: activeThread.id,
+                    name: activeThread.title,
+                  })
+                }
+                onArchive={() =>
+                  activeThread && void archiveThread(activeThread)
+                }
+              />
+              {serverStatus === "offline" ? (
+                <OfflineState
+                  backendUrl={platform?.backendUrl}
+                  error={serverError}
+                  attempt={bootstrapAttempt}
+                  isProbing={serverProbing}
+                  onRetry={() => setBootstrapAttempt((attempt) => attempt + 1)}
+                />
+              ) : activeThread ? (
+                <>
+                  {conversationGoalSnapshot ? (
+                    <GoalStrip
+                      snapshot={conversationGoalSnapshot}
+                      isRunning={Boolean(conversationActiveTurnId)}
+                      action={goalAction}
+                      onRun={() => void runGoal()}
+                      onPause={() => void changeGoalStatus("paused")}
+                      onCancel={() => void changeGoalStatus("cancelled")}
+                    />
+                  ) : null}
+                  {conversationLoadError ? (
+                    <ConversationLoadErrorState
+                      error={conversationLoadError}
+                      onRetry={() =>
+                        setConversationLoadAttempt((attempt) => attempt + 1)
+                      }
+                    />
+                  ) : isConversationLoading ? (
+                    <ConversationLoadingState />
+                  ) : (
+                    <MessageList
+                      key={activeThread.id}
+                      messages={conversationMessages}
+                      events={conversationEvents}
+                      activeTurnId={conversationActiveTurnId}
+                      pendingTurnFeedback={conversationPendingTurnFeedback}
+                      undoingTurnId={
+                        turnUndoDialog?.loading || turnUndoDialog?.applying
+                          ? turnUndoDialog.turnId
+                          : null
+                      }
+                      threadId={activeThread.id}
+                      artifacts={artifacts}
+                      onOpenArtifact={(artifactId) =>
+                        void openArtifact(activeThread.id, artifactId)
+                      }
+                      onOpenMarkdownLink={openMarkdownLink}
+                      onUndoTurn={(turnId) => void openTurnUndo(turnId)}
+                      onReviewChanges={() => {
+                        openToolTab("diff");
+                        void refreshWorkbench();
+                      }}
+                      onOpenFileReview={openFileReview}
+                      onLoadTurnFilePreview={(turnId, path, offset) => {
+                        if (!client) {
+                          return Promise.reject(new Error("服务尚未连接"));
+                        }
+                        return client.getTurnFileDiffPreview(
+                          activeThread.id,
+                          turnId,
+                          path,
+                          offset,
+                        );
+                      }}
+                    />
+                  )}
+                  {activeApproval ? (
+                    <ApprovalDialog
+                      key={activeApproval.approval_id}
+                      request={activeApproval}
+                      queuePosition={1}
+                      queueLength={pendingApprovalQueue.length}
+                      isSubmitting={
+                        decidingApprovalId === activeApproval.approval_id
+                      }
+                      error={approvalDecisionError}
+                      onDecision={(approved) =>
+                        void decideApproval(
+                          activeApproval.approval_id,
+                          approved,
+                        )
+                      }
+                    />
+                  ) : activeUserInput ? (
+                    <PlanChoiceCard
+                      key={activeUserInput.request.requestId}
+                      request={activeUserInput.request}
+                      isSubmitting={
+                        submittingUserInputId ===
+                        activeUserInput.request.requestId
+                      }
+                      error={userInputError}
+                      onSubmit={(response) =>
+                        void submitUserInput(
+                          activeUserInput.request.requestId,
+                          response,
+                        )
+                      }
+                    />
+                  ) : (
+                    <Composer
+                      value={composer}
+                      taskPlan={composerTaskPlan}
+                      isSending={isSending}
+                      isRunning={Boolean(conversationActiveTurnId)}
+                      isCancelling={
+                        Boolean(conversationActiveTurnId) &&
+                        cancellingTurnId === conversationActiveTurnId
+                      }
+                      queuedMessageCount={
+                        isConversationReady ? queuedMessageCount : 0
+                      }
+                      modelSelection={activeThread?.modelSelection ?? null}
+                      providers={settings?.providers ?? []}
+                      activeProviderId={settings?.activeProviderId ?? ""}
+                      permissionMode={settings?.permissionMode ?? "auto"}
+                      collaborationMode={collaborationMode}
+                      sandboxMode={
+                        settings?.sandbox.sandboxMode ?? "workspace-write"
+                      }
+                      contextSources={contextSources}
+                      skills={skills}
+                      selectedSkillIds={selectedSkillIds}
+                      workspaceRoot={null}
+                      projectName={null}
+                      projects={projects}
+                      onChange={setComposer}
+                      onSubmit={submitMessage}
+                      onCancel={() => void cancelTurn()}
+                      onPickWorkspace={() => void chooseWorkspace()}
+                      onSelectProject={selectProject}
+                      onChangePermissionMode={changeExecutionPreset}
+                      onChangeCollaborationMode={setCollaborationMode}
+                      onChangeSandboxMode={changeSandboxMode}
+                      onChangeModelSelection={changeModelSelection}
+                      onOpenSettings={() => setSettingsOpen(true)}
+                      onAddContextSources={addContextSources}
+                      onRemoveContextSource={removeContextSource}
+                      onToggleSkill={toggleSkill}
+                    />
+                  )}
+                </>
+              ) : (
+                <NewTaskState
+                  value={composer}
+                  workspaceRoot={currentWorkspaceRoot}
+                  projectName={draftProject?.name ?? null}
+                  projects={projects}
+                  modelSelection={draftModelSelection}
+                  providers={settings?.providers ?? []}
+                  activeProviderId={settings?.activeProviderId ?? ""}
+                  permissionMode={settings?.permissionMode ?? "auto"}
+                  collaborationMode={collaborationMode}
+                  sandboxMode={
+                    settings?.sandbox.sandboxMode ?? "workspace-write"
+                  }
+                  contextSources={contextSources}
+                  skills={skills}
+                  selectedSkillIds={selectedSkillIds}
+                  isSending={isSending}
+                  launchMode={newTaskLaunchMode}
+                  experienceMode={experienceMode}
+                  onChange={setComposer}
+                  onChangeLaunchMode={setNewTaskLaunchMode}
+                  onPickWorkspace={() => void chooseWorkspace(true)}
+                  onSelectProject={selectProject}
+                  onChangePermissionMode={changeExecutionPreset}
+                  onChangeCollaborationMode={setCollaborationMode}
+                  onChangeSandboxMode={changeSandboxMode}
+                  onChangeModelSelection={changeModelSelection}
+                  onOpenSettings={() => setSettingsOpen(true)}
+                  onAddContextSources={addContextSources}
+                  onRemoveContextSource={removeContextSource}
+                  onToggleSkill={toggleSkill}
+                  onSubmit={createThread}
+                />
+              )}
+            </section>
+            {toolStageOpen && !settingsOpen ? (
+              <div
+                className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
+                role="separator"
+                tabIndex={0}
+                aria-label="调整右侧栏宽度"
+                aria-controls="workspace-right-panel"
+                aria-orientation="vertical"
+                aria-valuemin={workspaceLayout.rightMin}
+                aria-valuemax={workspaceLayout.rightMax}
+                aria-valuenow={workspaceLayout.right}
+                aria-valuetext={`${workspaceLayout.right} 像素`}
+                onPointerDown={(event) => beginWorkspaceResize("right", event)}
+                onPointerMove={(event) =>
+                  continueWorkspaceResize("right", event)
+                }
+                onPointerUp={(event) => finishWorkspaceResize("right", event)}
+                onPointerCancel={(event) =>
+                  finishWorkspaceResize("right", event)
+                }
+                onLostPointerCapture={(event) =>
+                  finishWorkspaceResize("right", event)
+                }
+                onDoubleClick={() => resetWorkspacePanelSize("right")}
+                onKeyDown={(event) =>
+                  resizeWorkspaceWithKeyboard("right", event)
+                }
+              />
+            ) : null}
+            <RightPanel
+              client={client}
+              threads={threads}
+              toolTabs={toolTabs}
+              activeToolTab={activeToolTab}
+              toolStageOpen={toolStageOpen}
+              conversationCollapsed={conversationCollapsed}
+              contextRailOpen={contextRailVisible}
+              contextRailAutoVisible={contextRailAutoVisible}
+              thread={activeThread}
+              settings={settings}
+              projects={projects}
+              skills={skills}
+              collaborationMode={collaborationMode}
+              workspaceRoot={currentWorkspaceRoot}
+              messages={conversationMessages}
+              events={conversationEvents.filter(
+                (event) =>
+                  event.payload.type !== "approval_requested" ||
+                  pendingApprovalIds.includes(event.payload.approval_id),
+              )}
+              subagentRuns={isConversationReady ? subagentRuns : []}
+              terminalEvents={terminalEvents}
+              terminalSession={terminalSession}
+              workspaceTree={workspaceTree}
+              filePreview={filePreview}
+              workspaceDiff={workspaceDiff}
+              sandbox={sandbox}
+              plugins={plugins}
+              selectedSkillIds={selectedSkillIds}
+              mcpServers={mcpServers}
+              threadMcpServers={threadMcpServers}
+              workbenchError={workbenchError}
+              isRefreshingWorkbench={isRefreshingWorkbench}
+              pendingApprovalIds={pendingApprovalIds}
+              decidingApprovalId={decidingApprovalId}
+              artifacts={artifacts}
+              contextStatus={contextStatus}
+              isCompactingContext={isCompactingContext}
+              revertingDiffPath={revertingDiffPath}
+              hunkActionKey={hunkActionKey}
+              reviewFileRequest={reviewFileRequest}
+              onDecideApproval={decideApproval}
+              onRefreshWorkbench={() => void refreshWorkbench()}
+              onOpenWorkspacePath={(path) => void openWorkspacePath(path)}
+              onOpenWorkspaceEntry={(entry) => void openWorkspaceEntry(entry)}
+              onToggleThreadMcp={(serverId, enabled) =>
+                void toggleThreadMcp(serverId, enabled)
+              }
+              onCreateMcpServer={createMcpServer}
+              onUpdateMcpServer={updateMcpServer}
+              onRestartMcpServer={restartMcpServer}
+              onDeleteMcpServer={deleteMcpServer}
+              onInstallPlugin={installLocalPlugin}
+              onUninstallPlugin={uninstallLocalPlugin}
+              onToggleThreadPlugin={toggleThreadPlugin}
+              onUsePluginSkills={usePluginSkills}
+              onOpenWorkspace={(workspaceRoot) =>
+                void openWorkspaceRoot(workspaceRoot)
+              }
+              onEnsureTerminalSession={ensureTerminalSession}
+              onWriteTerminalSession={(threadId, sessionId, data) =>
+                void writeTerminalSession(threadId, sessionId, data)
+              }
+              onResizeTerminalSession={(threadId, sessionId, cols, rows) =>
+                void resizeTerminalSession(threadId, sessionId, cols, rows)
+              }
+              onCloseTerminalSession={(threadId, sessionId) =>
+                void closeTerminalSession(threadId, sessionId)
+              }
+              onCompactContext={() => void compactContext()}
+              onOpenArtifact={(threadId, artifactId) =>
+                void openArtifact(threadId, artifactId)
+              }
+              onOpenMarkdownLink={openMarkdownLink}
+              onRevertDiffFile={(path) => void revertDiffFile(path)}
+              onApplyDiffHunk={(hunk, action) =>
+                void applyDiffHunk(hunk, action)
+              }
+              onOpenFileTab={openReviewFileTab}
+              onLoadFileContent={loadReviewFileContent}
+              onLoadTurnFileDiff={loadReviewTurnFileDiff}
+              onGitAction={runReviewGitAction}
+              onGetArtifact={(threadId, artifactId) =>
+                getArtifact(threadId, artifactId)
+              }
+              onOpenToolTab={openToolTab}
+              onOpenSideTask={() => void openSideTask()}
+              onThreadUpdated={(updatedThread) =>
+                setThreads((current) =>
+                  current.map((thread) =>
+                    thread.id === updatedThread.id ? updatedThread : thread,
+                  ),
+                )
+              }
+              onSetThreadActivity={setThreadActivityStatus}
+              onChangePermissionMode={changeExecutionPreset}
+              onChangeSandboxMode={changeSandboxMode}
+              onOpenSettings={() => setSettingsOpen(true)}
+              onActivateToolTab={setActiveToolTabId}
+              onCloseToolTab={closeToolTab}
+              onToggleConversation={() =>
+                setConversationCollapsed((current) => !current)
+              }
+              onHideToolStage={() => {
+                setToolStageOpen(false);
+                setConversationCollapsed(false);
+              }}
+              onAddContextSources={() => void addContextSources()}
+              onCancelSubagent={(runId) => void cancelSubagent(runId)}
+            />
+          </main>
+        ) : null}
         {settingsOpen && (
           <RedesignedSettingsPanel
             platform={platform}

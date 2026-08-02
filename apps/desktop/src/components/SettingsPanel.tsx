@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
+  ArrowLeft,
   Bell,
   BellRing,
   Bot,
@@ -558,97 +559,82 @@ export function SettingsPanel({
   const saving = isSaving || isApplyingSave || isSavingSecret;
 
   return (
-    <div
-      className="modal-backdrop"
-      role="presentation"
-      onMouseDown={closeSafely}
-    >
-      <section
-        className="settings-panel settings-panel-redesigned"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="settings-title"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <header className="settings-header">
-          <div>
-            <h2 id="settings-title">设置</h2>
-            <p>管理 OpenTopia 的本机体验与运行配置</p>
-          </div>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="关闭设置"
-            title="关闭"
-            onClick={closeSafely}
-          >
-            <X size={17} />
-          </button>
-        </header>
-
-        <form className="settings-layout" onSubmit={submitSettings}>
-          <aside className="settings-sidebar" aria-label="设置分类">
-            <label className="settings-search">
-              <Search size={15} aria-hidden="true" />
-              <span className="sr-only">搜索设置</span>
-              <input
-                ref={searchRef}
-                type="search"
-                value={searchQuery}
-                placeholder="搜索设置"
-                onChange={(event) => setSearchQuery(event.target.value)}
-              />
-              {searchQuery ? (
-                <button
-                  type="button"
-                  aria-label="清除搜索"
-                  title="清除搜索"
-                  onClick={() => setSearchQuery("")}
-                >
-                  <X size={14} />
-                </button>
-              ) : null}
-            </label>
-            <nav aria-label="设置分类导航">
-              {settingsSectionOrder.map((section) => {
-                const tabs = matchingTabs.filter(
-                  (tab) => tab.section === section,
-                );
-                if (tabs.length === 0) return null;
-                return (
-                  <div key={section} className="settings-nav-section">
-                    <h3 className="settings-nav-section__label">
-                      {settingsSectionLabels[section]}
-                    </h3>
-                    {tabs.map((tab) => {
-                      const Icon = tab.icon;
-                      return (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          className={activeTab === tab.id ? "active" : ""}
-                          aria-current={
-                            activeTab === tab.id ? "page" : undefined
-                          }
-                          onClick={() => setActiveTab(tab.id)}
-                        >
-                          <Icon size={17} aria-hidden="true" />
-                          <span>
-                            <strong>{tab.label}</strong>
-                            <small>{tab.description}</small>
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                );
-              })}
-            </nav>
-            {matchingTabs.length === 0 ? (
-              <p className="settings-search-empty">没有匹配的设置</p>
+    <section className="settings-panel settings-panel-redesigned">
+      <form className="settings-layout" onSubmit={submitSettings}>
+        <aside className="settings-sidebar" aria-label="设置分类">
+          <header className="settings-sidebar-header">
+            <Button
+              className="settings-return-button"
+              variant="quiet"
+              onClick={closeSafely}
+            >
+              <ArrowLeft size={16} aria-hidden="true" focusable="false" />
+              返回应用
+            </Button>
+          </header>
+          <label className="settings-search">
+            <Search size={15} aria-hidden="true" />
+            <span className="sr-only">搜索设置</span>
+            <input
+              ref={searchRef}
+              type="search"
+              value={searchQuery}
+              placeholder="搜索设置"
+              onChange={(event) => setSearchQuery(event.target.value)}
+            />
+            {searchQuery ? (
+              <button
+                type="button"
+                aria-label="清除搜索"
+                title="清除搜索"
+                onClick={() => setSearchQuery("")}
+              >
+                <X size={14} />
+              </button>
             ) : null}
-          </aside>
+          </label>
+          <nav aria-label="设置分类导航">
+            {settingsSectionOrder.map((section) => {
+              const tabs = matchingTabs.filter(
+                (tab) => tab.section === section,
+              );
+              if (tabs.length === 0) return null;
+              return (
+                <div key={section} className="settings-nav-section">
+                  <h3 className="settings-nav-section__label">
+                    {settingsSectionLabels[section]}
+                  </h3>
+                  {tabs.map((tab) => {
+                    const Icon = tab.icon;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        className={activeTab === tab.id ? "active" : ""}
+                        aria-current={activeTab === tab.id ? "page" : undefined}
+                        onClick={() => setActiveTab(tab.id)}
+                      >
+                        <Icon size={16} aria-hidden="true" />
+                        <span>
+                          <strong>{tab.label}</strong>
+                          <small>{tab.description}</small>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </nav>
+          {matchingTabs.length === 0 ? (
+            <p className="settings-search-empty">没有匹配的设置</p>
+          ) : null}
+        </aside>
 
+        <div className="settings-workspace">
+          <h2 id="settings-title" className="ot-sr-only">
+            设置
+          </h2>
           <div className="settings-content">
             {activeTab === "general" ? (
               <GeneralSettings
@@ -788,23 +774,23 @@ export function SettingsPanel({
               {saving ? "保存中…" : "保存设置"}
             </button>
           </footer>
-        </form>
+        </div>
+      </form>
 
-        {importOpen ? (
-          <ProviderImportDialog
-            text={importText}
-            draft={importDraft}
-            onTextChange={(value) => {
-              setImportText(value);
-              setImportDraft(null);
-            }}
-            onParse={() => setImportDraft(parseProviderImport(importText))}
-            onApply={applyImportedProvider}
-            onClose={() => setImportOpen(false)}
-          />
-        ) : null}
-      </section>
-    </div>
+      {importOpen ? (
+        <ProviderImportDialog
+          text={importText}
+          draft={importDraft}
+          onTextChange={(value) => {
+            setImportText(value);
+            setImportDraft(null);
+          }}
+          onParse={() => setImportDraft(parseProviderImport(importText))}
+          onApply={applyImportedProvider}
+          onClose={() => setImportOpen(false)}
+        />
+      ) : null}
+    </section>
   );
 }
 
