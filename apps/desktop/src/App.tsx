@@ -131,6 +131,7 @@ import {
   reconcileReasoningEffort,
   resolveDefaultModelId,
 } from "./modelCatalog";
+import { modelSupportsVision } from "./modelCapabilities";
 import {
   appendImageUnderstandingContext,
   buildImageUnderstandingArguments,
@@ -2587,7 +2588,10 @@ export function App() {
     const providerId =
       modelSelection?.connectionId ?? settings?.activeProviderId;
     const provider = settings?.providers.find((item) => item.id === providerId);
-    if (provider?.supportsVision) {
+    if (
+      provider &&
+      modelSupportsVision(provider, modelSelection?.modelId ?? provider.model)
+    ) {
       return { prompt, imageAttachments };
     }
 
@@ -3656,8 +3660,10 @@ export function App() {
 
   async function syncProviderModels(
     providerId: string,
-  ): Promise<ProviderModelSyncResult | null> {
-    if (!client) return null;
+  ): Promise<ProviderModelSyncResult> {
+    if (!client) {
+      throw new Error("无法连接到 OpenTopia 后端，无法识别模型。");
+    }
     try {
       const result = await client.syncProviderModels(providerId);
       setSettings((current) =>
@@ -3668,8 +3674,10 @@ export function App() {
                 provider.id === providerId
                   ? {
                       ...provider,
+                      model: result.defaultModel,
                       syncedModels: result.models,
                       modelContextWindows: result.modelContextWindows,
+                      modelCapabilities: result.modelCapabilities,
                       modelsSyncedAt: result.syncedAt,
                     }
                   : provider,
@@ -3679,8 +3687,11 @@ export function App() {
       );
       return result;
     } catch (error) {
-      console.warn("OpenTopia could not sync the model list", error);
-      return null;
+      console.error("OpenTopia model discovery failed", {
+        providerId,
+        error: errorMessage(error),
+      });
+      throw error;
     }
   }
 
@@ -4293,6 +4304,20 @@ export function App() {
             editorPreferences={editorPreferences}
             isSaving={isSavingSettings}
             isSavingSecret={isSavingSecret}
+            sidebarResize={{
+              width: workspaceLayout.left,
+              minWidth: workspaceLayout.leftMin,
+              maxWidth: workspaceLayout.leftMax,
+              isResizing: workspaceResizeSide === "left",
+              onPointerDown: (event) => beginWorkspaceResize("left", event),
+              onPointerMove: (event) => continueWorkspaceResize("left", event),
+              onPointerUp: (event) => finishWorkspaceResize("left", event),
+              onPointerCancel: (event) => finishWorkspaceResize("left", event),
+              onLostPointerCapture: (event) =>
+                finishWorkspaceResize("left", event),
+              onDoubleClick: () => resetWorkspacePanelSize("left"),
+              onKeyDown: (event) => resizeWorkspaceWithKeyboard("left", event),
+            }}
             onAppearanceChange={setAppearance}
             onPersonalizationChange={setPersonalization}
             onEditorPreferencesChange={setEditorPreferences}

@@ -710,14 +710,14 @@ impl OpenAiCompatibleProvider {
     }
 
     fn with_generation_settings(mut self, settings: &ProviderSettings) -> Self {
-        if let Some(temperature) = settings.temperature {
+        if let Some(temperature) = settings.temperature_for_model() {
             self.temperature = Some(temperature);
         }
-        self.max_output_tokens = settings.max_output_tokens;
-        self.reasoning_effort = settings.reasoning_effort.clone();
+        self.max_output_tokens = settings.max_output_tokens_for_model();
+        self.reasoning_effort = settings.reasoning_effort_for_model();
         self.parallel_tool_calls = settings.parallel_tool_calls;
         self.prompt_cache_key = settings.prompt_cache_key.clone();
-        self.supports_vision = settings.supports_vision;
+        self.supports_vision = settings.supports_vision_for_model();
         if settings.kind == ProviderKind::OpenAiCompatible {
             if let Some(report) = settings
                 .openai_compatibility
@@ -1379,17 +1379,17 @@ impl OpenAiResponsesProvider {
         }
         let api_key = provider_api_key(settings)?;
         let mut provider = Self::new(settings.base_url.clone(), api_key, settings.model.clone());
-        if let Some(temperature) = settings.temperature {
+        if let Some(temperature) = settings.temperature_for_model() {
             provider.temperature = Some(temperature);
         }
-        provider.max_output_tokens = settings.max_output_tokens;
-        provider.reasoning_effort = settings.reasoning_effort.clone();
+        provider.max_output_tokens = settings.max_output_tokens_for_model();
+        provider.reasoning_effort = settings.reasoning_effort_for_model();
         provider.store_responses = settings.store_responses;
         provider.parallel_tool_calls = settings.parallel_tool_calls;
         provider.prompt_cache_key = settings.prompt_cache_key.clone();
         provider.prompt_cache_policy = settings.prompt_cache_policy;
         provider.compaction_threshold_tokens = settings.responses_compaction_threshold_tokens;
-        provider.supports_vision = settings.supports_vision;
+        provider.supports_vision = settings.supports_vision_for_model();
         provider.tool_protocol = settings.capabilities().tool_protocol;
         Some(provider)
     }
@@ -1630,12 +1630,12 @@ impl AnthropicMessagesProvider {
         }
         let api_key = provider_api_key(settings)?;
         let mut provider = Self::new(settings.base_url.clone(), api_key, settings.model.clone());
-        if let Some(temperature) = settings.temperature {
+        if let Some(temperature) = settings.temperature_for_model() {
             provider.temperature = Some(temperature);
         }
-        provider.max_output_tokens = settings.max_output_tokens;
-        provider.reasoning_effort = settings.reasoning_effort.clone();
-        provider.supports_vision = settings.supports_vision;
+        provider.max_output_tokens = settings.max_output_tokens_for_model();
+        provider.reasoning_effort = settings.reasoning_effort_for_model();
+        provider.supports_vision = settings.supports_vision_for_model();
         Some(provider)
     }
 
@@ -4659,7 +4659,7 @@ enum CodexDriveResult {
 impl CodexAppServerProvider {
     pub fn from_settings(settings: &ProviderSettings) -> Option<Self> {
         (settings.kind == ProviderKind::CodexAppServer).then(|| Self {
-            supports_vision: settings.supports_vision,
+            supports_vision: settings.supports_vision_for_model(),
             native_web_search: true,
             sessions: Mutex::new(HashMap::new()),
         })

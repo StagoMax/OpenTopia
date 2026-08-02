@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   ArrowLeft,
   Bell,
@@ -33,7 +42,12 @@ import { openExternal } from "../platform";
 import {
   availableFamiliesForModels,
   classifyModelFamily,
+  formatModelDisplayName,
 } from "../modelCatalog";
+import {
+  modelSupportsVision,
+  modelVisionSupportSource,
+} from "../modelCapabilities";
 import { ModelInputDropdown } from "./ModelInputDropdown";
 import { Badge, Button, Panel, SegmentedControl, Select, Switch } from "./ui";
 import { SettingsGroup, SettingsPage, SettingsRow } from "./SettingsLayout";
@@ -64,6 +78,7 @@ import type {
   ProviderHealthCheckResult,
   ProviderKind,
   ProviderModelSyncResult,
+  ProviderModelSettings,
   ProviderSecretOutcome,
   ProviderSettings,
   SecretSources,
@@ -81,6 +96,88 @@ type SettingsTab =
 /** Nav grouping shown in the sidebar, in render order. */
 type SettingsSection = "personal" | "coding";
 
+type ModelDiscoveryState =
+  | { status: "idle" }
+  | { status: "discovering" }
+  | { status: "success"; modelCount: number }
+  | { status: "error"; message: string };
+
+type ProviderBaseUrlPreset = {
+  id: string;
+  label: string;
+  baseUrl: string;
+  kind: Extract<ProviderKind, "openai_compatible" | "anthropic">;
+};
+
+const providerBaseUrlPresets: readonly ProviderBaseUrlPreset[] = [
+  {
+    id: "openai",
+    label: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
+    kind: "openai_compatible",
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic",
+    baseUrl: "https://api.anthropic.com",
+    kind: "anthropic",
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    kind: "openai_compatible",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    baseUrl: "https://api.deepseek.com/v1",
+    kind: "openai_compatible",
+  },
+  {
+    id: "qwen-china",
+    label: "Qwen / DashScope (中国大陆)",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    kind: "openai_compatible",
+  },
+  {
+    id: "qwen-international",
+    label: "Qwen / DashScope (国际)",
+    baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    kind: "openai_compatible",
+  },
+  {
+    id: "moonshot-china",
+    label: "Moonshot / Kimi (中国大陆)",
+    baseUrl: "https://api.moonshot.cn/v1",
+    kind: "openai_compatible",
+  },
+  {
+    id: "moonshot-international",
+    label: "Moonshot / Kimi (国际)",
+    baseUrl: "https://api.moonshot.ai/v1",
+    kind: "openai_compatible",
+  },
+  {
+    id: "zhipu-china",
+    label: "Zhipu AI / GLM (中国大陆)",
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+    kind: "openai_compatible",
+  },
+  {
+    id: "zhipu-international",
+    label: "Z.AI / GLM (国际)",
+    baseUrl: "https://api.z.ai/api/paas/v4",
+    kind: "openai_compatible",
+  },
+  {
+    id: "ollama",
+    label: "Ollama (local)",
+    baseUrl: "http://localhost:11434/v1",
+    kind: "openai_compatible",
+  },
+];
+
 const settingsSectionLabels: Record<SettingsSection, string> = {
   personal: "个人",
   coding: "编码",
@@ -92,6 +189,20 @@ export type SettingsSaveInput = {
   permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
   agentRuntime?: AgentRuntimeSettings;
   sandbox?: AppSettings["sandbox"];
+};
+
+type SettingsSidebarResize = {
+  width: number;
+  minWidth: number;
+  maxWidth: number;
+  isResizing: boolean;
+  onPointerDown(event: ReactPointerEvent<HTMLDivElement>): void;
+  onPointerMove(event: ReactPointerEvent<HTMLDivElement>): void;
+  onPointerUp(event: ReactPointerEvent<HTMLDivElement>): void;
+  onPointerCancel(event: ReactPointerEvent<HTMLDivElement>): void;
+  onLostPointerCapture(event: ReactPointerEvent<HTMLDivElement>): void;
+  onDoubleClick(): void;
+  onKeyDown(event: ReactKeyboardEvent<HTMLDivElement>): void;
 };
 
 type SettingsPanelProps = {
@@ -114,16 +225,17 @@ type SettingsPanelProps = {
   editorPreferences: EditorPreferences;
   isSaving: boolean;
   isSavingSecret: boolean;
+  sidebarResize: SettingsSidebarResize;
   onAppearanceChange(value: AppearanceSettings): void;
   onPersonalizationChange(value: PersonalizationSettings): void;
   onEditorPreferencesChange(value: EditorPreferences): void;
   onSave(input: SettingsSaveInput): Promise<boolean>;
-  onTestProvider(providerId: string, providers: ProviderSettings[]): void;
+  onTestProvider(providerId: string, providers?: ProviderSettings[]): void;
   // Pulls the connection's model list so families can be picked from what the
   // endpoint actually serves. Includes any context limits it advertises.
   onSyncProviderModels(
     providerId: string,
-  ): Promise<ProviderModelSyncResult | null>;
+  ): Promise<ProviderModelSyncResult>;
   onStoreProviderApiKey(
     providerId: string,
     value: string,
@@ -236,6 +348,7 @@ export function SettingsPanel({
   editorPreferences,
   isSaving,
   isSavingSecret,
+  sidebarResize,
   onAppearanceChange,
   onPersonalizationChange,
   onEditorPreferencesChange,
@@ -294,53 +407,160 @@ export function SettingsPanel({
   const [isApplyingSave, setIsApplyingSave] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const baselineRef = useRef("");
+  const initializedSettingsRef = useRef(false);
+  const providersRef = useRef(providers);
+  const pendingApiKeysRef = useRef(pendingApiKeys);
+  const activeProviderIdRef = useRef(activeProviderId);
+  const modelDiscoveryAttemptsRef = useRef<Record<string, string>>({});
+  const modelDiscoveryInFlightRef = useRef(new Set<string>());
+  const [modelDiscoveryStates, setModelDiscoveryStates] = useState<
+    Record<string, ModelDiscoveryState>
+  >({});
+  const automaticSaveTimerRef = useRef<number | null>(null);
+  const pendingAutomaticSaveRef = useRef<SettingsSaveInput | null>(null);
+  const automaticSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const [autoSaveError, setAutoSaveError] = useState<string | null>(null);
 
   const editingProvider =
     providers.find((provider) => provider.id === editingProviderId) ??
     providers[0] ??
     null;
 
+  const providerSnapshot = providerSettingsSnapshot(
+    providers,
+    activeProviderId,
+  );
+  const isProviderDirty =
+    Object.values(pendingApiKeys).some(Boolean) ||
+    (Boolean(baselineRef.current) && providerSnapshot !== baselineRef.current);
+
+  useEffect(() => {
+    providersRef.current = providers;
+  }, [providers]);
+
+  useEffect(() => {
+    pendingApiKeysRef.current = pendingApiKeys;
+  }, [pendingApiKeys]);
+
+  useEffect(() => {
+    activeProviderIdRef.current = activeProviderId;
+  }, [activeProviderId]);
+
   useEffect(() => {
     if (!settings) return;
     const normalizedProviders = normalizeProviderNames(settings.providers);
-    setProviders(normalizedProviders);
-    setActiveProviderId(settings.activeProviderId);
-    setEditingProviderId((current) =>
-      settings.providers.some((provider) => provider.id === current)
-        ? current
-        : settings.activeProviderId,
-    );
-    setPermissionMode(settings.permissionMode);
-    setAgentRuntime(settings.agentRuntime ?? defaultAgentRuntimeSettings);
-    setSandboxSettings(settings.sandbox);
-    baselineRef.current = settingsSnapshot(
+    const serverProviderSnapshot = providerSettingsSnapshot(
       normalizedProviders,
       settings.activeProviderId,
-      settings.permissionMode,
-      settings.agentRuntime ?? defaultAgentRuntimeSettings,
-      settings.sandbox,
     );
+    if (!initializedSettingsRef.current) {
+      initializedSettingsRef.current = true;
+      setProviders(normalizedProviders);
+      setActiveProviderId(settings.activeProviderId);
+      setEditingProviderId((current) =>
+        settings.providers.some((provider) => provider.id === current)
+          ? current
+          : settings.activeProviderId,
+      );
+      setPermissionMode(settings.permissionMode);
+      setAgentRuntime(settings.agentRuntime ?? defaultAgentRuntimeSettings);
+      setSandboxSettings(settings.sandbox);
+      baselineRef.current = serverProviderSnapshot;
+      return;
+    }
+
+    // Automatic preference updates must not overwrite an unsaved API draft.
+    if (providerSnapshot === baselineRef.current) {
+      setProviders(normalizedProviders);
+      setActiveProviderId(settings.activeProviderId);
+      setEditingProviderId((current) =>
+        settings.providers.some((provider) => provider.id === current)
+          ? current
+          : settings.activeProviderId,
+      );
+      baselineRef.current = serverProviderSnapshot;
+    }
   }, [settings]);
 
   useEffect(() => {
     searchRef.current?.focus();
   }, []);
 
-  const currentSnapshot = settingsSnapshot(
-    providers,
-    activeProviderId,
-    permissionMode,
-    agentRuntime,
-    sandboxSettings,
+  function flushAutomaticSave(): Promise<void> {
+    if (automaticSaveTimerRef.current !== null) {
+      window.clearTimeout(automaticSaveTimerRef.current);
+      automaticSaveTimerRef.current = null;
+    }
+    const input = pendingAutomaticSaveRef.current;
+    if (!input) return automaticSaveQueueRef.current;
+    pendingAutomaticSaveRef.current = null;
+    const save = async () => {
+      const didSave = await onSave(input);
+      setAutoSaveError(didSave ? null : "自动保存失败，请检查连接后重试。");
+    };
+    automaticSaveQueueRef.current = automaticSaveQueueRef.current.then(
+      save,
+      save,
+    );
+    return automaticSaveQueueRef.current;
+  }
+
+  function scheduleAutomaticSave(input: SettingsSaveInput) {
+    if (!settings) return;
+    pendingAutomaticSaveRef.current = {
+      ...pendingAutomaticSaveRef.current,
+      ...input,
+    };
+    if (automaticSaveTimerRef.current !== null) {
+      window.clearTimeout(automaticSaveTimerRef.current);
+    }
+    automaticSaveTimerRef.current = window.setTimeout(() => {
+      automaticSaveTimerRef.current = null;
+      void flushAutomaticSave();
+    }, 250);
+  }
+
+  useEffect(
+    () => () => {
+      if (automaticSaveTimerRef.current !== null) {
+        window.clearTimeout(automaticSaveTimerRef.current);
+      }
+    },
+    [],
   );
-  const isDirty =
-    Object.values(pendingApiKeys).some(Boolean) ||
-    (Boolean(baselineRef.current) && currentSnapshot !== baselineRef.current);
+
+  function discardProviderDraft() {
+    if (!settings) return;
+    const savedProviders = normalizeProviderNames(settings.providers);
+    const savedActiveProviderId = settings.activeProviderId;
+    setProviders(savedProviders);
+    providersRef.current = savedProviders;
+    setActiveProviderId(savedActiveProviderId);
+    activeProviderIdRef.current = savedActiveProviderId;
+    setEditingProviderId((current) =>
+      savedProviders.some((provider) => provider.id === current)
+        ? current
+        : savedActiveProviderId,
+    );
+    setPendingApiKeys({});
+    pendingApiKeysRef.current = {};
+    setModelDiscoveryStates({});
+    modelDiscoveryAttemptsRef.current = {};
+    baselineRef.current = providerSettingsSnapshot(
+      savedProviders,
+      savedActiveProviderId,
+    );
+  }
 
   const closeSafely = () => {
-    if (isDirty && !window.confirm("设置尚未保存。确定要放弃这些更改吗？")) {
-      return;
+    if (isProviderDirty) {
+      const discard = window.confirm(
+        "API 配置尚未保存。确定要放弃这些更改吗？",
+      );
+      if (!discard) return;
+      discardProviderDraft();
     }
+    void flushAutomaticSave();
     onClose();
   };
 
@@ -356,7 +576,35 @@ export function SettingsPanel({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [importOpen, isDirty]);
+  }, [importOpen, isProviderDirty]);
+
+  function updateAgentRuntime(next: AgentRuntimeSettings) {
+    setAgentRuntime(next);
+    scheduleAutomaticSave({ agentRuntime: next });
+  }
+
+  function updatePermissionMode(nextMode: "auto" | "approve" | "full_access") {
+    const nextSandbox =
+      nextMode === "full_access"
+        ? {
+            ...sandboxSettings,
+            sandboxMode: "danger-full-access" as const,
+            enforcement: "disabled" as const,
+            network: "allow" as const,
+          }
+        : controlledSandboxSettings(sandboxSettings);
+    setPermissionMode(nextMode);
+    setSandboxSettings(nextSandbox);
+    scheduleAutomaticSave({
+      permissionMode: nextMode,
+      sandbox: nextSandbox,
+    });
+  }
+
+  function updateSandbox(nextSandbox: AppSettings["sandbox"]) {
+    setSandboxSettings(nextSandbox);
+    scheduleAutomaticSave({ sandbox: nextSandbox });
+  }
 
   const matchingTabs = useMemo(() => {
     const query = searchQuery.trim().toLocaleLowerCase();
@@ -383,8 +631,8 @@ export function SettingsPanel({
     field: K,
     value: ProviderSettings[K],
   ) {
-    setProviders((current) =>
-      current.map((provider) =>
+    setProviders((current) => {
+      const next = current.map((provider) =>
         provider.id === id
           ? {
               ...provider,
@@ -394,9 +642,182 @@ export function SettingsPanel({
                 : {}),
             }
           : provider,
-      ),
-    );
+      );
+      providersRef.current = next;
+      return next;
+    });
   }
+
+  function updatePendingApiKey(providerId: string, apiKey: string) {
+    setPendingApiKeys((current) => {
+      const next = { ...current, [providerId]: apiKey };
+      pendingApiKeysRef.current = next;
+      return next;
+    });
+  }
+
+  function setModelDiscoveryState(
+    providerId: string,
+    state: ModelDiscoveryState,
+  ) {
+    setModelDiscoveryStates((current) => ({ ...current, [providerId]: state }));
+  }
+
+  async function discoverProviderModels(providerId: string): Promise<void> {
+    if (modelDiscoveryInFlightRef.current.has(providerId)) return;
+
+    const initialProvider = providersRef.current.find(
+      (provider) => provider.id === providerId,
+    );
+    if (!initialProvider) return;
+
+    const initialApiKey = pendingApiKeysRef.current[providerId]?.trim() ?? "";
+    const signature = providerDiscoverySignature(initialProvider, initialApiKey);
+    if (!signature) {
+      setModelDiscoveryState(providerId, {
+        status: "error",
+        message: "请先填写有效的 Base URL 和 API 密钥。",
+      });
+      return;
+    }
+
+    modelDiscoveryInFlightRef.current.add(providerId);
+    modelDiscoveryAttemptsRef.current[providerId] = signature;
+    setModelDiscoveryState(providerId, { status: "discovering" });
+
+    try {
+      let nextProviders = providersRef.current;
+      if (initialApiKey) {
+        const outcome = await onStoreProviderApiKey(providerId, initialApiKey);
+        if (!outcome.stored) {
+          setModelDiscoveryState(providerId, {
+            status: "error",
+            message: `无法保存 API 密钥：${outcome.error}`,
+          });
+          return;
+        }
+
+        nextProviders = providersRef.current.map((provider) =>
+          provider.id === providerId
+            ? {
+                ...provider,
+                apiKeySource: outcome.metadata.envTarget,
+                apiKeyConfigured: true,
+              }
+            : provider,
+        );
+        providersRef.current = nextProviders;
+        setProviders(nextProviders);
+      }
+
+      const didSave = await onSave({
+        providers: nextProviders,
+        activeProviderId: activeProviderIdRef.current,
+      });
+      if (!didSave) {
+        setModelDiscoveryState(providerId, {
+          status: "error",
+          message: "连接配置保存失败，无法识别模型。",
+        });
+        return;
+      }
+
+      if (
+        initialApiKey &&
+        pendingApiKeysRef.current[providerId]?.trim() === initialApiKey
+      ) {
+        const nextPendingApiKeys = {
+          ...pendingApiKeysRef.current,
+          [providerId]: "",
+        };
+        pendingApiKeysRef.current = nextPendingApiKeys;
+        setPendingApiKeys(nextPendingApiKeys);
+      }
+
+      const result = await onSyncProviderModels(providerId);
+      nextProviders = providersRef.current.map((provider) =>
+        provider.id === providerId
+          ? {
+              ...provider,
+              model: result.defaultModel,
+              syncedModels: result.models,
+              modelContextWindows: result.modelContextWindows,
+              modelCapabilities: result.modelCapabilities,
+              modelsSyncedAt: result.syncedAt,
+            }
+          : provider,
+      );
+      providersRef.current = nextProviders;
+      setProviders(nextProviders);
+      baselineRef.current = providerSettingsSnapshot(
+        nextProviders,
+        activeProviderIdRef.current,
+      );
+
+      const completedProvider = nextProviders.find(
+        (provider) => provider.id === providerId,
+      );
+      const currentApiKey = pendingApiKeysRef.current[providerId]?.trim() ?? "";
+      if (completedProvider && !currentApiKey) {
+        const completedSignature = providerDiscoverySignature(
+          completedProvider,
+          currentApiKey,
+        );
+        if (completedSignature) {
+          modelDiscoveryAttemptsRef.current[providerId] = completedSignature;
+        }
+      }
+      setModelDiscoveryState(providerId, {
+        status: "success",
+        modelCount: result.models.length,
+      });
+    } catch (error) {
+      setModelDiscoveryState(providerId, {
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      modelDiscoveryInFlightRef.current.delete(providerId);
+      // A URL or key may have changed while the request was in flight. Trigger
+      // the effect once more so that newer input is discovered next.
+      setModelDiscoveryStates((current) => ({ ...current }));
+    }
+  }
+
+  const editingProviderBaseUrl = editingProvider?.baseUrl ?? "";
+  const editingProviderKind = editingProvider?.kind ?? null;
+  const editingProviderApiKey = editingProvider
+    ? (pendingApiKeys[editingProvider.id] ?? "")
+    : "";
+  const editingProviderApiKeyConfigured =
+    editingProvider?.apiKeyConfigured ?? false;
+
+  useEffect(() => {
+    if (!editingProvider) return;
+    const signature = providerDiscoverySignature(
+      editingProvider,
+      editingProviderApiKey.trim(),
+    );
+    if (
+      !signature ||
+      modelDiscoveryAttemptsRef.current[editingProvider.id] === signature ||
+      modelDiscoveryInFlightRef.current.has(editingProvider.id)
+    ) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void discoverProviderModels(editingProvider.id);
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [
+    editingProvider,
+    editingProviderApiKey,
+    editingProviderApiKeyConfigured,
+    editingProviderBaseUrl,
+    editingProviderKind,
+    modelDiscoveryStates,
+  ]);
 
   function addProvider() {
     const id = uniqueProviderId("custom-provider", providers);
@@ -453,6 +874,7 @@ export function SettingsPanel({
   async function submitSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (isSaving || isApplyingSave) return;
+    await flushAutomaticSave();
     setStatusMessage(null);
     setIsApplyingSave(true);
     try {
@@ -462,11 +884,14 @@ export function SettingsPanel({
           name: provider.name.trim(),
         }),
       );
-      const invalidProvider = nextProviders.find((provider) => !provider.name);
+      const invalidProvider = nextProviders.find(
+        (provider) =>
+          provider.kind !== "codex_app_server" && !provider.baseUrl.trim(),
+      );
       if (invalidProvider) {
         setEditingProviderId(invalidProvider.id);
         setActiveTab("providers");
-        setStatusMessage("供应商名称不能为空。");
+        setStatusMessage("请先填写 Base URL。");
         return;
       }
       // A backend that fails to restart is not a failed save: the key is
@@ -498,58 +923,26 @@ export function SettingsPanel({
             : provider,
         );
       }
+      providersRef.current = nextProviders;
       setProviders(nextProviders);
       const didSave = await onSave({
         providers: nextProviders,
         activeProviderId,
-        permissionMode,
-        agentRuntime,
-        sandbox: sandboxSettings,
       });
       if (!didSave) {
         setStatusMessage("保存设置失败，请检查连接后重试。");
         return;
       }
-      const providerToDiscover = nextProviders.find(
-        (provider) => provider.id === editingProviderId,
-      );
-      let discovery: ProviderModelSyncResult | null = null;
-      if (
-        providerToDiscover &&
-        providerToDiscover.apiKeyConfigured &&
-        providerToDiscover.kind !== "mock" &&
-        providerToDiscover.kind !== "codex_app_server"
-      ) {
-        const synced = await onSyncProviderModels(providerToDiscover.id);
-        discovery = synced;
-        if (synced) {
-          nextProviders = nextProviders.map((provider) =>
-            provider.id === providerToDiscover.id
-              ? {
-                  ...provider,
-                  syncedModels: synced.models,
-                  modelContextWindows: synced.modelContextWindows,
-                  modelsSyncedAt: synced.syncedAt,
-                }
-              : provider,
-          );
-          setProviders(nextProviders);
-        }
-      }
       setPendingApiKeys({});
-      baselineRef.current = settingsSnapshot(
+      pendingApiKeysRef.current = {};
+      baselineRef.current = providerSettingsSnapshot(
         nextProviders,
         activeProviderId,
-        permissionMode,
-        agentRuntime,
-        sandboxSettings,
       );
       setStatusMessage(
         backendWarnings.length > 0
           ? `设置已保存，密钥也已写入系统密钥库；但本地后端未能重启：${backendWarnings[0]} 请重启应用后再发起对话。`
-          : discovery
-            ? `设置已保存，已同步 ${discovery.models.length} 个模型的能力信息。`
-            : "设置已保存。如果服务端不提供 /models，可手动同步模型列表。",
+          : "设置已保存。填写 Base URL 和 API 密钥后会自动识别模型。",
       );
     } finally {
       setIsApplyingSave(false);
@@ -557,11 +950,23 @@ export function SettingsPanel({
   }
 
   const saving = isSaving || isApplyingSave || isSavingSecret;
+  const layoutStyle = {
+    "--settings-sidebar-width": `${sidebarResize.width}px`,
+  } as CSSProperties;
 
   return (
-    <section className="settings-panel settings-panel-redesigned">
+    <section
+      className={`settings-panel settings-panel-redesigned${
+        sidebarResize.isResizing ? " is-resizing" : ""
+      }`}
+      style={layoutStyle}
+    >
       <form className="settings-layout" onSubmit={submitSettings}>
-        <aside className="settings-sidebar" aria-label="设置分类">
+        <aside
+          id="settings-sidebar"
+          className="settings-sidebar"
+          aria-label="设置分类"
+        >
           <header className="settings-sidebar-header">
             <Button
               className="settings-return-button"
@@ -631,11 +1036,38 @@ export function SettingsPanel({
           ) : null}
         </aside>
 
+        <div
+          className={`workspace-resizer settings-resizer ${
+            sidebarResize.isResizing ? "active" : ""
+          }`}
+          role="separator"
+          tabIndex={0}
+          aria-label="调整设置侧栏宽度"
+          aria-controls="settings-sidebar"
+          aria-orientation="vertical"
+          aria-valuemin={sidebarResize.minWidth}
+          aria-valuemax={sidebarResize.maxWidth}
+          aria-valuenow={sidebarResize.width}
+          aria-valuetext={`${sidebarResize.width} 像素`}
+          onPointerDown={sidebarResize.onPointerDown}
+          onPointerMove={sidebarResize.onPointerMove}
+          onPointerUp={sidebarResize.onPointerUp}
+          onPointerCancel={sidebarResize.onPointerCancel}
+          onLostPointerCapture={sidebarResize.onLostPointerCapture}
+          onDoubleClick={sidebarResize.onDoubleClick}
+          onKeyDown={sidebarResize.onKeyDown}
+        />
+
         <div className="settings-workspace">
           <h2 id="settings-title" className="ot-sr-only">
             设置
           </h2>
           <div className="settings-content">
+            {autoSaveError ? (
+              <p className="settings-auto-save-error" role="alert">
+                {autoSaveError}
+              </p>
+            ) : null}
             {activeTab === "general" ? (
               <GeneralSettings
                 platform={platform}
@@ -658,14 +1090,14 @@ export function SettingsPanel({
               <PersonalizationSettingsView
                 agentRuntime={agentRuntime}
                 personalization={personalization}
-                onAgentRuntimeChange={setAgentRuntime}
+                onAgentRuntimeChange={updateAgentRuntime}
                 onPersonalizationChange={onPersonalizationChange}
               />
             ) : null}
             {activeTab === "agent" ? (
               <AgentRuntimeSettingsView
                 value={agentRuntime}
-                onChange={setAgentRuntime}
+                onChange={updateAgentRuntime}
               />
             ) : null}
             {activeTab === "providers" ? (
@@ -687,18 +1119,15 @@ export function SettingsPanel({
                 }
                 showApiKey={showApiKey}
                 saving={saving}
+                hasUnsavedChanges={isProviderDirty}
+                statusMessage={statusMessage}
                 onSelectProvider={setEditingProviderId}
                 onSetActiveProvider={setActiveProviderId}
                 onUpdateProvider={updateProvider}
                 onAddProvider={addProvider}
                 onRemoveProvider={removeProvider}
                 onOpenImport={() => setImportOpen(true)}
-                onPendingApiKeyChange={(providerId, apiKey) =>
-                  setPendingApiKeys((current) => ({
-                    ...current,
-                    [providerId]: apiKey,
-                  }))
-                }
+                onPendingApiKeyChange={updatePendingApiKey}
                 onToggleApiKeyVisibility={() =>
                   setShowApiKey((value) => !value)
                 }
@@ -711,10 +1140,7 @@ export function SettingsPanel({
                     return;
                   }
                   updateProvider(providerId, "apiKeyConfigured", false);
-                  setPendingApiKeys((current) => ({
-                    ...current,
-                    [providerId]: "",
-                  }));
+                  updatePendingApiKey(providerId, "");
                   const restart = outcome.metadata.backendRestart;
                   setStatusMessage(
                     restart && !restart.restarted
@@ -722,8 +1148,17 @@ export function SettingsPanel({
                       : `已移除 ${providerId} 的密钥。`,
                   );
                 }}
-                onTestProvider={onTestProvider}
-                onSyncProviderModels={onSyncProviderModels}
+                onTestProvider={(providerId) =>
+                  onTestProvider(providerId, undefined)
+                }
+                modelDiscovery={
+                  editingProvider
+                    ? (modelDiscoveryStates[editingProvider.id] ?? {
+                        status: "idle",
+                      })
+                    : { status: "idle" }
+                }
+                onDiscoverProvider={discoverProviderModels}
                 onRefreshCodexAccount={onRefreshCodexAccount}
                 onStartCodexLogin={onStartCodexLogin}
                 onCancelCodexLogin={onCancelCodexLogin}
@@ -734,20 +1169,8 @@ export function SettingsPanel({
               <PermissionSettings
                 permissionMode={permissionMode}
                 sandbox={sandboxSettings}
-                onPermissionModeChange={(nextMode) => {
-                  setPermissionMode(nextMode);
-                  setSandboxSettings((current) =>
-                    nextMode === "full_access"
-                      ? {
-                          ...current,
-                          sandboxMode: "danger-full-access",
-                          enforcement: "disabled",
-                          network: "allow",
-                        }
-                      : controlledSandboxSettings(current),
-                  );
-                }}
-                onSandboxChange={setSandboxSettings}
+                onPermissionModeChange={updatePermissionMode}
+                onSandboxChange={updateSandbox}
               />
             ) : null}
             {activeTab === "advanced" ? (
@@ -758,22 +1181,6 @@ export function SettingsPanel({
               />
             ) : null}
           </div>
-
-          <footer className="settings-footer">
-            <div className="settings-save-status" aria-live="polite">
-              {statusMessage ?? (isDirty ? "有未保存的更改" : "所有更改已保存")}
-            </div>
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={closeSafely}
-            >
-              取消
-            </button>
-            <button className="primary-button" disabled={saving || !settings}>
-              {saving ? "保存中…" : "保存设置"}
-            </button>
-          </footer>
         </div>
       </form>
 
@@ -1140,6 +1547,8 @@ function ProviderSettingsView({
   pendingApiKey,
   showApiKey,
   saving,
+  hasUnsavedChanges,
+  statusMessage,
   onSelectProvider,
   onSetActiveProvider,
   onUpdateProvider,
@@ -1150,7 +1559,8 @@ function ProviderSettingsView({
   onToggleApiKeyVisibility,
   onDeleteProviderApiKey,
   onTestProvider,
-  onSyncProviderModels,
+  modelDiscovery,
+  onDiscoverProvider,
   onRefreshCodexAccount,
   onStartCodexLogin,
   onCancelCodexLogin,
@@ -1169,6 +1579,8 @@ function ProviderSettingsView({
   pendingApiKey: string;
   showApiKey: boolean;
   saving: boolean;
+  hasUnsavedChanges: boolean;
+  statusMessage: string | null;
   onSelectProvider(id: string): void;
   onSetActiveProvider(id: string): void;
   onUpdateProvider<K extends keyof ProviderSettings>(
@@ -1182,20 +1594,22 @@ function ProviderSettingsView({
   onPendingApiKeyChange(providerId: string, apiKey: string): void;
   onToggleApiKeyVisibility(): void;
   onDeleteProviderApiKey(providerId: string): Promise<void>;
-  onTestProvider(providerId: string, providers: ProviderSettings[]): void;
-  onSyncProviderModels(
-    providerId: string,
-  ): Promise<ProviderModelSyncResult | null>;
+  onTestProvider(providerId: string): void;
+  modelDiscovery: ModelDiscoveryState;
+  onDiscoverProvider(providerId: string): Promise<void>;
   onRefreshCodexAccount(): void;
   onStartCodexLogin(): Promise<CodexLoginStart | null>;
   onCancelCodexLogin(): Promise<void>;
   onLogoutCodexAccount(): Promise<void>;
 }) {
   const usesCodexAppServer = editingProvider?.kind === "codex_app_server";
+  // Existing connection-wide values remain readable for migrated settings, but
+  // new setup is intentionally configured at the individual-model level.
+  const showLegacyConnectionDefaults = false;
   const [manualModelProviderId, setManualModelProviderId] = useState<
     string | null
   >(null);
-  const [modelSyncing, setModelSyncing] = useState(false);
+  const modelSyncing = modelDiscovery.status === "discovering";
   const selectedModelPreset = editingProvider
     ? findOfficialModelPreset(editingProvider.model)
     : null;
@@ -1247,20 +1661,7 @@ function ProviderSettingsView({
 
   async function syncModels() {
     if (!editingProvider) return;
-    setModelSyncing(true);
-    try {
-      const result = await onSyncProviderModels(editingProvider.id);
-      if (result) {
-        onUpdateProvider(editingProvider.id, "syncedModels", result.models);
-        onUpdateProvider(
-          editingProvider.id,
-          "modelContextWindows",
-          result.modelContextWindows,
-        );
-      }
-    } finally {
-      setModelSyncing(false);
-    }
+    await onDiscoverProvider(editingProvider.id);
   }
 
   function updateProviderKind(kind: ProviderKind | "openai") {
@@ -1272,9 +1673,7 @@ function ProviderSettingsView({
           : "openai_compatible"
         : kind;
     const model =
-      resolvedKind === "codex_app_server"
-        ? ""
-        : editingProvider.model.trim() || "gpt-4.1-mini";
+      resolvedKind === "codex_app_server" ? "" : editingProvider.model.trim();
     onUpdateProvider(editingProvider.id, "kind", resolvedKind);
     if (model !== editingProvider.model) {
       onUpdateProvider(editingProvider.id, "model", model);
@@ -1288,6 +1687,24 @@ function ProviderSettingsView({
       onUpdateProvider(editingProvider.id, "reasoningEffort", reasoningEffort);
     }
     if (resolvedKind === "codex_app_server") setManualModelProviderId(null);
+  }
+
+  const selectedBaseUrlPresetId = editingProvider
+    ? (providerBaseUrlPresets.find(
+        (preset) => preset.baseUrl === editingProvider.baseUrl.trim(),
+      )?.id ?? "")
+    : "";
+
+  function selectBaseUrlPreset(presetId: string) {
+    if (!editingProvider) return;
+    const preset = providerBaseUrlPresets.find(
+      (item) => item.id === presetId,
+    );
+    if (!preset) return;
+    onUpdateProvider(editingProvider.id, "baseUrl", preset.baseUrl);
+    if (preset.kind !== editingProvider.kind) {
+      updateProviderKind(preset.kind);
+    }
   }
 
   return (
@@ -1379,9 +1796,7 @@ function ProviderSettingsView({
                 <span>名称</span>
                 <input
                   value={editingProvider.name}
-                  required
                   maxLength={MAX_PROVIDER_NAME_LENGTH}
-                  aria-invalid={!editingProvider.name.trim()}
                   placeholder="例如：Kimi K3"
                   onChange={(event) =>
                     onUpdateProvider(
@@ -1391,11 +1806,6 @@ function ProviderSettingsView({
                     )
                   }
                 />
-                {!editingProvider.name.trim() ? (
-                  <small className="settings-field-error" role="alert">
-                    请输入供应商名称。
-                  </small>
-                ) : null}
               </label>
               <label>
                 <span>供应商类型</span>
@@ -1416,34 +1826,6 @@ function ProviderSettingsView({
                 </select>
                 <small>{providerProtocolHint}</small>
               </label>
-              {!usesCodexAppServer ? (
-                <div className="settings-field-wide">
-                  <label>
-                    <span>模型</span>
-                    <ModelInputDropdown
-                      connection={editingProvider}
-                      value={editingProvider.model}
-                      onChange={updateModel}
-                      onSync={() => void syncModels()}
-                      syncing={modelSyncing}
-                    />
-                  </label>
-                  <div className="settings-model-meta">
-                    <span>{modelDescription}</span>
-                    {modelSourceUrl ? (
-                      <button
-                        type="button"
-                        className="settings-source-link"
-                        title={`官方资料，${OPENAI_MODEL_CATALOG_VERIFIED_AT} 核对`}
-                        onClick={() => void openExternal(modelSourceUrl)}
-                      >
-                        官方资料
-                        <ExternalLink size={12} aria-hidden="true" />
-                      </button>
-                    ) : null}
-                  </div>
-                </div>
-              ) : null}
               {usesCodexAppServer ? (
                 <div className="settings-field-wide settings-provider-local-note">
                   <CodexAccountSettings
@@ -1462,19 +1844,33 @@ function ProviderSettingsView({
                 <>
                   <label className="settings-field-wide">
                     <span>Base URL</span>
-                    <input
-                      type="url"
-                      value={editingProvider.baseUrl}
-                      required
-                      spellCheck={false}
-                      onChange={(event) =>
-                        onUpdateProvider(
-                          editingProvider.id,
-                          "baseUrl",
-                          event.target.value,
-                        )
-                      }
-                    />
+                    <div className="settings-base-url-input">
+                      <input
+                        type="url"
+                        value={editingProvider.baseUrl}
+                        spellCheck={false}
+                        placeholder="https://api.example.com/v1"
+                        onChange={(event) =>
+                          onUpdateProvider(
+                            editingProvider.id,
+                            "baseUrl",
+                            event.target.value,
+                          )
+                        }
+                      />
+                      <select
+                        aria-label="选择常用 Base URL"
+                        value={selectedBaseUrlPresetId}
+                        onChange={(event) => selectBaseUrlPreset(event.target.value)}
+                      >
+                        <option value="">常用服务</option>
+                        {providerBaseUrlPresets.map((preset) => (
+                          <option key={preset.id} value={preset.id}>
+                            {preset.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </label>
                   <label className="settings-field-wide">
                     <span>API 密钥</span>
@@ -1518,28 +1914,43 @@ function ProviderSettingsView({
                         : "密钥不会写入普通设置文件。"}
                     </small>
                   </label>
+                  <div className="settings-field-wide">
+                    <label>
+                      <span>默认模型</span>
+                      <ModelInputDropdown
+                        connection={editingProvider}
+                        value={editingProvider.model}
+                        onChange={updateModel}
+                        onSync={() => void syncModels()}
+                        syncing={modelSyncing}
+                        disabled={modelSyncing}
+                      />
+                    </label>
+                    <div className="settings-model-meta">
+                      <span>
+                        {editingProvider.syncedModels.length > 0
+                          ? modelDescription
+                          : "填写 Base URL 和 API 密钥后会自动识别此 API 的所有模型，无需手动填写模型名称。"}
+                      </span>
+                      {modelSourceUrl ? (
+                        <button
+                          type="button"
+                          className="settings-source-link"
+                          title={`官方资料，${OPENAI_MODEL_CATALOG_VERIFIED_AT} 核对`}
+                          onClick={() => void openExternal(modelSourceUrl)}
+                        >
+                          官方资料
+                          <ExternalLink size={12} aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </div>
+                    <ModelDiscoveryStatus
+                      state={modelDiscovery}
+                      onRetry={() => void syncModels()}
+                    />
+                  </div>
                 </>
               )}
-            </div>
-
-            <div className="settings-toggle-stack">
-              <SettingsRow
-                title="支持视觉输入"
-                description="关闭后，带图片的请求会在发送前明确拒绝。"
-                control={
-                  <Switch
-                    label="支持视觉输入"
-                    checked={editingProvider.supportsVision}
-                    onChange={(checked) =>
-                      onUpdateProvider(
-                        editingProvider.id,
-                        "supportsVision",
-                        checked,
-                      )
-                    }
-                  />
-                }
-              />
             </div>
 
             {!usesCodexAppServer ? (
@@ -1550,11 +1961,18 @@ function ProviderSettingsView({
             ) : null}
 
             {!usesCodexAppServer ? (
+              <ModelConfigurationSection
+                connection={editingProvider}
+                onUpdateProvider={onUpdateProvider}
+              />
+            ) : null}
+
+            {showLegacyConnectionDefaults && !usesCodexAppServer ? (
               <details className="settings-advanced-fields">
-                <summary>模型高级参数</summary>
+                <summary>连接默认参数</summary>
                 <div className="settings-form-grid">
                   <label>
-                    <span>Temperature</span>
+                    <span>默认 Temperature</span>
                     <input
                       type="number"
                       min="0"
@@ -1579,7 +1997,7 @@ function ProviderSettingsView({
                     </small>
                   </label>
                   <label>
-                    <span>最大输出 Token</span>
+                    <span>默认最大输出 Token</span>
                     <input
                       type="number"
                       min="1"
@@ -1598,7 +2016,7 @@ function ProviderSettingsView({
                   </label>
                   <div className="settings-field-wide">
                     <label>
-                      <span>上下文窗口覆盖值</span>
+                      <span>默认上下文窗口覆盖值</span>
                       <input
                         type="number"
                         min="4096"
@@ -1654,7 +2072,7 @@ function ProviderSettingsView({
                     </div>
                   ) : (
                     <label className="settings-field-wide settings-reasoning-field">
-                      <span>推理强度</span>
+                      <span>默认推理强度</span>
                       <select
                         value={selectedReasoningEffort ?? ""}
                         onChange={(event) =>
@@ -1791,13 +2209,18 @@ function ProviderSettingsView({
             <div className="settings-provider-footer">
               <div className="settings-provider-health-status">
                 {providerStatusChips(editingProvider, providerHealth)}
+                {statusMessage ? (
+                  <span className="settings-inline-status" role="status">
+                    {statusMessage}
+                  </span>
+                ) : null}
               </div>
               <div className="settings-provider-actions">
                 {!usesCodexAppServer && editingProvider.apiKeyConfigured ? (
                   <button
                     type="button"
                     className="secondary-button danger-text"
-                    disabled={saving}
+                    disabled={saving || modelSyncing}
                     onClick={() =>
                       void onDeleteProviderApiKey(editingProvider.id)
                     }
@@ -1810,16 +2233,28 @@ function ProviderSettingsView({
                   className="secondary-button"
                   disabled={
                     saving ||
+                    modelSyncing ||
                     providerTest?.status === "testing" ||
-                    Boolean(pendingApiKey)
+                    hasUnsavedChanges
                   }
-                  title={pendingApiKey ? "先保存密钥，再测试连接" : undefined}
-                  onClick={() => onTestProvider(editingProvider.id, providers)}
+                  title={
+                    hasUnsavedChanges
+                      ? "请先保存 API 配置，再测试连接"
+                      : undefined
+                  }
+                  onClick={() => onTestProvider(editingProvider.id)}
                 >
                   {providerTest?.providerId === editingProvider.id &&
                   providerTest.status === "testing"
                     ? "测试中…"
                     : "测试连接"}
+                </button>
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={saving || modelSyncing || !hasUnsavedChanges}
+                >
+                  {saving ? "保存中…" : "保存 API 配置"}
                 </button>
               </div>
             </div>
@@ -1838,6 +2273,38 @@ function ProviderSettingsView({
         )}
       </div>
     </SettingsPage>
+  );
+}
+
+function ModelDiscoveryStatus({
+  state,
+  onRetry,
+}: {
+  state: ModelDiscoveryState;
+  onRetry(): void;
+}) {
+  if (state.status === "idle") return null;
+
+  const message =
+    state.status === "discovering"
+      ? "正在识别模型与能力…"
+      : state.status === "success"
+        ? `已识别 ${state.modelCount} 个模型，模型能力和参数已更新。`
+        : `识别失败：${state.message}`;
+
+  return (
+    <div
+      className={`settings-model-discovery settings-model-discovery--${state.status}`}
+      role={state.status === "error" ? "alert" : "status"}
+      aria-live="polite"
+    >
+      <span>{message}</span>
+      {state.status === "error" ? (
+        <Button size="compact" variant="quiet" onClick={onRetry}>
+          重试
+        </Button>
+      ) : null}
+    </div>
   );
 }
 
@@ -2312,6 +2779,248 @@ function ProviderImportDialog({
   );
 }
 
+function ModelConfigurationSection({
+  connection,
+  onUpdateProvider,
+}: {
+  connection: ProviderSettings;
+  onUpdateProvider<K extends keyof ProviderSettings>(
+    id: string,
+    field: K,
+    value: ProviderSettings[K],
+  ): void;
+}) {
+  const modelIds = useMemo(
+    () => Array.from(new Set(connection.syncedModels)),
+    [connection.syncedModels],
+  );
+  const [configuredModelId, setConfiguredModelId] = useState("");
+  const modelId =
+    modelIds.find((id) => id === configuredModelId) ??
+    modelIds.find((id) => id === connection.model.trim()) ??
+    modelIds[0] ??
+    "";
+  const modelSettings = connection.modelSettings?.[modelId];
+  const reasoningCapability = resolveModelReasoningCapability(
+    connection.kind,
+    modelId,
+  );
+  const reportedContextWindow = connection.modelContextWindows?.[modelId];
+  const visionSource = modelVisionSupportSource(connection, modelId);
+  const supportsVision = modelSupportsVision(connection, modelId);
+
+  function updateModelSettings(patch: Partial<ProviderModelSettings>) {
+    if (!modelId) return;
+    onUpdateProvider(connection.id, "modelSettings", {
+      ...(connection.modelSettings ?? {}),
+      [modelId]: {
+        ...(connection.modelSettings?.[modelId] ?? {}),
+        ...patch,
+      },
+    });
+  }
+
+  function resetModelSetting<K extends keyof ProviderModelSettings>(field: K) {
+    if (!modelId) return;
+    const nextSettings = { ...(connection.modelSettings ?? {}) };
+    const nextModelSettings = { ...(nextSettings[modelId] ?? {}) };
+    delete nextModelSettings[field];
+    if (Object.keys(nextModelSettings).length === 0) {
+      delete nextSettings[modelId];
+    } else {
+      nextSettings[modelId] = nextModelSettings;
+    }
+    onUpdateProvider(connection.id, "modelSettings", nextSettings);
+  }
+
+  if (modelIds.length === 0) return null;
+
+  return (
+    <section className="settings-model-families">
+      <header>
+        <div>
+          <strong>模型配置</strong>
+          <span>
+            参数只应用到选中的模型；API 返回的上下文与多模态能力会自动显示。
+          </span>
+        </div>
+      </header>
+      <div className="settings-form-grid settings-model-parameter-grid">
+        <label className="settings-field-wide">
+          <span>配置模型</span>
+          <select
+            value={modelId}
+            onChange={(event) => setConfiguredModelId(event.target.value)}
+          >
+            {modelIds.map((id) => (
+              <option key={id} value={id}>
+                {formatModelDisplayName(id)} ({id})
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Temperature</span>
+          <input
+            type="number"
+            min="0"
+            max="2"
+            step="0.1"
+            value={modelSettings?.temperature ?? ""}
+            placeholder={
+              connection.temperature === null ||
+              connection.temperature === undefined
+                ? "供应商默认"
+                : `继承连接默认值 ${connection.temperature}`
+            }
+            onChange={(event) =>
+              event.target.value
+                ? updateModelSettings({
+                    temperature: Number(event.target.value),
+                  })
+                : resetModelSetting("temperature")
+            }
+          />
+          <small>
+            {modelSettings?.temperature !== undefined
+              ? "已为此模型单独配置。"
+              : "未从目录获取温度范围时，继承连接默认值。"}
+          </small>
+        </label>
+        <label>
+          <span>最大输出 Token</span>
+          <input
+            type="number"
+            min="1"
+            value={modelSettings?.maxOutputTokens ?? ""}
+            placeholder={
+              connection.maxOutputTokens === null ||
+              connection.maxOutputTokens === undefined
+                ? "跟随模型默认"
+                : `继承连接默认值 ${connection.maxOutputTokens}`
+            }
+            onChange={(event) =>
+              event.target.value
+                ? updateModelSettings({
+                    maxOutputTokens: Number(event.target.value),
+                  })
+                : resetModelSetting("maxOutputTokens")
+            }
+          />
+          <small>
+            {modelSettings?.maxOutputTokens !== undefined
+              ? "已为此模型单独配置。"
+              : "目录未声明输出上限时，使用模型或连接默认值。"}
+          </small>
+        </label>
+        <div className="settings-field-wide">
+          <label>
+            <span>上下文窗口覆盖值</span>
+            <input
+              type="number"
+              min="4096"
+              step="1024"
+              value={modelSettings?.contextWindowTokens ?? ""}
+              placeholder={reportedContextWindow ? "API 自动识别" : "自动识别"}
+              onChange={(event) =>
+                event.target.value
+                  ? updateModelSettings({
+                      contextWindowTokens: Number(event.target.value),
+                    })
+                  : resetModelSetting("contextWindowTokens")
+              }
+            />
+            <small role="status">
+              {modelSettings?.contextWindowTokens !== undefined
+                ? `正在使用此模型的手动覆盖：${modelSettings.contextWindowTokens?.toLocaleString()} tokens。`
+                : reportedContextWindow
+                  ? `API /models 已报告此模型为 ${reportedContextWindow.toLocaleString()} tokens。`
+                  : "API 未报告上下文窗口，将使用内置模型表或连接默认值。"}
+            </small>
+          </label>
+          {modelSettings?.contextWindowTokens !== undefined ? (
+            <Button
+              size="compact"
+              variant="quiet"
+              onClick={() => resetModelSetting("contextWindowTokens")}
+            >
+              恢复自动识别
+            </Button>
+          ) : null}
+        </div>
+        {reasoningCapability.status === "unsupported" ? (
+          <div
+            className="settings-field-wide settings-reasoning-unavailable"
+            role="status"
+          >
+            <span>推理强度</span>
+            <strong>当前模型不提供推理强度参数。</strong>
+          </div>
+        ) : (
+          <label className="settings-field-wide settings-reasoning-field">
+            <span>推理强度</span>
+            <select
+              value={modelSettings?.reasoningEffort ?? ""}
+              onChange={(event) =>
+                event.target.value
+                  ? updateModelSettings({
+                      reasoningEffort: event.target
+                        .value as ProviderModelSettings["reasoningEffort"],
+                    })
+                  : resetModelSetting("reasoningEffort")
+              }
+            >
+              <option value="">自动识别 / 继承连接默认值</option>
+              {reasoningCapability.supportedEfforts.map((effort) => (
+                <option key={effort} value={effort}>
+                  {REASONING_EFFORT_DETAILS[effort].label}
+                </option>
+              ))}
+            </select>
+            <small>
+              {reasoningCapability.official
+                ? `已识别 ${reasoningCapability.supportedEfforts.length} 个可用推理档位。`
+                : "模型能力未知，保留兼容 Provider 支持的推理档位。"}
+            </small>
+          </label>
+        )}
+      </div>
+      <div className="settings-toggle-stack">
+        <SettingsRow
+          title="支持图片输入"
+          description={
+            visionSource === "manual"
+              ? `${modelId} · 已手动覆盖`
+              : visionSource === "detected"
+                ? `${modelId} · API 已识别为${supportsVision ? "支持" : "不支持"}图片输入`
+                : `${modelId} · API 未返回多模态信息，沿用连接默认值`
+          }
+          control={
+            <div className="settings-model-capability-control">
+              <Switch
+                label={`${modelId} 支持图片输入`}
+                checked={supportsVision}
+                onChange={(checked) =>
+                  updateModelSettings({ supportsVision: checked })
+                }
+              />
+              {visionSource === "manual" ? (
+                <Button
+                  size="compact"
+                  variant="quiet"
+                  onClick={() => resetModelSetting("supportsVision")}
+                >
+                  恢复自动识别
+                </Button>
+              ) : null}
+            </div>
+          }
+        />
+      </div>
+    </section>
+  );
+}
+
 /**
  * Per-connection model scope. Users pick whole families rather than individual
  * model ids, because one API key on an aggregator or relay already grants the
@@ -2518,16 +3227,42 @@ function CompatibilityItem({
   );
 }
 
+function providerDiscoverySignature(
+  provider: ProviderSettings,
+  pendingApiKey: string,
+): string | null {
+  if (
+    provider.kind === "mock" ||
+    provider.kind === "codex_app_server" ||
+    !isHttpUrl(provider.baseUrl)
+  ) {
+    return null;
+  }
+  if (!pendingApiKey && !provider.apiKeyConfigured) return null;
+  return `${provider.id}\u0000${provider.baseUrl.trim()}\u0000${
+    pendingApiKey || "configured"
+  }`;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function createProviderSettings(
   id: string,
   overrides: Partial<ProviderSettings> = {},
 ): ProviderSettings {
   return {
     id,
-    name: id,
+    name: "",
     kind: "openai_compatible",
-    baseUrl: "https://api.openai.com/v1",
-    model: "gpt-4.1-mini",
+    baseUrl: "",
+    model: "",
     enabledFamilies: [],
     syncedModels: [],
     modelsSyncedAt: null,
@@ -2567,19 +3302,13 @@ function uniqueProviderId(
   return `${base}-${suffix}`;
 }
 
-function settingsSnapshot(
+function providerSettingsSnapshot(
   providers: ProviderSettings[],
   activeProviderId: string,
-  permissionMode: AppSettings["permissionMode"],
-  agentRuntime: AgentRuntimeSettings,
-  sandbox: AppSettings["sandbox"],
 ): string {
   return JSON.stringify({
     providers,
     activeProviderId,
-    permissionMode,
-    agentRuntime,
-    sandbox,
   });
 }
 

@@ -202,8 +202,8 @@ pub use scm_connector::{
 pub use settings::{
     AppSettings, NativeCompactionProtocol, OpenAiCompatibilityReport, OpenAiProtocol,
     ProviderCapabilities, ProviderFeatureSupport, ProviderHealth, ProviderHealthCheck,
-    ProviderKind, ProviderSettings, RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
-    MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
+    ProviderKind, ProviderModelCapabilities, ProviderModelSettings, ProviderSettings,
+    RolloutBudgetSettings, SandboxEnforcement, SandboxSettings, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,

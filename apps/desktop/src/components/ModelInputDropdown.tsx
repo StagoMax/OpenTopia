@@ -17,8 +17,9 @@ export type ModelInputDropdownProps = {
 };
 
 /**
- * Input + dropdown button for model selection. The dropdown shows synced
- * models grouped by family. Users can also type a model ID directly.
+ * Dropdown model selection. A custom ID remains available only when the
+ * endpoint cannot publish a catalog, so normal provider setup needs no manual
+ * model-name entry.
  */
 export function ModelInputDropdown({
   connection,
@@ -93,8 +94,13 @@ export function ModelInputDropdown({
           className="model-input-dropdown-input"
           value={value}
           spellCheck={false}
-          placeholder="输入模型 ID 或从列表选择"
+          placeholder={
+            hasSyncedModels
+              ? "从已识别模型中选择"
+              : "保存 URL 和 API 密钥后自动识别模型"
+          }
           disabled={disabled}
+          readOnly={hasSyncedModels}
           onChange={(event) => onChange(event.target.value)}
           onFocus={() => {
             if (hasSyncedModels && !disabled) setOpen(true);
@@ -122,6 +128,7 @@ export function ModelInputDropdown({
           type="button"
           className="model-input-dropdown-sync"
           disabled={syncing || disabled}
+          aria-label="从 API 同步模型列表"
           title="从 API 同步模型列表"
           onClick={onSync}
         >
@@ -149,6 +156,7 @@ export function ModelInputDropdown({
               <button
                 type="button"
                 className="model-input-dropdown-search-clear"
+                aria-label="清除模型搜索"
                 onClick={() => setQuery("")}
               >
                 <X size={12} />

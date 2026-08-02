@@ -135,6 +135,33 @@ impl ProviderKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProviderModelCapabilities {
+    /// Image-input support reported by the provider's model catalog. `None`
+    /// means the endpoint did not publish modality metadata for this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelSettings {
+    /// An explicit user choice that takes precedence over catalog detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    /// Outer `None` inherits the legacy connection setting. Inner `None`
+    /// explicitly omits the request parameter for this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<Option<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<Option<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<Option<usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderSettings {
     pub id: String,
     /// User-facing label. Empty values from legacy settings fall back to `id`.
@@ -159,6 +186,13 @@ pub struct ProviderSettings {
     /// detection available; it outranks the built-in table.
     #[serde(default)]
     pub model_context_windows: BTreeMap<String, usize>,
+    /// Capabilities reported for each model by the connection's catalog.
+    #[serde(default)]
+    pub model_capabilities: BTreeMap<String, ProviderModelCapabilities>,
+    /// Per-model user overrides. These are intentionally separate from the
+    /// catalog so a subsequent sync never discards an explicit choice.
+    #[serde(default)]
+    pub model_settings: BTreeMap<String, ProviderModelSettings>,
     #[serde(default)]
     pub models_synced_at: Option<DateTime<Utc>>,
     /// `None` means "don't send temperature — let the model use its default."
@@ -211,6 +245,8 @@ impl Default for ProviderSettings {
             enabled_families: Vec::new(),
             synced_models: Vec::new(),
             model_context_windows: BTreeMap::new(),
+            model_capabilities: BTreeMap::new(),
+            model_settings: BTreeMap::new(),
             models_synced_at: None,
             temperature: None,
             max_output_tokens: None,
@@ -330,7 +366,10 @@ impl ProviderSettings {
     /// then a conservative default. The endpoint outranks the table because the
     /// table cannot know about models released after this build.
     pub fn resolved_context_window_tokens(&self) -> usize {
-        self.context_window_tokens
+        self.current_model_settings()
+            .and_then(|settings| settings.context_window_tokens)
+            .flatten()
+            .or(self.context_window_tokens)
             .filter(|tokens| *tokens >= MIN_PROVIDER_CONTEXT_WINDOW_TOKENS)
             .or_else(|| self.reported_context_window_tokens())
             .or_else(|| known_model_context_window_tokens(&self.model))
@@ -345,6 +384,42 @@ impl ProviderSettings {
             .filter(|tokens| *tokens >= MIN_PROVIDER_CONTEXT_WINDOW_TOKENS)
     }
 
+    /// Resolves image-input support for the selected model. Legacy connections
+    /// fall back to the connection-wide setting until their catalog supplies
+    /// model-level metadata or the user creates an explicit override.
+    pub fn supports_vision_for_model(&self) -> bool {
+        self.current_model_settings()
+            .and_then(|settings| settings.supports_vision)
+            .or_else(|| {
+                self.model_capabilities
+                    .get(self.model.trim())
+                    .and_then(|capabilities| capabilities.supports_vision)
+            })
+            .unwrap_or(self.supports_vision)
+    }
+
+    pub fn temperature_for_model(&self) -> Option<f64> {
+        self.current_model_settings()
+            .and_then(|settings| settings.temperature)
+            .unwrap_or(self.temperature)
+    }
+
+    pub fn max_output_tokens_for_model(&self) -> Option<u32> {
+        self.current_model_settings()
+            .and_then(|settings| settings.max_output_tokens)
+            .unwrap_or(self.max_output_tokens)
+    }
+
+    pub fn reasoning_effort_for_model(&self) -> Option<String> {
+        self.current_model_settings()
+            .and_then(|settings| settings.reasoning_effort.clone())
+            .unwrap_or_else(|| self.reasoning_effort.clone())
+    }
+
+    fn current_model_settings(&self) -> Option<&ProviderModelSettings> {
+        self.model_settings.get(self.model.trim())
+    }
+
     /// Applies a per-thread model override on top of the connection defaults.
     /// The connection keeps owning transport concerns (endpoint, key, limits);
     /// only the model and its reasoning effort vary per conversation.
@@ -355,18 +430,18 @@ impl ProviderSettings {
     ) -> Self {
         let mut resolved = self.clone();
         if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
-            if model != resolved.model {
-                // A different model invalidates the connection's context-window
-                // override, which was declared for the previous model.
-                resolved.context_window_tokens = None;
-            }
             resolved.model = model.to_string();
         }
         if let Some(reasoning_effort) = reasoning_effort {
-            resolved.reasoning_effort = reasoning_effort
+            let value = reasoning_effort
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
+            resolved
+                .model_settings
+                .entry(resolved.model.clone())
+                .or_default()
+                .reasoning_effort = Some(value);
         }
         resolved
     }
@@ -441,11 +516,23 @@ pub fn known_model_context_window_tokens(model: &str) -> Option<usize> {
 
 fn context_window_for_base(model: &str) -> Option<usize> {
     // ── OpenAI ──────────────────────────────────────────────────────────
-    if model.starts_with("gpt-5.6") {
-        return Some(1_047_576);
+    // Verified against OpenAI's model pages on 2026-08-02. Do not confuse a
+    // model's maximum input with its complete context window.
+    if model.starts_with("gpt-5.6") || model.starts_with("gpt-5.5") {
+        return Some(1_050_000);
+    }
+    if model.starts_with("gpt-5.4") {
+        return if model.starts_with("gpt-5.4-mini") || model.starts_with("gpt-5.4-nano") {
+            Some(400_000)
+        } else {
+            Some(1_050_000)
+        };
+    }
+    if model.starts_with("gpt-5.3-codex") {
+        return Some(400_000);
     }
     if model.starts_with("gpt-5") {
-        return Some(272_000);
+        return Some(400_000);
     }
     if model.starts_with("gpt-4.1") {
         return Some(1_047_576);
@@ -520,6 +607,9 @@ fn context_window_for_base(model: &str) -> Option<usize> {
     // ── Zhipu GLM ───────────────────────────────────────────────────────
     if model.starts_with("glm-5.2") {
         return Some(1_000_000);
+    }
+    if model == "glm-5" || model.starts_with("glm-5-") {
+        return Some(200_000);
     }
     if model.starts_with("glm") || model.starts_with("chatglm") {
         return Some(128_000);
@@ -658,7 +748,7 @@ impl Default for SandboxSettings {
         Self {
             sandbox_mode: SandboxMode::WorkspaceWrite,
             enforcement: SandboxEnforcement::Enforce,
-            network: NetworkPolicy::Allow,
+            network: NetworkPolicy::Deny,
             writable_roots: Vec::new(),
             read_paths: Vec::new(),
         }
@@ -755,7 +845,7 @@ impl SandboxSettings {
                 Some(network) => network,
                 None => return Self::fail_safe(writable_roots, read_paths),
             },
-            Err(_) => NetworkPolicy::Allow,
+            Err(_) => NetworkPolicy::Deny,
         };
 
         Self {
@@ -1030,8 +1120,25 @@ mod tests {
     fn context_window_table_covers_the_families_the_picker_offers() {
         assert_eq!(
             known_model_context_window_tokens("gpt-5.6-sol"),
-            Some(1_047_576)
+            Some(1_050_000)
         );
+        assert_eq!(
+            known_model_context_window_tokens("gpt-5.5-pro"),
+            Some(1_050_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("gpt-5.4"),
+            Some(1_050_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("gpt-5.4-mini"),
+            Some(400_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("gpt-5.3-codex"),
+            Some(400_000)
+        );
+        assert_eq!(known_model_context_window_tokens("gpt-5"), Some(400_000));
         assert_eq!(
             known_model_context_window_tokens("gpt-4.1-mini"),
             Some(1_047_576)
@@ -1053,6 +1160,7 @@ mod tests {
             known_model_context_window_tokens("glm-5.2"),
             Some(1_000_000)
         );
+        assert_eq!(known_model_context_window_tokens("glm-5"), Some(200_000));
         assert_eq!(
             known_model_context_window_tokens("claude-sonnet-4-6"),
             Some(1_000_000)
@@ -1100,6 +1208,73 @@ mod tests {
         // An explicit user override still beats both.
         provider.context_window_tokens = Some(64_000);
         assert_eq!(provider.resolved_context_window_tokens(), 64_000);
+    }
+
+    #[test]
+    fn model_vision_settings_override_catalog_detection_and_legacy_default() {
+        let mut provider = ProviderSettings {
+            model: "text-only".to_string(),
+            supports_vision: true,
+            ..ProviderSettings::default()
+        };
+        provider.model_capabilities.insert(
+            "text-only".to_string(),
+            ProviderModelCapabilities {
+                supports_vision: Some(false),
+            },
+        );
+        assert!(!provider.supports_vision_for_model());
+
+        provider.model_settings.insert(
+            "text-only".to_string(),
+            ProviderModelSettings {
+                supports_vision: Some(true),
+                ..ProviderModelSettings::default()
+            },
+        );
+        assert!(provider.supports_vision_for_model());
+
+        provider.model = "unknown".to_string();
+        assert!(provider.supports_vision_for_model());
+    }
+
+    #[test]
+    fn model_generation_settings_override_connection_defaults() {
+        let mut provider = ProviderSettings {
+            model: "legacy-model".to_string(),
+            temperature: Some(0.2),
+            max_output_tokens: Some(1_024),
+            context_window_tokens: Some(32_000),
+            reasoning_effort: Some("low".to_string()),
+            ..ProviderSettings::default()
+        };
+        provider.model_settings.insert(
+            "configured-model".to_string(),
+            ProviderModelSettings {
+                temperature: Some(Some(0.7)),
+                max_output_tokens: Some(Some(8_192)),
+                context_window_tokens: Some(Some(128_000)),
+                reasoning_effort: Some(Some("high".to_string())),
+                ..ProviderModelSettings::default()
+            },
+        );
+
+        let selected = provider.with_model_override(Some("configured-model"), None);
+        assert_eq!(selected.temperature_for_model(), Some(0.7));
+        assert_eq!(selected.max_output_tokens_for_model(), Some(8_192));
+        assert_eq!(selected.resolved_context_window_tokens(), 128_000);
+        assert_eq!(
+            selected.reasoning_effort_for_model(),
+            Some("high".to_string())
+        );
+
+        assert_eq!(provider.temperature_for_model(), Some(0.2));
+        assert_eq!(provider.max_output_tokens_for_model(), Some(1_024));
+        assert_eq!(provider.resolved_context_window_tokens(), 32_000);
+        assert_eq!(
+            provider.reasoning_effort_for_model(),
+            Some("low".to_string())
+        );
     }
 
     #[test]
@@ -1439,7 +1614,7 @@ mod tests {
         let env = EnvGuard::cleared(&SANDBOX_ENV_KEYS);
         let settings = AppSettings::from_env(PermissionMode::Auto);
         assert_eq!(settings.sandbox, SandboxSettings::default());
-        assert_eq!(settings.sandbox.network, NetworkPolicy::Allow);
+        assert_eq!(settings.sandbox.network, NetworkPolicy::Deny);
 
         env.set("OPENTOPIA_SANDBOX_MODE", "best_effort");
         env.set("OPENTOPIA_SANDBOX_NETWORK", "inherit");

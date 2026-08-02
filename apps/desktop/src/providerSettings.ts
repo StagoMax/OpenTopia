@@ -12,7 +12,7 @@ export const KIMI_K3_MODEL_GUIDE_URL =
   "https://www.kimi.com/code/docs/en/kimi-code/models.html";
 export const GLM_THINKING_GUIDE_URL =
   "https://docs.bigmodel.cn/cn/guide/capabilities/thinking";
-export const OPENAI_MODEL_CATALOG_VERIFIED_AT = "2026-07-30";
+export const OPENAI_MODEL_CATALOG_VERIFIED_AT = "2026-08-02";
 
 export type OfficialModelPreset = {
   model: string;
@@ -63,6 +63,18 @@ const GPT_5_6_EFFORTS = [
 const GPT_5_4_EFFORTS = [
   "none",
   "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const satisfies readonly ReasoningEffort[];
+const GPT_5_5_EFFORTS = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const satisfies readonly ReasoningEffort[];
+const GPT_5_4_PRO_EFFORTS = [
   "medium",
   "high",
   "xhigh",
@@ -137,6 +149,34 @@ export const OFFICIAL_OPENAI_MODEL_PRESETS: readonly OfficialModelPreset[] = [
     sourceUrl: OPENAI_MODEL_GUIDE_URL,
   },
   {
+    model: "gpt-5.5",
+    label: "GPT-5.5",
+    description: "上一代复杂编程与专业工作模型。",
+    group: "compatibility",
+    sourceUrl: "https://developers.openai.com/api/docs/models/gpt-5.5",
+  },
+  {
+    model: "gpt-5.5-pro",
+    label: "GPT-5.5 Pro",
+    description: "适合高难度任务的上一代 Responses 模型。",
+    group: "compatibility",
+    sourceUrl: "https://developers.openai.com/api/docs/models/gpt-5.5-pro",
+  },
+  {
+    model: "gpt-5.4",
+    label: "GPT-5.4",
+    description: "适合编程和专业工作的 GPT-5.4 模型。",
+    group: "compatibility",
+    sourceUrl: "https://developers.openai.com/api/docs/models/gpt-5.4",
+  },
+  {
+    model: "gpt-5.4-pro",
+    label: "GPT-5.4 Pro",
+    description: "仅通过 Responses API 提供的 GPT-5.4 Pro 模型。",
+    group: "compatibility",
+    sourceUrl: "https://developers.openai.com/api/docs/models/gpt-5.4-pro",
+  },
+  {
     model: "gpt-5.4-mini",
     label: "GPT-5.4 mini",
     description: "兼容旧项目的高吞吐 GPT-5.4 系列模型。",
@@ -149,6 +189,13 @@ export const OFFICIAL_OPENAI_MODEL_PRESETS: readonly OfficialModelPreset[] = [
     description: "兼容现有非推理配置，不提供推理强度参数。",
     group: "compatibility",
     sourceUrl: "https://developers.openai.com/api/docs/models/gpt-4.1-mini",
+  },
+  {
+    model: "gpt-5.3-codex",
+    label: "GPT-5.3-Codex",
+    description: "面向 Agent 编程任务的 Codex 模型。",
+    group: "compatibility",
+    sourceUrl: "https://developers.openai.com/api/docs/models/gpt-5.3-codex",
   },
 ] as const;
 
@@ -217,6 +264,22 @@ const modelCapabilityRules: ReadonlyArray<{
       ["medium", "high", "xhigh"],
       "high",
       "https://developers.openai.com/api/docs/models/gpt-5.5-pro",
+    ),
+  },
+  {
+    pattern: /^gpt-5\.5(?:$|-\d{4}-\d{2}-\d{2})/,
+    capability: officialCapability(
+      GPT_5_5_EFFORTS,
+      "medium",
+      "https://developers.openai.com/api/docs/models/gpt-5.5",
+    ),
+  },
+  {
+    pattern: /^gpt-5\.4-pro(?:$|-\d{4}-\d{2}-\d{2})/,
+    capability: officialCapability(
+      GPT_5_4_PRO_EFFORTS,
+      "medium",
+      "https://developers.openai.com/api/docs/models/gpt-5.4-pro",
     ),
   },
   {

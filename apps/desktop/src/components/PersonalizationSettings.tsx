@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import { Info } from "lucide-react";
 import {
   CUSTOM_INSTRUCTIONS_MAX_LENGTH,
@@ -6,7 +5,7 @@ import {
 } from "../personalization";
 import type { AgentRuntimeSettings } from "../types";
 import { SettingsGroup, SettingsPage, SettingsRow } from "./SettingsLayout";
-import { Button, Select } from "./ui";
+import { Select } from "./ui";
 
 type PersonalityOption = AgentRuntimeSettings["personality"];
 
@@ -29,18 +28,6 @@ export function PersonalizationSettingsView({
   onAgentRuntimeChange,
   onPersonalizationChange,
 }: PersonalizationSettingsViewProps) {
-  // The textarea is an explicit-save field, so it holds a draft rather than
-  // writing on every keystroke. It re-syncs if the stored value changes under
-  // it, which happens on a reset or a second settings window.
-  const [draft, setDraft] = useState(personalization.customInstructions);
-  const [saved, setSaved] = useState(false);
-
-  useEffect(() => {
-    setDraft(personalization.customInstructions);
-  }, [personalization.customInstructions]);
-
-  const dirty = draft !== personalization.customInstructions;
-
   return (
     <SettingsPage title="个性化" description="语气与自定义指令">
       <div className="settings-notice" role="note">
@@ -72,25 +59,10 @@ export function PersonalizationSettingsView({
         description="为此主机上的所有任务提供额外说明和上下文。"
         actions={
           <>
-            {saved && !dirty ? (
-              <span className="settings-inline-status" role="status">
-                已保存
-              </span>
-            ) : null}
             <span className="settings-inline-count">
-              {draft.length} / {CUSTOM_INSTRUCTIONS_MAX_LENGTH}
+              {personalization.customInstructions.length} /{" "}
+              {CUSTOM_INSTRUCTIONS_MAX_LENGTH}
             </span>
-            <Button
-              size="compact"
-              variant="primary"
-              disabled={!dirty}
-              onClick={() => {
-                onPersonalizationChange({ customInstructions: draft });
-                setSaved(true);
-              }}
-            >
-              保存
-            </Button>
           </>
         }
       >
@@ -103,11 +75,12 @@ export function PersonalizationSettingsView({
             className="settings-textarea"
             placeholder="添加自定义指令…"
             maxLength={CUSTOM_INSTRUCTIONS_MAX_LENGTH}
-            value={draft}
-            onChange={(event) => {
-              setDraft(event.target.value);
-              setSaved(false);
-            }}
+            value={personalization.customInstructions}
+            onChange={(event) =>
+              onPersonalizationChange({
+                customInstructions: event.target.value,
+              })
+            }
           />
         </div>
       </SettingsGroup>

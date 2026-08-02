@@ -167,7 +167,26 @@ export type ProviderModelSyncResult = {
   models: string[];
   /** Context windows advertised alongside model ids, when the endpoint exposes them. */
   modelContextWindows: Record<string, number>;
+  /** Model capabilities returned by the endpoint's catalog. */
+  modelCapabilities: Record<string, ProviderModelCapabilities>;
+  /** A valid default selected from the models returned by the endpoint. */
+  defaultModel: string;
   syncedAt: string;
+};
+
+export type ProviderModelCapabilities = {
+  /** Omitted when the endpoint does not publish modality metadata. */
+  supportsVision?: boolean;
+};
+
+export type ProviderModelSettings = {
+  /** User overrides that apply only to this model. */
+  supportsVision?: boolean;
+  /** `undefined` inherits the legacy connection default; `null` omits the parameter. */
+  temperature?: number | null;
+  maxOutputTokens?: number | null;
+  contextWindowTokens?: number | null;
+  reasoningEffort?: ReasoningEffort | null;
 };
 
 export type Project = {
@@ -265,6 +284,10 @@ export type ProviderSettings = {
    * is real capability detection and outranks the server's built-in table.
    */
   modelContextWindows?: Record<string, number>;
+  /** Model capabilities automatically discovered from the provider's API. */
+  modelCapabilities?: Record<string, ProviderModelCapabilities>;
+  /** Per-model user overrides, preserved across capability re-discovery. */
+  modelSettings?: Record<string, ProviderModelSettings>;
   modelsSyncedAt?: string | null;
   /** `null` = don't send temperature, let the model use its vendor default. */
   temperature?: number | null;

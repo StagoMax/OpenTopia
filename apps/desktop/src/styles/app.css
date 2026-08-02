@@ -2601,7 +2601,9 @@ button:disabled {
 }
 
 .workspace.is-resizing,
-.workspace.is-resizing * {
+.workspace.is-resizing *,
+.settings-panel.is-resizing,
+.settings-panel.is-resizing * {
   cursor: col-resize !important;
   user-select: none !important;
 }
@@ -9233,7 +9235,9 @@ button:disabled {
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: calc(var(--space-16) * 7) minmax(0, 1fr);
+  grid-template-columns:
+    var(--settings-sidebar-width, calc(var(--space-16) * 7)) var(--space-0)
+    minmax(0, 1fr);
 }
 
 .settings-sidebar {
@@ -9242,23 +9246,26 @@ button:disabled {
   min-height: 0;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   align-content: stretch;
-  gap: var(--space-6);
+  gap: var(--space-3);
   border-right: 1px solid var(--border);
   background: var(--sidebar-gradient);
   padding: var(--space-4) var(--space-3);
 }
 
-.settings-sidebar-header {
+.settings-panel .settings-sidebar-header {
   display: flex;
   align-items: center;
   min-height: var(--control-height-md);
-  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  margin-bottom: var(--space-0);
+  padding: var(--space-0);
 }
 
-.settings-return-button {
+.settings-sidebar .settings-return-button {
   width: 100%;
   justify-content: flex-start;
   color: var(--text-secondary);
+  padding-inline: var(--space-5);
+  text-align: left;
 }
 
 .settings-return-button:not(:disabled):hover {
@@ -9434,8 +9441,13 @@ button:disabled {
   display: grid;
   min-width: 0;
   min-height: 0;
+  grid-column: 3;
   grid-template-rows: minmax(0, 1fr) auto;
   background: var(--surface);
+}
+
+.settings-resizer {
+  grid-column: 2;
 }
 
 .settings-content {
@@ -9447,6 +9459,13 @@ button:disabled {
     clamp(var(--space-10), 4vw, calc(var(--space-16) + var(--space-16)))
     var(--space-16);
   scrollbar-gutter: stable;
+}
+
+.settings-auto-save-error {
+  width: min(100%, calc(var(--space-16) * 22));
+  margin: var(--space-0) auto var(--space-6);
+  color: var(--danger);
+  font-size: var(--font-size-sm);
 }
 
 .settings-page {
@@ -10155,6 +10174,43 @@ button:disabled {
   line-height: 1.45;
 }
 
+.settings-model-discovery {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+}
+
+.settings-model-discovery > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.settings-model-discovery--discovering {
+  border-color: var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.settings-model-discovery--success {
+  border-color: var(--success);
+  background: var(--success-subtle);
+  color: var(--success);
+}
+
+.settings-model-discovery--error {
+  border-color: var(--danger);
+  background: var(--danger-subtle);
+  color: var(--danger);
+}
+
 .settings-source-link {
   display: inline-flex;
   min-height: 28px;
@@ -10230,6 +10286,18 @@ button:disabled {
 .settings-import-input textarea:focus {
   border-color: var(--focus-ring);
   box-shadow: 0 0 0 2px rgb(76 139 216 / 14%);
+}
+
+.settings-base-url-input {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.4fr);
+  gap: var(--space-3);
+}
+
+.settings-base-url-input > input,
+.settings-base-url-input > select {
+  min-width: 0;
 }
 
 .settings-field-wide {
@@ -10672,6 +10740,16 @@ button:disabled {
 
 .settings-model-families .settings-toggle-stack {
   border-top: 1px solid var(--border-subtle);
+}
+
+.settings-model-parameter-grid {
+  padding: var(--space-6) var(--space-8);
+}
+
+.settings-model-capability-control {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
 }
 
 .settings-provider-footer {
@@ -11193,7 +11271,9 @@ button:disabled {
 
 @media (max-width: 900px) {
   .settings-layout {
-    grid-template-columns: calc(var(--space-16) * 6) minmax(0, 1fr);
+    grid-template-columns:
+      var(--settings-sidebar-width, calc(var(--space-16) * 6))
+      var(--space-0) minmax(0, 1fr);
   }
 
   .settings-content {
@@ -11221,6 +11301,14 @@ button:disabled {
 @media (max-width: 760px) {
   .settings-layout {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-resizer {
+    display: none;
+  }
+
+  .settings-workspace {
+    grid-column: 1;
   }
 
   .settings-sidebar {
@@ -11281,6 +11369,10 @@ button:disabled {
   .settings-model-controls,
   .settings-panel-redesigned .settings-provider-list,
   .settings-import-presets {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-base-url-input {
     grid-template-columns: 1fr;
   }
 
@@ -12727,6 +12819,14 @@ button:disabled {
 
 .workspace:not(.with-tool-stage):has(.context-rail-shell.is-inline)
   .composer-shell {
+  padding-inline-start: var(--space-12);
+  padding-inline-end: var(--context-rail-reserved);
+}
+
+/* Keep the new-task welcome content centered in the usable conversation area,
+ * excluding the inline context rail that overlays the right edge. */
+.workspace:not(.with-tool-stage):has(.context-rail-shell.is-inline)
+  .new-task-state {
   padding-inline-start: var(--space-12);
   padding-inline-end: var(--context-rail-reserved);
 }

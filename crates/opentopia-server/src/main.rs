@@ -2194,37 +2194,78 @@ async fn sync_provider_models(
         request.header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
     };
 
-    let response = request
-        .send()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("model list request failed: {error}")))?;
+    let response = request.send().await.map_err(|error| {
+        warn!(
+            provider_id = %provider.id,
+            provider_kind = ?provider.kind,
+            "model discovery request failed"
+        );
+        ApiError::bad_gateway(format!("model list request failed: {error}"))
+    })?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("model list read failed: {error}")))?;
+    let body = response.text().await.map_err(|error| {
+        warn!(
+            provider_id = %provider.id,
+            provider_kind = ?provider.kind,
+            "model discovery response could not be read"
+        );
+        ApiError::bad_gateway(format!("model list read failed: {error}"))
+    })?;
     if !status.is_success() {
+        warn!(
+            provider_id = %provider.id,
+            provider_kind = ?provider.kind,
+            %status,
+            "model discovery endpoint returned a non-success status"
+        );
         return Err(ApiError::bad_gateway(format!(
             "model list request returned {status}: {}",
             truncate_chars(body.trim(), 300)
         )));
     }
     let payload: Value = serde_json::from_str(&body).map_err(|error| {
+        warn!(
+            provider_id = %provider.id,
+            provider_kind = ?provider.kind,
+            "model discovery response was not valid JSON"
+        );
         ApiError::bad_gateway(format!("model list response was not valid JSON: {error}"))
     })?;
 
     let catalog = extract_model_catalog(&payload);
-    let mut models: Vec<String> = catalog.iter().map(|(id, _)| id.clone()).collect();
+    let mut models: Vec<String> = catalog.iter().map(|entry| entry.id.clone()).collect();
     models.sort();
     models.dedup();
     if models.is_empty() {
+        warn!(
+            provider_id = %provider.id,
+            provider_kind = ?provider.kind,
+            "model discovery response contained no model IDs"
+        );
         return Err(ApiError::bad_gateway(
             "model list response contained no model ids",
         ));
     }
     let context_windows: BTreeMap<String, usize> = catalog
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .context_window
+                .map(|window| (entry.id.clone(), window))
+        })
+        .collect();
+    let model_capabilities: BTreeMap<String, opentopia_core::ProviderModelCapabilities> = catalog
         .into_iter()
-        .filter_map(|(id, window)| window.map(|window| (id, window)))
+        .filter_map(|entry| {
+            entry.supports_vision.map(|supports_vision| {
+                (
+                    entry.id,
+                    opentopia_core::ProviderModelCapabilities {
+                        supports_vision: Some(supports_vision),
+                    },
+                )
+            })
+        })
         .collect();
 
     let synced_at = Utc::now();
@@ -2240,27 +2281,56 @@ async fn sync_provider_models(
     };
     target.synced_models = models.clone();
     target.model_context_windows = context_windows.clone();
+    target.model_capabilities = model_capabilities.clone();
+    if !models.iter().any(|model| model == target.model.trim()) {
+        // Setup begins with an empty model. Once the endpoint exposes a
+        // catalog, choose a valid default from that actual catalog.
+        target.model = models[0].clone();
+    }
+    let default_model = target.model.clone();
     target.models_synced_at = Some(synced_at);
     let settings = state.store.save_settings(settings)?;
     {
         let mut settings_guard = state.settings.write().expect("settings lock poisoned");
-        *settings_guard = settings;
+        *settings_guard = settings.clone();
     }
+    {
+        let mut agent_guard = state.agent.write().expect("agent lock poisoned");
+        let mut agent = AgentCore::from_settings(&settings);
+        agent.set_browser_runtime(state.browser.clone());
+        agent.set_computer_runtime(state.computer.clone());
+        agent.set_subagent_scheduler(state.subagents.clone());
+        agent.set_background_processes(state.background.clone());
+        apply_evaluation_tool_policy(&mut agent);
+        *agent_guard = agent;
+    }
+
+    info!(
+        provider_id = %provider_id,
+        provider_kind = ?provider.kind,
+        model_count = models.len(),
+        "model discovery completed"
+    );
 
     Ok(Json(ProviderModelSyncResult {
         provider_id,
         models,
         model_context_windows: context_windows,
+        model_capabilities,
+        default_model,
         synced_at,
     }))
 }
 
 fn provider_model_catalog_url(provider: &ProviderSettings) -> String {
     let base_url = provider.base_url.trim_end_matches('/');
-    if provider.kind == ProviderKind::Anthropic {
-        format!("{base_url}/v1/models")
-    } else {
+    if base_url.ends_with("/v1") {
         format!("{base_url}/models")
+    } else {
+        // The setup form accepts both a service root and an OpenAI-compatible
+        // API root. Normalizing here means users can provide either
+        // `https://service.example` or `https://service.example/v1`.
+        format!("{base_url}/v1/models")
     }
 }
 
@@ -2274,7 +2344,13 @@ fn provider_model_catalog_url(provider: &ProviderSettings) -> String {
 /// `/v1/models` returns nothing but ids, but OpenRouter, vLLM, LiteLLM and many
 /// relay panels do publish a window, and a value from the endpoint always beats
 /// the hand-maintained table in `settings.rs`.
-fn extract_model_catalog(payload: &Value) -> Vec<(String, Option<usize>)> {
+struct DiscoveredModel {
+    id: String,
+    context_window: Option<usize>,
+    supports_vision: Option<bool>,
+}
+
+fn extract_model_catalog(payload: &Value) -> Vec<DiscoveredModel> {
     let entries = payload
         .get("data")
         .or_else(|| payload.get("models"))
@@ -2285,7 +2361,11 @@ fn extract_model_catalog(payload: &Value) -> Vec<(String, Option<usize>)> {
     entries
         .iter()
         .filter_map(|entry| match entry {
-            Value::String(id) => Some((id.trim().to_string(), None)),
+            Value::String(id) => Some(DiscoveredModel {
+                id: id.trim().to_string(),
+                context_window: None,
+                supports_vision: None,
+            }),
             Value::Object(_) => {
                 let id = entry
                     .get("id")
@@ -2293,12 +2373,71 @@ fn extract_model_catalog(payload: &Value) -> Vec<(String, Option<usize>)> {
                     .and_then(Value::as_str)?
                     .trim()
                     .to_string();
-                Some((id, extract_context_window(entry)))
+                Some(DiscoveredModel {
+                    id,
+                    context_window: extract_context_window(entry),
+                    supports_vision: extract_supports_vision(entry),
+                })
             }
             _ => None,
         })
-        .filter(|(id, _)| !id.is_empty())
+        .filter(|entry| !entry.id.is_empty())
         .collect()
+}
+
+/// Reads common catalog modality shapes. OpenAI's own `/v1/models` endpoint
+/// only returns model ids, so a missing field remains unknown rather than being
+/// guessed. Relays such as OpenRouter commonly expose `input_modalities`.
+fn extract_supports_vision(entry: &Value) -> Option<bool> {
+    const BOOLEAN_FIELDS: [&str; 2] = ["supports_vision", "vision"];
+    const MODALITY_FIELDS: [&str; 3] = [
+        "input_modalities",
+        "modalities",
+        "input_modalities_supported",
+    ];
+
+    let read_boolean = |object: &Value| {
+        BOOLEAN_FIELDS
+            .iter()
+            .find_map(|field| object.get(*field).and_then(Value::as_bool))
+    };
+    if let Some(value) =
+        read_boolean(entry).or_else(|| entry.get("capabilities").and_then(read_boolean))
+    {
+        return Some(value);
+    }
+
+    let has_image_modality = |value: &Value| {
+        let modalities: Vec<String> = match value {
+            Value::Array(items) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .collect(),
+            Value::String(value) => value
+                .split(|character: char| matches!(character, ',' | '+' | '/' | ' '))
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect(),
+            _ => return None,
+        };
+        Some(modalities.iter().any(|modality| {
+            matches!(
+                modality.as_str(),
+                "image" | "images" | "vision" | "image_url"
+            )
+        }))
+    };
+    MODALITY_FIELDS.iter().find_map(|field| {
+        entry
+            .get(*field)
+            .or_else(|| {
+                entry
+                    .get("architecture")
+                    .and_then(|value| value.get(*field))
+            })
+            .and_then(has_image_modality)
+    })
 }
 
 /// Reads whichever context-window field the endpoint happens to use. Values are
@@ -6319,6 +6458,21 @@ async fn run_new_agent_turn(
     let thread_id = thread.id;
     let turn_id = turn.turn_id;
     let settings = current_settings(&state);
+    let selected_provider = {
+        let connection = settings.provider_by_id_or_active(
+            thread
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.connection_id.as_str()),
+        );
+        match thread.model_selection.as_ref() {
+            Some(selection) => connection.with_model_override(
+                Some(selection.model_id.as_str()),
+                Some(selection.reasoning_effort.as_deref()),
+            ),
+            None => connection.clone(),
+        }
+    };
     let workspace_root = thread.workspace_root.clone();
     let _workspace_guard = state.turn_changes.lock_workspace(&workspace_root).await;
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
@@ -6373,7 +6527,7 @@ async fn run_new_agent_turn(
         .map(|catalog| estimate_tokens(&catalog))
         .unwrap_or_default();
     let context_reservation = turn_context_reservation(
-        &settings,
+        &selected_provider,
         &built_context.context,
         tool_schema_tokens,
         &content,
@@ -6412,6 +6566,7 @@ async fn run_new_agent_turn(
             turn_id,
             user_message.id,
             context_reservation,
+            &selected_provider,
         ) => prepared,
     };
     let prepared = match prepared_result {
@@ -7323,13 +7478,13 @@ struct TurnContextReservation {
 }
 
 fn turn_context_reservation(
-    settings: &AppSettings,
+    provider: &ProviderSettings,
     model_context: &CompiledModelContext,
     tool_schema_tokens: usize,
     current_text: &str,
     current_content: &[ModelContentPart],
 ) -> TurnContextReservation {
-    let context_window = settings.active_provider().resolved_context_window_tokens();
+    let context_window = provider.resolved_context_window_tokens();
     let model_context_tokens = model_context
         .items
         .iter()
@@ -7339,17 +7494,12 @@ fn turn_context_reservation(
         .iter()
         .map(model_content_part_token_estimate)
         .sum::<usize>();
-    let output_reserve = settings
-        .active_provider()
-        .max_output_tokens
+    let output_reserve = provider
+        .max_output_tokens_for_model()
         .map(|value| value as usize)
         .unwrap_or_else(|| (context_window / 10).clamp(4_096, 16_384));
-    let reasoning_reserve = match settings
-        .active_provider()
-        .reasoning_effort
-        .as_deref()
-        .unwrap_or("none")
-    {
+    let reasoning_effort = provider.reasoning_effort_for_model();
+    let reasoning_reserve = match reasoning_effort.as_deref().unwrap_or("none") {
         "minimal" => 512,
         "low" => 1_024,
         "medium" => 2_048,
@@ -7842,6 +7992,7 @@ async fn prepare_turn_context(
     turn_id: Uuid,
     current_message_id: Uuid,
     reservation: TurnContextReservation,
+    provider: &ProviderSettings,
 ) -> Result<PreparedTurnContext, ApiError> {
     let messages = state.store.list_messages(thread_id)?;
     let events = state.store.list_events(thread_id, None)?;
@@ -7872,7 +8023,7 @@ async fn prepare_turn_context(
         .map(|_| {
             recent_conversation_tail(
                 &prior_messages,
-                (context_window_tokens(state) / 10).clamp(2_048, 16_384),
+                (provider.resolved_context_window_tokens() / 10).clamp(2_048, 16_384),
             )
             .1
         })
@@ -7882,9 +8033,7 @@ async fn prepare_turn_context(
         .map(|summary| estimate_tokens(&summary.summary))
         .unwrap_or_default()
         .saturating_add(active_plan_tokens);
-    let settings = current_settings(state);
-    let active_provider = settings.active_provider();
-    let context_window = active_provider.resolved_context_window_tokens();
+    let context_window = provider.resolved_context_window_tokens();
     let usage_percent = reservation
         .fixed_input_tokens
         .saturating_add(reservation.current_input_tokens)
@@ -7894,7 +8043,7 @@ async fn prepare_turn_context(
         .saturating_add(unsummarized_tokens)
         .saturating_mul(100)
         / context_window.max(1);
-    let provider_is_compactable = active_provider.kind != ProviderKind::Mock;
+    let provider_is_compactable = provider.kind != ProviderKind::Mock;
     let mut compaction_passes = 0usize;
     loop {
         let remaining_messages = prior_messages.len().saturating_sub(covered);
@@ -8027,15 +8176,14 @@ async fn prepare_turn_context(
         .store
         .get_provider_conversation_state(thread_id, "/root")?
         .filter(|provider_state| {
-            provider_state.provider_id == active_provider.id
-                && provider_state.model == active_provider.model
+            provider_state.provider_id == provider.id && provider_state.model == provider.model
         });
     let projection = build_context_projection(
         summary.as_ref(),
         prior_messages.len(),
         &events,
         recent_tail_tokens,
-        active_provider,
+        provider,
         provider_state.as_ref(),
     );
     Ok(PreparedTurnContext {
@@ -8334,7 +8482,10 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
                 ));
             }
         }
-        if provider.kind != ProviderKind::CodexAppServer && provider.model.trim().is_empty() {
+        if provider.kind != ProviderKind::CodexAppServer
+            && provider.model.trim().is_empty()
+            && !provider.synced_models.is_empty()
+        {
             return Err(ApiError::bad_request("provider model cannot be empty"));
         }
         if let Some(temperature) = provider.temperature {
@@ -8375,6 +8526,47 @@ fn validate_provider_settings(providers: &[ProviderSettings]) -> Result<(), ApiE
             .contains(&effort)
             {
                 return Err(ApiError::bad_request("reasoning effort is not supported"));
+            }
+        }
+        for (model_id, model_settings) in &provider.model_settings {
+            if model_id.trim().is_empty() {
+                return Err(ApiError::bad_request("model setting IDs must not be empty"));
+            }
+            if let Some(temperature) = model_settings.temperature.flatten() {
+                if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                    return Err(ApiError::bad_request(
+                        "model temperature must be between 0 and 2",
+                    ));
+                }
+            }
+            if model_settings.max_output_tokens.flatten() == Some(0) {
+                return Err(ApiError::bad_request(
+                    "model max output tokens must be greater than zero",
+                ));
+            }
+            if model_settings
+                .context_window_tokens
+                .flatten()
+                .is_some_and(|tokens| tokens < 4_096)
+            {
+                return Err(ApiError::bad_request(
+                    "model context window must be at least 4096 tokens",
+                ));
+            }
+            if let Some(effort) = model_settings
+                .reasoning_effort
+                .as_ref()
+                .and_then(|value| value.as_deref())
+            {
+                if ![
+                    "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+                ]
+                .contains(&effort)
+                {
+                    return Err(ApiError::bad_request(
+                        "model reasoning effort is not supported",
+                    ));
+                }
             }
         }
         if provider
@@ -10180,6 +10372,8 @@ struct ProviderModelSyncResult {
     provider_id: String,
     models: Vec<String>,
     model_context_windows: BTreeMap<String, usize>,
+    model_capabilities: BTreeMap<String, opentopia_core::ProviderModelCapabilities>,
+    default_model: String,
     synced_at: DateTime<Utc>,
 }
 
@@ -10950,6 +11144,13 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
 
+    fn model_catalog_summary(payload: &Value) -> Vec<(String, Option<usize>, Option<bool>)> {
+        extract_model_catalog(payload)
+            .into_iter()
+            .map(|entry| (entry.id, entry.context_window, entry.supports_vision))
+            .collect()
+    }
+
     #[test]
     fn evaluation_catalog_enriches_suite_tasks_from_result_artifacts() {
         let workspace_root =
@@ -11146,26 +11347,26 @@ mod tests {
     fn model_catalog_reads_ids_from_every_shape_relays_return() {
         let openai = json!({"data": [{"id": "gpt-4.1-mini"}, {"id": "o3-mini"}]});
         assert_eq!(
-            extract_model_catalog(&openai),
+            model_catalog_summary(&openai),
             vec![
-                ("gpt-4.1-mini".to_string(), None),
-                ("o3-mini".to_string(), None)
+                ("gpt-4.1-mini".to_string(), None, None),
+                ("o3-mini".to_string(), None, None)
             ]
         );
 
         let bare = json!(["kimi-k2.5", "glm-4.6"]);
         assert_eq!(
-            extract_model_catalog(&bare),
+            model_catalog_summary(&bare),
             vec![
-                ("kimi-k2.5".to_string(), None),
-                ("glm-4.6".to_string(), None)
+                ("kimi-k2.5".to_string(), None, None),
+                ("glm-4.6".to_string(), None, None)
             ]
         );
 
         let named = json!({"models": [{"name": "deepseek-reasoner"}]});
         assert_eq!(
-            extract_model_catalog(&named),
-            vec![("deepseek-reasoner".to_string(), None)]
+            model_catalog_summary(&named),
+            vec![("deepseek-reasoner".to_string(), None, None)]
         );
     }
 
@@ -11183,6 +11384,27 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_accepts_service_roots_and_versioned_api_roots() {
+        let root = ProviderSettings {
+            base_url: "https://models.example".to_string(),
+            ..ProviderSettings::default()
+        };
+        assert_eq!(
+            provider_model_catalog_url(&root),
+            "https://models.example/v1/models"
+        );
+
+        let versioned = ProviderSettings {
+            base_url: "https://models.example/custom/v1/".to_string(),
+            ..ProviderSettings::default()
+        };
+        assert_eq!(
+            provider_model_catalog_url(&versioned),
+            "https://models.example/custom/v1/models"
+        );
+    }
+
+    #[test]
     fn model_catalog_picks_up_whichever_context_field_the_endpoint_uses() {
         let payload = json!({"data": [
             {"id": "a", "context_length": 200_000},
@@ -11192,13 +11414,32 @@ mod tests {
             {"id": "e", "max_context_tokens": "256000"},
         ]});
         assert_eq!(
-            extract_model_catalog(&payload),
+            model_catalog_summary(&payload),
             vec![
-                ("a".to_string(), Some(200_000)),
-                ("b".to_string(), Some(32_768)),
-                ("c".to_string(), Some(128_000)),
-                ("d".to_string(), Some(1_000_000)),
-                ("e".to_string(), Some(256_000)),
+                ("a".to_string(), Some(200_000), None),
+                ("b".to_string(), Some(32_768), None),
+                ("c".to_string(), Some(128_000), None),
+                ("d".to_string(), Some(1_000_000), None),
+                ("e".to_string(), Some(256_000), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_catalog_reads_image_capabilities_without_guessing_missing_values() {
+        let payload = json!({"data": [
+            {"id": "vision", "architecture": {"input_modalities": ["text", "image"]}},
+            {"id": "text-only", "input_modalities": ["text"]},
+            {"id": "flag", "capabilities": {"vision": true}},
+            {"id": "unknown"}
+        ]});
+        assert_eq!(
+            model_catalog_summary(&payload),
+            vec![
+                ("vision".to_string(), None, Some(true)),
+                ("text-only".to_string(), None, Some(false)),
+                ("flag".to_string(), None, Some(true)),
+                ("unknown".to_string(), None, None),
             ]
         );
     }
@@ -11212,11 +11453,11 @@ mod tests {
             {"id": "text", "context_length": "not-a-number"},
         ]});
         assert_eq!(
-            extract_model_catalog(&payload),
+            model_catalog_summary(&payload),
             vec![
-                ("tiny".to_string(), None),
-                ("huge".to_string(), None),
-                ("text".to_string(), None),
+                ("tiny".to_string(), None, None),
+                ("huge".to_string(), None, None),
+                ("text".to_string(), None, None),
             ]
         );
     }
@@ -11746,6 +11987,16 @@ mod tests {
         let mut provider = ProviderSettings::default();
         provider.name = " ".to_string();
         let error = validate_provider_settings(&[provider]).expect_err("reject blank name");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let mut provider = ProviderSettings::default();
+        provider.model.clear();
+        validate_provider_settings(&[provider.clone()])
+            .expect("allow an empty model while discovery has not run");
+
+        provider.synced_models = vec!["discovered-model".to_string()];
+        let error = validate_provider_settings(&[provider])
+            .expect_err("require a selected model after discovery");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 

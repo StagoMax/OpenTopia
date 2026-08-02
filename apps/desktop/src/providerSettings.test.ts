@@ -70,6 +70,14 @@ test("exposes current OpenAI presets with official source links", () => {
     findOfficialModelPreset(" GPT-5.6-TERRA ")?.label,
     "GPT-5.6 Terra",
   );
+  assert.equal(
+    findOfficialModelPreset("gpt-5.4-pro")?.label,
+    "GPT-5.4 Pro",
+  );
+  assert.equal(
+    findOfficialModelPreset("gpt-5.3-codex")?.label,
+    "GPT-5.3-Codex",
+  );
 });
 
 test("resolves model-specific reasoning effort capabilities", () => {
@@ -92,6 +100,16 @@ test("resolves model-specific reasoning effort capabilities", () => {
     resolveModelReasoningCapability("openai_responses", "gpt-5.3-codex")
       .supportedEfforts,
     ["low", "medium", "high", "xhigh"],
+  );
+  assert.deepEqual(
+    resolveModelReasoningCapability("openai_responses", "gpt-5.5")
+      .supportedEfforts,
+    ["none", "low", "medium", "high", "xhigh"],
+  );
+  assert.deepEqual(
+    resolveModelReasoningCapability("openai_responses", "gpt-5.4-pro")
+      .supportedEfforts,
+    ["medium", "high", "xhigh"],
   );
 });
 
