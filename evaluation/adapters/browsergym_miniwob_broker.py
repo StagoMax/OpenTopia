@@ -94,11 +94,19 @@ class StaticSiteServer:
 
 
 class MiniwobBroker:
-    def __init__(self, task_id: str, seed: int, miniwob_root: Path, browser_executable: Path | None):
+    def __init__(
+        self,
+        task_id: str,
+        seed: int,
+        miniwob_root: Path,
+        browser_executable: Path | None,
+        screenshots_enabled: bool,
+    ):
         self.task_id = self._normalize_task_id(task_id)
         self.seed = seed
         self.site = StaticSiteServer(miniwob_root)
         self.browser_executable = browser_executable
+        self.screenshots_enabled = screenshots_enabled
         self.playwright = None
         self.browser = None
         self.context = None
@@ -174,9 +182,19 @@ class MiniwobBroker:
                 a: "link", button: "button", textarea: "textbox", select: "combobox",
                 input: element.type === "checkbox" ? "checkbox" : element.type === "radio" ? "radio" : "textbox"
               })[element.localName] || element.localName;
-              const candidates = Array.from(document.querySelectorAll(
-                "a[href],button,input,textarea,select,[role=button],[role=link],[contenteditable=true],[tabindex]"
-              )).slice(0, 500);
+              const semanticCandidates = Array.from(document.querySelectorAll(
+                "a[href],button,input,textarea,select,[role=button],[role=link],[contenteditable=true],[tabindex],[data-color]"
+              ));
+              // MiniWoB also uses visual controls such as <span class="alink">
+              // with a click listener and cursor:pointer. They have neither a
+              // native interactive tag nor an ARIA role, so limiting the
+              // observation to semantic controls makes a solvable task appear
+              // to have no actionable nodes.
+              const visualCandidates = Array.from(document.querySelectorAll("*")).filter((element) => {
+                const style = window.getComputedStyle(element);
+                return style.cursor === "pointer" || element.hasAttribute("onclick") || typeof element.onclick === "function";
+              });
+              const candidates = Array.from(new Set([...semanticCandidates, ...visualCandidates])).slice(0, 500);
               return {
                 url: document.location.href,
                 title: document.title,
@@ -189,7 +207,7 @@ class MiniwobBroker:
                       selector: selectorFor(element),
                       tagName: element.localName,
                       role: roleFor(element),
-                      name: String(element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("placeholder") || ""),
+                      name: String(element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("placeholder") || element.getAttribute("data-color") || ""),
                       href: element.href || null,
                       formAction: element.getAttribute("formaction") || element.form?.getAttribute("action") || null,
                       formMethod: (element.getAttribute("formmethod") || element.form?.getAttribute("method") || "get").toLowerCase(),
@@ -264,7 +282,7 @@ class MiniwobBroker:
         }
         self._prune_observations()
         screenshot = None
-        if include_screenshot:
+        if include_screenshot and self.screenshots_enabled:
             image = self._page().screenshot(type="png")
             if len(image) > MAX_SCREENSHOT_BYTES:
                 raise BrokerError("screenshot_too_large", "Screenshot exceeds the 8 MiB limit.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
@@ -379,6 +397,8 @@ class MiniwobBroker:
         return browser_output(page, "wait")
 
     def screenshot(self) -> dict[str, Any]:
+        if not self.screenshots_enabled:
+            raise BrokerError("screenshots_disabled", "Screenshots are disabled for this text-only evaluation.", HTTPStatus.FORBIDDEN)
         image = self._page().screenshot(type="png")
         if len(image) > MAX_SCREENSHOT_BYTES:
             raise BrokerError("screenshot_too_large", "Screenshot exceeds the 8 MiB limit.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
@@ -513,6 +533,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--token", required=True)
     parser.add_argument("--browser-executable", type=Path, help="Optional Chrome or Chromium executable for Playwright")
+    parser.add_argument("--disable-screenshots", action="store_true", help="Do not return or capture browser screenshots")
     parser.add_argument("--result-path", type=Path)
     return parser.parse_args()
 
@@ -526,7 +547,13 @@ def main() -> int:
     browser_executable = args.browser_executable.resolve() if args.browser_executable else None
     if browser_executable and not browser_executable.is_file():
         raise SystemExit(f"Browser executable was not found: {browser_executable}")
-    broker = MiniwobBroker(args.task, args.seed, miniwob_root, browser_executable)
+    broker = MiniwobBroker(
+        args.task,
+        args.seed,
+        miniwob_root,
+        browser_executable,
+        screenshots_enabled=not args.disable_screenshots,
+    )
     broker.start()
     server = BrokerServer(("127.0.0.1", args.port), broker, args.token)
     port = server.server_address[1]

@@ -1,9 +1,18 @@
 param(
-  [string[]]$Tasks = @("miniwob.click-test", "miniwob.click-button", "miniwob.click-button-sequence"),
+  [string[]]$Tasks = @(),
+  [string]$TaskList = "",
+  [ValidateSet("smoke-3", "dom-control-30")][string]$Preset = "smoke-3",
   [int]$Seed = 0,
   [ValidateRange(1024, 65535)][int]$Port = 8820,
   [ValidateRange(60000, 1800000)][int]$TimeoutMs = 300000,
   [string]$OutputDirectory = "",
+  [ValidateSet("all", "first", "none")][string]$ProviderPreflight = "first",
+  [ValidateRange(0, 300)][int]$InterTaskDelaySeconds = 10,
+  [ValidateRange(0, 5)][int]$ProviderRateLimitRetries = 3,
+  [ValidateRange(15, 600)][int]$ProviderRateLimitBackoffSeconds = 90,
+  [ValidateRange(0, 5)][int]$ProviderTransientRetries = 2,
+  [ValidateRange(5, 600)][int]$ProviderTransientBackoffSeconds = 15,
+  [switch]$AllowScreenshots,
   [switch]$SkipBuild
 )
 
@@ -17,7 +26,9 @@ function New-Token {
   } finally {
     $random.Dispose()
   }
-  return [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+  # The prefix ensures a token is never parsed as a command-line flag when a
+  # launcher has to serialize an argument list.
+  return "ot_" + [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
 }
 
 function Get-FreeLoopbackPort {
@@ -78,6 +89,38 @@ function Get-TaskEvents {
   return @([IO.File]::ReadAllLines($EventsPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
 
+function Get-TaskDiagnostics {
+  param([AllowEmptyCollection()][string[]]$Events)
+
+  $parsed = @()
+  foreach ($line in $Events) {
+    try {
+      $parsed += $line | ConvertFrom-Json
+    } catch {
+      # A malformed diagnostic event must not invalidate BrowserGym's independent score.
+    }
+  }
+  $browserEvents = @($parsed | Where-Object { $_.type -eq "browser.action.completed" })
+  $failedBrowserEvents = @($browserEvents | Where-Object { -not $_.payload.success })
+  $timing = @($parsed | Where-Object { $_.type -eq "evaluation.timing" } | Select-Object -Last 1)[0]
+  $turn = @($parsed | Where-Object {
+    $_.type -eq "application.turn.completed" -or $_.type -eq "application.turn.awaiting_user_action"
+  } | Select-Object -Last 1)[0]
+  return [ordered]@{
+    turnStatus = if ($turn) { $turn.payload.status } else { $null }
+    browserActions = $browserEvents.Count
+    failedBrowserActions = @($failedBrowserEvents | ForEach-Object {
+      [ordered]@{
+        action = $_.payload.action
+        error = $_.payload.error
+      }
+    })
+    handoffs = @($parsed | Where-Object { $_.type -eq "browser.handoff.required" } | ForEach-Object { $_.payload.reason })
+    applicationErrors = @($parsed | Where-Object { $_.type -eq "application.error" } | ForEach-Object { $_.payload.message })
+    timing = if ($timing) { $timing.payload } else { $null }
+  }
+}
+
 function Import-EvaluationEnv {
   param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -112,6 +155,50 @@ if (-not $env:OPENTOPIA_API_KEY -and $env:OPENTOPIA_MODEL_KEY) {
 foreach ($name in @("OPENTOPIA_API_KEY", "OPENTOPIA_OPENAI_BASE_URL", "OPENTOPIA_MODEL")) {
   if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, "Process"))) {
     throw "$name is required. Configure it in .env before running the public browser benchmark."
+  }
+}
+if (-not [string]::IsNullOrWhiteSpace($TaskList)) {
+  $Tasks = @($TaskList.Split(",") | ForEach-Object { $_.Trim().Trim("'", '"') } | Where-Object { $_ })
+}
+if ($Tasks.Count -eq 0) {
+  $Tasks = switch ($Preset) {
+    "smoke-3" {
+      @("miniwob.click-test", "miniwob.click-button", "miniwob.click-button-sequence")
+    }
+    "dom-control-30" {
+      @(
+        "miniwob.click-button",
+        "miniwob.click-button-sequence",
+        "miniwob.click-checkboxes",
+        "miniwob.click-checkboxes-large",
+        "miniwob.click-checkboxes-soft",
+        "miniwob.click-checkboxes-transfer",
+        "miniwob.click-collapsible",
+        "miniwob.click-collapsible-2",
+        "miniwob.click-collapsible-2-nodelay",
+        "miniwob.click-collapsible-nodelay",
+        "miniwob.click-color",
+        "miniwob.click-dialog",
+        "miniwob.click-dialog-2",
+        "miniwob.click-link",
+        "miniwob.click-menu",
+        "miniwob.click-menu-2",
+        "miniwob.click-option",
+        "miniwob.click-scroll-list",
+        "miniwob.click-shades",
+        "miniwob.click-shape",
+        "miniwob.click-tab",
+        "miniwob.click-tab-2",
+        "miniwob.click-tab-2-easy",
+        "miniwob.click-tab-2-hard",
+        "miniwob.click-tab-2-medium",
+        "miniwob.click-test",
+        "miniwob.click-test-2",
+        "miniwob.click-test-transfer",
+        "miniwob.click-widget",
+        "miniwob.number-checkboxes"
+      )
+    }
   }
 }
 
@@ -155,7 +242,7 @@ if (-not (Test-Path -LiteralPath $serverPath -PathType Leaf)) {
 }
 
 $startedAt = (Get-Date).ToUniversalTime()
-$runId = "browsergym-miniwob-" + $startedAt.ToString("yyyyMMddTHHmmssZ")
+$runId = "browsergym-miniwob-" + $startedAt.ToString("yyyyMMddTHHmmssZ") + "-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $runRoot = if ($OutputDirectory) {
   if ([IO.Path]::IsPathRooted($OutputDirectory)) { $OutputDirectory } else { Join-Path $repoRoot $OutputDirectory }
 } else {
@@ -174,7 +261,12 @@ foreach ($name in @(
   "AGENT_EVAL_PROMPT_FILE",
   "AGENT_EVAL_TASK_ID",
   "OPENTOPIA_EVAL_BASE_URL",
-  "OPENTOPIA_EVAL_TIMEOUT_MS"
+  "OPENTOPIA_EVAL_TIMEOUT_MS",
+  "OPENTOPIA_EVAL_COMPACT_EVENTS",
+  "OPENTOPIA_EVAL_ALLOWED_TOOLS",
+  "OPENTOPIA_EVAL_ENABLE_BROWSER_PLUGIN",
+  "OPENTOPIA_EVAL_BROWSER_RESULT_URL",
+  "OPENTOPIA_EVAL_BROWSER_RESULT_TOKEN"
 )) {
   $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
 }
@@ -182,14 +274,25 @@ foreach ($name in @(
 $apiToken = New-Token
 $env:OPENTOPIA_API_TOKEN = $apiToken
 $env:OPENTOPIA_SANDBOX_NETWORK = "deny"
+$env:OPENTOPIA_EVAL_ALLOWED_TOOLS = "browser,complete_task"
+$env:OPENTOPIA_EVAL_ENABLE_BROWSER_PLUGIN = "1"
 $taskResults = @()
+$providerPreflightCompleted = $false
 try {
   for ($index = 0; $index -lt $Tasks.Count; $index += 1) {
     $task = $Tasks[$index].Trim()
     if ([string]::IsNullOrWhiteSpace($task)) {
       throw "Task ids cannot be empty"
     }
-    $taskRoot = Join-Path $runRoot ("{0:D2}-{1}" -f ($index + 1), ($task -replace "[^A-Za-z0-9._-]", "-"))
+    if ($index -gt 0 -and $InterTaskDelaySeconds -gt 0) {
+      Start-Sleep -Seconds $InterTaskDelaySeconds
+    }
+    $taskRootBase = Join-Path $runRoot ("{0:D2}-{1}" -f ($index + 1), ($task -replace "[^A-Za-z0-9._-]", "-"))
+    $attempts = @()
+    $taskResult = $null
+    $maxProviderAttempts = 1 + [Math]::Max($ProviderRateLimitRetries, $ProviderTransientRetries)
+    for ($attempt = 1; $attempt -le $maxProviderAttempts; $attempt += 1) {
+    $taskRoot = if ($attempt -eq 1) { $taskRootBase } else { Join-Path $taskRootBase ("attempt-{0:D2}" -f $attempt) }
     New-Item -ItemType Directory -Path $taskRoot -Force | Out-Null
     $brokerToken = New-Token
     $brokerStdout = Join-Path $taskRoot "broker.stdout.log"
@@ -209,8 +312,12 @@ try {
     $brokerResult = $null
     $events = @()
     $adapterExitCode = $null
+    $adapterError = $null
     try {
-      $brokerArguments = "evaluation/adapters/browsergym_miniwob_broker.py --task $task --seed $Seed --miniwob-root `"$miniwobRoot`" --port 0 --token $brokerToken --result-path `"$brokerResultPath`""
+      $brokerArguments = "evaluation/adapters/browsergym_miniwob_broker.py --task $task --seed $Seed --miniwob-root `"$miniwobRoot`" --port 0 --token=$brokerToken --result-path `"$brokerResultPath`""
+      if (-not $AllowScreenshots) {
+        $brokerArguments += " --disable-screenshots"
+      }
       if ($browserExecutable) {
         $brokerArguments += " --browser-executable `"$browserExecutable`""
       }
@@ -247,6 +354,7 @@ try {
       $prompt = @(
         "Complete this BrowserGym MiniWoB++ task using only the browser tool.",
         "The shared browser is already on the task page. Start with browser observe and do not navigate away.",
+        $(if (-not $AllowScreenshots) { "Do not request screenshots. Use the observed text and structured DOM nodes." }),
         "Task goal: $($taskInfo.goal)",
         "Stop after completing the task."
       ) -join "`n"
@@ -264,9 +372,12 @@ try {
         -WindowStyle Hidden
       $apiHeaders = @{ Authorization = "Bearer $apiToken" }
       Wait-Healthy -Url "http://127.0.0.1:$serverPort" -Headers $apiHeaders -Process $serverProcess -ExpectedService "opentopia-server"
-      $providerHealth = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$serverPort/api/provider/test" -Headers $apiHeaders -ContentType "application/json" -Body "{}" -TimeoutSec 20
-      if (-not $providerHealth.reachable -or -not $providerHealth.modelAvailable) {
-        throw "OpenTopia provider health check failed (reachable=$($providerHealth.reachable), modelAvailable=$($providerHealth.modelAvailable), detail=$($providerHealth.detail))"
+      if ($ProviderPreflight -eq "all" -or ($ProviderPreflight -eq "first" -and -not $providerPreflightCompleted)) {
+        $providerHealth = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$serverPort/api/provider/test" -Headers $apiHeaders -ContentType "application/json" -Body "{}" -TimeoutSec 20
+        if (-not $providerHealth.reachable -or -not $providerHealth.modelAvailable) {
+          throw "OpenTopia provider health check failed (reachable=$($providerHealth.reachable), modelAvailable=$($providerHealth.modelAvailable), error=$($providerHealth.error))"
+        }
+        $providerPreflightCompleted = $true
       }
 
       $env:AGENT_EVAL_WORKSPACE = $repoRoot
@@ -275,6 +386,9 @@ try {
       $env:AGENT_EVAL_TASK_ID = $taskInfo.taskId
       $env:OPENTOPIA_EVAL_BASE_URL = "http://127.0.0.1:$serverPort"
       $env:OPENTOPIA_EVAL_TIMEOUT_MS = "$TimeoutMs"
+      $env:OPENTOPIA_EVAL_COMPACT_EVENTS = "1"
+      $env:OPENTOPIA_EVAL_BROWSER_RESULT_URL = "$brokerUrl/results"
+      $env:OPENTOPIA_EVAL_BROWSER_RESULT_TOKEN = $brokerToken
       $adapterProcess = Start-Process `
         -FilePath (Get-Command node -ErrorAction Stop).Source `
         -ArgumentList "evaluation/adapters/opentopia-http.mjs" `
@@ -293,18 +407,32 @@ try {
       } catch {
         $adapterExitCode = $null
       }
-      if ($null -ne $adapterExitCode -and $adapterExitCode -ne 0) {
-        throw "OpenTopia adapter exited with code $adapterExitCode"
-      }
       $events = Get-TaskEvents $eventsPath
-      if (-not ($events | Where-Object { $_.Contains('"type":"application.turn.completed"') })) {
-        throw "OpenTopia adapter exited without recording a completed turn"
+      $hasTerminalTurn = $events | Where-Object {
+        $_.Contains('"type":"application.turn.completed"') -or $_.Contains('"type":"application.turn.awaiting_user_action"')
+      }
+      if (-not $hasTerminalTurn) {
+        $adapterStderrText = if (Test-Path -LiteralPath $adapterStderr -PathType Leaf) {
+          [IO.File]::ReadAllText($adapterStderr)
+        } else {
+          ""
+        }
+        if ($adapterStderrText -match "OpenTopia turn exceeded adapter timeout") {
+          $adapterError = "OpenTopia turn exceeded adapter timeout"
+        } elseif ($null -ne $adapterExitCode -and $adapterExitCode -ne 0) {
+          $adapterError = "OpenTopia adapter exited with code $adapterExitCode"
+        } else {
+          $adapterError = "OpenTopia adapter exited without recording a terminal turn"
+        }
       }
       if ($null -eq $adapterExitCode) {
         # Some Windows Start-Process instances do not retain ExitCode after asynchronous redirection.
         $adapterExitCode = 0
       }
       $brokerResult = Invoke-RestMethod -Uri "$brokerUrl/results" -Headers $brokerHeaders -TimeoutSec 10
+      if ($adapterError) {
+        $taskError = $adapterError
+      }
     } catch {
       $taskError = $_.Exception.Message.Replace($apiToken, "<redacted>").Replace($brokerToken, "<redacted>")
     } finally {
@@ -319,10 +447,24 @@ try {
       Stop-ChildProcess $brokerProcess
     }
     $browserActions = @($events | Where-Object { $_.Contains('"type":"browser.action.completed"') })
-    $taskResults += [ordered]@{
+    $diagnostics = Get-TaskDiagnostics $events
+    $providerErrors = @($taskError) + @($diagnostics.applicationErrors)
+    $providerRateLimited = @($providerErrors | Where-Object { $_ -match '(?i)(429|rpm_limited|rate.?limit)' }).Count -gt 0
+    $providerTransportFailure = @($providerErrors | Where-Object {
+      $_ -match '(?i)(error sending request for url|provider.*(connection|transport|network|timeout)|chat/completions.*(connection|transport|network|timeout))'
+    }).Count -gt 0
+    $retryableProviderFailure = $providerRateLimited -or $providerTransportFailure
+    $timedOut = $taskError -match "adapter timeout"
+    $taskResult = [ordered]@{
       task = $task
       seed = $Seed
-      status = if ($taskError) { "infra_error" } elseif ($brokerResult.success) { "passed" } else { "failed" }
+      # BrowserGym's terminal reward is the benchmark authority. A completed
+      # task with reward <= 0 is a functional miss, even if the adapter did
+      # not observe the model's final self-report before it exited.
+      status = if ($brokerResult.success) { "passed" } elseif ($retryableProviderFailure) { "infra_error" } elseif ($brokerResult.completed) { "failed" } elseif ($timedOut) { "failed" } elseif ($taskError) { "infra_error" } else { "failed" }
+      providerRateLimited = $providerRateLimited
+      providerTransportFailure = $providerTransportFailure
+      timedOut = $timedOut
       browsergym = $brokerResult
       browserActions = [ordered]@{
         total = $browserActions.Count
@@ -332,12 +474,33 @@ try {
         exitCode = $adapterExitCode
         events = $events.Count
       }
+      diagnostics = $diagnostics
+      attempts = @($attempts)
       paths = [ordered]@{
         root = $taskRoot.Substring($repoRoot.Length).TrimStart('\', '/')
         brokerResult = if (Test-Path -LiteralPath $brokerResultPath) { $brokerResultPath.Substring($repoRoot.Length).TrimStart('\', '/') } else { $null }
       }
       error = $taskError
     }
+    $attempts += [ordered]@{
+      attempt = $attempt
+      status = $taskResult.status
+      providerRateLimited = $providerRateLimited
+      providerTransportFailure = $providerTransportFailure
+      timedOut = $timedOut
+      error = $taskError
+      root = $taskResult.paths.root
+    }
+    $taskResult.attempts = @($attempts)
+    $shouldRetry = ($providerRateLimited -and $attempt -le $ProviderRateLimitRetries) -or
+      ($providerTransportFailure -and $attempt -le $ProviderTransientRetries)
+    if (-not $shouldRetry) {
+      break
+    }
+    $backoffSeconds = if ($providerRateLimited) { $ProviderRateLimitBackoffSeconds } else { $ProviderTransientBackoffSeconds }
+    Start-Sleep -Seconds $backoffSeconds
+    }
+    $taskResults += $taskResult
   }
 } finally {
   foreach ($name in $savedEnvironment.Keys) {
@@ -353,12 +516,27 @@ $summary = [ordered]@{
   startedAt = $startedAt.ToString("o")
   completedAt = (Get-Date).ToUniversalTime().ToString("o")
   model = $env:OPENTOPIA_MODEL
+  configuration = [ordered]@{
+    textOnly = -not $AllowScreenshots
+    providerPreflight = $ProviderPreflight
+    interTaskDelaySeconds = $InterTaskDelaySeconds
+    providerRateLimitRetries = $ProviderRateLimitRetries
+    providerRateLimitBackoffSeconds = $ProviderRateLimitBackoffSeconds
+    providerTransientRetries = $ProviderTransientRetries
+    providerTransientBackoffSeconds = $ProviderTransientBackoffSeconds
+  }
   tasks = $taskResults
   aggregate = [ordered]@{
     total = $taskResults.Count
     passed = @($taskResults | Where-Object { $_.status -eq "passed" }).Count
     failed = @($taskResults | Where-Object { $_.status -eq "failed" }).Count
     infraErrors = @($taskResults | Where-Object { $_.status -eq "infra_error" }).Count
+    providerRateLimited = @($taskResults | Where-Object { $_.providerRateLimited }).Count
+    providerTransportFailures = @($taskResults | Where-Object { $_.providerTransportFailure }).Count
+    timedOut = @($taskResults | Where-Object { $_.timedOut }).Count
+    modelNoOutputTimeouts = @($taskResults | Where-Object {
+      $_.timedOut -and -not $_.diagnostics.timing.firstModelOutputAt
+    }).Count
   }
 }
 $summaryPath = Join-Path $runRoot "summary.json"

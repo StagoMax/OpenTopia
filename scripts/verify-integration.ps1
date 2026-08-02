@@ -25,6 +25,43 @@ try {
   }
   $changedLines | Set-Content -LiteralPath (Join-Path $hunkWorkspace "sample.txt")
 
+  $evaluationRoot = Join-Path $hunkWorkspace ".opentopia\evaluations"
+  $evaluationSuite = Join-Path $evaluationRoot "integration-suite"
+  $evaluationAttempt = Join-Path $evaluationRoot "integration-attempt"
+  New-Item -ItemType Directory -Path $evaluationSuite, $evaluationAttempt -Force | Out-Null
+  @{
+    suiteId = "integration-suite"
+    benchmark = "Harness integration"
+    status = "failed"
+    tasks = @(
+      @{
+        taskId = "HARNESS-001"
+        runs = @(@{
+          runId = "integration-attempt"
+          status = "failed"
+          totalTokens = 0
+        })
+      }
+    )
+  } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evaluationSuite "summary.json") -Encoding utf8
+  @{
+    runId = "integration-attempt"
+    status = "failed"
+    failureCategory = "harness.adapter"
+    error = "intentional integration fixture"
+    task = @{
+      id = "HARNESS-001"
+      title = "Evaluation catalog fixture"
+    }
+    trajectoryMetrics = @{
+      toolCallsByName = @{ read_file = 2 }
+      totalTokens = 321
+      errorEvents = 1
+    }
+    recoveryPassed = $true
+    processContractPassed = $false
+  } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evaluationAttempt "result.json") -Encoding utf8
+
   $targetDir = Join-Path (Get-Location) ".opentopia\verify-target"
   $previousCargoTargetDir = $env:CARGO_TARGET_DIR
   $env:CARGO_TARGET_DIR = $targetDir
@@ -277,53 +314,38 @@ try {
       throw "expected enabled thread MCP binding"
     }
 
-    Invoke-RestMethod `
+    $searchResult = Invoke-RestMethod `
       -Method Post `
-      -Uri "http://127.0.0.1:8801/api/threads/$($thread.id)/messages" `
+      -Uri "http://127.0.0.1:8801/api/threads/$($thread.id)/workspace/search" `
       -ContentType "application/json" `
-      -Body (@{ content = "/search AgentCore" } | ConvertTo-Json) | Out-Null
-
-    $hasSearchFinish = $false
-    for ($i = 0; $i -lt 20; $i += 1) {
-      Start-Sleep -Milliseconds 500
-      $searchEvents = Invoke-RestMethod `
-        -Uri "http://127.0.0.1:8801/api/threads/$($thread.id)/events" `
-        -TimeoutSec 5
-      $hasSearchFinish = @(
-        $searchEvents | Where-Object {
-          $_.payload.type -eq "tool_call_finished" -and $_.payload.result.output -match "AgentCore"
-        }
-      ).Count -gt 0
-      if ($hasSearchFinish) { break }
-    }
-    if (-not $hasSearchFinish) {
-      throw "expected sandboxed search tool to finish"
+      -Body (@{ query = "AgentCore"; fixedStrings = $true; maxResults = 20 } | ConvertTo-Json)
+    $hasSearchFinish = $searchResult.output -match "AgentCore"
+    if (-not $hasSearchFinish -or $searchResult.metadata.toolName -ne "search") {
+      throw "expected deterministic workspace search to return AgentCore"
     }
 
-    Invoke-RestMethod `
+    $evaluationRuns = Invoke-RestMethod `
       -Method Post `
-      -Uri "http://127.0.0.1:8801/api/threads/$($thread.id)/messages" `
+      -Uri "http://127.0.0.1:8801/api/evaluations/import" `
       -ContentType "application/json" `
-      -Body (@{ content = "/run git reset --hard" } | ConvertTo-Json) | Out-Null
-
-    Start-Sleep -Seconds 1
-    $pending = Invoke-RestMethod `
-      -Uri "http://127.0.0.1:8801/api/threads/$($thread.id)/approvals?status=pending" `
+      -Body (@{ workspaceRoot = $hunkWorkspace } | ConvertTo-Json)
+    $evaluationRun = @($evaluationRuns | Where-Object { $_.runId -eq "integration-suite" })[0]
+    $evaluationTask = @($evaluationRun.tasks | Where-Object { $_.taskId -eq "HARNESS-001" })[0]
+    if (
+      -not $evaluationRun -or
+      $evaluationTask.failureCategory -ne "harness.adapter" -or
+      $evaluationTask.toolCallsByName.read_file -ne 2 -or
+      $evaluationTask.totalTokens -ne 321
+    ) {
+      throw "expected persisted evaluation catalog with detailed Harness metrics"
+    }
+    $encodedWorkspaceRoot = [uri]::EscapeDataString($hunkWorkspace)
+    $persistedEvaluationRuns = Invoke-RestMethod `
+      -Uri "http://127.0.0.1:8801/api/evaluations?workspaceRoot=$encodedWorkspaceRoot" `
       -TimeoutSec 5
-    if (@($pending).Count -lt 1) {
-      throw "expected at least one pending approval"
+    if (@($persistedEvaluationRuns | Where-Object { $_.runId -eq "integration-suite" }).Count -ne 1) {
+      throw "expected evaluation catalog entry to persist"
     }
-
-    $approvalId = @($pending)[0].approvalId
-    Invoke-RestMethod `
-      -Method Post `
-      -Uri "http://127.0.0.1:8801/api/threads/$($thread.id)/approvals/$approvalId/decision" `
-      -ContentType "application/json" `
-      -Body (@{ approved = $false } | ConvertTo-Json) | Out-Null
-
-    $denied = Invoke-RestMethod `
-      -Uri "http://127.0.0.1:8801/api/threads/$($thread.id)/approvals?status=denied" `
-      -TimeoutSec 5
 
     [PSCustomObject]@{
       healthy = $healthy
@@ -335,8 +357,8 @@ try {
       sandboxKind = $sandbox.kind
       mcpServers = @($threadMcp).Count
       searchToolFinished = $hasSearchFinish
-      pendingBeforeDeny = @($pending).Count
-      deniedAfterDeny = @($denied).Count
+      searchEngine = $searchResult.metadata.engine
+      evaluationCatalogPersisted = $true
       hunkStageUnstageDiscard = $true
       terminalHistoryPersisted = $true
       persistentPty = $ptyOutputSeen
