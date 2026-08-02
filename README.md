@@ -129,25 +129,13 @@ secret value. When the bundled server is spawned by Electron, the main process
 decrypts that key and injects it as `OPENTOPIA_API_KEY` only if an explicit
 environment or `.env` value has not already configured the provider key.
 
-Deterministic tool commands supported by the MVP:
-
-```text
-/list
-/read README.md
-/search AgentCore
-/search crates/opentopia-core/src -- ToolResult
-/write scratch/example.txt
-hello from OpenTopia
-/run git status --short
-/diff
-/patch
-diff --git a/example.txt b/example.txt
-new file mode 100644
---- /dev/null
-+++ b/example.txt
-@@ -0,0 +1 @@
-+hello
-```
+Workspace actions are exposed as first-class UI and HTTP APIs rather than
+special messages in the agent conversation. Slash-prefixed text is rejected at
+the message API, so it cannot accidentally bypass the model/tool permission
+flow. The deterministic workspace search endpoint is
+`POST /api/threads/{thread_id}/workspace/search`; it uses the same sandboxed
+`SearchTool` as the agent and is suitable for integration checks without a
+provider request.
 
 Build a desktop installer after installing Rust:
 
