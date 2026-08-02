@@ -197,6 +197,13 @@ export type ProviderKind =
   | "anthropic"
   | "codex_app_server";
 
+export type ProviderDriverDescriptor = {
+  id: string;
+  kind: ProviderKind;
+  displayName: string;
+  trust: "built_in" | "signed";
+};
+
 export type OpenAiProtocol = "chat_completions" | "responses";
 
 export type ProviderFeatureSupport = "supported" | "unsupported" | "unknown";
@@ -304,6 +311,35 @@ export type ProviderHealthCheckResult = {
   modelAvailable: boolean;
   error?: string | null;
   openaiCompatibility?: OpenAiCompatibilityReport | null;
+};
+
+export type EvaluationTaskResult = {
+  taskId: string;
+  runId?: string | null;
+  title?: string | null;
+  status: string;
+  failureCategory?: string | null;
+  error?: string | null;
+  toolCallsByName: Record<string, number>;
+  totalTokens?: number | null;
+  errorEvents?: number | null;
+  recoveryPassed?: boolean | null;
+  processContractPassed?: boolean | null;
+};
+
+export type EvaluationRun = {
+  runId: string;
+  workspaceRoot: string;
+  title: string;
+  status: string;
+  model?: string | null;
+  failureCategory?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  sourcePath: string;
+  tasks: EvaluationTaskResult[];
+  summary: unknown;
+  updatedAt: string;
 };
 
 export type CodexAccountStatus = {
@@ -609,6 +645,190 @@ export type GitBranchInfo = {
   remote: boolean;
   upstream: string | null;
   symbolicTarget: string | null;
+};
+
+export type LocalGitOperation =
+  | { type: "status"; request: { includeUntracked: boolean } }
+  | { type: "branches"; request: { includeRemote: boolean } }
+  | { type: "remotes" }
+  | { type: "stage"; request: { paths: string[] } }
+  | { type: "unstage"; request: { paths: string[] } }
+  | { type: "discard"; request: { paths: string[]; confirm: boolean } }
+  | {
+      type: "create_branch";
+      request: { branch: string; startPoint: string | null };
+    }
+  | { type: "switch_branch"; request: { branch: string } }
+  | {
+      type: "commit";
+      request: { message: string; allTracked: boolean };
+    }
+  | {
+      type: "push";
+      request: { remote: string; branch: string; setUpstream: boolean };
+    }
+  | { type: "fetch"; request: { remote: string | null } }
+  | {
+      type: "pull";
+      request: { remote: string | null; branch: string | null };
+    }
+  | {
+      type: "compare";
+      request: { base: string; head: string; mode: "direct" | "merge_base" };
+    }
+  | {
+      type: "create_worktree";
+      request: {
+        path: string;
+        target:
+          | { type: "existing_branch"; branch: string }
+          | {
+              type: "new_branch";
+              branch: string;
+              startPoint: string | null;
+            };
+      };
+    }
+  | { type: "list_worktrees" }
+  | { type: "remove_worktree"; request: { path: string; confirm: boolean } };
+
+export type NormalizedGitRemoteUrl = {
+  normalized: string;
+  scheme: string | null;
+  host: string | null;
+  port: number | null;
+  repositoryPath: string;
+};
+
+export type LocalGitRemote = {
+  name: string;
+  fetchUrls: NormalizedGitRemoteUrl[];
+  pushUrls: NormalizedGitRemoteUrl[];
+};
+
+export type LocalGitStatus = {
+  branch: string | null;
+  aheadBehind: { ahead: number; behind: number } | null;
+  porcelainV2: string;
+};
+
+export type LocalGitWorktree = {
+  path: string;
+  head: string | null;
+  branch: string | null;
+  detached: boolean;
+  bare: boolean;
+  locked: boolean;
+  lockReason: string | null;
+  prunable: boolean;
+  prunableReason: string | null;
+};
+
+export type LocalGitOutput =
+  | { type: "status"; value: LocalGitStatus }
+  | { type: "branches"; value: GitBranchInfo[] }
+  | { type: "remotes"; value: LocalGitRemote[] }
+  | { type: "worktrees"; value: LocalGitWorktree[] }
+  | { type: "compare"; value: number[] }
+  | { type: "mutation"; value: number[] };
+
+export type LocalGitResponse = {
+  apiVersion: "localGit.v1" | string;
+  operation:
+    | "status"
+    | "list_branches"
+    | "list_remotes"
+    | "stage"
+    | "unstage"
+    | "discard"
+    | "create_branch"
+    | "switch_branch"
+    | "commit"
+    | "push"
+    | "fetch"
+    | "pull"
+    | "compare"
+    | "create_worktree"
+    | "list_worktrees"
+    | "remove_worktree";
+  command: {
+    exitCode: number | null;
+    success: boolean;
+    truncated: boolean;
+    stderr: number[];
+  };
+  output: LocalGitOutput;
+};
+
+export type ScmConnectorCapability =
+  | "change_requests"
+  | "issues"
+  | "automation"
+  | "reviews"
+  | "releases"
+  | "repository_identity";
+
+export type ScmHostMatcher =
+  | { type: "exact"; value: string }
+  | { type: "suffix"; value: string }
+  | { type: "any" };
+
+export type ScmPathMatcher =
+  | { type: "exact"; value: string }
+  | { type: "prefix"; value: string }
+  | { type: "any" };
+
+export type ScmConnectorDescriptor = {
+  pluginId: string;
+  connectorId: string;
+  displayName: string;
+  capabilities: ScmConnectorCapability[];
+  remoteMatchers: Array<{
+    matcherId: string;
+    schemes: string[];
+    host: ScmHostMatcher;
+    path: ScmPathMatcher;
+  }>;
+};
+
+export type ScmRemoteBinding = {
+  workspaceKey: string;
+  remoteName: string;
+  connectorPluginId: string;
+  connectorId: string;
+  accountBindingId: string | null;
+};
+
+export type ScmConnectorCandidate = {
+  pluginId: string;
+  connectorId: string;
+  matcherId: string;
+  specificity: { host: number; path: number; scheme: number };
+};
+
+export type ScmConnectorSelection =
+  | { status: "unmatched" }
+  | {
+      status: "selected";
+      candidate: ScmConnectorCandidate;
+      source: "best_match" | "remote_binding";
+      accountBindingId: string | null;
+    }
+  | {
+      status: "conflict";
+      candidates: ScmConnectorCandidate[];
+      bindingIssue:
+        | "wrong_workspace_or_remote"
+        | "connector_unavailable"
+        | "connector_not_best_match"
+        | null;
+    };
+
+export type ScmRemoteConnectorResponse = {
+  remote: LocalGitRemote;
+  connectors: ScmConnectorDescriptor[];
+  binding: ScmRemoteBinding | null;
+  selection: ScmConnectorSelection;
 };
 
 export type TerminalEventType =
@@ -1065,6 +1285,277 @@ export type PluginView = {
   mcpServers: McpServerView[];
   threadEnabled: boolean;
   compatible: boolean;
+};
+
+export type PluginControlScopeType = "global" | "workspace" | "thread";
+
+export type PluginControlScope = {
+  scopeType: PluginControlScopeType;
+  scopeId?: string;
+};
+
+export type PluginActivationRecord = {
+  pluginId: string;
+  scope: PluginControlScope;
+  enabled: boolean;
+  updatedAt: string;
+};
+
+export type PluginSettingsRecord = {
+  pluginId: string;
+  scope: PluginControlScope;
+  settings: unknown;
+  updatedAt: string;
+};
+
+export type PluginSecretBindingRecord = {
+  pluginId: string;
+  scope: PluginControlScope;
+  settingKey: string;
+  bindingId: string;
+  metadata: unknown;
+  updatedAt: string;
+};
+
+export type PluginPermissionGrantStatus = "granted" | "revoked";
+
+export type PluginPermissionGrantRecord = {
+  pluginId: string;
+  scope: PluginControlScope;
+  permission: string;
+  constraint: unknown;
+  status: PluginPermissionGrantStatus;
+  grantedAt?: string;
+  updatedAt: string;
+};
+
+export type PluginPermissionRequest = {
+  category: string;
+  value: string;
+  permission: string;
+};
+
+export type PluginContributionRecord = {
+  pluginId: string;
+  contributionId: string;
+  kind: string;
+  localId: string;
+  descriptor: unknown;
+  updatedAt: string;
+};
+
+export type PluginRuntimeHealthStatus =
+  "unknown" | "ready" | "degraded" | "error" | "stopped";
+
+export type PluginRuntimeHealthRecord = {
+  pluginId: string;
+  contributionId: string;
+  status: PluginRuntimeHealthStatus;
+  lastError?: string;
+  lastCheckedAt: string;
+  restartCount: number;
+};
+
+export type PluginControlManifest = {
+  apiVersion?: string;
+  hostCapabilities: string[];
+  permissionRequests: PluginPermissionRequest[];
+  configurationSchema?: unknown;
+  secretSettingKeys: string[];
+  requiredSecretSettingKeys: string[];
+  contributions: PluginContributionRecord[];
+};
+
+export type PluginDetail = {
+  plugin: PluginDescriptor;
+  manifest: PluginControlManifest;
+  activations: PluginActivationRecord[];
+  effectiveEnabled: boolean;
+  contributions: PluginContributionRecord[];
+  health: PluginRuntimeHealthRecord[];
+};
+
+export type PluginActivationResponse = {
+  activation: PluginActivationRecord;
+  effectiveEnabled: boolean;
+};
+
+export type PluginSettingsResponse = {
+  schema?: unknown;
+  settings: PluginSettingsRecord;
+  secretBindings: PluginSecretBindingRecord[];
+};
+
+export type PluginPermissionsResponse = {
+  requests: PluginPermissionRequest[];
+  grants: PluginPermissionGrantRecord[];
+};
+
+export type PluginContributionKind =
+  | "skill"
+  | "mcp_server"
+  | "native_tool"
+  | "previewer"
+  | "context_loader"
+  | "agent_profile"
+  | "scm_connector"
+  | "app";
+
+export type PluginCapabilityPermission = {
+  kind: "filesystem" | "network" | "secret" | "desktop";
+  value: string;
+};
+
+export type PluginCapabilityContribution = {
+  id: string;
+  pluginId: string;
+  localId: string;
+  kind: PluginContributionKind;
+  origin: "codex_compatible" | "open_topia";
+  apiVersion: string;
+  requiredHostCapabilities: string[];
+  permissions: PluginCapabilityPermission[];
+  configurationSchema?: string | null;
+  declaration: unknown;
+};
+
+export type ActivatedPluginContribution = {
+  pluginName: string;
+  source: PluginDescriptor["source"];
+  trust: PluginDescriptor["trust"];
+  contribution: PluginCapabilityContribution;
+};
+
+export type CapabilityUnavailableReason =
+  | "disabled"
+  | "host_trust_required"
+  | "conflict"
+  | { missing_host_capabilities: string[] }
+  | { missing_permissions: PluginCapabilityPermission[] };
+
+export type CapabilityActivationSnapshot = {
+  scope: {
+    workspaceId?: string | null;
+    threadId?: string | null;
+  };
+  active: ActivatedPluginContribution[];
+  unavailable: Array<{
+    contribution: ActivatedPluginContribution;
+    reason: CapabilityUnavailableReason;
+  }>;
+  conflicts: Array<{
+    key: string;
+    contributionIds: string[];
+  }>;
+};
+
+export type ThreadPluginCapabilities = {
+  pluginId: string;
+  pluginName: string;
+  enabled: boolean;
+  contributions: PluginContributionRecord[];
+  grantedPermissions: string[];
+};
+
+export type ThreadCapabilities = {
+  threadId: string;
+  workspaceRoot: string;
+  generatedAt: string;
+  snapshot: CapabilityActivationSnapshot;
+  plugins: ThreadPluginCapabilities[];
+};
+
+export type MediaHandlerDescriptor = {
+  contributionId: string;
+  pluginId: string;
+  localId: string;
+  kind: "previewer" | "context_loader";
+  extensions: string[];
+  mediaTypes: string[];
+  priority: number;
+  runtime: string;
+};
+
+export type MediaHandlerSelection =
+  | { status: "none" }
+  | { status: "selected"; handler: MediaHandlerDescriptor }
+  | { status: "conflict"; contributionIds: string[] };
+
+export type MediaHandlerOperation = "preview" | "load_context";
+
+export type MediaHandlerRuntime =
+  | { type: "mcp_v1"; server: string; tool: string }
+  | { type: "builtin"; adapter: string };
+
+export type MediaHandlerResult = {
+  apiVersion: "opentopia.mediaHandlerResult.v1" | string;
+  kind: MediaHandlerOperation;
+  payload: unknown;
+};
+
+export type MediaHandlerInvocationResponse = {
+  contributionId: string;
+  pluginId: string;
+  runtime: MediaHandlerRuntime;
+  bytesRead: number;
+  output: MediaHandlerResult;
+};
+
+export type AppViewDescriptor = {
+  contributionId: string;
+  pluginId: string;
+  localId: string;
+  title: string;
+  entry: string;
+  allowedChannels: string[];
+  sandbox: {
+    nodeIntegration: false;
+    allowPopups: false;
+    allowTopNavigation: false;
+    allowedHostApis: string[];
+  };
+};
+
+export type AppViewSession = {
+  sessionId: string;
+  threadId: string;
+  descriptor: AppViewDescriptor;
+  status: "ready" | "stopped";
+  startedAt: string;
+  stoppedAt?: string | null;
+};
+
+export type AppViewSessionResponse = AppViewSession & {
+  contentPath: string;
+};
+
+export type AppViewMessage = {
+  sessionId: string;
+  channel: string;
+  payload: unknown;
+  sentAt: string;
+};
+
+export type PluginAgentProfile = {
+  name: string;
+  description: string;
+  developer_instructions: string;
+  nickname_candidates: string[];
+  model?: string | null;
+  model_reasoning_effort?: string | null;
+  sandbox_mode?: "read-only" | "workspace-write" | "danger-full-access" | null;
+  allowed_tools?: string[] | null;
+  denied_tools: string[];
+  source_plugin_id?: string | null;
+  source_contribution_id?: string | null;
+};
+
+export type ContributionHostSnapshot = {
+  previewers: MediaHandlerDescriptor[];
+  contextLoaders: MediaHandlerDescriptor[];
+  apps: AppViewDescriptor[];
+  agentProfiles: PluginAgentProfile[];
+  issues: string[];
 };
 
 export type SkillRef = {

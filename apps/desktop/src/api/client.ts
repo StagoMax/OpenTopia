@@ -1,6 +1,9 @@
 import type {
   AgentEvent,
   AgentRuntimeSettings,
+  AppViewMessage,
+  AppViewSession,
+  AppViewSessionResponse,
   AppSettings,
   ArtifactContent,
   ArtifactDescriptor,
@@ -10,9 +13,11 @@ import type {
   CodexLoginStart,
   ComputerObservation,
   ComputerWindowTarget,
+  ContributionHostSnapshot,
   ContextStatus,
   ContextSummary,
   DiffFileActionResult,
+  EvaluationRun,
   ExperienceMode,
   GitBranchInfo,
   GitStatusSummary,
@@ -21,6 +26,8 @@ import type {
   GoalSnapshot,
   GoalStatus,
   InlineImageAttachment,
+  LocalGitOperation,
+  LocalGitResponse,
   McpCallResult,
   McpServerInput,
   McpServerStatus,
@@ -28,6 +35,14 @@ import type {
   McpToolDescriptor,
   Message,
   PermissionMode,
+  PluginActivationResponse,
+  PluginContributionRecord,
+  PluginControlScope,
+  PluginDetail,
+  PluginPermissionGrantRecord,
+  PluginPermissionsResponse,
+  PluginRuntimeHealthRecord,
+  PluginSettingsResponse,
   PluginView,
   PreviewDescriptor,
   PreviewTarget,
@@ -35,9 +50,11 @@ import type {
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
+  ProviderDriverDescriptor,
   ProviderModelSyncResult,
   ProviderSettings,
   SandboxDescriptor,
+  ScmRemoteConnectorResponse,
   SkillDescriptor,
   SpreadsheetPreview,
   SpreadsheetPreviewRange,
@@ -45,6 +62,10 @@ import type {
   TerminalCancelResponse,
   TerminalEvent,
   TerminalStartResponse,
+  ThreadCapabilities,
+  MediaHandlerSelection,
+  MediaHandlerInvocationResponse,
+  MediaHandlerOperation,
   TurnChangeSet,
   TurnFileDiffPreview,
   TurnUndoPreview,
@@ -159,6 +180,10 @@ export class ApiClient {
     return this.get("/api/provider/health");
   }
 
+  async listProviderDrivers(): Promise<ProviderDriverDescriptor[]> {
+    return this.get("/api/provider/drivers");
+  }
+
   async getCodexAccount(): Promise<CodexAccountStatus> {
     return this.get("/api/codex/account");
   }
@@ -175,9 +200,15 @@ export class ApiClient {
     await this.post("/api/codex/account/logout", {});
   }
 
-  async listSkills(workspaceRoot?: string | null): Promise<SkillDescriptor[]> {
+  async listSkills(
+    workspaceRoot?: string | null,
+    threadId?: string | null,
+  ): Promise<SkillDescriptor[]> {
     return this.get(
-      `/api/skills${queryString({ workspaceRoot: workspaceRoot ?? undefined })}`,
+      `/api/skills${queryString({
+        workspaceRoot: workspaceRoot ?? undefined,
+        threadId: threadId ?? undefined,
+      })}`,
     );
   }
 
@@ -218,6 +249,237 @@ export class ApiClient {
     });
   }
 
+  async getPluginDetail(
+    pluginId: string,
+    input?: { workspaceRoot?: string | null; threadId?: string | null },
+  ): Promise<PluginDetail> {
+    return this.get(
+      `/api/plugins/${encodeURIComponent(pluginId)}${queryString({
+        workspaceRoot: input?.workspaceRoot ?? undefined,
+        threadId: input?.threadId ?? undefined,
+      })}`,
+    );
+  }
+
+  async setPluginActivation(
+    pluginId: string,
+    scope: PluginControlScope,
+    enabled: boolean,
+  ): Promise<PluginActivationResponse> {
+    return this.put(`/api/plugins/${encodeURIComponent(pluginId)}/activation`, {
+      scope,
+      enabled,
+    });
+  }
+
+  async getPluginSettings(
+    pluginId: string,
+    scope: PluginControlScope,
+  ): Promise<PluginSettingsResponse> {
+    return this.get(
+      `/api/plugins/${encodeURIComponent(pluginId)}/settings${queryString({
+        scopeType: scope.scopeType,
+        scopeId: scope.scopeId,
+      })}`,
+    );
+  }
+
+  async updatePluginSettings(
+    pluginId: string,
+    scope: PluginControlScope,
+    settings: Record<string, unknown>,
+    secretBindings: Record<string, string | null>,
+  ): Promise<PluginSettingsResponse> {
+    return this.patch(`/api/plugins/${encodeURIComponent(pluginId)}/settings`, {
+      scope,
+      settings,
+      secretBindings,
+    });
+  }
+
+  async getPluginPermissions(
+    pluginId: string,
+    input?: { workspaceRoot?: string | null; threadId?: string | null },
+  ): Promise<PluginPermissionsResponse> {
+    return this.get(
+      `/api/plugins/${encodeURIComponent(pluginId)}/permissions${queryString({
+        workspaceRoot: input?.workspaceRoot ?? undefined,
+        threadId: input?.threadId ?? undefined,
+      })}`,
+    );
+  }
+
+  async setPluginPermission(
+    pluginId: string,
+    input: {
+      scope: PluginControlScope;
+      permission: string;
+      constraint: unknown;
+      granted: boolean;
+    },
+  ): Promise<PluginPermissionGrantRecord> {
+    return this.put(
+      `/api/plugins/${encodeURIComponent(pluginId)}/permissions`,
+      input,
+    );
+  }
+
+  async getPluginContributions(
+    pluginId: string,
+    input?: { workspaceRoot?: string | null; threadId?: string | null },
+  ): Promise<PluginContributionRecord[]> {
+    return this.get(
+      `/api/plugins/${encodeURIComponent(pluginId)}/contributions${queryString({
+        workspaceRoot: input?.workspaceRoot ?? undefined,
+        threadId: input?.threadId ?? undefined,
+      })}`,
+    );
+  }
+
+  async getPluginHealth(
+    pluginId: string,
+    input?: { workspaceRoot?: string | null; threadId?: string | null },
+  ): Promise<PluginRuntimeHealthRecord[]> {
+    return this.get(
+      `/api/plugins/${encodeURIComponent(pluginId)}/health${queryString({
+        workspaceRoot: input?.workspaceRoot ?? undefined,
+        threadId: input?.threadId ?? undefined,
+      })}`,
+    );
+  }
+
+  async getThreadCapabilities(threadId: string): Promise<ThreadCapabilities> {
+    return this.get(
+      `/api/threads/${encodeURIComponent(threadId)}/capabilities`,
+    );
+  }
+
+  async getContributionHosts(
+    threadId: string,
+  ): Promise<ContributionHostSnapshot> {
+    return this.get(
+      `/api/threads/${encodeURIComponent(threadId)}/contribution-hosts`,
+    );
+  }
+
+  async selectPreviewHandler(
+    threadId: string,
+    input: { path?: string; contentType?: string },
+  ): Promise<MediaHandlerSelection> {
+    return this.get(
+      `/api/threads/${encodeURIComponent(threadId)}/preview-handler${queryString(input)}`,
+    );
+  }
+
+  async selectContextLoader(
+    threadId: string,
+    input: { path?: string; contentType?: string },
+  ): Promise<MediaHandlerSelection> {
+    return this.get(
+      `/api/threads/${encodeURIComponent(threadId)}/context-loader${queryString(input)}`,
+    );
+  }
+
+  async invokeMediaHandler(
+    threadId: string,
+    input: {
+      operation: MediaHandlerOperation;
+      contributionId?: string;
+      path: string;
+      contentType?: string;
+      options?: Record<string, unknown>;
+    },
+  ): Promise<MediaHandlerInvocationResponse> {
+    return this.post(
+      `/api/threads/${encodeURIComponent(threadId)}/media-handlers/invoke`,
+      { ...input, options: input.options ?? {} },
+    );
+  }
+
+  async startPluginAppSession(
+    threadId: string,
+    contributionId: string,
+  ): Promise<AppViewSessionResponse> {
+    return this.post(
+      `/api/threads/${encodeURIComponent(threadId)}/plugin-app-sessions`,
+      { contributionId },
+    );
+  }
+
+  async getPluginAppContent(
+    threadId: string,
+    sessionId: string,
+  ): Promise<string> {
+    const response = await fetch(
+      `${this.baseUrl}/api/threads/${encodeURIComponent(threadId)}/plugin-app-sessions/${encodeURIComponent(sessionId)}/content`,
+      { headers: this.authHeaders() },
+    );
+    if (!response.ok) {
+      const message = await response.text();
+      throw new ApiResponseError(
+        response.status,
+        message || `${response.status} ${response.statusText}`,
+      );
+    }
+    return response.text();
+  }
+
+  async postPluginAppMessage(
+    threadId: string,
+    sessionId: string,
+    channel: string,
+    payload: unknown,
+  ): Promise<AppViewMessage> {
+    return this.post(
+      `/api/threads/${encodeURIComponent(threadId)}/plugin-app-sessions/${encodeURIComponent(sessionId)}/messages`,
+      { channel, payload },
+    );
+  }
+
+  async stopPluginAppSession(
+    threadId: string,
+    sessionId: string,
+  ): Promise<AppViewSession> {
+    return this.delete(
+      `/api/threads/${encodeURIComponent(threadId)}/plugin-app-sessions/${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  async executeLocalGit(
+    threadId: string,
+    repository: string,
+    operation: LocalGitOperation,
+  ): Promise<LocalGitResponse> {
+    return this.post(
+      `/api/threads/${encodeURIComponent(threadId)}/local-git/v1`,
+      { repository, operation },
+    );
+  }
+
+  async getScmRemoteConnector(
+    threadId: string,
+    remoteName: string,
+  ): Promise<ScmRemoteConnectorResponse> {
+    return this.get(
+      `/api/threads/${encodeURIComponent(threadId)}/scm/remotes/${encodeURIComponent(remoteName)}/connector`,
+    );
+  }
+
+  async setScmRemoteConnector(
+    threadId: string,
+    remoteName: string,
+    input: {
+      connectorPluginId: string | null;
+      connectorId: string | null;
+      accountBindingId?: string | null;
+    },
+  ): Promise<ScmRemoteConnectorResponse> {
+    return this.put(
+      `/api/threads/${encodeURIComponent(threadId)}/scm/remotes/${encodeURIComponent(remoteName)}/connector`,
+      input,
+    );
+  }
+
   async testProviderConnection(
     providerId?: string,
   ): Promise<ProviderHealthCheckResult> {
@@ -244,6 +506,14 @@ export class ApiClient {
 
   async listProjects(): Promise<Project[]> {
     return this.get("/api/projects");
+  }
+
+  async listEvaluationRuns(workspaceRoot: string): Promise<EvaluationRun[]> {
+    return this.get(`/api/evaluations${queryString({ workspaceRoot })}`);
+  }
+
+  async importEvaluationRuns(workspaceRoot: string): Promise<EvaluationRun[]> {
+    return this.post("/api/evaluations/import", { workspaceRoot });
   }
 
   async createProject(input: {

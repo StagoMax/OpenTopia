@@ -1407,9 +1407,7 @@ function ProviderSettingsView({
                     )
                   }
                 >
-                  <option value="openai">
-                    OpenAI Compatible（自动识别）
-                  </option>
+                  <option value="openai">OpenAI Compatible（自动识别）</option>
                   <option value="anthropic">Anthropic Messages</option>
                   <option value="codex_app_server">
                     Codex App Server (local)
@@ -1447,9 +1445,7 @@ function ProviderSettingsView({
                 </div>
               ) : null}
               {usesCodexAppServer ? (
-                <div
-                  className="settings-field-wide settings-provider-local-note"
-                >
+                <div className="settings-field-wide settings-provider-local-note">
                   <CodexAccountSettings
                     account={codexAccount}
                     loading={codexAccountLoading}
@@ -1578,7 +1574,8 @@ function ProviderSettingsView({
                       }
                     />
                     <small>
-                      留空则不发送此参数，使用模型默认值。推理模型（o 系列、GPT-5）不支持自定义温度。
+                      留空则不发送此参数，使用模型默认值。推理模型（o
+                      系列、GPT-5）不支持自定义温度。
                     </small>
                   </label>
                   <label>
@@ -2124,8 +2121,8 @@ function CodexAccountSettings({
         </p>
       ) : null}
       <small className="settings-codex-account-hint">
-        登录后，Codex Provider 会使用该账号可用的 ChatGPT/Codex 额度；API
-        Key 模式仍使用 API 平台额度。
+        登录后，Codex Provider 会使用该账号可用的 ChatGPT/Codex 额度；API Key
+        模式仍使用 API 平台额度。
       </small>
     </Panel>
   );

@@ -62,6 +62,8 @@ import type {
 } from "../types";
 import type { ApiClient } from "../api/client";
 import { ArtifactGallery } from "./ArtifactGallery";
+import { EvaluationPanel } from "./EvaluationPanel";
+import { PluginControlPanel } from "./PluginControlPanel";
 import {
   DiffReviewPanel,
   type DiffReviewFileContent,
@@ -74,7 +76,12 @@ import { detectLanguage, MonacoEditor } from "./MonacoEditor";
 import { Badge, Button, IconButton } from "./ui";
 
 export type WorkbenchTab =
-  "files" | "diff" | "terminal" | "extensions" | "sandbox";
+  | "files"
+  | "diff"
+  | "terminal"
+  | "extensions"
+  | "sandbox"
+  | "evaluations";
 
 type WorkbenchPanelProps = {
   client: ApiClient | null;
@@ -154,6 +161,7 @@ const tabs: Array<{
   { id: "terminal", label: "Terminal", icon: TerminalSquare },
   { id: "extensions", label: "Plugins", icon: Puzzle },
   { id: "sandbox", label: "Sandbox", icon: Box },
+  { id: "evaluations", label: "Evaluations", icon: Workflow },
 ];
 
 export function WorkbenchPanel({
@@ -273,7 +281,10 @@ export function WorkbenchPanel({
       )}
       {activeTab === "extensions" && (
         <ExtensionsView
+          client={client}
           hasThread={Boolean(thread)}
+          threadId={thread?.id ?? null}
+          workspaceRoot={shownWorkspaceRoot}
           plugins={plugins}
           selectedSkillIds={selectedSkillIds}
           mcpServers={mcpServers}
@@ -291,6 +302,13 @@ export function WorkbenchPanel({
         />
       )}
       {activeTab === "sandbox" && <SandboxView sandbox={sandbox} />}
+      {activeTab === "evaluations" && (
+        <EvaluationPanel
+          client={client}
+          workspaceRoot={shownWorkspaceRoot}
+          onOpenPath={onOpenPath}
+        />
+      )}
     </>
   );
 
@@ -1541,7 +1559,10 @@ function lines(value: string): string[] {
 }
 
 function ExtensionsView({
+  client,
   hasThread,
+  threadId,
+  workspaceRoot,
   plugins,
   selectedSkillIds,
   mcpServers,
@@ -1557,7 +1578,10 @@ function ExtensionsView({
   onUsePluginSkills,
   onOpenPath,
 }: {
+  client: ApiClient | null;
   hasThread: boolean;
+  threadId: string | null;
+  workspaceRoot: string | null;
   plugins: PluginView[];
   selectedSkillIds: string[];
   mcpServers: McpServerView[];
@@ -1580,6 +1604,7 @@ function ExtensionsView({
   );
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedPluginId, setSelectedPluginId] = useState<string | null>(null);
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const filteredPlugins = useMemo(
     () =>
@@ -1597,6 +1622,13 @@ function ExtensionsView({
       plugin.threadEnabled ||
       plugin.skillIds.some((id) => selectedSkillIds.includes(id)),
   ).length;
+  const selectedPlugin = plugins.find(
+    (item) => item.plugin.id === selectedPluginId,
+  );
+
+  useEffect(() => {
+    if (selectedPluginId && !selectedPlugin) setSelectedPluginId(null);
+  }, [selectedPlugin, selectedPluginId]);
 
   async function run(key: string, action: () => Promise<void>) {
     setBusyKey(key);
@@ -1620,6 +1652,18 @@ function ExtensionsView({
     }
     await run(`remove:${view.plugin.id}`, () =>
       onUninstallPlugin(view.plugin.id),
+    );
+  }
+
+  if (selectedPlugin) {
+    return (
+      <PluginControlPanel
+        client={client}
+        pluginView={selectedPlugin}
+        threadId={threadId}
+        workspaceRoot={workspaceRoot}
+        onBack={() => setSelectedPluginId(null)}
+      />
     );
   }
 
@@ -1841,6 +1885,15 @@ function ExtensionsView({
                         )}
                       </div>
                       <div className="plugin-secondary-actions">
+                        <button
+                          className="icon-button"
+                          type="button"
+                          title="Configure plugin"
+                          aria-label={`Configure ${plugin.displayName}`}
+                          onClick={() => setSelectedPluginId(plugin.id)}
+                        >
+                          <Settings2 size={14} />
+                        </button>
                         <button
                           className="icon-button"
                           type="button"

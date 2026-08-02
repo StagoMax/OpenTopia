@@ -82,6 +82,7 @@ import {
   Table2,
   TerminalSquare,
   Trash2,
+  Workflow,
   X,
   Zap,
   ZoomIn,
@@ -1048,7 +1049,7 @@ export function App() {
     if (!client) return;
     let cancelled = false;
     void client
-      .listSkills(currentWorkspaceRoot)
+      .listSkills(currentWorkspaceRoot, activeThread?.id)
       .then((available) => {
         if (cancelled) return;
         setSkills(available);
@@ -1061,7 +1062,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [client, currentWorkspaceRoot, skillsRevision]);
+  }, [activeThread?.id, client, currentWorkspaceRoot, skillsRevision]);
 
   useEffect(() => {
     if (!client) return;
@@ -1545,7 +1546,10 @@ export function App() {
 
   useEffect(() => {
     const hasCodexProvider = Boolean(
-      client && settings?.providers.some((provider) => provider.kind === "codex_app_server"),
+      client &&
+      settings?.providers.some(
+        (provider) => provider.kind === "codex_app_server",
+      ),
     );
     if (!hasCodexProvider) {
       setCodexAccount(null);
@@ -2372,7 +2376,7 @@ export function App() {
           workspaceRoot: currentWorkspaceRoot,
           threadId: activeThread?.id,
         }),
-        client.listSkills(currentWorkspaceRoot),
+        client.listSkills(currentWorkspaceRoot, activeThread?.id),
         client.listMcpServers(),
         activeThread
           ? client.listThreadMcpServers(activeThread.id)
@@ -10639,6 +10643,7 @@ const toolStageLauncherKinds: Array<{
   { kind: "terminal", label: "终端" },
   { kind: "browser", label: "浏览器" },
   { kind: "files", label: "文件" },
+  { kind: "evaluations", label: "评测" },
 ];
 
 function toolTabTitle(kind: ToolTabKind): string {
@@ -10653,6 +10658,8 @@ function toolTabTitle(kind: ToolTabKind): string {
       return "Plugins";
     case "sandbox":
       return "沙箱";
+    case "evaluations":
+      return "评测";
     case "browser":
       return "浏览器";
     case "computer":
@@ -10676,6 +10683,8 @@ function toolTabIcon(kind: ToolTabKind): typeof Folder {
       return Plug;
     case "sandbox":
       return Box;
+    case "evaluations":
+      return Workflow;
     case "browser":
       return Globe2;
     case "computer":
