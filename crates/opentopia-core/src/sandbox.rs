@@ -103,7 +103,7 @@ impl Default for LocalSandboxConfig {
         Self {
             enabled: false,
             mode: OsSandboxMode::Disabled,
-            network: NetworkPolicy::Allow,
+            network: NetworkPolicy::Deny,
             read_paths: Vec::new(),
             write_paths: Vec::new(),
             sandbox_mode: SandboxMode::WorkspaceWrite,
@@ -209,7 +209,7 @@ impl LocalSandboxConfig {
                 }
             });
         let configured_network = match std::env::var("OPENTOPIA_SANDBOX_NETWORK")
-            .unwrap_or_else(|_| "allow".to_string())
+            .unwrap_or_else(|_| "deny".to_string())
             .to_ascii_lowercase()
             .as_str()
         {
@@ -693,44 +693,76 @@ fn build_windows_sandbox_command(
     workspace_root: &Path,
     config: &LocalSandboxConfig,
 ) -> anyhow::Result<SandboxCommandPlan> {
-    let Some(codex) = resolve_codex_sandbox_binary() else {
+    let Some(sandbox) = resolve_opentopia_sandbox_binary() else {
         let reason = std::env::var("OPENTOPIA_SANDBOX_BACKEND_ERROR")
-            .unwrap_or_else(|_| "Codex restricted-token sandbox backend was not found".to_string());
+            .unwrap_or_else(|_| "OpenTopia Windows sandbox backend was not found".to_string());
         return unavailable_backend(OsSandboxPlatform::Windows, reason, program, args, config);
     };
-    let permission_profile = windows_permission_profile(config);
-    let codex_home = prepare_codex_sandbox_home(config)?;
-    let mut sandbox_args = vec!["sandbox".to_string()];
-    for config_override in windows_permission_overrides(workspace_root, config) {
-        sandbox_args.push("--config".to_string());
-        sandbox_args.push(config_override);
+    build_windows_sandbox_command_with_binary(sandbox, program, args, cwd, workspace_root, config)
+}
+
+fn build_windows_sandbox_command_with_binary(
+    sandbox: PathBuf,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    workspace_root: &Path,
+    config: &LocalSandboxConfig,
+) -> anyhow::Result<SandboxCommandPlan> {
+    let workspace_root = absolute_path(workspace_root);
+    let mut sandbox_args = vec![
+        "run".to_string(),
+        "--cwd".to_string(),
+        path_to_string(&absolute_path(cwd)),
+    ];
+    for root in config
+        .effective_readable_roots(&workspace_root)
+        .into_iter()
+        .filter(|root| root.exists())
+    {
+        sandbox_args.extend([
+            "--read-root".to_string(),
+            path_to_string(&absolute_path(root)),
+        ]);
+    }
+    for root in config
+        .effective_writable_roots(&workspace_root)
+        .into_iter()
+        .filter(|root| root.exists())
+    {
+        sandbox_args.extend([
+            "--write-root".to_string(),
+            path_to_string(&absolute_path(root)),
+        ]);
+    }
+    for path in protected_paths(&workspace_root, config)
+        .into_iter()
+        .filter(|path| path.exists())
+    {
+        sandbox_args.extend([
+            "--protect".to_string(),
+            path_to_string(&absolute_path(path)),
+        ]);
     }
     sandbox_args.extend([
-        "--permission-profile".to_string(),
-        permission_profile.to_string(),
-        "--cd".to_string(),
-        path_to_string(&absolute_path(cwd)),
+        "--network".to_string(),
+        match config.network {
+            NetworkPolicy::Deny => "deny",
+            NetworkPolicy::Allow | NetworkPolicy::Inherit => "internet",
+        }
+        .to_string(),
     ]);
     sandbox_args.push("--".to_string());
     sandbox_args.push(program.to_string());
     sandbox_args.extend(args.iter().cloned());
 
     Ok(SandboxCommandPlan {
-        program: path_to_string(&codex),
+        program: path_to_string(&sandbox),
         args: sandbox_args,
-        env: vec![
-            ("CODEX_HOME".to_string(), path_to_string(&codex_home)),
-            (
-                "OPENTOPIA_SANDBOX_WORKSPACE".to_string(),
-                path_to_string(&absolute_path(workspace_root)),
-            ),
-        ],
+        env: Vec::new(),
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Windows,
-            backend: format!(
-                "codex-windows-{}",
-                windows_sandbox_implementation().replace('_', "-")
-            ),
+            backend: "opentopia-windows-appcontainer".to_string(),
         },
     })
 }
@@ -776,160 +808,41 @@ fn unavailable_backend(
     })
 }
 
-fn resolve_codex_sandbox_binary() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("OPENTOPIA_CODEX_SANDBOX_BIN") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-        if std::env::var("OPENTOPIA_REQUIRE_CODEX_SANDBOX_BIN").as_deref() == Ok("true") {
-            return None;
-        }
-    } else if std::env::var("OPENTOPIA_REQUIRE_CODEX_SANDBOX_BIN").as_deref() == Ok("true") {
-        return None;
-    }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        let candidate = PathBuf::from(profile)
-            .join(".codex")
-            .join("plugins")
-            .join(".plugin-appserver")
-            .join("codex.exe");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn prepare_codex_sandbox_home(config: &LocalSandboxConfig) -> anyhow::Result<PathBuf> {
-    let sandbox_root = config
-        .sandbox_home
-        .clone()
-        .or_else(|| {
-            std::env::var("OPENTOPIA_SANDBOX_HOME")
-                .ok()
-                .map(PathBuf::from)
-        })
-        .or_else(|| {
-            std::env::var("LOCALAPPDATA")
-                .map(|root| PathBuf::from(root).join("OpenTopia").join("sandbox"))
-                .ok()
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join("opentopia-sandbox"));
-    let implementation = windows_sandbox_implementation();
-    let contents = [
-        "[windows]".to_string(),
-        format!("sandbox = \"{implementation}\""),
-        "sandbox_private_desktop = true".to_string(),
-    ]
-    .join("\n");
-    let home = sandbox_root.join(format!("codex-home-v2-{implementation}"));
-    std::fs::create_dir_all(&home)?;
-    let path = home.join("config.toml");
-    if path.exists() {
-        anyhow::ensure!(
-            std::fs::read_to_string(&path).ok().as_deref() == Some(contents.as_str()),
-            "sandbox base profile content is inconsistent"
-        );
-    } else {
-        let temporary = home.join(format!("config-{}.tmp", Uuid::new_v4()));
-        std::fs::write(&temporary, &contents)?;
-        if let Err(error) = std::fs::rename(&temporary, &path) {
-            let _ = std::fs::remove_file(&temporary);
-            if !path.exists() {
-                return Err(error.into());
-            }
-        }
-        anyhow::ensure!(
-            std::fs::read_to_string(&path).ok().as_deref() == Some(contents.as_str()),
-            "sandbox base profile content is inconsistent"
-        );
-    }
-    Ok(home)
-}
-
-fn windows_permission_overrides(workspace_root: &Path, config: &LocalSandboxConfig) -> Vec<String> {
-    if windows_permission_profile(config) != "opentopia" {
-        return Vec::new();
-    }
-
-    let base = match config.sandbox_mode {
-        SandboxMode::ReadOnly => ":read-only",
-        SandboxMode::WorkspaceWrite => ":workspace",
-        SandboxMode::DangerFullAccess => ":danger-full-access",
-    };
-    let mut overrides = vec![format!(
-        "permissions.opentopia.extends={}",
-        toml_basic_string(base)
-    )];
-    let filesystem_entries = config
-        .read_paths
-        .iter()
-        .chain(config.approved_read_paths.iter())
-        .map(|path| (absolute_path(path), "read"))
-        .chain(
-            config
-                .effective_writable_roots(workspace_root)
-                .into_iter()
-                .filter(|path| absolute_path(path) != absolute_path(workspace_root))
-                .map(|path| (absolute_path(path), "write")),
-        )
-        .map(|(path, access)| {
-            format!(
-                "{}={}",
-                toml_basic_string(&path_to_string(&path)),
-                toml_basic_string(access)
-            )
-        })
-        .collect::<Vec<_>>();
-    if !filesystem_entries.is_empty() {
-        overrides.push(format!(
-            "permissions.opentopia.filesystem={{{}}}",
-            filesystem_entries.join(",")
-        ));
-    }
-    if matches!(
-        config.network,
-        NetworkPolicy::Allow | NetworkPolicy::Inherit
-    ) {
-        overrides.extend([
-            "permissions.opentopia.network.enabled=true".to_string(),
-            "permissions.opentopia.network.mode=\"full\"".to_string(),
-        ]);
-    }
-    overrides
-}
-
 fn windows_permission_profile(config: &LocalSandboxConfig) -> &'static str {
-    let has_extra_roots = !config.read_paths.is_empty()
-        || !config.write_paths.is_empty()
-        || !config.writable_roots.is_empty()
-        || !config.approved_read_paths.is_empty()
-        || !config.approved_write_paths.is_empty();
-    let network_enabled = matches!(
-        config.network,
-        NetworkPolicy::Allow | NetworkPolicy::Inherit
-    );
-    if has_extra_roots || network_enabled {
-        "opentopia"
-    } else {
-        match config.sandbox_mode {
-            SandboxMode::ReadOnly => ":read-only",
-            SandboxMode::WorkspaceWrite => ":workspace",
-            SandboxMode::DangerFullAccess => ":danger-full-access",
+    match (config.sandbox_mode, config.network) {
+        (SandboxMode::ReadOnly, NetworkPolicy::Deny) => "opentopia-appcontainer-read-only-offline",
+        (SandboxMode::WorkspaceWrite, NetworkPolicy::Deny) => {
+            "opentopia-appcontainer-workspace-write-offline"
         }
+        (SandboxMode::ReadOnly, _) => "opentopia-appcontainer-read-only-internet",
+        (SandboxMode::WorkspaceWrite, _) => "opentopia-appcontainer-workspace-write-internet",
+        (SandboxMode::DangerFullAccess, _) => "danger-full-access",
     }
 }
 
-fn windows_sandbox_implementation() -> &'static str {
-    match std::env::var("OPENTOPIA_WINDOWS_SANDBOX")
-        .unwrap_or_else(|_| "unelevated".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "elevated" => "elevated",
-        _ => "unelevated",
-    }
+fn resolve_opentopia_sandbox_binary() -> Option<PathBuf> {
+    let configured = std::env::var_os("OPENTOPIA_WINDOWS_SANDBOX_BIN").map(PathBuf::from);
+    let (sibling, cargo_debug_sibling) = std::env::current_exe()
+        .ok()
+        .map(|path| {
+            let sibling = path
+                .parent()
+                .map(|parent| parent.join("opentopia-sandbox.exe"));
+            // `cargo test` runs binaries from `target/<profile>/deps`; the
+            // first-party helper is emitted one directory above it.
+            let cargo_debug_sibling = path.parent().and_then(|parent| {
+                parent
+                    .parent()
+                    .map(|target_profile| target_profile.join("opentopia-sandbox.exe"))
+            });
+            (sibling, cargo_debug_sibling)
+        })
+        .unwrap_or((None, None));
+    configured
+        .into_iter()
+        .chain(sibling)
+        .chain(cargo_debug_sibling)
+        .find(|path| path.is_file())
 }
 
 fn first_existing_executable(candidates: &[PathBuf]) -> Option<PathBuf> {
@@ -1085,17 +998,6 @@ fn dedup_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     result
 }
 
-fn toml_basic_string(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,7 +1011,7 @@ mod tests {
         let config = LocalSandboxConfig::default();
         assert!(!config.is_enabled());
         assert_eq!(config.mode, OsSandboxMode::Disabled);
-        assert_eq!(config.network, NetworkPolicy::Allow);
+        assert_eq!(config.network, NetworkPolicy::Deny);
         assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
     }
 
@@ -1310,133 +1212,70 @@ mod tests {
     }
 
     #[test]
-    fn windows_best_effort_uses_restricted_token_backend_when_available() {
-        let args = sample_args();
-        let plan = build_local_sandbox_command_for_platform(
-            OsSandboxPlatform::Windows,
-            "powershell.exe",
-            &args,
-            Path::new("C:/workspace"),
-            Path::new("C:/workspace"),
-            &LocalSandboxConfig::best_effort(),
-        )
-        .expect("build plan");
+    fn windows_adapter_builds_first_party_appcontainer_command() {
+        let root =
+            std::env::temp_dir().join(format!("opentopia-windows-plan-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let shared = root.join("shared");
+        std::fs::create_dir_all(workspace.join(".git")).expect("create workspace");
+        std::fs::create_dir_all(&shared).expect("create shared root");
 
-        if resolve_codex_sandbox_binary().is_some() {
-            assert!(matches!(
-                plan.status,
-                SandboxCommandStatus::Wrapped {
-                    platform: OsSandboxPlatform::Windows,
-                    ..
-                }
-            ));
-            assert!(plan.args.iter().any(|arg| arg == "sandbox"));
-            assert_eq!(plan.args.last(), Some(&"echo ok".to_string()));
-        } else {
-            assert!(matches!(
-                plan.status,
-                SandboxCommandStatus::BestEffortPassthrough {
-                    platform: OsSandboxPlatform::Windows,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
-    fn windows_enforce_uses_restricted_token_backend() {
-        let args = sample_args();
-        let result = build_local_sandbox_command_for_platform(
-            OsSandboxPlatform::Windows,
-            "powershell.exe",
-            &args,
-            Path::new("C:/workspace"),
-            Path::new("C:/workspace"),
-            &LocalSandboxConfig::enforce(),
-        );
-
-        if resolve_codex_sandbox_binary().is_some() {
-            let plan = result.expect("windows enforce should use Codex sandbox backend");
-            assert!(matches!(
-                plan.status,
-                SandboxCommandStatus::Wrapped {
-                    platform: OsSandboxPlatform::Windows,
-                    ..
-                }
-            ));
-        } else {
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn windows_adapter_passes_custom_path_grants_per_invocation() {
-        let sandbox_home = std::env::temp_dir().join(format!(
-            "opentopia-sandbox-profile-{}",
-            uuid::Uuid::new_v4()
-        ));
         let mut config = LocalSandboxConfig::enforce();
-        config.sandbox_home = Some(sandbox_home.clone());
-        config.writable_roots = vec![PathBuf::from("C:/other")];
-        let result = build_local_sandbox_command_for_platform(
-            OsSandboxPlatform::Windows,
+        config.writable_roots = vec![shared.clone()];
+        config.grant_read_path(root.join("read-only.txt"));
+        let plan = build_windows_sandbox_command_with_binary(
+            std::env::current_exe().expect("current executable"),
             "powershell.exe",
             &sample_args(),
-            Path::new("C:/workspace"),
-            Path::new("C:/workspace"),
+            &workspace,
+            &workspace,
             &config,
-        );
+        )
+        .expect("build first-party Windows sandbox plan");
 
-        if resolve_codex_sandbox_binary().is_some() {
-            let plan = result.expect("custom roots should use a generated Codex profile");
-            assert!(plan
-                .args
-                .windows(2)
-                .any(|args| { args == ["--permission-profile", "opentopia"] }));
-            let codex_home = plan
-                .env
-                .iter()
-                .find_map(|(key, value)| (key == "CODEX_HOME").then_some(value))
-                .expect("plan includes CODEX_HOME");
-            let contents = std::fs::read_to_string(Path::new(codex_home).join("config.toml"))
-                .expect("read base profile");
-            assert!(!contents.contains("[permissions.opentopia]"));
-            let overrides = plan
-                .args
-                .windows(2)
-                .filter(|args| args[0] == "--config")
-                .map(|args| args[1].as_str())
-                .collect::<Vec<_>>();
-            assert!(overrides
-                .iter()
-                .any(|value| value == &"permissions.opentopia.extends=\":workspace\""));
-            assert!(overrides.iter().any(|value| value.contains("C:/other")));
-        } else {
-            assert!(result.is_err());
-        }
-        let _ = std::fs::remove_dir_all(sandbox_home);
+        let workspace_path = path_to_string(&absolute_path(&workspace));
+        let shared_path = path_to_string(&absolute_path(&shared));
+        assert_eq!(plan.args.first(), Some(&"run".to_string()));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|args| args[0] == "--write-root" && args[1] == workspace_path));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|args| args[0] == "--write-root" && args[1] == shared_path));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|args| args[0] == "--protect" && args[1].ends_with(".git")));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|args| args == ["--network", "deny"]));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|args| args == ["--", "powershell.exe"]));
+        assert!(matches!(
+            plan.status,
+            SandboxCommandStatus::Wrapped {
+                platform: OsSandboxPlatform::Windows,
+                ref backend,
+            } if backend == "opentopia-windows-appcontainer"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn windows_permission_overrides_are_isolated_by_effective_permissions() {
-        let workspace = std::env::temp_dir().join(format!(
-            "opentopia-sandbox-profile-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace).expect("create workspace");
-        let mut first = LocalSandboxConfig::enforce();
-        first.grant_read_path(workspace.join("first.txt"));
-        let mut second = LocalSandboxConfig::enforce();
-        second.grant_read_path(workspace.join("second.txt"));
-
-        let first_overrides = windows_permission_overrides(&workspace, &first).join("\n");
-        let second_overrides = windows_permission_overrides(&workspace, &second).join("\n");
-        assert_ne!(first_overrides, second_overrides);
-        assert!(first_overrides.contains("first.txt"));
-        assert!(!first_overrides.contains("second.txt"));
-        assert!(second_overrides.contains("second.txt"));
-        assert!(!second_overrides.contains("first.txt"));
-
-        let _ = std::fs::remove_dir_all(workspace);
+    fn windows_enforce_fails_closed_without_own_backend() {
+        let result = unavailable_backend(
+            OsSandboxPlatform::Windows,
+            "OpenTopia Windows sandbox backend was not found",
+            "powershell.exe",
+            &sample_args(),
+            &LocalSandboxConfig::enforce(),
+        );
+        assert!(result.is_err());
     }
 }

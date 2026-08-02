@@ -258,12 +258,6 @@ if ($env:OS -eq "Windows_NT") {
     throw "gcc was not found. Install WinLibs with winget install BrechtSanders.WinLibs.POSIX.UCRT, or set OPENTOPIA_MINGW_BIN to mingw64\bin."
   }
 
-  if (-not $env:OPENTOPIA_CODEX_SANDBOX_BIN) {
-    $codexSandbox = Join-Path $env:USERPROFILE ".codex\plugins\.plugin-appserver\codex.exe"
-    if (Test-Path -LiteralPath $codexSandbox) {
-      $env:OPENTOPIA_CODEX_SANDBOX_BIN = $codexSandbox
-    }
-  }
 }
 
 if (-not $env:OPENTOPIA_SANDBOX_MODE) {
@@ -273,5 +267,5 @@ if (-not $env:OPENTOPIA_SANDBOX_ENFORCEMENT) {
   $env:OPENTOPIA_SANDBOX_ENFORCEMENT = "enforce"
 }
 if (-not $env:OPENTOPIA_SANDBOX_NETWORK) {
-  $env:OPENTOPIA_SANDBOX_NETWORK = "allow"
+  $env:OPENTOPIA_SANDBOX_NETWORK = "deny"
 }

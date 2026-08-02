@@ -17,4 +17,5 @@ apps/desktop/release/
 apps/desktop/release-*/
 apps/desktop/resources/opentopia-server*
 apps/desktop/resources/codex-sandbox/
+apps/desktop/resources/opentopia-sandbox/
 !apps/desktop/resources/.gitkeep

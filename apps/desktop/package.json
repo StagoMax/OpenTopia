@@ -35,18 +35,9 @@
         "to": ".",
         "filter": [
           "opentopia-server",
-          "opentopia-server.exe"
-        ]
-      },
-      {
-        "from": "resources/codex-sandbox",
-        "to": "codex-sandbox",
-        "filter": [
-          "codex.exe",
-          "codex-command-runner.exe",
-          "codex-windows-sandbox-setup.exe",
-          "manifest.json",
-          "LICENSE"
+          "opentopia-server.exe",
+          "opentopia-sandbox/opentopia-sandbox.exe",
+          "!codex-sandbox{,/**/*}"
         ]
       }
     ],

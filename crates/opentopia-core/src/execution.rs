@@ -1462,12 +1462,15 @@ mod tests {
                 ExecutionContext::with_timeout(Duration::from_secs(45)),
             )
             .await
-            .expect("windows restricted-token sandbox should run");
+            .expect("OpenTopia Windows sandbox should run");
 
         assert!(exec.success);
         assert!(String::from_utf8_lossy(&exec.stdout).contains("ok"));
         let sandbox = exec.sandbox.expect("execution records sandbox metadata");
-        assert_eq!(sandbox.permission_profile, "opentopia");
+        assert_eq!(
+            sandbox.permission_profile,
+            "opentopia-appcontainer-workspace-write-offline"
+        );
         assert!(matches!(
             sandbox.status,
             SandboxCommandStatus::Wrapped {
@@ -1505,7 +1508,7 @@ mod tests {
                 ExecutionContext::with_timeout(Duration::from_secs(30)),
             )
             .await
-            .expect("restricted-token sandbox command should start");
+            .expect("OpenTopia Windows sandbox command should start");
 
         let outside_was_written = outside.exists();
         let command_succeeded = exec.success;

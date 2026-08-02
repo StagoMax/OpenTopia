@@ -31,12 +31,15 @@ $isWindowsHost = [System.Environment]::OSVersion.Platform -eq "Win32NT"
 $serverBinaryName = if ($isWindowsHost) { "opentopia-server.exe" } else { "opentopia-server" }
 $releaseServerBinary = Join-Path $repoRoot "target\release\$serverBinaryName"
 $resourceServerBinary = Join-Path $resourcesDir $serverBinaryName
-$codexSandboxResources = Join-Path $resourcesDir "codex-sandbox"
+$sandboxBinaryName = if ($isWindowsHost) { "opentopia-sandbox.exe" } else { "opentopia-sandbox" }
+$releaseSandboxBinary = Join-Path $repoRoot "target\release\$sandboxBinaryName"
+$sandboxResources = Join-Path $resourcesDir "opentopia-sandbox"
+$resourceSandboxBinary = Join-Path $sandboxResources $sandboxBinaryName
 
 Push-Location $repoRoot
 try {
-  Write-Host "Building Rust server: cargo build --release -p opentopia-server"
-  cargo build --release -p opentopia-server
+  Write-Host "Building Rust server and Windows sandbox: cargo build --release -p opentopia-server -p opentopia-windows-sandbox"
+  cargo build --release -p opentopia-server -p opentopia-windows-sandbox
   if ($LASTEXITCODE -ne 0) {
     throw "cargo build failed with exit code $LASTEXITCODE"
   }
@@ -55,71 +58,15 @@ try {
   Write-Host "Staged server binary for electron-builder extraResources: $resourceServerBinary"
 
   if ($isWindowsHost) {
-    $codexSandboxSource = if ($env:OPENTOPIA_CODEX_SANDBOX_DIR) {
-      $env:OPENTOPIA_CODEX_SANDBOX_DIR
-    } else {
-      Join-Path $env:USERPROFILE ".codex\plugins\.plugin-appserver"
+    if (-not (Test-Path -LiteralPath $releaseSandboxBinary)) {
+      throw "opentopia-sandbox release binary not found at $releaseSandboxBinary"
     }
-    $requiredHelpers = @(
-      "codex.exe",
-      "codex-command-runner.exe",
-      "codex-windows-sandbox-setup.exe"
-    )
-    $sandboxManifestPath = Join-Path $desktopRoot "electron\codex-sandbox-manifest.json"
-    if (-not (Test-Path -LiteralPath $sandboxManifestPath)) {
-      throw "Codex Windows sandbox manifest not found: $sandboxManifestPath"
+    New-Item -ItemType Directory -Force -Path $sandboxResources | Out-Null
+    Copy-Item -LiteralPath $releaseSandboxBinary -Destination $resourceSandboxBinary -Force
+    if (-not (Test-Path -LiteralPath $resourceSandboxBinary)) {
+      throw "Failed to stage OpenTopia Windows sandbox at $resourceSandboxBinary"
     }
-    $sandboxManifest = Get-Content -Raw -LiteralPath $sandboxManifestPath | ConvertFrom-Json
-    $actualVersion = (& (Join-Path $codexSandboxSource "codex.exe") --version).Trim()
-    $expectedVersion = "codex-cli $($sandboxManifest.codexCliVersion)"
-    if ($actualVersion -ne $expectedVersion) {
-      throw "Codex sandbox helper version mismatch: expected '$expectedVersion', got '$actualVersion'"
-    }
-    foreach ($helper in $requiredHelpers) {
-      $source = Join-Path $codexSandboxSource $helper
-      if (-not (Test-Path -LiteralPath $source)) {
-        throw "Required Codex Windows sandbox helper not found: $source"
-      }
-      $expectedHash = $sandboxManifest.files.$helper
-      $actualHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
-      if (-not $expectedHash -or $actualHash -ne $expectedHash) {
-        throw "Codex Windows sandbox helper hash mismatch: $helper"
-      }
-      $signature = Get-AuthenticodeSignature -LiteralPath $source
-      if (
-        $signature.Status -ne "Valid" -or
-        $signature.SignerCertificate.Subject -ne $sandboxManifest.signerSubject
-      ) {
-        throw "Codex Windows sandbox helper signature validation failed: $helper"
-      }
-    }
-    New-Item -ItemType Directory -Force -Path $codexSandboxResources | Out-Null
-    foreach ($helper in $requiredHelpers) {
-      Copy-Item `
-        -LiteralPath (Join-Path $codexSandboxSource $helper) `
-        -Destination (Join-Path $codexSandboxResources $helper) `
-        -Force
-    }
-    $codexLicenseCandidates = @()
-    if ($env:OPENTOPIA_CODEX_SOURCE) {
-      $codexLicenseCandidates += Join-Path $env:OPENTOPIA_CODEX_SOURCE "LICENSE"
-    }
-    $codexLicenseCandidates += "J:\Project\codex cli\codex\LICENSE"
-    $codexLicenseCandidates = @($codexLicenseCandidates | Where-Object {
-      Test-Path -LiteralPath $_
-    })
-    if (@($codexLicenseCandidates).Count -lt 1) {
-      throw "Codex Apache-2.0 LICENSE was not found; set OPENTOPIA_CODEX_SOURCE"
-    }
-    Copy-Item `
-      -LiteralPath @($codexLicenseCandidates)[0] `
-      -Destination (Join-Path $codexSandboxResources "LICENSE") `
-      -Force
-    Copy-Item `
-      -LiteralPath $sandboxManifestPath `
-      -Destination (Join-Path $codexSandboxResources "manifest.json") `
-      -Force
-    Write-Host "Staged Codex restricted-token sandbox helpers: $codexSandboxResources"
+    Write-Host "Staged first-party Windows sandbox for electron-builder: $resourceSandboxBinary"
   }
     Invoke-Pnpm --filter @opentopia/desktop build
     $electronBuilderArgs = @(

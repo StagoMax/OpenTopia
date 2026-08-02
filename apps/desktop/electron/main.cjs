@@ -818,27 +818,22 @@ function createBackendEnv(repoRoot, options = {}) {
   applyProviderAliases(env);
   if (options.includeKeyring !== false) {
     injectKeyringProviderApiKey(env);
-    const sandbox = resolveCodexSandboxBinary();
-    if (sandbox.exists) {
-      env.OPENTOPIA_CODEX_SANDBOX_BIN = sandbox.path;
-    } else if (sandbox.reason) {
-      env.OPENTOPIA_SANDBOX_BACKEND_ERROR = sandbox.reason;
-      writeLog("error", "sandbox.helper.integrity-failed", {
-        path: sandbox.path,
-        reason: sandbox.reason,
-      });
+    if (process.platform === "win32") {
+      const sandbox = resolveOpenTopiaWindowsSandboxBinary(repoRoot);
+      if (sandbox.exists) {
+        env.OPENTOPIA_WINDOWS_SANDBOX_BIN = sandbox.path;
+      } else if (sandbox.reason) {
+        env.OPENTOPIA_SANDBOX_BACKEND_ERROR = sandbox.reason;
+        writeLog("error", "sandbox.helper.missing", {
+          path: sandbox.path,
+          reason: sandbox.reason,
+        });
+      }
     }
-    if (!isDev) env.OPENTOPIA_REQUIRE_CODEX_SANDBOX_BIN = "true";
     env.OPENTOPIA_SANDBOX_MODE ||= "workspace-write";
     env.OPENTOPIA_SANDBOX_ENFORCEMENT ||=
       process.env.OPENTOPIA_SANDBOX_ENFORCEMENT || "enforce";
-    env.OPENTOPIA_SANDBOX_NETWORK ||= "allow";
-    env.OPENTOPIA_WINDOWS_SANDBOX ||=
-      process.env.OPENTOPIA_WINDOWS_SANDBOX || "unelevated";
-    env.OPENTOPIA_SANDBOX_HOME ||= path.join(
-      app.getPath("userData"),
-      "sandbox",
-    );
+    env.OPENTOPIA_SANDBOX_NETWORK ||= "deny";
   }
 
   if (process.platform === "win32") {
@@ -1413,92 +1408,36 @@ function resolvePackagedServerBinary() {
   };
 }
 
-function resolveCodexSandboxBinary() {
-  const packaged = path.join(
-    process.resourcesPath || "",
-    "codex-sandbox",
-    "codex.exe",
+function openTopiaWindowsSandboxBinaryName() {
+  return process.platform === "win32"
+    ? "opentopia-sandbox.exe"
+    : "opentopia-sandbox";
+}
+
+function cargoTargetDir(repoRoot) {
+  return (
+    process.env.CARGO_TARGET_DIR ||
+    process.env.OPENTOPIA_DEV_CARGO_TARGET_DIR ||
+    path.join(repoRoot, "target", "desktop-dev")
   );
-  if (!isDev) {
-    const verification = verifyCodexSandboxBundle(packaged);
-    return {
-      path: packaged,
-      exists: verification.valid,
-      reason: verification.reason,
-    };
-  }
+}
+
+function resolveOpenTopiaWindowsSandboxBinary(repoRoot) {
+  const binaryName = openTopiaWindowsSandboxBinaryName();
   const candidates = [
-    process.env.OPENTOPIA_CODEX_SANDBOX_BIN,
-    packaged,
-    path.join(
-      process.env.USERPROFILE || "",
-      ".codex",
-      "plugins",
-      ".plugin-appserver",
-      "codex.exe",
-    ),
+    process.env.OPENTOPIA_WINDOWS_SANDBOX_BIN,
+    path.join(process.resourcesPath || "", "opentopia-sandbox", binaryName),
+    path.join(__dirname, "..", "resources", "opentopia-sandbox", binaryName),
+    path.join(cargoTargetDir(repoRoot), "debug", binaryName),
   ].filter(Boolean);
   const found = candidates.find((candidate) => fs.existsSync(candidate));
   return {
-    path: found || candidates[0] || "codex.exe",
+    path: found || candidates[0] || binaryName,
     exists: Boolean(found),
+    reason: found
+      ? null
+      : `OpenTopia Windows sandbox helper was not found. Checked: ${candidates.join(", ")}`,
   };
-}
-
-function verifyCodexSandboxBundle(codexPath) {
-  const directory = path.dirname(codexPath);
-  const manifestPath = path.join(directory, "manifest.json");
-  if (!fs.existsSync(manifestPath)) {
-    return {
-      valid: false,
-      reason: `Sandbox manifest is missing: ${manifestPath}`,
-    };
-  }
-
-  try {
-    const expectedManifest = JSON.parse(
-      fs.readFileSync(
-        path.join(__dirname, "codex-sandbox-manifest.json"),
-        "utf8",
-      ),
-    );
-    const packagedManifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-    if (JSON.stringify(packagedManifest) !== JSON.stringify(expectedManifest)) {
-      return {
-        valid: false,
-        reason: "Sandbox manifest does not match the application bundle.",
-      };
-    }
-    const files = expectedManifest?.files;
-    if (!files || typeof files !== "object") {
-      return { valid: false, reason: "Sandbox manifest has no file hashes." };
-    }
-    for (const [name, expectedHash] of Object.entries(files)) {
-      const helperPath = path.join(directory, name);
-      if (!fs.existsSync(helperPath)) {
-        return { valid: false, reason: `Sandbox helper is missing: ${name}` };
-      }
-      const actualHash = crypto
-        .createHash("sha256")
-        .update(fs.readFileSync(helperPath))
-        .digest("hex");
-      if (
-        typeof expectedHash !== "string" ||
-        actualHash.toLowerCase() !== expectedHash.toLowerCase()
-      ) {
-        return {
-          valid: false,
-          reason: `Sandbox helper hash mismatch: ${name}`,
-        };
-      }
-    }
-    return { valid: true, reason: null };
-  } catch (error) {
-    return {
-      valid: false,
-      reason: `Sandbox manifest validation failed: ${String(error)}`,
-    };
-  }
 }
 
 // A dev backend is compiled ahead of time via `cargo build` and then spawned
@@ -1529,10 +1468,7 @@ async function waitForBackendHealth(attempts) {
 }
 
 function devServerBinaryPath(repoRoot) {
-  const targetDir =
-    process.env.CARGO_TARGET_DIR ||
-    process.env.OPENTOPIA_DEV_CARGO_TARGET_DIR ||
-    path.join(repoRoot, "target", "desktop-dev");
+  const targetDir = cargoTargetDir(repoRoot);
   const binaryName = `opentopia-server${process.platform === "win32" ? ".exe" : ""}`;
   return path.join(targetDir, "debug", binaryName);
 }
@@ -1541,7 +1477,11 @@ async function ensureBackendBuilt(repoRoot) {
   writeLog("info", "backend.build.starting", { repoRoot });
   const env = createBackendEnv(repoRoot);
   return new Promise((resolve, reject) => {
-    const child = spawn("cargo", ["build", "-p", "opentopia-server"], {
+    const packages = ["build", "-p", "opentopia-server"];
+    if (process.platform === "win32") {
+      packages.push("-p", "opentopia-windows-sandbox");
+    }
+    const child = spawn("cargo", packages, {
       cwd: repoRoot,
       env,
       stdio: ["ignore", "pipe", "pipe"],
