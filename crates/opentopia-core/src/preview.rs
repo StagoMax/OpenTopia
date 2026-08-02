@@ -54,6 +54,8 @@ pub struct PreviewDescriptor {
     pub bytes: u64,
     pub readonly: bool,
     pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +217,7 @@ pub fn resolve_workspace_preview(
         bytes: metadata.len(),
         readonly: true,
         revision: file_revision("w", &metadata),
+        handler_id: None,
     };
     Ok(ResolvedPreview {
         descriptor,
@@ -289,6 +292,7 @@ pub fn resolve_artifact_preview(
         bytes,
         readonly: true,
         revision,
+        handler_id: None,
     };
     Ok(ResolvedPreview {
         descriptor,

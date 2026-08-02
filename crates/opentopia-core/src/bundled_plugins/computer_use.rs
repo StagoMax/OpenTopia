@@ -21,7 +21,7 @@ pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
         name: "computer-use",
         version: "1.0.0",
         trust: BundledPluginTrust::TrustedDriver,
-        default_enabled: true,
+        default_enabled: false,
         native_capabilities: &["computer"],
     },
     files: FILES,
@@ -39,7 +39,7 @@ mod tests {
         assert_eq!(PACKAGE.metadata.name, manifest["name"]);
         assert_eq!(PACKAGE.metadata.version, manifest["version"]);
         assert_eq!(PACKAGE.metadata.trust, BundledPluginTrust::TrustedDriver);
-        assert!(PACKAGE.metadata.default_enabled);
+        assert!(!PACKAGE.metadata.default_enabled);
         assert_eq!(PACKAGE.metadata.native_capabilities, &["computer"]);
         assert!(manifest.get("trust").is_none());
         assert!(manifest.get("official").is_none());

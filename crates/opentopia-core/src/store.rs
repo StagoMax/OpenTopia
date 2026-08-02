@@ -1,15 +1,19 @@
+use crate::effect_journal::{
+    valid_effect_transition, validate_effect_intent, EffectIntent, EffectJournalError,
+    EffectJournalRecord, EffectKind, EffectSideEffectClass, EffectStatus,
+};
 use crate::mcp::{McpServerConfig, McpToolDescriptor, ThreadMcpServer};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    ArtifactStorage, ArtifactStorageMetadata, ExperienceMode, GoalAttemptStatus, GoalRecord,
-    GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart,
-    MessageRole, Project, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, Thread,
-    ThreadModelSelection, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord, TurnStatus,
-    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
+    ArtifactStorage, ArtifactStorageMetadata, EvaluationRun, ExperienceMode, GoalAttemptStatus,
+    GoalRecord, GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message,
+    MessagePart, MessageRole, Project, TaskPlan, TerminalCommandHistory, TerminalCommandStatus,
+    Thread, ThreadModelSelection, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord,
+    TurnStatus, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::provider::ModelConversationMessage;
 use crate::settings::AppSettings;
-use crate::subagents::{SubagentRun, SubagentRunStatus};
+use crate::subagents::{SubagentExecutionContract, SubagentRun, SubagentRunStatus};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -147,6 +151,25 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         thread_id: Uuid,
         after_seq: Option<i64>,
     ) -> anyhow::Result<Vec<AgentEvent>>;
+    fn prepare_effect(&self, intent: &EffectIntent) -> anyhow::Result<EffectJournalRecord>;
+    fn get_effect(&self, effect_id: Uuid) -> anyhow::Result<Option<EffectJournalRecord>>;
+    fn get_effect_by_idempotency_key(
+        &self,
+        thread_id: Uuid,
+        turn_id: Uuid,
+        agent_path: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<EffectJournalRecord>>;
+    fn list_turn_effects(&self, turn_id: Uuid) -> anyhow::Result<Vec<EffectJournalRecord>>;
+    fn start_effect(&self, effect_id: Uuid) -> anyhow::Result<EffectJournalRecord>;
+    fn finish_effect(
+        &self,
+        effect_id: Uuid,
+        status: EffectStatus,
+        result: Option<Value>,
+        error: Option<String>,
+    ) -> anyhow::Result<EffectJournalRecord>;
+    fn mark_running_effects_indeterminate(&self) -> anyhow::Result<usize>;
     fn insert_terminal_history(
         &self,
         history: TerminalCommandHistory,
@@ -584,6 +607,36 @@ impl SqliteSessionStore {
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS effect_journal (
+                effect_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                agent_path TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                input_hash TEXT NOT NULL,
+                input_json TEXT NOT NULL,
+                result_json TEXT,
+                status TEXT NOT NULL,
+                side_effect_class TEXT NOT NULL,
+                idempotent INTEGER NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(thread_id, turn_id, agent_path, idempotency_key),
+                CHECK(kind IN ('model_request', 'tool_call', 'approval', 'finalization')),
+                CHECK(status IN ('prepared', 'running', 'succeeded', 'failed', 'indeterminate')),
+                CHECK(side_effect_class IN ('none', 'workspace', 'external', 'unknown')),
+                CHECK(idempotent IN (0, 1)),
+                CHECK(attempt >= 0),
+                FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE,
+                FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS terminal_history (
                 command_id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL,
@@ -651,6 +704,7 @@ impl SqliteSessionStore {
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 completed_at TEXT,
+                execution_contract_json TEXT NOT NULL DEFAULT '{}',
                 CHECK(status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'timed_out')),
                 FOREIGN KEY(parent_thread_id) REFERENCES threads(id) ON DELETE CASCADE
             );
@@ -752,8 +806,31 @@ impl SqliteSessionStore {
                 FOREIGN KEY(server_id) REFERENCES mcp_servers(server_id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS evaluation_runs (
+                workspace_key TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                workspace_root TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                model TEXT,
+                failure_category TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                source_path TEXT NOT NULL,
+                tasks_json TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(workspace_key, run_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_thread_created
                 ON messages(thread_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_effect_journal_turn
+                ON effect_journal(turn_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_effect_journal_recovery
+                ON effect_journal(status, updated_at);
 
             CREATE INDEX IF NOT EXISTS idx_events_thread_seq
                 ON events(thread_id, seq);
@@ -810,10 +887,15 @@ impl SqliteSessionStore {
             CREATE INDEX IF NOT EXISTS idx_thread_plugin_activations_thread
                 ON thread_plugin_activations(thread_id, updated_at);
 
+            CREATE INDEX IF NOT EXISTS idx_evaluation_runs_workspace_updated
+                ON evaluation_runs(workspace_key, updated_at DESC);
+
             CREATE INDEX IF NOT EXISTS idx_projects_order
                 ON projects(pinned DESC, sort_order ASC, created_at ASC);
             "#,
         )?;
+        crate::plugin_control::migrate_plugin_control(&mut conn)?;
+        crate::scm_connector::migrate_scm_remote_bindings(&mut conn)?;
 
         if !table_has_column(&conn, "threads", "project_id")? {
             conn.execute(
@@ -871,6 +953,7 @@ impl SqliteSessionStore {
             ("agent_type", "TEXT NOT NULL DEFAULT 'default'"),
             ("fork_turns", "TEXT NOT NULL DEFAULT 'all'"),
             ("last_task_message", "TEXT NOT NULL DEFAULT ''"),
+            ("execution_contract_json", "TEXT NOT NULL DEFAULT '{}'"),
         ] {
             if !table_has_column(&conn, "subagent_runs", column)? {
                 conn.execute(
@@ -933,6 +1016,14 @@ impl SqliteSessionStore {
             params![recovered_at],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn with_connection<T>(
+        &self,
+        action: impl FnOnce(&mut Connection) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        action(&mut conn)
     }
 
     pub fn load_settings(
@@ -1280,6 +1371,74 @@ impl SqliteSessionStore {
             "#,
         )?;
         let rows = stmt.query_map([], map_mcp_server_tool)?;
+        collect_rows(rows)
+    }
+
+    /// Upserts an evaluation catalog entry imported by the server. The source
+    /// summary is stored alongside normalized task fields, so old reports stay
+    /// inspectable when the Harness schema gains additional metrics.
+    pub fn upsert_evaluation_run(&self, run: &EvaluationRun) -> anyhow::Result<()> {
+        let workspace_key = validated_workspace_key(&run.workspace_root)?;
+        let started_at = run.started_at.as_ref().map(DateTime::to_rfc3339);
+        let completed_at = run.completed_at.as_ref().map(DateTime::to_rfc3339);
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO evaluation_runs (
+                run_id, workspace_key, workspace_root, title, status, model,
+                failure_category, started_at, completed_at, source_path,
+                tasks_json, summary_json, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(workspace_key, run_id) DO UPDATE SET
+                workspace_key = excluded.workspace_key,
+                workspace_root = excluded.workspace_root,
+                title = excluded.title,
+                status = excluded.status,
+                model = excluded.model,
+                failure_category = excluded.failure_category,
+                started_at = excluded.started_at,
+                completed_at = excluded.completed_at,
+                source_path = excluded.source_path,
+                tasks_json = excluded.tasks_json,
+                summary_json = excluded.summary_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                &run.run_id,
+                &workspace_key,
+                run.workspace_root.to_string_lossy(),
+                &run.title,
+                &run.status,
+                &run.model,
+                &run.failure_category,
+                started_at,
+                completed_at,
+                run.source_path.to_string_lossy(),
+                serde_json::to_string(&run.tasks)?,
+                serde_json::to_string(&run.summary)?,
+                run.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_evaluation_runs(
+        &self,
+        workspace_root: &Path,
+    ) -> anyhow::Result<Vec<EvaluationRun>> {
+        let workspace_key = validated_workspace_key(workspace_root)?;
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT run_id, workspace_root, title, status, model, failure_category,
+                   started_at, completed_at, source_path, tasks_json, summary_json, updated_at
+            FROM evaluation_runs
+            WHERE workspace_key = ?1
+            ORDER BY COALESCE(completed_at, updated_at) DESC, run_id DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![workspace_key], map_evaluation_run)?;
         collect_rows(rows)
     }
 }
@@ -2369,6 +2528,181 @@ impl SessionStore for SqliteSessionStore {
         collect_rows(rows)
     }
 
+    fn prepare_effect(&self, intent: &EffectIntent) -> anyhow::Result<EffectJournalRecord> {
+        validate_effect_intent(intent)?;
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        if let Some(existing) = query_effect_by_idempotency_key(
+            &conn,
+            intent.thread_id,
+            intent.turn_id,
+            &intent.agent_path,
+            &intent.idempotency_key,
+        )? {
+            if existing.kind != intent.kind
+                || existing.operation != intent.operation
+                || existing.input_hash != intent.input_hash
+            {
+                return Err(EffectJournalError::IdempotencyConflict {
+                    key: intent.idempotency_key.clone(),
+                }
+                .into());
+            }
+            return Ok(existing);
+        }
+
+        let now = Utc::now();
+        let effect_id = Uuid::new_v4();
+        conn.execute(
+            r#"
+            INSERT INTO effect_journal (
+                effect_id, thread_id, turn_id, agent_path, idempotency_key,
+                kind, operation, input_hash, input_json, result_json, status,
+                side_effect_class, idempotent, attempt, error, created_at,
+                started_at, completed_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10,
+                ?11, ?12, 0, NULL, ?13, NULL, NULL, ?13
+            )
+            "#,
+            params![
+                effect_id.to_string(),
+                intent.thread_id.to_string(),
+                intent.turn_id.to_string(),
+                &intent.agent_path,
+                &intent.idempotency_key,
+                intent.kind.as_str(),
+                &intent.operation,
+                &intent.input_hash,
+                serde_json::to_string(&intent.input)?,
+                EffectStatus::Prepared.as_str(),
+                intent.side_effect_class.as_str(),
+                intent.idempotent,
+                now.to_rfc3339(),
+            ],
+        )?;
+        query_effect(&conn, effect_id)?.context("newly prepared effect was not persisted")
+    }
+
+    fn get_effect(&self, effect_id: Uuid) -> anyhow::Result<Option<EffectJournalRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        query_effect(&conn, effect_id)
+    }
+
+    fn get_effect_by_idempotency_key(
+        &self,
+        thread_id: Uuid,
+        turn_id: Uuid,
+        agent_path: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<EffectJournalRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        query_effect_by_idempotency_key(&conn, thread_id, turn_id, agent_path, idempotency_key)
+    }
+
+    fn list_turn_effects(&self, turn_id: Uuid) -> anyhow::Result<Vec<EffectJournalRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE turn_id = ?1 ORDER BY created_at ASC, effect_id ASC",
+            effect_select_sql()
+        ))?;
+        let rows = stmt.query_map(params![turn_id.to_string()], map_effect)?;
+        collect_rows(rows)
+    }
+
+    fn start_effect(&self, effect_id: Uuid) -> anyhow::Result<EffectJournalRecord> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let current = query_effect(&conn, effect_id)?.context("effect not found")?;
+        if current.status == EffectStatus::Running {
+            return Ok(current);
+        }
+        if !valid_effect_transition(current.status, EffectStatus::Running) {
+            return Err(EffectJournalError::InvalidTransition {
+                effect_id,
+                from: current.status,
+                to: EffectStatus::Running,
+            }
+            .into());
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            UPDATE effect_journal
+            SET status = ?2, attempt = attempt + 1, started_at = ?3,
+                completed_at = NULL, result_json = NULL, error = NULL, updated_at = ?3
+            WHERE effect_id = ?1
+            "#,
+            params![effect_id.to_string(), EffectStatus::Running.as_str(), now],
+        )?;
+        query_effect(&conn, effect_id)?.context("started effect disappeared")
+    }
+
+    fn finish_effect(
+        &self,
+        effect_id: Uuid,
+        status: EffectStatus,
+        result: Option<Value>,
+        error: Option<String>,
+    ) -> anyhow::Result<EffectJournalRecord> {
+        if !matches!(
+            status,
+            EffectStatus::Succeeded | EffectStatus::Failed | EffectStatus::Indeterminate
+        ) {
+            anyhow::bail!("finish_effect requires a terminal or indeterminate status");
+        }
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let current = query_effect(&conn, effect_id)?.context("effect not found")?;
+        if current.status == status {
+            return Ok(current);
+        }
+        if !valid_effect_transition(current.status, status) {
+            return Err(EffectJournalError::InvalidTransition {
+                effect_id,
+                from: current.status,
+                to: status,
+            }
+            .into());
+        }
+        let now = Utc::now().to_rfc3339();
+        let completed_at = status.is_terminal().then_some(now.clone());
+        conn.execute(
+            r#"
+            UPDATE effect_journal
+            SET status = ?2, result_json = ?3, error = ?4,
+                completed_at = ?5, updated_at = ?6
+            WHERE effect_id = ?1
+            "#,
+            params![
+                effect_id.to_string(),
+                status.as_str(),
+                result.as_ref().map(serde_json::to_string).transpose()?,
+                error,
+                completed_at,
+                now,
+            ],
+        )?;
+        query_effect(&conn, effect_id)?.context("finished effect disappeared")
+    }
+
+    fn mark_running_effects_indeterminate(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        let updated = conn.execute(
+            r#"
+            UPDATE effect_journal
+            SET status = ?1,
+                error = COALESCE(error, 'process exited before the effect outcome was persisted'),
+                updated_at = ?2
+            WHERE status = ?3
+            "#,
+            params![
+                EffectStatus::Indeterminate.as_str(),
+                now,
+                EffectStatus::Running.as_str(),
+            ],
+        )?;
+        Ok(updated)
+    }
+
     fn insert_terminal_history(
         &self,
         history: TerminalCommandHistory,
@@ -2525,8 +2859,8 @@ impl SessionStore for SqliteSessionStore {
             INSERT INTO subagent_runs (
                 id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
                 name, agent_type, input, fork_turns, last_task_message, depth, status,
-                result, error, created_at, started_at, completed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                result, error, created_at, started_at, completed_at, execution_contract_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(id) DO UPDATE SET
                 parent_turn_id = excluded.parent_turn_id,
                 last_task_message = excluded.last_task_message,
@@ -2534,7 +2868,8 @@ impl SessionStore for SqliteSessionStore {
                 result = excluded.result,
                 error = excluded.error,
                 started_at = excluded.started_at,
-                completed_at = excluded.completed_at
+                completed_at = excluded.completed_at,
+                execution_contract_json = excluded.execution_contract_json
             "#,
             params![
                 run.id.to_string(),
@@ -2554,6 +2889,7 @@ impl SessionStore for SqliteSessionStore {
                 run.created_at.to_rfc3339(),
                 run.started_at.as_ref().map(DateTime::to_rfc3339),
                 run.completed_at.as_ref().map(DateTime::to_rfc3339),
+                serde_json::to_string(&run.execution_contract)?,
             ],
         )?;
         touch_thread(&conn, run.parent_thread_id)?;
@@ -2567,7 +2903,7 @@ impl SessionStore for SqliteSessionStore {
                 r#"
                 SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
                        name, agent_type, input, fork_turns, last_task_message, depth, status,
-                       result, error, created_at, started_at, completed_at
+                       result, error, created_at, started_at, completed_at, execution_contract_json
                 FROM subagent_runs
                 WHERE id = ?1
                 "#,
@@ -2583,7 +2919,7 @@ impl SessionStore for SqliteSessionStore {
             r#"
             SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
                    name, agent_type, input, fork_turns, last_task_message, depth, status,
-                   result, error, created_at, started_at, completed_at
+                   result, error, created_at, started_at, completed_at, execution_contract_json
             FROM subagent_runs
             WHERE parent_thread_id = ?1
             ORDER BY created_at DESC
@@ -2599,7 +2935,7 @@ impl SessionStore for SqliteSessionStore {
             r#"
             SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
                    name, agent_type, input, fork_turns, last_task_message, depth, status,
-                   result, error, created_at, started_at, completed_at
+                   result, error, created_at, started_at, completed_at, execution_contract_json
             FROM subagent_runs
             ORDER BY created_at ASC
             "#,
@@ -3461,6 +3797,37 @@ fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
+fn map_evaluation_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvaluationRun> {
+    let tasks_json: String = row.get(9)?;
+    let summary_json: String = row.get(10)?;
+    let tasks = serde_json::from_str(&tasks_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(error))
+    })?;
+    let summary = serde_json::from_str(&summary_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
+    })?;
+    let started_at: Option<String> = row.get(6)?;
+    let completed_at: Option<String> = row.get(7)?;
+    Ok(EvaluationRun {
+        run_id: row.get(0)?,
+        workspace_root: PathBuf::from(row.get::<_, String>(1)?),
+        title: row.get(2)?,
+        status: row.get(3)?,
+        model: row.get(4)?,
+        failure_category: row.get(5)?,
+        started_at: started_at
+            .map(|value| parse_datetime(value, 6))
+            .transpose()?,
+        completed_at: completed_at
+            .map(|value| parse_datetime(value, 7))
+            .transpose()?,
+        source_path: PathBuf::from(row.get::<_, String>(8)?),
+        tasks,
+        summary,
+        updated_at: parse_datetime(row.get(11)?, 11)?,
+    })
+}
+
 fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let parts_json: String = row.get(3)?;
     let parts: Vec<MessagePart> = serde_json::from_str(&parts_json)
@@ -3770,6 +4137,115 @@ fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEvent> {
     })
 }
 
+fn effect_select_sql() -> &'static str {
+    r#"
+        SELECT effect_id, thread_id, turn_id, agent_path, idempotency_key,
+               kind, operation, input_hash, input_json, result_json, status,
+               side_effect_class, idempotent, attempt, error, created_at,
+               started_at, completed_at, updated_at
+        FROM effect_journal
+    "#
+}
+
+fn query_effect(conn: &Connection, effect_id: Uuid) -> anyhow::Result<Option<EffectJournalRecord>> {
+    conn.query_row(
+        &format!("{} WHERE effect_id = ?1", effect_select_sql()),
+        params![effect_id.to_string()],
+        map_effect,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_effect_by_idempotency_key(
+    conn: &Connection,
+    thread_id: Uuid,
+    turn_id: Uuid,
+    agent_path: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<Option<EffectJournalRecord>> {
+    conn.query_row(
+        &format!(
+            "{} WHERE thread_id = ?1 AND turn_id = ?2 AND agent_path = ?3 AND idempotency_key = ?4",
+            effect_select_sql()
+        ),
+        params![
+            thread_id.to_string(),
+            turn_id.to_string(),
+            agent_path,
+            idempotency_key,
+        ],
+        map_effect,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn map_effect(row: &rusqlite::Row<'_>) -> rusqlite::Result<EffectJournalRecord> {
+    let kind_text: String = row.get(5)?;
+    let kind = EffectKind::from_str(&kind_text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, Type::Text, boxed_invalid_data(error))
+    })?;
+    let input_json: String = row.get(8)?;
+    let input = serde_json::from_str(&input_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(error))
+    })?;
+    let result_json: Option<String> = row.get(9)?;
+    let result = result_json
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(error))
+        })?;
+    let status_text: String = row.get(10)?;
+    let status = EffectStatus::from_str(&status_text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(10, Type::Text, boxed_invalid_data(error))
+    })?;
+    let side_effect_text: String = row.get(11)?;
+    let side_effect_class =
+        EffectSideEffectClass::from_str(&side_effect_text).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(11, Type::Text, boxed_invalid_data(error))
+        })?;
+    let attempt_value: i64 = row.get(13)?;
+    let attempt = u32::try_from(attempt_value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(13, Type::Integer, Box::new(error))
+    })?;
+    let started_at: Option<String> = row.get(16)?;
+    let completed_at: Option<String> = row.get(17)?;
+    Ok(EffectJournalRecord {
+        effect_id: parse_uuid(row.get(0)?, 0)?,
+        thread_id: parse_uuid(row.get(1)?, 1)?,
+        turn_id: parse_uuid(row.get(2)?, 2)?,
+        agent_path: row.get(3)?,
+        idempotency_key: row.get(4)?,
+        kind,
+        operation: row.get(6)?,
+        input_hash: row.get(7)?,
+        input,
+        result,
+        status,
+        side_effect_class,
+        idempotent: row.get(12)?,
+        attempt,
+        error: row.get(14)?,
+        created_at: parse_datetime(row.get(15)?, 15)?,
+        started_at: started_at
+            .map(|value| parse_datetime(value, 16))
+            .transpose()?,
+        completed_at: completed_at
+            .map(|value| parse_datetime(value, 17))
+            .transpose()?,
+        updated_at: parse_datetime(row.get(18)?, 18)?,
+    })
+}
+
+fn boxed_invalid_data(error: impl std::fmt::Display) -> Box<std::io::Error> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        error.to_string(),
+    ))
+}
+
 fn map_terminal_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<TerminalCommandHistory> {
     let cwd: Option<String> = row.get(5)?;
     let status_value: String = row.get(9)?;
@@ -3855,6 +4331,11 @@ fn map_subagent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentRun> {
     })?;
     let started_at: Option<String> = row.get(15)?;
     let completed_at: Option<String> = row.get(16)?;
+    let execution_contract_json: String = row.get(17)?;
+    let execution_contract: SubagentExecutionContract =
+        serde_json::from_str(&execution_contract_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(17, Type::Text, Box::new(error))
+        })?;
     Ok(SubagentRun {
         id: parse_uuid(row.get(0)?, 0)?,
         parent_thread_id: parse_uuid(row.get(1)?, 1)?,
@@ -3877,6 +4358,7 @@ fn map_subagent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentRun> {
         completed_at: completed_at
             .map(|value| parse_datetime(value, 16))
             .transpose()?,
+        execution_contract,
         initial_conversation: Vec::new(),
         initial_model_context: None,
     })
@@ -4642,6 +5124,83 @@ mod tests {
     }
 
     #[test]
+    fn effect_journal_deduplicates_intent_and_recovers_running_effects() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/effect-journal"))
+            .expect("create thread");
+        let turn = store
+            .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+            .expect("insert turn");
+        let intent = EffectIntent {
+            thread_id: thread.id,
+            turn_id: turn.turn_id,
+            agent_path: "/root".to_string(),
+            idempotency_key: format!("{}/tool/call-1", turn.turn_id),
+            kind: EffectKind::ToolCall,
+            operation: "send_message".to_string(),
+            input_hash: "input-v1".to_string(),
+            input: serde_json::json!({ "message": "hello" }),
+            side_effect_class: EffectSideEffectClass::External,
+            idempotent: false,
+        };
+
+        let prepared = store.prepare_effect(&intent).expect("prepare effect");
+        let duplicate = store
+            .prepare_effect(&intent)
+            .expect("deduplicate prepared effect");
+        assert_eq!(prepared.effect_id, duplicate.effect_id);
+        let running = store
+            .start_effect(prepared.effect_id)
+            .expect("start effect");
+        assert_eq!(running.status, EffectStatus::Running);
+        assert_eq!(running.attempt, 1);
+
+        assert_eq!(
+            store
+                .mark_running_effects_indeterminate()
+                .expect("recover running effects"),
+            1
+        );
+        let uncertain = store
+            .get_effect(prepared.effect_id)
+            .expect("load effect")
+            .expect("effect exists");
+        assert_eq!(uncertain.status, EffectStatus::Indeterminate);
+        assert!(uncertain.requires_reconciliation());
+        assert_eq!(store.list_turn_effects(turn.turn_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn effect_journal_rejects_idempotency_key_reuse_with_new_input() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/effect-conflict"))
+            .expect("create thread");
+        let turn = store
+            .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+            .expect("insert turn");
+        let mut intent = EffectIntent {
+            thread_id: thread.id,
+            turn_id: turn.turn_id,
+            agent_path: "/root".to_string(),
+            idempotency_key: "stable-call".to_string(),
+            kind: EffectKind::ToolCall,
+            operation: "write_file".to_string(),
+            input_hash: "first".to_string(),
+            input: serde_json::json!({ "path": "a.txt" }),
+            side_effect_class: EffectSideEffectClass::Workspace,
+            idempotent: false,
+        };
+        store.prepare_effect(&intent).expect("prepare first intent");
+        intent.input_hash = "second".to_string();
+        let error = store
+            .prepare_effect(&intent)
+            .expect_err("reject changed input under the same key");
+        assert!(error.to_string().contains("reused with a different"));
+    }
+
+    #[test]
     fn turn_change_sets_round_trip_and_can_be_marked_reverted() {
         let store = SqliteSessionStore::open(":memory:").expect("open memory store");
         let thread = store
@@ -5049,6 +5608,15 @@ mod tests {
         let thread = store
             .create_thread(Some("Parent".to_string()), PathBuf::from("."))
             .expect("create thread");
+        let execution_contract = SubagentExecutionContract {
+            workspace: crate::subagents::SubagentWorkspaceAssignment {
+                mode: crate::subagents::SubagentWorkspaceMode::IsolatedWorktree,
+                root: Some(PathBuf::from(".opentopia/worktrees/reviewer")),
+                branch: Some("codex/subagent/reviewer".to_string()),
+                base_commit: Some("abc123".to_string()),
+            },
+            require_structured_delivery: true,
+        };
         let run = SubagentRun {
             id: Uuid::new_v4(),
             parent_thread_id: thread.id,
@@ -5067,6 +5635,7 @@ mod tests {
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
             completed_at: None,
+            execution_contract: execution_contract.clone(),
             initial_conversation: Vec::new(),
             initial_model_context: None,
         };
@@ -5083,14 +5652,14 @@ mod tests {
             store.load_subagent_conversation(run.id).unwrap().unwrap(),
             conversation
         );
-        assert_eq!(
-            store.get_subagent_run(run.id).unwrap().unwrap().status,
-            SubagentRunStatus::Running
-        );
+        let persisted = store.get_subagent_run(run.id).unwrap().unwrap();
+        assert_eq!(persisted.status, SubagentRunStatus::Running);
+        assert_eq!(persisted.execution_contract, execution_contract);
         assert_eq!(store.list_subagent_runs(thread.id).unwrap().len(), 1);
         assert_eq!(store.fail_interrupted_subagent_runs().unwrap(), 1);
         let recovered = store.get_subagent_run(run.id).unwrap().unwrap();
         assert_eq!(recovered.status, SubagentRunStatus::Failed);
+        assert_eq!(recovered.execution_contract, execution_contract);
         assert!(recovered.error.unwrap().contains("restarted"));
         assert!(recovered.completed_at.is_some());
     }
@@ -5276,5 +5845,52 @@ mod tests {
             .list_terminal_history(thread.id, Some(13))
             .expect("list terminal history after final seq");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn evaluation_runs_are_scoped_by_workspace_and_updated_by_run_id() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let now = Utc::now();
+        let first = EvaluationRun {
+            run_id: "suite-001".to_string(),
+            workspace_root: PathBuf::from(r"J:\Project\alpha"),
+            title: "Alpha suite".to_string(),
+            status: "failed".to_string(),
+            model: Some("glm-5.2".to_string()),
+            failure_category: Some("provider.compatibility".to_string()),
+            started_at: Some(now),
+            completed_at: Some(now),
+            source_path: PathBuf::from(r"J:\Project\alpha\.opentopia\evaluations\suite-001"),
+            tasks: Vec::new(),
+            summary: serde_json::json!({ "status": "failed" }),
+            updated_at: now,
+        };
+        let mut second = first.clone();
+        second.workspace_root = PathBuf::from(r"J:\Project\beta");
+        second.title = "Beta suite".to_string();
+        second.source_path = PathBuf::from(r"J:\Project\beta\.opentopia\evaluations\suite-001");
+
+        store
+            .upsert_evaluation_run(&first)
+            .expect("persist alpha run");
+        store
+            .upsert_evaluation_run(&second)
+            .expect("persist beta run");
+        second.status = "passed".to_string();
+        store
+            .upsert_evaluation_run(&second)
+            .expect("update beta run");
+
+        let alpha = store
+            .list_evaluation_runs(&first.workspace_root)
+            .expect("list alpha runs");
+        let beta = store
+            .list_evaluation_runs(&second.workspace_root)
+            .expect("list beta runs");
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(alpha[0].status, "failed");
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].title, "Beta suite");
+        assert_eq!(beta[0].status, "passed");
     }
 }

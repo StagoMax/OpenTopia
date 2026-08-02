@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -54,6 +55,138 @@ impl SubagentRunStatus {
     }
 }
 
+/// Physical workspace assigned to a child. This is execution isolation, not a
+/// unit of user-visible delivery: the parent remains responsible for selecting
+/// and integrating child results.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentWorkspaceMode {
+    SharedReadOnly,
+    #[default]
+    SharedCoordinated,
+    IsolatedWorktree,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentWorkspaceAssignment {
+    #[serde(default)]
+    pub mode: SubagentWorkspaceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+}
+
+impl SubagentWorkspaceAssignment {
+    fn validate(&self) -> Result<(), SubagentError> {
+        if self.mode == SubagentWorkspaceMode::IsolatedWorktree {
+            if self
+                .root
+                .as_ref()
+                .is_none_or(|path| path.as_os_str().is_empty())
+            {
+                return Err(SubagentError::InvalidWorkspaceContract(
+                    "an isolated worktree requires a non-empty workspace root".to_string(),
+                ));
+            }
+            if self.branch.as_deref().is_none_or(str::is_empty) {
+                return Err(SubagentError::InvalidWorkspaceContract(
+                    "an isolated worktree requires its integration branch".to_string(),
+                ));
+            }
+            if self.base_commit.as_deref().is_none_or(str::is_empty) {
+                return Err(SubagentError::InvalidWorkspaceContract(
+                    "an isolated worktree requires the parent snapshot commit".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentDeliverableKind {
+    Research,
+    CodeChange,
+    Review,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentVerificationEvidence {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentIntegrationMetadata {
+    pub worktree_root: PathBuf,
+    pub branch: String,
+    pub base_commit: String,
+    pub head_commit: String,
+}
+
+/// Typed child handoff. The scheduler can require this envelope for isolated
+/// writers while preserving ordinary text results for existing callers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentDeliverable {
+    pub kind: SubagentDeliverableKind,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default)]
+    pub changed_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub verification: Vec<SubagentVerificationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<SubagentIntegrationMetadata>,
+    #[serde(default)]
+    pub remaining_risks: Vec<String>,
+}
+
+impl SubagentDeliverable {
+    fn validate_for(&self, workspace: &SubagentWorkspaceAssignment) -> anyhow::Result<()> {
+        if self.summary.trim().is_empty() {
+            anyhow::bail!("deliverable summary cannot be empty");
+        }
+        if self.kind == SubagentDeliverableKind::CodeChange
+            && workspace.mode == SubagentWorkspaceMode::IsolatedWorktree
+        {
+            let integration = self.integration.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("isolated code changes require integration metadata")
+            })?;
+            if Some(&integration.worktree_root) != workspace.root.as_ref()
+                || Some(integration.branch.as_str()) != workspace.branch.as_deref()
+                || Some(integration.base_commit.as_str()) != workspace.base_commit.as_deref()
+                || integration.head_commit.trim().is_empty()
+            {
+                anyhow::bail!(
+                    "deliverable integration metadata does not match the assigned worktree"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentExecutionContract {
+    #[serde(default)]
+    pub workspace: SubagentWorkspaceAssignment,
+    #[serde(default)]
+    pub require_structured_delivery: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentRun {
@@ -79,6 +212,11 @@ pub struct SubagentRun {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Durable workspace and delivery contract chosen by the parent/harness.
+    /// This is persisted with the run so a completed isolated worktree remains
+    /// intelligible after a server restart.
+    #[serde(default)]
+    pub execution_contract: SubagentExecutionContract,
     /// Frozen at spawn time and intentionally omitted from task-list payloads.
     #[serde(skip)]
     pub initial_conversation: Vec<ModelConversationMessage>,
@@ -191,6 +329,8 @@ pub enum SubagentError {
     InputClosed(Uuid),
     #[error("timed out waiting for subagent run: {0}")]
     WaitTimedOut(Uuid),
+    #[error("invalid subagent workspace contract: {0}")]
+    InvalidWorkspaceContract(String),
 }
 
 #[async_trait]
@@ -201,6 +341,19 @@ pub trait SubagentExecutor: Send + Sync + 'static {
         input: mpsc::UnboundedReceiver<String>,
         cancellation: CancellationToken,
     ) -> anyhow::Result<String>;
+
+    /// New executors can honor workspace isolation without breaking existing
+    /// implementations. The default preserves the previous shared-workspace
+    /// behavior until the server wires an isolated executor.
+    async fn execute_with_contract(
+        &self,
+        run: SubagentRun,
+        _contract: SubagentExecutionContract,
+        input: mpsc::UnboundedReceiver<String>,
+        cancellation: CancellationToken,
+    ) -> anyhow::Result<String> {
+        self.execute(run, input, cancellation).await
+    }
 }
 
 pub trait SubagentObserver: Send + Sync + 'static {
@@ -226,6 +379,7 @@ struct SchedulerInner {
     executor: Arc<dyn SubagentExecutor>,
     observer: Arc<dyn SubagentObserver>,
     runs: Mutex<HashMap<Uuid, Arc<RunControl>>>,
+    contracts: Mutex<HashMap<Uuid, SubagentExecutionContract>>,
     queued_messages: Mutex<HashMap<Uuid, Vec<String>>>,
     groups: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
     events: broadcast::Sender<SubagentEvent>,
@@ -252,6 +406,7 @@ impl SubagentScheduler {
                 executor,
                 observer,
                 runs: Mutex::new(HashMap::new()),
+                contracts: Mutex::new(HashMap::new()),
                 queued_messages: Mutex::new(HashMap::new()),
                 groups: Mutex::new(HashMap::new()),
                 events,
@@ -307,10 +462,25 @@ impl SubagentScheduler {
             return Err(SubagentError::DuplicatePath(run.agent_path));
         }
         controls.insert(run.id, control);
+        self.inner
+            .contracts
+            .lock()
+            .expect("subagent contracts mutex poisoned")
+            .entry(run.id)
+            .or_insert_with(|| run.execution_contract.clone());
         Ok(())
     }
 
     pub fn spawn(&self, request: SpawnSubagentRequest) -> Result<SubagentRun, SubagentError> {
+        self.spawn_with_contract(request, SubagentExecutionContract::default())
+    }
+
+    pub fn spawn_with_contract(
+        &self,
+        request: SpawnSubagentRequest,
+        contract: SubagentExecutionContract,
+    ) -> Result<SubagentRun, SubagentError> {
+        contract.workspace.validate()?;
         let name = request.name.trim().to_string();
         if name.is_empty() {
             return Err(SubagentError::EmptyName);
@@ -350,6 +520,7 @@ impl SubagentScheduler {
             created_at: Utc::now(),
             started_at: None,
             completed_at: None,
+            execution_contract: contract.clone(),
             initial_conversation: request.initial_conversation,
             initial_model_context: request.initial_model_context,
         };
@@ -389,6 +560,11 @@ impl SubagentScheduler {
             }
             controls.insert(run.id, control.clone());
         }
+        self.inner
+            .contracts
+            .lock()
+            .expect("subagent contracts mutex poisoned")
+            .insert(run.id, contract);
         self.publish(&run);
 
         let scheduler = self.clone();
@@ -396,6 +572,21 @@ impl SubagentScheduler {
             scheduler.execute(control, input_rx).await;
         });
         Ok(run)
+    }
+
+    pub fn execution_contract(&self, run_id: Uuid) -> Option<SubagentExecutionContract> {
+        self.inner
+            .contracts
+            .lock()
+            .expect("subagent contracts mutex poisoned")
+            .get(&run_id)
+            .cloned()
+    }
+
+    pub fn structured_deliverable(&self, run_id: Uuid) -> Option<SubagentDeliverable> {
+        self.get(run_id)
+            .and_then(|run| run.result)
+            .and_then(|result| serde_json::from_str(&result).ok())
     }
 
     pub fn get(&self, run_id: Uuid) -> Option<SubagentRun> {
@@ -895,10 +1086,13 @@ impl SubagentScheduler {
             .lock()
             .expect("subagent run mutex poisoned")
             .clone();
-        let execution = self
-            .inner
-            .executor
-            .execute(run, input, control.cancellation.child_token());
+        let contract = self.execution_contract(run.id).unwrap_or_default();
+        let execution = self.inner.executor.execute_with_contract(
+            run,
+            contract,
+            input,
+            control.cancellation.child_token(),
+        );
         tokio::pin!(execution);
         tokio::select! {
             _ = control.cancellation.cancelled() => {
@@ -911,7 +1105,30 @@ impl SubagentScheduler {
 
     fn finish_execution_result(&self, control: &RunControl, result: anyhow::Result<String>) {
         match result {
-            Ok(result) => self.finish(control, SubagentRunStatus::Completed, Some(result), None),
+            Ok(result) => {
+                let run_id = control.run.lock().expect("subagent run mutex poisoned").id;
+                let contract = self.execution_contract(run_id).unwrap_or_default();
+                if contract.require_structured_delivery {
+                    match serde_json::from_str::<SubagentDeliverable>(&result)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|delivery| {
+                            delivery.validate_for(&contract.workspace)?;
+                            Ok(delivery)
+                        }) {
+                        Ok(_) => {
+                            self.finish(control, SubagentRunStatus::Completed, Some(result), None)
+                        }
+                        Err(error) => self.finish(
+                            control,
+                            SubagentRunStatus::Failed,
+                            Some(result),
+                            Some(format!("invalid structured subagent deliverable: {error}")),
+                        ),
+                    }
+                } else {
+                    self.finish(control, SubagentRunStatus::Completed, Some(result), None)
+                }
+            }
             Err(_) if control.cancellation.is_cancelled() => {
                 self.finish(control, SubagentRunStatus::Cancelled, None, None)
             }
@@ -954,6 +1171,11 @@ impl SubagentScheduler {
             run.result = result;
             run.error = error;
             run.completed_at = Some(Utc::now());
+            let contract = self.execution_contract(run.id).unwrap_or_default();
+            let delivery = run
+                .result
+                .as_deref()
+                .and_then(|result| serde_json::from_str::<SubagentDeliverable>(result).ok());
             self.queue_mailbox_message(
                 run.parent_thread_id,
                 AgentMailboxMessage {
@@ -965,6 +1187,8 @@ impl SubagentScheduler {
                         "status": run.status,
                         "result": run.result,
                         "error": run.error,
+                        "workspace": contract.workspace,
+                        "delivery": delivery,
                     }))
                     .unwrap_or_else(|_| "agent turn completed".to_string()),
                     created_at: Utc::now(),
@@ -1400,5 +1624,102 @@ mod tests {
             scheduler.send_input(run.id, "late".to_string()),
             Err(SubagentError::AlreadyTerminal(_))
         ));
+    }
+
+    struct StructuredDeliveryExecutor;
+
+    #[async_trait]
+    impl SubagentExecutor for StructuredDeliveryExecutor {
+        async fn execute(
+            &self,
+            _run: SubagentRun,
+            _input: mpsc::UnboundedReceiver<String>,
+            _cancellation: CancellationToken,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("contract-aware execution was expected")
+        }
+
+        async fn execute_with_contract(
+            &self,
+            _run: SubagentRun,
+            contract: SubagentExecutionContract,
+            _input: mpsc::UnboundedReceiver<String>,
+            _cancellation: CancellationToken,
+        ) -> anyhow::Result<String> {
+            let workspace = contract.workspace;
+            Ok(serde_json::to_string(&SubagentDeliverable {
+                kind: SubagentDeliverableKind::CodeChange,
+                summary: "Implemented the isolated change".to_string(),
+                findings: Vec::new(),
+                changed_files: vec![PathBuf::from("src/lib.rs")],
+                verification: vec![SubagentVerificationEvidence {
+                    summary: "Focused tests passed".to_string(),
+                    command: Some("cargo test focused".to_string()),
+                    exit_code: Some(0),
+                }],
+                integration: Some(SubagentIntegrationMetadata {
+                    worktree_root: workspace.root.unwrap(),
+                    branch: workspace.branch.unwrap(),
+                    base_commit: workspace.base_commit.unwrap(),
+                    head_commit: "def456".to_string(),
+                }),
+                remaining_risks: Vec::new(),
+            })?)
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_children_use_contract_aware_execution_and_typed_delivery() {
+        let scheduler = SubagentScheduler::new(
+            SubagentSchedulerConfig::default(),
+            Arc::new(StructuredDeliveryExecutor),
+            Arc::new(NoopSubagentObserver),
+        );
+        let workspace = SubagentWorkspaceAssignment {
+            mode: SubagentWorkspaceMode::IsolatedWorktree,
+            root: Some(PathBuf::from("C:/tmp/opentopia-agent")),
+            branch: Some("codex/child-change".to_string()),
+            base_commit: Some("abc123".to_string()),
+        };
+        let run = scheduler
+            .spawn_with_contract(
+                request(Uuid::new_v4(), "isolated"),
+                SubagentExecutionContract {
+                    workspace: workspace.clone(),
+                    require_structured_delivery: true,
+                },
+            )
+            .unwrap();
+        let completed = scheduler
+            .wait(run.id, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(completed.status, SubagentRunStatus::Completed);
+        assert_eq!(
+            scheduler.execution_contract(run.id).unwrap().workspace,
+            workspace
+        );
+        let delivery = scheduler.structured_deliverable(run.id).unwrap();
+        assert_eq!(delivery.kind, SubagentDeliverableKind::CodeChange);
+        assert_eq!(delivery.integration.unwrap().head_commit, "def456");
+    }
+
+    #[test]
+    fn isolated_workspace_contract_requires_snapshot_identity() {
+        let (scheduler, _) = scheduler(1, Duration::from_millis(1));
+        let error = scheduler
+            .spawn_with_contract(
+                request(Uuid::new_v4(), "invalid_isolated"),
+                SubagentExecutionContract {
+                    workspace: SubagentWorkspaceAssignment {
+                        mode: SubagentWorkspaceMode::IsolatedWorktree,
+                        ..SubagentWorkspaceAssignment::default()
+                    },
+                    require_structured_delivery: true,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, SubagentError::InvalidWorkspaceContract(_)));
     }
 }

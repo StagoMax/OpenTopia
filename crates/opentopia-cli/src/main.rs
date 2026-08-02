@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
 use opentopia_core::{
-    AgentCore, AgentEvent, AgentTurnInput, Message, MessageRole, PermissionMode, SessionStore,
-    SqliteSessionStore,
+    discover_plugins, AgentCore, AgentEvent, AgentTurnInput, Message, MessageRole, PermissionMode,
+    SessionStore, SqliteSessionStore,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -58,7 +59,13 @@ async fn main() -> anyhow::Result<()> {
                 content.clone(),
             ))?;
 
-            let agent = AgentCore::from_env();
+            let bundled_plugin_activations = discover_plugins(Some(&thread.workspace_root))
+                .into_iter()
+                .filter(|plugin| !plugin.native_capabilities.is_empty())
+                .map(|plugin| (plugin.name, plugin.default_enabled))
+                .collect::<HashMap<_, _>>();
+            let mut agent = AgentCore::from_env();
+            agent.set_bundled_plugin_activations(&bundled_plugin_activations);
             let turn_id = Uuid::new_v4();
             let payloads = agent
                 .run_turn(AgentTurnInput {

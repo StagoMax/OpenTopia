@@ -51,6 +51,19 @@ pub struct OpenAiCompatibilityReport {
     pub responses: ProviderFeatureSupport,
     #[serde(default)]
     pub responses_native_tools: ProviderFeatureSupport,
+    /// Function tools using the Responses wire shape. Kept separate from
+    /// `responses_native_tools`: a relay may accept hosted web search while
+    /// rejecting application-defined functions, or vice versa.
+    #[serde(default)]
+    pub responses_function_tools: ProviderFeatureSupport,
+    /// Freeform/custom tool definitions and `custom_tool_call` output items.
+    #[serde(default)]
+    pub responses_custom_tools: ProviderFeatureSupport,
+    /// The named Responses `apply_patch` tool and its structured call/output
+    /// item pair. This is negotiated per endpoint/model, never inferred from a
+    /// vendor or model-name table.
+    #[serde(default)]
+    pub responses_apply_patch: ProviderFeatureSupport,
     pub developer_messages: ProviderFeatureSupport,
     pub message_compatibility: bool,
     pub checked_at: DateTime<Utc>,
@@ -92,6 +105,20 @@ pub struct ProviderCapabilities {
     pub supports_previous_response_id: bool,
     pub supports_provider_items: bool,
     pub supports_prompt_cache: bool,
+    #[serde(default)]
+    pub tool_protocol: ProviderToolProtocolCapabilities,
+}
+
+/// Capabilities of the selected API protocol as actually exposed by a
+/// connection. `Unknown` intentionally behaves like unsupported at selection
+/// time so compatible relays always retain the portable function-tool path.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderToolProtocolCapabilities {
+    pub function_tools: ProviderFeatureSupport,
+    pub freeform_tools: ProviderFeatureSupport,
+    pub hosted_apply_patch: ProviderFeatureSupport,
+    pub assistant_phase: ProviderFeatureSupport,
 }
 
 impl ProviderKind {
@@ -235,16 +262,52 @@ impl RolloutBudgetSettings {
 impl ProviderSettings {
     pub fn capabilities(&self) -> ProviderCapabilities {
         match self.kind {
-            ProviderKind::OpenAiResponses => ProviderCapabilities {
-                supports_native_compaction: self.responses_compaction_threshold_tokens.is_some(),
-                native_compaction_protocol: Some(NativeCompactionProtocol::OpenAiResponsesCompact),
-                supports_response_state: self.store_responses,
-                supports_previous_response_id: self.store_responses,
-                supports_provider_items: true,
-                supports_prompt_cache: true,
-            },
+            ProviderKind::OpenAiResponses => {
+                let negotiated = self
+                    .openai_compatibility
+                    .as_ref()
+                    .filter(|report| report.applies_to(&self.base_url, &self.model));
+                ProviderCapabilities {
+                    supports_native_compaction: self
+                        .responses_compaction_threshold_tokens
+                        .is_some(),
+                    native_compaction_protocol: Some(
+                        NativeCompactionProtocol::OpenAiResponsesCompact,
+                    ),
+                    supports_response_state: self.store_responses,
+                    supports_previous_response_id: self.store_responses,
+                    supports_provider_items: true,
+                    supports_prompt_cache: true,
+                    tool_protocol: ProviderToolProtocolCapabilities {
+                        // Function tools are the portable Responses baseline.
+                        // An explicit failed probe overrides that baseline.
+                        function_tools: negotiated
+                            .map(|report| report.responses_function_tools)
+                            .unwrap_or(ProviderFeatureSupport::Supported),
+                        freeform_tools: negotiated
+                            .map(|report| report.responses_custom_tools)
+                            .unwrap_or_default(),
+                        hosted_apply_patch: negotiated
+                            .map(|report| report.responses_apply_patch)
+                            .unwrap_or_default(),
+                        // Phase is optional on the wire and cannot be proven
+                        // without observing an assistant message. Parsing is
+                        // always tolerant; replayed items are authoritative.
+                        assistant_phase: ProviderFeatureSupport::Unknown,
+                    },
+                }
+            }
             ProviderKind::OpenAiCompatible => ProviderCapabilities {
                 supports_prompt_cache: true,
+                tool_protocol: ProviderToolProtocolCapabilities {
+                    function_tools: self
+                        .openai_compatibility
+                        .as_ref()
+                        .filter(|report| report.applies_to(&self.base_url, &self.model))
+                        .map(|report| report.chat_function_tools)
+                        .unwrap_or(ProviderFeatureSupport::Unknown),
+                    ..ProviderToolProtocolCapabilities::default()
+                },
                 ..ProviderCapabilities::default()
             },
             ProviderKind::Mock | ProviderKind::CodexAppServer | ProviderKind::Anthropic => {
@@ -1154,6 +1217,9 @@ mod tests {
             chat_function_tools: ProviderFeatureSupport::Supported,
             responses: ProviderFeatureSupport::Unsupported,
             responses_native_tools: ProviderFeatureSupport::Unsupported,
+            responses_function_tools: ProviderFeatureSupport::Unknown,
+            responses_custom_tools: ProviderFeatureSupport::Unknown,
+            responses_apply_patch: ProviderFeatureSupport::Unknown,
             developer_messages: ProviderFeatureSupport::Unsupported,
             message_compatibility: true,
             checked_at: Utc::now(),
@@ -1308,6 +1374,14 @@ mod tests {
         assert!(stateless.supports_provider_items);
         assert!(!stateless.supports_response_state);
         assert!(!stateless.supports_previous_response_id);
+        assert_eq!(
+            stateless.tool_protocol.function_tools,
+            ProviderFeatureSupport::Supported
+        );
+        assert_eq!(
+            stateless.tool_protocol.hosted_apply_patch,
+            ProviderFeatureSupport::Unknown
+        );
 
         provider.store_responses = true;
         let stateful = provider.capabilities();
@@ -1319,6 +1393,45 @@ mod tests {
         assert!(!chat.supports_native_compaction);
         assert_eq!(chat.native_compaction_protocol, None);
         assert!(!chat.supports_provider_items);
+    }
+
+    #[test]
+    fn responses_tool_capabilities_use_matching_probe_without_model_name_mapping() {
+        let mut provider = ProviderSettings::default();
+        provider.kind = ProviderKind::OpenAiResponses;
+        provider.base_url = "https://relay.example/v1".to_string();
+        provider.model = "opaque-model-id".to_string();
+        provider.openai_compatibility = Some(OpenAiCompatibilityReport {
+            base_url: provider.base_url.clone(),
+            model: provider.model.clone(),
+            selected_protocol: OpenAiProtocol::Responses,
+            chat_completions: ProviderFeatureSupport::Unknown,
+            chat_function_tools: ProviderFeatureSupport::Unknown,
+            responses: ProviderFeatureSupport::Supported,
+            responses_native_tools: ProviderFeatureSupport::Supported,
+            responses_function_tools: ProviderFeatureSupport::Supported,
+            responses_custom_tools: ProviderFeatureSupport::Supported,
+            responses_apply_patch: ProviderFeatureSupport::Unsupported,
+            developer_messages: ProviderFeatureSupport::Unknown,
+            message_compatibility: false,
+            checked_at: Utc::now(),
+            notes: Vec::new(),
+        });
+
+        let capabilities = provider.capabilities().tool_protocol;
+        assert_eq!(
+            capabilities.freeform_tools,
+            ProviderFeatureSupport::Supported
+        );
+        assert_eq!(
+            capabilities.hosted_apply_patch,
+            ProviderFeatureSupport::Unsupported
+        );
+
+        provider.model = "different-model".to_string();
+        let stale = provider.capabilities().tool_protocol;
+        assert_eq!(stale.freeform_tools, ProviderFeatureSupport::Unknown);
+        assert_eq!(stale.hosted_apply_patch, ProviderFeatureSupport::Unknown);
     }
 
     #[test]

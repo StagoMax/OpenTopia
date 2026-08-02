@@ -1,6 +1,10 @@
 use crate::bundled_plugins::{
     ensure_bundled_plugins_installed, verified_bundled_plugin_metadata, BundledPluginTrust,
 };
+use crate::capabilities::{
+    CodexCompatibleContributions, ContributionOrigin, OpenTopiaManifest, PluginCapabilityManifest,
+    RegisteredPluginCapabilities,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +56,7 @@ pub struct PluginDescriptor {
     pub trust: BundledPluginTrust,
     pub default_enabled: bool,
     pub native_capabilities: Vec<String>,
+    pub capability_manifest: PluginCapabilityManifest,
     pub skill_root: Option<PathBuf>,
     pub skill_count: usize,
     pub mcp_server_count: usize,
@@ -68,6 +73,18 @@ impl PluginDescriptor {
         self.skill_count > 0
             || self.supported_mcp_server_count > 0
             || !self.native_capabilities.is_empty()
+            || !self.capability_manifest.contributions.is_empty()
+    }
+
+    pub fn capability_registration(&self) -> RegisteredPluginCapabilities {
+        RegisteredPluginCapabilities {
+            plugin_id: self.id.clone(),
+            plugin_name: self.name.clone(),
+            source: self.source,
+            trust: self.trust,
+            default_enabled: self.default_enabled,
+            contributions: self.capability_manifest.contributions.clone(),
+        }
     }
 }
 
@@ -134,6 +151,8 @@ struct PluginManifest {
     mcp_servers: Option<String>,
     #[serde(default)]
     interface: PluginInterface,
+    #[serde(default)]
+    opentopia: Option<OpenTopiaManifest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,15 +425,35 @@ fn descriptor_from_manifest(
         inspect_mcp_capability(&plugin_root, manifest.mcp_servers.as_deref());
     issues.extend(mcp_issues);
     let has_apps = manifest.apps.is_some();
-    if has_apps {
-        issues.push("Plugin app bridges are detected but not supported yet.".to_string());
-    }
     if skill_count == 0
         && mcp_server_count == 0
         && !has_apps
         && bundled.is_none_or(|metadata| metadata.native_capabilities.is_empty())
     {
         issues.push("The plugin does not declare Skills, MCP servers, or apps.".to_string());
+    }
+
+    let id = plugin_id(source, &manifest_path, &manifest.name);
+    let capability_manifest = PluginCapabilityManifest::from_manifests(
+        &id,
+        manifest.opentopia.clone(),
+        CodexCompatibleContributions {
+            skills: manifest.skills.as_deref(),
+            mcp_servers: manifest.mcp_servers.as_deref(),
+            apps: manifest.apps.as_ref(),
+        },
+    )
+    .map_err(|error| PluginError::InvalidManifest(error.to_string()))?;
+    if let Some(reference) = capability_manifest.configuration_schema.as_deref() {
+        resolve_declared_path(&plugin_root, reference, false)?;
+    }
+    for contribution in &capability_manifest.contributions {
+        if contribution.origin == ContributionOrigin::CodexCompatible {
+            continue;
+        }
+        if let Some(reference) = contribution.declared_path_reference() {
+            resolve_declared_path(&plugin_root, reference, false)?;
+        }
     }
 
     let interface = manifest.interface;
@@ -424,7 +463,6 @@ fn descriptor_from_manifest(
     let manifest_author = manifest.author.map(PluginAuthor::name).unwrap_or_default();
     let author = non_empty(interface.developer_name, &manifest_author);
     let website_url = interface.website_url.or(manifest.homepage);
-    let id = plugin_id(source, &manifest_path);
 
     Ok(PluginDescriptor {
         id,
@@ -455,6 +493,7 @@ fn descriptor_from_manifest(
                     .collect()
             })
             .unwrap_or_default(),
+        capability_manifest,
         skill_root,
         skill_count,
         mcp_server_count,
@@ -852,14 +891,20 @@ fn non_empty(value: String, fallback: &str) -> String {
     }
 }
 
-fn plugin_id(source: PluginSource, manifest_path: &Path) -> String {
+fn plugin_id(source: PluginSource, manifest_path: &Path, plugin_name: &str) -> String {
+    if source == PluginSource::Bundled {
+        // Bundled package identity is host-owned and verified against the catalog.
+        // Keeping it independent of the application install path preserves scoped
+        // activation, permission and settings records across upgrades or moves.
+        return format!("bundled:{plugin_name}");
+    }
     format!(
         "{}:{}",
         match source {
             PluginSource::Workspace => "workspace",
             PluginSource::User => "user",
             PluginSource::Codex => "codex",
-            PluginSource::Bundled => "bundled",
+            PluginSource::Bundled => unreachable!("bundled IDs are handled above"),
         },
         manifest_path.to_string_lossy().replace('\\', "/")
     )
@@ -972,6 +1017,77 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_opentopia_manifest_contributions_without_starting_runtimes() {
+        let dir = TestDir::new();
+        let plugin = dir.plugin(
+            "capability-pack",
+            r##"{
+              "name":"capability-pack",
+              "version":"1.0.0",
+              "skills":"./skills",
+              "mcpServers":"./.mcp.json",
+              "opentopia":{
+                "apiVersion":"1",
+                "requires":{"hostCapabilities":["workspace.files.v1"]},
+                "permissions":{"filesystem":["workspace:read"],"network":[],"secrets":[],"desktop":[]},
+                "contributes":{
+                  "nativeTools":[{"id":"inspect","runtime":"builtin:test"}],
+                  "previewers":[{"id":"text","mediaTypes":["text/plain"]}],
+                  "contextLoaders":["./loaders/context-text.json"],
+                  "agentProfiles":["./agents/reviewer.toml"],
+                  "scmConnectors":["./scm/example.json"],
+                  "apps":[{"id":"dashboard","path":"./apps/dashboard.json"}]
+                },
+                "configuration":{"schema":"./configuration.schema.json"}
+              }
+            }"##,
+        );
+        for path in [
+            "loaders/context-text.json",
+            "agents/reviewer.toml",
+            "scm/example.json",
+            "apps/dashboard.json",
+            "configuration.schema.json",
+        ] {
+            let path = plugin.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "{}").unwrap();
+        }
+        fs::create_dir_all(plugin.join("skills/review")).unwrap();
+        fs::write(plugin.join("skills/review/SKILL.md"), "# Review").unwrap();
+        fs::write(plugin.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+
+        let descriptor = inspect_plugin(&plugin).unwrap();
+        assert_eq!(
+            descriptor.capability_manifest.api_version.as_deref(),
+            Some("1")
+        );
+        assert_eq!(descriptor.capability_manifest.contributions.len(), 8);
+        assert!(descriptor
+            .capability_manifest
+            .contributions
+            .iter()
+            .any(|contribution| contribution.id == format!("{}/dashboard", descriptor.id)));
+        assert!(descriptor
+            .capability_manifest
+            .contributions
+            .iter()
+            .filter(|contribution| contribution.origin == ContributionOrigin::CodexCompatible)
+            .all(|contribution| matches!(
+                contribution.kind,
+                crate::capabilities::ContributionKind::Skill
+                    | crate::capabilities::ContributionKind::McpServer
+            )));
+        assert_eq!(
+            descriptor
+                .capability_manifest
+                .configuration_schema
+                .as_deref(),
+            Some("configuration.schema.json")
+        );
+    }
+
+    #[test]
     fn reports_http_mcp_as_detected_but_unsupported() {
         let dir = TestDir::new();
         let plugin = dir.plugin("remote", r#"{"name":"remote","mcpServers":"./.mcp.json"}"#);
@@ -1019,9 +1135,26 @@ mod tests {
             assert_eq!(descriptor.trust, metadata.trust);
             assert_eq!(descriptor.default_enabled, metadata.default_enabled);
             assert_eq!(descriptor.native_capabilities, metadata.native_capabilities);
+            assert_eq!(
+                descriptor.capability_manifest.api_version.as_deref(),
+                Some("1")
+            );
+            assert!(descriptor
+                .capability_manifest
+                .contributions
+                .iter()
+                .any(|contribution| contribution.kind
+                    == crate::capabilities::ContributionKind::NativeTool));
             assert!(!descriptor.managed);
             assert!(descriptor.is_compatible());
-            assert!(descriptor.id.starts_with("bundled:"));
+            assert_eq!(descriptor.id, format!("bundled:{}", metadata.name));
+            assert!(descriptor
+                .capability_manifest
+                .contributions
+                .iter()
+                .all(|contribution| contribution
+                    .id
+                    .starts_with(&format!("bundled:{}/", metadata.name))));
             assert!(!descriptor
                 .issues
                 .iter()

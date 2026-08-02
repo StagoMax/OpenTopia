@@ -13,41 +13,43 @@ use futures_util::stream::{self, StreamExt};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
     agent_model_context_with_runtime, browser_handoff_for_node, build_local_sandbox_command,
-    bundled_plugin_metadata, bundled_plugins_path, content_fingerprint, discover_plugins,
-    discover_skills, ensure_bundled_plugins_installed, execute_git_workflow,
-    experience_mode_module, install_plugin, load_context_sources, load_plugin_mcp_servers,
+    bundled_plugin_metadata, bundled_plugins_path, configured_provider_from_settings,
+    content_fingerprint, discover_plugins, discover_skills, ensure_bundled_plugins_installed,
+    execute_git_workflow, experience_mode_module, install_plugin,
+    isolated_subagent_worktree_request, load_context_sources, load_plugin_mcp_servers,
     load_selected_skills, permission_policy_module, redact_model_observation,
     resolve_instruction_documents, uninstall_plugin, world_state_catalog_item, world_state_item,
     AgentContextBudget, AgentContinuation, AgentCore, AgentEvent, AgentEventPayload,
-    AgentProfileRegistry, AgentRuntimeSettings, AgentTurnInput, AgentTurnOutcome,
-    AnthropicMessagesProvider, AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction, BrowserActionReceipt,
-    BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest, BrowserNodeRef,
-    BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserRuntime,
-    BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
-    BrowserWaitRequest, ChangedFile, CodexAccountManager, CodexAccountStatus,
-    CodexAppServerProvider, CodexLoginStart, CollaborationMode, CompiledModelContext,
-    ComputerRuntime, ComputerRuntimeConfig, ComputerSessionId, ContextCacheScope,
-    ContextCheckpoint, ContextCheckpointArtifact, ContextCheckpointCommand,
-    ContextCheckpointCoverage, ContextCheckpointFact, ContextCheckpointInteraction,
-    ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
-    ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextItemKind,
-    ContextProjection, ContextRole, ContextSensitivity, ContextSourcePolicy, ContextSourceRef,
-    ContextSummary, DesktopBrowserRuntime, ExecRequest, ExecutionContext, ExperienceMode,
-    GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill,
-    LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment, McpCallResult,
-    McpServerConfig, McpServerStatus, McpToolDescriptor, Message, MessagePart, MessageRole,
-    ModelContentPart, ModelContextItem, ModelConversationMessage, ModelConversationRole,
-    ModelProvider, ModelRequest, ObserveOptions, OpenAiCompatibleProvider, OpenAiProtocol,
-    OpenAiResponsesProvider, PermissionMode, PluginDescriptor, PluginError, PolicyDecision,
-    PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest,
-    PreviewTarget, PreviewWorkbook, ProviderConversationCursor, ProviderConversationState,
-    ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent,
-    ResolvedPreview, ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxSettings,
+    AgentProfileRegistry, AgentRuntimeSettings, AgentTurnInput, AgentTurnOutcome, AppSettings,
+    Approval, ApprovalStatus, Artifact, ArtifactMetadata, BackgroundProcessRegistry,
+    BasicPolicyEngine, BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
+    BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
+    BrowserObserveOptions, BrowserOutput, BrowserRuntime, BrowserRuntimeConfig, BrowserSelector,
+    BrowserSessionId, BrowserWaitCondition, BrowserWaitRequest, ChangedFile, CodexAccountManager,
+    CodexAccountStatus, CodexLoginStart, CollaborationMode, CompiledModelContext, ComputerRuntime,
+    ComputerRuntimeConfig, ComputerSessionId, ContextCacheScope, ContextCheckpoint,
+    ContextCheckpointArtifact, ContextCheckpointCommand, ContextCheckpointCoverage,
+    ContextCheckpointFact, ContextCheckpointInteraction, ContextCheckpointMode,
+    ContextCheckpointStep, ContextCheckpointWorkspace, ContextCompactionDetails,
+    ContextCompactionMetrics, ContextFactStatus, ContextItemKind, ContextProjection, ContextRole,
+    ContextSensitivity, ContextSourcePolicy, ContextSourceRef, ContextSummary, ContributionKind,
+    DesktopBrowserRuntime, EvaluationRun, EvaluationTaskResult, ExecRequest, ExecutionContext,
+    ExperienceMode, GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus,
+    LoadedSkill, LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment,
+    LocalSandboxConfig, McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor,
+    MediaHandlerSelection, Message, MessagePart, MessageRole, ModelContentPart, ModelContextItem,
+    ModelConversationMessage, ModelConversationRole, ModelRequest, ObserveOptions,
+    OpenAiCompatibleProvider, OpenAiProtocol, PermissionMode, PluginControlScope, PluginDescriptor,
+    PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind,
+    PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderConversationCursor,
+    ProviderConversationState, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth,
+    ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview,
+    ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxMode, SandboxSettings, SearchTool,
     SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
-    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
-    SubagentScope, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot,
-    ThreadMcpServer, ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult,
+    SubagentExecutionContract, SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler,
+    SubagentSchedulerConfig, SubagentScope, SubagentWorkspaceMode, TaskPlan,
+    TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer,
+    ThreadModelSelection, Tool, ToolCall, ToolContext, ToolPermissionDescriptor, ToolResult,
     TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus,
     UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff,
     WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
@@ -58,7 +60,7 @@ use opentopia_core::{
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -78,6 +80,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod auth;
+mod contributions_api;
+mod plugins_api;
+mod scm_api;
 mod turn_changes;
 mod turns;
 
@@ -119,6 +124,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let store = Arc::new(SqliteSessionStore::open(&args.db)?);
+    let indeterminate_effects = store.mark_running_effects_indeterminate()?;
+    if indeterminate_effects > 0 {
+        warn!(
+            indeterminate_effects,
+            "marked in-flight effects indeterminate for reconciliation"
+        );
+    }
     let interrupted_turns = store.interrupt_active_turns()?;
     if interrupted_turns > 0 {
         info!(interrupted_turns, "recovered interrupted agent turns");
@@ -162,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
     initial_agent.set_browser_runtime(browser.clone());
     initial_agent.set_computer_runtime(computer.clone());
     initial_agent.set_background_processes(background.clone());
+    apply_evaluation_tool_policy(&mut initial_agent);
     let agent = Arc::new(RwLock::new(initial_agent));
     let subagents = SubagentScheduler::new(
         SubagentSchedulerConfig::default(),
@@ -202,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         turn_queue,
         subagents,
         background,
+        app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
     };
 
     let queue_state = state.clone();
@@ -322,8 +336,8 @@ async fn initialize_browser_runtime() -> Arc<dyn BrowserRuntime> {
     }
 
     let mut config = BrowserRuntimeConfig::default();
-    if let Some(data_root) = std::env::var_os("OPENTOPIA_BROWSER_DATA_ROOT")
-        .filter(|value| !value.is_empty())
+    if let Some(data_root) =
+        std::env::var_os("OPENTOPIA_BROWSER_DATA_ROOT").filter(|value| !value.is_empty())
     {
         config.data_root = PathBuf::from(data_root);
         info!(path = %config.data_root.display(), "using configured local browser data root");
@@ -331,17 +345,47 @@ async fn initialize_browser_runtime() -> Arc<dyn BrowserRuntime> {
     Arc::new(LocalBrowserRuntime::new(config))
 }
 
+/// The public application never accepts an allowlist from a chat request. The
+/// evaluator starts a dedicated server process and may narrow that process to a
+/// deterministic tool surface through its trusted launch environment.
+fn apply_evaluation_tool_policy(agent: &mut AgentCore) {
+    let Some(raw) = std::env::var("OPENTOPIA_EVAL_ALLOWED_TOOLS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    let tools = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|tool| !tool.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    if tools.is_empty() {
+        warn!("OPENTOPIA_EVAL_ALLOWED_TOOLS did not contain any tool names; ignoring evaluator policy");
+        return;
+    }
+    info!(tools = ?tools, "restricting agent tools for evaluator process");
+    agent.restrict_to_tools(tools);
+}
+
 fn build_router(state: AppState) -> Router {
     let cors = state.auth.cors_layer();
     let auth_state = state.clone();
     Router::new()
+        .merge(contributions_api::router())
+        .merge(plugins_api::router())
+        .merge(scm_api::router())
         .route("/health", get(health))
+        .route("/api/evaluations", get(list_evaluation_runs))
+        .route("/api/evaluations/import", post(import_evaluation_runs))
         .route("/api/settings", get(get_settings).patch(update_settings))
         .route("/api/skills", get(list_skills))
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/install", post(install_local_plugin))
         .route("/api/plugins/uninstall", post(uninstall_local_plugin))
         .route("/api/threads/:thread_id/plugins", put(set_thread_plugin))
+        .route("/api/provider/drivers", get(list_provider_drivers))
         .route("/api/provider/health", get(provider_health))
         .route("/api/provider/test", post(test_provider_connection))
         .route("/api/codex/account", get(get_codex_account))
@@ -453,6 +497,10 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/threads/:thread_id/workspace/file",
             get(read_workspace_file),
+        )
+        .route(
+            "/api/threads/:thread_id/workspace/search",
+            post(search_workspace),
         )
         .route(
             "/api/threads/:thread_id/workspace/diff",
@@ -567,6 +615,7 @@ struct AppState {
     turn_queue: mpsc::UnboundedSender<Uuid>,
     subagents: SubagentScheduler,
     background: BackgroundProcessRegistry,
+    app_views: Arc<Mutex<opentopia_core::AppViewHost>>,
 }
 
 struct StoreSubagentObserver {
@@ -588,11 +637,95 @@ struct ServerSubagentExecutor {
     mcp_host: McpExtensionHost,
 }
 
+impl ServerSubagentExecutor {
+    async fn prepare_workspace(
+        &self,
+        thread_root: &FsPath,
+        contract: &SubagentExecutionContract,
+    ) -> anyhow::Result<PathBuf> {
+        let requested_root = contract
+            .workspace
+            .root
+            .clone()
+            .unwrap_or_else(|| thread_root.to_path_buf());
+        let isolated_root = thread_root.join(".opentopia").join("worktrees");
+        let contains_parent_component = requested_root
+            .components()
+            .any(|component| component == std::path::Component::ParentDir);
+        if contains_parent_component
+            || (requested_root != thread_root && !requested_root.starts_with(&isolated_root))
+        {
+            anyhow::bail!(
+                "subagent workspace root is outside the thread isolation area: {}",
+                requested_root.display()
+            );
+        }
+        if contract.workspace.mode != SubagentWorkspaceMode::IsolatedWorktree {
+            return Ok(requested_root);
+        }
+
+        let branch = contract
+            .workspace
+            .branch
+            .clone()
+            .context("isolated subagent is missing its branch")?;
+        let base_commit = contract
+            .workspace
+            .base_commit
+            .clone()
+            .context("isolated subagent is missing its base commit")?;
+        if requested_root.join(".git").exists() {
+            return Ok(requested_root);
+        }
+        if let Some(parent) = requested_root.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create subagent worktree parent {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let request = isolated_subagent_worktree_request(
+            thread_root.to_path_buf(),
+            requested_root.clone(),
+            branch,
+            base_commit,
+        )?;
+        let environment = LocalExecutionEnvironment::with_sandbox_config(
+            thread_root.to_path_buf(),
+            // The model-facing spawn tool already passed policy inspection and
+            // this control-plane command is fully constructed from validated
+            // refs plus a path confined under .opentopia/worktrees.
+            LocalSandboxConfig::danger_full_access(),
+        );
+        execute_git_workflow(
+            &environment,
+            &request,
+            ExecutionContext::with_timeout(Duration::from_secs(120)),
+        )
+        .await
+        .context("failed to prepare isolated subagent worktree")?;
+        Ok(requested_root)
+    }
+}
+
 #[async_trait]
 impl SubagentExecutor for ServerSubagentExecutor {
     async fn execute(
         &self,
         run: SubagentRun,
+        input: mpsc::UnboundedReceiver<String>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<String> {
+        let contract = run.execution_contract.clone();
+        self.execute_with_contract(run, contract, input, cancellation)
+            .await
+    }
+
+    async fn execute_with_contract(
+        &self,
+        run: SubagentRun,
+        contract: SubagentExecutionContract,
         mut input: mpsc::UnboundedReceiver<String>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<String> {
@@ -600,14 +733,27 @@ impl SubagentExecutor for ServerSubagentExecutor {
             .store
             .get_thread(run.parent_thread_id)?
             .ok_or_else(|| anyhow::anyhow!("parent thread no longer exists"))?;
-        let registry = AgentProfileRegistry::load(&thread.workspace_root);
+        let workspace_root = self
+            .prepare_workspace(&thread.workspace_root, &contract)
+            .await?;
+        let registry = load_agent_profiles_for_thread(&self.store, &thread)?;
         for warning in registry.warnings() {
             warn!(agent_path = %run.agent_path, warning, "agent profile warning");
         }
-        let profile = registry
+        let mut profile = registry
             .get(&run.agent_type)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown agent_type `{}`", run.agent_type))?;
+        if contract.require_structured_delivery {
+            let workspace = &contract.workspace;
+            profile.developer_instructions.push_str(&format!(
+                "\n\n[Subagent delivery contract]\nWork only in the assigned isolated worktree '{}'. Do not merge into the parent workspace and do not commit unless the delegated task explicitly authorizes a commit. The parent agent owns semantic integration. Your final response must be only one JSON object matching SubagentDeliverable: kind ('research', 'code_change', or 'review'), summary, findings, changedFiles, verification, integration, and remainingRisks. For code_change set integration.worktreeRoot='{}', branch='{}', baseCommit='{}', and headCommit to the current HEAD (it may equal baseCommit when changes are intentionally uncommitted).",
+                workspace_root.display(),
+                workspace_root.display(),
+                workspace.branch.as_deref().unwrap_or_default(),
+                workspace.base_commit.as_deref().unwrap_or_default(),
+            ));
+        }
         let persisted_conversation = self.store.load_subagent_conversation(run.id)?;
         let mut conversation = match persisted_conversation {
             Some(conversation) => conversation,
@@ -640,6 +786,14 @@ impl SubagentExecutor for ServerSubagentExecutor {
                 agent.set_provider_from_settings(&settings);
             }
             agent.apply_agent_profile(&profile);
+            if contract.workspace.mode == SubagentWorkspaceMode::SharedReadOnly {
+                agent.set_sandbox_config(
+                    settings
+                        .sandbox
+                        .to_local_sandbox_config()
+                        .with_sandbox_mode(SandboxMode::ReadOnly),
+                );
+            }
             agent.set_mcp_host(self.mcp_host.clone());
             agent.set_subagent_identity(run.id, run.depth, run.agent_path.clone());
             sync_thread_bundled_plugin_activations(&self.store, run.parent_thread_id, &mut agent);
@@ -673,12 +827,18 @@ impl SubagentExecutor for ServerSubagentExecutor {
                     AgentTurnInput {
                         thread_id: run.parent_thread_id,
                         user_message_id: Uuid::new_v4(),
-                        workspace_root: thread.workspace_root.clone(),
+                        workspace_root: workspace_root.clone(),
                         content: prompt.clone(),
                         user_content: Vec::new(),
                         context_summary: None,
                         conversation: conversation.clone(),
-                        permission_mode: settings.permission_mode,
+                        permission_mode: if contract.workspace.mode
+                            == SubagentWorkspaceMode::SharedReadOnly
+                        {
+                            PermissionMode::ReadOnly
+                        } else {
+                            settings.permission_mode
+                        },
                         context_budget: None,
                         provider_cursor: provider_cursor.cursor,
                         store: Some(self.store.clone()),
@@ -1163,6 +1323,324 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+const MAX_EVALUATION_SUMMARIES: usize = 200;
+const MAX_EVALUATION_SUMMARY_BYTES: u64 = 1_048_576;
+
+async fn list_evaluation_runs(
+    State(state): State<AppState>,
+    Query(query): Query<EvaluationRunsQuery>,
+) -> Result<Json<Vec<EvaluationRun>>, ApiError> {
+    let workspace_root = canonicalize_workspace_root(query.workspace_root);
+    Ok(Json(state.store.list_evaluation_runs(&workspace_root)?))
+}
+
+async fn import_evaluation_runs(
+    State(state): State<AppState>,
+    Json(request): Json<ImportEvaluationRunsRequest>,
+) -> Result<Json<Vec<EvaluationRun>>, ApiError> {
+    let workspace_root = canonicalize_workspace_root(request.workspace_root);
+    let runs = scan_workspace_evaluation_runs(&workspace_root)?;
+    for run in &runs {
+        state.store.upsert_evaluation_run(run)?;
+    }
+    Ok(Json(state.store.list_evaluation_runs(&workspace_root)?))
+}
+
+fn scan_workspace_evaluation_runs(workspace_root: &FsPath) -> anyhow::Result<Vec<EvaluationRun>> {
+    let evaluation_root = workspace_root.join(".opentopia").join("evaluations");
+    if !evaluation_root.exists() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        evaluation_root.is_dir(),
+        "evaluation path is not a directory: {}",
+        evaluation_root.display()
+    );
+
+    let mut summary_paths = std::fs::read_dir(&evaluation_root)
+        .with_context(|| format!("failed to read {}", evaluation_root.display()))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.path().join("summary.json"))
+        })
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    summary_paths.sort();
+    summary_paths.truncate(MAX_EVALUATION_SUMMARIES);
+
+    let mut runs = Vec::new();
+    for summary_path in summary_paths {
+        match read_evaluation_json(&summary_path)
+            .and_then(|summary| evaluation_run_from_summary(workspace_root, &summary_path, summary))
+        {
+            Ok(run) => runs.push(run),
+            Err(error) => {
+                warn!(path = %summary_path.display(), ?error, "skipping unreadable evaluation summary")
+            }
+        }
+    }
+    runs.sort_by(|left, right| {
+        right
+            .completed_at
+            .or(right.started_at)
+            .cmp(&left.completed_at.or(left.started_at))
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    Ok(runs)
+}
+
+fn read_evaluation_json(path: &FsPath) -> anyhow::Result<Value> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.len() <= MAX_EVALUATION_SUMMARY_BYTES,
+        "evaluation JSON exceeds {} bytes: {}",
+        MAX_EVALUATION_SUMMARY_BYTES,
+        path.display()
+    );
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn evaluation_run_from_summary(
+    workspace_root: &FsPath,
+    summary_path: &FsPath,
+    summary: Value,
+) -> anyhow::Result<EvaluationRun> {
+    let directory = summary_path
+        .parent()
+        .context("evaluation summary has no parent directory")?;
+    let fallback_id = directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("evaluation-run");
+    let run_id =
+        json_string(&summary, &["runId", "suiteId"]).unwrap_or_else(|| fallback_id.to_string());
+    let title = json_string(&summary, &["benchmark", "title", "suiteId"])
+        .unwrap_or_else(|| "OpenTopia evaluation".to_string());
+    let status = json_string(&summary, &["status"]).unwrap_or_else(|| "unknown".to_string());
+    let model = json_string(&summary, &["model"])
+        .or_else(|| json_string_at(&summary, &["provider", "model"]))
+        .or_else(|| json_string_at(&summary, &["provider", "expectedModel"]));
+    let failure_category = json_string(&summary, &["failureCategory"]);
+    let tasks = evaluation_tasks_from_details(directory, &summary).unwrap_or_else(|error| {
+        warn!(path = %directory.display(), ?error, "using summary-only evaluation task details");
+        evaluation_tasks_from_summary(&summary)
+    });
+
+    Ok(EvaluationRun {
+        run_id,
+        workspace_root: workspace_root.to_path_buf(),
+        title,
+        status,
+        model,
+        failure_category,
+        started_at: json_datetime(&summary, "startedAt"),
+        completed_at: json_datetime(&summary, "completedAt"),
+        source_path: directory.to_path_buf(),
+        tasks,
+        summary,
+        updated_at: Utc::now(),
+    })
+}
+
+fn evaluation_tasks_from_details(
+    directory: &FsPath,
+    summary: &Value,
+) -> anyhow::Result<Vec<EvaluationTaskResult>> {
+    let mut tasks = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some("summary.json")
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let detail = match read_evaluation_json(&path) {
+            Ok(detail) => detail,
+            Err(error) => {
+                warn!(path = %path.display(), ?error, "skipping unreadable evaluation task detail");
+                continue;
+            }
+        };
+        if let Some(task) = evaluation_task_from_detail(&detail) {
+            tasks.push(task);
+        }
+    }
+    if tasks.is_empty() {
+        tasks = evaluation_tasks_from_referenced_runs(directory, summary);
+    }
+    Ok(tasks)
+}
+
+/// A suite summary only contains aggregate task rows. Its per-attempt result
+/// files live next to the suite directory and carry the trajectory metrics we
+/// need for observability. Keep the summary row when an attempt artifact is
+/// missing, rather than inferring a replacement category from the UI.
+fn evaluation_tasks_from_referenced_runs(
+    suite_directory: &FsPath,
+    summary: &Value,
+) -> Vec<EvaluationTaskResult> {
+    let mut tasks = evaluation_tasks_from_summary(summary);
+    let Some(evaluation_root) = suite_directory.parent() else {
+        return tasks;
+    };
+
+    for task in &mut tasks {
+        let Some(run_id) = task.run_id.as_deref() else {
+            continue;
+        };
+        let Some(result_path) = evaluation_result_path(evaluation_root, run_id) else {
+            warn!(%run_id, "skipping unsafe evaluation run id from summary");
+            continue;
+        };
+        let detail = match read_evaluation_json(&result_path) {
+            Ok(detail) => detail,
+            Err(error) => {
+                warn!(path = %result_path.display(), ?error, "evaluation task result artifact is unavailable");
+                continue;
+            }
+        };
+        if let Some(detail_task) = evaluation_task_from_detail(&detail) {
+            // Preserve the suite's task/attempt label while enriching it from
+            // the detailed Harness artifact.
+            let task_id = task.task_id.clone();
+            *task = detail_task;
+            task.task_id = task_id;
+        }
+    }
+    tasks
+}
+
+fn evaluation_result_path(evaluation_root: &FsPath, run_id: &str) -> Option<PathBuf> {
+    let mut components = FsPath::new(run_id).components();
+    let component = components.next()?;
+    if components.next().is_some() || !matches!(component, std::path::Component::Normal(_)) {
+        return None;
+    }
+    Some(evaluation_root.join(run_id).join("result.json"))
+}
+
+fn evaluation_task_from_detail(value: &Value) -> Option<EvaluationTaskResult> {
+    let task = value.get("task")?;
+    let task_id = json_string(task, &["id"])?;
+    let tool_calls_by_name = value
+        .pointer("/trajectoryMetrics/toolCallsByName")
+        .and_then(Value::as_object)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|(name, count)| count.as_u64().map(|count| (name.clone(), count)))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(EvaluationTaskResult {
+        task_id,
+        run_id: json_string(value, &["runId"]),
+        title: json_string(task, &["title"]),
+        status: json_string(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
+        failure_category: json_string(value, &["failureCategory"]),
+        error: json_string(value, &["error"]),
+        tool_calls_by_name,
+        total_tokens: value
+            .pointer("/trajectoryMetrics/totalTokens")
+            .and_then(Value::as_u64),
+        error_events: value
+            .pointer("/trajectoryMetrics/errorEvents")
+            .and_then(Value::as_u64),
+        recovery_passed: value.get("recoveryPassed").and_then(Value::as_bool),
+        process_contract_passed: value.get("processContractPassed").and_then(Value::as_bool),
+    })
+}
+
+fn evaluation_tasks_from_summary(summary: &Value) -> Vec<EvaluationTaskResult> {
+    let mut tasks = Vec::new();
+    for task in summary
+        .get("tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let task_id = json_string(task, &["taskId", "task"]).unwrap_or_else(|| "task".to_string());
+        let runs = task.get("runs").and_then(Value::as_array);
+        if let Some(runs) = runs.filter(|runs| !runs.is_empty()) {
+            for (index, run) in runs.iter().enumerate() {
+                tasks.push(evaluation_task_from_summary_value(
+                    run,
+                    task_id.clone(),
+                    (runs.len() > 1).then_some(index + 1),
+                ));
+            }
+        } else {
+            tasks.push(evaluation_task_from_summary_value(task, task_id, None));
+        }
+    }
+    tasks
+}
+
+fn evaluation_task_from_summary_value(
+    value: &Value,
+    task_id: String,
+    attempt: Option<usize>,
+) -> EvaluationTaskResult {
+    let task_id = attempt
+        .map(|attempt| format!("{task_id} · {attempt}"))
+        .unwrap_or(task_id);
+    EvaluationTaskResult {
+        task_id,
+        run_id: json_string(value, &["runId"]),
+        title: json_string(value, &["title"]),
+        status: json_string(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
+        failure_category: json_string(value, &["failureCategory"]),
+        error: json_string(value, &["error"]),
+        tool_calls_by_name: BTreeMap::new(),
+        total_tokens: json_u64(value, "totalTokens"),
+        error_events: json_u64(value, "errorEvents"),
+        recovery_passed: value.get("recoveryPassed").and_then(Value::as_bool),
+        process_contract_passed: value.get("processContractPassed").and_then(Value::as_bool),
+    }
+}
+
+fn json_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn json_string_at(value: &Value, path: &[&str]) -> Option<String> {
+    let value = path
+        .iter()
+        .try_fold(value, |current, key| current.get(*key))?;
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
+fn json_datetime(value: &Value, key: &str) -> Option<DateTime<Utc>> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
 async fn get_settings(State(state): State<AppState>) -> Json<AppSettings> {
     Json(current_settings(&state))
 }
@@ -1239,6 +1717,7 @@ async fn update_settings(
         agent.set_computer_runtime(state.computer.clone());
         agent.set_subagent_scheduler(state.subagents.clone());
         agent.set_background_processes(state.background.clone());
+        apply_evaluation_tool_policy(&mut agent);
         *agent_guard = agent;
     }
     Ok(Json(settings))
@@ -1253,6 +1732,10 @@ async fn provider_health(State(state): State<AppState>) -> Json<Vec<ProviderHeal
             .map(ProviderHealth::from_settings)
             .collect(),
     )
+}
+
+async fn list_provider_drivers() -> Json<Vec<ProviderDriverDescriptor>> {
+    Json(ProviderDriverRegistry::built_in().descriptors())
 }
 
 async fn get_codex_account(
@@ -1291,7 +1774,21 @@ async fn list_skills(
     State(state): State<AppState>,
     Query(query): Query<SkillsQuery>,
 ) -> Result<Json<Vec<SkillDescriptor>>, ApiError> {
-    let workspace_root = match query.workspace_root {
+    let thread = query
+        .thread_id
+        .map(|thread_id| ensure_thread(&state, thread_id))
+        .transpose()?;
+    if let (Some(thread), Some(workspace_root)) = (&thread, &query.workspace_root) {
+        if &thread.workspace_root != workspace_root {
+            return Err(ApiError::bad_request(
+                "workspaceRoot does not match the thread workspace",
+            ));
+        }
+    }
+    let workspace_root = match query
+        .workspace_root
+        .or_else(|| thread.as_ref().map(|thread| thread.workspace_root.clone()))
+    {
         Some(workspace_root) => {
             if state
                 .store
@@ -1306,7 +1803,23 @@ async fn list_skills(
         }
         None => None,
     };
-    Ok(Json(discover_skills(workspace_root.as_deref())))
+    let mut skills = discover_skills(workspace_root.as_deref());
+    if let Some(thread) = &thread {
+        let active_skill_plugins =
+            plugins_api::active_contributions_for_thread(&state.store, thread)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?
+                .into_iter()
+                .filter(|contribution| contribution.kind == ContributionKind::Skill)
+                .map(|contribution| contribution.plugin_id)
+                .collect::<BTreeSet<_>>();
+        skills.retain(|skill| {
+            let Some(plugin_id) = skill.plugin_id.as_ref() else {
+                return true;
+            };
+            active_skill_plugins.contains(plugin_id)
+        });
+    }
+    Ok(Json(skills))
 }
 
 async fn list_plugins(
@@ -1385,6 +1898,11 @@ async fn set_thread_plugin(
         .find(|plugin| plugin.id == request.plugin_id)
         .ok_or_else(|| ApiError::not_found("plugin is not available in this workspace"))?;
     let servers = sync_plugin_mcp_configs(&state, &plugin).await?;
+    state.store.set_plugin_activation(
+        &plugin.id,
+        &PluginControlScope::thread(thread_id),
+        request.enabled,
+    )?;
     if !plugin.native_capabilities.is_empty() {
         state
             .store
@@ -1580,21 +2098,13 @@ async fn test_provider_connection(
     ) {
         OpenAiCompatibleProvider::probe_settings(&provider_settings).await?
     } else {
-        let provider: Box<dyn ModelProvider> = match provider_settings.kind.clone() {
-            ProviderKind::Mock => {
-                return Err(ApiError::bad_request(
-                    "mock provider has no remote connection",
-                ))
-            }
-            ProviderKind::OpenAiCompatible | ProviderKind::OpenAiResponses => unreachable!(),
-            ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(&provider_settings)
-                .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-            ProviderKind::CodexAppServer => {
-                CodexAppServerProvider::from_settings(&provider_settings)
-                    .map(|provider| Box::new(provider) as Box<dyn ModelProvider>)
-            }
+        if provider_settings.kind == ProviderKind::Mock {
+            return Err(ApiError::bad_request(
+                "mock provider has no remote connection",
+            ));
         }
-        .ok_or_else(|| ApiError::bad_request("provider is not configured"))?;
+        let provider = configured_provider_from_settings(&provider_settings)
+            .ok_or_else(|| ApiError::bad_request("provider is not configured"))?;
         provider.check_health().await?
     };
 
@@ -1631,6 +2141,7 @@ async fn test_provider_connection(
                     agent.set_computer_runtime(state.computer.clone());
                     agent.set_subagent_scheduler(state.subagents.clone());
                     agent.set_background_processes(state.background.clone());
+                    apply_evaluation_tool_policy(&mut agent);
                     *agent_guard = agent;
                 }
             }
@@ -1963,18 +2474,7 @@ async fn summarize_thread_title(state: &AppState, prompt: &str) -> Result<String
     }
     active.temperature = active.temperature.map(|temperature| temperature.min(0.2));
     active.max_output_tokens = Some(active.max_output_tokens.unwrap_or(64).min(64));
-    let provider: Box<dyn ModelProvider> = match active.kind {
-        ProviderKind::Mock => None,
-        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-    }
-    .ok_or_else(|| {
+    let provider = configured_provider_from_settings(&active).ok_or_else(|| {
         ApiError::bad_request(format!(
             "provider '{}' has no configured API key",
             active.id
@@ -2230,6 +2730,8 @@ async fn send_message(
     // Explicit Skill selection is structured user input. Load its bounded main prompt once,
     // persist only the reference, and inject the instructions into this Turn's user context.
     let loaded_skills = load_selected_skills(Some(&thread.workspace_root), &request.skill_ids)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    ensure_plugin_skills_enabled(&state.store, &thread, &loaded_skills)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let pinned_skills = loaded_skills.iter().map(SkillRef::from).collect::<Vec<_>>();
     let prompt = if request.content.trim().is_empty() {
@@ -2607,7 +3109,13 @@ fn launch_next_queued_turn(state: &AppState, thread_id: Uuid) {
         }
     };
     let selected_skills = match load_selected_skills(Some(&thread.workspace_root), &skill_ids) {
-        Ok(skills) => skills,
+        Ok(skills) => match ensure_plugin_skills_enabled(&state.store, &thread, &skills) {
+            Ok(()) => skills,
+            Err(error) => {
+                fail_queued_turn(state, thread_id, turn.turn_id, error.to_string());
+                return;
+            }
+        },
         Err(error) => {
             fail_queued_turn(state, thread_id, turn.turn_id, error.to_string());
             return;
@@ -3008,7 +3516,7 @@ async fn spawn_subagent_run(
         .or_else(|| latest_turn.map(|turn| turn.turn_id))
         .unwrap_or_else(Uuid::new_v4);
     let agent_type = request.agent_type.unwrap_or_else(|| "default".to_string());
-    if AgentProfileRegistry::load(&thread.workspace_root)
+    if load_agent_profiles_for_thread(&state.store, &thread)?
         .get(&agent_type)
         .is_none()
     {
@@ -3172,10 +3680,21 @@ async fn resolve_preview(
     let thread = ensure_thread(&state, thread_id)?;
     let preview = resolve_preview_target(&state.store, &thread, &target)?;
     let mut descriptor = preview.descriptor;
-    if descriptor.kind == PreviewKind::Spreadsheet
-        && !bundled_plugin_enabled_for_thread(&state.store, thread_id, "spreadsheet")?
-    {
-        descriptor.kind = PreviewKind::Unsupported;
+    let handlers = contributions_api::handler_registry_for_thread(&state, &thread)?;
+    match handlers.select_previewer(descriptor.path.as_deref(), Some(&descriptor.content_type)) {
+        MediaHandlerSelection::Selected { handler } => {
+            descriptor.handler_id = Some(handler.contribution_id);
+        }
+        MediaHandlerSelection::Conflict { contribution_ids } => {
+            return Err(ApiError::conflict(format!(
+                "multiple preview handlers have equal priority: {}",
+                contribution_ids.join(", ")
+            )));
+        }
+        MediaHandlerSelection::None if descriptor.kind == PreviewKind::Spreadsheet => {
+            descriptor.kind = PreviewKind::Unsupported;
+        }
+        MediaHandlerSelection::None => {}
     }
     Ok(Json(descriptor))
 }
@@ -3278,18 +3797,42 @@ async fn read_preview_range(
     Ok(Json(range))
 }
 
+#[cfg(test)]
 fn bundled_plugin_enabled_for_thread(
     store: &SqliteSessionStore,
     thread_id: Uuid,
     plugin_name: &str,
 ) -> Result<bool, ApiError> {
-    let metadata = bundled_plugin_metadata(plugin_name)
+    bundled_plugin_contribution_enabled_for_thread(
+        store,
+        thread_id,
+        plugin_name,
+        ContributionKind::NativeTool,
+    )
+}
+
+fn bundled_plugin_contribution_enabled_for_thread(
+    store: &SqliteSessionStore,
+    thread_id: Uuid,
+    plugin_name: &str,
+    kind: ContributionKind,
+) -> Result<bool, ApiError> {
+    bundled_plugin_metadata(plugin_name)
         .ok_or_else(|| ApiError::internal(format!("unknown bundled plugin: {plugin_name}")))?;
-    Ok(store
-        .list_thread_plugin_activations(thread_id)?
-        .get(plugin_name)
-        .copied()
-        .unwrap_or(metadata.default_enabled))
+    let thread = store
+        .get_thread(thread_id)?
+        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
+    let Some(plugin) = discover_plugins(Some(&thread.workspace_root))
+        .into_iter()
+        .find(|plugin| plugin.name == plugin_name && !plugin.native_capabilities.is_empty())
+    else {
+        return Ok(false);
+    };
+    let contributions = plugins_api::active_contributions_for_thread(store, &thread)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(contributions
+        .iter()
+        .any(|contribution| contribution.plugin_id == plugin.id && contribution.kind == kind))
 }
 
 fn require_bundled_plugin_for_thread(
@@ -3297,7 +3840,12 @@ fn require_bundled_plugin_for_thread(
     thread_id: Uuid,
     plugin_name: &str,
 ) -> Result<(), ApiError> {
-    if bundled_plugin_enabled_for_thread(store, thread_id, plugin_name)? {
+    if bundled_plugin_contribution_enabled_for_thread(
+        store,
+        thread_id,
+        plugin_name,
+        ContributionKind::Previewer,
+    )? {
         Ok(())
     } else {
         Err(ApiError::bad_request(format!(
@@ -3410,6 +3958,83 @@ async fn read_workspace_file(
         truncated,
         readonly: true,
     }))
+}
+
+/// A deterministic, read-only SearchTool entry point for the workspace UI and
+/// integration tests. It deliberately does not go through `send_message`, so
+/// the result cannot be affected by provider availability or model behaviour.
+async fn search_workspace(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(request): Json<WorkspaceSearchRequest>,
+) -> Result<Json<ToolResult>, ApiError> {
+    let thread = ensure_thread(&state, thread_id)?;
+    let settings = current_settings(&state);
+    let sandbox_config = settings.sandbox.to_local_sandbox_config();
+    let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+        thread.workspace_root.clone(),
+        settings.permission_mode,
+        &sandbox_config,
+    ));
+    let call = ToolCall::new(
+        "search",
+        json!({
+            "query": request.query,
+            "path": request.path,
+            "fixedStrings": request.fixed_strings,
+            "wordMatch": request.word_match,
+            "maxResults": request.max_results,
+        }),
+    );
+    publish_payload(
+        &state,
+        thread_id,
+        None,
+        AgentEventPayload::ToolCallStarted { call: call.clone() },
+    );
+
+    let mut context =
+        ToolContext::local_with_sandbox_config(thread.workspace_root, policy, sandbox_config);
+    context.store = Some(state.store.clone());
+    context.thread_id = Some(thread_id);
+    let result = SearchTool.execute(call.clone(), context).await;
+    match result {
+        Ok(mut result) => {
+            if let Some(metadata) = result.metadata.as_object_mut() {
+                metadata.insert("toolName".to_string(), json!("search"));
+                metadata.insert("success".to_string(), json!(true));
+            }
+            publish_payload(
+                &state,
+                thread_id,
+                None,
+                AgentEventPayload::ToolCallFinished {
+                    result: result.clone(),
+                },
+            );
+            Ok(Json(result))
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let result = ToolResult {
+                call_id: call.id,
+                output: message.clone(),
+                content: vec![ModelContentPart::text(message.clone())],
+                metadata: json!({
+                    "toolName": "search",
+                    "success": false,
+                    "error": message,
+                }),
+            };
+            publish_payload(
+                &state,
+                thread_id,
+                None,
+                AgentEventPayload::ToolCallFinished { result },
+            );
+            Err(ApiError::bad_request(message))
+        }
+    }
 }
 
 async fn get_workspace_diff(
@@ -3870,11 +4495,7 @@ async fn run_browser_command(
                 .observation_node(session, observation_id, node_ref)
                 .await
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
-            if let Some(handoff) = browser_handoff_for_node(
-                "click",
-                &target,
-                target.href.clone(),
-            ) {
+            if let Some(handoff) = browser_handoff_for_node("click", &target, target.href.clone()) {
                 return Err(ApiError::conflict(handoff.reason));
             }
             let receipt = state
@@ -4040,7 +4661,6 @@ fn browser_observation_output(
         }),
     }
 }
-
 
 async fn run_git_workflow(
     State(state): State<AppState>,
@@ -5384,6 +6004,25 @@ async fn sync_thread_mcp_tools(
     thread_id: Uuid,
     agent: &mut AgentCore,
 ) {
+    let thread = match store.get_thread(thread_id) {
+        Ok(Some(thread)) => thread,
+        Ok(None) => return,
+        Err(err) => {
+            error!(?err, %thread_id, "failed to load thread for plugin activation");
+            return;
+        }
+    };
+    let active_mcp_plugins = match plugins_api::active_contributions_for_thread(store, &thread) {
+        Ok(contributions) => contributions
+            .into_iter()
+            .filter(|contribution| contribution.kind == ContributionKind::McpServer)
+            .map(|contribution| contribution.plugin_id)
+            .collect::<BTreeSet<_>>(),
+        Err(err) => {
+            error!(?err, %thread_id, "failed to resolve MCP capability snapshot");
+            BTreeSet::new()
+        }
+    };
     let enabled_servers = match store.list_mcp_servers() {
         Ok(servers) => servers
             .into_iter()
@@ -5395,17 +6034,29 @@ async fn sync_thread_mcp_tools(
             return;
         }
     };
-    let server_ids = match store.list_thread_mcp_servers(thread_id) {
+    let legacy_bindings = match store.list_thread_mcp_servers(thread_id) {
         Ok(bindings) => bindings
             .into_iter()
-            .filter(|binding| binding.enabled && enabled_servers.contains_key(&binding.server_id))
-            .map(|binding| binding.server_id)
-            .collect::<Vec<_>>(),
+            .map(|binding| (binding.server_id, binding.enabled))
+            .collect::<HashMap<_, _>>(),
         Err(err) => {
             error!(?err, %thread_id, "failed to load thread MCP bindings");
             return;
         }
     };
+    let mut server_ids = Vec::new();
+    for server in enabled_servers.values() {
+        let enabled = match server.plugin_id.as_ref() {
+            Some(plugin_id) => active_mcp_plugins.contains(plugin_id),
+            None => legacy_bindings
+                .get(&server.server_id)
+                .copied()
+                .unwrap_or(false),
+        };
+        if enabled {
+            server_ids.push(server.server_id);
+        }
+    }
     let mut ready_server_ids = Vec::with_capacity(server_ids.len());
     for server_id in server_ids {
         let Some(server) = enabled_servers.get(&server_id) else {
@@ -5426,13 +6077,76 @@ fn sync_thread_bundled_plugin_activations(
     thread_id: Uuid,
     agent: &mut AgentCore,
 ) {
-    match store.list_thread_plugin_activations(thread_id) {
-        Ok(activations) => agent.set_bundled_plugin_activations(&activations),
+    let thread = match store.get_thread(thread_id) {
+        Ok(Some(thread)) => thread,
+        Ok(None) => return,
         Err(err) => {
-            error!(?err, %thread_id, "failed to load bundled plugin activations");
+            error!(?err, %thread_id, "failed to load bundled plugin thread");
             agent.disable_all_bundled_plugins();
+            return;
+        }
+    };
+    let active_native_plugins = match plugins_api::active_contributions_for_thread(store, &thread) {
+        Ok(contributions) => contributions
+            .into_iter()
+            .filter(|contribution| contribution.kind == ContributionKind::NativeTool)
+            .map(|contribution| contribution.plugin_id)
+            .collect::<BTreeSet<_>>(),
+        Err(err) => {
+            error!(?err, %thread_id, "failed to resolve bundled capability snapshot");
+            BTreeSet::new()
+        }
+    };
+    let activations = discover_plugins(Some(&thread.workspace_root))
+        .into_iter()
+        .filter(|plugin| !plugin.native_capabilities.is_empty())
+        .map(|plugin| {
+            let enabled = active_native_plugins.contains(&plugin.id);
+            (plugin.name, enabled)
+        })
+        .collect::<HashMap<_, _>>();
+    agent.set_bundled_plugin_activations(&activations);
+}
+
+fn ensure_plugin_skills_enabled(
+    store: &SqliteSessionStore,
+    thread: &opentopia_core::Thread,
+    skills: &[LoadedSkill],
+) -> anyhow::Result<()> {
+    let active_skill_plugins = plugins_api::active_contributions_for_thread(store, thread)?
+        .into_iter()
+        .filter(|contribution| contribution.kind == ContributionKind::Skill)
+        .map(|contribution| contribution.plugin_id)
+        .collect::<BTreeSet<_>>();
+    for skill in skills {
+        let Some(plugin_id) = skill.descriptor.plugin_id.as_deref() else {
+            continue;
+        };
+        if !active_skill_plugins.contains(plugin_id) {
+            anyhow::bail!(
+                "plugin capability is unavailable for this thread; its Skill '{}' cannot be used",
+                skill.descriptor.name
+            );
         }
     }
+    Ok(())
+}
+
+fn load_agent_profiles_for_thread(
+    store: &SqliteSessionStore,
+    thread: &opentopia_core::Thread,
+) -> anyhow::Result<AgentProfileRegistry> {
+    let plugins = discover_plugins(Some(&thread.workspace_root));
+    let enabled_plugin_ids = plugins_api::active_contributions_for_thread(store, thread)?
+        .into_iter()
+        .filter(|contribution| contribution.kind == ContributionKind::AgentProfile)
+        .map(|contribution| contribution.plugin_id)
+        .collect::<BTreeSet<_>>();
+    Ok(AgentProfileRegistry::load_with_plugin_profiles(
+        &thread.workspace_root,
+        &plugins,
+        &enabled_plugin_ids,
+    ))
 }
 
 fn publish_payload(
@@ -6807,8 +7521,39 @@ async fn build_turn_model_context(
             .unwrap_or_default()
             .as_slice(),
     );
+    let active_contributions = match state.store.get_thread(thread_id) {
+        Ok(Some(thread)) => {
+            match plugins_api::active_contributions_for_thread(&state.store, &thread) {
+                Ok(contributions) => contributions,
+                Err(error) => {
+                    warn!(?error, %thread_id, "failed to project plugin capabilities into model context");
+                    Vec::new()
+                }
+            }
+        }
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            warn!(?error, %thread_id, "failed to load thread plugin capabilities");
+            Vec::new()
+        }
+    };
+    let active_plugin_ids = active_contributions
+        .iter()
+        .map(|contribution| contribution.plugin_id.clone())
+        .collect::<BTreeSet<_>>();
+    let active_skill_plugin_ids = active_contributions
+        .iter()
+        .filter(|contribution| contribution.kind == ContributionKind::Skill)
+        .map(|contribution| contribution.plugin_id.clone())
+        .collect::<BTreeSet<_>>();
     let skill_catalog = discover_skills(Some(&cwd))
         .into_iter()
+        .filter(|skill| {
+            skill
+                .plugin_id
+                .as_ref()
+                .is_none_or(|plugin_id| active_skill_plugin_ids.contains(plugin_id))
+        })
         .map(|skill| WorldStateSkill {
             content_hash: content_fingerprint(
                 format!(
@@ -6831,9 +7576,7 @@ async fn build_turn_model_context(
         .collect::<Vec<_>>();
     let plugin_catalog = discover_plugins(Some(&cwd))
         .into_iter()
-        .filter(|plugin| {
-            plugin.native_capabilities.is_empty() || agent.bundled_plugin_enabled(&plugin.name)
-        })
+        .filter(|plugin| active_plugin_ids.contains(&plugin.id))
         .collect::<Vec<_>>();
     if !plugin_catalog.is_empty() {
         let available = plugin_catalog
@@ -7883,18 +8626,7 @@ async fn generate_context_summary(
             "real context summarization requires an OpenAI-compatible provider",
         ));
     }
-    let provider: Box<dyn ModelProvider> = match active.kind {
-        ProviderKind::Mock => None,
-        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(&active)
-            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>),
-    }
-    .ok_or_else(|| {
+    let provider = configured_provider_from_settings(&active).ok_or_else(|| {
         ApiError::bad_request(format!(
             "provider '{}' has no configured API key",
             active.id
@@ -9386,6 +10118,18 @@ struct HealthResponse {
     api_version: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvaluationRunsQuery {
+    workspace_root: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportEvaluationRunsRequest {
+    workspace_root: PathBuf,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GitWorkflowResponse {
@@ -9452,6 +10196,7 @@ struct ThreadModelRequest {
 #[serde(rename_all = "camelCase")]
 struct SkillsQuery {
     workspace_root: Option<PathBuf>,
+    thread_id: Option<Uuid>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -9871,6 +10616,18 @@ struct WorkspacePathQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WorkspaceSearchRequest {
+    query: String,
+    path: Option<String>,
+    #[serde(default)]
+    fixed_strings: bool,
+    #[serde(default)]
+    word_match: bool,
+    max_results: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewRangeQuery {
     sheet: String,
     start_row: Option<u32>,
@@ -10194,18 +10951,98 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_plugin_activation_uses_default_and_persisted_thread_override() {
+    fn evaluation_catalog_enriches_suite_tasks_from_result_artifacts() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-evaluation-catalog-{}", Uuid::new_v4()));
+        let evaluation_root = workspace_root.join(".opentopia").join("evaluations");
+        let suite_directory = evaluation_root.join("suite-001");
+        let result_directory = evaluation_root.join("attempt-001");
+        std::fs::create_dir_all(&suite_directory).expect("create suite directory");
+        std::fs::create_dir_all(&result_directory).expect("create result directory");
+        std::fs::write(
+            result_directory.join("result.json"),
+            serde_json::to_vec(&json!({
+                "runId": "attempt-001",
+                "status": "failed",
+                "failureCategory": "agent.tool_execution",
+                "error": "tool call was rejected",
+                "task": {
+                    "id": "LONG-001",
+                    "title": "Complex fixture"
+                },
+                "trajectoryMetrics": {
+                    "toolCallsByName": { "read_file": 4, "shell": 2 },
+                    "totalTokens": 1234,
+                    "errorEvents": 1
+                },
+                "recoveryPassed": true,
+                "processContractPassed": false
+            }))
+            .expect("serialize result"),
+        )
+        .expect("write result artifact");
+
+        let summary = json!({
+            "suiteId": "suite-001",
+            "benchmark": "Long horizon",
+            "status": "failed",
+            "tasks": [{
+                "taskId": "LONG-001",
+                "runs": [{
+                    "runId": "attempt-001",
+                    "status": "failed",
+                    "totalTokens": 0
+                }]
+            }]
+        });
+        let run = evaluation_run_from_summary(
+            &workspace_root,
+            &suite_directory.join("summary.json"),
+            summary,
+        )
+        .expect("parse suite summary");
+
+        assert_eq!(run.title, "Long horizon");
+        assert_eq!(run.tasks.len(), 1);
+        let task = &run.tasks[0];
+        assert_eq!(task.task_id, "LONG-001");
+        assert_eq!(task.title.as_deref(), Some("Complex fixture"));
+        assert_eq!(
+            task.failure_category.as_deref(),
+            Some("agent.tool_execution")
+        );
+        assert_eq!(task.tool_calls_by_name.get("read_file"), Some(&4));
+        assert_eq!(task.total_tokens, Some(1234));
+        assert_eq!(task.error_events, Some(1));
+        assert_eq!(task.recovery_passed, Some(true));
+        assert_eq!(task.process_contract_passed, Some(false));
+
+        std::fs::remove_dir_all(workspace_root).expect("remove temporary evaluation catalog");
+    }
+
+    #[test]
+    fn bundled_plugin_requires_permission_grants_and_honors_thread_disable() {
         let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let workspace = std::env::current_dir().expect("cwd");
         let thread = store
-            .create_thread(None, std::env::current_dir().expect("cwd"))
+            .create_thread(None, workspace.clone())
             .expect("create thread");
+        let plugin = discover_plugins(Some(&workspace))
+            .into_iter()
+            .find(|plugin| plugin.name == "spreadsheet")
+            .expect("spreadsheet bundled plugin");
 
         assert!(
+            !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
+                .expect("permissions are required")
+        );
+        grant_all_plugin_permissions(&store, &plugin);
+        assert!(
             bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
-                .expect("default activation")
+                .expect("granted activation")
         );
         store
-            .set_thread_plugin_activation(thread.id, "spreadsheet", false)
+            .set_plugin_activation(&plugin.id, &PluginControlScope::thread(thread.id), false)
             .expect("disable spreadsheet");
         assert!(
             !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
@@ -10214,6 +11051,62 @@ mod tests {
         let error = require_bundled_plugin_for_thread(&store, thread.id, "spreadsheet")
             .expect_err("disabled preview capability must be rejected");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn scoped_plugin_activation_overrides_legacy_thread_state_monotonically() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let workspace = std::env::current_dir().expect("cwd");
+        let thread = store
+            .create_thread(None, workspace.clone())
+            .expect("create thread");
+        let plugin = discover_plugins(Some(&workspace))
+            .into_iter()
+            .find(|plugin| plugin.name == "spreadsheet")
+            .expect("spreadsheet bundled plugin");
+        grant_all_plugin_permissions(&store, &plugin);
+
+        store
+            .set_thread_plugin_activation(thread.id, "spreadsheet", true)
+            .expect("legacy enable");
+        store
+            .set_plugin_activation(&plugin.id, &PluginControlScope::global(), false)
+            .expect("global disable");
+        store
+            .set_plugin_activation(&plugin.id, &PluginControlScope::thread(thread.id), true)
+            .expect("thread enable request");
+        assert!(
+            !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
+                .expect("global constraint wins")
+        );
+
+        store
+            .set_plugin_activation(&plugin.id, &PluginControlScope::global(), true)
+            .expect("global enable");
+        store
+            .set_plugin_activation(&plugin.id, &PluginControlScope::thread(thread.id), false)
+            .expect("thread disable");
+        assert!(
+            !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
+                .expect("thread disable wins")
+        );
+    }
+
+    fn grant_all_plugin_permissions(store: &SqliteSessionStore, plugin: &PluginDescriptor) {
+        let manifest = opentopia_core::inspect_plugin_control_manifest(plugin)
+            .expect("inspect plugin permissions");
+        for request in &manifest.permission_requests {
+            store
+                .set_manifest_plugin_permission_grant(
+                    &plugin.id,
+                    &manifest,
+                    &PluginControlScope::global(),
+                    &request.permission,
+                    &Value::Null,
+                    opentopia_core::PluginPermissionGrantStatus::Granted,
+                )
+                .expect("grant plugin permission");
+        }
     }
 
     #[test]
@@ -11032,7 +11925,10 @@ mod tests {
     fn browser_handoff_turns_are_paused_but_can_be_followed_by_a_new_turn() {
         assert!(!TurnStatus::WaitingUserAction.is_active());
         assert!(!TurnStatus::WaitingUserAction.is_terminal());
-        assert_eq!(TurnStatus::WaitingUserAction.as_str(), "waiting_user_action");
+        assert_eq!(
+            TurnStatus::WaitingUserAction.as_str(),
+            "waiting_user_action"
+        );
     }
 
     #[test]

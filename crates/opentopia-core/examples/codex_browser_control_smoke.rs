@@ -1,9 +1,9 @@
 use anyhow::Context;
 use opentopia_core::{
     AgentCore, AgentEventPayload, AgentProfile, AgentTurnInput, BrowserObserveOptions,
-    BrowserRuntime, BrowserRuntimeConfig,
-    BrowserSessionId, CodexAppServerProvider, LocalBrowserRuntime, MessagePart, PermissionMode,
-    ProviderKind, ProviderSettings, SessionStore, SqliteSessionStore, ToolRegistry,
+    BrowserRuntime, BrowserRuntimeConfig, BrowserSessionId, CodexAppServerProvider,
+    LocalBrowserRuntime, MessagePart, PermissionMode, ProviderKind, ProviderSettings, SessionStore,
+    SqliteSessionStore, ToolRegistry,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +74,8 @@ async fn main() -> anyhow::Result<()> {
             sandbox_mode: None,
             allowed_tools: Some(vec!["browser".to_string()]),
             denied_tools: Vec::new(),
+            source_plugin_id: None,
+            source_contribution_id: None,
         });
 
         let events = agent

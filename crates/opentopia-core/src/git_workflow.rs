@@ -7,6 +7,7 @@ use thiserror::Error;
 pub const MAX_COMMIT_MESSAGE_BYTES: usize = 32 * 1024;
 const MAX_REF_BYTES: usize = 1_024;
 const MAX_REMOTE_BYTES: usize = 255;
+const MAX_PATHS_PER_REQUEST: usize = 10_000;
 const BRANCH_LIST_FORMAT: &str =
     "%(refname)%00%(refname:short)%00%(HEAD)%00%(upstream:short)%00%(symref)";
 
@@ -22,12 +23,20 @@ pub struct GitWorkflowRequest {
 pub enum GitWorkflowAction {
     Status(GitStatusRequest),
     ListBranches(ListBranchesRequest),
+    ListRemotes,
+    Stage(GitPathsRequest),
+    Unstage(GitPathsRequest),
+    Discard(GitPathsRequest),
     CreateBranch(CreateBranchRequest),
     SwitchBranch(SwitchBranchRequest),
     Commit(CommitRequest),
     Push(PushRequest),
+    Fetch(FetchRequest),
+    Pull(PullRequest),
     Compare(CompareRequest),
     CreateWorktree(CreateWorktreeRequest),
+    ListWorktrees,
+    RemoveWorktree(RemoveWorktreeRequest),
 }
 
 impl GitWorkflowAction {
@@ -35,12 +44,20 @@ impl GitWorkflowAction {
         match self {
             Self::Status(_) => GitWorkflowActionKind::Status,
             Self::ListBranches(_) => GitWorkflowActionKind::ListBranches,
+            Self::ListRemotes => GitWorkflowActionKind::ListRemotes,
+            Self::Stage(_) => GitWorkflowActionKind::Stage,
+            Self::Unstage(_) => GitWorkflowActionKind::Unstage,
+            Self::Discard(_) => GitWorkflowActionKind::Discard,
             Self::CreateBranch(_) => GitWorkflowActionKind::CreateBranch,
             Self::SwitchBranch(_) => GitWorkflowActionKind::SwitchBranch,
             Self::Commit(_) => GitWorkflowActionKind::Commit,
             Self::Push(_) => GitWorkflowActionKind::Push,
+            Self::Fetch(_) => GitWorkflowActionKind::Fetch,
+            Self::Pull(_) => GitWorkflowActionKind::Pull,
             Self::Compare(_) => GitWorkflowActionKind::Compare,
             Self::CreateWorktree(_) => GitWorkflowActionKind::CreateWorktree,
+            Self::ListWorktrees => GitWorkflowActionKind::ListWorktrees,
+            Self::RemoveWorktree(_) => GitWorkflowActionKind::RemoveWorktree,
         }
     }
 }
@@ -50,25 +67,68 @@ impl GitWorkflowAction {
 pub enum GitWorkflowActionKind {
     Status,
     ListBranches,
+    ListRemotes,
+    Stage,
+    Unstage,
+    Discard,
     CreateBranch,
     SwitchBranch,
     Commit,
     Push,
+    Fetch,
+    Pull,
     Compare,
     CreateWorktree,
+    ListWorktrees,
+    RemoveWorktree,
 }
 
 impl GitWorkflowActionKind {
     pub fn is_mutation(self) -> bool {
         matches!(
             self,
-            Self::CreateBranch
+            Self::Stage
+                | Self::Unstage
+                | Self::Discard
+                | Self::CreateBranch
                 | Self::SwitchBranch
                 | Self::Commit
                 | Self::Push
+                | Self::Fetch
+                | Self::Pull
                 | Self::CreateWorktree
+                | Self::RemoveWorktree
         )
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPathsRequest {
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchRequest {
+    /// Omit the remote to let Git use the current branch's configured upstreams.
+    pub remote: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequest {
+    /// Omit both values to pull from the current branch's configured upstream.
+    pub remote: Option<String>,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveWorktreeRequest {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,6 +214,50 @@ pub enum WorktreeTarget {
     },
 }
 
+/// Builds the mechanical Git request used to prepare an isolated child-agent
+/// worktree. Choosing whether work is independent enough to isolate remains a
+/// parent-agent decision; this helper only provides a validated execution plan.
+pub fn isolated_subagent_worktree_request(
+    repository: PathBuf,
+    path: PathBuf,
+    branch: String,
+    base_commit: String,
+) -> Result<GitWorkflowRequest, GitWorkflowError> {
+    let request = GitWorkflowRequest {
+        repository,
+        action: GitWorkflowAction::CreateWorktree(CreateWorktreeRequest {
+            path,
+            target: WorktreeTarget::NewBranch {
+                branch,
+                start_point: Some(base_commit),
+            },
+        }),
+    };
+    // Validate all paths and refs before a server schedules the child.
+    build_git_exec_request(&request)?;
+    Ok(request)
+}
+
+/// Builds a merge-base comparison for a completed isolated child. The parent
+/// consumes this diff and decides how to integrate it; children never merge one
+/// another's worktrees.
+pub fn isolated_subagent_compare_request(
+    repository: PathBuf,
+    base_commit: String,
+    child_head: String,
+) -> Result<GitWorkflowRequest, GitWorkflowError> {
+    let request = GitWorkflowRequest {
+        repository,
+        action: GitWorkflowAction::Compare(CompareRequest {
+            base: base_commit,
+            head: child_head,
+            mode: CompareMode::MergeBase,
+        }),
+    };
+    build_git_exec_request(&request)?;
+    Ok(request)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitWorkflowResult {
@@ -198,6 +302,14 @@ pub enum GitWorkflowError {
     InvalidRef { value: String, reason: &'static str },
     #[error("invalid remote {value:?}: {reason}")]
     InvalidRemote { value: String, reason: &'static str },
+    #[error("path list cannot be empty")]
+    EmptyPaths,
+    #[error("path list contains {actual} entries; at most {maximum} are allowed")]
+    TooManyPaths { actual: usize, maximum: usize },
+    #[error("invalid repository-relative path {value:?}: {reason}")]
+    InvalidPath { value: String, reason: &'static str },
+    #[error("invalid pull target: {reason}")]
+    InvalidPullTarget { reason: &'static str },
     #[error("invalid commit message: {reason}")]
     InvalidCommitMessage { reason: &'static str },
     #[error("worktree path is empty")]
@@ -239,6 +351,14 @@ pub struct GitBranchInfo {
     pub symbolic_target: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemoteInfo {
+    pub name: String,
+    pub fetch_urls: Vec<String>,
+    pub push_urls: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AheadBehind {
@@ -252,6 +372,10 @@ pub enum GitWorkflowParseError {
     InvalidBranchRecord { line: usize, actual: usize },
     #[error("branch list record {line} has an empty ref or branch name")]
     EmptyBranchRecord { line: usize },
+    #[error("remote list record {line} is malformed")]
+    InvalidRemoteRecord { line: usize },
+    #[error("remote list record {line} has an invalid remote name")]
+    InvalidRemoteName { line: usize },
 }
 
 pub fn validate_branch(branch: &str) -> Result<(), GitWorkflowError> {
@@ -367,6 +491,24 @@ pub fn build_git_exec_request(
                 args.push("refs/remotes/".to_string());
             }
         }
+        GitWorkflowAction::ListRemotes => {
+            args.extend(strings(["remote", "--verbose"]));
+        }
+        GitWorkflowAction::Stage(paths) => {
+            let paths = validate_git_paths(&paths.paths)?;
+            args.extend(strings(["add", "--"]));
+            args.extend(paths);
+        }
+        GitWorkflowAction::Unstage(paths) => {
+            let paths = validate_git_paths(&paths.paths)?;
+            args.extend(strings(["restore", "--staged", "--"]));
+            args.extend(paths);
+        }
+        GitWorkflowAction::Discard(paths) => {
+            let paths = validate_git_paths(&paths.paths)?;
+            args.extend(strings(["restore", "--source=HEAD", "--worktree", "--"]));
+            args.extend(paths);
+        }
         GitWorkflowAction::CreateBranch(create) => {
             validate_branch(&create.branch)?;
             if let Some(start_point) = create.start_point.as_deref() {
@@ -398,6 +540,26 @@ pub fn build_git_exec_request(
             }
             args.extend(strings(["--", &push.remote, &push.branch]));
         }
+        GitWorkflowAction::Fetch(fetch) => {
+            args.extend(strings(["fetch", "--prune"]));
+            if let Some(remote) = fetch.remote.as_deref() {
+                validate_remote(remote)?;
+                args.extend(strings(["--", remote]));
+            }
+        }
+        GitWorkflowAction::Pull(pull) => match (pull.remote.as_deref(), pull.branch.as_deref()) {
+            (None, None) => args.extend(strings(["pull", "--ff-only"])),
+            (Some(remote), Some(branch)) => {
+                validate_remote(remote)?;
+                validate_ref(branch)?;
+                args.extend(strings(["pull", "--ff-only", "--", remote, branch]));
+            }
+            _ => {
+                return Err(GitWorkflowError::InvalidPullTarget {
+                    reason: "remote and branch must either both be provided or both be omitted",
+                });
+            }
+        },
         GitWorkflowAction::Compare(compare) => {
             validate_ref(&compare.base)?;
             validate_ref(&compare.head)?;
@@ -429,6 +591,17 @@ pub fn build_git_exec_request(
                     }
                 }
             }
+        }
+        GitWorkflowAction::ListWorktrees => {
+            args.extend(strings(["worktree", "list", "--porcelain", "-z"]));
+        }
+        GitWorkflowAction::RemoveWorktree(worktree) => {
+            let path = validate_worktree_path(&worktree.path)?;
+            args.extend(strings(["worktree", "remove"]));
+            if worktree.force {
+                args.push("--force".to_string());
+            }
+            args.extend(strings(["--", path]));
         }
     }
 
@@ -511,6 +684,98 @@ pub fn parse_ahead_behind(status_output: &str) -> Option<AheadBehind> {
         }
         Some(AheadBehind { ahead, behind })
     })
+}
+
+fn validate_git_paths(paths: &[PathBuf]) -> Result<Vec<String>, GitWorkflowError> {
+    if paths.is_empty() {
+        return Err(GitWorkflowError::EmptyPaths);
+    }
+    if paths.len() > MAX_PATHS_PER_REQUEST {
+        return Err(GitWorkflowError::TooManyPaths {
+            actual: paths.len(),
+            maximum: MAX_PATHS_PER_REQUEST,
+        });
+    }
+
+    paths
+        .iter()
+        .map(|path| {
+            if path.as_os_str().is_empty() {
+                return Err(GitWorkflowError::InvalidPath {
+                    value: path.display().to_string(),
+                    reason: "path is empty",
+                });
+            }
+            if path.is_absolute() {
+                return Err(GitWorkflowError::InvalidPath {
+                    value: path.display().to_string(),
+                    reason: "path must be relative to the repository",
+                });
+            }
+            let mut components = path.components();
+            let has_parent =
+                components.any(|component| matches!(component, std::path::Component::ParentDir));
+            if has_parent {
+                return Err(GitWorkflowError::InvalidPath {
+                    value: path.display().to_string(),
+                    reason: "path must not escape the repository",
+                });
+            }
+            let value = path.to_str().ok_or_else(|| GitWorkflowError::InvalidPath {
+                value: path.display().to_string(),
+                reason: "path must be valid Unicode",
+            })?;
+            if value.contains(['\0', '\r', '\n']) {
+                return Err(GitWorkflowError::InvalidPath {
+                    value: path.display().to_string(),
+                    reason: "path contains a NUL or line break",
+                });
+            }
+            Ok(value.to_string())
+        })
+        .collect()
+}
+
+pub fn parse_remote_list(output: &str) -> Result<Vec<GitRemoteInfo>, GitWorkflowParseError> {
+    use std::collections::BTreeMap;
+
+    let mut remotes = BTreeMap::<String, GitRemoteInfo>::new();
+    for (index, raw_line) in output.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+
+        let (name, value) = line
+            .split_once('\t')
+            .ok_or(GitWorkflowParseError::InvalidRemoteRecord { line: line_number })?;
+        validate_remote(name)
+            .map_err(|_| GitWorkflowParseError::InvalidRemoteName { line: line_number })?;
+        let (url, direction) = value
+            .rsplit_once(' ')
+            .ok_or(GitWorkflowParseError::InvalidRemoteRecord { line: line_number })?;
+        if url.is_empty() {
+            return Err(GitWorkflowParseError::InvalidRemoteRecord { line: line_number });
+        }
+
+        let remote = remotes
+            .entry(name.to_string())
+            .or_insert_with(|| GitRemoteInfo {
+                name: name.to_string(),
+                fetch_urls: Vec::new(),
+                push_urls: Vec::new(),
+            });
+        match direction {
+            "(fetch)" => remote.fetch_urls.push(url.to_string()),
+            "(push)" => remote.push_urls.push(url.to_string()),
+            _ => {
+                return Err(GitWorkflowParseError::InvalidRemoteRecord { line: line_number });
+            }
+        }
+    }
+
+    Ok(remotes.into_values().collect())
 }
 
 fn validate_repository_path(path: &Path) -> Result<(), GitWorkflowError> {
@@ -663,6 +928,108 @@ mod tests {
         assert_eq!(
             &request.args[2..],
             &strings(["refs/heads/", "refs/remotes/"])
+        );
+    }
+
+    #[test]
+    fn list_remotes_uses_git_remote_verbose() {
+        let request = built(GitWorkflowAction::ListRemotes);
+
+        assert_eq!(request.args, strings(["remote", "--verbose"]));
+    }
+
+    #[test]
+    fn path_mutations_use_repository_relative_paths_after_end_of_options() {
+        let paths = GitPathsRequest {
+            paths: vec![
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("docs/file name.md"),
+            ],
+        };
+
+        assert_eq!(
+            built(GitWorkflowAction::Stage(paths.clone())).args,
+            strings(["add", "--", "src/lib.rs", "docs/file name.md"])
+        );
+        assert_eq!(
+            built(GitWorkflowAction::Unstage(paths.clone())).args,
+            strings([
+                "restore",
+                "--staged",
+                "--",
+                "src/lib.rs",
+                "docs/file name.md",
+            ])
+        );
+        assert_eq!(
+            built(GitWorkflowAction::Discard(paths)).args,
+            strings([
+                "restore",
+                "--source=HEAD",
+                "--worktree",
+                "--",
+                "src/lib.rs",
+                "docs/file name.md",
+            ])
+        );
+    }
+
+    #[test]
+    fn fetch_and_pull_keep_remote_and_ref_as_separate_validated_arguments() {
+        assert_eq!(
+            built(GitWorkflowAction::Fetch(FetchRequest {
+                remote: Some("origin".to_string()),
+            }))
+            .args,
+            strings(["fetch", "--prune", "--", "origin"])
+        );
+        assert_eq!(
+            built(GitWorkflowAction::Pull(PullRequest {
+                remote: Some("origin".to_string()),
+                branch: Some("main".to_string()),
+            }))
+            .args,
+            strings(["pull", "--ff-only", "--", "origin", "main"])
+        );
+    }
+
+    #[test]
+    fn pull_rejects_partial_remote_target() {
+        let request = workflow(GitWorkflowAction::Pull(PullRequest {
+            remote: Some("origin".to_string()),
+            branch: None,
+        }));
+
+        assert!(matches!(
+            build_git_exec_request(&request),
+            Err(GitWorkflowError::InvalidPullTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn worktree_list_uses_unquoted_nul_terminated_porcelain() {
+        assert_eq!(
+            built(GitWorkflowAction::ListWorktrees).args,
+            strings(["worktree", "list", "--porcelain", "-z"])
+        );
+    }
+
+    #[test]
+    fn worktree_remove_path_is_one_argument_after_end_of_options() {
+        let path = PathBuf::from(r"C:\worktrees\feature one");
+        let request = built(GitWorkflowAction::RemoveWorktree(RemoveWorktreeRequest {
+            path: path.clone(),
+            force: false,
+        }));
+
+        assert_eq!(
+            request.args,
+            vec![
+                "worktree".to_string(),
+                "remove".to_string(),
+                "--".to_string(),
+                path.to_str().unwrap().to_string(),
+            ]
         );
     }
 
@@ -968,15 +1335,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_remote_list_with_distinct_fetch_and_push_urls() {
+        let output = concat!(
+            "mirror\thttps://git.example.test/org/repo.git (push)\n",
+            "origin\tgit@example.test:org/repo.git (fetch)\n",
+            "origin\tssh://git@example.test/org/repo.git (push)\n",
+        );
+
+        assert_eq!(
+            parse_remote_list(output).unwrap(),
+            vec![
+                GitRemoteInfo {
+                    name: "mirror".to_string(),
+                    fetch_urls: Vec::new(),
+                    push_urls: vec!["https://git.example.test/org/repo.git".to_string()],
+                },
+                GitRemoteInfo {
+                    name: "origin".to_string(),
+                    fetch_urls: vec!["git@example.test:org/repo.git".to_string()],
+                    push_urls: vec!["ssh://git@example.test/org/repo.git".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_remote_list_records() {
+        assert_eq!(
+            parse_remote_list("origin https://example.test/repo.git (fetch)\n").unwrap_err(),
+            GitWorkflowParseError::InvalidRemoteRecord { line: 1 }
+        );
+        assert_eq!(
+            parse_remote_list("bad/name\thttps://example.test/repo.git (fetch)\n").unwrap_err(),
+            GitWorkflowParseError::InvalidRemoteName { line: 1 }
+        );
+    }
+
+    #[test]
     fn action_kind_marks_only_mutations() {
+        assert!(GitWorkflowActionKind::Stage.is_mutation());
+        assert!(GitWorkflowActionKind::Unstage.is_mutation());
+        assert!(GitWorkflowActionKind::Discard.is_mutation());
         assert!(GitWorkflowActionKind::CreateBranch.is_mutation());
         assert!(GitWorkflowActionKind::SwitchBranch.is_mutation());
         assert!(GitWorkflowActionKind::Commit.is_mutation());
         assert!(GitWorkflowActionKind::Push.is_mutation());
+        assert!(GitWorkflowActionKind::Fetch.is_mutation());
+        assert!(GitWorkflowActionKind::Pull.is_mutation());
         assert!(GitWorkflowActionKind::CreateWorktree.is_mutation());
+        assert!(GitWorkflowActionKind::RemoveWorktree.is_mutation());
         assert!(!GitWorkflowActionKind::Status.is_mutation());
         assert!(!GitWorkflowActionKind::ListBranches.is_mutation());
+        assert!(!GitWorkflowActionKind::ListRemotes.is_mutation());
         assert!(!GitWorkflowActionKind::Compare.is_mutation());
+        assert!(!GitWorkflowActionKind::ListWorktrees.is_mutation());
     }
 
     struct MockEnvironment {
@@ -1130,5 +1542,49 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn isolated_subagent_helpers_prepare_worktree_and_parent_comparison() {
+        let setup = isolated_subagent_worktree_request(
+            PathBuf::from("C:/repo"),
+            PathBuf::from("C:/worktrees/child"),
+            "codex/child".to_string(),
+            "abc123".to_string(),
+        )
+        .unwrap();
+        let setup_exec = build_git_exec_request(&setup).unwrap();
+        assert_eq!(
+            setup_exec.args,
+            strings([
+                "worktree",
+                "add",
+                "-b",
+                "codex/child",
+                "--",
+                "C:/worktrees/child",
+                "abc123",
+            ])
+        );
+
+        let compare = isolated_subagent_compare_request(
+            PathBuf::from("C:/repo"),
+            "abc123".to_string(),
+            "def456".to_string(),
+        )
+        .unwrap();
+        let compare_exec = build_git_exec_request(&compare).unwrap();
+        assert_eq!(
+            compare_exec.args,
+            strings([
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--merge-base",
+                "abc123",
+                "def456",
+                "--",
+            ])
+        );
     }
 }

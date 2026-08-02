@@ -3,17 +3,22 @@ pub mod agent_profiles;
 pub mod background;
 pub mod browser;
 pub mod bundled_plugins;
+pub mod capabilities;
 pub mod computer;
 pub mod context_sources;
+pub mod contribution_hosts;
 pub mod desktop_browser;
+pub mod effect_journal;
 pub mod execution;
 pub mod git_workflow;
 pub mod guardian;
 pub mod instructions;
+pub mod local_git;
 pub mod mcp;
 pub mod mcp_host;
 pub mod model;
 pub mod model_context;
+pub mod plugin_control;
 pub mod plugins;
 pub mod policy;
 pub mod preview;
@@ -21,6 +26,7 @@ pub mod process_quota;
 pub mod prompt_runtime;
 pub mod provider;
 pub mod sandbox;
+pub mod scm_connector;
 pub mod settings;
 mod skill_authoring;
 pub mod skills;
@@ -53,6 +59,15 @@ pub use bundled_plugins::{
     BundledPluginInstallOutcome, BundledPluginInstallStatus, BundledPluginMetadata,
     BundledPluginTrust,
 };
+pub use capabilities::{
+    ActivatedContribution, CapabilityActivationRequest, CapabilityActivationScope,
+    CapabilityActivationSnapshot, CapabilityConflict, CapabilityManifestError, CapabilityRegistry,
+    CapabilityRegistryError, CapabilityUnavailableReason, CodexCompatibleContributions,
+    ContributionKind, ContributionOrigin, ManifestConfiguration, ManifestContributions,
+    ManifestRequirements, OpenTopiaManifest, PluginActivation, PluginCapabilityManifest,
+    PluginContribution, PluginPermission, PluginPermissionKind, PluginPermissions,
+    RegisteredPluginCapabilities, UnavailableContribution, OPENTOPIA_MANIFEST_API_VERSION,
+};
 pub use computer::{
     ComputerAction, ComputerActionReceipt, ComputerError, ComputerMouseButton, ComputerObservation,
     ComputerPolicyContext, ComputerRuntime, ComputerRuntimeConfig, ComputerScreenshot,
@@ -63,17 +78,32 @@ pub use context_sources::{
     load_context_sources, ContextSourceError, ContextSourceKind, ContextSourcePolicy,
     LoadedContextSource,
 };
+pub use contribution_hosts::{
+    AppViewDescriptor, AppViewHost, AppViewMessage, AppViewSandbox, AppViewSession,
+    AppViewSessionStatus, ContributionHandlerRegistry, ContributionHostError,
+    MediaHandlerDescriptor, MediaHandlerInvocationV1, MediaHandlerOperation,
+    MediaHandlerResultEnvelopeV1, MediaHandlerRuntime, MediaHandlerSelection, MediaHandlerSourceV1,
+    MAX_APP_VIEW_MESSAGE_BYTES, MAX_MEDIA_HANDLER_INPUT_BYTES, MAX_MEDIA_HANDLER_OPTIONS_BYTES,
+    MAX_MEDIA_HANDLER_OUTPUT_BYTES, MEDIA_HANDLER_INVOCATION_API_VERSION,
+    MEDIA_HANDLER_RESULT_API_VERSION,
+};
 pub use desktop_browser::{DesktopBrowserRuntime, DesktopBrowserRuntimeConfig};
+pub use effect_journal::{
+    valid_effect_transition, validate_effect_intent, EffectIntent, EffectJournalError,
+    EffectJournalRecord, EffectKind, EffectSideEffectClass, EffectStatus,
+};
 pub use execution::{
     ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
     FileReadResult, FileWriteRequest, LocalExecutionEnvironment, PatchResult, ResourceLimit,
     StdioSession, WriteResult,
 };
 pub use git_workflow::{
-    execute_git_workflow, AheadBehind, CommitRequest, CompareMode, CompareRequest,
-    CreateBranchRequest, CreateWorktreeRequest, GitBranchInfo, GitStatusRequest, GitWorkflowAction,
-    GitWorkflowActionKind, GitWorkflowError, GitWorkflowRequest, GitWorkflowResult,
-    ListBranchesRequest, PushRequest, SwitchBranchRequest, WorktreeTarget,
+    execute_git_workflow, isolated_subagent_compare_request, isolated_subagent_worktree_request,
+    AheadBehind, CommitRequest, CompareMode, CompareRequest, CreateBranchRequest,
+    CreateWorktreeRequest, FetchRequest, GitBranchInfo, GitPathsRequest, GitRemoteInfo,
+    GitStatusRequest, GitWorkflowAction, GitWorkflowActionKind, GitWorkflowError,
+    GitWorkflowRequest, GitWorkflowResult, ListBranchesRequest, PullRequest, PushRequest,
+    RemoveWorktreeRequest, SwitchBranchRequest, WorktreeTarget,
 };
 pub use guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianAssessment, GuardianAssessmentOutcome,
@@ -82,6 +112,12 @@ pub use guardian::{
 };
 pub use instructions::{
     resolve_instruction_documents, InstructionDocument, InstructionResolution, InstructionScope,
+};
+pub use local_git::{
+    normalize_git_remote_url, LocalGitCommandSummary, LocalGitDiscardRequest, LocalGitRemote,
+    LocalGitRemoveWorktreeRequest, LocalGitStatus, LocalGitV1Error, LocalGitV1Operation,
+    LocalGitV1Output, LocalGitV1Request, LocalGitV1Response, LocalGitV1Service, LocalGitWorktree,
+    NormalizedGitRemoteUrl, LOCAL_GIT_V1_API_VERSION,
 };
 pub use mcp::{
     McpCallResult, McpLifecycleStatus, McpServerConfig, McpServerStatus, McpToolDescriptor,
@@ -95,19 +131,27 @@ pub use model::{
     ContextCheckpointFact, ContextCheckpointFile, ContextCheckpointInteraction,
     ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
     ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextProjection,
-    ContextSourceRef, ContextSummary, ExperienceMode, GoalAttemptStatus, GoalRecord, GoalSnapshot,
-    GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart, MessageRole,
-    ModelContentPart, Project, SkillRef, TaskPlan, TaskPlanStep, TaskPlanStepStatus,
-    TerminalCommandHistory, TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall,
-    ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord,
-    TurnStatus, UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord,
-    UserInputRequest, UserInputResponse, UserInputStatus, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+    ContextSourceRef, ContextSummary, EvaluationRun, EvaluationTaskResult, ExperienceMode,
+    GoalAttemptStatus, GoalRecord, GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt,
+    GoalTaskStatus, Message, MessagePart, MessageRole, ModelContentPart, Project, SkillRef,
+    TaskPlan, TaskPlanStep, TaskPlanStepStatus, TerminalCommandHistory, TerminalCommandStatus,
+    Thread, ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet, TurnChangeSetStatus,
+    TurnFileChange, TurnFileChangeKind, TurnRecord, TurnStatus, UserInputAnswer, UserInputOption,
+    UserInputQuestion, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
+    CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };
 pub use model_context::{
     content_fingerprint, estimate_tokens as estimate_model_context_tokens,
     world_state_catalog_item, world_state_item, CompiledModelContext, ContextCacheScope,
     ContextItemKind, ContextRole, ContextSensitivity, InstructionSnapshotRef, ModelContextItem,
     ThreadContextSnapshot, TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
+};
+pub use plugin_control::{
+    inspect_plugin_control_manifest, permission_requested, validate_plugin_settings,
+    PluginActivationRecord, PluginContributionRecord, PluginControlManifest, PluginControlScope,
+    PluginControlScopeType, PluginPermissionGrantRecord, PluginPermissionGrantStatus,
+    PluginPermissionRequest, PluginRuntimeHealthRecord, PluginRuntimeHealthStatus,
+    PluginSecretBindingRecord, PluginSettingsRecord,
 };
 pub use plugins::{
     bundled_plugins_path, discover_plugins, inspect_plugin, install_plugin,
@@ -132,17 +176,28 @@ pub use prompt_runtime::{
     PromptRuntimeCapabilities, RuntimeSurface,
 };
 pub use provider::{
+    configured_provider_from_settings, guardian_provider_from_settings, provider_from_settings,
     redact_model_observation, AnthropicMessagesProvider, CodexAccountManager, CodexAccountStatus,
     CodexAppServerProvider, CodexLoginStart, IncompleteReason, MockProvider,
     ModelConversationMessage, ModelConversationRole, ModelDecision, ModelFinishReason,
     ModelInputContent, ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
-    OpenAiCompatibleProvider, OpenAiResponsesProvider, PreparedProviderRequest, ProviderToolCall,
+    OpenAiCompatibleProvider, OpenAiResponsesProvider, PreparedProviderRequest,
+    ProviderDriverDescriptor, ProviderDriverRegistry, ProviderDriverTrust, ProviderToolCall,
     ProviderToolCandidate, ProviderToolResult, ProviderTransportEvent,
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,
     ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy, OsSandboxMode, OsSandboxPlatform,
     SandboxCommandPlan, SandboxCommandStatus, SandboxDescriptor, SandboxLifecycle, SandboxMode,
+};
+pub use scm_connector::{
+    select_scm_connector, CommitPushChangeRequestOutcome, CommitPushChangeRequestResult,
+    LocalCommitReceipt, LocalGitV1MutationHandle, LocalGitV1ReadHandle, LocalPushReceipt,
+    ScmBindingIssue, ScmChangeRequestReceipt, ScmConnectorCandidate, ScmConnectorCapability,
+    ScmConnectorDescriptor, ScmConnectorHostContext, ScmConnectorHostHandles,
+    ScmConnectorSelection, ScmHostMatcher, ScmMatcherSpecificity, ScmPathMatcher, ScmRemoteBinding,
+    ScmRemoteUrlMatcher, ScmSelectionSource, ScmWorkflowError, WorkflowStage, WorkflowStageStatus,
+    SCM_CONNECTOR_HOST_API_VERSION,
 };
 pub use settings::{
     AppSettings, NativeCompactionProtocol, OpenAiCompatibilityReport, OpenAiProtocol,
@@ -167,15 +222,18 @@ pub use store::{
 };
 pub use subagents::{
     AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDelivery, AgentWaitActivity,
-    NoopSubagentObserver, SpawnSubagentRequest, SubagentError, SubagentEvent, SubagentExecutor,
-    SubagentObserver, SubagentRun, SubagentRunStatus, SubagentScheduler, SubagentSchedulerConfig,
-    SubagentScope,
+    NoopSubagentObserver, SpawnSubagentRequest, SubagentDeliverable, SubagentDeliverableKind,
+    SubagentError, SubagentEvent, SubagentExecutionContract, SubagentExecutor,
+    SubagentIntegrationMetadata, SubagentObserver, SubagentRun, SubagentRunStatus,
+    SubagentScheduler, SubagentSchedulerConfig, SubagentScope, SubagentVerificationEvidence,
+    SubagentWorkspaceAssignment, SubagentWorkspaceMode,
 };
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
     BrowserTool, ComputerTool, GitDiffTool, ListFilesTool, ListSkillsTool, McpToolWrapper,
-    ReadFileTool, ReadSkillTool, RequestUserInputTool, SetPlanTool, ShellTool, SpreadsheetTool,
-    Tool, ToolContext, ToolRegistry, ToolSource, UpdatePlanTool, WaitAgentsTool, WriteFileTool,
+    NativePatchOperation, ReadFileTool, ReadSkillTool, RequestUserInputTool, SearchTool,
+    SetPlanTool, ShellTool, SpreadsheetTool, Tool, ToolContext, ToolRegistry, ToolSource,
+    UpdatePlanTool, WaitAgentsTool, WriteFileTool,
 };
 pub use workspace::{
     ChangedFile, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,

@@ -13,10 +13,13 @@
 
 use crate::execution::{
     BackgroundOutputSink, ExecRequest, ExecutionContext, ExecutionEnvironment, OutputStream,
+    StdioSession,
 };
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -69,6 +72,8 @@ pub struct BackgroundJobSnapshot {
     pub job_id: Uuid,
     pub agent_path: String,
     pub command: String,
+    /// Interactive jobs retain stdin and can receive input until they exit.
+    pub interactive: bool,
     pub status: BackgroundJobStatus,
     pub exit_code: Option<i32>,
     pub success: bool,
@@ -113,7 +118,10 @@ struct StreamBuffer {
     /// Output produced but not yet handed to the model.
     unread: Vec<u8>,
     total_bytes: usize,
+    /// Bytes omitted from all chunks over the lifetime of this stream.
     dropped_bytes: usize,
+    /// Bytes omitted from the chunk that has not yet been read.
+    unread_dropped_bytes: usize,
 }
 
 impl StreamBuffer {
@@ -121,10 +129,18 @@ impl StreamBuffer {
         self.total_bytes = self.total_bytes.saturating_add(chunk.len());
         self.unread.extend_from_slice(chunk);
         if self.unread.len() > max_bytes {
-            // Keep the tail: the end of a long log is where the outcome is.
-            let excess = self.unread.len() - max_bytes;
-            self.unread.drain(..excess);
+            // Keep both the invocation/prologue and the newest outcome. Repeated
+            // pushes preserve the original head while rotating the tail.
+            let original_len = self.unread.len();
+            let head_len = max_bytes / 2;
+            let tail_len = max_bytes.saturating_sub(head_len);
+            let mut bounded = Vec::with_capacity(max_bytes);
+            bounded.extend_from_slice(&self.unread[..head_len]);
+            bounded.extend_from_slice(&self.unread[original_len - tail_len..]);
+            self.unread = bounded;
+            let excess = original_len - max_bytes;
             self.dropped_bytes = self.dropped_bytes.saturating_add(excess);
+            self.unread_dropped_bytes = self.unread_dropped_bytes.saturating_add(excess);
         }
     }
 
@@ -134,6 +150,20 @@ impl StreamBuffer {
 
     fn clear(&mut self) {
         self.unread.clear();
+        self.unread_dropped_bytes = 0;
+    }
+}
+
+#[derive(Clone)]
+struct InteractiveSession {
+    inner: Arc<dyn StdioSession>,
+}
+
+impl std::fmt::Debug for InteractiveSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InteractiveSession")
+            .finish_non_exhaustive()
     }
 }
 
@@ -158,6 +188,7 @@ struct Job {
     started_at: DateTime<Utc>,
     cancel: CancellationToken,
     max_buffered_bytes: usize,
+    session: Option<InteractiveSession>,
     state: Mutex<JobState>,
 }
 
@@ -174,6 +205,7 @@ impl Job {
             job_id: self.id,
             agent_path: self.scope.agent_path.clone(),
             command: self.command.clone(),
+            interactive: self.session.is_some(),
             status: state.status,
             exit_code: state.exit_code,
             success: state.success,
@@ -223,6 +255,13 @@ impl Default for BackgroundProcessRegistry {
 }
 
 pub struct BackgroundSpawnRequest {
+    pub scope: BackgroundScope,
+    pub command: String,
+    pub request: ExecRequest,
+    pub context: ExecutionContext,
+}
+
+pub struct BackgroundSessionSpawnRequest {
     pub scope: BackgroundScope,
     pub command: String,
     pub request: ExecRequest,
@@ -294,6 +333,7 @@ impl BackgroundProcessRegistry {
             started_at: Utc::now(),
             cancel: cancel.clone(),
             max_buffered_bytes: self.inner.config.max_buffered_bytes,
+            session: None,
             state: Mutex::new(JobState {
                 status: BackgroundJobStatus::Running,
                 exit_code: None,
@@ -361,6 +401,197 @@ impl BackgroundProcessRegistry {
         Ok(snapshot)
     }
 
+    /// Starts a persistent stdio session and returns once its process is running.
+    /// Output is drained concurrently into the same bounded buffers used by
+    /// detached commands, while stdin remains available through [`Self::write_stdin`].
+    pub async fn spawn_session(
+        &self,
+        environment: Arc<dyn ExecutionEnvironment>,
+        spawn: BackgroundSessionSpawnRequest,
+    ) -> anyhow::Result<BackgroundJobSnapshot> {
+        if !environment.supports_persistent_stdio() {
+            anyhow::bail!(
+                "execution environment '{}' does not support persistent stdio sessions",
+                environment.id()
+            );
+        }
+
+        let BackgroundSessionSpawnRequest {
+            scope,
+            command,
+            request,
+            mut context,
+        } = spawn;
+        let running = self
+            .jobs()
+            .values()
+            .filter(|job| job.scope == scope && !job.lock().status.is_terminal())
+            .count();
+        if running >= self.inner.config.max_jobs_per_agent {
+            anyhow::bail!(
+                "this agent already has {running} background jobs running (maximum {}); wait for one to finish or stop it first",
+                self.inner.config.max_jobs_per_agent
+            );
+        }
+
+        let cancel = CancellationToken::new();
+        let session_done = CancellationToken::new();
+        if let Some(turn_cancel) = context.cancel.take() {
+            let session_cancel = cancel.clone();
+            let session_finished = session_done.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = turn_cancel.cancelled() => session_cancel.cancel(),
+                    _ = session_finished.cancelled() => {}
+                }
+            });
+        }
+        context.cancel = Some(cancel.clone());
+        let timeout = context.timeout;
+        let session: Arc<dyn StdioSession> = environment
+            .spawn_stdio(request, context)
+            .await
+            .with_context(|| format!("failed to start interactive command: {command}"))?
+            .into();
+
+        let job = Arc::new(Job {
+            id: Uuid::new_v4(),
+            scope,
+            command,
+            started_at: Utc::now(),
+            cancel: cancel.clone(),
+            max_buffered_bytes: self.inner.config.max_buffered_bytes,
+            session: Some(InteractiveSession {
+                inner: session.clone(),
+            }),
+            state: Mutex::new(JobState {
+                status: BackgroundJobStatus::Running,
+                exit_code: None,
+                success: false,
+                finished_at: None,
+                error: None,
+                stdout: StreamBuffer::default(),
+                stderr: StreamBuffer::default(),
+                completion_reported: false,
+            }),
+        });
+        let snapshot = job.snapshot();
+        self.jobs().insert(job.id, job.clone());
+
+        let stdout_job = job.clone();
+        let stdout_session = session.clone();
+        let stdout_task = tokio::spawn(async move {
+            loop {
+                match stdout_session.read_stdout().await {
+                    Ok(bytes) if bytes.is_empty() => break,
+                    Ok(bytes) => stdout_job
+                        .lock()
+                        .stdout
+                        .push(&bytes, stdout_job.max_buffered_bytes),
+                    Err(error) => {
+                        let mut state = stdout_job.lock();
+                        if state.error.is_none() {
+                            state.error = Some(format!("failed to read session stdout: {error}"));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        let stderr_job = job.clone();
+        let stderr_session = session.clone();
+        let stderr_task = tokio::spawn(async move {
+            loop {
+                match stderr_session.read_stderr().await {
+                    Ok(bytes) if bytes.is_empty() => break,
+                    Ok(bytes) => stderr_job
+                        .lock()
+                        .stderr
+                        .push(&bytes, stderr_job.max_buffered_bytes),
+                    Err(error) => {
+                        let mut state = stderr_job.lock();
+                        if state.error.is_none() {
+                            state.error = Some(format!("failed to read session stderr: {error}"));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            // Do not cancel the `wait` future itself: LocalStdioSession owns the
+            // child handle while waiting. Signal its cancellation token instead
+            // so it can kill and reap the process without leaking it.
+            let timed_out = Arc::new(AtomicBool::new(false));
+            let timer = {
+                let timed_out = timed_out.clone();
+                let finished = session_done.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(timeout) => {
+                            timed_out.store(true, Ordering::Release);
+                            cancel.cancel();
+                        }
+                        _ = finished.cancelled() => {}
+                    }
+                })
+            };
+            let outcome = session.wait().await;
+            session_done.cancel();
+            let _ = timer.await;
+            // Both pipes reach EOF after the process exits. Awaiting them before
+            // publishing completion prevents the final log lines from arriving late.
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+
+            let mut state = job.lock();
+            state.finished_at = Some(Utc::now());
+            match outcome {
+                Ok(result) => {
+                    state.status = BackgroundJobStatus::Exited;
+                    state.exit_code = result.exit_code;
+                    state.success = result.success;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    state.status = if timed_out.load(Ordering::Acquire) {
+                        BackgroundJobStatus::TimedOut
+                    } else if job.cancel.is_cancelled() || message.contains("cancelled") {
+                        BackgroundJobStatus::Cancelled
+                    } else {
+                        BackgroundJobStatus::Failed
+                    };
+                    if state.error.is_none() {
+                        state.error = Some(message);
+                    }
+                }
+            }
+        });
+
+        Ok(snapshot)
+    }
+
+    pub async fn write_stdin(
+        &self,
+        scope: &BackgroundScope,
+        job_id: Uuid,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        let job = self.visible(scope, job_id)?;
+        if job.lock().status.is_terminal() {
+            anyhow::bail!("background session {job_id} has already exited");
+        }
+        let session = job
+            .session
+            .as_ref()
+            .context("background job is not an interactive stdio session")?
+            .inner
+            .clone();
+        session.write_stdin(data).await
+    }
+
     /// Returns the output produced since the agent last read, consuming it.
     pub fn read_output(
         &self,
@@ -371,7 +602,7 @@ impl BackgroundProcessRegistry {
         let mut state = job.lock();
         let stdout = state.stdout.peek();
         let stderr = state.stderr.peek();
-        let dropped = state.stdout.dropped_bytes + state.stderr.dropped_bytes;
+        let dropped = state.stdout.unread_dropped_bytes + state.stderr.unread_dropped_bytes;
         state.stdout.clear();
         state.stderr.clear();
         // Reading the tail of a finished job is the same delivery the push path would
@@ -431,7 +662,7 @@ impl BackgroundProcessRegistry {
                 }
                 let stdout = state.stdout.peek();
                 let stderr = state.stderr.peek();
-                let dropped = state.stdout.dropped_bytes + state.stderr.dropped_bytes;
+                let dropped = state.stdout.unread_dropped_bytes + state.stderr.unread_dropped_bytes;
                 drop(state);
                 Some(BackgroundOutputChunk {
                     job: job.snapshot(),
@@ -663,6 +894,59 @@ mod tests {
         assert!(registry.list(&stranger).is_empty());
 
         wait_until_terminal(&registry, &owner, snapshot.job_id).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_stream_keeps_the_first_and_last_bytes() {
+        let mut buffer = StreamBuffer::default();
+        buffer.push(b"BEGIN-0123456789-END", 12);
+        let visible = buffer.peek();
+        assert!(visible.starts_with("BEGIN-"));
+        assert!(visible.ends_with("89-END"));
+        assert_eq!(buffer.unread.len(), 12);
+        assert_eq!(buffer.unread_dropped_bytes, 8);
+
+        buffer.clear();
+        assert_eq!(buffer.unread_dropped_bytes, 0);
+        assert_eq!(buffer.dropped_bytes, 8);
+    }
+
+    #[tokio::test]
+    async fn persistent_session_accepts_input_and_reports_output() {
+        let root = workspace("interactive");
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let command = if cfg!(windows) {
+            "$line = [Console]::In.ReadLine(); Write-Output \"got:$line\""
+        } else {
+            "read line; echo got:$line"
+        };
+        let snapshot = registry
+            .spawn_session(
+                environment(&root),
+                BackgroundSessionSpawnRequest {
+                    scope: scope.clone(),
+                    command: command.to_string(),
+                    request: ExecRequest::shell(command).cwd(&root),
+                    context: ExecutionContext::with_timeout(Duration::from_secs(30)),
+                },
+            )
+            .await
+            .expect("session starts");
+        assert!(snapshot.interactive);
+
+        registry
+            .write_stdin(&scope, snapshot.job_id, b"hello\n")
+            .await
+            .expect("stdin write succeeds");
+        let finished = wait_until_terminal(&registry, &scope, snapshot.job_id).await;
+        assert_eq!(finished.status, BackgroundJobStatus::Exited);
+        let output = registry
+            .read_output(&scope, snapshot.job_id)
+            .expect("session output is readable");
+        assert!(output.stdout.contains("got:hello"), "{:?}", output);
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

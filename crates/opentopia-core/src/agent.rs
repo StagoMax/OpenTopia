@@ -3,6 +3,7 @@ use crate::background::{BackgroundProcessRegistry, BackgroundScope};
 use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime};
+use crate::effect_journal::{EffectIntent, EffectKind, EffectSideEffectClass, EffectStatus};
 use crate::guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext,
     GuardianReviewSessionManager, GuardianReviewStatus, GuardianRolloutDecision,
@@ -16,8 +17,8 @@ use crate::model::{
     UserInputRequest, UserInputResponse,
 };
 use crate::model_context::{
-    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
-    ModelContextItem,
+    content_fingerprint, CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole,
+    ContextSensitivity, ModelContextItem,
 };
 use crate::policy::{approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode};
 use crate::prompt_runtime::{
@@ -38,7 +39,7 @@ use crate::skills::SkillScope;
 use crate::store::{ProviderContextStateKind, SessionStore};
 use crate::subagents::{SubagentScheduler, SubagentScope};
 use crate::tools::{
-    browser_handoff_required, McpToolWrapper, ToolContext, ToolRegistry, ToolSource,
+    browser_handoff_required, McpToolWrapper, ToolContext, ToolRegistry, ToolSideEffect, ToolSource,
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,9 @@ const MIN_RETAINED_TOOL_RESULTS_AFTER_COMPACTION: usize = 4;
 const MAX_COMPACTED_TOOL_HISTORY_CHARS: usize = 12_000;
 const FINALIZATION_GUARD_TOOL_NAME: &str = "runtime_finalization_guard";
 const MAX_FINALIZATION_GUARD_ACTIVATIONS: usize = 3;
+const TOOL_SEARCH_NAME: &str = "tool_search";
+const AUTOMATIC_TOOL_DISCLOSURE_THRESHOLD: usize = 32;
+const MAX_TOOL_SEARCH_RESULTS: usize = 12;
 const ROLLOUT_REVIEW_TOOL_NAME: &str = "runtime_rollout_review";
 const ROLLOUT_REVIEW_INTERVAL: usize = 90;
 const MAX_ROLLOUT_MODEL_ROUNDS: usize = 270;
@@ -67,6 +71,24 @@ const ROLLOUT_REVIEW_BUDGET_BANDS: [f64; 3] = [0.5, 0.25, 0.10];
 /// Reviews cost a full reviewer round trip each, so the extra budget-band triggers
 /// stay bounded rather than firing once per band per interval.
 const MAX_ROLLOUT_REVIEWS: usize = 6;
+
+/// Controls how much of the executable tool catalog is sent to the model.
+///
+/// This is a harness policy, not a user-facing model setting. `Automatic` keeps
+/// ordinary catalogs unchanged and defers MCP schemas only when the catalog has
+/// grown large enough to create meaningful selection noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExposurePolicy {
+    Eager,
+    Automatic,
+    Progressive,
+}
+
+impl Default for ToolExposurePolicy {
+    fn default() -> Self {
+        Self::Automatic
+    }
+}
 /// A short turn can cross a budget band simply because the work was expensive, not
 /// because it went wrong, and a reviewer has almost nothing to judge that early.
 /// Budget-band reviews therefore wait until a turn has a real history behind it;
@@ -449,6 +471,7 @@ pub struct AgentCore {
     additional_developer_instructions: Option<String>,
     allowed_tools: Option<HashSet<String>>,
     denied_tools: HashSet<String>,
+    tool_exposure_policy: ToolExposurePolicy,
     enabled_bundled_plugins: HashSet<String>,
     rollout_budget_settings: Option<RolloutBudgetSettings>,
     agent_runtime_settings: AgentRuntimeSettings,
@@ -482,6 +505,7 @@ impl Default for AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
@@ -516,6 +540,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
             rollout_budget_settings: provider_settings.rollout_budget,
             agent_runtime_settings: AgentRuntimeSettings::default(),
@@ -544,6 +569,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
             rollout_budget_settings: active.rollout_budget.clone(),
             agent_runtime_settings: settings.agent_runtime.clone(),
@@ -569,6 +595,7 @@ impl AgentCore {
             additional_developer_instructions: None,
             allowed_tools: None,
             denied_tools: HashSet::new(),
+            tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
@@ -596,6 +623,20 @@ impl AgentCore {
         self.sandbox_config = sandbox_config;
     }
 
+    /// Narrows the tool catalog for this agent instance. Repeated restrictions
+    /// intersect, so a caller cannot widen an existing profile's boundary.
+    pub fn restrict_to_tools<I, S>(&mut self, tools: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let requested = tools.into_iter().map(Into::into).collect::<HashSet<_>>();
+        self.allowed_tools = Some(match self.allowed_tools.take() {
+            Some(existing) => existing.intersection(&requested).cloned().collect(),
+            None => requested,
+        });
+    }
+
     pub fn set_browser_runtime(&mut self, browser: Arc<dyn BrowserRuntime>) {
         self.browser = browser;
     }
@@ -605,14 +646,14 @@ impl AgentCore {
     }
 
     pub fn set_bundled_plugin_activations(&mut self, activations: &HashMap<String, bool>) {
-        self.enabled_bundled_plugins = bundled_plugin_catalog()
-            .filter(|plugin| {
-                activations
-                    .get(plugin.name)
-                    .copied()
-                    .unwrap_or(plugin.default_enabled)
+        self.enabled_bundled_plugins = activations
+            .iter()
+            .filter(|(_, enabled)| **enabled)
+            .filter_map(|(name, _)| {
+                bundled_plugin_catalog()
+                    .any(|plugin| plugin.name == name)
+                    .then(|| name.clone())
             })
-            .map(|plugin| plugin.name.to_string())
             .collect();
     }
 
@@ -640,6 +681,13 @@ impl AgentCore {
 
     pub fn set_agent_runtime_settings(&mut self, settings: AgentRuntimeSettings) {
         self.agent_runtime_settings = settings;
+    }
+
+    /// Selects an internal tool-schema exposure policy. Product surfaces should
+    /// normally leave this on `Automatic`; it is intentionally not a per-model
+    /// or per-user patch-format preference.
+    pub fn set_tool_exposure_policy(&mut self, policy: ToolExposurePolicy) {
+        self.tool_exposure_policy = policy;
     }
 
     pub fn agent_runtime_settings(&self) -> &AgentRuntimeSettings {
@@ -694,13 +742,7 @@ impl AgentCore {
             .as_ref()
             .map(|tools| tools.iter().cloned().collect::<HashSet<_>>())
         {
-            self.allowed_tools = Some(match self.allowed_tools.take() {
-                Some(parent_allowed) => parent_allowed
-                    .intersection(&profile_allowed)
-                    .cloned()
-                    .collect(),
-                None => profile_allowed,
-            });
+            self.restrict_to_tools(profile_allowed);
         }
         self.denied_tools
             .extend(profile.denied_tools.iter().cloned());
@@ -734,7 +776,7 @@ When the material decisions are resolved, call set_plan exactly once with goal_i
                 CollaborationMode::Goal => format!(
                     r#"[Goal collaboration mode]
 You are executing persistent goal {goal_id}: {objective}
-The server owns this exact goal id. If no plan exists, call set_plan first with goal_id "{goal_id}". Execute the DAG serially: select only the next runnable pending step, mark it in_progress with update_plan, perform the work, verify its acceptance criteria, then mark it completed with concrete evidence. If a step cannot proceed, resolve it explicitly as blocked, deferred, or cancelled with a status_reason. Continue until every step is resolved. Call complete_task only after the runtime plan has no actionable steps and all completed steps have evidence."#,
+The server owns this exact goal id. If no plan exists, call set_plan first with goal_id "{goal_id}". Use the DAG as durable external memory: keep the work you have committed to current, respect dependencies, and attach concrete evidence when resolving steps. You may reorder or work on independent runnable steps together when that improves the outcome; update the plan when evidence changes the approach instead of following stale sequencing. If a step cannot proceed, resolve it explicitly as blocked, deferred, or cancelled with a status_reason. Continue until every committed step is resolved. Call complete_task only after the runtime plan has no actionable steps and all completed steps have evidence."#,
                     goal_id = goal.id,
                     objective = goal.objective,
                 ),
@@ -753,6 +795,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             let plan_tools = [
                 "list_files",
                 "read_file",
+                "read_files",
                 "search",
                 "git_diff",
                 "list_skills",
@@ -763,10 +806,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             .into_iter()
             .map(str::to_string)
             .collect::<HashSet<_>>();
-            self.allowed_tools = Some(match self.allowed_tools.take() {
-                Some(existing) => existing.intersection(&plan_tools).cloned().collect(),
-                None => plan_tools,
-            });
+            self.restrict_to_tools(plan_tools);
         }
         self.collaboration_mode = mode;
         self.goal = goal;
@@ -1110,16 +1150,6 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 }));
             }
         }
-        if self.collaboration_mode != CollaborationMode::Plan
-            && verification_is_required(latest_plan.as_ref(), provider_tool_results)
-            && !has_verification_evidence(latest_plan.as_ref(), provider_tool_results)
-        {
-            blockers.push(json!({
-                "kind": "verification_missing",
-                "reason": "The request or current plan requires verification, but no successful verification evidence was recorded.",
-            }));
-        }
-
         let mut agent_delivery = None;
         if let Some(scheduler) = self.subagents.as_ref() {
             let scope = self.subagent_scope(thread_id, fallback_turn_id);
@@ -1172,7 +1202,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             "agentPath": self.agent_path,
             "blockers": blockers,
             "requiredAction": [
-                "Resolve every blocker using tools, a plan update, verification, or an explicit user request as appropriate.",
+                "Resolve the reported runtime state using the appropriate tool, plan update, or explicit user request.",
                 "Only return a final response after the runtime state is ready."
             ]
         });
@@ -1784,14 +1814,14 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         cancellation: Option<CancellationToken>,
         model_user_message: String,
         model_user_content: Vec<ModelContentPart>,
-        tool_candidates: Vec<ProviderToolCandidate>,
+        mut tool_candidates: Vec<ProviderToolCandidate>,
         mut provider_tool_calls: Vec<ProviderToolCall>,
         mut provider_tool_results: Vec<ProviderToolResult>,
         mut pending_tool_calls: Vec<ProviderToolCall>,
         mut compacted_tool_history: String,
         mut provider_response_items: Vec<Value>,
         branch_developer_instructions: Option<String>,
-        provider_compatibility_hash: String,
+        mut compatibility_hash: String,
         mut completion_guard_delivery: Option<AgentCompletionGuardDelivery>,
         events: &mut TurnEvents,
     ) -> anyhow::Result<AgentTurnResult> {
@@ -1821,7 +1851,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 });
                 ctx.fork_model_context = Some(model_context.clone());
                 match self
-                    .execute_provider_tool_call(&provider_call, ctx, events)
+                    .execute_provider_tool_call(&provider_call, user_message_id, ctx, events)
                     .await
                 {
                     Ok(result) => {
@@ -1833,6 +1863,14 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                             .transpose()?;
                         if let Some(ref mut budget) = budget {
                             budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
+                        }
+                        if self.reveal_tools_from_search_result(&result, &mut tool_candidates) {
+                            compatibility_hash = provider_compatibility_hash(
+                                &model_context,
+                                context_summary.as_deref(),
+                                &tool_candidates,
+                                branch_developer_instructions.as_deref(),
+                            );
                         }
                         provider_tool_results.push(result);
                         pending_tool_calls.remove(0);
@@ -1872,7 +1910,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                                             rollout_reviews,
                                             runtime_state: runtime_state.clone(),
                                             branch_developer_instructions,
-                                            provider_compatibility_hash,
+                                            provider_compatibility_hash: compatibility_hash,
                                         },
                                     },
                                 },
@@ -2039,7 +2077,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                                         rollout_reviews,
                                         runtime_state: runtime_state.clone(),
                                         branch_developer_instructions,
-                                        provider_compatibility_hash,
+                                        provider_compatibility_hash: compatibility_hash,
                                     },
                                 },
                             },
@@ -2280,7 +2318,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                         provider_tool_results,
                         budget,
                         std::mem::replace(events, TurnEvents::new(None)),
-                        provider_compatibility_hash,
+                        compatibility_hash,
                         outcome,
                     ));
                 }
@@ -2406,7 +2444,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         response
     }
 
-    fn provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
+    fn eligible_provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
         let subagents_available = self.subagents.is_some()
             && self.agent_runtime_settings.multi_agent != MultiAgentMode::Off;
         let structured_input_available = self.request_user_input_is_available();
@@ -2424,6 +2462,127 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 })
             })
             .collect()
+    }
+
+    fn progressive_tool_disclosure_active(&self, eligible: &[ProviderToolCandidate]) -> bool {
+        let has_deferred_tools = eligible
+            .iter()
+            .any(|candidate| self.tools.source(&candidate.name) == Some(ToolSource::Mcp));
+        has_deferred_tools
+            && match self.tool_exposure_policy {
+                ToolExposurePolicy::Eager => false,
+                ToolExposurePolicy::Automatic => {
+                    eligible.len() > AUTOMATIC_TOOL_DISCLOSURE_THRESHOLD
+                }
+                ToolExposurePolicy::Progressive => true,
+            }
+    }
+
+    fn provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
+        let eligible = self.eligible_provider_tool_candidates();
+        if !self.progressive_tool_disclosure_active(&eligible) {
+            return eligible;
+        }
+
+        let mut exposed = eligible
+            .into_iter()
+            .filter(|candidate| self.tools.source(&candidate.name) != Some(ToolSource::Mcp))
+            .collect::<Vec<_>>();
+        exposed.push(ProviderToolCandidate {
+            name: TOOL_SEARCH_NAME.to_string(),
+            description: "Search the deferred tool catalog by capability. Matching tools are made available on the next model round; use the returned names rather than guessing an unloaded tool schema.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Capability or action to search for."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_TOOL_SEARCH_RESULTS,
+                        "description": "Maximum matches to reveal."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        });
+        exposed
+    }
+
+    fn search_deferred_tools(&self, query: &str, limit: usize) -> Vec<ProviderToolCandidate> {
+        let terms = query
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches = self
+            .eligible_provider_tool_candidates()
+            .into_iter()
+            .filter(|candidate| self.tools.source(&candidate.name) == Some(ToolSource::Mcp))
+            .filter_map(|candidate| {
+                let name = candidate.name.to_lowercase();
+                let description = candidate.description.to_lowercase();
+                let matched = terms
+                    .iter()
+                    .filter(|term| {
+                        name.contains(term.as_str()) || description.contains(term.as_str())
+                    })
+                    .count();
+                (matched > 0).then_some((matched, candidate))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        matches
+            .into_iter()
+            .take(limit.min(MAX_TOOL_SEARCH_RESULTS))
+            .map(|(_, candidate)| candidate)
+            .collect()
+    }
+
+    fn reveal_tools_from_search_result(
+        &self,
+        result: &ProviderToolResult,
+        exposed: &mut Vec<ProviderToolCandidate>,
+    ) -> bool {
+        if result.name != TOOL_SEARCH_NAME || result.is_error {
+            return false;
+        }
+        let names = result
+            .metadata
+            .get("revealedTools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<HashSet<_>>();
+        if names.is_empty() {
+            return false;
+        }
+        let existing = exposed
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<HashSet<_>>();
+        let mut additions = self
+            .eligible_provider_tool_candidates()
+            .into_iter()
+            .filter(|candidate| names.contains(candidate.name.as_str()))
+            .filter(|candidate| !existing.contains(candidate.name.as_str()))
+            .collect::<Vec<_>>();
+        let changed = !additions.is_empty();
+        exposed.append(&mut additions);
+        changed
     }
 
     /// `RequestUserInputTool::execute` rejects the call outside plan mode, so
@@ -2514,7 +2673,10 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         ctx.browser = Some(self.browser.clone());
         ctx.computer = Some(self.computer.clone());
         self.apply_subagent_context(&mut ctx, fallback_turn_id);
-        match self.execute_provider_tool_call(call, ctx, events).await {
+        match self
+            .execute_provider_tool_call(call, fallback_turn_id, ctx, events)
+            .await
+        {
             Ok(mut result) => {
                 if let Some(metadata) = result.metadata.as_object_mut() {
                     metadata.insert("approvalGranted".to_string(), json!(true));
@@ -2550,10 +2712,94 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
     async fn execute_provider_tool_call(
         &self,
         provider_call: &ProviderToolCall,
+        user_message_id: Uuid,
         ctx: ToolContext,
         events: &mut TurnEvents,
     ) -> anyhow::Result<ProviderToolResult> {
+        if provider_call.name == TOOL_SEARCH_NAME {
+            return self.execute_tool_search_call(provider_call, events);
+        }
         let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
+        let execution_policy = self
+            .tools
+            .get(&provider_call.name)
+            .map(|tool| tool.execution_policy(&call));
+        let mut journal = None;
+        if let (Some(store), Some(thread_id), Some(policy)) =
+            (ctx.store.as_ref(), ctx.thread_id, execution_policy.as_ref())
+        {
+            if let Some(active_turn) = store.get_active_turn(thread_id)? {
+                if active_turn.user_message_id == user_message_id {
+                    let input_hash = content_fingerprint(
+                        serde_json::to_vec(&provider_call.arguments)
+                            .unwrap_or_default()
+                            .as_slice(),
+                    );
+                    let intent = EffectIntent {
+                        thread_id,
+                        turn_id: active_turn.turn_id,
+                        agent_path: self.agent_path.clone(),
+                        idempotency_key: format!(
+                            "{}/{}/{}/{}",
+                            active_turn.turn_id,
+                            self.agent_path,
+                            provider_call.name,
+                            provider_call.id
+                        ),
+                        kind: EffectKind::ToolCall,
+                        operation: provider_call.name.clone(),
+                        input_hash,
+                        input: provider_call.arguments.clone(),
+                        side_effect_class: effect_side_effect_class(policy.side_effect),
+                        idempotent: policy.idempotent,
+                    };
+                    let prepared = store.prepare_effect(&intent)?;
+                    if prepared.status == EffectStatus::Succeeded {
+                        let value = prepared
+                            .result
+                            .context("succeeded tool effect is missing its replayable result")?;
+                        let mut replayed = serde_json::from_value::<ProviderToolResult>(value)
+                            .context("succeeded tool effect contains an invalid result")?;
+                        if let Some(metadata) = replayed.metadata.as_object_mut() {
+                            metadata.insert("effectJournalReplay".to_string(), json!(true));
+                            metadata.insert("effectId".to_string(), json!(prepared.effect_id));
+                        }
+                        record_provider_tool_result_event(events, call, &replayed);
+                        return Ok(replayed);
+                    }
+                    if prepared.requires_reconciliation()
+                        || prepared.status == EffectStatus::Running
+                    {
+                        let reason = if prepared.status == EffectStatus::Running {
+                            "the same durable tool effect is still marked running"
+                        } else {
+                            "a previous attempt may have produced a non-idempotent side effect"
+                        };
+                        let blocked = ProviderToolResult {
+                            call_id: provider_call.id.clone(),
+                            name: provider_call.name.clone(),
+                            output: format!(
+                                "Tool execution requires reconciliation: {reason}. Inspect the target state or ask the user before attempting the action again."
+                            ),
+                            content: vec![ModelContentPart::text(format!(
+                                "Tool execution requires reconciliation: {reason}. Inspect the target state or ask the user before attempting the action again."
+                            ))],
+                            is_error: true,
+                            metadata: json!({
+                                "success": false,
+                                "effectId": prepared.effect_id,
+                                "effectStatus": prepared.status,
+                                "reconciliationRequired": true,
+                            }),
+                        };
+                        record_provider_tool_result_event(events, call, &blocked);
+                        return Ok(blocked);
+                    }
+                    let running = store.start_effect(prepared.effect_id)?;
+                    journal = Some((Arc::clone(store), running.effect_id, policy.clone()));
+                }
+            }
+        }
         let result = self
             .execute_tool_call(
                 call,
@@ -2563,7 +2809,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             )
             .await;
 
-        match result {
+        let provider_result = match result {
             Ok(result) => {
                 let is_error = tool_result_is_error(&result);
                 let content = result.content_or_legacy_text();
@@ -2595,7 +2841,122 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     metadata,
                 })
             }
+        };
+
+        if let Some((store, effect_id, policy)) = journal {
+            match &provider_result {
+                Ok(result) => {
+                    store.finish_effect(
+                        effect_id,
+                        EffectStatus::Succeeded,
+                        Some(serde_json::to_value(result)?),
+                        None,
+                    )?;
+                }
+                Err(error) => {
+                    let status = if approval_required(error).is_some()
+                        || policy.side_effect == ToolSideEffect::None
+                        || policy.idempotent
+                    {
+                        EffectStatus::Failed
+                    } else {
+                        EffectStatus::Indeterminate
+                    };
+                    store.finish_effect(effect_id, status, None, Some(error.to_string()))?;
+                }
+            }
         }
+        provider_result
+    }
+
+    fn execute_tool_search_call(
+        &self,
+        provider_call: &ProviderToolCall,
+        events: &mut TurnEvents,
+    ) -> anyhow::Result<ProviderToolResult> {
+        let call = ToolCall::new(TOOL_SEARCH_NAME, provider_call.arguments.clone());
+        events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
+        let search_is_exposed = self
+            .provider_tool_candidates()
+            .iter()
+            .any(|candidate| candidate.name == TOOL_SEARCH_NAME);
+        let query = provider_call
+            .arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|query| !query.is_empty());
+        let limit = provider_call
+            .arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(MAX_TOOL_SEARCH_RESULTS, |value| value as usize)
+            .clamp(1, MAX_TOOL_SEARCH_RESULTS);
+
+        let result = if !search_is_exposed {
+            ToolResult {
+                call_id: call.id,
+                output: "tool_search is unavailable because the full eligible tool catalog is already exposed".to_string(),
+                content: vec![ModelContentPart::text(
+                    "tool_search is unavailable because the full eligible tool catalog is already exposed",
+                )],
+                metadata: json!({
+                    "toolName": TOOL_SEARCH_NAME,
+                    "providerToolCallId": provider_call.id,
+                    "success": false,
+                }),
+            }
+        } else if let Some(query) = query {
+            let matches = self.search_deferred_tools(query, limit);
+            let revealed = matches
+                .iter()
+                .map(|candidate| candidate.name.clone())
+                .collect::<Vec<_>>();
+            let payload = json!({
+                "query": query,
+                "tools": matches.iter().map(|candidate| json!({
+                    "name": candidate.name,
+                    "description": candidate.description,
+                })).collect::<Vec<_>>(),
+                "revealedCount": revealed.len(),
+                "note": "The matching tool schemas will be available on the next model round.",
+            });
+            ToolResult {
+                call_id: call.id,
+                output: serde_json::to_string_pretty(&payload)?,
+                content: vec![ModelContentPart::json(payload)],
+                metadata: json!({
+                    "toolName": TOOL_SEARCH_NAME,
+                    "providerToolCallId": provider_call.id,
+                    "success": true,
+                    "revealedTools": revealed,
+                }),
+            }
+        } else {
+            ToolResult {
+                call_id: call.id,
+                output: "query must be a non-empty string".to_string(),
+                content: vec![ModelContentPart::text("query must be a non-empty string")],
+                metadata: json!({
+                    "toolName": TOOL_SEARCH_NAME,
+                    "providerToolCallId": provider_call.id,
+                    "success": false,
+                }),
+            }
+        };
+        events.push(AgentEventPayload::ToolCallFinished {
+            result: result.clone(),
+        });
+        let is_error = tool_result_is_error(&result);
+        let content = result.content_or_legacy_text();
+        Ok(ProviderToolResult {
+            call_id: provider_call.id.clone(),
+            name: TOOL_SEARCH_NAME.to_string(),
+            output: result.output,
+            content,
+            is_error,
+            metadata: result.metadata,
+        })
     }
 
     async fn execute_tool_call(
@@ -2616,47 +2977,6 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         });
         ctx.current_task_plan = current_task_plan.clone();
         events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
-        let is_plan_control = matches!(
-            name.as_str(),
-            "set_plan" | "update_plan" | "get_goal" | "complete_task" | "request_user_input"
-        );
-        if !is_plan_control
-            && current_task_plan
-                .as_ref()
-                .is_some_and(TaskPlan::has_actionable_steps)
-            && active_plan_step_id.is_none()
-        {
-            let next_runnable = current_task_plan
-                .as_ref()
-                .and_then(TaskPlan::next_runnable_step);
-            let next_runnable_step =
-                next_runnable.map(|step| json!({ "id": step.id, "title": step.title }));
-            let required_action = next_runnable.map_or_else(
-                || "resolve the plan's dependency or terminal-state blockers".to_string(),
-                |step| format!("mark {} ({}) in_progress", step.id, step.title),
-            );
-            let err = anyhow::anyhow!(
-                "task plan execution is not attached to an in_progress step; {required_action} before calling {name}"
-            );
-            let mut metadata = json!({
-                "toolName": &name,
-                "success": false,
-                "error": err.to_string(),
-                "nextRunnableStep": next_runnable_step,
-            });
-            self.insert_tool_source_metadata(&name, &mut metadata);
-            insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
-            merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
-            events.push(AgentEventPayload::ToolCallFinished {
-                result: ToolResult {
-                    call_id: call.id,
-                    output: err.to_string(),
-                    content: vec![ModelContentPart::text(err.to_string())],
-                    metadata,
-                },
-            });
-            return Err(err);
-        }
         if !self.tool_is_allowed(&name) {
             let err = anyhow::anyhow!(self.tool_disabled_message(&name));
             let mut metadata = json!({
@@ -3113,81 +3433,6 @@ fn current_task_plan_for_tool(
         }))
 }
 
-fn verification_is_required(
-    plan: Option<&TaskPlan>,
-    provider_tool_results: &[ProviderToolResult],
-) -> bool {
-    let text_requires_verification = |text: &str| {
-        let normalized = text.to_lowercase();
-        normalized.contains("验证")
-            || normalized.contains("测试")
-            || normalized.contains("检查")
-            || normalized.contains("校验")
-            || normalized
-                .split(|character: char| !character.is_alphanumeric())
-                .any(|word| {
-                    matches!(
-                        word,
-                        "verify"
-                            | "verified"
-                            | "verification"
-                            | "validate"
-                            | "validation"
-                            | "test"
-                            | "tests"
-                            | "testing"
-                            | "check"
-                            | "checks"
-                    )
-                })
-    };
-
-    plan.is_some_and(|plan| {
-        plan.steps.iter().any(|step| {
-            text_requires_verification(&step.title)
-                || step
-                    .acceptance_criteria
-                    .iter()
-                    .any(|criterion| text_requires_verification(criterion))
-        })
-    }) || provider_tool_results
-        .iter()
-        .any(|result| result.metadata.get("taskCompletion").is_some())
-}
-
-fn has_verification_evidence(
-    plan: Option<&TaskPlan>,
-    provider_tool_results: &[ProviderToolResult],
-) -> bool {
-    plan.is_some_and(|plan| plan.steps.iter().any(|step| !step.evidence.is_empty()))
-        || provider_tool_results.iter().any(|result| {
-            if result.is_error
-                || result
-                    .metadata
-                    .get("success")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|success| !success)
-            {
-                return false;
-            }
-            let declared = result
-                .metadata
-                .get("verification")
-                .and_then(Value::as_array)
-                .is_some_and(|items| !items.is_empty())
-                || result
-                    .metadata
-                    .pointer("/taskCompletion/verification")
-                    .and_then(Value::as_array)
-                    .is_some_and(|items| !items.is_empty());
-            let observational_tool = matches!(
-                result.name.as_str(),
-                "shell" | "read_file" | "search" | "list_files"
-            ) || result.name.starts_with("browser_");
-            declared || observational_tool
-        })
-}
-
 fn provider_compatibility_hash(
     model_context: &CompiledModelContext,
     context_summary: Option<&str>,
@@ -3398,7 +3643,7 @@ pub fn agent_model_context_with_runtime(
     context
 }
 
-pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-07-29.1";
+pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-08-01.1";
 pub const BASE_AGENT_PROMPT: &str = include_str!("base_agent_prompt.md");
 
 pub fn base_agent_prompt_hash() -> String {
@@ -3595,6 +3840,17 @@ fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("")
         ),
+        "read_files" => format!(
+            "/read-many {}",
+            call.arguments
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("path").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         "search" => {
             let path = call
                 .arguments
@@ -3690,6 +3946,18 @@ fn approved_sandbox_config_for_call(
                 config.grant_read_path(path);
             }
         }
+        "read_files" => {
+            for value in call
+                .arguments
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("path").and_then(Value::as_str))
+            {
+                config.grant_read_path(approval_path(workspace_root, value));
+            }
+        }
         "write_file" => {
             if let Some(path) = path("path") {
                 config.grant_write_path(path);
@@ -3743,6 +4011,34 @@ fn tool_result_is_error(result: &ToolResult) -> bool {
             .unwrap_or(false)
 }
 
+fn effect_side_effect_class(side_effect: ToolSideEffect) -> EffectSideEffectClass {
+    match side_effect {
+        ToolSideEffect::None => EffectSideEffectClass::None,
+        ToolSideEffect::WorkspaceWrite => EffectSideEffectClass::Workspace,
+        ToolSideEffect::External
+        | ToolSideEffect::Process
+        | ToolSideEffect::SessionMutation
+        | ToolSideEffect::ControlPlane => EffectSideEffectClass::External,
+        ToolSideEffect::Unknown => EffectSideEffectClass::Unknown,
+    }
+}
+
+fn record_provider_tool_result_event(
+    events: &mut TurnEvents,
+    call: ToolCall,
+    result: &ProviderToolResult,
+) {
+    events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
+    events.push(AgentEventPayload::ToolCallFinished {
+        result: ToolResult {
+            call_id: call.id,
+            output: result.output.clone(),
+            content: result.content.clone(),
+            metadata: result.metadata.clone(),
+        },
+    });
+}
+
 fn merge_metadata_overlay(metadata: &mut Value, overlay: Option<&Value>) {
     let Some(Value::Object(overlay)) = overlay else {
         return;
@@ -3788,18 +4084,263 @@ pub struct AgentTurnInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentEvent, MessagePart, TaskPlanStepStatus};
+    use crate::model::{AgentEvent, MessagePart, TaskPlanStepStatus, TurnRecord};
+    use crate::policy::ApprovalRequired;
     use crate::settings::ProviderHealthCheck;
     use crate::store::SqliteSessionStore;
     use crate::subagents::{
         NoopSubagentObserver, SpawnSubagentRequest, SubagentExecutor, SubagentRun,
         SubagentRunStatus, SubagentSchedulerConfig,
     };
+    use crate::tools::{Tool, ToolExecutionPolicy};
+    use async_trait::async_trait;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CatalogTestTool {
+        name: String,
+        description: String,
+    }
+
+    struct JournalTestTool {
+        executions: Arc<AtomicUsize>,
+        requires_approval: bool,
+    }
+
+    #[async_trait]
+    impl Tool for JournalTestTool {
+        fn name(&self) -> &str {
+            "journal_test"
+        }
+
+        fn description(&self) -> &str {
+            "Exercise durable tool-call journaling in tests."
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+
+        fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+            ToolExecutionPolicy {
+                read_only: false,
+                idempotent: false,
+                parallel_safe: false,
+                side_effect: ToolSideEffect::External,
+                resource_keys: vec!["journal-test".to_string()],
+            }
+        }
+
+        async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+            if self.requires_approval && !ctx.approval_granted {
+                return Err(ApprovalRequired::new("approve journal test").into());
+            }
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::text(
+                call.id,
+                "executed",
+                json!({ "success": true }),
+            ))
+        }
+    }
+
+    fn journal_test_context(
+        store: Arc<dyn SessionStore>,
+        thread_id: Uuid,
+        workspace: PathBuf,
+        approval_granted: bool,
+    ) -> ToolContext {
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut ctx = ToolContext::local(workspace, policy);
+        ctx.store = Some(store);
+        ctx.thread_id = Some(thread_id);
+        ctx.approval_granted = approval_granted;
+        ctx
+    }
+
+    #[async_trait]
+    impl Tool for CatalogTestTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+
+        async fn execute(&self, call: ToolCall, _ctx: ToolContext) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult::text(call.id, "ok", json!({ "success": true })))
+        }
+    }
+
+    #[test]
+    fn progressive_tool_search_reveals_only_matching_deferred_schemas() {
+        let mut registry = ToolRegistry::with_builtins();
+        registry.insert_mcp(
+            "mcp_issue_lookup".to_string(),
+            Arc::new(CatalogTestTool {
+                name: "mcp_issue_lookup".to_string(),
+                description: "Look up issue tracker records".to_string(),
+            }),
+        );
+        registry.insert_mcp(
+            "mcp_invoice_send".to_string(),
+            Arc::new(CatalogTestTool {
+                name: "mcp_invoice_send".to_string(),
+                description: "Send a customer invoice".to_string(),
+            }),
+        );
+        let mut agent = AgentCore::new(Arc::new(MockProvider), registry);
+        agent.set_tool_exposure_policy(ToolExposurePolicy::Progressive);
+        let mut exposed = agent.provider_tool_catalog();
+        assert!(exposed.iter().any(|tool| tool.name == TOOL_SEARCH_NAME));
+        assert!(!exposed.iter().any(|tool| tool.name == "mcp_issue_lookup"));
+        assert!(!exposed.iter().any(|tool| tool.name == "mcp_invoice_send"));
+
+        let mut events = TurnEvents::new(None);
+        let result = agent
+            .execute_tool_search_call(
+                &ProviderToolCall {
+                    id: "search-tools".to_string(),
+                    name: TOOL_SEARCH_NAME.to_string(),
+                    arguments: json!({ "query": "issue tracker" }),
+                },
+                &mut events,
+            )
+            .expect("search deferred tools");
+        assert!(agent.reveal_tools_from_search_result(&result, &mut exposed));
+        assert!(exposed.iter().any(|tool| tool.name == "mcp_issue_lookup"));
+        assert!(!exposed.iter().any(|tool| tool.name == "mcp_invoice_send"));
+    }
+
+    #[tokio::test]
+    async fn durable_tool_effect_replays_a_succeeded_provider_call() {
+        let workspace = test_workspace("journal-replay");
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
+        let thread = store.create_thread(None, workspace.clone()).unwrap();
+        let user_message_id = Uuid::new_v4();
+        let turn = store
+            .insert_turn(TurnRecord::running(thread.id, user_message_id))
+            .unwrap();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::with_core_tools();
+        registry.insert(
+            "journal_test".to_string(),
+            Arc::new(JournalTestTool {
+                executions: Arc::clone(&executions),
+                requires_approval: false,
+            }),
+        );
+        let agent = AgentCore::new(Arc::new(MockProvider), registry);
+        let provider_call = ProviderToolCall {
+            id: "stable-provider-call".to_string(),
+            name: "journal_test".to_string(),
+            arguments: json!({}),
+        };
+
+        let first = agent
+            .execute_provider_tool_call(
+                &provider_call,
+                user_message_id,
+                journal_test_context(Arc::clone(&store), thread.id, workspace.clone(), false),
+                &mut TurnEvents::new(None),
+            )
+            .await
+            .unwrap();
+        let replay = agent
+            .execute_provider_tool_call(
+                &provider_call,
+                user_message_id,
+                journal_test_context(Arc::clone(&store), thread.id, workspace.clone(), false),
+                &mut TurnEvents::new(None),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.output, "executed");
+        assert_eq!(replay.output, "executed");
+        assert_eq!(replay.metadata["effectJournalReplay"], true);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let effects = store.list_turn_effects(turn.turn_id).unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].status, EffectStatus::Succeeded);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn approved_retry_restarts_the_same_failed_effect_record() {
+        let workspace = test_workspace("journal-approved-retry");
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
+        let thread = store.create_thread(None, workspace.clone()).unwrap();
+        let user_message_id = Uuid::new_v4();
+        let turn = store
+            .insert_turn(TurnRecord::running(thread.id, user_message_id))
+            .unwrap();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::with_core_tools();
+        registry.insert(
+            "journal_test".to_string(),
+            Arc::new(JournalTestTool {
+                executions: Arc::clone(&executions),
+                requires_approval: true,
+            }),
+        );
+        let agent = AgentCore::new(Arc::new(MockProvider), registry);
+        let provider_call = ProviderToolCall {
+            id: "approval-provider-call".to_string(),
+            name: "journal_test".to_string(),
+            arguments: json!({}),
+        };
+
+        let denied = agent
+            .execute_provider_tool_call(
+                &provider_call,
+                user_message_id,
+                journal_test_context(Arc::clone(&store), thread.id, workspace.clone(), false),
+                &mut TurnEvents::new(None),
+            )
+            .await
+            .unwrap_err();
+        assert!(approval_required(&denied).is_some());
+        assert_eq!(
+            store.list_turn_effects(turn.turn_id).unwrap()[0].status,
+            EffectStatus::Failed
+        );
+
+        let approved = agent
+            .execute_provider_tool_call(
+                &provider_call,
+                user_message_id,
+                journal_test_context(Arc::clone(&store), thread.id, workspace.clone(), true),
+                &mut TurnEvents::new(None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.output, "executed");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let effects = store.list_turn_effects(turn.turn_id).unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].status, EffectStatus::Succeeded);
+        assert_eq!(effects[0].attempt, 2);
+        let _ = fs::remove_dir_all(workspace);
+    }
 
     #[test]
     fn thread_activation_filters_bundled_tools_from_catalog_and_execution_guard() {
         let mut agent = AgentCore::default();
+        agent.set_tool_exposure_policy(ToolExposurePolicy::Eager);
+        agent.set_bundled_plugin_activations(&HashMap::from([
+            ("browser-automation".to_string(), true),
+            ("computer-use".to_string(), false),
+            ("spreadsheet".to_string(), false),
+        ]));
         assert!(agent
             .provider_tool_catalog()
             .iter()
@@ -3817,9 +4358,10 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(!tools.contains("browser"));
         assert!(tools.contains("computer"));
-        assert!(tools.contains("spreadsheet"));
+        assert!(!tools.contains("spreadsheet"));
         assert!(!agent.tool_is_allowed("browser"));
         assert!(agent.tool_is_allowed("computer"));
+        assert!(!agent.tool_is_allowed("spreadsheet"));
 
         let mut metadata = json!({});
         agent.insert_tool_source_metadata("computer", &mut metadata);
@@ -3847,6 +4389,7 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert!(tools.contains("read_file"));
+        assert!(tools.contains("read_files"));
         assert!(tools.contains("search"));
         assert!(tools.contains("git_diff"));
         assert!(tools.contains("request_user_input"));
@@ -3908,6 +4451,30 @@ mod tests {
         assert!(module
             .text_content()
             .contains("Never present an ordinary-text multiple-choice prompt"));
+    }
+
+    #[test]
+    fn tool_restrictions_can_only_narrow_the_provider_catalog() {
+        let mut agent = AgentCore::default();
+        assert!(agent
+            .provider_tool_candidates()
+            .iter()
+            .any(|candidate| candidate.name == "read_file"));
+
+        agent.restrict_to_tools(["read_file", "complete_task"]);
+        let names = agent
+            .provider_tool_candidates()
+            .into_iter()
+            .map(|candidate| candidate.name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from(["read_file".to_string(), "complete_task".to_string()])
+        );
+
+        agent.restrict_to_tools(["complete_task"]);
+        assert!(agent.tool_is_allowed("complete_task"));
+        assert!(!agent.tool_is_allowed("read_file"));
     }
 
     #[test]
@@ -4664,6 +5231,41 @@ mod tests {
     }
 
     #[test]
+    fn finalization_guard_does_not_infer_workflow_from_plan_wording() {
+        let agent = AgentCore::new(Arc::new(MockProvider), ToolRegistry::with_builtins());
+        let plan: TaskPlan = serde_json::from_value(json!({
+            "planRevision": 1,
+            "goalId": "objective-state-only",
+            "steps": [{
+                "id": "review-tests",
+                "title": "Review test strategy",
+                "status": "completed",
+                "dependencies": [],
+                "acceptanceCriteria": ["Testing approach is documented"],
+                "evidence": []
+            }]
+        }))
+        .unwrap();
+        let mut events = TurnEvents::new(None);
+        events.push(AgentEventPayload::PlanUpdated { plan });
+
+        let intervention = agent
+            .apply_finalization_guard(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                None,
+                &[],
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut events,
+            )
+            .unwrap();
+
+        assert!(intervention.is_none());
+    }
+
+    #[test]
     fn finalization_guard_blocks_a_pending_plan_restored_from_the_store() {
         let workspace = test_workspace("persisted-pending-finalization-guard");
         let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
@@ -4772,7 +5374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_tools_require_an_in_progress_plan_step() {
+    async fn ordinary_tools_can_run_while_a_plan_is_external_memory() {
         let workspace = test_workspace("tool-plan-step-gate");
         let policy = Arc::new(BasicPolicyEngine::new(
             workspace.clone(),
@@ -4796,7 +5398,7 @@ mod tests {
         let agent = AgentCore::new(Arc::new(MockProvider), ToolRegistry::with_builtins());
         let mut events = TurnEvents::new(None);
 
-        let error = agent
+        let result = agent
             .execute_tool_call(
                 ToolCall::new("list_files", json!({ "path": "." })),
                 ctx,
@@ -4804,16 +5406,15 @@ mod tests {
                 None,
             )
             .await
-            .unwrap_err();
+            .expect("the plan must not gate an otherwise valid tool call");
 
-        assert!(error
-            .to_string()
-            .contains("mark inspect-workspace (Inspect the workspace) in_progress"));
+        assert_eq!(result.metadata["toolName"], "list_files");
+        assert!(result.metadata.get("taskPlanStepId").is_none());
         assert!(events.items.iter().any(|event| matches!(
             event,
             AgentEventPayload::ToolCallFinished { result }
-                if result.metadata["nextRunnableStep"]["id"] == "inspect-workspace"
-                    && result.metadata["success"] == false
+                if result.metadata["toolName"] == "list_files"
+                    && result.metadata.get("taskPlanStepId").is_none()
         )));
 
         let _ = fs::remove_dir_all(workspace);

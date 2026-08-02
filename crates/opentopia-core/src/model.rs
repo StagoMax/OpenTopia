@@ -6,6 +6,7 @@ use crate::subagents::SubagentRun;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -34,6 +35,60 @@ impl Project {
             updated_at: now,
         }
     }
+}
+
+/// A durable, read-only index entry for an application evaluation stored under
+/// a workspace's `.opentopia/evaluations` directory. The full source summary
+/// remains available so a newer Harness can add fields without a database
+/// migration, while the normalized task fields power the desktop workbench.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationRun {
+    pub run_id: String,
+    pub workspace_root: PathBuf,
+    pub title: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    pub source_path: PathBuf,
+    #[serde(default)]
+    pub tasks: Vec<EvaluationTaskResult>,
+    pub summary: Value,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A normalized task attempt within an evaluation run. `failure_category` is
+/// intentionally supplied by the Harness rather than inferred by the UI so
+/// provider outages, model behaviour, and Harness failures remain distinct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationTaskResult {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub tool_calls_by_name: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_contract_passed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

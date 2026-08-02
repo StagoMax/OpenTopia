@@ -1,6 +1,7 @@
 use crate::sandbox::SandboxMode;
+use crate::{ContributionKind, PluginDescriptor};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,10 @@ pub struct AgentProfile {
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub denied_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_contribution_id: Option<String>,
 }
 
 impl AgentProfile {
@@ -35,6 +40,8 @@ impl AgentProfile {
             sandbox_mode: None,
             allowed_tools: None,
             denied_tools: Vec::new(),
+            source_plugin_id: None,
+            source_contribution_id: None,
         }
     }
 
@@ -97,6 +104,56 @@ impl AgentProfileRegistry {
         registry
     }
 
+    pub fn load_with_plugin_profiles(
+        workspace_root: &Path,
+        plugins: &[PluginDescriptor],
+        enabled_plugin_ids: &BTreeSet<String>,
+    ) -> Self {
+        let mut registry = Self::load(workspace_root);
+        let mut contributions =
+            BTreeMap::<String, Vec<(&PluginDescriptor, &crate::PluginContribution)>>::new();
+        for plugin in plugins
+            .iter()
+            .filter(|plugin| enabled_plugin_ids.contains(&plugin.id))
+        {
+            for contribution in plugin
+                .capability_manifest
+                .contributions
+                .iter()
+                .filter(|contribution| contribution.kind == ContributionKind::AgentProfile)
+            {
+                contributions
+                    .entry(contribution.local_id.clone())
+                    .or_default()
+                    .push((plugin, contribution));
+            }
+        }
+        for (local_id, registrations) in contributions {
+            if registrations.len() > 1 {
+                registry.warnings.push(format!(
+                    "ignored agent profile `{local_id}`: active plugins declare conflicting contributions"
+                ));
+                continue;
+            }
+            let (plugin, contribution) = registrations[0];
+            let Some(reference) = contribution.declared_path_reference() else {
+                registry.warnings.push(format!(
+                    "ignored {}: agent profile contribution has no package-relative path",
+                    contribution.id
+                ));
+                continue;
+            };
+            registry.load_plugin_profile(
+                &plugin.id,
+                &contribution.id,
+                &contribution.local_id,
+                &plugin.path,
+                reference,
+            );
+        }
+        registry
+    }
+
     pub fn get(&self, name: &str) -> Option<&AgentProfile> {
         self.profiles.get(name.trim())
     }
@@ -144,6 +201,87 @@ impl AgentProfileRegistry {
             }
         }
     }
+
+    fn load_plugin_profile(
+        &mut self,
+        plugin_id: &str,
+        contribution_id: &str,
+        local_id: &str,
+        plugin_root: &Path,
+        reference: &str,
+    ) {
+        let root = match plugin_root.canonicalize() {
+            Ok(root) => root,
+            Err(error) => {
+                self.warnings.push(format!(
+                    "ignored {contribution_id}: failed to resolve plugin root: {error}"
+                ));
+                return;
+            }
+        };
+        let path = match root.join(reference.trim_start_matches("./")).canonicalize() {
+            Ok(path) if path.starts_with(&root) && path.is_file() => path,
+            Ok(_) => {
+                self.warnings.push(format!(
+                    "ignored {contribution_id}: profile path escapes the plugin package"
+                ));
+                return;
+            }
+            Err(error) => {
+                self.warnings.push(format!(
+                    "ignored {contribution_id}: failed to resolve profile: {error}"
+                ));
+                return;
+            }
+        };
+        let source = match fs::read_to_string(&path) {
+            Ok(source) if source.len() <= 256 * 1024 => source,
+            Ok(_) => {
+                self.warnings.push(format!(
+                    "ignored {contribution_id}: profile exceeds 256 KiB"
+                ));
+                return;
+            }
+            Err(error) => {
+                self.warnings.push(format!(
+                    "ignored {contribution_id}: failed to read {}: {error}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        let parsed = match path.extension().and_then(|value| value.to_str()) {
+            Some("json") => {
+                serde_json::from_str::<AgentProfile>(&source).map_err(anyhow::Error::from)
+            }
+            _ => toml::from_str::<AgentProfile>(&source).map_err(anyhow::Error::from),
+        };
+        let mut profile = match parsed {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.warnings.push(format!(
+                    "ignored {contribution_id}: invalid agent profile: {error}"
+                ));
+                return;
+            }
+        };
+        if !is_valid_profile_name(&profile.name) || profile.name != local_id {
+            self.warnings.push(format!(
+                "ignored {contribution_id}: profile name must equal contribution id `{local_id}`"
+            ));
+            return;
+        }
+        if self.profiles.contains_key(&profile.name) {
+            self.warnings.push(format!(
+                "ignored {contribution_id}: agent profile `{}` is already registered",
+                profile.name
+            ));
+            return;
+        }
+        profile.source_plugin_id = Some(plugin_id.to_string());
+        profile.source_contribution_id = Some(contribution_id.to_string());
+        self.profiles.insert(profile.name.clone(), profile);
+    }
 }
 
 fn codex_home() -> Option<PathBuf> {
@@ -189,6 +327,60 @@ model_reasoning_effort = "high"
         let profile = registry.get("worker").unwrap();
         assert_eq!(profile.description, "Project worker");
         assert_eq!(profile.model_reasoning_effort.as_deref(), Some("high"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plugin_profiles_are_package_scoped_and_cannot_override_builtins() {
+        let root =
+            std::env::temp_dir().join(format!("opentopia-plugin-profile-{}", Uuid::new_v4()));
+        let plugin_root = root.join("plugin");
+        fs::create_dir_all(plugin_root.join("agents")).unwrap();
+        fs::write(
+            plugin_root.join("agents/reviewer.toml"),
+            r#"
+name = "reviewer"
+description = "Plugin reviewer"
+developer_instructions = "Review the selected domain."
+denied_tools = ["computer"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_root.join("agents/worker.toml"),
+            r#"
+name = "worker"
+description = "Override"
+developer_instructions = "Override built-in."
+"#,
+        )
+        .unwrap();
+
+        let mut registry = AgentProfileRegistry::default();
+        registry.load_plugin_profile(
+            "plugin",
+            "plugin/reviewer",
+            "reviewer",
+            &plugin_root,
+            "agents/reviewer.toml",
+        );
+        registry.load_plugin_profile(
+            "plugin",
+            "plugin/worker",
+            "worker",
+            &plugin_root,
+            "agents/worker.toml",
+        );
+        let reviewer = registry.get("reviewer").unwrap();
+        assert_eq!(reviewer.source_plugin_id.as_deref(), Some("plugin"));
+        assert_eq!(
+            registry.get("worker").unwrap().description,
+            "Implementation-focused agent for a concrete, bounded work item."
+        );
+        assert!(registry
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("already registered")));
         fs::remove_dir_all(root).unwrap();
     }
 }

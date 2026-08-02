@@ -238,6 +238,22 @@ pub struct FileWriteRequest {
     pub create_parent_dirs: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileDeleteRequest {
+    pub path: PathBuf,
+}
+
+impl FileDeleteRequest {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteResult {
+    pub path: PathBuf,
+}
+
 impl FileWriteRequest {
     pub fn new(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -271,6 +287,14 @@ pub trait StdioSession: Send + Sync {
     async fn read_stdout(&self) -> anyhow::Result<Vec<u8>>;
     async fn read_stderr(&self) -> anyhow::Result<Vec<u8>>;
     async fn close(&self) -> anyhow::Result<ExecResult>;
+    /// Wait for the process without closing stdin first.
+    ///
+    /// Persistent shell sessions use this while another task continues to write
+    /// input. Implementations that do not distinguish wait from close retain the
+    /// old behavior through this conservative default.
+    async fn wait(&self) -> anyhow::Result<ExecResult> {
+        self.close().await
+    }
     async fn kill(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -284,6 +308,13 @@ pub trait ExecutionEnvironment: Send + Sync {
     fn id(&self) -> &str;
     fn kind(&self) -> ExecutionEnvironmentKind;
     fn workspace_root(&self) -> &Path;
+
+    /// Whether `spawn_stdio` can remain alive while callers independently read,
+    /// write, and wait for it. The default prevents a nominal stdio adapter from
+    /// being exposed as an interactive session when its `wait` closes stdin.
+    fn supports_persistent_stdio(&self) -> bool {
+        false
+    }
 
     fn resolve_read_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
         if path
@@ -329,6 +360,9 @@ pub trait ExecutionEnvironment: Send + Sync {
 
     async fn read_file(&self, request: FileReadRequest) -> anyhow::Result<FileReadResult>;
     async fn write_file(&self, request: FileWriteRequest) -> anyhow::Result<WriteResult>;
+    async fn delete_file(&self, _request: FileDeleteRequest) -> anyhow::Result<DeleteResult> {
+        anyhow::bail!("this execution environment does not support direct file deletion")
+    }
 
     async fn cancel(&self, request_id: &str) -> anyhow::Result<()>;
 
@@ -528,6 +562,10 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
 
     fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    fn supports_persistent_stdio(&self) -> bool {
+        true
     }
 
     fn resolve_read_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
@@ -918,6 +956,20 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             bytes_written,
         })
     }
+
+    async fn delete_file(&self, request: FileDeleteRequest) -> anyhow::Result<DeleteResult> {
+        let path = self.resolve_write_path(&request.path)?;
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if !metadata.is_file() {
+            anyhow::bail!("delete path is not a file: {}", path.display());
+        }
+        tokio::fs::remove_file(&path)
+            .await
+            .with_context(|| format!("failed to delete {}", path.display()))?;
+        Ok(DeleteResult { path })
+    }
 }
 
 async fn read_pipe_with_limit<R: AsyncRead + Unpin>(
@@ -960,8 +1012,17 @@ async fn read_pipe_with_limit<R: AsyncRead + Unpin>(
 fn truncate_output_vec(bytes: Vec<u8>, max_bytes: Option<usize>) -> Vec<u8> {
     match max_bytes {
         Some(max) if bytes.len() > max => {
-            let mut truncated = bytes[..max].to_vec();
-            truncated.extend_from_slice(b"\n\n[output truncated by resource limit]");
+            let marker = format!(
+                "\n\n[output truncated by resource limit: {} bytes omitted]\n\n",
+                bytes.len().saturating_sub(max)
+            );
+            let marker_bytes = marker.as_bytes();
+            let head_len = max / 2;
+            let tail_len = max.saturating_sub(head_len);
+            let mut truncated = Vec::with_capacity(max.saturating_add(marker_bytes.len()));
+            truncated.extend_from_slice(&bytes[..head_len]);
+            truncated.extend_from_slice(marker_bytes);
+            truncated.extend_from_slice(&bytes[bytes.len().saturating_sub(tail_len)..]);
             truncated
         }
         _ => bytes,
@@ -1014,6 +1075,10 @@ impl StdioSession for LocalStdioSession {
             let _ = stdin.shutdown().await;
         }
 
+        self.wait().await
+    }
+
+    async fn wait(&self) -> anyhow::Result<ExecResult> {
         let mut child_guard = self.child.lock().await;
         let mut child = child_guard.take();
 
@@ -1023,42 +1088,42 @@ impl StdioSession for LocalStdioSession {
                     let cancel = cancel.clone();
                     let cancel_token = cancel_token.clone();
                     tokio::select! {
-                        result = child.wait() => result,
+                        result = child.wait() => result.map_err(anyhow::Error::from),
                         _ = cancel.cancelled() => {
                             let _ = child.kill().await;
                             let _ = child.wait().await;
-                            anyhow::bail!("stdio session cancelled during close");
+                            Err(anyhow::anyhow!("stdio session cancelled during wait"))
                         }
                         _ = cancel_token.cancelled() => {
                             let _ = child.kill().await;
                             let _ = child.wait().await;
-                            anyhow::bail!("stdio session cancelled during close");
+                            Err(anyhow::anyhow!("stdio session cancelled during wait"))
                         }
                     }
                 }
                 (Some(cancel), None) => {
                     let cancel = cancel.clone();
                     tokio::select! {
-                        result = child.wait() => result,
+                        result = child.wait() => result.map_err(anyhow::Error::from),
                         _ = cancel.cancelled() => {
                             let _ = child.kill().await;
                             let _ = child.wait().await;
-                            anyhow::bail!("stdio session cancelled during close");
+                            Err(anyhow::anyhow!("stdio session cancelled during wait"))
                         }
                     }
                 }
                 (None, Some(cancel_token)) => {
                     let cancel_token = cancel_token.clone();
                     tokio::select! {
-                        result = child.wait() => result,
+                        result = child.wait() => result.map_err(anyhow::Error::from),
                         _ = cancel_token.cancelled() => {
                             let _ = child.kill().await;
                             let _ = child.wait().await;
-                            anyhow::bail!("stdio session cancelled during close");
+                            Err(anyhow::anyhow!("stdio session cancelled during wait"))
                         }
                     }
                 }
-                (None, None) => child.wait().await,
+                (None, None) => child.wait().await.map_err(anyhow::Error::from),
             };
 
             if let Some(ref request_id) = self.request_id {

@@ -5,6 +5,7 @@ use crate::model_context::{
 use crate::settings::{
     model_accepts_temperature, OpenAiCompatibilityReport, OpenAiProtocol, PromptCachePolicy,
     ProviderFeatureSupport, ProviderHealthCheck, ProviderKind, ProviderSettings,
+    ProviderToolProtocolCapabilities,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -241,6 +242,26 @@ pub enum ModelStreamDelta {
     },
 }
 
+/// Responses assistant-message phase values. The stream adapter uses these to
+/// prevent commentary preambles from being promoted into the final answer,
+/// while retaining the original provider item (including `phase`) for replay.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantOutputPhase {
+    Commentary,
+    FinalAnswer,
+}
+
+impl AssistantOutputPhase {
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "commentary" => Some(Self::Commentary),
+            "final_answer" => Some(Self::FinalAnswer),
+            _ => None,
+        }
+    }
+}
+
 pub type ModelStreamCallback<'a> = dyn FnMut(ModelStreamDelta) -> anyhow::Result<()> + Send + 'a;
 
 #[derive(Debug, Clone)]
@@ -278,6 +299,34 @@ pub struct ProviderToolCandidate {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+}
+
+/// Provider-facing representations are selected from negotiated protocol
+/// capabilities, not vendor or model-name tables. Function is the portable
+/// fallback; Freeform and Hosted are optional fast paths.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderToolRepresentation {
+    Function,
+    Freeform,
+    Hosted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "representation", rename_all = "snake_case")]
+pub enum ProviderToolDefinition {
+    Function {
+        name: String,
+        description: String,
+        input_schema: Value,
+    },
+    Freeform {
+        name: String,
+        description: String,
+    },
+    Hosted {
+        kind: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -379,51 +428,183 @@ pub trait ModelProvider: Send + Sync {
     async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck>;
 }
 
-/// Builds the transport for a connection. Callers pass settings that already
-/// carry any per-thread model override, so this stays the single place that
-/// maps a provider kind onto a concrete client.
-///
-/// An unconfigured connection degrades to [`MockProvider`] rather than failing,
-/// matching the behaviour the desktop app relies on for first-run setup.
-pub fn provider_from_settings(settings: &ProviderSettings) -> std::sync::Arc<dyn ModelProvider> {
-    use std::sync::Arc;
-    match settings.kind {
-        ProviderKind::Mock => Arc::new(MockProvider),
-        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(settings)
-            .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
-            .unwrap_or_else(|| Arc::new(MockProvider)),
-        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(settings)
-            .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
-            .unwrap_or_else(|| Arc::new(MockProvider)),
-        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(settings)
-            .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
-            .unwrap_or_else(|| Arc::new(MockProvider)),
-        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(settings)
-            .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
-            .unwrap_or_else(|| Arc::new(MockProvider)),
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDriverTrust {
+    BuiltIn,
+    Signed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDriverDescriptor {
+    pub id: String,
+    pub kind: ProviderKind,
+    pub display_name: String,
+    pub trust: ProviderDriverTrust,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderDriverUse {
+    Model,
+    Guardian,
+}
+
+type ProviderDriverFactory =
+    fn(&ProviderSettings, ProviderDriverUse) -> Option<Arc<dyn ModelProvider>>;
+
+#[derive(Clone)]
+struct ProviderDriverRegistration {
+    descriptor: ProviderDriverDescriptor,
+    factory: ProviderDriverFactory,
+}
+
+/// Host-owned registry for model transports. Registrations are intentionally
+/// private to this crate: ordinary plugin discovery cannot add provider drivers
+/// or promote a manifest into a trusted transport implementation.
+#[derive(Clone)]
+pub struct ProviderDriverRegistry {
+    drivers: BTreeMap<String, ProviderDriverRegistration>,
+}
+
+impl Default for ProviderDriverRegistry {
+    fn default() -> Self {
+        let mut registry = Self {
+            drivers: BTreeMap::new(),
+        };
+        registry.register_builtin(ProviderKind::Mock, "Mock", |_, _| {
+            Some(Arc::new(MockProvider))
+        });
+        registry.register_builtin(
+            ProviderKind::OpenAiCompatible,
+            "OpenAI-compatible",
+            |settings, usage| {
+                OpenAiCompatibleProvider::from_settings(settings).map(|provider| match usage {
+                    ProviderDriverUse::Model => Arc::new(provider) as Arc<dyn ModelProvider>,
+                    ProviderDriverUse::Guardian => {
+                        Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>
+                    }
+                })
+            },
+        );
+        registry.register_builtin(
+            ProviderKind::OpenAiResponses,
+            "OpenAI Responses",
+            |settings, usage| {
+                OpenAiResponsesProvider::from_settings(settings).map(|provider| match usage {
+                    ProviderDriverUse::Model => Arc::new(provider) as Arc<dyn ModelProvider>,
+                    ProviderDriverUse::Guardian => {
+                        Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>
+                    }
+                })
+            },
+        );
+        registry.register_builtin(
+            ProviderKind::Anthropic,
+            "Anthropic Messages",
+            |settings, usage| {
+                AnthropicMessagesProvider::from_settings(settings).map(|provider| match usage {
+                    ProviderDriverUse::Model => Arc::new(provider) as Arc<dyn ModelProvider>,
+                    ProviderDriverUse::Guardian => {
+                        Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>
+                    }
+                })
+            },
+        );
+        registry.register_builtin(
+            ProviderKind::CodexAppServer,
+            "Codex App Server",
+            |settings, usage| {
+                CodexAppServerProvider::from_settings(settings).map(|provider| match usage {
+                    ProviderDriverUse::Model => Arc::new(provider) as Arc<dyn ModelProvider>,
+                    ProviderDriverUse::Guardian => {
+                        Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>
+                    }
+                })
+            },
+        );
+        registry
     }
 }
 
-/// Same connection, constrained for guardian review calls.
-pub fn guardian_provider_from_settings(
-    settings: &ProviderSettings,
-) -> std::sync::Arc<dyn ModelProvider> {
-    use std::sync::Arc;
-    match settings.kind {
-        ProviderKind::Mock => Arc::new(MockProvider),
-        ProviderKind::OpenAiCompatible => OpenAiCompatibleProvider::from_settings(settings)
-            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
-            .unwrap_or_else(|| Arc::new(MockProvider)),
-        ProviderKind::OpenAiResponses => OpenAiResponsesProvider::from_settings(settings)
-            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
-            .unwrap_or_else(|| Arc::new(MockProvider)),
-        ProviderKind::Anthropic => AnthropicMessagesProvider::from_settings(settings)
-            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
-            .unwrap_or_else(|| Arc::new(MockProvider)),
-        ProviderKind::CodexAppServer => CodexAppServerProvider::from_settings(settings)
-            .map(|provider| Arc::new(provider.for_guardian()) as Arc<dyn ModelProvider>)
-            .unwrap_or_else(|| Arc::new(MockProvider)),
+impl ProviderDriverRegistry {
+    pub fn built_in() -> &'static Self {
+        static REGISTRY: OnceLock<ProviderDriverRegistry> = OnceLock::new();
+        REGISTRY.get_or_init(Self::default)
     }
+
+    pub fn descriptors(&self) -> Vec<ProviderDriverDescriptor> {
+        self.drivers
+            .values()
+            .map(|registration| registration.descriptor.clone())
+            .collect()
+    }
+
+    pub fn descriptor(&self, kind: &ProviderKind) -> Option<&ProviderDriverDescriptor> {
+        self.drivers
+            .get(kind.as_str())
+            .map(|registration| &registration.descriptor)
+    }
+
+    pub fn create(&self, settings: &ProviderSettings) -> Option<Arc<dyn ModelProvider>> {
+        self.create_for(settings, ProviderDriverUse::Model)
+    }
+
+    pub fn create_guardian(&self, settings: &ProviderSettings) -> Option<Arc<dyn ModelProvider>> {
+        self.create_for(settings, ProviderDriverUse::Guardian)
+    }
+
+    fn register_builtin(
+        &mut self,
+        kind: ProviderKind,
+        display_name: &str,
+        factory: ProviderDriverFactory,
+    ) {
+        let id = kind.as_str().to_string();
+        let replaced = self.drivers.insert(
+            id.clone(),
+            ProviderDriverRegistration {
+                descriptor: ProviderDriverDescriptor {
+                    id,
+                    kind,
+                    display_name: display_name.to_string(),
+                    trust: ProviderDriverTrust::BuiltIn,
+                },
+                factory,
+            },
+        );
+        debug_assert!(replaced.is_none(), "duplicate built-in provider driver");
+    }
+
+    fn create_for(
+        &self,
+        settings: &ProviderSettings,
+        usage: ProviderDriverUse,
+    ) -> Option<Arc<dyn ModelProvider>> {
+        self.drivers
+            .get(settings.kind.as_str())
+            .and_then(|registration| (registration.factory)(settings, usage))
+    }
+}
+
+/// Builds the transport for a connection. Callers pass settings that already
+/// carry any per-thread model override. An unconfigured connection degrades to
+/// [`MockProvider`] to preserve the desktop first-run behaviour.
+pub fn provider_from_settings(settings: &ProviderSettings) -> Arc<dyn ModelProvider> {
+    configured_provider_from_settings(settings).unwrap_or_else(|| Arc::new(MockProvider))
+}
+
+pub fn configured_provider_from_settings(
+    settings: &ProviderSettings,
+) -> Option<Arc<dyn ModelProvider>> {
+    ProviderDriverRegistry::built_in().create(settings)
+}
+
+/// Same connection, constrained for guardian review calls.
+pub fn guardian_provider_from_settings(settings: &ProviderSettings) -> Arc<dyn ModelProvider> {
+    ProviderDriverRegistry::built_in()
+        .create_guardian(settings)
+        .unwrap_or_else(|| Arc::new(MockProvider))
 }
 
 #[derive(Debug, Clone)]
@@ -617,11 +798,58 @@ impl OpenAiCompatibleProvider {
             "stream": false,
             "store": false
         });
-        let (chat, responses, chat_function_tools, responses_native_tools) = tokio::join!(
+        let responses_function_tools_payload = json!({
+            "model": self.model,
+            "input": "Reply with OK.",
+            "tools": [{
+                "type": "function",
+                "name": "compatibility_probe",
+                "description": "Validates Responses function-tool support without invoking a tool.",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "tool_choice": "none",
+            "max_output_tokens": 16,
+            "stream": false,
+            "store": false
+        });
+        let responses_custom_tools_payload = json!({
+            "model": self.model,
+            "input": "Reply with OK.",
+            "tools": [{
+                "type": "custom",
+                "name": "compatibility_probe",
+                "description": "Validates Responses freeform-tool support without invoking a tool."
+            }],
+            "tool_choice": "none",
+            "max_output_tokens": 16,
+            "stream": false,
+            "store": false
+        });
+        let responses_apply_patch_payload = json!({
+            "model": self.model,
+            "input": "Reply with OK.",
+            "tools": [{"type": "apply_patch"}],
+            "tool_choice": "none",
+            "max_output_tokens": 16,
+            "stream": false,
+            "store": false
+        });
+        let (
+            chat,
+            responses,
+            chat_function_tools,
+            responses_native_tools,
+            responses_function_tools,
+            responses_custom_tools,
+            responses_apply_patch,
+        ) = tokio::join!(
             self.probe_openai_endpoint("/chat/completions", chat_payload, false),
             self.probe_openai_endpoint("/responses", responses_payload, false),
             self.probe_openai_endpoint("/chat/completions", chat_tools_payload, true),
             self.probe_openai_endpoint("/responses", responses_native_tools_payload, true),
+            self.probe_openai_endpoint("/responses", responses_function_tools_payload, true),
+            self.probe_openai_endpoint("/responses", responses_custom_tools_payload, true),
+            self.probe_openai_endpoint("/responses", responses_apply_patch_payload, true),
         );
 
         let developer = if chat.support == ProviderFeatureSupport::Supported {
@@ -659,11 +887,13 @@ impl OpenAiCompatibleProvider {
         let chat_agent_compatible = chat.support == ProviderFeatureSupport::Supported
             && chat_function_tools.support != ProviderFeatureSupport::Unsupported;
         let responses_agent_compatible = responses.support == ProviderFeatureSupport::Supported
+            && responses_function_tools.support != ProviderFeatureSupport::Unsupported
             && responses_native_tools.support != ProviderFeatureSupport::Unsupported;
         let selected_protocol =
             if chat_agent_compatible && developer.support == ProviderFeatureSupport::Supported {
                 OpenAiProtocol::ChatCompletions
             } else if responses.support == ProviderFeatureSupport::Supported
+                && responses_function_tools.support == ProviderFeatureSupport::Supported
                 && responses_native_tools.support == ProviderFeatureSupport::Supported
             {
                 OpenAiProtocol::Responses
@@ -697,6 +927,15 @@ impl OpenAiCompatibleProvider {
         if let Some(detail) = responses_native_tools.detail {
             notes.push(format!("Responses native tools: {detail}"));
         }
+        if let Some(detail) = responses_function_tools.detail {
+            notes.push(format!("Responses function tools: {detail}"));
+        }
+        if let Some(detail) = responses_custom_tools.detail {
+            notes.push(format!("Responses custom tools: {detail}"));
+        }
+        if let Some(detail) = responses_apply_patch.detail {
+            notes.push(format!("Responses apply_patch: {detail}"));
+        }
         if let Some(detail) = developer.detail {
             notes.push(format!("developer messages: {detail}"));
         }
@@ -717,6 +956,9 @@ impl OpenAiCompatibleProvider {
             chat_function_tools: chat_function_tools.support,
             responses: responses.support,
             responses_native_tools: responses_native_tools.support,
+            responses_function_tools: responses_function_tools.support,
+            responses_custom_tools: responses_custom_tools.support,
+            responses_apply_patch: responses_apply_patch.support,
             developer_messages: developer.support,
             message_compatibility,
             checked_at: Utc::now(),
@@ -1045,6 +1287,7 @@ pub struct OpenAiResponsesProvider {
     compaction_threshold_tokens: Option<u32>,
     native_web_search: bool,
     supports_vision: bool,
+    tool_protocol: ProviderToolProtocolCapabilities,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1066,6 +1309,40 @@ impl ResponsesRequestError {
             || body.contains("previous response")
             || body.contains(&response_id.to_ascii_lowercase())
     }
+
+    fn unsupported_tool_representation(&self) -> bool {
+        if !matches!(self.status.as_u16(), 400 | 404 | 422) {
+            return false;
+        }
+        let body = self.body.to_ascii_lowercase();
+        [
+            "unsupported",
+            "not supported",
+            "unknown tool",
+            "unknown field",
+            "unknown parameter",
+            "unrecognized",
+            "invalid tool",
+            "invalid value",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+    }
+}
+
+fn responses_request_uses_enhanced_tools(prepared: &PreparedProviderRequest) -> bool {
+    prepared
+        .body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                matches!(
+                    tool.get("type").and_then(Value::as_str),
+                    Some("custom") | Some("apply_patch")
+                )
+            })
+        })
 }
 
 impl OpenAiResponsesProvider {
@@ -1089,6 +1366,10 @@ impl OpenAiResponsesProvider {
             compaction_threshold_tokens: None,
             native_web_search: true,
             supports_vision: true,
+            tool_protocol: ProviderToolProtocolCapabilities {
+                function_tools: ProviderFeatureSupport::Supported,
+                ..ProviderToolProtocolCapabilities::default()
+            },
         }
     }
 
@@ -1109,6 +1390,7 @@ impl OpenAiResponsesProvider {
         provider.prompt_cache_policy = settings.prompt_cache_policy;
         provider.compaction_threshold_tokens = settings.responses_compaction_threshold_tokens;
         provider.supports_vision = settings.supports_vision;
+        provider.tool_protocol = settings.capabilities().tool_protocol;
         Some(provider)
     }
 
@@ -1180,7 +1462,17 @@ impl OpenAiResponsesProvider {
         if self.native_web_search {
             tools.push(json!({ "type": "web_search" }));
         }
-        tools.extend(responses_tools(&request.tool_candidates));
+        let tool_protocol = if openai_enhanced_tools_unsupported_cached(&self.base_url, &self.model)
+        {
+            ProviderToolProtocolCapabilities {
+                function_tools: ProviderFeatureSupport::Supported,
+                assistant_phase: self.tool_protocol.assistant_phase,
+                ..ProviderToolProtocolCapabilities::default()
+            }
+        } else {
+            self.tool_protocol
+        };
+        tools.extend(responses_tools(&request.tool_candidates, tool_protocol));
         if !tools.is_empty() {
             payload["tools"] = json!(tools);
             payload["tool_choice"] = json!("auto");
@@ -1923,6 +2215,8 @@ struct ResponsesStreamAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, StreamingToolCall>,
     provider_items: BTreeMap<usize, Value>,
+    output_phases: BTreeMap<usize, AssistantOutputPhase>,
+    output_item_indices: HashMap<String, usize>,
     usage: Option<ModelUsage>,
     response_id: Option<String>,
     completed_response: Option<Value>,
@@ -1958,10 +2252,28 @@ impl ResponsesStreamAccumulator {
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    self.text.push_str(delta);
-                    on_delta(ModelStreamDelta::Text {
-                        text: delta.to_string(),
-                    })?;
+                    let index = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .map(|index| index as usize)
+                        .or_else(|| {
+                            event
+                                .get("item_id")
+                                .and_then(Value::as_str)
+                                .and_then(|item_id| self.output_item_indices.get(item_id).copied())
+                        })
+                        .unwrap_or(0);
+                    let phase = event
+                        .get("phase")
+                        .and_then(Value::as_str)
+                        .and_then(AssistantOutputPhase::from_wire)
+                        .or_else(|| self.output_phases.get(&index).copied());
+                    if phase != Some(AssistantOutputPhase::Commentary) {
+                        self.text.push_str(delta);
+                        on_delta(ModelStreamDelta::Text {
+                            text: delta.to_string(),
+                        })?;
+                    }
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
@@ -1979,6 +2291,18 @@ impl ResponsesStreamAccumulator {
                     as usize;
                 if let Some(item) = event.get("item") {
                     self.provider_items.insert(index, item.clone());
+                    if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                        self.output_item_indices.insert(item_id.to_string(), index);
+                    }
+                    if item.get("type").and_then(Value::as_str) == Some("message") {
+                        if let Some(phase) = item
+                            .get("phase")
+                            .and_then(Value::as_str)
+                            .and_then(AssistantOutputPhase::from_wire)
+                        {
+                            self.output_phases.insert(index, phase);
+                        }
+                    }
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let call = self.tool_calls.entry(index).or_default();
                         if let Some(id) = item
@@ -1995,6 +2319,47 @@ impl ResponsesStreamAccumulator {
                             if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
                                 call.arguments = arguments.to_string();
                             }
+                        }
+                    } else if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+                        let call = self.tool_calls.entry(index).or_default();
+                        if let Some(id) = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            call.id = id.to_string();
+                        }
+                        if let Some(name) = item.get("name").and_then(Value::as_str) {
+                            call.name = name.to_string();
+                        }
+                        if event_type == "response.output_item.done" {
+                            let input = item
+                                .get("input")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            call.arguments = if call.name == "apply_patch" {
+                                json!({ "patch": input }).to_string()
+                            } else {
+                                serde_json::from_str::<Value>(input)
+                                    .unwrap_or_else(|_| json!({ "input": input }))
+                                    .to_string()
+                            };
+                        }
+                    } else if item.get("type").and_then(Value::as_str) == Some("apply_patch_call") {
+                        if event_type == "response.output_item.done" {
+                            let parsed = parse_responses_apply_patch_call(item, index)?;
+                            self.tool_calls.insert(
+                                index,
+                                StreamingToolCall {
+                                    id: parsed.id,
+                                    name: parsed.name,
+                                    arguments: parsed.arguments.to_string(),
+                                },
+                            );
+                        } else {
+                            let call = self.tool_calls.entry(index).or_default();
+                            call.id = responses_call_id(item, index);
+                            call.name = "apply_patch".to_string();
                         }
                     }
                 }
@@ -2044,7 +2409,15 @@ impl ResponsesStreamAccumulator {
     fn finish(mut self) -> anyhow::Result<ModelResponse> {
         if let Some(completed) = self.completed_response.as_ref() {
             let completed_text = extract_response_text(completed);
-            if !completed_text.is_empty() {
+            let completed_has_messages = completed
+                .get("output")
+                .and_then(Value::as_array)
+                .is_some_and(|output| {
+                    output
+                        .iter()
+                        .any(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+                });
+            if !completed_text.is_empty() || completed_has_messages {
                 self.text = completed_text;
             }
             let completed_calls = extract_provider_tool_calls(completed)?;
@@ -2214,6 +2587,8 @@ fn model_prefers_compatibility_messages(model: &str) -> bool {
 }
 
 static OPENAI_MESSAGE_COMPATIBILITY_CACHE: OnceLock<StdRwLock<HashSet<String>>> = OnceLock::new();
+static OPENAI_ENHANCED_TOOLS_UNSUPPORTED_CACHE: OnceLock<StdRwLock<HashSet<String>>> =
+    OnceLock::new();
 
 fn openai_compatibility_cache_key(base_url: &str, model: &str) -> String {
     format!(
@@ -2240,6 +2615,21 @@ fn remember_openai_message_compatibility(base_url: &str, model: &str, required: 
         cache.insert(key);
     } else {
         cache.remove(&key);
+    }
+}
+
+fn openai_enhanced_tools_unsupported_cached(base_url: &str, model: &str) -> bool {
+    OPENAI_ENHANCED_TOOLS_UNSUPPORTED_CACHE
+        .get()
+        .and_then(|cache| cache.read().ok())
+        .is_some_and(|cache| cache.contains(&openai_compatibility_cache_key(base_url, model)))
+}
+
+fn remember_openai_enhanced_tools_unsupported(base_url: &str, model: &str) {
+    let cache =
+        OPENAI_ENHANCED_TOOLS_UNSUPPORTED_CACHE.get_or_init(|| StdRwLock::new(HashSet::new()));
+    if let Ok(mut cache) = cache.write() {
+        cache.insert(openai_compatibility_cache_key(base_url, model));
     }
 }
 
@@ -2734,17 +3124,80 @@ fn openai_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
         .collect()
 }
 
-fn responses_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
+fn responses_tool_definitions(
+    candidates: &[ProviderToolCandidate],
+    capabilities: ProviderToolProtocolCapabilities,
+) -> Vec<ProviderToolDefinition> {
     candidates
         .iter()
         .map(|candidate| {
-            json!({
+            let is_apply_patch = candidate.name == "apply_patch";
+            // The local executor advertises native operation support through
+            // its schema. This second gate prevents an endpoint capability
+            // from selecting a wire format the Harness cannot yet execute.
+            let accepts_native_operation = candidate
+                .input_schema
+                .pointer("/properties/operation")
+                .is_some();
+            let accepts_freeform_patch = candidate
+                .input_schema
+                .pointer("/properties/patch/type")
+                .and_then(Value::as_str)
+                == Some("string");
+
+            if is_apply_patch
+                && accepts_native_operation
+                && capabilities.hosted_apply_patch == ProviderFeatureSupport::Supported
+            {
+                ProviderToolDefinition::Hosted {
+                    kind: "apply_patch".to_string(),
+                }
+            } else if is_apply_patch
+                && accepts_freeform_patch
+                && capabilities.freeform_tools == ProviderFeatureSupport::Supported
+            {
+                ProviderToolDefinition::Freeform {
+                    name: candidate.name.clone(),
+                    description: format!(
+                        "{} Return only the raw unified diff accepted by this tool; do not wrap it in JSON or Markdown.",
+                        candidate.description
+                    ),
+                }
+            } else {
+                ProviderToolDefinition::Function {
+                    name: candidate.name.clone(),
+                    description: candidate.description.clone(),
+                    input_schema: candidate.input_schema.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+fn responses_tools(
+    candidates: &[ProviderToolCandidate],
+    capabilities: ProviderToolProtocolCapabilities,
+) -> Vec<Value> {
+    responses_tool_definitions(candidates, capabilities)
+        .into_iter()
+        .map(|definition| match definition {
+            ProviderToolDefinition::Function {
+                name,
+                description,
+                input_schema,
+            } => json!({
                 "type": "function",
-                "name": &candidate.name,
-                "description": &candidate.description,
-                "parameters": &candidate.input_schema,
+                "name": name,
+                "description": description,
+                "parameters": input_schema,
                 "strict": false,
-            })
+            }),
+            ProviderToolDefinition::Freeform { name, description } => json!({
+                "type": "custom",
+                "name": name,
+                "description": description,
+            }),
+            ProviderToolDefinition::Hosted { kind } => json!({ "type": kind }),
         })
         .collect()
 }
@@ -2808,16 +3261,56 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
         input.extend(request.previous_response_items.iter().cloned());
     }
     input.extend(request.tool_results.iter().map(|result| {
-        json!({
-            "type": "function_call_output",
-            "call_id": &result.call_id,
-            "output": provider_tool_result_content(result),
-        })
+        let output = provider_tool_result_content(result);
+        match responses_tool_call_kind(&request.previous_response_items, &result.call_id) {
+            Some(ResponsesToolCallKind::ApplyPatch) => json!({
+                "type": "apply_patch_call_output",
+                "call_id": &result.call_id,
+                "status": if result.is_error { "failed" } else { "completed" },
+                "output": output,
+            }),
+            Some(ResponsesToolCallKind::Custom) => json!({
+                "type": "custom_tool_call_output",
+                "call_id": &result.call_id,
+                "output": output,
+            }),
+            Some(ResponsesToolCallKind::Function) | None => json!({
+                "type": "function_call_output",
+                "call_id": &result.call_id,
+                "output": output,
+            }),
+        }
     }));
     if let Some(companion) = responses_tool_image_companion(&request.tool_results) {
         input.push(companion);
     }
     input
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesToolCallKind {
+    Function,
+    Custom,
+    ApplyPatch,
+}
+
+fn responses_tool_call_kind(items: &[Value], call_id: &str) -> Option<ResponsesToolCallKind> {
+    items.iter().find_map(|item| {
+        let matches_call = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            == Some(call_id);
+        if !matches_call {
+            return None;
+        }
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => Some(ResponsesToolCallKind::Function),
+            Some("custom_tool_call") => Some(ResponsesToolCallKind::Custom),
+            Some("apply_patch_call") => Some(ResponsesToolCallKind::ApplyPatch),
+            _ => None,
+        }
+    })
 }
 
 fn add_responses_prompt_cache_breakpoint(input: &mut Value, request: &ModelRequest) {
@@ -3295,12 +3788,29 @@ fn extract_response_text(body: &Value) -> String {
         }
     }
 
-    let responses_text = body
+    let response_messages = body
         .get("output")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .collect::<Vec<_>>();
+    let has_final_phase = response_messages
+        .iter()
+        .any(|item| item.get("phase").and_then(Value::as_str) == Some("final_answer"));
+    let responses_text = response_messages
+        .iter()
+        .copied()
+        .filter(|item| {
+            let phase = item.get("phase").and_then(Value::as_str);
+            if has_final_phase {
+                phase == Some("final_answer")
+            } else {
+                // Legacy providers omit phase. Commentary is never promoted
+                // to the final answer even when no final item has arrived.
+                phase != Some("commentary")
+            }
+        })
         .flat_map(|item| {
             item.get("content")
                 .and_then(Value::as_array)
@@ -3311,7 +3821,7 @@ fn extract_response_text(body: &Value) -> String {
         .filter_map(render_responses_output_text_part)
         .collect::<Vec<_>>()
         .join("");
-    if !responses_text.is_empty() {
+    if !responses_text.is_empty() || !response_messages.is_empty() {
         return responses_text;
     }
 
@@ -3467,8 +3977,17 @@ fn extract_provider_tool_calls(body: &Value) -> anyhow::Result<Vec<ProviderToolC
 
     if let Some(output) = body.get("output").and_then(Value::as_array) {
         for item in output {
-            if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                calls.push(parse_responses_function_call(item, calls.len())?);
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    calls.push(parse_responses_function_call(item, calls.len())?)
+                }
+                Some("custom_tool_call") => {
+                    calls.push(parse_responses_custom_tool_call(item, calls.len())?)
+                }
+                Some("apply_patch_call") => {
+                    calls.push(parse_responses_apply_patch_call(item, calls.len())?)
+                }
+                _ => {}
             }
         }
     }
@@ -3526,6 +4045,70 @@ fn parse_responses_function_call(value: &Value, index: usize) -> anyhow::Result<
         id,
         name: name.to_string(),
         arguments: parse_tool_arguments(value.get("arguments"))?,
+    })
+}
+
+fn responses_call_id(value: &Value, index: usize) -> String {
+    value
+        .get("call_id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{index}"))
+}
+
+fn parse_responses_custom_tool_call(
+    value: &Value,
+    index: usize,
+) -> anyhow::Result<ProviderToolCall> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("custom_tool_call missing name: {value}"))?;
+    let input = value
+        .get("input")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let arguments = if name == "apply_patch" {
+        json!({ "patch": input })
+    } else {
+        serde_json::from_str(input).unwrap_or_else(|_| json!({ "input": input }))
+    };
+    Ok(ProviderToolCall {
+        id: responses_call_id(value, index),
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn parse_responses_apply_patch_call(
+    value: &Value,
+    index: usize,
+) -> anyhow::Result<ProviderToolCall> {
+    let operation = value
+        .get("operation")
+        .filter(|operation| operation.is_object())
+        .ok_or_else(|| anyhow::anyhow!("apply_patch_call missing operation: {value}"))?;
+    let operation_type = operation
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("apply_patch_call operation missing type: {value}"))?;
+    if !matches!(
+        operation_type,
+        "create_file" | "update_file" | "delete_file"
+    ) {
+        anyhow::bail!("unsupported apply_patch operation type: {operation_type}");
+    }
+    if operation.get("path").and_then(Value::as_str).is_none() {
+        anyhow::bail!("apply_patch_call operation missing path: {value}");
+    }
+    if operation_type != "delete_file" && operation.get("diff").and_then(Value::as_str).is_none() {
+        anyhow::bail!("apply_patch_call operation missing diff: {value}");
+    }
+    Ok(ProviderToolCall {
+        id: responses_call_id(value, index),
+        name: "apply_patch".to_string(),
+        arguments: json!({ "operation": operation }),
     })
 }
 
@@ -3698,10 +4281,37 @@ impl ModelProvider for OpenAiResponsesProvider {
         on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
         let previous_response_id = prepared.logical_request.previous_response_id.clone();
+        let enhanced_tools = responses_request_uses_enhanced_tools(&prepared);
         match self
             .execute_responses_request(prepared.clone(), 1, on_delta, on_transport)
             .await
         {
+            Err(error)
+                if enhanced_tools
+                    && error
+                        .downcast_ref::<ResponsesRequestError>()
+                        .is_some_and(ResponsesRequestError::unsupported_tool_representation) =>
+            {
+                remember_openai_enhanced_tools_unsupported(&self.base_url, &self.model);
+                let mut portable_provider = self.clone();
+                portable_provider.tool_protocol = ProviderToolProtocolCapabilities {
+                    function_tools: ProviderFeatureSupport::Supported,
+                    assistant_phase: self.tool_protocol.assistant_phase,
+                    ..ProviderToolProtocolCapabilities::default()
+                };
+                let replay = portable_provider
+                    .prepare_responses_request(prepared.request_id, prepared.logical_request)?;
+                on_transport(ProviderTransportEvent::Retry {
+                    attempt: 2,
+                    reason:
+                        "enhanced tool representation unsupported; retrying portable function tools"
+                            .to_string(),
+                    body: replay.observation_body.clone(),
+                })?;
+                portable_provider
+                    .execute_responses_request(replay, 2, on_delta, on_transport)
+                    .await
+            }
             Err(error)
                 if previous_response_id.as_deref().is_some_and(|response_id| {
                     error
@@ -6159,7 +6769,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..5 {
+            for _ in 0..8 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut socket).await;
                 let is_responses = request.starts_with("POST /v1/responses ");
@@ -6230,7 +6840,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..5 {
+            for _ in 0..8 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut socket).await;
                 let has_developer = request.contains(r#""role":"developer""#);
@@ -6286,7 +6896,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..5 {
+            for _ in 0..8 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut socket).await;
                 let is_responses = request.starts_with("POST /v1/responses ");
@@ -6633,6 +7243,174 @@ mod tests {
             .any(|event| matches!(event, ProviderTransportEvent::Retry { attempt: 2, .. })));
     }
 
+    #[test]
+    fn responses_tool_representation_is_capability_driven_with_function_fallback() {
+        let portable = ProviderToolCandidate {
+            name: "apply_patch".to_string(),
+            description: "Apply a patch.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "patch": { "type": "string" } },
+                "required": ["patch"]
+            }),
+        };
+
+        let fallback = responses_tools(
+            std::slice::from_ref(&portable),
+            ProviderToolProtocolCapabilities::default(),
+        );
+        assert_eq!(fallback[0]["type"], "function");
+
+        let freeform = responses_tools(
+            std::slice::from_ref(&portable),
+            ProviderToolProtocolCapabilities {
+                freeform_tools: ProviderFeatureSupport::Supported,
+                ..ProviderToolProtocolCapabilities::default()
+            },
+        );
+        assert_eq!(freeform[0]["type"], "custom");
+
+        let native_candidate = ProviderToolCandidate {
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string" },
+                    "operation": { "type": "object" }
+                }
+            }),
+            ..portable
+        };
+        let hosted = responses_tools(
+            &[native_candidate],
+            ProviderToolProtocolCapabilities {
+                hosted_apply_patch: ProviderFeatureSupport::Supported,
+                freeform_tools: ProviderFeatureSupport::Supported,
+                ..ProviderToolProtocolCapabilities::default()
+            },
+        );
+        assert_eq!(hosted, vec![json!({ "type": "apply_patch" })]);
+    }
+
+    #[test]
+    fn responses_runtime_capability_rejection_is_cached_per_endpoint_and_model() {
+        let mut provider = OpenAiResponsesProvider::new(
+            "https://runtime-fallback.example/v1",
+            "secret",
+            "opaque-model",
+        );
+        provider.tool_protocol.freeform_tools = ProviderFeatureSupport::Supported;
+        remember_openai_enhanced_tools_unsupported(&provider.base_url, &provider.model);
+
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "apply_patch".to_string(),
+            description: "Apply a patch.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "patch": { "type": "string" } }
+            }),
+        }];
+        let prepared = provider
+            .prepare_responses_request(Uuid::nil(), request)
+            .unwrap();
+        let apply_patch = prepared.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.get("name") == Some(&json!("apply_patch")))
+            .expect("portable apply_patch function");
+        assert_eq!(apply_patch["type"], "function");
+    }
+
+    #[test]
+    fn responses_native_patch_call_and_output_preserve_wire_protocol() {
+        let item = json!({
+            "type": "apply_patch_call",
+            "id": "apc_1",
+            "call_id": "call_patch",
+            "status": "completed",
+            "operation": {
+                "type": "update_file",
+                "path": "src/lib.rs",
+                "diff": "@@\n-old\n+new"
+            }
+        });
+        let calls = extract_provider_tool_calls(&json!({ "output": [item.clone()] })).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "apply_patch");
+        assert_eq!(calls[0].arguments["operation"]["type"], "update_file");
+        assert_eq!(calls[0].arguments["operation"]["path"], "src/lib.rs");
+
+        let mut request = model_request();
+        request.previous_response_items = vec![item];
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "call_patch".to_string(),
+            name: "apply_patch".to_string(),
+            output: "Done!".to_string(),
+            content: Vec::new(),
+            is_error: false,
+            metadata: json!({}),
+        }];
+        let input = responses_input(&request);
+        let output = input
+            .iter()
+            .find(|item| item.get("type") == Some(&json!("apply_patch_call_output")))
+            .expect("native patch output");
+        assert_eq!(output["call_id"], "call_patch");
+        assert_eq!(output["status"], "completed");
+    }
+
+    #[test]
+    fn responses_phase_keeps_commentary_out_of_final_text_and_replay_items() {
+        let commentary = json!({
+            "type": "message",
+            "id": "msg_commentary",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "I will inspect it."}]
+        });
+        let final_answer = json!({
+            "type": "message",
+            "id": "msg_final",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "Implemented."}]
+        });
+        let completed = json!({
+            "id": "resp_phase",
+            "status": "completed",
+            "output": [commentary.clone(), final_answer.clone()]
+        });
+        assert_eq!(extract_response_text(&completed), "Implemented.");
+
+        let mut accumulator = ResponsesStreamAccumulator::default();
+        let mut deltas = Vec::new();
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":commentary}),
+            json!({"type":"response.output_text.delta","output_index":0,"delta":"I will inspect it."}),
+            json!({"type":"response.output_item.added","output_index":1,"item":final_answer}),
+            json!({"type":"response.output_text.delta","output_index":1,"delta":"Implemented."}),
+            json!({"type":"response.completed","response":completed}),
+        ] {
+            accumulator
+                .apply(&event, &mut |delta| {
+                    deltas.push(delta);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let response = accumulator.finish().unwrap();
+        assert_eq!(response.text, "Implemented.");
+        assert_eq!(response.provider_items[0]["phase"], "commentary");
+        assert_eq!(response.provider_items[1]["phase"], "final_answer");
+        assert_eq!(
+            deltas,
+            vec![ModelStreamDelta::Text {
+                text: "Implemented.".to_string()
+            }]
+        );
+    }
+
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 1024];
@@ -6662,5 +7440,39 @@ mod tests {
         haystack
             .windows(needle.len())
             .position(|window| window == needle)
+    }
+
+    #[test]
+    fn built_in_provider_driver_registry_is_complete_and_host_trusted() {
+        let registry = ProviderDriverRegistry::built_in();
+        let descriptors = registry.descriptors();
+        assert_eq!(descriptors.len(), 5);
+        for kind in [
+            ProviderKind::Mock,
+            ProviderKind::OpenAiCompatible,
+            ProviderKind::OpenAiResponses,
+            ProviderKind::Anthropic,
+            ProviderKind::CodexAppServer,
+        ] {
+            let descriptor = registry.descriptor(&kind).expect("registered driver");
+            assert_eq!(descriptor.id, kind.as_str());
+            assert_eq!(descriptor.kind, kind);
+            assert_eq!(descriptor.trust, ProviderDriverTrust::BuiltIn);
+        }
+    }
+
+    #[test]
+    fn provider_driver_registry_preserves_unconfigured_fallback_semantics() {
+        let mut settings = ProviderSettings::default();
+        settings.kind = ProviderKind::Mock;
+        assert!(ProviderDriverRegistry::built_in()
+            .create(&settings)
+            .is_some());
+
+        let mut unconfigured = settings;
+        unconfigured.kind = ProviderKind::OpenAiCompatible;
+        unconfigured.api_key_configured = false;
+        assert!(configured_provider_from_settings(&unconfigured).is_none());
+        let _fallback = provider_from_settings(&unconfigured);
     }
 }

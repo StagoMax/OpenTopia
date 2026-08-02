@@ -159,13 +159,25 @@ impl DesktopBrowserRuntime {
     async fn rejected_error(&self, response: Response) -> BrowserError {
         let status = response.status().as_u16();
         let limit = self.config.max_response_bytes.min(MAX_ERROR_RESPONSE_BYTES);
-        let message = match read_response_limited(response, limit).await {
-            Ok(body) => sanitize_error_message(&body, &self.token),
+        let body = match read_response_limited(response, limit).await {
+            Ok(body) => body,
             Err(BrowserError::BrokerResponseTooLarge { .. }) => {
-                "broker error response exceeded the configured limit".to_string()
+                return BrowserError::BrokerRejected {
+                    status,
+                    message: "broker error response exceeded the configured limit".to_string(),
+                };
             }
-            Err(_) => "broker returned an unreadable error response".to_string(),
+            Err(_) => {
+                return BrowserError::BrokerRejected {
+                    status,
+                    message: "broker returned an unreadable error response".to_string(),
+                };
+            }
         };
+        if let Some(reason) = stale_observation_reason(&body, &self.token) {
+            return BrowserError::StaleObservation { reason };
+        }
+        let message = sanitize_error_message(&body, &self.token);
         BrowserError::BrokerRejected { status, message }
     }
 
@@ -542,6 +554,15 @@ fn sanitize_error_message(body: &[u8], token: &str) -> String {
     }
 }
 
+fn stale_observation_reason(body: &[u8], token: &str) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let code = value.pointer("/error/code").and_then(Value::as_str)?;
+    if code != "stale_observation" {
+        return None;
+    }
+    Some(sanitize_error_message(body, token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +745,29 @@ mod tests {
                 if message.contains("[redacted]") && !message.contains(token)
         ));
         assert!(!error.to_string().contains(token));
+    }
+
+    #[tokio::test]
+    async fn stale_broker_observations_keep_the_reobserve_signal() {
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "code": "stale_observation",
+                "message": "The observed element changed or moved."
+            }
+        }))
+        .unwrap();
+        let (base_url, _) = spawn_broker(409, body, Duration::ZERO).await;
+        let runtime = DesktopBrowserRuntime::new(&base_url, "test-token").unwrap();
+
+        let error = runtime
+            .observe(BrowserSessionId::new(), BrowserObserveOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BrowserError::StaleObservation { ref reason }
+                if reason == "The observed element changed or moved."
+        ));
     }
 
     #[tokio::test]

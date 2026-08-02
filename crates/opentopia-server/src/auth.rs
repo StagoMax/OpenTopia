@@ -23,6 +23,14 @@ pub(crate) struct ApiAuth {
 }
 
 impl ApiAuth {
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            token: "0123456789abcdef0123456789abcdef".to_string(),
+            allowed_origins: vec!["null".to_string()],
+        }
+    }
+
     pub(crate) fn from_env() -> anyhow::Result<Self> {
         let token = env::var(API_TOKEN_ENV).with_context(|| {
             format!("{API_TOKEN_ENV} is required; refusing to start without API authentication")
@@ -178,10 +186,10 @@ mod tests {
     use super::*;
 
     fn auth() -> ApiAuth {
-        ApiAuth {
-            token: "0123456789abcdef0123456789abcdef".to_string(),
-            allowed_origins: vec!["null".to_string(), "http://127.0.0.1:5173".to_string()],
-        }
+        let mut auth = ApiAuth::for_tests();
+        auth.allowed_origins
+            .push("http://127.0.0.1:5173".to_string());
+        auth
     }
 
     #[test]

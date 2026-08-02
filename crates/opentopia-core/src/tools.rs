@@ -1,5 +1,8 @@
 use crate::agent_profiles::AgentProfileRegistry;
-use crate::background::{BackgroundProcessRegistry, BackgroundScope, BackgroundSpawnRequest};
+use crate::background::{
+    BackgroundProcessRegistry, BackgroundScope, BackgroundSessionSpawnRequest,
+    BackgroundSpawnRequest,
+};
 use crate::browser::{
     BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
     BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
@@ -12,9 +15,10 @@ use crate::computer::{
     ObserveOptions,
 };
 use crate::execution::{
-    ExecRequest, ExecutionContext, ExecutionEnvironment, FileReadRequest, FileWriteRequest,
-    LocalExecutionEnvironment,
+    ExecRequest, ExecutionContext, ExecutionEnvironment, FileDeleteRequest, FileReadRequest,
+    FileWriteRequest, LocalExecutionEnvironment,
 };
+use crate::git_workflow::isolated_subagent_worktree_request;
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
@@ -24,7 +28,7 @@ use crate::model::{
 use crate::model_context::CompiledModelContext;
 use crate::policy::{ApprovalRequired, PolicyDecision, PolicyEngine, ToolPermissionDescriptor};
 use crate::provider::{ModelConversationMessage, ModelConversationRole};
-use crate::sandbox::LocalSandboxConfig;
+use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::skill_authoring::{
     create_skill_from_draft, preview_skill_draft, SkillDraft, SkillResourceDraft,
 };
@@ -36,7 +40,8 @@ use crate::spreadsheet::{
 };
 use crate::store::SessionStore;
 use crate::subagents::{
-    SpawnSubagentRequest, SubagentRun, SubagentRunStatus, SubagentScheduler, SubagentScope,
+    SpawnSubagentRequest, SubagentExecutionContract, SubagentRun, SubagentRunStatus,
+    SubagentScheduler, SubagentScope, SubagentWorkspaceAssignment, SubagentWorkspaceMode,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -169,7 +174,59 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
+    /// Scheduling facts, separate from the model-facing schema. AgentCore may use
+    /// these to run independent observations concurrently without guessing from
+    /// tool names. The default is intentionally conservative for plugins/MCP.
+    fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::conservative()
+    }
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSideEffect {
+    None,
+    WorkspaceWrite,
+    Process,
+    SessionMutation,
+    ControlPlane,
+    External,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionPolicy {
+    pub read_only: bool,
+    pub idempotent: bool,
+    pub parallel_safe: bool,
+    pub side_effect: ToolSideEffect,
+    /// Logical resources touched by this call. Equal keys conflict; `*` is a
+    /// global barrier. Paths remain logical and are not trusted for authorization.
+    pub resource_keys: Vec<String>,
+}
+
+impl ToolExecutionPolicy {
+    pub fn conservative() -> Self {
+        Self {
+            read_only: false,
+            idempotent: false,
+            parallel_safe: false,
+            side_effect: ToolSideEffect::Unknown,
+            resource_keys: vec!["*".to_string()],
+        }
+    }
+
+    pub fn read_only(resource_keys: Vec<String>) -> Self {
+        Self {
+            read_only: true,
+            idempotent: true,
+            parallel_safe: true,
+            side_effect: ToolSideEffect::None,
+            resource_keys,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -196,6 +253,7 @@ impl ToolRegistry {
         let mut tools: BTreeMap<String, Arc<dyn Tool>> = BTreeMap::new();
         tools.insert("list_files".to_string(), Arc::new(ListFilesTool));
         tools.insert("read_file".to_string(), Arc::new(ReadFileTool));
+        tools.insert("read_files".to_string(), Arc::new(ReadFilesTool));
         tools.insert("write_file".to_string(), Arc::new(WriteFileTool));
         tools.insert("search".to_string(), Arc::new(SearchTool));
         tools.insert("shell".to_string(), Arc::new(ShellTool));
@@ -279,6 +337,10 @@ impl ToolRegistry {
 
     pub fn source(&self, name: &str) -> Option<ToolSource> {
         self.sources.get(name).cloned()
+    }
+
+    pub fn execution_policy(&self, name: &str, call: &ToolCall) -> Option<ToolExecutionPolicy> {
+        self.tools.get(name).map(|tool| tool.execution_policy(call))
     }
 }
 
@@ -915,7 +977,7 @@ impl Tool for CompleteTaskTool {
     }
 
     fn description(&self) -> &str {
-        "Finish the current user task after its requested scope has been verified. Provide a concise summary, concrete verification evidence, and any deliberately deferred work. This is the final tool call for the turn."
+        "Finish the current user task after its requested scope has been verified. The plan records commitments and evidence, not a mandatory reasoning path. Provide a concise summary, concrete verification evidence, and any deliberately deferred work. This is the final tool call for the turn."
     }
 
     fn schema(&self) -> Value {
@@ -1079,7 +1141,7 @@ impl Tool for SetPlanTool {
     }
 
     fn description(&self) -> &str {
-        "Atomically create or replace the complete dependency-aware plan for the server-assigned goal. Every step starts pending. Use this after read-only investigation; use update_plan while executing the goal."
+        "Atomically create or replace the dependency-aware external memory for the server-assigned goal. The plan records commitments, progress, and completion evidence; it does not prescribe a fixed execution schedule beyond explicit dependencies. Every step starts pending and may be revised as evidence changes."
     }
 
     fn schema(&self) -> Value {
@@ -1282,7 +1344,7 @@ impl Tool for UpdatePlanTool {
     }
 
     fn description(&self) -> &str {
-        "Mutate the current task plan one step at a time with append_step, update_step, or remove_step. Always send the current goal_id and expected_revision; successful changes increment the revision. Keep the reported next_runnable_step in progress until it is resolved. Deferred, blocked, and cancelled steps require a status_reason. Removal requires a concrete change_reason and is rejected while another step depends on the target."
+        "Apply one atomic append_step, update_step, or remove_step mutation to the task's external progress memory. Always send the current goal_id and expected_revision; successful changes increment the revision. next_runnable_step is an advisory dependency-aware candidate, not a mandatory scheduler decision. Deferred, blocked, and cancelled steps require a status_reason. Removal requires a concrete change_reason and is rejected while another step depends on the target."
     }
 
     fn schema(&self) -> Value {
@@ -1292,7 +1354,7 @@ impl Tool for UpdatePlanTool {
                 "operation": {
                     "type": "string",
                     "enum": ["append_step", "update_step", "remove_step"],
-                    "description": "The single incremental mutation to apply."
+                    "description": "The single atomic plan-memory mutation to apply."
                 },
                 "goal_id": {
                     "type": "string",
@@ -1558,7 +1620,7 @@ impl Tool for UpdatePlanTool {
                 next_runnable_step.as_ref().map_or_else(
                     || " No runnable step remains.".to_string(),
                     |step| format!(
-                        " Next runnable step: {} - {}. Mark it in_progress before execution.",
+                        " Advisory runnable candidate: {} - {}.",
                         step.id, step.title
                     )
                 )
@@ -2127,7 +2189,7 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Use the shared local browser. Observe before every click or type, then use the returned observationId and nodeRef. The runtime rejects stale observations. Navigate and follow ordinary links normally. When a page requires a login, verification, upload, payment, publication, or irreversible submission, stop controlling the page and tell the user to complete it in the visible browser. After the user says to continue, observe the page again before interacting."
+        "Use the shared local browser. Observe before every click or type, then use the returned observationId and nodeRef. The runtime rejects stale observations; if it reports stale_observation, discard the old node reference and call observe again before retrying. Navigate and follow ordinary links normally. When a page requires a login, verification, upload, payment, publication, or irreversible submission, stop controlling the page and tell the user to complete it in the visible browser. After the user says to continue, observe the page again before interacting."
     }
 
     fn schema(&self) -> Value {
@@ -2701,7 +2763,7 @@ impl Tool for SpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Create an independently running child agent thread. The child inherits the current workspace and security boundary; use an agent_type profile to specialize it."
+        "Create an independently running child agent. The harness can keep read-only work shared or prepare an isolated Git worktree for an independent writer; the parent remains responsible for selecting and integrating results."
     }
 
     fn schema(&self) -> Value {
@@ -2712,6 +2774,11 @@ impl Tool for SpawnAgentTool {
                 "message": { "type": "string", "description": "Concrete initial task for the child agent." },
                 "fork_turns": { "type": ["string", "integer"], "description": "Parent history to copy: none, all, or a positive number of turns." },
                 "agent_type": { "type": "string", "description": "Built-in or project agent profile name. Defaults to default." },
+                "workspace_mode": {
+                    "type": "string",
+                    "enum": ["auto", "shared_read_only", "shared_coordinated", "isolated_worktree"],
+                    "description": "Harness workspace contract. auto uses shared_read_only for a read-only profile and shared_coordinated otherwise. Use isolated_worktree for independent code changes that the parent will integrate."
+                },
                 "name": { "type": "string", "description": "Deprecated alias for task_name." },
                 "input": { "type": "string", "description": "Deprecated alias for message." }
             },
@@ -2757,19 +2824,37 @@ impl Tool for SpawnAgentTool {
                 "unknown agent_type `{agent_type}`; call list_agents to inspect available profiles"
             );
         }
+        let profile = profiles
+            .get(&agent_type)
+            .context("validated agent profile disappeared")?;
+        let workspace_mode = call
+            .input
+            .get("workspace_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("auto");
+        let execution_contract = subagent_execution_contract(
+            &ctx,
+            &name,
+            workspace_mode,
+            profile.sandbox_mode == Some(SandboxMode::ReadOnly),
+        )
+        .await?;
         let initial_conversation = select_fork_conversation(&ctx.fork_conversation, &fork_turns);
-        let run = scheduler.spawn(SpawnSubagentRequest {
-            parent_thread_id: thread_id,
-            parent_turn_id,
-            parent_agent_path: ctx.agent_path.clone(),
-            name,
-            agent_type,
-            input,
-            fork_turns,
-            depth: ctx.subagent_depth.saturating_add(1),
-            initial_conversation,
-            initial_model_context: ctx.fork_model_context.clone(),
-        })?;
+        let run = scheduler.spawn_with_contract(
+            SpawnSubagentRequest {
+                parent_thread_id: thread_id,
+                parent_turn_id,
+                parent_agent_path: ctx.agent_path.clone(),
+                name,
+                agent_type,
+                input,
+                fork_turns,
+                depth: ctx.subagent_depth.saturating_add(1),
+                initial_conversation,
+                initial_model_context: ctx.fork_model_context.clone(),
+            },
+            execution_contract.clone(),
+        )?;
         Ok(ToolResult {
             call_id: call.id,
             output: serde_json::to_string(&run)?,
@@ -2779,10 +2864,91 @@ impl Tool for SpawnAgentTool {
                 "runId": run.id,
                 "agentPath": run.agent_path,
                 "status": run.status,
+                "executionContract": execution_contract,
                 "success": true
             }),
         })
     }
+}
+
+async fn subagent_execution_contract(
+    ctx: &ToolContext,
+    task_name: &str,
+    requested: &str,
+    profile_read_only: bool,
+) -> anyhow::Result<SubagentExecutionContract> {
+    let mode = match requested {
+        "auto" if profile_read_only => SubagentWorkspaceMode::SharedReadOnly,
+        "auto" => SubagentWorkspaceMode::SharedCoordinated,
+        "shared_read_only" => SubagentWorkspaceMode::SharedReadOnly,
+        "shared_coordinated" => SubagentWorkspaceMode::SharedCoordinated,
+        "isolated_worktree" => SubagentWorkspaceMode::IsolatedWorktree,
+        other => anyhow::bail!("unknown spawn_agent workspace_mode `{other}`"),
+    };
+    if mode != SubagentWorkspaceMode::IsolatedWorktree {
+        return Ok(SubagentExecutionContract {
+            workspace: SubagentWorkspaceAssignment {
+                mode,
+                root: Some(ctx.workspace_root.clone()),
+                branch: None,
+                base_commit: None,
+            },
+            require_structured_delivery: false,
+        });
+    }
+
+    let head = ctx
+        .environment
+        .exec(
+            ExecRequest::new("git")
+                .args(["rev-parse", "--verify", "HEAD"])
+                .cwd(&ctx.workspace_root),
+            ctx.execution_context(Duration::from_secs(15)),
+        )
+        .await
+        .context("isolated subagent requires a Git repository with a HEAD commit")?;
+    if !head.success {
+        anyhow::bail!(
+            "isolated subagent could not resolve HEAD: {}",
+            truncate(&String::from_utf8_lossy(&head.stderr), 2_000)
+        );
+    }
+    let base_commit = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    if base_commit.is_empty() {
+        anyhow::bail!("isolated subagent resolved an empty HEAD commit");
+    }
+    let suffix = Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..12];
+    let branch = format!("codex/subagent/{task_name}-{suffix}");
+    let root = ctx
+        .workspace_root
+        .join(".opentopia")
+        .join("worktrees")
+        .join(format!("{task_name}-{suffix}"));
+    let request = isolated_subagent_worktree_request(
+        ctx.workspace_root.clone(),
+        root.clone(),
+        branch.clone(),
+        base_commit.clone(),
+    )?;
+    let command = format!(
+        "git worktree add -b {} {} {}",
+        branch,
+        root.display(),
+        base_commit
+    );
+    enforce_policy_decision(ctx.policy.inspect_command(&command), ctx.approval_granted)?;
+    drop(request);
+
+    Ok(SubagentExecutionContract {
+        workspace: SubagentWorkspaceAssignment {
+            mode,
+            root: Some(root),
+            branch: Some(branch),
+            base_commit: Some(base_commit),
+        },
+        require_structured_delivery: true,
+    })
 }
 
 fn select_fork_conversation(
@@ -3446,6 +3612,16 @@ impl Tool for ListFilesTool {
         })
     }
 
+    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec![tool_resource_key(
+            "dir",
+            call.input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("."),
+        )])
+    }
+
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
         let relative = call
             .input
@@ -3501,6 +3677,16 @@ impl Tool for ReadFileTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec![tool_resource_key(
+            "file",
+            call.input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("*"),
+        )])
     }
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
@@ -3597,6 +3783,147 @@ impl Tool for ReadFileTool {
     }
 }
 
+pub struct ReadFilesTool;
+
+const READ_FILES_MAX_ITEMS: usize = 8;
+const READ_FILES_TOTAL_CHARS: usize = 64_000;
+
+#[async_trait]
+impl Tool for ReadFilesTool {
+    fn name(&self) -> &str {
+        "read_files"
+    }
+
+    fn description(&self) -> &str {
+        "Read up to 8 independent UTF-8 files concurrently. Each item supports the same character offset/limit window as read_file; the combined response is capped at 64000 characters."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": READ_FILES_MAX_ITEMS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "File path relative to workspace." },
+                            "offset": { "type": "integer", "minimum": 0 },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": READ_FILE_WINDOW_CHARS }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["files"],
+            "additionalProperties": false
+        })
+    }
+
+    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        let keys = call
+            .input
+            .get("files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                tool_resource_key(
+                    "file",
+                    item.get("path").and_then(Value::as_str).unwrap_or("*"),
+                )
+            })
+            .collect();
+        ToolExecutionPolicy::read_only(keys)
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let files = call
+            .input
+            .get("files")
+            .and_then(Value::as_array)
+            .context("read_files requires a files array")?;
+        if files.is_empty() || files.len() > READ_FILES_MAX_ITEMS {
+            anyhow::bail!("read_files accepts between 1 and {READ_FILES_MAX_ITEMS} files per call");
+        }
+
+        // Validate every authorization boundary before starting concurrent I/O.
+        // This ensures one denied path suspends the whole tool call for approval
+        // instead of being hidden inside an ordinary per-file error.
+        for item in files {
+            let relative = item
+                .get("path")
+                .and_then(Value::as_str)
+                .context("each read_files item requires a path")?;
+            let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
+            enforce_read_policy(&ctx, &logical_path)?;
+        }
+
+        let per_file_cap = (READ_FILES_TOTAL_CHARS / files.len()).min(READ_FILE_WINDOW_CHARS);
+        let mut pending = FuturesUnordered::new();
+        for (index, item) in files.iter().cloned().enumerate() {
+            let mut input = item;
+            let requested = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(per_file_cap)
+                .clamp(1, per_file_cap);
+            input["limit"] = json!(requested);
+            let item_ctx = ctx.clone();
+            pending.push(async move {
+                let path = input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>")
+                    .to_string();
+                let result = ReadFileTool
+                    .execute(ToolCall::new("read_file", input), item_ctx)
+                    .await;
+                (index, path, result)
+            });
+        }
+
+        let mut ordered = vec![None; files.len()];
+        while let Some((index, path, result)) = pending.next().await {
+            ordered[index] = Some(match result {
+                Ok(result) => json!({
+                    "path": path,
+                    "ok": true,
+                    "content": result.output,
+                    "metadata": result.metadata
+                }),
+                Err(error) => json!({
+                    "path": path,
+                    "ok": false,
+                    "error": error.to_string()
+                }),
+            });
+        }
+        let results = ordered.into_iter().flatten().collect::<Vec<_>>();
+        let succeeded = results
+            .iter()
+            .filter(|result| result.get("ok").and_then(Value::as_bool) == Some(true))
+            .count();
+        let value = json!({ "files": results });
+        Ok(ToolResult {
+            call_id: call.id,
+            output: serde_json::to_string_pretty(&value)?,
+            content: Vec::new(),
+            metadata: json!({
+                "count": files.len(),
+                "succeeded": succeeded,
+                "failed": files.len().saturating_sub(succeeded),
+                "perFileLimit": per_file_cap,
+                "success": succeeded == files.len()
+            }),
+        })
+    }
+}
+
 pub struct WriteFileTool;
 
 #[async_trait]
@@ -3618,6 +3945,22 @@ impl Tool for WriteFileTool {
             },
             "required": ["path", "content"]
         })
+    }
+
+    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        ToolExecutionPolicy {
+            read_only: false,
+            idempotent: true,
+            parallel_safe: false,
+            side_effect: ToolSideEffect::WorkspaceWrite,
+            resource_keys: vec![tool_resource_key(
+                "file",
+                call.input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*"),
+            )],
+        }
     }
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
@@ -3684,6 +4027,16 @@ impl Tool for SearchTool {
             },
             "required": ["query"]
         })
+    }
+
+    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec![tool_resource_key(
+            "tree",
+            call.input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("."),
+        )])
     }
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
@@ -3849,7 +4202,7 @@ impl Tool for BackgroundOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect the background commands you started: list them, read the output produced since you last looked, or stop one. You do not need to poll for completion; a finished command reports itself."
+        "Control commands and persistent stdio sessions you started: list them, read new output, write input to an interactive session, or stop one. You do not need to poll for completion; a finished command reports itself."
     }
 
     fn schema(&self) -> Value {
@@ -3858,13 +4211,48 @@ impl Tool for BackgroundOutputTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["read", "list", "stop"],
-                    "description": "read returns new output for one job, list summarizes every job you own, stop ends one job."
+                    "enum": ["read", "list", "write", "stop"],
+                    "description": "read returns new output for one job, list summarizes every job you own, write sends input to an interactive session, and stop ends one job."
                 },
-                "jobId": { "type": "string", "description": "Job UUID returned by shell. Required for read and stop." }
+                "jobId": { "type": "string", "description": "Job UUID returned by shell. Required for read, write, and stop." },
+                "data": { "type": "string", "description": "Input to send for write." },
+                "appendNewline": { "type": "boolean", "description": "Append a newline to data. Defaults to false." }
             },
             "additionalProperties": false
         })
+    }
+
+    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        let action = call
+            .input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("read");
+        let key = format!(
+            "session:{}",
+            call.input
+                .get("jobId")
+                .and_then(Value::as_str)
+                .unwrap_or("*")
+        );
+        match action {
+            "list" => ToolExecutionPolicy::read_only(vec!["sessions:self".to_string()]),
+            "read" => ToolExecutionPolicy {
+                read_only: false,
+                idempotent: false,
+                parallel_safe: false,
+                side_effect: ToolSideEffect::SessionMutation,
+                resource_keys: vec![key],
+            },
+            "write" | "stop" => ToolExecutionPolicy {
+                read_only: false,
+                idempotent: false,
+                parallel_safe: false,
+                side_effect: ToolSideEffect::SessionMutation,
+                resource_keys: vec![key],
+            },
+            _ => ToolExecutionPolicy::conservative(),
+        }
     }
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
@@ -3907,6 +4295,30 @@ impl Tool for BackgroundOutputTool {
                     json!({ "jobId": job_id, "success": true }),
                 )
             }
+            "write" => {
+                let job_id = job_id.context("background_output write requires jobId")?;
+                let mut data = call
+                    .input
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .context("background_output write requires data")?
+                    .to_string();
+                if call
+                    .input
+                    .get("appendNewline")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    data.push('\n');
+                }
+                registry
+                    .write_stdin(&scope, job_id, data.as_bytes())
+                    .await?;
+                (
+                    json!({ "jobId": job_id, "bytesWritten": data.len(), "written": true }),
+                    json!({ "jobId": job_id, "bytesWritten": data.len(), "success": true }),
+                )
+            }
             "read" => {
                 let job_id = job_id.context("background_output read requires jobId")?;
                 let chunk = registry.read_output(&scope, job_id)?;
@@ -3944,7 +4356,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in the workspace with timeout and output caps. Set background for anything slow (installs, builds, downloads, servers): it returns a job id immediately, the command keeps running while you do other work, and its result is delivered to you automatically when it finishes."
+        "Run a shell command in a workspace directory with timeout and output caps. Set background for slow commands, or interactive for a persistent stdio session that accepts input through background_output. Both return a job id immediately and report completion automatically."
     }
 
     fn schema(&self) -> Value {
@@ -3952,14 +4364,29 @@ impl Tool for ShellTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Command to run. The platform shell interprets it, so substitutions and redirection inside the string are executed." },
+                "workdir": { "type": "string", "description": "Existing workspace-relative directory in which to run. Defaults to the workspace root." },
                 "timeoutSeconds": { "type": "number", "description": "Timeout in seconds. Up to 1800 in the foreground, or 21600 in the background." },
                 "background": {
                     "type": "boolean",
                     "description": "Run detached and return a job id right away. Use background_output to read progress or stop the job; the finished result reaches you on its own."
+                },
+                "interactive": {
+                    "type": "boolean",
+                    "description": "Keep stdin open as a persistent stdio session. Use background_output write/read/stop with the returned job id."
                 }
             },
             "required": ["command"]
         })
+    }
+
+    fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+        ToolExecutionPolicy {
+            read_only: false,
+            idempotent: false,
+            parallel_safe: false,
+            side_effect: ToolSideEffect::Process,
+            resource_keys: vec!["process:self".to_string(), "workspace:*".to_string()],
+        }
     }
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
@@ -3970,11 +4397,28 @@ impl Tool for ShellTool {
             .context("shell requires a command")?;
         enforce_policy_decision(ctx.policy.inspect_command(command), ctx.approval_granted)?;
 
-        let background = call
+        let interactive = call
             .input
-            .get("background")
+            .get("interactive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let background = interactive
+            || call
+                .input
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let requested_workdir = call
+            .input
+            .get("workdir")
+            .and_then(Value::as_str)
+            .unwrap_or(".");
+        let logical_workdir = normalize_workspace_path(&ctx.workspace_root, requested_workdir)?;
+        enforce_read_policy(&ctx, &logical_workdir)?;
+        let workdir = ctx.environment.resolve_read_path(&logical_workdir)?;
+        if !workdir.is_dir() {
+            anyhow::bail!("shell workdir is not a directory: {}", workdir.display());
+        }
         let timeout_seconds = call
             .input
             .get("timeoutSeconds")
@@ -3990,6 +4434,48 @@ impl Tool for ShellTool {
                 MAX_FOREGROUND_TIMEOUT_SECONDS
             });
 
+        if interactive {
+            let registry = ctx
+                .background
+                .as_ref()
+                .context("interactive commands are unavailable in this runtime")?;
+            let job = registry
+                .spawn_session(
+                    ctx.environment.clone(),
+                    BackgroundSessionSpawnRequest {
+                        scope: background_scope(&ctx)?,
+                        command: command.to_string(),
+                        request: ExecRequest::shell(command).cwd(&workdir),
+                        context: ctx.execution_context(Duration::from_secs(timeout_seconds)),
+                    },
+                )
+                .await?;
+            let value = json!({
+                "jobId": job.job_id,
+                "status": job.status.as_str(),
+                "command": job.command,
+                "workdir": workdir.display().to_string(),
+                "interactive": true,
+                "transport": "stdio",
+                "startedAt": job.started_at,
+                "note": "The persistent stdio session is running. Use background_output write/read/stop with this job id."
+            });
+            return Ok(ToolResult {
+                call_id: call.id,
+                output: serde_json::to_string_pretty(&value)?,
+                content: vec![ModelContentPart::json(value)],
+                metadata: json!({
+                    "toolName": self.name(),
+                    "background": true,
+                    "interactive": true,
+                    "transport": "stdio",
+                    "jobId": job.job_id,
+                    "workdir": workdir.display().to_string(),
+                    "success": true
+                }),
+            });
+        }
+
         if background {
             let registry = ctx
                 .background
@@ -4000,7 +4486,7 @@ impl Tool for ShellTool {
                 BackgroundSpawnRequest {
                     scope: background_scope(&ctx)?,
                     command: command.to_string(),
-                    request: ExecRequest::shell(command).cwd(&ctx.workspace_root),
+                    request: ExecRequest::shell(command).cwd(&workdir),
                     context: ctx.execution_context(Duration::from_secs(timeout_seconds)),
                 },
             )?;
@@ -4008,6 +4494,7 @@ impl Tool for ShellTool {
                 "jobId": job.job_id,
                 "status": job.status.as_str(),
                 "command": job.command,
+                "workdir": workdir.display().to_string(),
                 "startedAt": job.started_at,
                 "note": "The command is running detached. Carry on with other work: its output and exit status are delivered to you when it finishes, and background_output reads progress or stops it in the meantime."
             });
@@ -4019,6 +4506,7 @@ impl Tool for ShellTool {
                     "toolName": self.name(),
                     "background": true,
                     "jobId": job.job_id,
+                    "workdir": workdir.display().to_string(),
                     "success": true
                 }),
             });
@@ -4028,7 +4516,7 @@ impl Tool for ShellTool {
         let output = ctx
             .environment
             .exec(
-                ExecRequest::shell(command).cwd(&ctx.workspace_root),
+                ExecRequest::shell(command).cwd(&workdir),
                 ctx.execution_context(Duration::from_secs(timeout_seconds)),
             )
             .await?;
@@ -4062,6 +4550,7 @@ impl Tool for ShellTool {
             content: Vec::new(),
             metadata: json!({
                 "command": command,
+                "workdir": workdir.display().to_string(),
                 "exitCode": output.exit_code,
                 "success": output.success,
                 "truncated": output.truncated,
@@ -4126,6 +4615,10 @@ impl Tool for GitDiffTool {
         json!({ "type": "object", "properties": {} })
     }
 
+    fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec!["git:index-and-worktree".to_string()])
+    }
+
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
         let output = ctx
             .environment
@@ -4160,6 +4653,27 @@ impl Tool for GitDiffTool {
 
 pub struct ApplyPatchTool;
 
+/// Provider-native patch calls are normalized here instead of teaching the
+/// workspace executor about any one transport. Their `diff` is commonly a bare
+/// unified hunk (`@@ ...`) and therefore cannot be passed directly to `git apply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NativePatchOperation {
+    CreateFile { path: String, diff: String },
+    UpdateFile { path: String, diff: String },
+    DeleteFile { path: String },
+}
+
+impl NativePatchOperation {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::CreateFile { path, .. }
+            | Self::UpdateFile { path, .. }
+            | Self::DeleteFile { path } => path,
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for ApplyPatchTool {
     fn name(&self) -> &str {
@@ -4167,70 +4681,249 @@ impl Tool for ApplyPatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a unified diff patch to files in the workspace using git apply."
+        "Apply either a portable unified diff patch or one structured create_file/update_file/delete_file operation to the workspace."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "patch": { "type": "string", "description": "Unified diff patch." }
+                "patch": { "type": "string", "description": "Portable unified diff patch." },
+                "operation": {
+                    "type": "object",
+                    "description": "Structured provider-native operation. Supply this instead of patch.",
+                    "properties": {
+                        "type": { "type": "string", "enum": ["create_file", "update_file", "delete_file"] },
+                        "path": { "type": "string", "description": "Workspace-relative target path." },
+                        "diff": { "type": "string", "description": "Unified diff hunks; required for create_file and update_file." }
+                    },
+                    "required": ["type", "path"],
+                    "additionalProperties": false
+                }
             },
-            "required": ["patch"]
+            "oneOf": [
+                { "required": ["patch"] },
+                { "required": ["operation"] }
+            ],
+            "additionalProperties": false
         })
+    }
+
+    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        let key = call
+            .input
+            .get("operation")
+            .and_then(|operation| operation.get("path"))
+            .and_then(Value::as_str)
+            .map(|path| tool_resource_key("file", path))
+            .unwrap_or_else(|| "workspace:*".to_string());
+        ToolExecutionPolicy {
+            read_only: false,
+            idempotent: false,
+            parallel_safe: false,
+            side_effect: ToolSideEffect::WorkspaceWrite,
+            resource_keys: vec![key],
+        }
     }
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let patch = call
-            .input
-            .get("patch")
-            .and_then(Value::as_str)
-            .context("apply_patch requires a patch")?;
+        if let Some(operation) = call.input.get("operation") {
+            let operation: NativePatchOperation = serde_json::from_value(operation.clone())
+                .context("apply_patch operation is invalid")?;
+            return execute_native_patch_operation(call.id, operation, ctx).await;
+        }
 
-        enforce_policy_decision(
-            ctx.policy
-                .inspect_command("git apply --whitespace=nowarn -"),
-            ctx.approval_granted,
-        )?;
+        let patch =
+            call.input.get("patch").and_then(Value::as_str).context(
+                "apply_patch requires either a portable patch or a structured operation",
+            )?;
 
-        let result = ctx
+        execute_portable_patch(call.id, patch, ctx).await
+    }
+}
+
+async fn execute_portable_patch(
+    call_id: Uuid,
+    patch: &str,
+    ctx: ToolContext,
+) -> anyhow::Result<ToolResult> {
+    enforce_policy_decision(
+        ctx.policy
+            .inspect_command("git apply --whitespace=nowarn -"),
+        ctx.approval_granted,
+    )?;
+
+    let result = ctx
+        .environment
+        .apply_patch(patch, ctx.execution_context(Duration::from_secs(30)))
+        .await
+        .context("git apply failed")?;
+    let output = result.exec;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.success && looks_like_sandbox_denial(&stderr) {
+        return Err(ApprovalRequired::new(format!(
+            "Patch was blocked by the sandbox: {}",
+            truncate(&stderr, 2_000)
+        ))
+        .into());
+    }
+    if !output.success {
+        anyhow::bail!(
+            "git apply failed ({:?})\n{}",
+            output.exit_code,
+            truncate(&stderr, 12_000)
+        );
+    }
+
+    Ok(ToolResult {
+        call_id,
+        output: format!(
+            "Patch applied.\n\n[stdout]\n{}\n\n[stderr]\n{}",
+            truncate(&stdout, 8_000),
+            truncate(&stderr, 8_000)
+        ),
+        content: Vec::new(),
+        metadata: json!({
+            "success": true,
+            "bytes": result.bytes,
+            "sandbox": output.sandbox
+        }),
+    })
+}
+
+/// Execute one normalized native operation. This is public for transport
+/// adapters that surface hosted apply-patch calls outside ordinary function
+/// calling; portable callers continue to use [`ApplyPatchTool`].
+pub async fn execute_native_patch_operation(
+    call_id: Uuid,
+    operation: NativePatchOperation,
+    ctx: ToolContext,
+) -> anyhow::Result<ToolResult> {
+    let relative = validate_native_patch_path(operation.path())?;
+    let target = normalize_workspace_path(&ctx.workspace_root, &relative)?;
+    enforce_policy_decision(ctx.policy.inspect_write(&target), ctx.approval_granted)?;
+
+    if matches!(&operation, NativePatchOperation::DeleteFile { .. }) {
+        let deleted = ctx
             .environment
-            .apply_patch(patch, ctx.execution_context(Duration::from_secs(30)))
-            .await
-            .context("git apply failed")?;
-        let output = result.exec;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.success && looks_like_sandbox_denial(&stderr) {
-            return Err(ApprovalRequired::new(format!(
-                "Patch was blocked by the sandbox: {}",
-                truncate(&stderr, 2_000)
-            ))
-            .into());
-        }
-        if !output.success {
-            anyhow::bail!(
-                "git apply failed ({:?})\n{}",
-                output.exit_code,
-                truncate(&stderr, 12_000)
-            );
-        }
-
-        Ok(ToolResult {
-            call_id: call.id,
-            output: format!(
-                "Patch applied.\n\n[stdout]\n{}\n\n[stderr]\n{}",
-                truncate(&stdout, 8_000),
-                truncate(&stderr, 8_000)
-            ),
+            .delete_file(FileDeleteRequest::new(&target))
+            .await?;
+        return Ok(ToolResult {
+            call_id,
+            output: format!("Deleted {}", deleted.path.display()),
             content: Vec::new(),
             metadata: json!({
                 "success": true,
-                "bytes": result.bytes,
-                "sandbox": output.sandbox
+                "operation": "delete_file",
+                "changedPath": deleted.path.display().to_string()
             }),
-        })
+        });
     }
+
+    let patch = native_patch_operation_to_unified_diff(&operation)?;
+    let mut result = execute_portable_patch(call_id, &patch, ctx).await?;
+    if let Some(metadata) = result.metadata.as_object_mut() {
+        metadata.insert(
+            "operation".to_string(),
+            json!(match operation {
+                NativePatchOperation::CreateFile { .. } => "create_file",
+                NativePatchOperation::UpdateFile { .. } => "update_file",
+                NativePatchOperation::DeleteFile { .. } => unreachable!(),
+            }),
+        );
+        metadata.insert("changedPath".to_string(), json!(relative));
+    }
+    Ok(result)
+}
+
+pub fn native_patch_operation_to_unified_diff(
+    operation: &NativePatchOperation,
+) -> anyhow::Result<String> {
+    let path = validate_native_patch_path(operation.path())?;
+    match operation {
+        NativePatchOperation::DeleteFile { .. } => {
+            anyhow::bail!("delete_file is executed directly and has no supplied diff")
+        }
+        NativePatchOperation::CreateFile { diff, .. } => {
+            let hunks = normalize_native_create_hunks(diff)?;
+            Ok(format!(
+                "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n{hunks}"
+            ))
+        }
+        NativePatchOperation::UpdateFile { diff, .. } => {
+            let hunks = extract_native_hunks(diff)
+                .context("update_file diff must contain at least one unified @@ hunk")?;
+            Ok(format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{hunks}"
+            ))
+        }
+    }
+}
+
+fn validate_native_patch_path(path: &str) -> anyhow::Result<String> {
+    let path = path.trim();
+    if path.is_empty() || path.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        anyhow::bail!("native patch path must be a non-empty single line")
+    }
+    let candidate = Path::new(path);
+    if candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        anyhow::bail!("native patch path must be workspace-relative: {path}")
+    }
+    Ok(path.replace('\\', "/"))
+}
+
+fn extract_native_hunks(diff: &str) -> Option<String> {
+    let normalized = diff.replace("\r\n", "\n");
+    let start = normalized
+        .split_inclusive('\n')
+        .scan(0usize, |offset, line| {
+            let current = *offset;
+            *offset += line.len();
+            Some((current, line))
+        })
+        .find_map(|(offset, line)| line.starts_with("@@").then_some(offset))?;
+    let mut hunks = normalized[start..].to_string();
+    if !hunks.ends_with('\n') {
+        hunks.push('\n');
+    }
+    Some(hunks)
+}
+
+fn normalize_native_create_hunks(diff: &str) -> anyhow::Result<String> {
+    if let Some(hunks) = extract_native_hunks(diff) {
+        return Ok(hunks);
+    }
+    let normalized = diff.replace("\r\n", "\n");
+    let had_final_newline = normalized.ends_with('\n');
+    let body = normalized.strip_suffix('\n').unwrap_or(&normalized);
+    if body.is_empty() {
+        return Ok(String::new());
+    }
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut hunks = format!("@@ -0,0 +1,{} @@\n", lines.len());
+    for line in lines {
+        if line.starts_with('+') {
+            hunks.push_str(line);
+        } else {
+            hunks.push('+');
+            hunks.push_str(line);
+        }
+        hunks.push('\n');
+    }
+    if !had_final_newline {
+        hunks.push_str("\\ No newline at end of file\n");
+    }
+    Ok(hunks)
 }
 
 fn normalize_workspace_path(workspace_root: &Path, path: &str) -> anyhow::Result<PathBuf> {
@@ -4249,6 +4942,18 @@ fn normalize_workspace_path(workspace_root: &Path, path: &str) -> anyhow::Result
     } else {
         Ok(workspace_root.join(candidate))
     }
+}
+
+fn tool_resource_key(kind: &str, path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    format!(
+        "{kind}:{}",
+        if normalized.is_empty() {
+            "*"
+        } else {
+            normalized.as_str()
+        }
+    )
 }
 
 fn enforce_read_policy(ctx: &ToolContext, path: &Path) -> anyhow::Result<()> {
@@ -4552,12 +5257,20 @@ fn truncate_bytes(value: &str, max_bytes: usize) -> (String, bool) {
         return (value.to_string(), false);
     }
 
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+    let head_target = max_bytes / 2;
+    let tail_target = max_bytes.saturating_sub(head_target);
+    let mut head_end = head_target;
+    while head_end > 0 && !value.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    let mut truncated = value[..end].to_string();
-    truncated.push_str("\n\n[output truncated]");
+    let mut tail_start = value.len().saturating_sub(tail_target);
+    while tail_start < value.len() && !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start.saturating_sub(head_end);
+    let mut truncated = value[..head_end].to_string();
+    truncated.push_str(&format!("\n\n[{omitted} bytes omitted]\n\n"));
+    truncated.push_str(&value[tail_start..]);
     (truncated, true)
 }
 
@@ -4600,12 +5313,19 @@ fn is_not_found_error(err: &anyhow::Error) -> bool {
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
         return value.to_string();
     }
 
-    let mut truncated: String = value.chars().take(max_chars).collect();
-    truncated.push_str("\n\n[output truncated]");
+    let head_chars = max_chars / 2;
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let mut truncated: String = value.chars().take(head_chars).collect();
+    truncated.push_str(&format!(
+        "\n\n[{} characters omitted]\n\n",
+        total_chars.saturating_sub(max_chars)
+    ));
+    truncated.extend(value.chars().skip(total_chars.saturating_sub(tail_chars)));
     truncated
 }
 
@@ -4892,6 +5612,20 @@ mod tests {
             ]
         );
         assert_eq!(select_fork_conversation(&conversation, "2"), conversation);
+    }
+
+    #[tokio::test]
+    async fn automatic_subagent_workspace_contract_keeps_read_only_profiles_shared() {
+        let context = tool_context(test_scheduler(), Uuid::new_v4(), Uuid::new_v4());
+        let contract = subagent_execution_contract(&context, "research", "auto", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            contract.workspace.mode,
+            SubagentWorkspaceMode::SharedReadOnly
+        );
+        assert_eq!(contract.workspace.root, Some(context.workspace_root));
+        assert!(!contract.require_structured_delivery);
     }
 
     #[test]
@@ -5927,5 +6661,196 @@ mod tests {
             "workspace write is authorized"
         );
         fs::remove_dir_all(workspace_root).expect("remove workspace fixture");
+    }
+
+    #[test]
+    fn truncation_preserves_diagnostic_head_and_tail() {
+        let value = format!("HEAD{}TAIL", "x".repeat(100));
+        let truncated = truncate(&value, 20);
+        assert!(truncated.starts_with("HEAD"));
+        assert!(truncated.ends_with("TAIL"));
+        assert!(truncated.contains("characters omitted"));
+
+        let (bytes, was_truncated) = truncate_bytes(&value, 20);
+        assert!(was_truncated);
+        assert!(bytes.starts_with("HEAD"));
+        assert!(bytes.ends_with("TAIL"));
+        assert!(bytes.contains("bytes omitted"));
+    }
+
+    #[tokio::test]
+    async fn read_files_reads_multiple_windows_in_one_call() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-read-files-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("a.txt"), "alpha").unwrap();
+        fs::write(workspace_root.join("b.txt"), "bravo").unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local(workspace_root.clone(), policy);
+
+        let result = ReadFilesTool
+            .execute(
+                ToolCall::new(
+                    "read_files",
+                    json!({ "files": [{ "path": "a.txt" }, { "path": "b.txt" }] }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+        assert!(result.output.contains("alpha"));
+        assert!(result.output.contains("bravo"));
+        assert_eq!(result.metadata["succeeded"], 2);
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_honors_workspace_relative_workdir() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-shell-workdir-{}", Uuid::new_v4()));
+        fs::create_dir_all(workspace_root.join("nested")).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+        let command = if cfg!(windows) {
+            "(Get-Location).Path"
+        } else {
+            "pwd"
+        };
+        let result = ShellTool
+            .execute(
+                ToolCall::new("shell", json!({ "command": command, "workdir": "nested" })),
+                context,
+            )
+            .await
+            .unwrap();
+        assert!(result.output.contains("nested"));
+        assert!(result.metadata["workdir"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("nested")));
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[test]
+    fn tool_execution_policy_marks_observations_as_parallel_safe() {
+        let registry = ToolRegistry::with_core_tools();
+        let read = ToolCall::new("read_file", json!({ "path": "src/lib.rs" }));
+        let policy = registry.execution_policy("read_file", &read).unwrap();
+        assert!(policy.read_only);
+        assert!(policy.idempotent);
+        assert!(policy.parallel_safe);
+        assert_eq!(policy.side_effect, ToolSideEffect::None);
+        assert_eq!(policy.resource_keys, vec!["file:src/lib.rs"]);
+
+        let shell = ToolCall::new("shell", json!({ "command": "git status" }));
+        let policy = registry.execution_policy("shell", &shell).unwrap();
+        assert!(!policy.read_only);
+        assert!(!policy.parallel_safe);
+        assert_eq!(policy.side_effect, ToolSideEffect::Process);
+    }
+
+    #[test]
+    fn plan_tools_describe_memory_and_evidence_without_mandating_a_scheduler() {
+        assert!(SetPlanTool.description().contains("external memory"));
+        assert!(UpdatePlanTool.description().contains("advisory"));
+        assert!(!UpdatePlanTool.description().contains("one step at a time"));
+        assert!(CompleteTaskTool
+            .description()
+            .contains("verification evidence"));
+    }
+
+    #[tokio::test]
+    async fn native_patch_operations_create_update_and_delete_one_target() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-native-patch-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+
+        ApplyPatchTool
+            .execute(
+                ToolCall::new(
+                    "apply_patch",
+                    json!({
+                        "operation": {
+                            "type": "create_file",
+                            "path": "notes.txt",
+                            "diff": "@@ -0,0 +1,2 @@\n+hello\n+world\n"
+                        }
+                    }),
+                ),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("notes.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "hello\nworld\n"
+        );
+
+        execute_native_patch_operation(
+            Uuid::new_v4(),
+            NativePatchOperation::UpdateFile {
+                path: "notes.txt".to_string(),
+                diff: "@@ -1,2 +1,2 @@\n hello\n-world\n+earth\n".to_string(),
+            },
+            context.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("notes.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "hello\nearth\n"
+        );
+
+        execute_native_patch_operation(
+            Uuid::new_v4(),
+            NativePatchOperation::DeleteFile {
+                path: "notes.txt".to_string(),
+            },
+            context,
+        )
+        .await
+        .unwrap();
+        assert!(!workspace_root.join("notes.txt").exists());
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[test]
+    fn native_patch_rejects_path_injection_and_retargets_full_diffs() {
+        let error = native_patch_operation_to_unified_diff(&NativePatchOperation::UpdateFile {
+            path: "../escape.txt".to_string(),
+            diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("workspace-relative"));
+
+        let patch = native_patch_operation_to_unified_diff(&NativePatchOperation::UpdateFile {
+            path: "safe.txt".to_string(),
+            diff: "--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        })
+        .unwrap();
+        assert!(patch.contains("--- a/safe.txt"));
+        assert!(!patch.contains("other.txt"));
     }
 }

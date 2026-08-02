@@ -33,6 +33,20 @@ OpenTopia application suites are model-neutral. Select and freeze the provider,
 model, reasoning settings, and context limits in the external run profile; the
 result manifest records that run configuration without changing fixture IDs.
 
+候选 harness 改动应当与同一 suite 的基线运行进行比较。比较门禁默认不允许
+完成率或单任务通过率下降，并把每次成功的 token 与平均延迟增幅限制在 20%：
+
+```powershell
+node evaluation/src/cli.mjs compare `
+  --baseline evaluation/.runs/baseline/summary.json `
+  --candidate evaluation/.runs/candidate/summary.json `
+  --output evaluation/.comparisons/current
+```
+
+可以用 `--max-pass-rate-drop`、`--max-task-pass-rate-drop`、
+`--max-token-increase-ratio` 和 `--max-latency-increase-ratio` 显式调整门禁。
+比较会生成机器可读的 `comparison.json` 和人工审阅的 `comparison.md`。
+
 Tasks can declare ordered `phases`. A phase with `restartBefore: true` asks the
 target lifecycle supervisor to restart the application before the next prompt;
 the target keeps only the task's persisted state needed to resume the same

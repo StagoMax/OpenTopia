@@ -2,7 +2,9 @@
 
 import process from "node:process";
 import path from "node:path";
+import { compareSummaries, writeComparison } from "./compare.mjs";
 import { runSuite, validateDefinitions } from "./runner.mjs";
+import { loadJson } from "./validation.mjs";
 
 function help() {
   return `Application Agent Evaluation Harness
@@ -10,6 +12,7 @@ function help() {
 Usage:
   agent-eval validate --suite <suite.json> --target <target.json>
   agent-eval run --suite <suite.json> --target <target.json> [--output <dir>] [--repetitions <n>]
+  agent-eval compare --baseline <summary.json> --candidate <summary.json> [--output <dir>]
 
 The target is a black-box process adapter. The harness passes the prompt through
 stdin or a file, exposes trial paths through AGENT_EVAL_* environment variables,
@@ -36,6 +39,36 @@ async function main() {
   const { command, options } = parseArguments(process.argv.slice(2));
   if (!command || command === "help" || command === "--help") {
     process.stdout.write(help());
+    return;
+  }
+  if (command === "compare") {
+    if (!options.baseline || !options.candidate) {
+      throw new Error("--baseline and --candidate are required for compare");
+    }
+    const numericOption = (name, fallback) => {
+      if (options[name] === undefined) return fallback;
+      const value = Number(options[name]);
+      if (!Number.isFinite(value) || value < 0) throw new Error(`--${name} must be a non-negative number`);
+      return value;
+    };
+    const comparison = compareSummaries(
+      await loadJson(options.baseline),
+      await loadJson(options.candidate),
+      {
+        maxPassRateDrop: numericOption("max-pass-rate-drop", 0),
+        maxTaskPassRateDrop: numericOption("max-task-pass-rate-drop", 0),
+        maxTokenIncreaseRatio: numericOption("max-token-increase-ratio", 0.2),
+        maxLatencyIncreaseRatio: numericOption("max-latency-increase-ratio", 0.2)
+      }
+    );
+    const outputDirectory = options.output ?? path.dirname(path.resolve(options.candidate));
+    const reports = await writeComparison(outputDirectory, comparison);
+    process.stdout.write(`${JSON.stringify({
+      status: comparison.status,
+      comparison: reports.jsonPath,
+      report: reports.markdownPath
+    }, null, 2)}\n`);
+    if (comparison.status !== "passed") process.exitCode = 1;
     return;
   }
   if (!options.suite || !options.target) throw new Error("--suite and --target are required");
