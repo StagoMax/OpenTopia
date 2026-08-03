@@ -5211,82 +5211,111 @@ fn codex_turn_input(
     request: &ModelRequest,
     attachment_paths: &mut Vec<PathBuf>,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut input = vec![json!({ "type": "text", "text": codex_request_text(request) })];
-    for part in request
-        .conversation
-        .iter()
-        .flat_map(|message| message.content_parts.iter())
-        .chain(request.user_content.iter())
-        .chain(
-            request
-                .tool_results
-                .iter()
-                .flat_map(|result| result.content.iter()),
-        )
-    {
-        if let ModelContentPart::Image { content_type, data } = part {
-            let path = materialize_codex_image(content_type, data)?;
-            input.push(json!({
-                "type": "localImage",
-                "path": path,
-                "detail": "original",
-            }));
-            attachment_paths.push(path);
-        }
-    }
-    Ok(input)
-}
-
-fn codex_request_text(request: &ModelRequest) -> String {
-    let mut sections = Vec::new();
+    let mut input = Vec::new();
     for message in &request.conversation {
         let role = match message.role {
             ModelConversationRole::System => "System",
             ModelConversationRole::User => "User",
             ModelConversationRole::Assistant => "Assistant",
         };
-        let mut content = message.content.clone();
-        append_codex_part_text(&mut content, &message.content_parts);
-        if !content.trim().is_empty() {
-            sections.push(format!("{role}:\n{content}"));
+        let separator = if input.is_empty() { "" } else { "\n\n" };
+        push_codex_input_text(
+            &mut input,
+            format!("{separator}{role}:\n{}", message.content),
+        );
+        if !message.content.is_empty() && !message.content_parts.is_empty() {
+            push_codex_input_text(&mut input, "\n");
+        }
+        append_codex_input_parts(&mut input, &message.content_parts, attachment_paths)?;
+    }
+
+    let separator = if input.is_empty() { "" } else { "\n\n" };
+    push_codex_input_text(
+        &mut input,
+        format!("{separator}Current user request:\n{}", request.user_message),
+    );
+    if !request.user_message.is_empty() && !request.user_content.is_empty() {
+        push_codex_input_text(&mut input, "\n");
+    }
+    append_codex_input_parts(&mut input, &request.user_content, attachment_paths)?;
+
+    if !request.tool_results.is_empty() {
+        push_codex_input_text(
+            &mut input,
+            format!(
+                "\n\nCompleted OpenTopia tool results:\n{}",
+                request
+                    .tool_results
+                    .iter()
+                    .map(provider_tool_result_content)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        );
+        for result in &request.tool_results {
+            for part in &result.content {
+                if matches!(part, ModelContentPart::Image { .. }) {
+                    append_codex_input_parts(
+                        &mut input,
+                        std::slice::from_ref(part),
+                        attachment_paths,
+                    )?;
+                }
+            }
         }
     }
-    let mut current_user = request.user_message.clone();
-    append_codex_part_text(&mut current_user, &request.user_content);
-    sections.push(format!("Current user request:\n{current_user}"));
-    if !request.tool_results.is_empty() {
-        sections.push(format!(
-            "Completed OpenTopia tool results:\n{}",
-            request
-                .tool_results
-                .iter()
-                .map(provider_tool_result_content)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    sections.join("\n\n")
+    Ok(input)
 }
 
-fn append_codex_part_text(output: &mut String, parts: &[ModelContentPart]) {
+fn push_codex_input_text(input: &mut Vec<Value>, text: impl Into<String>) {
+    let text = text.into();
+    if text.is_empty() {
+        return;
+    }
+    if let Some(existing) = input
+        .last_mut()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+    {
+        if let Some(current) = existing.get("text").and_then(Value::as_str) {
+            let combined = format!("{current}{text}");
+            existing["text"] = Value::String(combined);
+            return;
+        }
+    }
+    input.push(json!({ "type": "text", "text": text }));
+}
+
+fn append_codex_input_parts(
+    input: &mut Vec<Value>,
+    parts: &[ModelContentPart],
+    attachment_paths: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
     for part in parts {
-        let rendered = match part {
-            ModelContentPart::Text { text } => text.clone(),
-            ModelContentPart::Json { value } => value.to_string(),
-            ModelContentPart::Image { content_type, .. } => {
-                format!("[Attached image: {content_type}]")
+        match part {
+            ModelContentPart::Text { text } => push_codex_input_text(input, text),
+            ModelContentPart::Json { value } => {
+                push_codex_input_text(input, value.to_string());
+            }
+            ModelContentPart::Image { content_type, data } => {
+                let path = materialize_codex_image(content_type, data)?;
+                input.push(json!({
+                    "type": "localImage",
+                    "path": path,
+                    "detail": "original",
+                }));
+                attachment_paths.push(path);
             }
             ModelContentPart::Resource {
                 uri,
                 content_type,
                 name,
-            } => resource_fallback_text(uri, content_type.as_deref(), name.as_deref()),
-        };
-        if !output.is_empty() {
-            output.push('\n');
+            } => push_codex_input_text(
+                input,
+                resource_fallback_text(uri, content_type.as_deref(), name.as_deref()),
+            ),
         }
-        output.push_str(&rendered);
     }
+    Ok(())
 }
 
 fn materialize_codex_image(content_type: &str, data: &[u8]) -> anyhow::Result<PathBuf> {
@@ -5402,27 +5431,34 @@ mod tests {
     }
 
     #[test]
-    fn codex_turn_input_materializes_generic_image_as_local_attachment() {
+    fn codex_turn_input_preserves_order_around_local_image_attachments() {
         let mut request = model_request();
         request.user_content = vec![
-            ModelContentPart::text("inspect this"),
+            ModelContentPart::text("before image"),
             ModelContentPart::image("image/png", vec![0x89, b'P', b'N', b'G']),
+            ModelContentPart::text("after image"),
+            ModelContentPart::image("image/jpeg", vec![0xff, 0xd8, 0xff]),
         ];
         let mut paths = Vec::new();
 
         let input = codex_turn_input(&request, &mut paths).expect("build Codex local input");
 
+        assert_eq!(input.len(), 4);
         assert_eq!(input[0]["type"], "text");
-        assert!(input[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Attached image"));
+        assert!(input[0]["text"].as_str().unwrap().ends_with("before image"));
         assert_eq!(input[1]["type"], "localImage");
         assert_eq!(input[1]["detail"], "original");
-        assert_eq!(paths.len(), 1);
+        assert_eq!(input[2]["type"], "text");
+        assert_eq!(input[2]["text"], "after image");
+        assert_eq!(input[3]["type"], "localImage");
+        assert_eq!(paths.len(), 2);
         assert_eq!(
             paths[0].extension().and_then(|value| value.to_str()),
             Some("png")
+        );
+        assert_eq!(
+            paths[1].extension().and_then(|value| value.to_str()),
+            Some("jpg")
         );
         assert_eq!(
             std::fs::read(&paths[0]).unwrap(),

@@ -277,10 +277,16 @@ pub enum MessagePart {
         text: String,
     },
     Image {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<Uuid>,
+        #[serde(rename = "contentType", alias = "content_type")]
         content_type: String,
         data: Vec<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+    },
+    ImageRef {
+        image_id: Uuid,
     },
     ToolCall {
         call: ToolCall,

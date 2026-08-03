@@ -7,6 +7,11 @@ export {
 } from "./Button";
 export { ColorField, type ColorFieldProps } from "./ColorField";
 export { IconButton, type IconButtonProps } from "./IconButton";
+export {
+  InputDropdown,
+  type InputDropdownOption,
+  type InputDropdownProps,
+} from "./InputDropdown";
 export { NumberField, type NumberFieldProps } from "./NumberField";
 export { Panel, type PanelProps } from "./Panel";
 export { Popover, type PopoverAlign, type PopoverProps } from "./Popover";

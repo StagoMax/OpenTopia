@@ -49,7 +49,15 @@ import {
   modelVisionSupportSource,
 } from "../modelCapabilities";
 import { ModelInputDropdown } from "./ModelInputDropdown";
-import { Badge, Button, Panel, SegmentedControl, Select, Switch } from "./ui";
+import {
+  Badge,
+  Button,
+  InputDropdown,
+  Panel,
+  SegmentedControl,
+  Select,
+  Switch,
+} from "./ui";
 import { SettingsGroup, SettingsPage, SettingsRow } from "./SettingsLayout";
 import { AppearanceSettingsView } from "./AppearanceSettings";
 import { PersonalizationSettingsView } from "./PersonalizationSettings";
@@ -136,37 +144,37 @@ const providerBaseUrlPresets: readonly ProviderBaseUrlPreset[] = [
   },
   {
     id: "qwen-china",
-    label: "Qwen / DashScope (中国大陆)",
+    label: "Qwen / DashScope (CN)",
     baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     kind: "openai_compatible",
   },
   {
     id: "qwen-international",
-    label: "Qwen / DashScope (国际)",
+    label: "Qwen / DashScope (GLOBAL)",
     baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     kind: "openai_compatible",
   },
   {
     id: "moonshot-china",
-    label: "Moonshot / Kimi (中国大陆)",
+    label: "Moonshot / Kimi (CN)",
     baseUrl: "https://api.moonshot.cn/v1",
     kind: "openai_compatible",
   },
   {
     id: "moonshot-international",
-    label: "Moonshot / Kimi (国际)",
+    label: "Moonshot / Kimi (GLOBAL)",
     baseUrl: "https://api.moonshot.ai/v1",
     kind: "openai_compatible",
   },
   {
     id: "zhipu-china",
-    label: "Zhipu AI / GLM (中国大陆)",
+    label: "Zhipu AI / GLM (CN)",
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
     kind: "openai_compatible",
   },
   {
     id: "zhipu-international",
-    label: "Z.AI / GLM (国际)",
+    label: "Z.AI / GLM (GLOBAL)",
     baseUrl: "https://api.z.ai/api/paas/v4",
     kind: "openai_compatible",
   },
@@ -176,6 +184,31 @@ const providerBaseUrlPresets: readonly ProviderBaseUrlPreset[] = [
     baseUrl: "http://localhost:11434/v1",
     kind: "openai_compatible",
   },
+];
+
+const contextWindowPresets = [
+  { tokens: 8_000, label: "8K" },
+  { tokens: 32_000, label: "32K" },
+  { tokens: 64_000, label: "64K" },
+  { tokens: 128_000, label: "128K" },
+  { tokens: 200_000, label: "200K" },
+  { tokens: 256_000, label: "256K" },
+  { tokens: 400_000, label: "400K" },
+  { tokens: 1_000_000, label: "1M" },
+  { tokens: 1_050_000, label: "1.05M" },
+] as const;
+
+const providerBaseUrlPresetOptions = providerBaseUrlPresets.map((preset) => ({
+  value: preset.id,
+  label: preset.label,
+}));
+
+const contextWindowPresetOptions = [
+  { value: "auto", label: "自动识别" },
+  ...contextWindowPresets.map((preset) => ({
+    value: preset.tokens.toString(),
+    label: preset.label,
+  })),
 ];
 
 const settingsSectionLabels: Record<SettingsSection, string> = {
@@ -233,9 +266,7 @@ type SettingsPanelProps = {
   onTestProvider(providerId: string, providers?: ProviderSettings[]): void;
   // Pulls the connection's model list so families can be picked from what the
   // endpoint actually serves. Includes any context limits it advertises.
-  onSyncProviderModels(
-    providerId: string,
-  ): Promise<ProviderModelSyncResult>;
+  onSyncProviderModels(providerId: string): Promise<ProviderModelSyncResult>;
   onStoreProviderApiKey(
     providerId: string,
     value: string,
@@ -672,7 +703,10 @@ export function SettingsPanel({
     if (!initialProvider) return;
 
     const initialApiKey = pendingApiKeysRef.current[providerId]?.trim() ?? "";
-    const signature = providerDiscoverySignature(initialProvider, initialApiKey);
+    const signature = providerDiscoverySignature(
+      initialProvider,
+      initialApiKey,
+    );
     if (!signature) {
       setModelDiscoveryState(providerId, {
         status: "error",
@@ -1697,9 +1731,7 @@ function ProviderSettingsView({
 
   function selectBaseUrlPreset(presetId: string) {
     if (!editingProvider) return;
-    const preset = providerBaseUrlPresets.find(
-      (item) => item.id === presetId,
-    );
+    const preset = providerBaseUrlPresets.find((item) => item.id === presetId);
     if (!preset) return;
     onUpdateProvider(editingProvider.id, "baseUrl", preset.baseUrl);
     if (preset.kind !== editingProvider.kind) {
@@ -1844,33 +1876,22 @@ function ProviderSettingsView({
                 <>
                   <label className="settings-field-wide">
                     <span>Base URL</span>
-                    <div className="settings-base-url-input">
-                      <input
-                        type="url"
-                        value={editingProvider.baseUrl}
-                        spellCheck={false}
-                        placeholder="https://api.example.com/v1"
-                        onChange={(event) =>
-                          onUpdateProvider(
-                            editingProvider.id,
-                            "baseUrl",
-                            event.target.value,
-                          )
-                        }
-                      />
-                      <select
-                        aria-label="选择常用 Base URL"
-                        value={selectedBaseUrlPresetId}
-                        onChange={(event) => selectBaseUrlPreset(event.target.value)}
-                      >
-                        <option value="">常用服务</option>
-                        {providerBaseUrlPresets.map((preset) => (
-                          <option key={preset.id} value={preset.id}>
-                            {preset.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
+                    <InputDropdown
+                      value={editingProvider.baseUrl}
+                      options={providerBaseUrlPresetOptions}
+                      selectedOptionValue={selectedBaseUrlPresetId}
+                      inputProps={{
+                        type: "url",
+                        spellCheck: false,
+                        placeholder: "https://api.example.com/v1",
+                      }}
+                      label="选择常用 Base URL"
+                      menuLabel="常用 Base URL"
+                      onValueChange={(value) =>
+                        onUpdateProvider(editingProvider.id, "baseUrl", value)
+                      }
+                      onOptionSelect={selectBaseUrlPreset}
+                    />
                   </label>
                   <label className="settings-field-wide">
                     <span>API 密钥</span>
@@ -2808,6 +2829,12 @@ function ModelConfigurationSection({
   const reportedContextWindow = connection.modelContextWindows?.[modelId];
   const visionSource = modelVisionSupportSource(connection, modelId);
   const supportsVision = modelSupportsVision(connection, modelId);
+  const selectedContextWindowPreset =
+    modelSettings?.contextWindowTokens == null
+      ? "auto"
+      : (contextWindowPresets
+          .find((preset) => preset.tokens === modelSettings.contextWindowTokens)
+          ?.tokens.toString() ?? null);
 
   function updateModelSettings(patch: Partial<ProviderModelSettings>) {
     if (!modelId) return;
@@ -2831,6 +2858,15 @@ function ModelConfigurationSection({
       nextSettings[modelId] = nextModelSettings;
     }
     onUpdateProvider(connection.id, "modelSettings", nextSettings);
+  }
+
+  function selectContextWindowPreset(value: string) {
+    if (value === "auto") {
+      resetModelSetting("contextWindowTokens");
+      return;
+    }
+    if (!value) return;
+    updateModelSettings({ contextWindowTokens: Number(value) });
   }
 
   if (modelIds.length === 0) return null;
@@ -2916,19 +2952,26 @@ function ModelConfigurationSection({
         <div className="settings-field-wide">
           <label>
             <span>上下文窗口覆盖值</span>
-            <input
-              type="number"
-              min="4096"
-              step="1024"
+            <InputDropdown
               value={modelSettings?.contextWindowTokens ?? ""}
-              placeholder={reportedContextWindow ? "API 自动识别" : "自动识别"}
-              onChange={(event) =>
-                event.target.value
-                  ? updateModelSettings({
-                      contextWindowTokens: Number(event.target.value),
-                    })
+              options={contextWindowPresetOptions}
+              selectedOptionValue={selectedContextWindowPreset}
+              inputProps={{
+                type: "number",
+                min: 4096,
+                step: 1024,
+                placeholder: reportedContextWindow
+                  ? "API 自动识别"
+                  : "自动识别",
+              }}
+              label="选择常用上下文窗口"
+              menuLabel="常用上下文窗口"
+              onValueChange={(value) =>
+                value
+                  ? updateModelSettings({ contextWindowTokens: Number(value) })
                   : resetModelSetting("contextWindowTokens")
               }
+              onOptionSelect={selectContextWindowPreset}
             />
             <small role="status">
               {modelSettings?.contextWindowTokens !== undefined
@@ -2938,15 +2981,6 @@ function ModelConfigurationSection({
                   : "API 未报告上下文窗口，将使用内置模型表或连接默认值。"}
             </small>
           </label>
-          {modelSettings?.contextWindowTokens !== undefined ? (
-            <Button
-              size="compact"
-              variant="quiet"
-              onClick={() => resetModelSetting("contextWindowTokens")}
-            >
-              恢复自动识别
-            </Button>
-          ) : null}
         </div>
         {reasoningCapability.status === "unsupported" ? (
           <div

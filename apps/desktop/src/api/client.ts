@@ -26,6 +26,7 @@ import type {
   GoalSnapshot,
   GoalStatus,
   InlineImageAttachment,
+  InlineMessageContentPart,
   LocalGitOperation,
   LocalGitResponse,
   McpCallResult,
@@ -596,6 +597,7 @@ export class ApiClient {
     collaborationMode: CollaborationMode = "default",
     goalId?: string,
     imageAttachments: InlineImageAttachment[] = [],
+    contentParts: InlineMessageContentPart[] = [],
   ): Promise<{
     message: Message;
     turnId: string | null;
@@ -613,6 +615,7 @@ export class ApiClient {
           collaborationMode,
           goalId,
           imageAttachments,
+          contentParts,
         }),
       },
     );

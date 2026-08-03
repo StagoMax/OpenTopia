@@ -9,6 +9,7 @@ import {
 import type { InlineImageAttachment, McpToolDescriptor } from "./types.ts";
 
 const attachment: InlineImageAttachment = {
+  id: "11111111-1111-4111-8111-111111111111",
   contentType: "image/png",
   data: [1, 2, 3],
   name: "sample.png",

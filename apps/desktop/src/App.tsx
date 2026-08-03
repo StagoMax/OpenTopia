@@ -50,6 +50,7 @@ import {
   GitFork,
   Globe2,
   Hand,
+  ImagePlus,
   Laptop,
   ListTodo,
   Loader2,
@@ -71,6 +72,7 @@ import {
   Plus,
   Presentation,
   RotateCcw,
+  Quote,
   Search,
   Settings,
   ShieldAlert,
@@ -116,6 +118,11 @@ import { ComputerPanel } from "./components/ComputerPanel";
 import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
 import { Button, IconButton, Popover } from "./components/ui";
 import { normalizeCopiedText } from "./clipboardText";
+import {
+  composerContentText,
+  normalizeComposerContentParts,
+  referencedImageIds,
+} from "./composerContent";
 import { isConversationScrollNearEnd } from "./conversationScroll";
 import {
   conversationStreamEventTrace,
@@ -192,6 +199,7 @@ import type {
   GoalSnapshot,
   GoalStatus,
   InlineImageAttachment,
+  InlineMessageContentPart,
   McpServerInput,
   McpServerView,
   McpToolDescriptor,
@@ -2651,6 +2659,7 @@ export function App() {
   async function createThread(
     initialPrompt?: string,
     imageAttachments: InlineImageAttachment[] = [],
+    contentParts: InlineMessageContentPart[] = [],
   ): Promise<boolean> {
     if (!client) return false;
     if (newTaskLaunchMode === "new_worktree") {
@@ -2763,6 +2772,7 @@ export function App() {
           collaborationMode,
           undefined,
           prepared.imageAttachments,
+          prepared.imageAttachments.length > 0 ? contentParts : [],
         );
         setMessages([message]);
         setThreadActivityStatus(thread.id, "processing");
@@ -2858,6 +2868,7 @@ export function App() {
   async function submitMessage(
     input: string,
     imageAttachments: InlineImageAttachment[] = [],
+    contentParts: InlineMessageContentPart[] = [],
   ): Promise<boolean> {
     const messageText = input.trim();
     if (
@@ -2915,6 +2926,7 @@ export function App() {
         collaborationMode,
         reusableGoalId(collaborationMode, goalSnapshot),
         prepared.imageAttachments,
+        prepared.imageAttachments.length > 0 ? contentParts : [],
       );
       setMessages((current) => [...current, message]);
       setThreadActivityStatus(activeThread.id, "processing");
@@ -7673,11 +7685,26 @@ const MessageBubble = memo(function MessageBubble({
   onOpenArtifact(artifactId: string): void;
   onOpenMarkdownLink(href: string): void;
 }) {
+  const referencedImageIds = new Set(
+    message.parts.flatMap((part) =>
+      part.type === "image_ref" ? [part.image_id] : [],
+    ),
+  );
+  const imagesById = new Map(
+    message.parts.flatMap((part) =>
+      part.type === "image" && part.id ? [[part.id, part] as const] : [],
+    ),
+  );
   const visibleParts = message.parts.filter(
     (part) =>
       part.type !== "turn_context" &&
       part.type !== "tool_call" &&
-      part.type !== "tool_result",
+      part.type !== "tool_result" &&
+      !(
+        part.type === "image" &&
+        part.id &&
+        referencedImageIds.has(part.id)
+      ),
   );
   if (visibleParts.length === 0) return null;
 
@@ -7689,6 +7716,11 @@ const MessageBubble = memo(function MessageBubble({
             key={index}
             messageId={message.id}
             part={part}
+            referencedImage={
+              part.type === "image_ref"
+                ? imagesById.get(part.image_id)
+                : undefined
+            }
             role={message.role}
             threadId={threadId}
             artifacts={artifacts}
@@ -7704,6 +7736,7 @@ const MessageBubble = memo(function MessageBubble({
 function MessagePartView({
   messageId,
   part,
+  referencedImage,
   role,
   threadId,
   artifacts,
@@ -7712,6 +7745,7 @@ function MessagePartView({
 }: {
   messageId: string;
   part: MessagePart;
+  referencedImage?: Extract<MessagePart, { type: "image" }>;
   role: Message["role"];
   threadId: string;
   artifacts: ArtifactDescriptor[];
@@ -7720,6 +7754,13 @@ function MessagePartView({
 }) {
   if (part.type === "image") {
     return <InlineImageMessagePart part={part} />;
+  }
+  if (part.type === "image_ref") {
+    return referencedImage ? (
+      <InlineImageMessagePart part={referencedImage} compact />
+    ) : (
+      <span className="message-image-reference-missing">[图片不可用]</span>
+    );
   }
   if (part.type === "text") {
     const refs = artifactReferencesFromText(part.text);
@@ -7737,7 +7778,7 @@ function MessagePartView({
             text={part.text}
           />
         ) : (
-          <p className="message-text">{part.text}</p>
+          <span className="message-text">{part.text}</span>
         )}
         <MessageArtifactLinks
           refs={refs}
@@ -7784,23 +7825,31 @@ function MessagePartView({
 
 function InlineImageMessagePart({
   part,
+  compact = false,
 }: {
   part: Extract<MessagePart, { type: "image" }>;
+  compact?: boolean;
 }) {
+  const contentType =
+    part.contentType ||
+    (part as typeof part & { content_type?: string }).content_type ||
+    "application/octet-stream";
   const previewUrl = useMemo(
     () =>
       URL.createObjectURL(
-        new Blob([new Uint8Array(part.data)], { type: part.contentType }),
+        new Blob([new Uint8Array(part.data)], { type: contentType }),
       ),
-    [part.contentType, part.data],
+    [contentType, part.data],
   );
 
   useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
 
   return (
-    <div className="message-inline-image">
+    <span
+      className={`message-inline-image ${compact ? "is-reference" : ""}`}
+    >
       <img src={previewUrl} alt={part.name || "已发送图片"} />
-    </div>
+    </span>
   );
 }
 
@@ -7948,9 +7997,125 @@ const MAX_COMPOSER_IMAGES = 10;
 const MAX_COMPOSER_IMAGE_BYTES = 25 * 1024 * 1024;
 
 type ComposerImageAttachment = InlineImageAttachment & {
-  id: string;
   previewUrl: string;
+  fingerprint: string;
 };
+
+async function imageFileFingerprint(file: File): Promise<{
+  data: number[];
+  fingerprint: string;
+}> {
+  const buffer = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return {
+    data: Array.from(new Uint8Array(buffer)),
+    fingerprint: `${file.type}:${fingerprint}`,
+  };
+}
+
+function pushComposerText(
+  parts: InlineMessageContentPart[],
+  text: string,
+) {
+  if (!text) return;
+  const previous = parts.at(-1);
+  if (previous?.type === "text") previous.text += text;
+  else parts.push({ type: "text", text });
+}
+
+function readComposerContentParts(
+  editor: HTMLElement,
+): InlineMessageContentPart[] {
+  const parts: InlineMessageContentPart[] = [];
+  const visit = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      pushComposerText(parts, node.textContent ?? "");
+      return;
+    }
+    if (!(node instanceof HTMLElement)) return;
+    const imageId = node.dataset.composerImageId;
+    if (imageId) {
+      parts.push({ type: "image_ref", imageId });
+      return;
+    }
+    if (node.tagName === "BR") {
+      pushComposerText(parts, "\n");
+      return;
+    }
+    const block = node !== editor && ["DIV", "P"].includes(node.tagName);
+    if (block) {
+      const previous = parts.at(-1);
+      if (previous?.type === "text" && !previous.text.endsWith("\n")) {
+        previous.text += "\n";
+      }
+    }
+    node.childNodes.forEach(visit);
+    if (block) pushComposerText(parts, "\n");
+  };
+  editor.childNodes.forEach(visit);
+  return normalizeComposerContentParts(parts);
+}
+
+function createComposerImageReferenceNode(
+  attachment: ComposerImageAttachment,
+): HTMLElement {
+  const wrapper = document.createElement("span");
+  wrapper.className = "composer-inline-image-reference";
+  wrapper.dataset.composerImageId = attachment.id;
+  wrapper.contentEditable = "false";
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "composer-inline-image-button";
+  button.dataset.composerImageId = attachment.id;
+  button.title = attachment.name || "预览图片";
+  button.setAttribute("aria-label", `预览 ${attachment.name || "图片"}`);
+
+  const image = document.createElement("img");
+  image.src = attachment.previewUrl;
+  image.alt = "";
+  image.setAttribute("aria-hidden", "true");
+  button.append(image);
+  wrapper.append(button);
+  return wrapper;
+}
+
+function rangeBelongsToEditor(editor: HTMLElement, range: Range | null): boolean {
+  if (!range) return false;
+  const container =
+    range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+      ? range.commonAncestorContainer.parentNode
+      : range.commonAncestorContainer;
+  return Boolean(container && editor.contains(container));
+}
+
+function endOfComposerRange(editor: HTMLElement): Range {
+  const range = document.createRange();
+  range.selectNodeContents(editor);
+  range.collapse(false);
+  return range;
+}
+
+function composerRangeAtPoint(x: number, y: number): Range | null {
+  const rangedDocument = document as Document & {
+    caretRangeFromPoint?(x: number, y: number): Range | null;
+    caretPositionFromPoint?(x: number, y: number): {
+      offsetNode: Node;
+      offset: number;
+    } | null;
+  };
+  const direct = rangedDocument.caretRangeFromPoint?.(x, y);
+  if (direct) return direct;
+  const position = rangedDocument.caretPositionFromPoint?.(x, y);
+  if (!position) return null;
+  const range = document.createRange();
+  range.setStart(position.offsetNode, position.offset);
+  range.collapse(true);
+  return range;
+}
 
 function fileExtension(name: string): string {
   const baseName = name.split(/[\\/]/).pop() ?? name;
@@ -8098,6 +8263,7 @@ function Composer({
   onSubmit(
     value: string,
     imageAttachments: InlineImageAttachment[],
+    contentParts: InlineMessageContentPart[],
   ): Promise<boolean>;
   onCancel(): void;
   onPickWorkspace(): void;
@@ -8125,8 +8291,19 @@ function Composer({
   >([]);
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [imageContextMenu, setImageContextMenu] = useState<{
+    imageId: string;
+    x: number;
+    y: number;
+  } | null>(null);
   const dragDepthRef = useRef(0);
   const imageAttachmentsRef = useRef(imageAttachments);
+  const editorRef = useRef<HTMLDivElement>(null);
+  const imageFileInputRef = useRef<HTMLInputElement>(null);
+  const savedComposerRangeRef = useRef<Range | null>(null);
+  const contextMenuInsertionRangeRef = useRef<Range | null>(null);
+  const contextMenuReferenceRef = useRef<HTMLElement | null>(null);
+  const imageContextMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     imageAttachmentsRef.current = imageAttachments;
@@ -8145,71 +8322,214 @@ function Composer({
     setDraft(value);
   }, [value]);
 
+  useLayoutEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || imageAttachmentsRef.current.length > 0) return;
+    const current = composerContentText(readComposerContentParts(editor), []);
+    if (current === value) return;
+    editor.textContent = value;
+  }, [value]);
+
+  useEffect(() => {
+    const rememberSelection = () => {
+      const editor = editorRef.current;
+      const selection = window.getSelection();
+      if (!editor || !selection || selection.rangeCount === 0) return;
+      const range = selection.getRangeAt(0);
+      if (rangeBelongsToEditor(editor, range)) {
+        savedComposerRangeRef.current = range.cloneRange();
+      }
+    };
+    document.addEventListener("selectionchange", rememberSelection);
+    return () => document.removeEventListener("selectionchange", rememberSelection);
+  }, []);
+
+  useEffect(() => {
+    if (!imageContextMenu) return;
+    const close = () => setImageContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [imageContextMenu]);
+
+  useLayoutEffect(() => {
+    const menu = imageContextMenuRef.current;
+    if (!menu || !imageContextMenu) return;
+    const bounds = menu.getBoundingClientRect();
+    const nextX = Math.max(
+      0,
+      imageContextMenu.x - Math.max(0, bounds.right - window.innerWidth),
+    );
+    const nextY = Math.max(
+      0,
+      imageContextMenu.y - Math.max(0, bounds.bottom - window.innerHeight),
+    );
+    if (nextX !== imageContextMenu.x || nextY !== imageContextMenu.y) {
+      setImageContextMenu((current) =>
+        current ? { ...current, x: nextX, y: nextY } : null,
+      );
+    }
+  }, [imageContextMenu]);
+
+  function syncComposerState() {
+    const editor = editorRef.current;
+    if (!editor) return;
+    if (
+      !editor.textContent &&
+      !editor.querySelector("[data-composer-image-id]")
+    ) {
+      editor.replaceChildren();
+    }
+    const parts = readComposerContentParts(editor);
+    const usedIds = referencedImageIds(parts);
+    const currentAttachments = imageAttachmentsRef.current;
+    const nextAttachments = currentAttachments.filter((attachment) => {
+      const keep = usedIds.has(attachment.id);
+      if (!keep) URL.revokeObjectURL(attachment.previewUrl);
+      return keep;
+    });
+    if (nextAttachments.length !== currentAttachments.length) {
+      imageAttachmentsRef.current = nextAttachments;
+      setImageAttachments(nextAttachments);
+      setPreviewIndex((current) =>
+        current !== null && current >= nextAttachments.length ? null : current,
+      );
+    }
+    const text = composerContentText(parts, nextAttachments);
+    setDraft(text);
+    onChange(text);
+  }
+
+  function insertImageReference(
+    attachment: ComposerImageAttachment,
+    requestedRange: Range | null = savedComposerRangeRef.current,
+  ) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const range = rangeBelongsToEditor(editor, requestedRange)
+      ? requestedRange!.cloneRange()
+      : endOfComposerRange(editor);
+    const node = createComposerImageReferenceNode(attachment);
+    range.deleteContents();
+    range.insertNode(node);
+    range.setStartAfter(node);
+    range.collapse(true);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    savedComposerRangeRef.current = range.cloneRange();
+    editor.focus();
+  }
+
+  async function addImageFiles(
+    files: File[],
+    requestedRange: Range | null = savedComposerRangeRef.current,
+  ) {
+    const acceptedFiles = files
+      .filter((file) => file.type.startsWith("image/"))
+      .filter((file) => file.size <= MAX_COMPOSER_IMAGE_BYTES);
+    if (acceptedFiles.length === 0) return;
+
+    const next: ComposerImageAttachment[] = [];
+    const references: ComposerImageAttachment[] = [];
+    for (const file of acceptedFiles) {
+      const { data, fingerprint } = await imageFileFingerprint(file);
+      const existing = [...imageAttachmentsRef.current, ...next].find(
+        (attachment) => attachment.fingerprint === fingerprint,
+      );
+      if (existing) {
+        references.push(existing);
+        continue;
+      }
+      if (imageAttachmentsRef.current.length + next.length >= MAX_COMPOSER_IMAGES) {
+        continue;
+      }
+      const attachment = {
+        id: crypto.randomUUID(),
+        name: file.name || `pasted-image-${next.length + 1}.png`,
+        contentType: file.type || "image/png",
+        data,
+        previewUrl: URL.createObjectURL(file),
+        fingerprint,
+      };
+      next.push(attachment);
+      references.push(attachment);
+    }
+    if (references.length === 0) return;
+    const combined = [...imageAttachmentsRef.current, ...next];
+    imageAttachmentsRef.current = combined;
+    setImageAttachments(combined);
+
+    let range = requestedRange?.cloneRange() ?? null;
+    for (const attachment of references) {
+      insertImageReference(attachment, range);
+      range = savedComposerRangeRef.current?.cloneRange() ?? null;
+    }
+    syncComposerState();
+  }
+
+  function removeImageReference(reference: HTMLElement | null) {
+    if (!reference?.isConnected) return;
+    reference.remove();
+    syncComposerState();
+  }
+
   const submitDraft = async () => {
     if (isSending) return;
-    const submittedValue = draft;
-    const submittedAttachments = imageAttachments.map(
-      ({ id: _id, previewUrl: _previewUrl, ...attachment }) => attachment,
+    const editor = editorRef.current;
+    const parts = editor ? readComposerContentParts(editor) : [];
+    const usedIds = referencedImageIds(parts);
+    const currentAttachments = imageAttachmentsRef.current;
+    const submittedAttachments = currentAttachments
+      .filter((attachment) => usedIds.has(attachment.id))
+      .map(
+        ({
+          previewUrl: _previewUrl,
+          fingerprint: _fingerprint,
+          ...attachment
+        }) => attachment,
+      );
+    const submittedValue =
+      submittedAttachments.length > 0
+        ? composerContentText(parts, submittedAttachments)
+        : draft;
+    const accepted = await onSubmit(
+      submittedValue,
+      submittedAttachments,
+      submittedAttachments.length > 0 ? parts : [],
     );
-    const accepted = await onSubmit(submittedValue, submittedAttachments);
     if (!accepted) return;
-    imageAttachments.forEach((attachment) =>
+    currentAttachments.forEach((attachment) =>
       URL.revokeObjectURL(attachment.previewUrl),
     );
     setImageAttachments([]);
+    imageAttachmentsRef.current = [];
     setPreviewIndex(null);
+    if (editor) editor.replaceChildren();
     setDraft("");
     onChange("");
   };
 
-  async function handlePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+  async function handlePaste(event: ReactClipboardEvent<HTMLDivElement>) {
     const items = Array.from(event.clipboardData.items).filter(
       (item) => item.kind === "file" && item.type.startsWith("image/"),
     );
     if (items.length === 0) return;
 
     event.preventDefault();
-    const remaining = Math.max(
-      0,
-      MAX_COMPOSER_IMAGES - imageAttachments.length,
-    );
-    const next: ComposerImageAttachment[] = [];
-    for (const item of items.slice(0, remaining)) {
-      const file = item.getAsFile();
-      if (!file || file.size > MAX_COMPOSER_IMAGE_BYTES) continue;
-      const data = Array.from(new Uint8Array(await file.arrayBuffer()));
-      next.push({
-        id: `pasted-image-${Date.now()}-${next.length}`,
-        name: file.name || `pasted-image-${next.length + 1}.png`,
-        contentType: file.type || "image/png",
-        data,
-        previewUrl: URL.createObjectURL(file),
-      });
-    }
-    if (next.length > 0) {
-      setImageAttachments((current) => [...current, ...next]);
-    }
-  }
-
-  function removeImageAttachment(id: string) {
-    setImageAttachments((current) => {
-      const removedIndex = current.findIndex(
-        (attachment) => attachment.id === id,
-      );
-      const removed = removedIndex >= 0 ? current[removedIndex] : undefined;
-      if (removed) URL.revokeObjectURL(removed.previewUrl);
-      const next = current.filter((attachment) => attachment.id !== id);
-      if (previewIndex !== null) {
-        if (next.length === 0) {
-          setPreviewIndex(null);
-        } else if (removedIndex < previewIndex) {
-          setPreviewIndex(previewIndex - 1);
-        } else if (previewIndex >= next.length) {
-          setPreviewIndex(next.length - 1);
-        }
-      }
-      return next;
-    });
+    const range = savedComposerRangeRef.current?.cloneRange() ?? null;
+    const files = items
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file));
+    await addImageFiles(files, range);
   }
 
   function handleDragEnter(event: ReactDragEvent<HTMLDivElement>) {
@@ -8236,7 +8556,13 @@ function Composer({
     dragDepthRef.current = 0;
     setIsDraggingFiles(false);
     const files = Array.from(event.dataTransfer.files);
-    if (files.length > 0) void onAddContextSources(files);
+    const images = files.filter((file) => file.type.startsWith("image/"));
+    const otherFiles = files.filter((file) => !file.type.startsWith("image/"));
+    if (images.length > 0) {
+      const range = composerRangeAtPoint(event.clientX, event.clientY);
+      void addImageFiles(images, range);
+    }
+    if (otherFiles.length > 0) void onAddContextSources(otherFiles);
   }
 
   const hasSendableContent = Boolean(
@@ -8250,7 +8576,7 @@ function Composer({
     <div className="composer-shell">
       {taskPlan ? <ComposerTaskPlan plan={taskPlan} /> : null}
       <div
-        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || imageAttachments.length || selectedSkillIds.length ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
+        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
         ref={popoverRef}
         onDragEnter={handleDragEnter}
         onDragOver={handleDragOver}
@@ -8457,33 +8783,8 @@ function Composer({
             </button>
           </div>
         )}
-        {(contextSources.length > 0 ||
-          imageAttachments.length > 0 ||
-          selectedSkillIds.length > 0) && (
+        {(contextSources.length > 0 || selectedSkillIds.length > 0) && (
           <div className="composer-sources" aria-label="已添加来源">
-            {imageAttachments.map((attachment, index) => (
-              <span className="composer-image-attachment" key={attachment.id}>
-                <button
-                  className="composer-image-preview-button"
-                  type="button"
-                  title={`预览 ${attachment.name}`}
-                  aria-label={`预览 ${attachment.name}`}
-                  onClick={() => setPreviewIndex(index)}
-                >
-                  <img src={attachment.previewUrl} alt={attachment.name} />
-                </button>
-                <IconButton
-                  className="composer-image-remove"
-                  size="compact"
-                  type="button"
-                  aria-label={`移除 ${attachment.name}`}
-                  title={`移除 ${attachment.name}`}
-                  onClick={() => removeImageAttachment(attachment.id)}
-                >
-                  <X size={14} aria-hidden="true" />
-                </IconButton>
-              </span>
-            ))}
             {contextSources.map((source) => (
               <span
                 className="composer-source"
@@ -8532,16 +8833,62 @@ function Composer({
             <span>释放以添加文件</span>
           </div>
         ) : null}
-        <textarea
+        <div
+          ref={editorRef}
           autoFocus={autoFocus}
-          value={draft}
+          className="composer-rich-input"
+          contentEditable
+          suppressContentEditableWarning
+          role="textbox"
           aria-label="消息"
-          placeholder={collaborationModePlaceholder(collaborationMode)}
+          aria-multiline="true"
+          data-placeholder={collaborationModePlaceholder(collaborationMode)}
           onFocus={closeMenus}
-          onPointerDown={closeMenus}
+          onPointerDown={(event) => {
+            closeMenus();
+            if (
+              event.button === 2 &&
+              (event.target as Element).closest("[data-composer-image-id]")
+            ) {
+              contextMenuInsertionRangeRef.current =
+                savedComposerRangeRef.current?.cloneRange() ?? null;
+            }
+          }}
           onPaste={(event) => void handlePaste(event)}
-          onChange={(event) => setDraft(event.target.value)}
+          onInput={syncComposerState}
+          onClick={(event) => {
+            const target = (event.target as Element).closest<HTMLElement>(
+              ".composer-inline-image-button",
+            );
+            const imageId = target?.dataset.composerImageId;
+            if (!imageId) return;
+            const index = imageAttachmentsRef.current.findIndex(
+              (attachment) => attachment.id === imageId,
+            );
+            if (index >= 0) setPreviewIndex(index);
+          }}
+          onContextMenu={(event) => {
+            const reference = (event.target as Element).closest<HTMLElement>(
+              ".composer-inline-image-reference",
+            );
+            const imageId = reference?.dataset.composerImageId;
+            if (!imageId) return;
+            event.preventDefault();
+            contextMenuReferenceRef.current = reference;
+            setImageContextMenu({
+              imageId,
+              x: event.clientX,
+              y: event.clientY,
+            });
+          }}
           onKeyDown={(event) => {
+            if (
+              (event.target as Element).closest(
+                ".composer-inline-image-button",
+              )
+            ) {
+              return;
+            }
             if (
               event.key === "Enter" &&
               !event.altKey &&
@@ -8551,6 +8898,18 @@ function Composer({
               event.preventDefault();
               submitDraft();
             }
+          }}
+        />
+        <input
+          ref={imageFileInputRef}
+          hidden
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={(event) => {
+            const files = Array.from(event.target.files ?? []);
+            event.target.value = "";
+            void addImageFiles(files);
           }}
         />
         <div className="composer-toolbar">
@@ -8674,6 +9033,16 @@ function Composer({
         </button>
         {openMenu === "actions" && (
           <div className="tool-popover composer-actions-popover" role="menu">
+            <button
+              role="menuitem"
+              onClick={() => {
+                imageFileInputRef.current?.click();
+                setOpenMenu(null);
+              }}
+            >
+              <ImagePlus size={14} aria-hidden="true" />
+              <span>图片</span>
+            </button>
             <div className="composer-actions-section-label">添加</div>
             <button
               role="menuitem"
@@ -8752,6 +9121,51 @@ function Composer({
           onClose={() => setPreviewIndex(null)}
         />
       ) : null}
+      {imageContextMenu
+        ? createPortal(
+            <div
+              ref={imageContextMenuRef}
+              className="tool-popover composer-image-context-menu"
+              role="menu"
+              style={{ left: imageContextMenu.x, top: imageContextMenu.y }}
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              <button
+                role="menuitem"
+                onClick={() => {
+                  const attachment = imageAttachmentsRef.current.find(
+                    (item) => item.id === imageContextMenu.imageId,
+                  );
+                  if (attachment) {
+                    insertImageReference(
+                      attachment,
+                      contextMenuInsertionRangeRef.current,
+                    );
+                    syncComposerState();
+                  }
+                  contextMenuInsertionRangeRef.current = null;
+                  setImageContextMenu(null);
+                }}
+              >
+                <Quote size={14} aria-hidden="true" />
+                <span>引用</span>
+              </button>
+              <button
+                role="menuitem"
+                onClick={() => {
+                  removeImageReference(contextMenuReferenceRef.current);
+                  contextMenuInsertionRangeRef.current = null;
+                  contextMenuReferenceRef.current = null;
+                  setImageContextMenu(null);
+                }}
+              >
+                <Trash2 size={14} aria-hidden="true" />
+                <span>删除此引用</span>
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
     </div>
   );
 }
@@ -9259,6 +9673,7 @@ function SideTaskConversation({
   async function submitSideTaskMessage(
     input: string,
     imageAttachments: InlineImageAttachment[],
+    contentParts: InlineMessageContentPart[],
   ): Promise<boolean> {
     const messageText = input.trim();
     if (
@@ -9294,6 +9709,7 @@ function SideTaskConversation({
         collaborationMode,
         undefined,
         imageAttachments,
+        contentParts,
       );
       setMessages((current) => [...current, message]);
       setActiveTurnId(turnId);
@@ -10133,6 +10549,7 @@ function NewTaskState({
   onSubmit(
     value: string,
     imageAttachments: InlineImageAttachment[],
+    contentParts: InlineMessageContentPart[],
   ): Promise<boolean>;
 }) {
   const suggestions =

@@ -51,10 +51,15 @@ export type ContextSourcePickResult =
   | { canceled: false; files: ContextSourceFile[] };
 
 export type InlineImageAttachment = {
+  id: string;
   contentType: string;
   data: number[];
   name?: string;
 };
+
+export type InlineMessageContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_ref"; imageId: string };
 
 export type PluginDirectoryPickResult =
   { canceled: true } | { canceled: false; path: string };
@@ -1240,7 +1245,8 @@ export type Message = {
 
 export type MessagePart =
   | { type: "text"; text: string }
-  | ({ type: "image" } & InlineImageAttachment)
+  | ({ type: "image" } & Omit<InlineImageAttachment, "id"> & { id?: string })
+  | { type: "image_ref"; image_id: string }
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; result: ToolResult }
   | { type: "file_ref"; path: string }

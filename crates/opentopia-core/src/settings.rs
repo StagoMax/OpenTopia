@@ -515,146 +515,267 @@ pub fn known_model_context_window_tokens(model: &str) -> Option<usize> {
 }
 
 fn context_window_for_base(model: &str) -> Option<usize> {
-    // ── OpenAI ──────────────────────────────────────────────────────────
-    // Verified against OpenAI's model pages on 2026-08-02. Do not confuse a
-    // model's maximum input with its complete context window.
-    if model.starts_with("gpt-5.6") || model.starts_with("gpt-5.5") {
-        return Some(1_050_000);
-    }
-    if model.starts_with("gpt-5.4") {
-        return if model.starts_with("gpt-5.4-mini") || model.starts_with("gpt-5.4-nano") {
-            Some(400_000)
-        } else {
-            Some(1_050_000)
-        };
-    }
-    if model.starts_with("gpt-5.3-codex") {
-        return Some(400_000);
-    }
-    if model.starts_with("gpt-5") {
-        return Some(400_000);
-    }
-    if model.starts_with("gpt-4.1") {
-        return Some(1_047_576);
-    }
-    if model.starts_with("gpt-4o") || model.starts_with("gpt-4-turbo") {
-        return Some(128_000);
-    }
-    if is_openai_reasoning_model(model) {
-        return Some(200_000);
-    }
+    // Snapshot from https://openrouter.ai/api/v1/models, verified 2026-08-02.
+    // Direct-provider aliases not currently present in that catalog are marked
+    // below. This is deliberately an exact-ID table: a model-family prefix is
+    // not a reliable context window contract.
+    const WINDOWS: &[(&str, usize)] = &[
+        // OpenAI (official docs and OpenRouter catalog)
+        ("gpt-3.5-turbo", 16_385),
+        ("gpt-3.5-turbo-0613", 4_095),
+        ("gpt-3.5-turbo-16k", 16_385),
+        ("gpt-3.5-turbo-instruct", 4_095),
+        ("gpt-4", 8_191),
+        ("gpt-4.1", 1_047_576),
+        ("gpt-4.1-mini", 1_047_576),
+        ("gpt-4.1-nano", 1_047_576),
+        ("gpt-4o", 128_000),
+        ("gpt-4o-2024-05-13", 128_000),
+        ("gpt-4o-2024-08-06", 128_000),
+        ("gpt-4o-2024-11-20", 128_000),
+        ("gpt-4o-mini", 128_000),
+        ("gpt-4o-mini-2024-07-18", 128_000),
+        ("gpt-4-turbo", 128_000),
+        ("gpt-4-turbo-preview", 128_000),
+        ("gpt-5", 400_000),
+        ("gpt-5-mini", 400_000),
+        ("gpt-5-nano", 400_000),
+        ("gpt-5-pro", 400_000),
+        ("gpt-5.1", 400_000),
+        ("gpt-5.1-codex", 400_000),
+        ("gpt-5.1-codex-max", 400_000),
+        ("gpt-5.1-codex-mini", 400_000),
+        ("gpt-5.2", 400_000),
+        ("gpt-5.2-chat", 128_000),
+        ("gpt-5.2-codex", 400_000),
+        ("gpt-5.2-pro", 400_000),
+        ("gpt-5.3-chat", 128_000),
+        ("gpt-5.3-codex", 400_000),
+        ("gpt-5.4", 1_050_000),
+        ("gpt-5.4-image-2", 272_000),
+        ("gpt-5.4-mini", 400_000),
+        ("gpt-5.4-nano", 400_000),
+        ("gpt-5.4-pro", 1_050_000),
+        ("gpt-5.5", 1_050_000),
+        ("gpt-5.5-pro", 1_050_000),
+        ("gpt-5.6", 1_050_000), // Direct-provider alias for GPT-5.6 Sol.
+        ("gpt-5.6-luna", 1_050_000),
+        ("gpt-5.6-luna-pro", 1_050_000),
+        ("gpt-5.6-sol", 1_050_000),
+        ("gpt-5.6-sol-pro", 1_050_000),
+        ("gpt-5.6-terra", 1_050_000),
+        ("gpt-5.6-terra-pro", 1_050_000),
+        ("gpt-5-image", 400_000),
+        ("gpt-5-image-mini", 400_000),
+        ("gpt-audio", 128_000),
+        ("gpt-audio-mini", 128_000),
+        ("gpt-chat-latest", 400_000),
+        ("gpt-oss-120b", 131_072),
+        ("gpt-oss-20b", 131_072),
+        ("gpt-oss-safeguard-20b", 131_072),
+        ("o1", 200_000),
+        ("o1-pro", 200_000),
+        ("o3", 200_000),
+        ("o3-mini", 200_000),
+        ("o3-mini-high", 200_000),
+        ("o3-pro", 200_000),
+        ("o4-mini", 200_000),
+        ("o4-mini-high", 200_000),
+        // Anthropic
+        ("claude-3-haiku", 200_000),
+        ("claude-3-5-haiku", 200_000), // Direct-provider historical ID.
+        ("claude-3-5-sonnet", 200_000), // Direct-provider historical ID.
+        ("claude-3-7-sonnet", 200_000), // Direct-provider historical ID.
+        ("claude-haiku-4.5", 200_000),
+        ("claude-opus-4", 200_000),
+        ("claude-opus-4.1", 200_000),
+        ("claude-opus-4.5", 200_000),
+        ("claude-opus-4-6", 1_000_000), // Direct-provider spelling.
+        ("claude-opus-4.6", 1_000_000),
+        ("claude-opus-4-7", 1_000_000), // Direct-provider spelling.
+        ("claude-opus-4.7", 1_000_000),
+        ("claude-opus-4.7-fast", 1_000_000),
+        ("claude-opus-4-8", 1_000_000), // Direct-provider spelling.
+        ("claude-opus-4.8", 1_000_000),
+        ("claude-opus-4.8-fast", 1_000_000),
+        ("claude-opus-5", 1_000_000),
+        ("claude-opus-5-fast", 1_000_000),
+        ("claude-sonnet-4", 1_000_000),
+        ("claude-sonnet-4-5", 1_000_000), // Direct-provider spelling.
+        ("claude-sonnet-4.5", 1_000_000),
+        ("claude-sonnet-4-6", 1_000_000), // Direct-provider spelling.
+        ("claude-sonnet-4.6", 1_000_000),
+        ("claude-sonnet-5", 1_000_000),
+        ("claude-fable-5", 1_000_000),
+        // Google
+        ("gemini-1.5-flash", 1_000_000), // Direct-provider historical ID.
+        ("gemini-1.5-pro", 1_000_000),   // Direct-provider historical ID.
+        ("gemini-2.0-flash", 1_000_000), // Direct-provider historical ID.
+        ("gemini-2.0-flash-lite", 1_000_000), // Direct-provider historical ID.
+        ("gemini-2.5-flash", 1_048_576),
+        ("gemini-2.5-flash-image", 32_768),
+        ("gemini-2.5-flash-lite", 1_048_576),
+        ("gemini-2.5-pro", 1_048_576),
+        ("gemini-2.5-pro-preview", 1_048_576),
+        ("gemini-2.5-pro-preview-05-06", 1_048_576),
+        ("gemini-3-flash-preview", 1_048_576),
+        ("gemini-3-pro-image", 131_072),
+        ("gemini-3-pro-image-preview", 65_536),
+        ("gemini-3.1-flash-image", 131_072),
+        ("gemini-3.1-flash-image-preview", 65_536),
+        ("gemini-3.1-flash-lite", 1_048_576),
+        ("gemini-3.1-flash-lite-image", 65_536),
+        ("gemini-3.1-flash-lite-preview", 1_048_576),
+        ("gemini-3.1-pro-preview", 1_048_576),
+        ("gemini-3.1-pro-preview-customtools", 1_048_576),
+        ("gemini-3.5-flash", 1_048_576),
+        ("gemini-3.5-flash-lite", 1_048_576),
+        ("gemini-3.6-flash", 1_048_576),
+        ("gemma-2-27b-it", 8_192),
+        ("gemma-3-4b-it", 131_072),
+        ("gemma-3-12b-it", 131_072),
+        ("gemma-3-27b-it", 262_144),
+        ("gemma-3n-e4b-it", 32_768),
+        ("gemma-4-26b-a4b-it", 262_144),
+        ("gemma-4-31b-it", 262_144),
+        // Moonshot / Kimi
+        ("moonshot-v1", 8_000), // Direct-provider base tier.
+        ("moonshot-v1-8k", 8_000),
+        ("moonshot-v1-32k", 32_000),
+        ("moonshot-v1-128k", 128_000),
+        ("k3", 1_000_000),    // Direct-provider alias.
+        ("k3-256k", 256_000), // Direct-provider tier.
+        ("kimi-k2", 131_072),
+        ("kimi-k2-0905", 262_144),
+        ("kimi-k2-thinking", 262_144),
+        ("kimi-k2.5", 262_144),
+        ("kimi-k2.6", 262_144),
+        ("kimi-k2.7-code", 262_144),
+        ("kimi-k3", 1_048_576),
+        ("kimi-k3-256k", 256_000), // Direct-provider tier.
+        // DeepSeek
+        ("deepseek-chat", 163_840),
+        ("deepseek-chat-v3.1", 163_840),
+        ("deepseek-chat-v3-0324", 163_840),
+        ("deepseek-r1", 163_840),
+        ("deepseek-r1-0528", 163_840),
+        ("deepseek-r1-distill-llama-70b", 8_192),
+        ("deepseek-reasoner", 163_840), // Direct-provider alias.
+        ("deepseek-v3.1-terminus", 163_840),
+        ("deepseek-v3.2", 163_840),
+        ("deepseek-v3.2-exp", 163_840),
+        ("deepseek-v4-flash", 1_048_576),
+        ("deepseek-v4-flash-0731", 1_048_576),
+        ("deepseek-v4-pro", 1_048_576),
+        // Qwen / Alibaba
+        ("qwen-2.5-7b-instruct", 32_768),
+        ("qwen-2.5-72b-instruct", 32_768),
+        ("qwen-2.5-coder-32b-instruct", 32_768),
+        ("qwen2.5-vl-72b-instruct", 128_000),
+        ("qwen-plus", 1_000_000),
+        ("qwen-plus-2025-07-28", 1_000_000),
+        ("qwen3-8b", 131_072),
+        ("qwen3-14b", 131_072),
+        ("qwen3-30b-a3b", 131_072),
+        ("qwen3-32b", 131_072),
+        ("qwen3-235b-a22b", 131_072),
+        ("qwen3-235b-a22b-2507", 262_144),
+        ("qwen3-235b-a22b-thinking-2507", 262_144),
+        ("qwen3-30b-a3b-instruct-2507", 262_144),
+        ("qwen3-30b-a3b-thinking-2507", 81_920),
+        ("qwen3-coder", 262_144),
+        ("qwen3-coder-30b-a3b-instruct", 262_144),
+        ("qwen3-coder-flash", 1_000_000),
+        ("qwen3-coder-next", 262_144),
+        ("qwen3-coder-plus", 1_000_000),
+        ("qwen3-max", 262_144),
+        ("qwen3-max-thinking", 262_144),
+        ("qwen3-next-80b-a3b-instruct", 262_144),
+        ("qwen3-next-80b-a3b-thinking", 262_144),
+        ("qwen3-vl-8b-instruct", 262_144),
+        ("qwen3-vl-8b-thinking", 131_072),
+        ("qwen3-vl-32b-instruct", 131_072),
+        ("qwen3-vl-30b-a3b-instruct", 262_144),
+        ("qwen3-vl-30b-a3b-thinking", 262_144),
+        ("qwen3-vl-235b-a22b-instruct", 262_144),
+        ("qwen3-vl-235b-a22b-thinking", 131_072),
+        ("qwen3.5-9b", 262_144),
+        ("qwen3.5-27b", 262_144),
+        ("qwen3.5-35b-a3b", 262_144),
+        ("qwen3.5-122b-a10b", 262_144),
+        ("qwen3.5-397b-a17b", 262_144),
+        ("qwen3.5-flash-02-23", 1_000_000),
+        ("qwen3.5-plus-02-15", 1_000_000),
+        ("qwen3.5-plus-20260420", 1_000_000),
+        ("qwen3.6-27b", 262_144),
+        ("qwen3.6-35b-a3b", 262_144),
+        ("qwen3.6-flash", 1_000_000),
+        ("qwen3.6-max-preview", 262_144),
+        ("qwen3.6-plus", 1_000_000),
+        ("qwen3.7-flash", 1_000_000),
+        ("qwen3.7-max", 1_000_000),
+        ("qwen3.7-plus", 1_000_000),
+        // Z.AI GLM
+        ("glm-4.5", 131_072),
+        ("glm-4.5-air", 131_072),
+        ("glm-4.5v", 65_536),
+        ("glm-4.6", 204_800),
+        ("glm-4.6v", 131_072),
+        ("glm-4.7", 204_800),
+        ("glm-4.7-flash", 202_752),
+        ("glm-5", 204_800),
+        ("glm-5-turbo", 202_752),
+        ("glm-5v-turbo", 202_752),
+        ("glm-5.1", 204_800),
+        ("glm-5.2", 1_048_576),
+        // xAI Grok
+        ("grok-4.20", 2_000_000),
+        ("grok-4.20-multi-agent", 2_000_000),
+        ("grok-4.3", 1_000_000),
+        ("grok-4.5", 500_000),
+        ("grok-build-0.1", 256_000),
+        // Mistral
+        ("codestral-2508", 256_000),
+        ("ministral-3b-2512", 131_072),
+        ("ministral-8b-2512", 262_144),
+        ("ministral-14b-2512", 262_144),
+        ("mistral-large", 128_000),
+        ("mistral-large-2407", 131_072),
+        ("mistral-large-2512", 262_144),
+        ("mistral-medium-3", 131_072),
+        ("mistral-medium-3.1", 131_072),
+        ("mistral-medium-3-5", 262_144),
+        ("mistral-nemo", 131_072),
+        ("mistral-saba", 32_768),
+        ("mistral-small-24b-instruct-2501", 32_768),
+        ("mistral-small-3.1-24b-instruct", 128_000),
+        ("mistral-small-3.2-24b-instruct", 256_000),
+        ("mistral-small-2603", 262_144),
+        ("mixtral-8x22b-instruct", 65_536),
+        ("voxtral-small-24b-2507", 32_000),
+        // Meta Llama
+        ("llama-3.1-8b-instruct", 131_072),
+        ("llama-3.1-70b-instruct", 131_072),
+        ("llama-3.2-1b-instruct", 60_000),
+        ("llama-3.2-3b-instruct", 131_072),
+        ("llama-3.3-70b-instruct", 131_072),
+        ("llama-4-maverick", 1_048_576),
+        ("llama-4-scout", 1_310_720),
+        ("llama-guard-4-12b", 1_048_576),
+        // MiniMax
+        ("minimax-01", 1_000_192),
+        ("minimax-m1", 1_000_000),
+        ("minimax-m2", 204_800),
+        ("minimax-m2.1", 204_800),
+        ("minimax-m2.5", 204_800),
+        ("minimax-m2.7", 204_800),
+        ("minimax-m2-her", 65_536),
+        ("minimax-m3", 1_048_576),
+    ];
 
-    // ── Anthropic ───────────────────────────────────────────────────────
-    if claude_model_has_one_million_context(model) {
-        return Some(1_000_000);
-    }
-    if model.starts_with("claude-") || model.contains("claude") {
-        return Some(200_000);
-    }
-
-    // ── Google ──────────────────────────────────────────────────────────
-    if model.starts_with("gemini-1.5") || model.starts_with("gemini-2") {
-        return Some(1_000_000);
-    }
-    if model.starts_with("gemini") {
-        return Some(128_000);
-    }
-
-    // ── Moonshot / Kimi ─────────────────────────────────────────────────
-    // moonshot-v1-* has explicit context-tier suffixes.
-    if model.starts_with("moonshot-v1-8k") {
-        return Some(8_000);
-    }
-    if model.starts_with("moonshot-v1-32k") {
-        return Some(32_000);
-    }
-    if model.starts_with("moonshot-v1-128k") {
-        return Some(128_000);
-    }
-    if model.starts_with("moonshot-v1") {
-        return Some(8_000); // base tier
-    }
-    // K3 has a tier-dependent 1M variant and an explicit 256K variant. A
-    // reported connection limit or manual override takes precedence here.
-    if model.starts_with("k3-256k") || model.starts_with("kimi-k3-256k") {
-        return Some(256_000);
-    }
-    if model == "k3" || model.starts_with("k3-") || model.starts_with("kimi-k3") {
-        return Some(1_000_000);
-    }
-    // kimi-k2.5 is a 256K variant; other legacy Kimi IDs are 128K.
-    if model.starts_with("kimi-k2.5") {
-        return Some(256_000);
-    }
-    if model.starts_with("kimi") {
-        return Some(128_000);
-    }
-
-    // ── DeepSeek ────────────────────────────────────────────────────────
-    // V4 introduced 1M context; earlier models are 128K.
-    if model.starts_with("deepseek-v4") {
-        return Some(1_000_000);
-    }
-    if model.starts_with("deepseek") {
-        return Some(128_000);
-    }
-
-    // ── Qwen / Alibaba ──────────────────────────────────────────────────
-    if model.starts_with("qwen") || model.starts_with("qwq") || model.starts_with("qvq") {
-        return Some(128_000);
-    }
-
-    // ── Zhipu GLM ───────────────────────────────────────────────────────
-    if model.starts_with("glm-5.2") {
-        return Some(1_000_000);
-    }
-    if model == "glm-5" || model.starts_with("glm-5-") {
-        return Some(200_000);
-    }
-    if model.starts_with("glm") || model.starts_with("chatglm") {
-        return Some(128_000);
-    }
-
-    // ── xAI Grok ────────────────────────────────────────────────────────
-    if model.starts_with("grok") {
-        return Some(128_000);
-    }
-
-    // ── Mistral ─────────────────────────────────────────────────────────
-    if model.starts_with("mistral")
-        || model.starts_with("mixtral")
-        || model.starts_with("codestral")
-    {
-        return Some(128_000);
-    }
-
-    // ── Meta Llama ──────────────────────────────────────────────────────
-    if model.starts_with("llama") || model.starts_with("codellama") {
-        return Some(128_000);
-    }
-
-    // ── MiniMax ─────────────────────────────────────────────────────────
-    if model.starts_with("minimax") || model.starts_with("abab") {
-        return Some(128_000);
-    }
-
-    None
-}
-
-fn claude_model_has_one_million_context(model: &str) -> bool {
-    [
-        "claude-opus-4-6",
-        "claude-opus-4-7",
-        "claude-opus-4-8",
-        "claude-opus-5",
-        "claude-sonnet-4-6",
-        "claude-sonnet-5",
-        "claude-fable-5",
-        "claude-mythos-5",
-        "claude-mythos-preview",
-    ]
-    .iter()
-    .any(|prefix| model.starts_with(prefix))
+    WINDOWS
+        .iter()
+        .find_map(|(id, context_window)| (*id == model).then_some(*context_window))
 }
 
 /// Whether a model accepts a caller-supplied `temperature`.
@@ -676,14 +797,16 @@ pub fn model_accepts_temperature(model: &str) -> bool {
 /// carry version numbers (`gpt-5.6`).
 fn model_bases(model: &str) -> Vec<String> {
     let normalized = model.trim().to_ascii_lowercase();
-    let after_slash = normalized
-        .rsplit('/')
-        .next()
-        .unwrap_or(&normalized)
+    let after_slash = normalized.rsplit('/').next().unwrap_or(&normalized);
+    // OpenRouter uses modifiers such as `:free` and `:thinking`; they don't
+    // identify a different base model or context window.
+    let after_variant = after_slash
+        .split_once(':')
+        .map_or(after_slash, |(base, _)| base)
         .to_string();
 
-    let mut bases = vec![after_slash.clone()];
-    if let Some((prefix, rest)) = after_slash.split_once('.') {
+    let mut bases = vec![after_variant.clone()];
+    if let Some((prefix, rest)) = after_variant.split_once('.') {
         // `azure.o3-mini` is a vendor prefix; `gpt-5.6` is a version.
         let looks_like_vendor = !prefix.is_empty()
             && prefix.chars().all(|c| c.is_ascii_alphabetic())
@@ -1117,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn context_window_table_covers_the_families_the_picker_offers() {
+    fn context_window_table_uses_verified_exact_model_ids() {
         assert_eq!(
             known_model_context_window_tokens("gpt-5.6-sol"),
             Some(1_050_000)
@@ -1146,28 +1269,26 @@ mod tests {
         assert_eq!(known_model_context_window_tokens("o3-mini"), Some(200_000));
         assert_eq!(
             known_model_context_window_tokens("anthropic/claude-sonnet-4-5"),
-            Some(200_000)
+            Some(1_000_000)
         );
-        // K3 has a 1M tier and an explicit 256K model ID; per-connection
-        // entitlement still wins through detected or manually set values.
         assert_eq!(
             known_model_context_window_tokens("kimi-k2.5"),
-            Some(256_000)
+            Some(262_144)
         );
-        assert_eq!(known_model_context_window_tokens("kimi-k2"), Some(128_000));
+        assert_eq!(known_model_context_window_tokens("kimi-k2"), Some(131_072));
         assert_eq!(known_model_context_window_tokens("k3-256k"), Some(256_000));
         assert_eq!(
             known_model_context_window_tokens("glm-5.2"),
-            Some(1_000_000)
+            Some(1_048_576)
         );
-        assert_eq!(known_model_context_window_tokens("glm-5"), Some(200_000));
+        assert_eq!(known_model_context_window_tokens("glm-5"), Some(204_800));
         assert_eq!(
             known_model_context_window_tokens("claude-sonnet-4-6"),
             Some(1_000_000)
         );
         assert_eq!(
             known_model_context_window_tokens("kimi-k3"),
-            Some(1_000_000)
+            Some(1_048_576)
         );
         assert_eq!(
             known_model_context_window_tokens("moonshot-v1-32k"),
@@ -1177,18 +1298,54 @@ mod tests {
             known_model_context_window_tokens("moonshot-v1-8k"),
             Some(8_000)
         );
-        // deepseek-v4 is 1M; earlier models are 128K
         assert_eq!(
-            known_model_context_window_tokens("deepseek-v4"),
-            Some(1_000_000)
+            known_model_context_window_tokens("deepseek-v4-flash"),
+            Some(1_048_576)
         );
         assert_eq!(
             known_model_context_window_tokens("deepseek-reasoner"),
-            Some(128_000)
+            Some(163_840)
         );
         assert_eq!(
             known_model_context_window_tokens("gemini-2.5-pro"),
+            Some(1_048_576)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("qwen-2.5-72b-instruct"),
+            Some(32_768)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("openrouter/qwen-plus:free"),
             Some(1_000_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("deepseek-r1-distill-llama-70b"),
+            Some(8_192)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("gemini-2.5-flash-image"),
+            Some(32_768)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("grok-4.20"),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("mistral-small-3.2-24b-instruct"),
+            Some(256_000)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("llama-4-scout"),
+            Some(1_310_720)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("minimax-m2"),
+            Some(204_800)
+        );
+        assert_eq!(known_model_context_window_tokens("glm-4.6"), Some(204_800));
+        assert_eq!(
+            known_model_context_window_tokens("qwen3-14b-unpublished"),
+            None
         );
         assert_eq!(known_model_context_window_tokens("my-finetune-v3"), None);
     }
