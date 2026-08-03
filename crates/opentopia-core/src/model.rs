@@ -1657,12 +1657,14 @@ pub enum AgentEventPayload {
         round: usize,
         context_hash: String,
         token_estimate: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         items: Vec<ModelContextItem>,
     },
     ModelRequest {
         #[serde(default = "Uuid::new_v4")]
         request_id: Uuid,
         round: usize,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
         request: Value,
     },
     ProviderRequestSent {
@@ -1672,6 +1674,7 @@ pub enum AgentEventPayload {
         adapter: String,
         method: String,
         endpoint: String,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
     },
     ProviderRequestRetried {
@@ -1679,6 +1682,7 @@ pub enum AgentEventPayload {
         round: usize,
         attempt: usize,
         reason: String,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
     },
     ProviderResponseReceived {
@@ -1687,6 +1691,7 @@ pub enum AgentEventPayload {
         attempt: usize,
         status: Option<u16>,
         response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
     },
     ModelDelta {

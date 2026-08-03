@@ -17,12 +17,15 @@ use crate::subagents::{SubagentExecutionContract, SubagentRun, SubagentRunStatus
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex, MutexGuard,
+};
 use uuid::Uuid;
 
 pub trait SessionStore: Send + Sync + std::fmt::Debug {
@@ -418,9 +421,27 @@ pub struct ProviderConversationState {
     pub updated_at: DateTime<Utc>,
 }
 
+fn open_read_connection(path: &Path) -> anyhow::Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open SQLite read connection {}", path.display()))?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch(
+        r#"
+        PRAGMA query_only = ON;
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
+    Ok(connection)
+}
+
 #[derive(Debug)]
 pub struct SqliteSessionStore {
     conn: Mutex<Connection>,
+    read_connections: Vec<Mutex<Connection>>,
+    next_read_connection: AtomicUsize,
 }
 
 impl SqliteSessionStore {
@@ -435,11 +456,32 @@ impl SqliteSessionStore {
 
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite db {}", path.display()))?;
-        let store = Self {
+        let mut store = Self {
             conn: Mutex::new(conn),
+            read_connections: Vec::new(),
+            next_read_connection: AtomicUsize::new(0),
         };
         store.migrate()?;
+        if path != Path::new(":memory:") {
+            store.read_connections = (0..4)
+                .map(|_| open_read_connection(path))
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .into_iter()
+                .map(Mutex::new)
+                .collect();
+        }
         Ok(store)
+    }
+
+    fn read_connection(&self) -> MutexGuard<'_, Connection> {
+        if self.read_connections.is_empty() {
+            return self.conn.lock().expect("sqlite mutex poisoned");
+        }
+        let index =
+            self.next_read_connection.fetch_add(1, Ordering::Relaxed) % self.read_connections.len();
+        self.read_connections[index]
+            .lock()
+            .expect("sqlite read mutex poisoned")
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
@@ -604,6 +646,18 @@ impl SqliteSessionStore {
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 UNIQUE(thread_id, seq),
+                FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_events (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                turn_id TEXT,
+                seq INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(thread_id, seq),
+                FOREIGN KEY(id) REFERENCES events(id) ON DELETE CASCADE,
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
             );
 
@@ -835,6 +889,9 @@ impl SqliteSessionStore {
             CREATE INDEX IF NOT EXISTS idx_events_thread_seq
                 ON events(thread_id, seq);
 
+            CREATE INDEX IF NOT EXISTS idx_conversation_events_thread_seq
+                ON conversation_events(thread_id, seq);
+
             CREATE INDEX IF NOT EXISTS idx_turns_thread_started
                 ON turns(thread_id, started_at DESC);
 
@@ -983,6 +1040,45 @@ impl SqliteSessionStore {
         }
         if schema_version < 8 {
             conn.execute_batch("PRAGMA user_version = 8;")?;
+        }
+        if schema_version < 9 {
+            conn.execute_batch(
+                r#"
+                INSERT OR REPLACE INTO conversation_events (
+                    id, thread_id, turn_id, seq, payload_json, created_at
+                )
+                SELECT id, thread_id, turn_id, seq,
+                    CASE kind
+                    WHEN 'model_context_built'
+                        THEN json_remove(payload_json, '$.items')
+                    WHEN 'model_request'
+                        THEN json_remove(payload_json, '$.request')
+                    WHEN 'provider_request_sent'
+                        THEN json_remove(payload_json, '$.body')
+                    WHEN 'provider_request_retried'
+                        THEN json_remove(payload_json, '$.body')
+                    WHEN 'provider_response_received'
+                        THEN json_remove(payload_json, '$.body')
+                    WHEN 'tool_call_finished'
+                        THEN json_remove(payload_json, '$.result.content')
+                    ELSE payload_json
+                    END,
+                    created_at
+                FROM events
+                WHERE kind <> 'reasoning_delta';
+                "#,
+            )?;
+            conn.execute_batch("PRAGMA user_version = 9;")?;
+        }
+        if schema_version < 10 {
+            conn.execute_batch(
+                r#"
+                UPDATE conversation_events
+                SET payload_json = json_remove(payload_json, '$.result.content')
+                WHERE json_extract(payload_json, '$.type') = 'tool_call_finished';
+                PRAGMA user_version = 10;
+                "#,
+            )?;
         }
         let recovered_at = Utc::now().to_rfc3339();
         conn.execute(
@@ -1440,6 +1536,73 @@ impl SqliteSessionStore {
         )?;
         let rows = stmt.query_map(params![workspace_key], map_evaluation_run)?;
         collect_rows(rows)
+    }
+
+    /// Returns the event history needed by the conversation UI without the
+    /// duplicated model/provider payloads retained for diagnostics and export.
+    pub fn list_conversation_events(
+        &self,
+        thread_id: Uuid,
+        after_seq: Option<i64>,
+    ) -> anyhow::Result<Vec<AgentEvent>> {
+        let conn = self.read_connection();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, thread_id, turn_id, seq, payload_json, created_at
+            FROM conversation_events
+            WHERE thread_id = ?1
+              AND seq > ?2
+            ORDER BY seq ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![thread_id.to_string(), after_seq.unwrap_or(0)],
+            map_event,
+        )?;
+        collect_rows(rows)
+    }
+
+    /// Loads only event kinds used to calculate the context status panel.
+    pub fn list_context_events(&self, thread_id: Uuid) -> anyhow::Result<Vec<AgentEvent>> {
+        let conn = self.read_connection();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT events.id, events.thread_id, events.turn_id, events.seq,
+                   CASE events.kind
+                       WHEN 'model_context_built'
+                           THEN COALESCE(
+                               conversation_events.payload_json,
+                               json_remove(events.payload_json, '$.items')
+                           )
+                       ELSE events.payload_json
+                   END,
+                   events.created_at
+            FROM events
+            LEFT JOIN conversation_events ON conversation_events.id = events.id
+            WHERE events.thread_id = ?1
+              AND events.kind IN (
+                  'model_context_built',
+                  'provider_response_received',
+                  'context_compacted',
+                  'provider_context_state_invalidated',
+                  'context_warning',
+                  'token_usage'
+              )
+            ORDER BY events.seq ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![thread_id.to_string()], map_event)?;
+        collect_rows(rows)
+    }
+
+    pub fn count_events_after(&self, thread_id: Uuid, after_seq: i64) -> anyhow::Result<usize> {
+        let conn = self.read_connection();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE thread_id = ?1 AND seq > ?2",
+            params![thread_id.to_string(), after_seq],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count).context("event count exceeds usize range")
     }
 }
 
@@ -2166,7 +2329,7 @@ impl SessionStore for SqliteSessionStore {
     }
 
     fn list_messages(&self, thread_id: Uuid) -> anyhow::Result<Vec<Message>> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let conn = self.read_connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, thread_id, role, parts_json, created_at
@@ -2480,15 +2643,17 @@ impl SessionStore for SqliteSessionStore {
     }
 
     fn append_event(&self, mut event: AgentEvent) -> anyhow::Result<AgentEvent> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let seq: i64 = conn.query_row(
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let tx = conn.transaction()?;
+        let seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE thread_id = ?1",
             params![event.thread_id.to_string()],
             |row| row.get(0),
         )?;
         event.seq = seq;
         let payload_json = serde_json::to_string(&event.payload)?;
-        conn.execute(
+        let conversation_payload_json = conversation_payload_json(&event.payload, &payload_json)?;
+        tx.execute(
             r#"
             INSERT INTO events (id, thread_id, turn_id, seq, kind, payload_json, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -2503,7 +2668,26 @@ impl SessionStore for SqliteSessionStore {
                 event.created_at.to_rfc3339(),
             ],
         )?;
-        touch_thread(&conn, event.thread_id)?;
+        if let Some(conversation_payload_json) = conversation_payload_json {
+            tx.execute(
+                r#"
+                INSERT INTO conversation_events (
+                    id, thread_id, turn_id, seq, payload_json, created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    event.id.to_string(),
+                    event.thread_id.to_string(),
+                    event.turn_id.as_ref().map(|id| id.to_string()),
+                    event.seq,
+                    conversation_payload_json,
+                    event.created_at.to_rfc3339(),
+                ],
+            )?;
+        }
+        touch_thread(&tx, event.thread_id)?;
+        tx.commit()?;
         Ok(event)
     }
 
@@ -2512,7 +2696,7 @@ impl SessionStore for SqliteSessionStore {
         thread_id: Uuid,
         after_seq: Option<i64>,
     ) -> anyhow::Result<Vec<AgentEvent>> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let conn = self.read_connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, thread_id, turn_id, seq, payload_json, created_at
@@ -4122,6 +4306,90 @@ fn map_turn_change_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnChangeSe
     })
 }
 
+fn conversation_payload_json(
+    payload: &AgentEventPayload,
+    full_payload_json: &str,
+) -> anyhow::Result<Option<String>> {
+    let compact = match payload {
+        AgentEventPayload::ReasoningDelta { .. } => return Ok(None),
+        AgentEventPayload::ModelContextBuilt {
+            request_id,
+            round,
+            context_hash,
+            token_estimate,
+            ..
+        } => serde_json::json!({
+            "type": "model_context_built",
+            "request_id": request_id,
+            "round": round,
+            "context_hash": context_hash,
+            "token_estimate": token_estimate,
+        }),
+        AgentEventPayload::ModelRequest {
+            request_id, round, ..
+        } => serde_json::json!({
+            "type": "model_request",
+            "request_id": request_id,
+            "round": round,
+        }),
+        AgentEventPayload::ProviderRequestSent {
+            request_id,
+            round,
+            attempt,
+            adapter,
+            method,
+            endpoint,
+            ..
+        } => serde_json::json!({
+            "type": "provider_request_sent",
+            "request_id": request_id,
+            "round": round,
+            "attempt": attempt,
+            "adapter": adapter,
+            "method": method,
+            "endpoint": endpoint,
+        }),
+        AgentEventPayload::ProviderRequestRetried {
+            request_id,
+            round,
+            attempt,
+            reason,
+            ..
+        } => serde_json::json!({
+            "type": "provider_request_retried",
+            "request_id": request_id,
+            "round": round,
+            "attempt": attempt,
+            "reason": reason,
+        }),
+        AgentEventPayload::ProviderResponseReceived {
+            request_id,
+            round,
+            attempt,
+            status,
+            response_id,
+            ..
+        } => serde_json::json!({
+            "type": "provider_response_received",
+            "request_id": request_id,
+            "round": round,
+            "attempt": attempt,
+            "status": status,
+            "response_id": response_id,
+        }),
+        AgentEventPayload::ToolCallFinished { result } => serde_json::json!({
+            "type": "tool_call_finished",
+            "result": {
+                "callId": result.call_id,
+                "output": &result.output,
+                "metadata": &result.metadata,
+            },
+        }),
+        _ => return Ok(Some(full_payload_json.to_string())),
+    };
+    Ok(Some(serde_json::to_string(&compact)?))
+}
+
 fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEvent> {
     let turn_id: Option<String> = row.get(2)?;
     let payload_json: String = row.get(4)?;
@@ -4874,6 +5142,138 @@ mod tests {
             }
             payload => panic!("unexpected payload: {payload:?}"),
         }
+    }
+
+    #[test]
+    fn conversation_event_view_removes_diagnostic_bodies_and_hidden_reasoning() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/conversation-events"))
+            .expect("create thread");
+        let turn_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        for payload in [
+            AgentEventPayload::ModelRequest {
+                request_id,
+                round: 1,
+                request: serde_json::json!({"prompt": "x".repeat(32_000)}),
+            },
+            AgentEventPayload::ProviderRequestSent {
+                request_id,
+                round: 1,
+                attempt: 1,
+                adapter: "test".to_string(),
+                method: "POST".to_string(),
+                endpoint: "http://localhost/model".to_string(),
+                body: serde_json::json!({"input": "y".repeat(32_000)}),
+            },
+            AgentEventPayload::ReasoningDelta {
+                text: "hidden historical reasoning".to_string(),
+            },
+            AgentEventPayload::ToolCallFinished {
+                result: ToolResult::text(
+                    Uuid::new_v4(),
+                    "tool output".repeat(1_000),
+                    serde_json::json!({}),
+                ),
+            },
+            AgentEventPayload::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cached_input_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+            AgentEventPayload::TurnFinished {
+                summary: "done".to_string(),
+            },
+        ] {
+            store
+                .append_event(AgentEvent::new(thread.id, Some(turn_id), 0, payload))
+                .expect("append event");
+        }
+
+        let raw = store.list_events(thread.id, None).expect("list raw events");
+        assert_eq!(raw.len(), 6);
+        assert!(matches!(
+            &raw[0].payload,
+            AgentEventPayload::ModelRequest { request, .. }
+                if request.get("prompt").is_some()
+        ));
+
+        let conversation = store
+            .list_conversation_events(thread.id, None)
+            .expect("list conversation events");
+        assert_eq!(conversation.len(), 5);
+        assert!(matches!(
+            &conversation[0].payload,
+            AgentEventPayload::ModelRequest { request, .. } if request.is_null()
+        ));
+        assert!(matches!(
+            &conversation[1].payload,
+            AgentEventPayload::ProviderRequestSent { body, .. } if body.is_null()
+        ));
+        assert!(matches!(
+            &conversation[2].payload,
+            AgentEventPayload::ToolCallFinished { result }
+                if result.content.is_empty() && result.output.len() == 11_000
+        ));
+        assert!(conversation
+            .iter()
+            .all(|event| !matches!(event.payload, AgentEventPayload::ReasoningDelta { .. })));
+
+        let context = store
+            .list_context_events(thread.id)
+            .expect("list context events");
+        assert_eq!(context.len(), 1);
+        assert!(matches!(
+            context[0].payload,
+            AgentEventPayload::TokenUsage { .. }
+        ));
+        assert_eq!(
+            store
+                .count_events_after(thread.id, 2)
+                .expect("count later events"),
+            4
+        );
+    }
+
+    #[test]
+    fn migration_backfills_conversation_events_for_existing_databases() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/event-backfill"))
+            .expect("create thread");
+        store
+            .append_event(AgentEvent::new(
+                thread.id,
+                None,
+                0,
+                AgentEventPayload::TurnFinished {
+                    summary: "existing event".to_string(),
+                },
+            ))
+            .expect("append event");
+        {
+            let conn = store.conn.lock().expect("lock store");
+            conn.execute("DELETE FROM conversation_events", [])
+                .expect("remove projected rows");
+            conn.execute_batch("PRAGMA user_version = 8;")
+                .expect("restore previous schema version");
+        }
+
+        store.migrate().expect("rerun migration");
+
+        let events = store
+            .list_conversation_events(thread.id, None)
+            .expect("list backfilled events");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].payload,
+            AgentEventPayload::TurnFinished { .. }
+        ));
     }
 
     #[test]

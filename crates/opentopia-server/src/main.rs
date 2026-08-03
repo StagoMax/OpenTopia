@@ -2574,7 +2574,8 @@ async fn generate_thread_title(
         }));
     }
 
-    let title = summarize_thread_title(&state, &request.prompt).await?;
+    let title =
+        summarize_thread_title(&state, &request.prompt, current.model_selection.as_ref()).await?;
     let latest = state
         .store
         .get_thread(thread_id)?
@@ -2596,7 +2597,11 @@ async fn generate_thread_title(
     }))
 }
 
-async fn summarize_thread_title(state: &AppState, prompt: &str) -> Result<String, ApiError> {
+async fn summarize_thread_title(
+    state: &AppState,
+    prompt: &str,
+    model_selection: Option<&ThreadModelSelection>,
+) -> Result<String, ApiError> {
     const TITLE_PROMPT_LIMIT: usize = 12_000;
 
     let prompt = prompt.trim();
@@ -2605,23 +2610,27 @@ async fn summarize_thread_title(state: &AppState, prompt: &str) -> Result<String
     }
 
     let settings = current_settings(state);
-    let mut active = settings.active_provider().clone();
-    if active.kind == ProviderKind::Mock {
+    let mut provider_settings = provider_settings_for_thread(&settings, model_selection);
+    if provider_settings.kind == ProviderKind::Mock {
         return Err(ApiError::bad_request(
             "thread title generation requires a configured model provider",
         ));
     }
-    active.temperature = active.temperature.map(|temperature| temperature.min(0.2));
-    active.max_output_tokens = Some(active.max_output_tokens.unwrap_or(64).min(64));
-    let provider = configured_provider_from_settings(&active).ok_or_else(|| {
+    provider_settings.temperature = provider_settings
+        .temperature
+        .map(|temperature| temperature.min(0.2));
+    provider_settings.max_output_tokens =
+        Some(provider_settings.max_output_tokens.unwrap_or(64).min(64));
+    let provider = configured_provider_from_settings(&provider_settings).ok_or_else(|| {
         ApiError::bad_request(format!(
             "provider '{}' has no configured API key",
-            active.id
+            provider_settings.id
         ))
     })?;
     let request = ModelRequest {
-        system_prompt: "Create a concise sidebar title for the user's first message. Use the same language as the user and preserve specific product, file, and error names. Return only the title: no quotes, Markdown, label, or trailing punctuation. The title must contain at most 20 Unicode characters."
-            .to_string(),
+        system_prompt: format!(
+            "Create a concise sidebar title for the user's first message. Use the same language as the user and preserve specific product, file, and error names. Return only the title: no quotes, Markdown, label, or trailing punctuation. The title must contain at most {MAX_THREAD_TITLE_CHARS} Unicode characters."
+        ),
         conversation: Vec::new(),
         user_message: truncate_chars(prompt, TITLE_PROMPT_LIMIT),
         user_content: Vec::new(),
@@ -2645,7 +2654,23 @@ async fn summarize_thread_title(state: &AppState, prompt: &str) -> Result<String
         .ok_or_else(|| ApiError::bad_gateway("thread title provider returned an empty title"))
 }
 
-const MAX_THREAD_TITLE_CHARS: usize = 20;
+const MAX_THREAD_TITLE_CHARS: usize = 50;
+
+fn provider_settings_for_thread(
+    settings: &AppSettings,
+    model_selection: Option<&ThreadModelSelection>,
+) -> ProviderSettings {
+    let connection = settings.provider_by_id_or_active(
+        model_selection.map(|selection| selection.connection_id.as_str()),
+    );
+    match model_selection {
+        Some(selection) => connection.with_model_override(
+            Some(selection.model_id.as_str()),
+            Some(selection.reasoning_effort.as_deref()),
+        ),
+        None => connection.clone(),
+    }
+}
 
 fn normalize_generated_thread_title(response: &str) -> Option<String> {
     response.lines().find_map(|line| {
@@ -2798,7 +2823,11 @@ async fn list_messages(
     Path(thread_id): Path<Uuid>,
 ) -> Result<Json<Vec<Message>>, ApiError> {
     ensure_thread(&state, thread_id)?;
-    Ok(Json(state.store.list_messages(thread_id)?))
+    let store = state.store.clone();
+    let messages = tokio::task::spawn_blocking(move || store.list_messages(thread_id))
+        .await
+        .map_err(|error| ApiError::internal(format!("message history task failed: {error}")))??;
+    Ok(Json(messages))
 }
 
 async fn get_thread_goal(
@@ -4423,7 +4452,11 @@ async fn get_context_status(
     Path(thread_id): Path<Uuid>,
 ) -> Result<Json<ContextStatusResponse>, ApiError> {
     ensure_thread(&state, thread_id)?;
-    Ok(Json(context_status(&state, thread_id)?))
+    let worker_state = state.clone();
+    let status = tokio::task::spawn_blocking(move || context_status(&worker_state, thread_id))
+        .await
+        .map_err(|error| ApiError::internal(format!("context status task failed: {error}")))??;
+    Ok(Json(status))
 }
 
 async fn compact_context(
@@ -4930,7 +4963,14 @@ async fn list_events(
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<AgentEvent>>, ApiError> {
     ensure_thread(&state, thread_id)?;
-    Ok(Json(state.store.list_events(thread_id, query.since)?))
+    let store = state.store.clone();
+    let events = tokio::task::spawn_blocking(move || match query.view {
+        Some(EventView::Conversation) => store.list_conversation_events(thread_id, query.since),
+        None => store.list_events(thread_id, query.since),
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("event history task failed: {error}")))??;
+    Ok(Json(events))
 }
 
 async fn stream_events(
@@ -4940,18 +4980,47 @@ async fn stream_events(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     ensure_thread(&state, thread_id)?;
     let rx = state.events.subscribe(thread_id);
-    let history = state.store.list_events(thread_id, query.since)?;
-    let event_stream = replay_then_live_events(history, rx, query.since).map(|agent_event| {
-        let event_name = sse_event_name(agent_event.kind());
-        let sse = Event::default()
-            .id(agent_event.seq.to_string())
-            .event(event_name)
-            .json_data(agent_event)
-            .expect("agent event should serialize");
-        Ok(sse)
-    });
+    let conversation_view = matches!(query.view, Some(EventView::Conversation));
+    let history = if conversation_view {
+        state
+            .store
+            .list_conversation_events(thread_id, query.since)?
+    } else {
+        state.store.list_events(thread_id, query.since)?
+    };
+    let event_stream = replay_then_live_events(history, rx, query.since)
+        .filter_map(move |agent_event| async move {
+            if conversation_view {
+                project_conversation_event(agent_event)
+            } else {
+                Some(agent_event)
+            }
+        })
+        .map(|agent_event| {
+            let event_name = sse_event_name(agent_event.kind());
+            let sse = Event::default()
+                .id(agent_event.seq.to_string())
+                .event(event_name)
+                .json_data(agent_event)
+                .expect("agent event should serialize");
+            Ok(sse)
+        });
 
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+}
+
+fn project_conversation_event(mut event: AgentEvent) -> Option<AgentEvent> {
+    match &mut event.payload {
+        AgentEventPayload::ReasoningDelta { .. } => return None,
+        AgentEventPayload::ModelContextBuilt { items, .. } => items.clear(),
+        AgentEventPayload::ModelRequest { request, .. } => *request = Value::Null,
+        AgentEventPayload::ProviderRequestSent { body, .. }
+        | AgentEventPayload::ProviderRequestRetried { body, .. }
+        | AgentEventPayload::ProviderResponseReceived { body, .. } => *body = Value::Null,
+        AgentEventPayload::ToolCallFinished { result } => result.content.clear(),
+        _ => {}
+    }
+    Some(event)
 }
 
 fn replay_then_live_events(
@@ -6513,21 +6582,8 @@ async fn run_new_agent_turn(
     let thread_id = thread.id;
     let turn_id = turn.turn_id;
     let settings = current_settings(&state);
-    let selected_provider = {
-        let connection = settings.provider_by_id_or_active(
-            thread
-                .model_selection
-                .as_ref()
-                .map(|selection| selection.connection_id.as_str()),
-        );
-        match thread.model_selection.as_ref() {
-            Some(selection) => connection.with_model_override(
-                Some(selection.model_id.as_str()),
-                Some(selection.reasoning_effort.as_deref()),
-            ),
-            None => connection.clone(),
-        }
-    };
+    let selected_provider =
+        provider_settings_for_thread(&settings, thread.model_selection.as_ref());
     let workspace_root = thread.workspace_root.clone();
     let _workspace_guard = state.turn_changes.lock_workspace(&workspace_root).await;
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
@@ -8762,6 +8818,31 @@ fn build_context_projection(
     provider: &ProviderSettings,
     provider_state: Option<&ProviderConversationState>,
 ) -> ContextProjection {
+    let covered_through_seq = summary
+        .map(|summary| summary.covered_through_seq)
+        .unwrap_or_default();
+    let unsummarized_event_count = events
+        .iter()
+        .filter(|event| event.seq > covered_through_seq)
+        .count();
+    build_context_projection_with_event_count(
+        summary,
+        total_message_count,
+        unsummarized_event_count,
+        recent_tail_tokens,
+        provider,
+        provider_state,
+    )
+}
+
+fn build_context_projection_with_event_count(
+    summary: Option<&ContextSummary>,
+    total_message_count: usize,
+    unsummarized_event_count: usize,
+    recent_tail_tokens: usize,
+    provider: &ProviderSettings,
+    provider_state: Option<&ProviderConversationState>,
+) -> ContextProjection {
     let covered_message_count = summary
         .map(summary_message_cursor)
         .unwrap_or_default()
@@ -8788,10 +8869,7 @@ fn build_context_projection(
         covered_through_seq,
         covered_message_count,
         unsummarized_message_count: total_message_count.saturating_sub(covered_message_count),
-        unsummarized_event_count: events
-            .iter()
-            .filter(|event| event.seq > covered_through_seq)
-            .count(),
+        unsummarized_event_count,
         recent_tail_tokens,
         native_compaction_supported: capabilities.supports_native_compaction,
         provider_state_available: provider_state.is_some(),
@@ -8807,9 +8885,9 @@ fn build_context_projection(
 }
 
 fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResponse, ApiError> {
-    let mut budget = state.store.get_context_budget(thread_id)?;
-    budget.total_tokens = context_window_tokens(state);
-    let events = state.store.list_events(thread_id, None)?;
+    let messages = state.store.list_messages(thread_id)?;
+    let mut budget = context_budget_from_messages(&messages, context_window_tokens(state));
+    let events = state.store.list_context_events(thread_id)?;
     if let Some(model_tokens) = events.iter().rev().find_map(|event| match &event.payload {
         AgentEventPayload::ModelContextBuilt { token_estimate, .. } => Some(*token_estimate),
         _ => None,
@@ -8818,7 +8896,6 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
     }
     budget.estimated_usage = budget.used_tokens.saturating_mul(100) / budget.total_tokens.max(1);
     let latest_summary = latest_context_summary_event(&events);
-    let messages = state.store.list_messages(thread_id)?;
     let (_, recent_tail_tokens) =
         recent_conversation_tail(&messages, (budget.total_tokens / 10).clamp(2_048, 16_384));
     let active_provider = current_settings(state).active_provider().clone();
@@ -8893,10 +8970,17 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
             _ => {}
         }
     }
-    let projection = build_context_projection(
+    let covered_through_seq = latest_summary
+        .as_ref()
+        .map(|summary| summary.covered_through_seq)
+        .unwrap_or_default();
+    let unsummarized_event_count = state
+        .store
+        .count_events_after(thread_id, covered_through_seq)?;
+    let projection = build_context_projection_with_event_count(
         latest_summary.as_ref(),
         messages.len(),
-        &events,
+        unsummarized_event_count,
         recent_tail_tokens,
         &active_provider,
         provider_state.as_ref(),
@@ -8907,6 +8991,39 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
         usage,
         projection,
     })
+}
+
+fn context_budget_from_messages(
+    messages: &[Message],
+    total_tokens: usize,
+) -> opentopia_core::ContextBudget {
+    let used_tokens = messages.iter().fold(0usize, |total, message| {
+        let message_tokens = message
+            .parts
+            .iter()
+            .map(|part| match part {
+                MessagePart::Text { text } => opentopia_core::estimate_model_context_tokens(text),
+                MessagePart::ToolResult { result } => {
+                    opentopia_core::estimate_model_context_tokens(&result.output)
+                }
+                MessagePart::ToolCall { call } => {
+                    opentopia_core::estimate_model_context_tokens(&call.name)
+                        .saturating_add(opentopia_core::estimate_model_context_tokens(
+                            &call.input.to_string(),
+                        ))
+                        .saturating_add(16)
+                }
+                _ => 16,
+            })
+            .sum::<usize>();
+        total.saturating_add(message_tokens.saturating_add(50))
+    });
+    opentopia_core::ContextBudget {
+        total_tokens,
+        used_tokens,
+        message_count: messages.len(),
+        estimated_usage: used_tokens.saturating_mul(100) / total_tokens.max(1),
+    }
 }
 
 fn latest_context_summary_event(events: &[AgentEvent]) -> Option<ContextSummary> {
@@ -10515,12 +10632,8 @@ struct ProviderTestRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexLoginRequest {
-    #[serde(default = "default_codex_device_code")]
+    #[serde(default)]
     device_code: bool,
-}
-
-fn default_codex_device_code() -> bool {
-    true
 }
 
 #[derive(Debug, Serialize)]
@@ -10864,9 +10977,16 @@ struct UserInputQuery {
     status: Option<UserInputStatus>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EventView {
+    Conversation,
+}
+
 #[derive(Debug, Deserialize)]
 struct EventQuery {
     since: Option<i64>,
+    view: Option<EventView>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -11751,6 +11871,37 @@ mod tests {
                 .expect("normalized title");
         assert_eq!(title.chars().count(), MAX_THREAD_TITLE_CHARS);
         assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn title_generation_uses_the_thread_pinned_connection_and_model() {
+        let mut settings = AppSettings::from_env(PermissionMode::Auto);
+        let mut active = settings.active_provider().clone();
+        active.id = "active".to_string();
+        active.model = "active-model".to_string();
+        active.base_url = "https://active.example/v1".to_string();
+
+        let mut pinned = active.clone();
+        pinned.id = "pinned".to_string();
+        pinned.model = "connection-default".to_string();
+        pinned.base_url = "https://pinned.example/v1".to_string();
+
+        settings.active_provider_id = active.id.clone();
+        settings.providers = vec![active, pinned];
+        let selection = ThreadModelSelection {
+            connection_id: "pinned".to_string(),
+            model_id: "thread-model".to_string(),
+            reasoning_effort: Some("high".to_string()),
+        };
+
+        let provider = provider_settings_for_thread(&settings, Some(&selection));
+        assert_eq!(provider.id, "pinned");
+        assert_eq!(provider.base_url, "https://pinned.example/v1");
+        assert_eq!(provider.model, "thread-model");
+        assert_eq!(
+            provider.reasoning_effort_for_model(),
+            Some("high".to_string())
+        );
     }
 
     #[test]
@@ -12645,5 +12796,39 @@ mod tests {
             recv_broadcast_after_lag(&mut receiver, "test stream").await,
             None
         );
+    }
+
+    #[test]
+    fn conversation_stream_projection_removes_large_diagnostics() {
+        let event = AgentEvent::new(
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+            4,
+            AgentEventPayload::ModelRequest {
+                request_id: Uuid::new_v4(),
+                round: 1,
+                request: json!({"prompt": "large diagnostic payload"}),
+            },
+        );
+
+        let projected = project_conversation_event(event).expect("project event");
+        assert!(matches!(
+            projected.payload,
+            AgentEventPayload::ModelRequest { request, .. } if request.is_null()
+        ));
+    }
+
+    #[test]
+    fn conversation_stream_projection_drops_hidden_reasoning() {
+        let event = AgentEvent::new(
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+            5,
+            AgentEventPayload::ReasoningDelta {
+                text: "hidden".to_string(),
+            },
+        );
+
+        assert!(project_conversation_event(event).is_none());
     }
 }
