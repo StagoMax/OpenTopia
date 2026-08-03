@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   composerContentText,
+  composerUndoEntries,
+  composerVisibleText,
   normalizeComposerContentParts,
   referencedImageIds,
 } from "./composerContent.ts";
@@ -40,4 +42,58 @@ test("builds a readable fallback prompt without exposing internal image IDs", ()
 
   assert.equal(text, "请按[图片：settings.png]实现设置页");
   assert.doesNotMatch(text, /11111111/);
+});
+
+test("keeps image filenames out of the visible composer text", () => {
+  const text = composerVisibleText([
+    { type: "text", text: "请按" },
+    { type: "image_ref", imageId },
+    { type: "text", text: "实现设置页" },
+  ]);
+
+  assert.equal(text, "请按实现设置页");
+  assert.doesNotMatch(text, /settings|图片|11111111/);
+});
+
+test("splits a multi-character IME commit into one undo entry per character", () => {
+  const entries = composerUndoEntries(
+    { parts: [], caretOffset: 0 },
+    { parts: [{ type: "text", text: "你好" }], caretOffset: 2 },
+    true,
+  );
+
+  assert.deepEqual(entries, [
+    { parts: [], caretOffset: 0 },
+    { parts: [{ type: "text", text: "你" }], caretOffset: 1 },
+  ]);
+});
+
+test("keeps a pasted phrase as one undo operation", () => {
+  const entries = composerUndoEntries(
+    { parts: [{ type: "text", text: "前" }], caretOffset: 1 },
+    { parts: [{ type: "text", text: "前粘贴内容" }], caretOffset: 5 },
+    false,
+  );
+
+  assert.deepEqual(entries, [
+    { parts: [{ type: "text", text: "前" }], caretOffset: 1 },
+  ]);
+});
+
+test("records inline image insertion in the custom undo history", () => {
+  const entries = composerUndoEntries(
+    { parts: [{ type: "text", text: "前" }], caretOffset: 1 },
+    {
+      parts: [
+        { type: "text", text: "前" },
+        { type: "image_ref", imageId },
+      ],
+      caretOffset: 2,
+    },
+    true,
+  );
+
+  assert.deepEqual(entries, [
+    { parts: [{ type: "text", text: "前" }], caretOffset: 1 },
+  ]);
 });

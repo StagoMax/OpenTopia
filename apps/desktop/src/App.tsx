@@ -120,8 +120,12 @@ import { Button, IconButton, Popover } from "./components/ui";
 import { normalizeCopiedText } from "./clipboardText";
 import {
   composerContentText,
+  composerUndoEntries,
+  composerVisibleText,
   normalizeComposerContentParts,
   referencedImageIds,
+  splitComposerText,
+  type ComposerHistorySnapshot,
 } from "./composerContent";
 import { isConversationScrollNearEnd } from "./conversationScroll";
 import {
@@ -6307,32 +6311,6 @@ function Sidebar({
               <section
                 className={`project-node ${isActive ? "active" : ""}`}
                 key={project.id}
-                onMouseEnter={(event) => {
-                  const bounds = event.currentTarget.getBoundingClientRect();
-                  const cardWidth = 320;
-                  const left = Math.min(
-                    bounds.right + 8,
-                    window.innerWidth - cardWidth - 8,
-                  );
-                  const remoteUrl =
-                    project.id === activeProjectId
-                      ? activeWorkspaceRemoteUrl
-                      : null;
-                  setHoveredProject({
-                    id: projectInfoId,
-                    name: project.name,
-                    threadCount: projectThreads.length,
-                    workspaceRoot: project.workspaceRoot,
-                    pinned: project.pinned,
-                    remoteUrl,
-                    left: Math.max(8, left),
-                    top: Math.max(
-                      36,
-                      Math.min(bounds.top, window.innerHeight - 174),
-                    ),
-                  });
-                }}
-                onMouseLeave={() => setHoveredProject(null)}
               >
                 <div className="project-row">
                   <button
@@ -6340,6 +6318,33 @@ function Sidebar({
                     title={project.workspaceRoot ?? project.name}
                     aria-label={`项目 ${project.name}`}
                     aria-describedby={projectInfoId}
+                    onMouseEnter={(event) => {
+                      const bounds =
+                        event.currentTarget.getBoundingClientRect();
+                      const cardWidth = 320;
+                      const left = Math.min(
+                        bounds.right + 8,
+                        window.innerWidth - cardWidth - 8,
+                      );
+                      const remoteUrl =
+                        project.id === activeProjectId
+                          ? activeWorkspaceRemoteUrl
+                          : null;
+                      setHoveredProject({
+                        id: projectInfoId,
+                        name: project.name,
+                        threadCount: projectThreads.length,
+                        workspaceRoot: project.workspaceRoot,
+                        pinned: project.pinned,
+                        remoteUrl,
+                        left: Math.max(8, left),
+                        top: Math.max(
+                          36,
+                          Math.min(bounds.top, window.innerHeight - 174),
+                        ),
+                      });
+                    }}
+                    onMouseLeave={() => setHoveredProject(null)}
                     onClick={() => {
                       toggleExpandedProject(project.id);
                       onSelectProject(project);
@@ -7700,11 +7705,7 @@ const MessageBubble = memo(function MessageBubble({
       part.type !== "turn_context" &&
       part.type !== "tool_call" &&
       part.type !== "tool_result" &&
-      !(
-        part.type === "image" &&
-        part.id &&
-        referencedImageIds.has(part.id)
-      ),
+      !(part.type === "image" && part.id && referencedImageIds.has(part.id)),
   );
   if (visibleParts.length === 0) return null;
 
@@ -7845,9 +7846,7 @@ function InlineImageMessagePart({
   useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
 
   return (
-    <span
-      className={`message-inline-image ${compact ? "is-reference" : ""}`}
-    >
+    <span className={`message-inline-image ${compact ? "is-reference" : ""}`}>
       <img src={previewUrl} alt={part.name || "已发送图片"} />
     </span>
   );
@@ -7995,6 +7994,7 @@ function ComposerPlanStepIcon({
 
 const MAX_COMPOSER_IMAGES = 10;
 const MAX_COMPOSER_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_COMPOSER_HISTORY_ENTRIES = 200;
 
 type ComposerImageAttachment = InlineImageAttachment & {
   previewUrl: string;
@@ -8016,33 +8016,58 @@ async function imageFileFingerprint(file: File): Promise<{
   };
 }
 
-function pushComposerText(
-  parts: InlineMessageContentPart[],
-  text: string,
-) {
+function pushComposerText(parts: InlineMessageContentPart[], text: string) {
   if (!text) return;
   const previous = parts.at(-1);
   if (previous?.type === "text") previous.text += text;
   else parts.push({ type: "text", text });
 }
 
-function readComposerContentParts(
+type ComposerCaretPoint = {
+  node: Node;
+  offset: number;
+};
+
+function readComposerContent(
   editor: HTMLElement,
-): InlineMessageContentPart[] {
+  caretPoint?: ComposerCaretPoint,
+): ComposerHistorySnapshot {
   const parts: InlineMessageContentPart[] = [];
+  let contentOffset = 0;
+  let caretOffset: number | null = null;
+  const appendText = (text: string) => {
+    const normalized = text.replaceAll("\u200b", "");
+    pushComposerText(parts, normalized);
+    contentOffset += splitComposerText(normalized).length;
+  };
+  const captureElementOffset = (element: HTMLElement, offset: number) => {
+    if (caretPoint?.node === element && caretPoint.offset === offset) {
+      caretOffset = contentOffset;
+    }
+  };
   const visit = (node: Node) => {
     if (node.nodeType === Node.TEXT_NODE) {
-      pushComposerText(parts, node.textContent ?? "");
+      const text = node.textContent ?? "";
+      if (caretPoint?.node === node) {
+        caretOffset =
+          contentOffset +
+          splitComposerText(text.slice(0, caretPoint.offset)).length;
+      }
+      appendText(text);
       return;
     }
     if (!(node instanceof HTMLElement)) return;
     const imageId = node.dataset.composerImageId;
     if (imageId) {
+      captureElementOffset(node, 0);
       parts.push({ type: "image_ref", imageId });
+      contentOffset += 1;
+      captureElementOffset(node, node.childNodes.length);
       return;
     }
     if (node.tagName === "BR") {
-      pushComposerText(parts, "\n");
+      captureElementOffset(node, 0);
+      appendText("\n");
       return;
     }
     const block = node !== editor && ["DIV", "P"].includes(node.tagName);
@@ -8050,13 +8075,109 @@ function readComposerContentParts(
       const previous = parts.at(-1);
       if (previous?.type === "text" && !previous.text.endsWith("\n")) {
         previous.text += "\n";
+        contentOffset += 1;
       }
     }
-    node.childNodes.forEach(visit);
-    if (block) pushComposerText(parts, "\n");
+    captureElementOffset(node, 0);
+    node.childNodes.forEach((child, index) => {
+      captureElementOffset(node, index);
+      visit(child);
+      captureElementOffset(node, index + 1);
+    });
+    if (block) appendText("\n");
   };
-  editor.childNodes.forEach(visit);
-  return normalizeComposerContentParts(parts);
+  captureElementOffset(editor, 0);
+  editor.childNodes.forEach((child, index) => {
+    captureElementOffset(editor, index);
+    visit(child);
+    captureElementOffset(editor, index + 1);
+  });
+  return {
+    parts: normalizeComposerContentParts(parts),
+    caretOffset: caretOffset ?? contentOffset,
+  };
+}
+
+function readComposerContentParts(
+  editor: HTMLElement,
+): InlineMessageContentPart[] {
+  return readComposerContent(editor).parts;
+}
+
+function cloneComposerHistorySnapshot(
+  snapshot: ComposerHistorySnapshot,
+): ComposerHistorySnapshot {
+  return {
+    parts: snapshot.parts.map((part) => ({ ...part })),
+    caretOffset: snapshot.caretOffset,
+  };
+}
+
+function composerSnapshotAtSelection(
+  editor: HTMLElement,
+): ComposerHistorySnapshot {
+  const selection = window.getSelection();
+  const range =
+    selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+  return rangeBelongsToEditor(editor, range)
+    ? readComposerContent(editor, {
+        node: range!.startContainer,
+        offset: range!.startOffset,
+      })
+    : readComposerContent(editor);
+}
+
+function renderComposerSnapshot(
+  editor: HTMLElement,
+  snapshot: ComposerHistorySnapshot,
+  attachments: ComposerImageAttachment[],
+): Range {
+  const attachmentsById = new Map(
+    attachments.map((attachment) => [attachment.id, attachment]),
+  );
+  editor.replaceChildren();
+  for (const part of normalizeComposerContentParts(snapshot.parts)) {
+    if (part.type === "text") {
+      editor.append(document.createTextNode(part.text));
+      continue;
+    }
+    const attachment = attachmentsById.get(part.imageId);
+    if (attachment) {
+      editor.append(createComposerImageReferenceNode(attachment));
+    }
+  }
+
+  let remaining = Math.max(0, snapshot.caretOffset);
+  const range = document.createRange();
+  for (const node of editor.childNodes) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent ?? "";
+      const graphemes = splitComposerText(text);
+      if (remaining <= graphemes.length) {
+        range.setStart(node, graphemes.slice(0, remaining).join("").length);
+        range.collapse(true);
+        return range;
+      }
+      remaining -= graphemes.length;
+      continue;
+    }
+    if (node instanceof HTMLElement && node.dataset.composerImageId) {
+      if (remaining === 0) {
+        range.setStartBefore(node);
+        range.collapse(true);
+        return range;
+      }
+      remaining -= 1;
+      if (remaining === 0) {
+        range.setStartAfter(node);
+        range.collapse(true);
+        return range;
+      }
+    }
+  }
+  range.selectNodeContents(editor);
+  range.collapse(false);
+  return range;
 }
 
 function createComposerImageReferenceNode(
@@ -8083,7 +8204,10 @@ function createComposerImageReferenceNode(
   return wrapper;
 }
 
-function rangeBelongsToEditor(editor: HTMLElement, range: Range | null): boolean {
+function rangeBelongsToEditor(
+  editor: HTMLElement,
+  range: Range | null,
+): boolean {
   if (!range) return false;
   const container =
     range.commonAncestorContainer.nodeType === Node.TEXT_NODE
@@ -8102,7 +8226,10 @@ function endOfComposerRange(editor: HTMLElement): Range {
 function composerRangeAtPoint(x: number, y: number): Range | null {
   const rangedDocument = document as Document & {
     caretRangeFromPoint?(x: number, y: number): Range | null;
-    caretPositionFromPoint?(x: number, y: number): {
+    caretPositionFromPoint?(
+      x: number,
+      y: number,
+    ): {
       offsetNode: Node;
       offset: number;
     } | null;
@@ -8289,6 +8416,8 @@ function Composer({
   const [imageAttachments, setImageAttachments] = useState<
     ComposerImageAttachment[]
   >([]);
+  const [hasInlineImageReferences, setHasInlineImageReferences] =
+    useState(false);
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [imageContextMenu, setImageContextMenu] = useState<{
@@ -8304,6 +8433,18 @@ function Composer({
   const contextMenuInsertionRangeRef = useRef<Range | null>(null);
   const contextMenuReferenceRef = useRef<HTMLElement | null>(null);
   const imageContextMenuRef = useRef<HTMLDivElement>(null);
+  const composerUndoHistoryRef = useRef<ComposerHistorySnapshot[]>([]);
+  const composerRedoHistoryRef = useRef<ComposerHistorySnapshot[]>([]);
+  const currentComposerSnapshotRef = useRef<ComposerHistorySnapshot | null>(
+    null,
+  );
+  const compositionStartSnapshotRef = useRef<ComposerHistorySnapshot | null>(
+    null,
+  );
+  const pendingBeforeInputSnapshotRef = useRef<ComposerHistorySnapshot | null>(
+    null,
+  );
+  const isComposingRef = useRef(false);
 
   useEffect(() => {
     imageAttachmentsRef.current = imageAttachments;
@@ -8318,16 +8459,30 @@ function Composer({
     [],
   );
 
-  useEffect(() => {
-    setDraft(value);
-  }, [value]);
-
   useLayoutEffect(() => {
     const editor = editorRef.current;
-    if (!editor || imageAttachmentsRef.current.length > 0) return;
-    const current = composerContentText(readComposerContentParts(editor), []);
-    if (current === value) return;
+    if (!editor) return;
+    const current = composerSnapshotAtSelection(editor);
+    const currentText = composerVisibleText(current.parts);
+    if (currentComposerSnapshotRef.current && currentText === value) return;
+    if (!currentComposerSnapshotRef.current && currentText === value) {
+      currentComposerSnapshotRef.current = current;
+      return;
+    }
+
+    imageAttachmentsRef.current.forEach((attachment) =>
+      URL.revokeObjectURL(attachment.previewUrl),
+    );
+    imageAttachmentsRef.current = [];
+    setImageAttachments([]);
+    setHasInlineImageReferences(false);
+    setPreviewIndex(null);
     editor.textContent = value;
+    const next = readComposerContent(editor);
+    currentComposerSnapshotRef.current = next;
+    composerUndoHistoryRef.current = [];
+    composerRedoHistoryRef.current = [];
+    setDraft(value);
   }, [value]);
 
   useEffect(() => {
@@ -8338,10 +8493,20 @@ function Composer({
       const range = selection.getRangeAt(0);
       if (rangeBelongsToEditor(editor, range)) {
         savedComposerRangeRef.current = range.cloneRange();
+        if (!isComposingRef.current && currentComposerSnapshotRef.current) {
+          currentComposerSnapshotRef.current = {
+            ...currentComposerSnapshotRef.current,
+            caretOffset: readComposerContent(editor, {
+              node: range.startContainer,
+              offset: range.startOffset,
+            }).caretOffset,
+          };
+        }
       }
     };
     document.addEventListener("selectionchange", rememberSelection);
-    return () => document.removeEventListener("selectionchange", rememberSelection);
+    return () =>
+      document.removeEventListener("selectionchange", rememberSelection);
   }, []);
 
   useEffect(() => {
@@ -8379,7 +8544,24 @@ function Composer({
     }
   }, [imageContextMenu]);
 
-  function syncComposerState() {
+  function publishComposerSnapshot(snapshot: ComposerHistorySnapshot) {
+    const usedIds = referencedImageIds(snapshot.parts);
+    const currentAttachments = imageAttachmentsRef.current;
+    const text = composerVisibleText(snapshot.parts);
+    setHasInlineImageReferences(usedIds.size > 0);
+    setPreviewIndex((current) => {
+      const attachment =
+        current === null ? undefined : currentAttachments[current];
+      return attachment && !usedIds.has(attachment.id) ? null : current;
+    });
+    setDraft(text);
+    onChange(text);
+  }
+
+  function commitComposerMutation(
+    splitInsertedContent: boolean,
+    requestedBefore?: ComposerHistorySnapshot | null,
+  ) {
     const editor = editorRef.current;
     if (!editor) return;
     if (
@@ -8388,24 +8570,67 @@ function Composer({
     ) {
       editor.replaceChildren();
     }
-    const parts = readComposerContentParts(editor);
-    const usedIds = referencedImageIds(parts);
-    const currentAttachments = imageAttachmentsRef.current;
-    const nextAttachments = currentAttachments.filter((attachment) => {
-      const keep = usedIds.has(attachment.id);
-      if (!keep) URL.revokeObjectURL(attachment.previewUrl);
-      return keep;
-    });
-    if (nextAttachments.length !== currentAttachments.length) {
-      imageAttachmentsRef.current = nextAttachments;
-      setImageAttachments(nextAttachments);
-      setPreviewIndex((current) =>
-        current !== null && current >= nextAttachments.length ? null : current,
-      );
+    const after = composerSnapshotAtSelection(editor);
+    const before =
+      requestedBefore ?? currentComposerSnapshotRef.current ?? after;
+    const entries = composerUndoEntries(before, after, splitInsertedContent);
+    if (entries.length > 0) {
+      composerUndoHistoryRef.current.push(...entries);
+      if (
+        composerUndoHistoryRef.current.length > MAX_COMPOSER_HISTORY_ENTRIES
+      ) {
+        composerUndoHistoryRef.current.splice(
+          0,
+          composerUndoHistoryRef.current.length - MAX_COMPOSER_HISTORY_ENTRIES,
+        );
+      }
+      composerRedoHistoryRef.current = [];
     }
-    const text = composerContentText(parts, nextAttachments);
-    setDraft(text);
-    onChange(text);
+    currentComposerSnapshotRef.current = cloneComposerHistorySnapshot(after);
+    publishComposerSnapshot(after);
+  }
+
+  function publishUncommittedComposerState() {
+    const editor = editorRef.current;
+    if (!editor) return;
+    publishComposerSnapshot(composerSnapshotAtSelection(editor));
+  }
+
+  function restoreComposerHistorySnapshot(snapshot: ComposerHistorySnapshot) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const restored = cloneComposerHistorySnapshot(snapshot);
+    const range = renderComposerSnapshot(
+      editor,
+      restored,
+      imageAttachmentsRef.current,
+    );
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    savedComposerRangeRef.current = range.cloneRange();
+    currentComposerSnapshotRef.current = restored;
+    compositionStartSnapshotRef.current = null;
+    pendingBeforeInputSnapshotRef.current = null;
+    setImageContextMenu(null);
+    editor.focus();
+    publishComposerSnapshot(restored);
+  }
+
+  function undoComposerMutation() {
+    const target = composerUndoHistoryRef.current.pop();
+    const editor = editorRef.current;
+    if (!target || !editor) return;
+    composerRedoHistoryRef.current.push(composerSnapshotAtSelection(editor));
+    restoreComposerHistorySnapshot(target);
+  }
+
+  function redoComposerMutation() {
+    const target = composerRedoHistoryRef.current.pop();
+    const editor = editorRef.current;
+    if (!target || !editor) return;
+    composerUndoHistoryRef.current.push(composerSnapshotAtSelection(editor));
+    restoreComposerHistorySnapshot(target);
   }
 
   function insertImageReference(
@@ -8449,7 +8674,10 @@ function Composer({
         references.push(existing);
         continue;
       }
-      if (imageAttachmentsRef.current.length + next.length >= MAX_COMPOSER_IMAGES) {
+      if (
+        imageAttachmentsRef.current.length + next.length >=
+        MAX_COMPOSER_IMAGES
+      ) {
         continue;
       }
       const attachment = {
@@ -8469,17 +8697,29 @@ function Composer({
     setImageAttachments(combined);
 
     let range = requestedRange?.cloneRange() ?? null;
+    const editor = editorRef.current;
+    const before =
+      editor && rangeBelongsToEditor(editor, range)
+        ? readComposerContent(editor, {
+            node: range!.startContainer,
+            offset: range!.startOffset,
+          })
+        : editor
+          ? composerSnapshotAtSelection(editor)
+          : null;
     for (const attachment of references) {
       insertImageReference(attachment, range);
       range = savedComposerRangeRef.current?.cloneRange() ?? null;
     }
-    syncComposerState();
+    commitComposerMutation(true, before);
   }
 
   function removeImageReference(reference: HTMLElement | null) {
     if (!reference?.isConnected) return;
+    const editor = editorRef.current;
+    const before = editor ? composerSnapshotAtSelection(editor) : null;
     reference.remove();
-    syncComposerState();
+    commitComposerMutation(false, before);
   }
 
   const submitDraft = async () => {
@@ -8512,8 +8752,17 @@ function Composer({
     );
     setImageAttachments([]);
     imageAttachmentsRef.current = [];
+    setHasInlineImageReferences(false);
     setPreviewIndex(null);
     if (editor) editor.replaceChildren();
+    currentComposerSnapshotRef.current = {
+      parts: [],
+      caretOffset: 0,
+    };
+    composerUndoHistoryRef.current = [];
+    composerRedoHistoryRef.current = [];
+    compositionStartSnapshotRef.current = null;
+    pendingBeforeInputSnapshotRef.current = null;
     setDraft("");
     onChange("");
   };
@@ -8567,7 +8816,7 @@ function Composer({
 
   const hasSendableContent = Boolean(
     draft.trim() ||
-    imageAttachments.length > 0 ||
+    hasInlineImageReferences ||
     contextSources.length > 0 ||
     selectedSkillIds.length > 0,
   );
@@ -8855,7 +9104,59 @@ function Composer({
             }
           }}
           onPaste={(event) => void handlePaste(event)}
-          onInput={syncComposerState}
+          onBeforeInput={(event) => {
+            const inputType = (event.nativeEvent as InputEvent).inputType;
+            if (inputType === "historyUndo") {
+              event.preventDefault();
+              undoComposerMutation();
+            } else if (inputType === "historyRedo") {
+              event.preventDefault();
+              redoComposerMutation();
+            } else if (
+              !isComposingRef.current &&
+              !compositionStartSnapshotRef.current
+            ) {
+              const editor = editorRef.current;
+              pendingBeforeInputSnapshotRef.current = editor
+                ? composerSnapshotAtSelection(editor)
+                : currentComposerSnapshotRef.current;
+            }
+          }}
+          onCompositionStart={() => {
+            const editor = editorRef.current;
+            isComposingRef.current = true;
+            compositionStartSnapshotRef.current = editor
+              ? composerSnapshotAtSelection(editor)
+              : currentComposerSnapshotRef.current;
+          }}
+          onCompositionEnd={() => {
+            isComposingRef.current = false;
+            queueMicrotask(() => {
+              const before = compositionStartSnapshotRef.current;
+              compositionStartSnapshotRef.current = null;
+              pendingBeforeInputSnapshotRef.current = null;
+              commitComposerMutation(true, before);
+            });
+          }}
+          onInput={(event) => {
+            const nativeEvent = event.nativeEvent as InputEvent;
+            if (
+              isComposingRef.current ||
+              compositionStartSnapshotRef.current ||
+              nativeEvent.isComposing
+            ) {
+              publishUncommittedComposerState();
+              return;
+            }
+            const before = pendingBeforeInputSnapshotRef.current;
+            pendingBeforeInputSnapshotRef.current = null;
+            commitComposerMutation(
+              nativeEvent.inputType === "insertText" ||
+                nativeEvent.inputType === "insertCompositionText" ||
+                nativeEvent.inputType === "insertFromComposition",
+              before,
+            );
+          }}
           onClick={(event) => {
             const target = (event.target as Element).closest<HTMLElement>(
               ".composer-inline-image-button",
@@ -8882,10 +9183,30 @@ function Composer({
             });
           }}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
+            const primaryModifier = event.ctrlKey || event.metaKey;
             if (
-              (event.target as Element).closest(
-                ".composer-inline-image-button",
-              )
+              primaryModifier &&
+              !event.altKey &&
+              event.key.toLocaleLowerCase() === "z"
+            ) {
+              event.preventDefault();
+              if (event.shiftKey) redoComposerMutation();
+              else undoComposerMutation();
+              return;
+            }
+            if (
+              event.ctrlKey &&
+              !event.altKey &&
+              !event.shiftKey &&
+              event.key.toLocaleLowerCase() === "y"
+            ) {
+              event.preventDefault();
+              redoComposerMutation();
+              return;
+            }
+            if (
+              (event.target as Element).closest(".composer-inline-image-button")
             ) {
               return;
             }
@@ -9137,11 +9458,19 @@ function Composer({
                     (item) => item.id === imageContextMenu.imageId,
                   );
                   if (attachment) {
-                    insertImageReference(
-                      attachment,
-                      contextMenuInsertionRangeRef.current,
-                    );
-                    syncComposerState();
+                    const editor = editorRef.current;
+                    const requestedRange = contextMenuInsertionRangeRef.current;
+                    const before =
+                      editor && rangeBelongsToEditor(editor, requestedRange)
+                        ? readComposerContent(editor, {
+                            node: requestedRange!.startContainer,
+                            offset: requestedRange!.startOffset,
+                          })
+                        : editor
+                          ? composerSnapshotAtSelection(editor)
+                          : null;
+                    insertImageReference(attachment, requestedRange);
+                    commitComposerMutation(true, before);
                   }
                   contextMenuInsertionRangeRef.current = null;
                   setImageContextMenu(null);
