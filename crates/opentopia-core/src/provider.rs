@@ -4660,7 +4660,7 @@ impl CodexAppServerProvider {
     pub fn from_settings(settings: &ProviderSettings) -> Option<Self> {
         (settings.kind == ProviderKind::CodexAppServer).then(|| Self {
             supports_vision: settings.supports_vision_for_model(),
-            native_web_search: true,
+            native_web_search: false,
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -4846,14 +4846,26 @@ impl CodexAppServerProvider {
             let params = event.get("params").cloned().unwrap_or(Value::Null);
             match method {
                 "item/started" => {
-                    if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id)
-                        && params.pointer("/item/type").and_then(Value::as_str)
+                    if params.get("turnId").and_then(Value::as_str) == Some(&session.turn_id) {
+                        if let Some(item_type) =
+                            params.pointer("/item/type").and_then(Value::as_str)
+                        {
+                            if is_codex_builtin_action(item_type) {
+                                anyhow::bail!(
+                                    "Codex App Server attempted built-in action {item_type}; OpenTopia must execute all actions through its own tools"
+                                );
+                            }
+                        }
+                        if params.pointer("/item/type").and_then(Value::as_str)
                             == Some("agentMessage")
-                        && params.pointer("/item/phase").and_then(Value::as_str)
-                            == Some("final_answer")
-                    {
-                        if let Some(item_id) = params.pointer("/item/id").and_then(Value::as_str) {
-                            session.final_message_item_ids.insert(item_id.to_string());
+                            && params.pointer("/item/phase").and_then(Value::as_str)
+                                == Some("final_answer")
+                        {
+                            if let Some(item_id) =
+                                params.pointer("/item/id").and_then(Value::as_str)
+                            {
+                                session.final_message_item_ids.insert(item_id.to_string());
+                            }
                         }
                     }
                 }
@@ -5054,6 +5066,7 @@ fn codex_app_server_command() -> Command {
         if let Some(candidate) = latest_codex_desktop_binary() {
             let mut command = Command::new(candidate);
             command.arg("app-server");
+            configure_codex_app_server_environment(&mut command);
             return command;
         }
         if let Some(app_data) = std::env::var_os("APPDATA") {
@@ -5062,13 +5075,46 @@ fn codex_app_server_command() -> Command {
                 let mut command = Command::new("cmd.exe");
                 command.args(["/d", "/s", "/c"]);
                 command.arg(format!("\"\"{}\" app-server\"", candidate.display()));
+                configure_codex_app_server_environment(&mut command);
                 return command;
             }
         }
     }
     let mut command = Command::new(OsString::from("codex"));
     command.arg("app-server");
+    configure_codex_app_server_environment(&mut command);
     command
+}
+
+/// A development host such as the Codex IDE can inject an isolated `CODEX_HOME`.
+/// Do not let that host-only profile hide the user's normal Codex credentials
+/// from the OpenTopia child process.
+fn configure_codex_app_server_environment(command: &mut Command) {
+    let codex_home = std::env::var_os("CODEX_HOME");
+    let originator = std::env::var("CODEX_INTERNAL_ORIGINATOR_OVERRIDE").ok();
+    let uses_host_profile = codex_home
+        .as_deref()
+        .is_some_and(|home| is_isolated_codex_host_profile(Path::new(home), originator.as_deref()));
+    if !uses_host_profile {
+        return;
+    }
+
+    for variable in [
+        "CODEX_HOME",
+        "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+        "CODEX_THREAD_ID",
+        "CODEX_PERMISSION_PROFILE",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+    ] {
+        command.env_remove(variable);
+    }
+}
+
+fn is_isolated_codex_host_profile(codex_home: &Path, originator: Option<&str>) -> bool {
+    originator.is_some()
+        && codex_home
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("codex-api"))
 }
 
 #[cfg(windows)]
@@ -5173,6 +5219,18 @@ fn codex_dynamic_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn is_codex_builtin_action(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "webSearch"
+            | "imageView"
+            | "collabToolCall"
+    )
 }
 
 fn codex_developer_instructions(request: &ModelRequest, native_web_search: bool) -> String {
@@ -5468,6 +5526,22 @@ mod tests {
         for path in paths {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn isolated_codex_host_profile_does_not_override_user_login() {
+        assert!(is_isolated_codex_host_profile(
+            Path::new("C:/Users/example/AppData/Local/OpenAI/codex-api"),
+            Some("codex_vscode"),
+        ));
+        assert!(!is_isolated_codex_host_profile(
+            Path::new("C:/Users/example/.codex"),
+            Some("codex_vscode"),
+        ));
+        assert!(!is_isolated_codex_host_profile(
+            Path::new("C:/Users/example/AppData/Local/OpenAI/codex-api"),
+            None,
+        ));
     }
 
     #[test]
@@ -5793,22 +5867,37 @@ mod tests {
     }
 
     #[test]
-    fn codex_app_server_allows_native_web_search_only_for_normal_agent_requests() {
+    fn codex_app_server_routes_all_actions_through_opentopia_tools() {
         let mut settings = ProviderSettings::default();
         settings.kind = ProviderKind::CodexAppServer;
         let provider = CodexAppServerProvider::from_settings(&settings).unwrap();
 
         let normal_instructions =
             codex_developer_instructions(&model_request(), provider.native_web_search);
-        assert!(normal_instructions.contains("built-in web search tool"));
-        assert!(normal_instructions.contains("do not invoke other built-in tools"));
-        assert!(normal_instructions.contains(NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION));
+        assert!(!normal_instructions.contains("web search"));
+        assert!(normal_instructions.contains("do not invoke built-in tools"));
 
         let guardian = provider.for_guardian();
         let guardian_instructions =
             codex_developer_instructions(&model_request(), guardian.native_web_search);
         assert!(!guardian_instructions.contains("web search"));
         assert!(guardian_instructions.contains("do not invoke built-in tools"));
+    }
+
+    #[test]
+    fn codex_builtin_actions_are_rejected_for_host_owned_execution() {
+        for action in [
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "webSearch",
+            "imageView",
+            "collabToolCall",
+        ] {
+            assert!(is_codex_builtin_action(action));
+        }
+        assert!(!is_codex_builtin_action("dynamicToolCall"));
+        assert!(!is_codex_builtin_action("agentMessage"));
     }
 
     #[test]
