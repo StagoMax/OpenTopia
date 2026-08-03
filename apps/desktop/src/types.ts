@@ -58,8 +58,7 @@ export type InlineImageAttachment = {
 };
 
 export type InlineMessageContentPart =
-  | { type: "text"; text: string }
-  | { type: "image_ref"; imageId: string };
+  { type: "text"; text: string } | { type: "image_ref"; imageId: string };
 
 export type PluginDirectoryPickResult =
   { canceled: true } | { canceled: false; path: string };
@@ -1863,13 +1862,13 @@ export type AgentEventPayload =
       round: number;
       context_hash: string;
       token_estimate: number;
-      items: ModelContextItem[];
+      items?: ModelContextItem[];
     }
   | {
       type: "model_request";
       request_id: string;
       round: number;
-      request: ModelRequestSnapshot;
+      request?: ModelRequestSnapshot | null;
     }
   | {
       type: "provider_request_sent";
@@ -1879,7 +1878,7 @@ export type AgentEventPayload =
       adapter: string;
       method: string;
       endpoint: string;
-      body: unknown;
+      body?: unknown;
     }
   | {
       type: "provider_request_retried";
@@ -1887,7 +1886,7 @@ export type AgentEventPayload =
       round: number;
       attempt: number;
       reason: string;
-      body: unknown;
+      body?: unknown;
     }
   | {
       type: "provider_response_received";
@@ -1896,7 +1895,7 @@ export type AgentEventPayload =
       attempt: number;
       status?: number | null;
       response_id?: string | null;
-      body: unknown;
+      body?: unknown;
     }
   | { type: "model_delta"; text: string }
   | { type: "reasoning_delta"; text: string }

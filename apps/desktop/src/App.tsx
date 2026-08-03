@@ -129,10 +129,16 @@ import {
 } from "./composerContent";
 import { isConversationScrollNearEnd } from "./conversationScroll";
 import {
+  cacheConversation,
+  mergeConversationEvents,
+  type ConversationCacheEntry,
+} from "./conversationCache";
+import {
   conversationStreamEventTrace,
   rendererTraceTime,
   type ConversationStreamEventTrace,
 } from "./conversationRenderTrace";
+import { threadTitleRetryDelay } from "./threadTitleRetry";
 import { resolveMarkdownLink } from "./markdownLinks";
 import {
   useWorkspacePathIndex,
@@ -261,6 +267,14 @@ type PendingTurnFeedback = {
   turnId: string | null;
   phase: ActiveTurnPhase;
   startedAt: string;
+};
+
+type PendingThreadTitleRetry = {
+  threadId: string;
+  prompt: string;
+  expectedTitle: string;
+  failureCount: number;
+  retryAt: number;
 };
 
 function resolveThreadActivityStatus(
@@ -608,6 +622,10 @@ export function App() {
       error: null,
     });
   const [conversationLoadAttempt, setConversationLoadAttempt] = useState(0);
+  const conversationCacheRef = useRef(
+    new Map<string, ConversationCacheEntry>(),
+  );
+  const conversationCacheClientRef = useRef<ApiClient | null>(null);
   const [subagentRuns, setSubagentRuns] = useState<SubagentRun[]>([]);
   const [terminalEvents, setTerminalEvents] = useState<TerminalEvent[]>([]);
   const [terminalSession, setTerminalSession] =
@@ -621,6 +639,12 @@ export function App() {
   const [skillsRevision, setSkillsRevision] = useState(0);
   const [isSending, setIsSending] = useState(false);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const pendingThreadTitleRetriesRef = useRef(
+    new Map<string, PendingThreadTitleRetry>(),
+  );
+  const threadTitleRetryInFlightRef = useRef(new Set<string>());
+  const threadTitleRetryTimerRef = useRef<number | null>(null);
+  const [threadTitleRetryRevision, setThreadTitleRetryRevision] = useState(0);
   const [pendingTurnFeedback, setPendingTurnFeedback] =
     useState<PendingTurnFeedback | null>(null);
   const [threadActivityStatuses, setThreadActivityStatuses] = useState<
@@ -704,6 +728,7 @@ export function App() {
   >([]);
   const [workbenchError, setWorkbenchError] = useState<string | null>(null);
   const [isRefreshingWorkbench, setIsRefreshingWorkbench] = useState(false);
+  const workbenchRefreshControllerRef = useRef<AbortController | null>(null);
   const [artifacts, setArtifacts] = useState<ArtifactDescriptor[]>([]);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(
     null,
@@ -1646,12 +1671,29 @@ export function App() {
     const threadId = activeThreadId;
     let cancelled = false;
     let source: StreamHandle | null = null;
-    setMessages([]);
-    setEvents([]);
-    setConversationLoadState({ threadId, status: "loading", error: null });
+    const controller = new AbortController();
+    if (conversationCacheClientRef.current !== client) {
+      conversationCacheRef.current.clear();
+      conversationCacheClientRef.current = client;
+    }
+    const cached = conversationCacheRef.current.get(threadId) ?? null;
+    if (cached) {
+      cacheConversation(conversationCacheRef.current, threadId, cached);
+      setMessages(cached.messages);
+      setEvents(cached.events);
+      setConversationLoadState({ threadId, status: "ready", error: null });
+    } else {
+      setMessages([]);
+      setEvents([]);
+      setConversationLoadState({ threadId, status: "loading", error: null });
+    }
 
-    const messagesRequest = client.listMessages(threadId);
-    const eventsRequest = client.listEvents(threadId);
+    const messagesRequest = client.listMessages(threadId, controller.signal);
+    const eventsRequest = client.listConversationEvents(
+      threadId,
+      cached?.events.at(-1)?.seq,
+      controller.signal,
+    );
 
     void messagesRequest
       .then((loadedMessages) => {
@@ -1660,7 +1702,13 @@ export function App() {
         setConversationLoadState({ threadId, status: "ready", error: null });
       })
       .catch((error) => {
-        if (cancelled) return;
+        if (cancelled || isAbortError(error)) return;
+        if (cached) {
+          setServerError(
+            error instanceof Error ? error.message : String(error),
+          );
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         setConversationLoadState({
           threadId,
@@ -1673,26 +1721,30 @@ export function App() {
     void eventsRequest
       .then((loadedEvents) => {
         if (cancelled) return;
-        setEvents(loadedEvents);
+        const nextEvents = mergeConversationEvents(
+          cached?.events ?? [],
+          loadedEvents,
+        );
+        setEvents(nextEvents);
         source = client.openEventStream(
           threadId,
-          loadedEvents.at(-1)?.seq,
+          nextEvents.at(-1)?.seq,
           ingestEvent,
         );
       })
       .catch((error) => {
-        if (!cancelled)
+        if (!cancelled && !isAbortError(error))
           setServerError(
             error instanceof Error ? error.message : String(error),
           );
       });
 
     void Promise.all([
-      client.getTurnStatus(threadId),
-      client.listPendingApprovals(threadId),
-      client.listPendingUserInput(threadId),
-      client.listSubagents(threadId),
-      client.getGoal(threadId),
+      client.getTurnStatus(threadId, controller.signal),
+      client.listPendingApprovals(threadId, controller.signal),
+      client.listPendingUserInput(threadId, controller.signal),
+      client.listSubagents(threadId, controller.signal),
+      client.getGoal(threadId, controller.signal),
     ])
       .then(
         ([
@@ -1724,7 +1776,7 @@ export function App() {
         },
       )
       .catch((error) => {
-        if (!cancelled)
+        if (!cancelled && !isAbortError(error))
           setServerError(
             error instanceof Error ? error.message : String(error),
           );
@@ -1732,6 +1784,7 @@ export function App() {
 
     return () => {
       cancelled = true;
+      controller.abort();
       source?.close();
     };
   }, [
@@ -1743,6 +1796,26 @@ export function App() {
   ]);
 
   useEffect(() => {
+    if (
+      !activeThreadId ||
+      conversationLoadState.threadId !== activeThreadId ||
+      conversationLoadState.status !== "ready"
+    ) {
+      return;
+    }
+    cacheConversation(conversationCacheRef.current, activeThreadId, {
+      messages,
+      events,
+    });
+  }, [
+    activeThreadId,
+    conversationLoadState.status,
+    conversationLoadState.threadId,
+    events,
+    messages,
+  ]);
+
+  useEffect(() => {
     if (!client || !activeThreadId) {
       setTerminalEvents([]);
       setTerminalSession(null);
@@ -1750,11 +1823,16 @@ export function App() {
     }
     let cancelled = false;
     let source: StreamHandle | null = null;
+    const controller = new AbortController();
     setTerminalEvents([]);
     setTerminalSession(null);
 
     void (async () => {
-      const history = await client.listTerminalHistory(activeThreadId);
+      const history = await client.listTerminalHistory(
+        activeThreadId,
+        undefined,
+        controller.signal,
+      );
       if (cancelled) return;
       setTerminalEvents(history);
       const since = history.at(-1)?.seq;
@@ -1766,7 +1844,7 @@ export function App() {
       const session = await client.ensureTerminalSession(activeThreadId);
       if (!cancelled) setTerminalSession(session);
     })().catch((error) => {
-      if (!cancelled)
+      if (!cancelled && !isAbortError(error))
         setWorkbenchError(
           error instanceof Error ? error.message : String(error),
         );
@@ -1774,6 +1852,7 @@ export function App() {
 
     return () => {
       cancelled = true;
+      controller.abort();
       source?.close();
     };
   }, [activeThreadId, client, ingestTerminalEvent]);
@@ -1781,6 +1860,10 @@ export function App() {
   const refreshWorkbench = useCallback(
     async (path?: string) => {
       if (!client || !activeThreadId) return;
+      workbenchRefreshControllerRef.current?.abort();
+      const controller = new AbortController();
+      workbenchRefreshControllerRef.current = controller;
+      const threadId = activeThreadId;
       setIsRefreshingWorkbench(true);
       setWorkbenchError(null);
       try {
@@ -1791,27 +1874,34 @@ export function App() {
           threadMcp,
           artifactList,
           loadedContextStatus,
+          loadedMcpServers,
         ] = await Promise.all([
-          client.listWorkspaceTree(activeThreadId, path),
-          client.getWorkspaceDiff(activeThreadId),
-          client.getSandbox(activeThreadId),
-          client.listThreadMcpServers(activeThreadId),
-          client.listArtifacts(activeThreadId),
-          client.getContextStatus(activeThreadId),
+          client.listWorkspaceTree(threadId, path, controller.signal),
+          client.getWorkspaceDiff(threadId, controller.signal),
+          client.getSandbox(threadId, controller.signal),
+          client.listThreadMcpServers(threadId, controller.signal),
+          client.listArtifacts(threadId, controller.signal),
+          client.getContextStatus(threadId, controller.signal),
+          client.listMcpServers(controller.signal),
         ]);
+        if (controller.signal.aborted) return;
         setWorkspaceTree(tree);
         setWorkspaceDiff(diff);
         setSandbox(sandboxStatus);
         setThreadMcpServers(threadMcp);
         setArtifacts(artifactList);
         setContextStatus(loadedContextStatus);
-        setMcpServers(await client.listMcpServers());
+        setMcpServers(loadedMcpServers);
       } catch (error) {
+        if (isAbortError(error)) return;
         setWorkbenchError(
           error instanceof Error ? error.message : String(error),
         );
       } finally {
-        setIsRefreshingWorkbench(false);
+        if (workbenchRefreshControllerRef.current === controller) {
+          workbenchRefreshControllerRef.current = null;
+          setIsRefreshingWorkbench(false);
+        }
       }
     },
     [activeThreadId, client],
@@ -1819,6 +1909,8 @@ export function App() {
 
   useEffect(() => {
     if (!activeThreadId) {
+      workbenchRefreshControllerRef.current?.abort();
+      workbenchRefreshControllerRef.current = null;
       setWorkspaceTree(null);
       setWorkspaceDiff(null);
       setSandbox(null);
@@ -1829,6 +1921,9 @@ export function App() {
       return;
     }
     void refreshWorkbench();
+    return () => {
+      workbenchRefreshControllerRef.current?.abort();
+    };
   }, [activeThreadId, refreshWorkbench]);
 
   function selectThread(threadId: string) {
@@ -2660,6 +2755,83 @@ export function App() {
     );
   }
 
+  function requestThreadTitleGeneration(retry: PendingThreadTitleRetry) {
+    if (!client || threadTitleRetryInFlightRef.current.has(retry.threadId)) {
+      return;
+    }
+
+    threadTitleRetryInFlightRef.current.add(retry.threadId);
+    void client
+      .generateThreadTitle(retry.threadId, retry.prompt, retry.expectedTitle)
+      .then(({ thread: titledThread, updated }) => {
+        pendingThreadTitleRetriesRef.current.delete(retry.threadId);
+        if (!updated) return;
+        setThreads((current) =>
+          current.map((item) =>
+            item.id === titledThread.id ? titledThread : item,
+          ),
+        );
+      })
+      .catch((error) => {
+        const failureCount = retry.failureCount + 1;
+        const delay = threadTitleRetryDelay(failureCount);
+        if (delay === null) {
+          pendingThreadTitleRetriesRef.current.delete(retry.threadId);
+          console.warn(
+            "OpenTopia could not generate the task title after retries",
+            error,
+          );
+          return;
+        }
+
+        pendingThreadTitleRetriesRef.current.set(retry.threadId, {
+          ...retry,
+          failureCount,
+          retryAt: Date.now() + delay,
+        });
+        console.warn(
+          "OpenTopia could not generate the task title; it will retry when idle",
+          error,
+        );
+      })
+      .finally(() => {
+        threadTitleRetryInFlightRef.current.delete(retry.threadId);
+        setThreadTitleRetryRevision((current) => current + 1);
+      });
+  }
+
+  useEffect(() => {
+    if (threadTitleRetryTimerRef.current !== null) {
+      window.clearTimeout(threadTitleRetryTimerRef.current);
+      threadTitleRetryTimerRef.current = null;
+    }
+    if (!client || activeTurnId || isSending) return;
+
+    const nextRetry = [...pendingThreadTitleRetriesRef.current.values()]
+      .filter(
+        (retry) => !threadTitleRetryInFlightRef.current.has(retry.threadId),
+      )
+      .sort((left, right) => left.retryAt - right.retryAt)[0];
+    if (!nextRetry) return;
+
+    const waitMs = Math.max(0, nextRetry.retryAt - Date.now());
+    if (waitMs === 0) {
+      requestThreadTitleGeneration(nextRetry);
+      return;
+    }
+
+    threadTitleRetryTimerRef.current = window.setTimeout(() => {
+      threadTitleRetryTimerRef.current = null;
+      setThreadTitleRetryRevision((current) => current + 1);
+    }, waitMs);
+    return () => {
+      if (threadTitleRetryTimerRef.current !== null) {
+        window.clearTimeout(threadTitleRetryTimerRef.current);
+        threadTitleRetryTimerRef.current = null;
+      }
+    };
+  }, [activeTurnId, client, isSending, threadTitleRetryRevision]);
+
   async function createThread(
     initialPrompt?: string,
     imageAttachments: InlineImageAttachment[] = [],
@@ -2732,19 +2904,13 @@ export function App() {
       setActiveToolTabId(null);
       setToolStageOpen(false);
       if (threadTitleNeedsSummary(prompt)) {
-        void client
-          .generateThreadTitle(thread.id, prompt, thread.title)
-          .then(({ thread: titledThread, updated }) => {
-            if (!updated) return;
-            setThreads((current) =>
-              current.map((item) =>
-                item.id === titledThread.id ? titledThread : item,
-              ),
-            );
-          })
-          .catch((error) => {
-            console.warn("OpenTopia could not generate the task title", error);
-          });
+        requestThreadTitleGeneration({
+          threadId: thread.id,
+          prompt,
+          expectedTitle: thread.title,
+          failureCount: 0,
+          retryAt: Date.now(),
+        });
       }
       if (directCommand) {
         await runDirectToolCommand(thread.id, directCommand);
@@ -3474,7 +3640,7 @@ export function App() {
   async function startCodexLogin(): Promise<CodexLoginStart | null> {
     if (!client) return null;
     try {
-      const login = await client.startCodexLogin(true);
+      const login = await client.startCodexLogin();
       setCodexAccount((current) => ({
         ...(current ?? {
           loggedIn: false,
@@ -9893,6 +10059,7 @@ function SideTaskConversation({
 
     let cancelled = false;
     let source: StreamHandle | null = null;
+    const controller = new AbortController();
     eventIdsRef.current = new Set();
     setMessages([]);
     setEvents([]);
@@ -9901,11 +10068,11 @@ function SideTaskConversation({
     setLoadState({ threadId, status: "loading", error: null });
 
     void Promise.all([
-      client.listMessages(threadId),
-      client.listEvents(threadId),
-      client.getTurnStatus(threadId),
-      client.listPendingApprovals(threadId),
-      client.listPendingUserInput(threadId),
+      client.listMessages(threadId, controller.signal),
+      client.listConversationEvents(threadId, undefined, controller.signal),
+      client.getTurnStatus(threadId, controller.signal),
+      client.listPendingApprovals(threadId, controller.signal),
+      client.listPendingUserInput(threadId, controller.signal),
     ])
       .then(
         ([
@@ -9944,7 +10111,7 @@ function SideTaskConversation({
         },
       )
       .catch((error) => {
-        if (cancelled) return;
+        if (cancelled || isAbortError(error)) return;
         setLoadState({
           threadId,
           status: "error",
@@ -9954,6 +10121,7 @@ function SideTaskConversation({
 
     return () => {
       cancelled = true;
+      controller.abort();
       source?.close();
     };
   }, [client, ingestSideTaskEvent, loadAttempt, onSetThreadActivity, threadId]);
@@ -11257,6 +11425,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 function friendlyProviderError(message: string): string {
   if (/401|auth_failed|master_key|unauthorized/i.test(message)) {
     return "认证失败：当前 Provider 的 Base URL 拒绝了 API Key。请在设置中更新该 Provider 的密钥并测试连接。";
@@ -11491,7 +11663,7 @@ function usesFormatAwarePreview(path: string): boolean {
   );
 }
 
-const MAX_THREAD_TITLE_CHARS = 20;
+const MAX_THREAD_TITLE_CHARS = 50;
 
 function threadTitleNeedsSummary(prompt: string): boolean {
   return Array.from(prompt.trim()).length > MAX_THREAD_TITLE_CHARS;

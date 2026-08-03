@@ -189,7 +189,7 @@ export class ApiClient {
     return this.get("/api/codex/account");
   }
 
-  async startCodexLogin(deviceCode = true): Promise<CodexLoginStart> {
+  async startCodexLogin(deviceCode = false): Promise<CodexLoginStart> {
     return this.post("/api/codex/account/login", { deviceCode });
   }
 
@@ -585,8 +585,11 @@ export class ApiClient {
     return this.delete(`/api/threads/${threadId}`);
   }
 
-  async listMessages(threadId: string): Promise<Message[]> {
-    return this.get(`/api/threads/${threadId}/messages`);
+  async listMessages(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<Message[]> {
+    return this.get(`/api/threads/${threadId}/messages`, signal);
   }
 
   async sendMessage(
@@ -628,8 +631,11 @@ export class ApiClient {
     };
   }
 
-  async getGoal(threadId: string): Promise<GoalSnapshot | null> {
-    return this.get(`/api/threads/${threadId}/goal`);
+  async getGoal(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<GoalSnapshot | null> {
+    return this.get(`/api/threads/${threadId}/goal`, signal);
   }
 
   async updateGoalStatus(
@@ -682,12 +688,18 @@ export class ApiClient {
     await this.post(`/api/threads/${threadId}/computer/session`, {});
   }
 
-  async getTurnStatus(threadId: string): Promise<TurnStatus | null> {
-    return this.get(`/api/threads/${threadId}/turn`);
+  async getTurnStatus(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<TurnStatus | null> {
+    return this.get(`/api/threads/${threadId}/turn`, signal);
   }
 
-  async listSubagents(threadId: string): Promise<SubagentRun[]> {
-    return this.get(`/api/threads/${threadId}/subagents`);
+  async listSubagents(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<SubagentRun[]> {
+    return this.get(`/api/threads/${threadId}/subagents`, signal);
   }
 
   async spawnSubagent(
@@ -725,9 +737,29 @@ export class ApiClient {
     return this.post(`/api/threads/${threadId}/turn/cancel`, { turnId });
   }
 
-  async listEvents(threadId: string, since?: number): Promise<AgentEvent[]> {
-    const query = since ? `?since=${since}` : "";
-    return this.get(`/api/threads/${threadId}/events${query}`);
+  async listEvents(
+    threadId: string,
+    since?: number,
+    signal?: AbortSignal,
+  ): Promise<AgentEvent[]> {
+    return this.get(
+      `/api/threads/${threadId}/events${queryString({ since })}`,
+      signal,
+    );
+  }
+
+  async listConversationEvents(
+    threadId: string,
+    since?: number,
+    signal?: AbortSignal,
+  ): Promise<AgentEvent[]> {
+    return this.get(
+      `/api/threads/${threadId}/events${queryString({
+        since,
+        view: "conversation",
+      })}`,
+      signal,
+    );
   }
 
   async startTerminalCommand(
@@ -754,9 +786,11 @@ export class ApiClient {
   async listTerminalHistory(
     threadId: string,
     since?: number,
+    signal?: AbortSignal,
   ): Promise<TerminalEvent[]> {
     return this.get(
       `/api/threads/${threadId}/terminal/history${queryString({ since })}`,
+      signal,
     );
   }
 
@@ -820,12 +854,22 @@ export class ApiClient {
 
   async listPendingApprovals(
     threadId: string,
+    signal?: AbortSignal,
   ): Promise<Array<{ approvalId: string }>> {
-    return this.get(`/api/threads/${threadId}/approvals?status=pending`);
+    return this.get(
+      `/api/threads/${threadId}/approvals?status=pending`,
+      signal,
+    );
   }
 
-  async listPendingUserInput(threadId: string): Promise<UserInputRecord[]> {
-    return this.get(`/api/threads/${threadId}/user-input?status=pending`);
+  async listPendingUserInput(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<UserInputRecord[]> {
+    return this.get(
+      `/api/threads/${threadId}/user-input?status=pending`,
+      signal,
+    );
   }
 
   async respondToUserInput(
@@ -842,9 +886,11 @@ export class ApiClient {
   async listWorkspaceTree(
     threadId: string,
     path?: string,
+    signal?: AbortSignal,
   ): Promise<WorkspaceTree> {
     return this.get(
       `/api/threads/${threadId}/workspace/tree${queryString({ path })}`,
+      signal,
     );
   }
 
@@ -857,8 +903,11 @@ export class ApiClient {
     );
   }
 
-  async getWorkspaceDiff(threadId: string): Promise<WorkspaceDiff> {
-    return this.get(`/api/threads/${threadId}/workspace/diff`);
+  async getWorkspaceDiff(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceDiff> {
+    return this.get(`/api/threads/${threadId}/workspace/diff`, signal);
   }
 
   async getTurnChanges(
@@ -955,12 +1004,18 @@ export class ApiClient {
     });
   }
 
-  async getSandbox(threadId: string): Promise<SandboxDescriptor> {
-    return this.get(`/api/threads/${threadId}/sandbox`);
+  async getSandbox(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<SandboxDescriptor> {
+    return this.get(`/api/threads/${threadId}/sandbox`, signal);
   }
 
-  async getContextStatus(threadId: string): Promise<ContextStatus> {
-    return this.get(`/api/threads/${threadId}/context`);
+  async getContextStatus(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<ContextStatus> {
+    return this.get(`/api/threads/${threadId}/context`, signal);
   }
 
   async compactContext(
@@ -970,8 +1025,11 @@ export class ApiClient {
     return this.post(`/api/threads/${threadId}/context/compact`, { summary });
   }
 
-  async listArtifacts(threadId: string): Promise<ArtifactDescriptor[]> {
-    return this.get(`/api/threads/${threadId}/artifacts`);
+  async listArtifacts(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<ArtifactDescriptor[]> {
+    return this.get(`/api/threads/${threadId}/artifacts`, signal);
   }
 
   async getArtifact(
@@ -1128,8 +1186,8 @@ export class ApiClient {
     this.legacyPreviewContent.delete(previewId);
   }
 
-  async listMcpServers(): Promise<McpServerView[]> {
-    return this.get("/api/mcp/servers");
+  async listMcpServers(signal?: AbortSignal): Promise<McpServerView[]> {
+    return this.get("/api/mcp/servers", signal);
   }
 
   async listMcpTools(serverId: string): Promise<McpToolDescriptor[]> {
@@ -1154,8 +1212,11 @@ export class ApiClient {
     await this.delete(`/api/mcp/servers/${serverId}`);
   }
 
-  async listThreadMcpServers(threadId: string): Promise<ThreadMcpServerView[]> {
-    return this.get(`/api/threads/${threadId}/mcp`);
+  async listThreadMcpServers(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<ThreadMcpServerView[]> {
+    return this.get(`/api/threads/${threadId}/mcp`, signal);
   }
 
   async setThreadMcpServer(
@@ -1188,7 +1249,7 @@ export class ApiClient {
     since: number | undefined,
     onEvent: (event: AgentEvent) => void,
   ): StreamHandle {
-    const query = since ? `?since=${since}` : "";
+    const query = queryString({ since, view: "conversation" });
     return this.openAuthenticatedSse(
       `/api/threads/${threadId}/events/stream${query}`,
       (data) => onEvent(JSON.parse(data) as AgentEvent),
@@ -1207,9 +1268,11 @@ export class ApiClient {
     );
   }
 
-  private async get<T>(path: string): Promise<T> {
+  private async get<T>(path: string, signal?: AbortSignal): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       headers: this.authHeaders(),
+      cache: "no-store",
+      signal,
     });
     return parseResponse<T>(response);
   }
