@@ -6,6 +6,10 @@ use crate::enterprise::{
     AgentInstanceStatusV1, AgentInstanceV1, AgentTemplateDiffV1, AgentTemplateError,
     AgentTemplateSpecV1, AgentTemplateStatusV1, AgentTemplateVersionV1,
 };
+use crate::flow::{
+    definition_from_draft, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1,
+    FlowTrialV1,
+};
 use crate::mcp::{McpServerConfig, McpToolDescriptor, ThreadMcpServer};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
@@ -279,6 +283,29 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         thread_id: Uuid,
         response: &UserInputResponse,
     ) -> anyhow::Result<Option<UserInputRecord>>;
+    fn create_flow_draft(&self, draft: &FlowDraftV1) -> anyhow::Result<FlowDraftV1>;
+    fn get_flow_draft(&self, draft_id: Uuid) -> anyhow::Result<Option<FlowDraftV1>>;
+    fn list_flow_drafts(&self, thread_id: Option<Uuid>) -> anyhow::Result<Vec<FlowDraftV1>>;
+    fn update_flow_draft(
+        &self,
+        draft: &FlowDraftV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<FlowDraftV1>;
+    fn bind_thread_flow_draft(&self, thread_id: Uuid, draft_id: Uuid) -> anyhow::Result<()>;
+    fn get_thread_flow_draft(&self, thread_id: Uuid) -> anyhow::Result<Option<FlowDraftV1>>;
+    fn insert_flow_trial(&self, trial: &FlowTrialV1) -> anyhow::Result<FlowTrialV1>;
+    fn list_flow_trials(&self, draft_id: Uuid) -> anyhow::Result<Vec<FlowTrialV1>>;
+    fn publish_flow_draft(
+        &self,
+        draft_id: Uuid,
+        published_by: &str,
+    ) -> anyhow::Result<FlowDefinitionV1>;
+    fn search_flow_definitions(&self, query: &str) -> anyhow::Result<Vec<FlowDefinitionV1>>;
+    fn get_flow_definition(
+        &self,
+        flow_id: &str,
+        version: Option<u32>,
+    ) -> anyhow::Result<Option<FlowDefinitionV1>>;
 
     fn insert_large_tool_output_artifact(
         &self,
@@ -392,6 +419,20 @@ pub enum AgentTemplateStoreError {
     InvalidThreadBinding,
     #[error("Agent instance belongs to a different thread")]
     InstanceThreadMismatch,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FlowStoreError {
+    #[error("Flow draft not found: {0}")]
+    DraftNotFound(Uuid),
+    #[error("Flow draft revision conflict; current revision is {0}")]
+    RevisionConflict(u32),
+    #[error("Flow draft cannot be published until validation passes")]
+    ValidationRequired,
+    #[error("Flow draft cannot be published without a passed simulation for its current revision")]
+    PassedTrialRequired,
+    #[error("high-risk Flow publication requires an independent approver")]
+    IndependentApproverRequired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1219,6 +1260,60 @@ impl SqliteSessionStore {
             // idempotent schema block above. Advancing the version here keeps
             // older databases on the same migration ledger.
             conn.execute_batch("PRAGMA user_version = 12;")?;
+        }
+        if schema_version < 13 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS flow_drafts (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    flow_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    status TEXT NOT NULL,
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS thread_flow_drafts (
+                    thread_id TEXT PRIMARY KEY,
+                    draft_id TEXT NOT NULL UNIQUE,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE,
+                    FOREIGN KEY(draft_id) REFERENCES flow_drafts(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS flow_trials (
+                    id TEXT PRIMARY KEY,
+                    draft_id TEXT NOT NULL,
+                    draft_revision INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('passed', 'failed')),
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(draft_id) REFERENCES flow_drafts(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS flow_definitions (
+                    id TEXT PRIMARY KEY,
+                    flow_id TEXT NOT NULL,
+                    version INTEGER NOT NULL CHECK(version > 0),
+                    name TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    document_json TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    published_by TEXT NOT NULL,
+                    UNIQUE(flow_id, version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_flow_drafts_thread_updated
+                    ON flow_drafts(thread_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_flow_drafts_flow_updated
+                    ON flow_drafts(flow_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_flow_trials_draft_created
+                    ON flow_trials(draft_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_flow_definitions_search
+                    ON flow_definitions(flow_id, version DESC);
+                PRAGMA user_version = 13;
+                "#,
+            )?;
         }
         let recovered_at = Utc::now().to_rfc3339();
         conn.execute(
@@ -2153,6 +2248,313 @@ impl SqliteSessionStore {
 }
 
 impl SessionStore for SqliteSessionStore {
+    fn create_flow_draft(&self, draft: &FlowDraftV1) -> anyhow::Result<FlowDraftV1> {
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO flow_drafts (
+                id, thread_id, flow_id, revision, status, document_json,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                draft.id.to_string(),
+                draft.thread_id.to_string(),
+                &draft.spec.flow_id,
+                i64::from(draft.revision),
+                draft.status.as_str(),
+                serde_json::to_string(draft)?,
+                draft.created_at.to_rfc3339(),
+                draft.updated_at.to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO thread_flow_drafts (thread_id, draft_id, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                draft_id = excluded.draft_id,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                draft.thread_id.to_string(),
+                draft.id.to_string(),
+                draft.updated_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(draft.clone())
+    }
+
+    fn get_flow_draft(&self, draft_id: Uuid) -> anyhow::Result<Option<FlowDraftV1>> {
+        let conn = self.read_connection();
+        query_flow_draft(&conn, draft_id)
+    }
+
+    fn list_flow_drafts(&self, thread_id: Option<Uuid>) -> anyhow::Result<Vec<FlowDraftV1>> {
+        let conn = self.read_connection();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT document_json FROM flow_drafts
+            WHERE (?1 IS NULL OR thread_id = ?1)
+            ORDER BY updated_at DESC
+            "#,
+        )?;
+        let thread_id = thread_id.map(|value| value.to_string());
+        let rows = stmt.query_map(params![thread_id], deserialize_json_column::<FlowDraftV1>)?;
+        collect_rows(rows)
+    }
+
+    fn update_flow_draft(
+        &self,
+        draft: &FlowDraftV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<FlowDraftV1> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let changed = conn.execute(
+            r#"
+            UPDATE flow_drafts
+            SET flow_id = ?2, revision = ?3, status = ?4,
+                document_json = ?5, updated_at = ?6
+            WHERE id = ?1 AND revision = ?7
+            "#,
+            params![
+                draft.id.to_string(),
+                &draft.spec.flow_id,
+                i64::from(draft.revision),
+                draft.status.as_str(),
+                serde_json::to_string(draft)?,
+                draft.updated_at.to_rfc3339(),
+                i64::from(expected_revision),
+            ],
+        )?;
+        if changed != 1 {
+            let current: Option<i64> = conn
+                .query_row(
+                    "SELECT revision FROM flow_drafts WHERE id = ?1",
+                    params![draft.id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return match current {
+                Some(revision) => Err(FlowStoreError::RevisionConflict(
+                    u32::try_from(revision).unwrap_or(u32::MAX),
+                )
+                .into()),
+                None => Err(FlowStoreError::DraftNotFound(draft.id).into()),
+            };
+        }
+        Ok(draft.clone())
+    }
+
+    fn bind_thread_flow_draft(&self, thread_id: Uuid, draft_id: Uuid) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let belongs_to_thread: bool = conn
+            .query_row(
+                "SELECT thread_id = ?2 FROM flow_drafts WHERE id = ?1",
+                params![draft_id.to_string(), thread_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(FlowStoreError::DraftNotFound(draft_id))?;
+        if !belongs_to_thread {
+            anyhow::bail!("Flow draft belongs to a different thread");
+        }
+        conn.execute(
+            r#"
+            INSERT INTO thread_flow_drafts (thread_id, draft_id, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                draft_id = excluded.draft_id,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                thread_id.to_string(),
+                draft_id.to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_thread_flow_draft(&self, thread_id: Uuid) -> anyhow::Result<Option<FlowDraftV1>> {
+        let conn = self.read_connection();
+        let document: Option<String> = conn
+            .query_row(
+                r#"
+                SELECT flow_drafts.document_json
+                FROM thread_flow_drafts
+                JOIN flow_drafts ON flow_drafts.id = thread_flow_drafts.draft_id
+                WHERE thread_flow_drafts.thread_id = ?1
+                "#,
+                params![thread_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        document
+            .map(|document| serde_json::from_str(&document).map_err(Into::into))
+            .transpose()
+    }
+
+    fn insert_flow_trial(&self, trial: &FlowTrialV1) -> anyhow::Result<FlowTrialV1> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO flow_trials (
+                id, draft_id, draft_revision, status, document_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                trial.id.to_string(),
+                trial.draft_id.to_string(),
+                i64::from(trial.draft_revision),
+                trial.status.as_str(),
+                serde_json::to_string(trial)?,
+                trial.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(trial.clone())
+    }
+
+    fn list_flow_trials(&self, draft_id: Uuid) -> anyhow::Result<Vec<FlowTrialV1>> {
+        let conn = self.read_connection();
+        let mut stmt = conn.prepare(
+            "SELECT document_json FROM flow_trials WHERE draft_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(
+            params![draft_id.to_string()],
+            deserialize_json_column::<FlowTrialV1>,
+        )?;
+        collect_rows(rows)
+    }
+
+    fn publish_flow_draft(
+        &self,
+        draft_id: Uuid,
+        published_by: &str,
+    ) -> anyhow::Result<FlowDefinitionV1> {
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut draft = query_flow_draft(&tx, draft_id)?
+            .ok_or(FlowStoreError::DraftNotFound(draft_id))?;
+        if !draft
+            .last_validation
+            .as_ref()
+            .is_some_and(|report| report.valid)
+        {
+            return Err(FlowStoreError::ValidationRequired.into());
+        }
+        let passed_trials: i64 = tx.query_row(
+            r#"
+            SELECT COUNT(*) FROM flow_trials
+            WHERE draft_id = ?1 AND draft_revision = ?2 AND status = 'passed'
+            "#,
+            params![draft_id.to_string(), i64::from(draft.revision)],
+            |row| row.get(0),
+        )?;
+        if passed_trials == 0 {
+            return Err(FlowStoreError::PassedTrialRequired.into());
+        }
+        if matches!(
+            draft.spec.risk_class,
+            crate::enterprise::AgentRiskClassV1::High
+                | crate::enterprise::AgentRiskClassV1::Critical
+        ) && draft.spec.owner == published_by
+        {
+            return Err(FlowStoreError::IndependentApproverRequired.into());
+        }
+        let next_version: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM flow_definitions WHERE flow_id = ?1",
+            params![&draft.spec.flow_id],
+            |row| row.get(0),
+        )?;
+        let definition = definition_from_draft(
+            &draft,
+            u32::try_from(next_version).context("Flow version overflow")?,
+            published_by,
+        );
+        tx.execute(
+            r#"
+            INSERT INTO flow_definitions (
+                id, flow_id, version, name, owner, content_hash,
+                document_json, published_at, published_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                definition.id.to_string(),
+                &definition.flow_id,
+                i64::from(definition.version),
+                &definition.name,
+                &definition.owner,
+                &definition.content_hash,
+                serde_json::to_string(&definition)?,
+                definition.published_at.to_rfc3339(),
+                &definition.published_by,
+            ],
+        )?;
+        draft.status = FlowDraftStatusV1::Published;
+        draft.updated_at = Utc::now();
+        tx.execute(
+            r#"
+            UPDATE flow_drafts SET status = 'published', document_json = ?2, updated_at = ?3
+            WHERE id = ?1
+            "#,
+            params![
+                draft.id.to_string(),
+                serde_json::to_string(&draft)?,
+                draft.updated_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(definition)
+    }
+
+    fn search_flow_definitions(&self, query: &str) -> anyhow::Result<Vec<FlowDefinitionV1>> {
+        let conn = self.read_connection();
+        let pattern = format!("%{}%", query.trim());
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT document_json FROM flow_definitions
+            WHERE flow_id LIKE ?1 OR name LIKE ?1 OR owner LIKE ?1
+            ORDER BY published_at DESC
+            LIMIT 100
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![pattern],
+            deserialize_json_column::<FlowDefinitionV1>,
+        )?;
+        collect_rows(rows)
+    }
+
+    fn get_flow_definition(
+        &self,
+        flow_id: &str,
+        version: Option<u32>,
+    ) -> anyhow::Result<Option<FlowDefinitionV1>> {
+        let conn = self.read_connection();
+        let document: Option<String> = match version {
+            Some(version) => conn
+                .query_row(
+                    "SELECT document_json FROM flow_definitions WHERE flow_id = ?1 AND version = ?2",
+                    params![flow_id, i64::from(version)],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => conn
+                .query_row(
+                    "SELECT document_json FROM flow_definitions WHERE flow_id = ?1 ORDER BY version DESC LIMIT 1",
+                    params![flow_id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        document
+            .map(|document| serde_json::from_str(&document).map_err(Into::into))
+            .transpose()
+    }
+
     fn create_project(
         &self,
         name: String,
@@ -4551,6 +4953,29 @@ fn query_agent_instance(conn: &Connection, id: Uuid) -> anyhow::Result<Option<Ag
     document
         .map(|document| serde_json::from_str(&document).map_err(Into::into))
         .transpose()
+}
+
+fn query_flow_draft(conn: &Connection, id: Uuid) -> anyhow::Result<Option<FlowDraftV1>> {
+    let document: Option<String> = conn
+        .query_row(
+            "SELECT document_json FROM flow_drafts WHERE id = ?1",
+            params![id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    document
+        .map(|document| serde_json::from_str(&document).map_err(Into::into))
+        .transpose()
+}
+
+fn deserialize_json_column<T>(row: &rusqlite::Row<'_>) -> rusqlite::Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let document: String = row.get(0)?;
+    serde_json::from_str(&document).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+    })
 }
 
 fn collect_rows<T, F>(rows: rusqlite::MappedRows<'_, F>) -> anyhow::Result<Vec<T>>
@@ -7118,5 +7543,85 @@ mod tests {
         assert_eq!(beta.len(), 1);
         assert_eq!(beta[0].title, "Beta suite");
         assert_eq!(beta[0].status, "passed");
+    }
+
+    #[test]
+    fn flow_drafts_require_current_validation_and_trial_before_immutable_publish() {
+        use crate::enterprise::{AgentRiskClassV1, CapabilityProjection};
+        use crate::flow::{
+            simulate_flow, validate_flow_spec, FlowBudgetV1, FlowSourceV1, FlowSpecV1,
+            GraphDefinitionV1, GraphNodeKindV1, GraphNodeV1,
+        };
+        use std::collections::BTreeSet;
+
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread_with_mode(
+                Some("flow design".to_string()),
+                PathBuf::from("."),
+                ExperienceMode::Flow,
+            )
+            .expect("create Flow thread");
+        let capabilities = CapabilityProjection::deny_all();
+        let spec = FlowSpecV1 {
+            flow_id: "evidence-return".to_string(),
+            name: "Evidence return".to_string(),
+            description: "Return a verified result".to_string(),
+            owner: "operations".to_string(),
+            categories: BTreeSet::new(),
+            source: FlowSourceV1::NaturalLanguage {
+                description: "return the final result".to_string(),
+            },
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "object"}),
+            graph: GraphDefinitionV1 {
+                schema_version: 1,
+                entry_node_id: "output".to_string(),
+                nodes: vec![GraphNodeV1 {
+                    id: "output".to_string(),
+                    label: "Return result".to_string(),
+                    kind: GraphNodeKindV1::Output,
+                    config: serde_json::json!({}),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                }],
+                edges: Vec::new(),
+            },
+            requested_capabilities: capabilities.clone(),
+            budget: FlowBudgetV1::default(),
+            risk_class: AgentRiskClassV1::Low,
+            pending_decisions: Vec::new(),
+        };
+        let mut draft = FlowDraftV1::new(thread.id, spec, &capabilities);
+        store.create_flow_draft(&draft).expect("persist draft");
+        assert!(matches!(
+            store.publish_flow_draft(draft.id, "reviewer").unwrap_err().downcast_ref::<FlowStoreError>(),
+            Some(FlowStoreError::ValidationRequired)
+        ));
+
+        let report = validate_flow_spec(&draft.spec, &capabilities);
+        assert!(report.valid);
+        draft.last_validation = Some(report);
+        draft.status = FlowDraftStatusV1::ReadyToPublish;
+        draft.updated_at = Utc::now();
+        store
+            .update_flow_draft(&draft, draft.revision)
+            .expect("persist validation");
+        let trial = simulate_flow(&draft, serde_json::json!({}), &capabilities);
+        store.insert_flow_trial(&trial).expect("persist trial");
+
+        let definition = store
+            .publish_flow_draft(draft.id, "reviewer")
+            .expect("publish Flow");
+        assert_eq!(definition.flow_id, "evidence-return");
+        assert_eq!(definition.version, 1);
+        assert_eq!(
+            store
+                .get_flow_definition("evidence-return", None)
+                .expect("load definition")
+                .expect("definition")
+                .content_hash,
+            definition.content_hash
+        );
     }
 }

@@ -447,6 +447,9 @@ impl ToolRegistry {
         tools.insert("list_skills".to_string(), Arc::new(ListSkillsTool));
         tools.insert("read_skill".to_string(), Arc::new(ReadSkillTool));
         tools.insert("create_skill".to_string(), Arc::new(CreateSkillTool));
+        for (name, tool) in crate::flow_tools::flow_tools() {
+            tools.insert(name, tool);
+        }
         let sources = tools
             .keys()
             .cloned()
@@ -555,7 +558,8 @@ fn tool_governance_metadata(
     }
     match name {
         "list_files" | "read_file" | "read_files" | "search" | "git_diff" | "background_output"
-        | "list_agents" | "wait_agent" | "wait_agents" | "list_skills" | "read_skill" => (
+        | "list_agents" | "wait_agent" | "wait_agents" | "list_skills" | "read_skill"
+        | "flow.search" | "flow.inspect" => (
             ToolRiskLevel::Low,
             vec![ToolSideEffect::None],
             ToolApprovalMode::PolicyControlled,
@@ -589,6 +593,18 @@ fn tool_governance_metadata(
         "request_user_input" | "set_plan" | "update_plan" | "complete_task" => (
             ToolRiskLevel::Medium,
             vec![ToolSideEffect::SessionMutation],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Confidential,
+        ),
+        "flow.validate" | "flow.simulate" => (
+            ToolRiskLevel::Medium,
+            vec![ToolSideEffect::SessionMutation],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Confidential,
+        ),
+        "flow.create" | "flow.update" | "flow.publish" => (
+            ToolRiskLevel::Medium,
+            vec![ToolSideEffect::ControlPlane],
             ToolApprovalMode::PolicyControlled,
             DataClassification::Confidential,
         ),

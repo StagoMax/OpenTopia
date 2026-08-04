@@ -105,7 +105,7 @@ import {
 } from "./components/ApprovalDialog";
 import { PlanChoiceCard } from "./components/PlanChoiceCard";
 import { PreviewHost } from "./components/PreviewHost";
-import { AgentTemplatePanel } from "./components/AgentTemplatePanel";
+import { FlowWorkspacePanel } from "./components/FlowWorkspacePanel";
 import { RightContextRail } from "./components/RightContextRail";
 import { SettingsPanel as RedesignedSettingsPanel } from "./components/SettingsPanel";
 import { TaskSearchDialog } from "./components/TaskSearchDialog";
@@ -10875,7 +10875,7 @@ function RightPanel({
       aria-hidden={!contextRailOpen}
     >
       {thread?.experienceMode === "flow" ? (
-        <AgentTemplatePanel
+        <FlowWorkspacePanel
           client={client}
           threadId={thread.id}
           workspaceRoot={workspaceRoot}

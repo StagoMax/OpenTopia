@@ -1604,6 +1604,143 @@ export type AgentInstance = {
   updatedAt: string;
 };
 
+export type FlowSource =
+  | { kind: "natural_language"; description: string }
+  | { kind: "run_trace"; runId: string; traceHash: string };
+
+export type FlowNodeKind =
+  | "agent"
+  | "skill"
+  | "tool"
+  | "condition"
+  | "validator"
+  | "approval"
+  | "join"
+  | "loop"
+  | "output";
+
+export type FlowGraphNode = {
+  id: string;
+  label: string;
+  kind: FlowNodeKind;
+  config: Record<string, unknown>;
+  inputSchema: Record<string, unknown>;
+  outputSchema: Record<string, unknown>;
+};
+
+export type FlowGraphEdge = {
+  from: string;
+  to: string;
+  condition: string | null;
+  allowedFields: string[];
+  dataClassification: DataClassification;
+  onError: string | null;
+  loopPolicy: {
+    maxIterations: number;
+    continueCondition: string;
+    onExhausted: "require_human" | "return_partial" | "fail";
+  } | null;
+};
+
+export type FlowSpec = {
+  flowId: string;
+  name: string;
+  description: string;
+  owner: string;
+  categories: string[];
+  source: FlowSource;
+  inputSchema: Record<string, unknown>;
+  outputSchema: Record<string, unknown>;
+  graph: {
+    schemaVersion: number;
+    entryNodeId: string;
+    nodes: FlowGraphNode[];
+    edges: FlowGraphEdge[];
+  };
+  requestedCapabilities: CapabilityProjection;
+  budget: {
+    maxNodeExecutions: number;
+    maxToolCalls: number;
+    maxDurationSeconds: number;
+    maxLoopIterations: number;
+  };
+  riskClass: "low" | "medium" | "high" | "critical";
+  pendingDecisions: string[];
+};
+
+export type FlowValidationIssue = {
+  severity: "error" | "warning";
+  code: string;
+  message: string;
+  nodeId: string | null;
+  edgeIndex: number | null;
+  remediation: string;
+};
+
+export type FlowValidationReport = {
+  valid: boolean;
+  issues: FlowValidationIssue[];
+  validatedAt: string;
+};
+
+export type FlowDraft = {
+  schemaVersion: number;
+  id: string;
+  threadId: string;
+  revision: number;
+  status:
+    "drafting" | "reviewing" | "validating" | "ready_to_publish" | "published";
+  spec: FlowSpec;
+  effectiveCapabilities: CapabilityProjection;
+  contentHash: string;
+  lastValidation: FlowValidationReport | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type FlowTrial = {
+  schemaVersion: number;
+  id: string;
+  draftId: string;
+  draftRevision: number;
+  status: "passed" | "failed";
+  input: unknown;
+  steps: Array<{
+    order: number;
+    nodeId: string;
+    harnessTarget: string;
+    boundedBy: number | null;
+  }>;
+  report: FlowValidationReport;
+  createdAt: string;
+};
+
+export type FlowDraftView = {
+  draft: FlowDraft;
+  trials: FlowTrial[];
+};
+
+export type FlowDefinition = {
+  schemaVersion: number;
+  id: string;
+  flowId: string;
+  name: string;
+  version: number;
+  owner: string;
+  description: string;
+  categories: string[];
+  source: FlowSource;
+  graph: FlowSpec["graph"];
+  inputSchema: Record<string, unknown>;
+  outputSchema: Record<string, unknown>;
+  capabilities: CapabilityProjection;
+  budget: FlowSpec["budget"];
+  riskClass: FlowSpec["riskClass"];
+  contentHash: string;
+  publishedAt: string;
+  publishedBy: string;
+};
+
 export type ThreadCapabilities = {
   threadId: string;
   experienceMode: ExperienceMode;

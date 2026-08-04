@@ -188,11 +188,18 @@ impl ExperienceSurfaceProfile {
                     "git_diff",
                     "list_skills",
                     "read_skill",
+                    "flow.search",
+                    "flow.create",
+                    "flow.update",
+                    "flow.inspect",
+                    "flow.validate",
+                    "flow.simulate",
+                    "flow.publish",
                     "complete_task",
                 ]);
-                // Phase 0 is a design-only baseline. Flow-specific tools arrive
-                // in Phase 2; external plugins and MCP are opt-in through a
-                // future Agent template rather than inherited from Code/Work.
+                // Flow design is control-plane work. External plugins and MCP
+                // remain opt-in through an Agent template rather than being
+                // inherited from Code/Work mode.
                 capabilities.allow_all_plugins = false;
                 capabilities.plugins.clear();
                 capabilities.allow_all_mcp_servers = false;
@@ -1469,42 +1476,6 @@ fn diff_delegates(
         &next.delegate_template_ids,
         changes,
     );
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct FlowDefinitionV1 {
-    pub schema_version: u16,
-    pub id: Uuid,
-    pub name: String,
-    pub version: u32,
-    pub graph: GraphDefinitionV1,
-    pub input_schema: Value,
-    pub output_schema: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct GraphDefinitionV1 {
-    pub schema_version: u16,
-    pub nodes: Vec<GraphNodeV1>,
-    pub edges: Vec<GraphEdgeV1>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct GraphNodeV1 {
-    pub id: String,
-    pub kind: String,
-    pub config: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GraphEdgeV1 {
-    pub from: String,
-    pub to: String,
-    pub condition: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

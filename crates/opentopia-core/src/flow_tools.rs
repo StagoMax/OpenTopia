@@ -1,0 +1,397 @@
+use crate::flow::{
+    simulate_flow, validate_flow_spec, FlowDraftStatusV1, FlowDraftV1, FlowSourceV1, FlowSpecV1,
+};
+use crate::model::{ExperienceMode, ToolCall, ToolResult, TurnStatus};
+use crate::tools::{Tool, ToolContext, ToolExecutionPolicy, ToolSideEffect};
+use async_trait::async_trait;
+use chrono::Utc;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy)]
+enum FlowToolAction {
+    Search,
+    Create,
+    Update,
+    Inspect,
+    Validate,
+    Simulate,
+    Publish,
+}
+
+pub fn flow_tools() -> Vec<(String, Arc<dyn Tool>)> {
+    [
+        FlowToolAction::Search,
+        FlowToolAction::Create,
+        FlowToolAction::Update,
+        FlowToolAction::Inspect,
+        FlowToolAction::Validate,
+        FlowToolAction::Simulate,
+        FlowToolAction::Publish,
+    ]
+    .into_iter()
+    .map(|action| {
+        let tool = FlowTool { action };
+        (tool.name().to_string(), Arc::new(tool) as Arc<dyn Tool>)
+    })
+    .collect()
+}
+
+struct FlowTool {
+    action: FlowToolAction,
+}
+
+impl FlowTool {
+    fn store<'a>(
+        &self,
+        ctx: &'a ToolContext,
+    ) -> anyhow::Result<&'a Arc<dyn crate::store::SessionStore>> {
+        ctx.store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} requires a persistent SessionStore", self.name()))
+    }
+
+    fn thread_id(&self, ctx: &ToolContext) -> anyhow::Result<Uuid> {
+        ctx.thread_id
+            .ok_or_else(|| anyhow::anyhow!("{} requires an active thread", self.name()))
+    }
+
+    fn require_flow_thread(&self, ctx: &ToolContext) -> anyhow::Result<Uuid> {
+        let thread_id = self.thread_id(ctx)?;
+        let thread = self
+            .store(ctx)?
+            .get_thread(thread_id)?
+            .ok_or_else(|| anyhow::anyhow!("active thread not found"))?;
+        anyhow::ensure!(
+            thread.experience_mode == ExperienceMode::Flow,
+            "{} is only available in Flow mode",
+            self.name()
+        );
+        Ok(thread_id)
+    }
+
+    fn result(call_id: Uuid, value: Value) -> anyhow::Result<ToolResult> {
+        let output = serde_json::to_string_pretty(&value)?;
+        Ok(ToolResult::text(call_id, output, value))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SearchInput {
+    #[serde(default)]
+    query: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateInput {
+    spec: FlowSpecV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateInput {
+    draft_id: Uuid,
+    expected_revision: u32,
+    spec: FlowSpecV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InspectInput {
+    #[serde(default)]
+    draft_id: Option<Uuid>,
+    #[serde(default)]
+    flow_id: Option<String>,
+    #[serde(default)]
+    version: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DraftInput {
+    draft_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SimulateInput {
+    draft_id: Uuid,
+    #[serde(default)]
+    input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublishInput {
+    draft_id: Uuid,
+    published_by: String,
+}
+
+fn flow_spec_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["flowId", "name", "description", "owner", "source", "graph", "requestedCapabilities", "riskClass"],
+        "properties": {
+            "flowId": {"type": "string", "description": "Stable kebab-case identifier."},
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "owner": {"type": "string"},
+            "categories": {"type": "array", "items": {"type": "string"}},
+            "source": {
+                "type": "object",
+                "description": "Use kind=natural_language with description, or kind=run_trace with a successful runId and traceHash."
+            },
+            "inputSchema": {"type": "object"},
+            "outputSchema": {"type": "object"},
+            "graph": {
+                "type": "object",
+                "description": "Complete reviewable graph. Node kinds: agent, skill, tool, condition, validator, approval, join, loop, output. Cycles require a bounded loopPolicy on the feedback edge."
+            },
+            "requestedCapabilities": {
+                "type": "object",
+                "description": "Capabilities requested from the current ExecutionContext. This can only narrow, never grant access."
+            },
+            "budget": {"type": "object"},
+            "riskClass": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+            "pendingDecisions": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+#[async_trait]
+impl Tool for FlowTool {
+    fn name(&self) -> &str {
+        match self.action {
+            FlowToolAction::Search => "flow.search",
+            FlowToolAction::Create => "flow.create",
+            FlowToolAction::Update => "flow.update",
+            FlowToolAction::Inspect => "flow.inspect",
+            FlowToolAction::Validate => "flow.validate",
+            FlowToolAction::Simulate => "flow.simulate",
+            FlowToolAction::Publish => "flow.publish",
+        }
+    }
+
+    fn description(&self) -> &str {
+        match self.action {
+            FlowToolAction::Search => "Search reusable published Flows and current Flow drafts before designing a duplicate.",
+            FlowToolAction::Create => "Create and bind a complete FlowDraft from a natural-language workflow or a successful existing Run/Trace. Use this for reusable cross-role or long-running dependency graphs, not a short vertical task that belongs in a Skill. The Flow only requests capabilities already visible in the current ExecutionContext.",
+            FlowToolAction::Update => "Replace a FlowDraft specification using optimistic revision control after reviewing validation issues or user feedback.",
+            FlowToolAction::Inspect => "Inspect a FlowDraft with its validation and simulation history, or inspect an immutable published Flow version.",
+            FlowToolAction::Validate => "Statically validate graph topology, schemas, references, capability boundaries, risk gates, budgets, and bounded termination without calling another model.",
+            FlowToolAction::Simulate => "Compile and dry-run a valid FlowDraft against the existing Agent Harness, showing which AgentCore, SubagentScheduler, SkillRuntime, ToolRegistry, and runtime-control primitives each node will use. No business side effects are executed.",
+            FlowToolAction::Publish => "Publish an immutable Flow version after current-revision validation and simulation pass. High-risk Flows require an independent approver.",
+        }
+    }
+
+    fn schema(&self) -> Value {
+        match self.action {
+            FlowToolAction::Search => json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"query": {"type": "string"}}
+            }),
+            FlowToolAction::Create => json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["spec"], "properties": {"spec": flow_spec_schema()}
+            }),
+            FlowToolAction::Update => json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["draftId", "expectedRevision", "spec"],
+                "properties": {
+                    "draftId": {"type": "string", "format": "uuid"},
+                    "expectedRevision": {"type": "integer", "minimum": 1},
+                    "spec": flow_spec_schema()
+                }
+            }),
+            FlowToolAction::Inspect => json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "draftId": {"type": "string", "format": "uuid"},
+                    "flowId": {"type": "string"},
+                    "version": {"type": "integer", "minimum": 1}
+                }
+            }),
+            FlowToolAction::Validate => draft_schema(),
+            FlowToolAction::Simulate => json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["draftId"],
+                "properties": {
+                    "draftId": {"type": "string", "format": "uuid"},
+                    "input": {}
+                }
+            }),
+            FlowToolAction::Publish => json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["draftId", "publishedBy"],
+                "properties": {
+                    "draftId": {"type": "string", "format": "uuid"},
+                    "publishedBy": {"type": "string", "minLength": 1}
+                }
+            }),
+        }
+    }
+
+    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        let draft_key = call
+            .input
+            .get("draftId")
+            .and_then(Value::as_str)
+            .unwrap_or("current");
+        match self.action {
+            FlowToolAction::Search | FlowToolAction::Inspect => {
+                ToolExecutionPolicy::read_only(vec![format!("flow:{draft_key}")])
+            }
+            FlowToolAction::Validate | FlowToolAction::Simulate => ToolExecutionPolicy {
+                read_only: false,
+                idempotent: false,
+                parallel_safe: false,
+                side_effect: ToolSideEffect::SessionMutation,
+                resource_keys: vec![format!("flow:{draft_key}")],
+            },
+            FlowToolAction::Create | FlowToolAction::Update | FlowToolAction::Publish => {
+                ToolExecutionPolicy {
+                    read_only: false,
+                    idempotent: false,
+                    parallel_safe: false,
+                    side_effect: ToolSideEffect::ControlPlane,
+                    resource_keys: vec![format!("flow:{draft_key}")],
+                }
+            }
+        }
+    }
+
+    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+        let store = self.store(&ctx)?;
+        match self.action {
+            FlowToolAction::Search => {
+                self.require_flow_thread(&ctx)?;
+                let input: SearchInput = serde_json::from_value(call.input)?;
+                let definitions = store.search_flow_definitions(&input.query)?;
+                let drafts = store
+                    .list_flow_drafts(Some(self.thread_id(&ctx)?))?
+                    .into_iter()
+                    .filter(|draft| {
+                        input.query.trim().is_empty()
+                            || draft.spec.flow_id.contains(input.query.trim())
+                            || draft.spec.name.contains(input.query.trim())
+                    })
+                    .collect::<Vec<_>>();
+                Self::result(
+                    call.id,
+                    json!({"definitions": definitions, "drafts": drafts}),
+                )
+            }
+            FlowToolAction::Create => {
+                let thread_id = self.require_flow_thread(&ctx)?;
+                let input: CreateInput = serde_json::from_value(call.input)?;
+                if let FlowSourceV1::RunTrace { run_id, .. } = &input.spec.source {
+                    let run = store
+                        .get_turn(*run_id)?
+                        .ok_or_else(|| anyhow::anyhow!("source Run/Trace not found: {run_id}"))?;
+                    anyhow::ensure!(
+                        run.status == TurnStatus::Succeeded,
+                        "only a successful Run/Trace can be converted into a FlowDraft"
+                    );
+                }
+                let draft = FlowDraftV1::new(thread_id, input.spec, &ctx.capability_projection);
+                let report = validate_flow_spec(&draft.spec, &ctx.capability_projection);
+                let draft = store.create_flow_draft(&draft)?;
+                Self::result(call.id, json!({"draft": draft, "validation": report}))
+            }
+            FlowToolAction::Update => {
+                self.require_flow_thread(&ctx)?;
+                let input: UpdateInput = serde_json::from_value(call.input)?;
+                let mut draft = store
+                    .get_flow_draft(input.draft_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Flow draft not found"))?;
+                anyhow::ensure!(
+                    draft.revision == input.expected_revision,
+                    "Flow draft revision conflict: current revision is {}",
+                    draft.revision
+                );
+                draft.replace_spec(input.spec, &ctx.capability_projection);
+                let report = validate_flow_spec(&draft.spec, &ctx.capability_projection);
+                let draft = store.update_flow_draft(&draft, input.expected_revision)?;
+                Self::result(call.id, json!({"draft": draft, "validation": report}))
+            }
+            FlowToolAction::Inspect => {
+                self.require_flow_thread(&ctx)?;
+                let input: InspectInput = serde_json::from_value(call.input)?;
+                if let Some(flow_id) = input.flow_id {
+                    let definition = store.get_flow_definition(&flow_id, input.version)?;
+                    return Self::result(call.id, json!({"definition": definition}));
+                }
+                let draft = match input.draft_id {
+                    Some(id) => store.get_flow_draft(id)?,
+                    None => store.get_thread_flow_draft(self.thread_id(&ctx)?)?,
+                };
+                let trials = match &draft {
+                    Some(draft) => store.list_flow_trials(draft.id)?,
+                    None => Vec::new(),
+                };
+                Self::result(call.id, json!({"draft": draft, "trials": trials}))
+            }
+            FlowToolAction::Validate => {
+                self.require_flow_thread(&ctx)?;
+                let input: DraftInput = serde_json::from_value(call.input)?;
+                let mut draft = store
+                    .get_flow_draft(input.draft_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Flow draft not found"))?;
+                let expected_revision = draft.revision;
+                let report = validate_flow_spec(&draft.spec, &ctx.capability_projection);
+                draft.status = if report.valid {
+                    FlowDraftStatusV1::ReadyToPublish
+                } else {
+                    FlowDraftStatusV1::Reviewing
+                };
+                draft.last_validation = Some(report.clone());
+                draft.updated_at = Utc::now();
+                let draft = store.update_flow_draft(&draft, expected_revision)?;
+                Self::result(call.id, json!({"draft": draft, "validation": report}))
+            }
+            FlowToolAction::Simulate => {
+                self.require_flow_thread(&ctx)?;
+                let input: SimulateInput = serde_json::from_value(call.input)?;
+                let mut draft = store
+                    .get_flow_draft(input.draft_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Flow draft not found"))?;
+                let expected_revision = draft.revision;
+                let trial = simulate_flow(&draft, input.input, &ctx.capability_projection);
+                draft.last_validation = Some(trial.report.clone());
+                draft.status = if trial.report.valid {
+                    FlowDraftStatusV1::ReadyToPublish
+                } else {
+                    FlowDraftStatusV1::Reviewing
+                };
+                draft.updated_at = Utc::now();
+                store.update_flow_draft(&draft, expected_revision)?;
+                let trial = store.insert_flow_trial(&trial)?;
+                Self::result(call.id, json!({"trial": trial}))
+            }
+            FlowToolAction::Publish => {
+                self.require_flow_thread(&ctx)?;
+                let input: PublishInput = serde_json::from_value(call.input)?;
+                anyhow::ensure!(
+                    !input.published_by.trim().is_empty(),
+                    "publishedBy is required"
+                );
+                let definition =
+                    store.publish_flow_draft(input.draft_id, input.published_by.trim())?;
+                Self::result(call.id, json!({"definition": definition}))
+            }
+        }
+    }
+}
+
+fn draft_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["draftId"],
+        "properties": {"draftId": {"type": "string", "format": "uuid"}}
+    })
+}

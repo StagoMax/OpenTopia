@@ -24,6 +24,10 @@ import type {
   DiffFileActionResult,
   EvaluationRun,
   ExperienceMode,
+  FlowDefinition,
+  FlowDraftView,
+  FlowSpec,
+  FlowTrial,
   GitBranchInfo,
   GitStatusSummary,
   GitWorkflowAction,
@@ -457,6 +461,68 @@ export class ApiClient {
     },
   ): Promise<AgentInstance> {
     return this.patch(`/api/agent-instances/${instanceId}`, input);
+  }
+
+  async searchFlows(query = ""): Promise<FlowDefinition[]> {
+    return this.get(`/api/flows${queryString({ query: query || undefined })}`);
+  }
+
+  async listFlowDrafts(threadId: string): Promise<FlowDraftView[]> {
+    return this.get(`/api/threads/${encodeURIComponent(threadId)}/flow-drafts`);
+  }
+
+  async getThreadFlowDraft(threadId: string): Promise<FlowDraftView | null> {
+    return this.get(`/api/threads/${encodeURIComponent(threadId)}/flow-draft`);
+  }
+
+  async createFlowDraft(
+    threadId: string,
+    spec: FlowSpec,
+  ): Promise<FlowDraftView> {
+    return this.post(
+      `/api/threads/${encodeURIComponent(threadId)}/flow-drafts`,
+      { spec },
+    );
+  }
+
+  async updateFlowDraft(
+    draftId: string,
+    expectedRevision: number,
+    spec: FlowSpec,
+  ): Promise<FlowDraftView> {
+    return this.put(`/api/flow-drafts/${encodeURIComponent(draftId)}`, {
+      expectedRevision,
+      spec,
+    });
+  }
+
+  async validateFlowDraft(draftId: string): Promise<FlowDraftView> {
+    return this.post(
+      `/api/flow-drafts/${encodeURIComponent(draftId)}/validate`,
+      {},
+    );
+  }
+
+  async simulateFlowDraft(
+    draftId: string,
+    input: unknown = {},
+  ): Promise<FlowTrial> {
+    return this.post(
+      `/api/flow-drafts/${encodeURIComponent(draftId)}/simulate`,
+      { input },
+    );
+  }
+
+  async publishFlowDraft(
+    draftId: string,
+    publishedBy: string,
+  ): Promise<FlowDefinition> {
+    return this.post(
+      `/api/flow-drafts/${encodeURIComponent(draftId)}/publish`,
+      {
+        publishedBy,
+      },
+    );
   }
 
   async getContributionHosts(

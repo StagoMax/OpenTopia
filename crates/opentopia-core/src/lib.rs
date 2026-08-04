@@ -13,6 +13,8 @@ pub mod enterprise;
 pub mod execution;
 mod execution_runtime;
 pub mod execution_spec;
+pub mod flow;
+mod flow_tools;
 pub mod git_workflow;
 pub mod guardian;
 pub mod instructions;
@@ -103,9 +105,18 @@ pub use enterprise::{
     AgentTemplateSpecV1, AgentTemplateStatusV1, AgentTemplateVersionV1, AuditEventV1,
     CapabilityChangeKindV1, CapabilityChangeV1, CapabilityProjection, DataClassification,
     EnterpriseExecutionContextV1, EvidenceRecordV1, ExecutionBoundaryError, ExecutionIdentityRoute,
-    ExecutionIdentityRouter, ExecutionResourceGrantV1, ExperienceSurfaceProfile, FlowDefinitionV1,
-    GraphDefinitionV1, GraphEdgeV1, GraphNodeV1, ResourceKind, ENTERPRISE_SCHEMA_VERSION_V1,
+    ExecutionIdentityRouter, ExecutionResourceGrantV1, ExperienceSurfaceProfile, ResourceKind,
+    ENTERPRISE_SCHEMA_VERSION_V1,
     MAX_AGENT_DELEGATION_DEPTH,
+};
+pub use flow::{
+    compile_flow, definition_from_draft, flow_content_hash, normalize_flow_spec, simulate_flow,
+    validate_flow_spec, CompiledFlowNodeV1, CompiledFlowPlanV1, FlowBudgetV1, FlowDefinitionV1,
+    FlowDraftStatusV1, FlowDraftV1, FlowSimulationStepV1, FlowSourceV1, FlowSpecV1,
+    FlowTrialStatusV1, FlowTrialV1, FlowValidationIssueV1, FlowValidationReportV1,
+    FlowValidationSeverityV1, GraphDefinitionV1, GraphEdgeV1, GraphLoopPolicyV1,
+    GraphNodeKindV1, GraphNodeV1, HarnessNodeTargetV1, LoopExhaustionActionV1,
+    MAX_FLOW_DURATION_SECONDS, MAX_FLOW_LOOP_ITERATIONS, MAX_FLOW_NODES,
 };
 pub use execution::{
     ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
@@ -234,8 +245,9 @@ pub use spreadsheet::{
     MAX_OUTPUT_FILE_BYTES as MAX_SPREADSHEET_OUTPUT_BYTES,
 };
 pub use store::{
-    normalize_workspace_key, AgentTemplateStoreError, ContextBudget, ProviderContextStateKind,
-    ProviderConversationState, SessionStore, SqliteSessionStore, StoreError,
+    normalize_workspace_key, AgentTemplateStoreError, ContextBudget, FlowStoreError,
+    ProviderContextStateKind, ProviderConversationState, SessionStore, SqliteSessionStore,
+    StoreError,
 };
 pub use subagents::{
     AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDelivery, AgentWaitActivity,

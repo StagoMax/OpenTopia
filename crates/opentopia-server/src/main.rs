@@ -83,6 +83,7 @@ use uuid::Uuid;
 mod agent_templates_api;
 mod auth;
 mod contributions_api;
+mod flows_api;
 mod plugins_api;
 mod scm_api;
 mod turn_changes;
@@ -377,6 +378,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(agent_templates_api::router())
         .merge(contributions_api::router())
+        .merge(flows_api::router())
         .merge(plugins_api::router())
         .merge(scm_api::router())
         .route("/health", get(health))
