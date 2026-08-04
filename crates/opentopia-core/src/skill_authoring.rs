@@ -1,4 +1,5 @@
 use crate::skills::{descriptor_for_skill_file, SkillDescriptor, SkillScope};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -15,8 +16,8 @@ const MAX_RESOURCE_FILES: usize = 24;
 const MAX_RESOURCE_FILE_BYTES: usize = 64 * 1024;
 const MAX_RESOURCE_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillResourceDraft {
     pub path: String,
     pub content: String,

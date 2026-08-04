@@ -27,10 +27,10 @@ use crate::prompt_runtime::{
 };
 use crate::provider::{
     guardian_provider_from_settings, provider_from_settings, redact_model_observation,
-    IncompleteReason, MockProvider, ModelConversationMessage, ModelConversationRole, ModelDecision,
-    ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
-    OpenAiCompatibleProvider, ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
-    ProviderTransportEvent,
+    tool_input_schema_error, IncompleteReason, MockProvider, ModelConversationMessage,
+    ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
+    ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolResult, ProviderTransportEvent,
 };
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::settings::{AppSettings, RolloutBudgetSettings};
@@ -99,6 +99,9 @@ const STALL_SIGNATURE_WINDOW: usize = 12;
 /// How often the same signature may repeat inside the window before the runtime
 /// tells the model it looks stuck.
 const STALL_REPEAT_THRESHOLD: usize = 3;
+/// Invalid calls are never useful polling. Stop the turn once a provider repeats
+/// the exact same schema-invalid call instead of spending the rollout budget on it.
+const INVALID_TOOL_CALL_REPEAT_LIMIT: usize = 3;
 /// Repeating a call a few times early in a turn is normal, so detection only starts
 /// once enough rounds exist to form a pattern.
 const MIN_ROUNDS_BEFORE_STALL_DETECTION: usize = 6;
@@ -1568,7 +1571,18 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     outcome,
                 ));
             }
-            ModelDecision::Act(_) => {}
+            ModelDecision::Act(tool_calls) => {
+                if let Some(message) =
+                    repeated_invalid_tool_call_error(&runtime_state, &tool_calls, &tool_candidates)
+                {
+                    events.push(AgentEventPayload::ContextWarning {
+                        stage: "invalid_tool_call_circuit_breaker".to_string(),
+                        message: message.clone(),
+                    });
+                    anyhow::bail!(message);
+                }
+                runtime_state.record_tool_calls(&tool_calls);
+            }
         }
 
         let provider_tool_calls = response.tool_calls.clone();
@@ -2323,6 +2337,17 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     ));
                 }
                 ModelDecision::Act(tool_calls) => {
+                    if let Some(message) = repeated_invalid_tool_call_error(
+                        &runtime_state,
+                        &tool_calls,
+                        &tool_candidates,
+                    ) {
+                        events.push(AgentEventPayload::ContextWarning {
+                            stage: "invalid_tool_call_circuit_breaker".to_string(),
+                            message: message.clone(),
+                        });
+                        anyhow::bail!(message);
+                    }
                     pending_tool_calls = tool_calls;
                     runtime_state.record_tool_calls(&pending_tool_calls);
                 }
@@ -2709,6 +2734,18 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         }
     }
 
+    fn provider_tool_input_error(&self, provider_call: &ProviderToolCall) -> Option<String> {
+        if let Some(tool) = self.tools.get(&provider_call.name) {
+            return tool.input_error(&provider_call.arguments);
+        }
+        let schema = self
+            .provider_tool_candidates()
+            .into_iter()
+            .find(|candidate| candidate.name == provider_call.name)?
+            .input_schema;
+        tool_input_schema_error(&schema, &provider_call.arguments, "arguments")
+    }
+
     async fn execute_provider_tool_call(
         &self,
         provider_call: &ProviderToolCall,
@@ -2716,6 +2753,31 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         ctx: ToolContext,
         events: &mut TurnEvents,
     ) -> anyhow::Result<ProviderToolResult> {
+        if let Some(validation_error) = self.provider_tool_input_error(provider_call) {
+            let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
+            let output = format!(
+                "Invalid arguments for tool `{}`: {validation_error}. Do not retry this call unchanged; provide the required fields or choose a different action.",
+                provider_call.name
+            );
+            let mut metadata = json!({
+                "toolName": &provider_call.name,
+                "providerToolCallId": &provider_call.id,
+                "success": false,
+                "invalidToolArguments": true,
+                "inputSchemaValidationError": validation_error,
+            });
+            self.insert_tool_source_metadata(&provider_call.name, &mut metadata);
+            let result = ProviderToolResult {
+                call_id: provider_call.id.clone(),
+                name: provider_call.name.clone(),
+                output: output.clone(),
+                content: vec![ModelContentPart::text(output)],
+                is_error: true,
+                metadata,
+            };
+            record_provider_tool_result_event(events, call, &result);
+            return Ok(result);
+        }
         if provider_call.name == TOOL_SEARCH_NAME {
             return self.execute_tool_search_call(provider_call, events);
         }
@@ -3470,6 +3532,41 @@ fn canonical_json_string(value: &Value) -> String {
     }
 
     serde_json::to_string(&canonicalize(value)).unwrap_or_else(|_| "null".to_string())
+}
+
+fn repeated_invalid_tool_call_error(
+    runtime_state: &TurnRuntimeState,
+    calls: &[ProviderToolCall],
+    candidates: &[ProviderToolCandidate],
+) -> Option<String> {
+    let mut signature_counts = BTreeMap::<String, usize>::new();
+    for signature in &runtime_state.tool_call_signatures {
+        *signature_counts.entry(signature.clone()).or_default() += 1;
+    }
+
+    for call in calls {
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.name == call.name)
+        else {
+            continue;
+        };
+        let Some(validation_error) =
+            tool_input_schema_error(&candidate.input_schema, &call.arguments, "arguments")
+        else {
+            continue;
+        };
+        let signature = format!("{}:{}", call.name, canonical_json_string(&call.arguments));
+        let count = signature_counts.entry(signature).or_default();
+        *count += 1;
+        if *count >= INVALID_TOOL_CALL_REPEAT_LIMIT {
+            return Some(format!(
+                "Stopped after the provider returned the same schema-invalid `{}` call {} times: {}. This usually indicates a provider tool-call compatibility problem rather than a command permission failure.",
+                call.name, *count, validation_error
+            ));
+        }
+    }
+    None
 }
 
 fn record_rollout_usage(
@@ -5657,6 +5754,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_invalid_provider_tool_call_returns_actionable_error() {
+        let workspace = test_workspace("invalid-provider-tool-call");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_read_without_path".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({}),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            },
+            ModelResponse::text("The provider call was invalid, so I stopped."),
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        agent
+            .run_turn(AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Read a file.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            })
+            .await
+            .expect("the model can recover from one invalid call");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let result = &requests[1].tool_results[0];
+        assert!(result.is_error);
+        assert_eq!(result.metadata["invalidToolArguments"], true);
+        assert!(result.output.contains("arguments.path is required"));
+        assert!(result.output.contains("Do not retry this call unchanged"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn repeated_schema_invalid_provider_calls_trip_circuit_breaker() {
+        let workspace = test_workspace("invalid-provider-tool-call-loop");
+        let responses = (1..=INVALID_TOOL_CALL_REPEAT_LIMIT)
+            .map(|index| ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: format!("call_invalid_{index}"),
+                    name: "shell".to_string(),
+                    arguments: json!({}),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            })
+            .collect::<Vec<_>>();
+        let provider = Arc::new(ScriptedProvider::new(responses));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let error = agent
+            .run_turn(AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Run the command.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            })
+            .await
+            .expect_err("the third identical invalid call must stop the turn");
+
+        assert!(error
+            .to_string()
+            .contains("provider returned the same schema-invalid `shell` call 3 times"));
+        assert_eq!(provider.requests().len(), INVALID_TOOL_CALL_REPEAT_LIMIT);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn model_can_summarize_the_conversation_into_a_skill_tool_call() {
         let workspace = test_workspace("create-skill-tool-loop");
         let provider = Arc::new(ScriptedProvider::new(vec![
@@ -7604,8 +7796,10 @@ mod tests {
             },
             ModelResponse::text("Approved shell command completed."),
         ]));
+        let mut sandbox = LocalSandboxConfig::enforce();
+        sandbox.network = crate::sandbox::NetworkPolicy::Allow;
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
-            .with_sandbox_config(LocalSandboxConfig::enforce());
+            .with_sandbox_config(sandbox);
 
         let result = agent
             .run_turn_detailed_streaming(
@@ -7964,7 +8158,10 @@ mod tests {
             provider_items: Vec::new(),
             finish_reason: ModelFinishReason::Stop,
         }]));
-        let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
+        let mut sandbox = LocalSandboxConfig::enforce();
+        sandbox.network = crate::sandbox::NetworkPolicy::Allow;
+        let agent =
+            AgentCore::new(provider, ToolRegistry::with_builtins()).with_sandbox_config(sandbox);
         let workspace_for_turn = workspace.clone();
         let cancellation_for_turn = cancellation.clone();
         let task = tokio::spawn(async move {
@@ -7991,10 +8188,11 @@ mod tests {
             .await
             .expect("cancelled shell returns promptly")
             .expect("turn task joins");
-        assert!(result
-            .expect_err("cancelled shell should fail the command turn")
-            .to_string()
-            .contains("cancelled"));
+        let error = result.expect_err("cancelled shell should fail the command turn");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "unexpected cancellation error: {error:#}"
+        );
         let _ = fs::remove_dir_all(workspace);
     }
 

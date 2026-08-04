@@ -4,6 +4,7 @@ use crate::model_context::{ModelContextItem, ThreadContextSnapshot, TurnContextS
 use crate::skills::LoadedSkill;
 use crate::subagents::SubagentRun;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -471,7 +472,7 @@ impl ToolResult {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPlanStepStatus {
     Pending,

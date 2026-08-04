@@ -1,6 +1,8 @@
 use crate::policy::PermissionMode;
 use crate::prompt_runtime::AgentRuntimeSettings;
-use crate::sandbox::{LocalSandboxConfig, NetworkPolicy, OsSandboxMode, SandboxMode};
+use crate::sandbox::{
+    LocalSandboxConfig, NetworkPolicy, OsSandboxMode, SandboxMode, WindowsSandboxBackend,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -864,6 +866,7 @@ pub struct SandboxSettings {
     pub network: NetworkPolicy,
     pub writable_roots: Vec<PathBuf>,
     pub read_paths: Vec<PathBuf>,
+    pub windows_backend: WindowsSandboxBackend,
 }
 
 impl Default for SandboxSettings {
@@ -874,6 +877,7 @@ impl Default for SandboxSettings {
             network: NetworkPolicy::Deny,
             writable_roots: Vec::new(),
             read_paths: Vec::new(),
+            windows_backend: WindowsSandboxBackend::Auto,
         }
     }
 }
@@ -886,6 +890,7 @@ struct SandboxSettingsWire {
     network: Option<String>,
     writable_roots: Vec<PathBuf>,
     read_paths: Vec<PathBuf>,
+    windows_backend: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SandboxSettings {
@@ -910,15 +915,23 @@ impl<'de> Deserialize<'de> for SandboxSettings {
             .as_deref()
             .map(parse_sandbox_network)
             .unwrap_or(Some(defaults.network));
+        let windows_backend = wire
+            .windows_backend
+            .as_deref()
+            .map(parse_windows_sandbox_backend)
+            .unwrap_or(Some(defaults.windows_backend));
 
-        match (sandbox_mode, enforcement, network) {
-            (Some(sandbox_mode), Some(enforcement), Some(network)) => Ok(Self {
-                sandbox_mode,
-                enforcement,
-                network,
-                writable_roots: wire.writable_roots,
-                read_paths: wire.read_paths,
-            }),
+        match (sandbox_mode, enforcement, network, windows_backend) {
+            (Some(sandbox_mode), Some(enforcement), Some(network), Some(windows_backend)) => {
+                Ok(Self {
+                    sandbox_mode,
+                    enforcement,
+                    network,
+                    writable_roots: wire.writable_roots,
+                    read_paths: wire.read_paths,
+                    windows_backend,
+                })
+            }
             _ => Ok(Self::fail_safe(wire.writable_roots, wire.read_paths)),
         }
     }
@@ -970,6 +983,13 @@ impl SandboxSettings {
             },
             Err(_) => NetworkPolicy::Deny,
         };
+        let windows_backend = match std::env::var("OPENTOPIA_WINDOWS_SANDBOX") {
+            Ok(value) => match parse_windows_sandbox_backend(&value) {
+                Some(backend) => backend,
+                None => return Self::fail_safe(writable_roots, read_paths),
+            },
+            Err(_) => WindowsSandboxBackend::Auto,
+        };
 
         Self {
             sandbox_mode,
@@ -977,6 +997,7 @@ impl SandboxSettings {
             network,
             writable_roots,
             read_paths,
+            windows_backend,
         }
     }
 
@@ -1003,6 +1024,7 @@ impl SandboxSettings {
             sandbox_mode: self.sandbox_mode,
             writable_roots: self.writable_roots.clone(),
             sandbox_home: None,
+            windows_backend: self.windows_backend,
             approved_read_paths: Vec::new(),
             approved_write_paths: Vec::new(),
         }
@@ -1015,6 +1037,7 @@ impl SandboxSettings {
             network: NetworkPolicy::Deny,
             writable_roots,
             read_paths,
+            windows_backend: WindowsSandboxBackend::Auto,
         }
     }
 }
@@ -1186,6 +1209,15 @@ fn parse_sandbox_network(value: &str) -> Option<NetworkPolicy> {
         "inherit" => Some(NetworkPolicy::Inherit),
         "allow" => Some(NetworkPolicy::Allow),
         "deny" => Some(NetworkPolicy::Deny),
+        _ => None,
+    }
+}
+
+fn parse_windows_sandbox_backend(value: &str) -> Option<WindowsSandboxBackend> {
+    match normalize_sandbox_value(value).as_str() {
+        "auto" => Some(WindowsSandboxBackend::Auto),
+        "elevated" => Some(WindowsSandboxBackend::Elevated),
+        "unelevated" | "legacy" => Some(WindowsSandboxBackend::Unelevated),
         _ => None,
     }
 }
@@ -1805,6 +1837,7 @@ mod tests {
             network: NetworkPolicy::Inherit,
             writable_roots: vec![PathBuf::from("C:/workspace")],
             read_paths: vec![PathBuf::from("C:/reference")],
+            windows_backend: WindowsSandboxBackend::Elevated,
         };
 
         let config = settings.to_local_sandbox_config();
@@ -1816,6 +1849,7 @@ mod tests {
         assert_eq!(config.read_paths, settings.read_paths);
         assert!(config.write_paths.is_empty());
         assert_eq!(config.sandbox_home, None);
+        assert_eq!(config.windows_backend, WindowsSandboxBackend::Elevated);
     }
 
     #[test]

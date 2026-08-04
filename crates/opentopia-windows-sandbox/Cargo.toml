@@ -15,5 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
+opentopia-sandbox-protocol = { path = "../opentopia-sandbox-protocol" }
+serde.workspace = true
+serde_json.workspace = true
 uuid.workspace = true
 windows-sys.workspace = true

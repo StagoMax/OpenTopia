@@ -254,7 +254,7 @@ if ($env:OS -eq "Windows_NT") {
     rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy
   }
 
-  if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+  if ($toolchain.EndsWith("-gnu") -and -not (Get-Command gcc -ErrorAction SilentlyContinue)) {
     throw "gcc was not found. Install WinLibs with winget install BrechtSanders.WinLibs.POSIX.UCRT, or set OPENTOPIA_MINGW_BIN to mingw64\bin."
   }
 

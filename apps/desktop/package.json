@@ -31,13 +31,13 @@
     ],
     "extraResources": [
       {
-        "from": "resources",
+        "from": ".runtime-stage",
         "to": ".",
         "filter": [
+          "opentopia-runtime-manifest.json",
           "opentopia-server",
           "opentopia-server.exe",
-          "opentopia-sandbox/opentopia-sandbox.exe",
-          "!codex-sandbox{,/**/*}"
+          "opentopia-sandbox/opentopia-sandbox.exe"
         ]
       }
     ],

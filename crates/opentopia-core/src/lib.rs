@@ -10,6 +10,8 @@ pub mod contribution_hosts;
 pub mod desktop_browser;
 pub mod effect_journal;
 pub mod execution;
+mod execution_runtime;
+pub mod execution_spec;
 pub mod git_workflow;
 pub mod guardian;
 pub mod instructions;
@@ -23,6 +25,7 @@ pub mod plugins;
 pub mod policy;
 pub mod preview;
 pub mod process_quota;
+mod process_supervisor;
 pub mod prompt_runtime;
 pub mod provider;
 pub mod sandbox;
@@ -33,6 +36,7 @@ pub mod skills;
 pub mod spreadsheet;
 pub mod store;
 pub mod subagents;
+mod tool_adapter;
 pub mod tools;
 pub mod workspace;
 
@@ -187,8 +191,9 @@ pub use provider::{
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,
-    ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy, OsSandboxMode, OsSandboxPlatform,
-    SandboxCommandPlan, SandboxCommandStatus, SandboxDescriptor, SandboxLifecycle, SandboxMode,
+    build_local_sandbox_command_with_options, ExecutionEnvironmentKind, LocalSandboxConfig,
+    NetworkPolicy, OsSandboxMode, OsSandboxPlatform, SandboxCommandPlan, SandboxCommandStatus,
+    SandboxDescriptor, SandboxLaunchOptions, SandboxLifecycle, SandboxMode,
 };
 pub use scm_connector::{
     select_scm_connector, CommitPushChangeRequestOutcome, CommitPushChangeRequestResult,

@@ -3,6 +3,7 @@ use calamine::{
     SheetVisible as CalamineSheetVisible, Xlsx,
 };
 use rust_xlsxwriter::{Formula, Workbook, Worksheet};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
@@ -100,24 +101,25 @@ pub struct WriteWorkbookRequest {
     pub sheets: Vec<SheetWriteRequest>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SheetWriteRequest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<SheetVisibility>,
     #[serde(default)]
+    #[schemars(length(max = 10000))]
     pub cells: Vec<CellUpdate>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CellUpdate {
     pub address: CellAddress,
     pub value: SpreadsheetCellInput,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum SpreadsheetCellInput {
     Blank,
@@ -128,8 +130,8 @@ pub enum SpreadsheetCellInput {
     Formula(FormulaInput),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FormulaInput {
     pub expression: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,16 +139,20 @@ pub struct FormulaInput {
 }
 
 /// Zero-based row and column coordinates.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(rename_all = "camelCase")]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CellAddress {
+    #[schemars(range(max = 1048575))]
     pub row: u32,
+    #[schemars(range(max = 16383))]
     pub column: u32,
 }
 
 /// An inclusive range using zero-based coordinates.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CellRange {
     pub start: CellAddress,
     pub end: CellAddress,
@@ -230,7 +236,7 @@ pub enum SheetKind {
     Vba,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SheetVisibility {
     #[default]

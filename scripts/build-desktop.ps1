@@ -1,3 +1,7 @@
+param(
+  [switch]$StageOnly
+)
+
 $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot\dev-env.ps1"
@@ -26,15 +30,29 @@ function Invoke-Pnpm {
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $desktopRoot = Join-Path $repoRoot "apps\desktop"
-$resourcesDir = Join-Path $desktopRoot "resources"
+$runtimeStageDir = Join-Path $desktopRoot ".runtime-stage"
+$runtimeTempDir = "$runtimeStageDir.tmp-$PID"
 $isWindowsHost = [System.Environment]::OSVersion.Platform -eq "Win32NT"
 $serverBinaryName = if ($isWindowsHost) { "opentopia-server.exe" } else { "opentopia-server" }
 $releaseServerBinary = Join-Path $repoRoot "target\release\$serverBinaryName"
-$resourceServerBinary = Join-Path $resourcesDir $serverBinaryName
+$stagedServerBinary = Join-Path $runtimeTempDir $serverBinaryName
 $sandboxBinaryName = if ($isWindowsHost) { "opentopia-sandbox.exe" } else { "opentopia-sandbox" }
 $releaseSandboxBinary = Join-Path $repoRoot "target\release\$sandboxBinaryName"
-$sandboxResources = Join-Path $resourcesDir "opentopia-sandbox"
-$resourceSandboxBinary = Join-Path $sandboxResources $sandboxBinaryName
+$sandboxStageDir = Join-Path $runtimeTempDir "opentopia-sandbox"
+$stagedSandboxBinary = Join-Path $sandboxStageDir $sandboxBinaryName
+$runtimeManifestPath = Join-Path $runtimeTempDir "opentopia-runtime-manifest.json"
+
+function Assert-RuntimeStagePath {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $fullPath = [System.IO.Path]::GetFullPath($Path)
+  $desktopPrefix = [System.IO.Path]::GetFullPath($desktopRoot) + [System.IO.Path]::DirectorySeparatorChar
+  if (-not $fullPath.StartsWith($desktopPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to modify runtime stage outside the desktop directory: $fullPath"
+  }
+  if (-not ([System.IO.Path]::GetFileName($fullPath)).StartsWith(".runtime-stage")) {
+    throw "Refusing to modify an unexpected runtime stage path: $fullPath"
+  }
+}
 
 Push-Location $repoRoot
 try {
@@ -48,47 +66,127 @@ try {
     throw "opentopia-server release binary not found at $releaseServerBinary"
   }
 
-  New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
-  Copy-Item -LiteralPath $releaseServerBinary -Destination $resourceServerBinary -Force
+  Assert-RuntimeStagePath -Path $runtimeTempDir
+  Assert-RuntimeStagePath -Path $runtimeStageDir
+  if (Test-Path -LiteralPath $runtimeTempDir) {
+    Remove-Item -LiteralPath $runtimeTempDir -Recurse -Force
+  }
+  New-Item -ItemType Directory -Force -Path $runtimeTempDir | Out-Null
+  Copy-Item -LiteralPath $releaseServerBinary -Destination $stagedServerBinary -Force
 
-  if (-not (Test-Path -LiteralPath $resourceServerBinary)) {
-    throw "Failed to stage server binary at $resourceServerBinary"
+  if (-not (Test-Path -LiteralPath $stagedServerBinary)) {
+    throw "Failed to stage server binary at $stagedServerBinary"
   }
 
-  Write-Host "Staged server binary for electron-builder extraResources: $resourceServerBinary"
+  Write-Host "Staged server binary for the runtime bundle: $stagedServerBinary"
 
+  $sandboxProtocol = $null
   if ($isWindowsHost) {
     if (-not (Test-Path -LiteralPath $releaseSandboxBinary)) {
       throw "opentopia-sandbox release binary not found at $releaseSandboxBinary"
     }
-    New-Item -ItemType Directory -Force -Path $sandboxResources | Out-Null
-    Copy-Item -LiteralPath $releaseSandboxBinary -Destination $resourceSandboxBinary -Force
-    if (-not (Test-Path -LiteralPath $resourceSandboxBinary)) {
-      throw "Failed to stage OpenTopia Windows sandbox at $resourceSandboxBinary"
+    $protocolJson = (& $releaseSandboxBinary protocol --json | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+      throw "opentopia-sandbox protocol handshake failed with exit code $LASTEXITCODE"
     }
-    Write-Host "Staged first-party Windows sandbox for electron-builder: $resourceSandboxBinary"
+    $sandboxProtocol = $protocolJson | ConvertFrom-Json
+    if ($sandboxProtocol.schema -ne "ai.opentopia.sandbox.protocol" -or $sandboxProtocol.protocolVersion -lt 1) {
+      throw "opentopia-sandbox returned an invalid protocol descriptor: $protocolJson"
+    }
+    New-Item -ItemType Directory -Force -Path $sandboxStageDir | Out-Null
+    Copy-Item -LiteralPath $releaseSandboxBinary -Destination $stagedSandboxBinary -Force
+    if (-not (Test-Path -LiteralPath $stagedSandboxBinary)) {
+      throw "Failed to stage OpenTopia Windows sandbox at $stagedSandboxBinary"
+    }
+    Write-Host "Staged first-party Windows sandbox for the runtime bundle: $stagedSandboxBinary"
   }
-    Invoke-Pnpm --filter @opentopia/desktop build
-    $electronBuilderArgs = @(
-      "--filter",
-      "@opentopia/desktop",
-      "exec",
-      "electron-builder"
-    )
-    if ($env:OPENTOPIA_ELECTRON_DIST) {
-      $electronDist = (Resolve-Path -LiteralPath $env:OPENTOPIA_ELECTRON_DIST).Path
-      $electronBuilderArgs += "--config.electronDist=$electronDist"
+
+  $artifacts = [ordered]@{
+    server = [ordered]@{
+      path = $serverBinaryName
+      sha256 = (Get-FileHash -LiteralPath $stagedServerBinary -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    if ($env:OPENTOPIA_DESKTOP_OUTPUT_DIR) {
-      $electronBuilderArgs += "--config.directories.output=$($env:OPENTOPIA_DESKTOP_OUTPUT_DIR)"
+  }
+  if ($isWindowsHost) {
+    $artifacts.sandbox = [ordered]@{
+      path = "opentopia-sandbox/$sandboxBinaryName"
+      sha256 = (Get-FileHash -LiteralPath $stagedSandboxBinary -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    if ($env:OPENTOPIA_DISABLE_ASAR_INTEGRITY -eq "true") {
-      $electronBuilderArgs += "--config.disableAsarIntegrity=true"
+  }
+  $manifest = [ordered]@{
+    schemaVersion = 1
+    createdAt = [DateTime]::UtcNow.ToString("o")
+    sandboxProtocol = $sandboxProtocol
+    artifacts = $artifacts
+  }
+  $manifestJson = $manifest | ConvertTo-Json -Depth 8
+  [System.IO.File]::WriteAllText(
+    $runtimeManifestPath,
+    $manifestJson,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+
+  $runtimeBackupDir = "$runtimeStageDir.previous-$PID"
+  Assert-RuntimeStagePath -Path $runtimeBackupDir
+  if (Test-Path -LiteralPath $runtimeBackupDir) {
+    Remove-Item -LiteralPath $runtimeBackupDir -Recurse -Force
+  }
+  if (Test-Path -LiteralPath $runtimeStageDir) {
+    Move-Item -LiteralPath $runtimeStageDir -Destination $runtimeBackupDir
+  }
+  try {
+    Move-Item -LiteralPath $runtimeTempDir -Destination $runtimeStageDir
+  } catch {
+    if (Test-Path -LiteralPath $runtimeBackupDir) {
+      Move-Item -LiteralPath $runtimeBackupDir -Destination $runtimeStageDir
     }
-    if ($env:OPENTOPIA_SKIP_EXE_EDIT -eq "true") {
-      $electronBuilderArgs += "--config.win.signAndEditExecutable=false"
+    throw
+  }
+  if (Test-Path -LiteralPath $runtimeBackupDir) {
+    Remove-Item -LiteralPath $runtimeBackupDir -Recurse -Force
+  }
+  Write-Host "Published verified runtime bundle: $runtimeStageDir"
+
+  if ($StageOnly) {
+    Write-Host "Runtime bundle staging completed; Electron packaging was skipped."
+    return
+  }
+
+  Invoke-Pnpm --filter @opentopia/desktop build
+  $electronBuilderArgs = @()
+  if ($env:OPENTOPIA_ELECTRON_DIST) {
+    $electronDist = (Resolve-Path -LiteralPath $env:OPENTOPIA_ELECTRON_DIST).Path
+    $electronBuilderArgs += "--config.electronDist=$electronDist"
+  }
+  if ($env:OPENTOPIA_DESKTOP_OUTPUT_DIR) {
+    $electronBuilderArgs += "--config.directories.output=$($env:OPENTOPIA_DESKTOP_OUTPUT_DIR)"
+  }
+  if ($env:OPENTOPIA_DISABLE_ASAR_INTEGRITY -eq "true") {
+    $electronBuilderArgs += "--config.disableAsarIntegrity=true"
+  }
+  if ($env:OPENTOPIA_SKIP_EXE_EDIT -eq "true") {
+    $electronBuilderArgs += "--config.win.signAndEditExecutable=false"
+  }
+
+  $electronBuilderName = if ($isWindowsHost) { "electron-builder.CMD" } else { "electron-builder" }
+  $localElectronBuilder = Join-Path $desktopRoot "node_modules\.bin\$electronBuilderName"
+  if (Test-Path -LiteralPath $localElectronBuilder) {
+    Push-Location $desktopRoot
+    try {
+      & $localElectronBuilder @electronBuilderArgs
+      if ($LASTEXITCODE -ne 0) {
+        throw "electron-builder failed with exit code $LASTEXITCODE"
+      }
+    } finally {
+      Pop-Location
     }
-    Invoke-Pnpm @electronBuilderArgs
+  } else {
+    Invoke-Pnpm --filter @opentopia/desktop exec electron-builder @electronBuilderArgs
+  }
 } finally {
+  if (Test-Path -LiteralPath $runtimeTempDir) {
+    Assert-RuntimeStagePath -Path $runtimeTempDir
+    Remove-Item -LiteralPath $runtimeTempDir -Recurse -Force
+  }
   Pop-Location
 }

@@ -17,8 +17,9 @@ This repository currently contains:
 - One long-lived PTY shell per thread with xterm.js input/output, resize, close,
   SSE replay, process-tree cleanup, and SQLite terminal history.
 - Real provider-backed context summaries that are persisted and injected into later turns.
-- OS sandbox adapters for Linux bubblewrap, macOS Seatbelt, and Windows Codex
-  restricted-token isolation. Packaged Windows builds default to strict mode.
+- OS sandbox adapters for Linux bubblewrap, macOS Seatbelt, and OpenTopia's
+  Windows dedicated-user/restricted-token dual backend. Packaged Windows builds
+  default to strict mode.
 
 See `docs/source-adaptation-map.md` for the concrete source projects and modules this MVP borrows from.
 
@@ -96,9 +97,42 @@ back when the platform helper is unavailable, while packaged builds fail closed:
 ```powershell
 $env:OPENTOPIA_SANDBOX_MODE="workspace-write" # read-only | workspace-write | danger-full-access
 $env:OPENTOPIA_SANDBOX_ENFORCEMENT="enforce"  # disabled | best-effort | enforce
-$env:OPENTOPIA_SANDBOX_NETWORK="allow" # allow (default) | inherit | deny
+$env:OPENTOPIA_SANDBOX_NETWORK="deny" # deny (default) | allow | inherit
 $env:OPENTOPIA_SANDBOX_WRITABLE_ROOTS="D:\shared"
+$env:OPENTOPIA_WINDOWS_SANDBOX="auto" # auto | elevated | unelevated
 ```
+
+Windows uses OpenTopia's first-party dual backend. `elevated` runs commands as
+dedicated offline/online local users; the offline identity is blocked by
+persistent WFP rules. `unelevated` is the restricted-token fallback and
+intentionally rejects guarantees it cannot enforce, such as an
+authoritative per-path deny-read rule or offline networking. `auto` uses the
+dedicated-user backend after setup and otherwise falls back to a
+`WRITE_RESTRICTED` token for network-enabled requests. After elevated setup,
+forcing `unelevated` is rejected so a host-identity child cannot access the
+broker's stored credentials; use `auto` or `elevated`.
+
+Run elevated setup once from the built helper (Windows will request UAC):
+
+```powershell
+target\release\opentopia-sandbox.exe setup
+```
+
+The broker stores DPAPI-protected credentials, WFP configuration, a versioned
+ACL ledger, and daily stage logs under `%LOCALAPPDATA%\OpenTopia\sandbox`.
+Persistent workspace grants avoid rewriting ACLs for every tool invocation.
+Detach a workspace and revoke the sandbox-user ACEs recorded for it with:
+
+```powershell
+target\release\opentopia-sandbox.exe cleanup --workspace J:\Project\example
+```
+
+All command sources use the same structured execution contract: resolved
+runtime roots, explicit environment/stdin policy, filesystem and network
+requirements, startup/execution/termination deadlines, Job Object process-tree
+ownership, and staged failures. Tool adapters only supply compatibility
+details (for example, headless Git or `PowerShell -NoProfile`); containment
+does not depend on recognizing a particular tool.
 
 The existing `--permission`/desktop permission control remains the approval and
 tool-policy layer. Selecting a non-interactive approval mode does not disable the
@@ -154,19 +188,18 @@ pnpm.cmd install --frozen-lockfile
 .\scripts\build-desktop.ps1
 ```
 
-It runs `cargo build --release -p opentopia-server`, stages the server binary
-at `apps\desktop\resources\opentopia-server.exe` on Windows
-(`opentopia-server` on Unix), then runs `electron-builder`. The desktop
-`extraResources` config copies that server binary and, on Windows, the Codex
-restricted-token sandbox helpers plus their Apache-2.0 license into
-`process.resourcesPath`, where the packaged Electron app resolves it at
-startup.
+It builds `opentopia-server` and `opentopia-windows-sandbox` together, verifies
+the helper protocol handshake, and atomically publishes a hash-verified runtime
+bundle under `apps\desktop\.runtime-stage` before running `electron-builder`.
+The desktop refuses to launch a packaged server/helper pair whose manifest,
+hashes, or sandbox protocol do not match. Use `-StageOnly` to build and verify
+the runtime bundle without invoking Electron packaging.
 
 For an offline or locked-directory diagnostic build, the packaging script also
 accepts `OPENTOPIA_ELECTRON_DIST` (an already extracted Electron distribution)
 and `OPENTOPIA_DESKTOP_OUTPUT_DIR`. ASAR integrity and executable metadata remain
 enabled unless the smoke-only `OPENTOPIA_DISABLE_ASAR_INTEGRITY=true` or
-`OPENTOPIA_SKIP_EXE_EDIT=true` flags are explicitly set.
+`OPENTOPIA_SKIP_EXE_EDIT=true` overrides are explicitly set.
 
 Packaged builds store SQLite under Electron `userData` rather than beside the
 installed executable, so installs under `Program Files` do not require write access.

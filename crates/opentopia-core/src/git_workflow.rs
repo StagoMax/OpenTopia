@@ -100,6 +100,25 @@ impl GitWorkflowActionKind {
                 | Self::RemoveWorktree
         )
     }
+
+    pub fn writes_metadata(self) -> bool {
+        matches!(
+            self,
+            Self::Stage
+                | Self::Unstage
+                | Self::CreateBranch
+                | Self::SwitchBranch
+                | Self::Commit
+                | Self::Fetch
+                | Self::Pull
+                | Self::CreateWorktree
+                | Self::RemoveWorktree
+        )
+    }
+
+    pub fn requires_network(self) -> bool {
+        matches!(self, Self::Push | Self::Fetch | Self::Pull)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

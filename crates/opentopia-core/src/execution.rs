@@ -1,15 +1,23 @@
+use crate::execution_runtime::{
+    configure_command_environment, configure_stdio, environment_keys, resolve_runtime,
+};
+pub use crate::execution_spec::{
+    EnvironmentPolicy, ExecRequest, ExecutionFailure, ExecutionRequirements, ExecutionSpec,
+    ExecutionStage, LifecyclePolicy, RuntimeRequirements, StdioPolicy,
+};
 use crate::policy::ApprovalRequired;
 use crate::process_quota::ProcessQuota;
+use crate::process_supervisor::{spawn_process, terminate_process};
 use crate::sandbox::{
-    build_local_sandbox_command, is_protected_metadata_path, sandbox_permission_profile,
-    ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy, OsSandboxPlatform,
-    SandboxCommandStatus, SandboxMode,
+    build_local_sandbox_command_with_options, is_protected_metadata_path,
+    sandbox_permission_profile, ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy,
+    OsSandboxPlatform, SandboxBackendCapabilities, SandboxCommandStatus, SandboxLaunchOptions,
+    SandboxMode,
 };
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -18,13 +26,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-const SENSITIVE_CHILD_ENV_KEYS: &[&str] = &[
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENTOPIA_API_KEY",
-    "OPENTOPIA_API_TOKEN",
-    "CREDIT_REVIEW_LLM_API_KEY",
-];
+const SANDBOX_ERROR_EXIT_CODE: i32 = 125;
+const SANDBOX_ERROR_PREFIX: &str = "OPENTOPIA_SANDBOX_ERROR ";
+const SANDBOX_ERROR_NONCE_ENV: &str = "OPENTOPIA_SANDBOX_ERROR_NONCE";
 
 #[derive(Debug, Clone)]
 pub struct ResourceLimit {
@@ -63,6 +67,8 @@ pub trait BackgroundOutputSink: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     pub timeout: Duration,
+    pub startup_timeout: Duration,
+    pub termination_timeout: Duration,
     pub cancel: Option<CancellationToken>,
     pub resource_limits: ResourceLimit,
     /// When set, output is forwarded here as it arrives as well as being returned.
@@ -73,6 +79,8 @@ impl ExecutionContext {
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
             timeout,
+            startup_timeout: Duration::from_secs(15),
+            termination_timeout: Duration::from_secs(5),
             cancel: None,
             resource_limits: ResourceLimit::default(),
             output_sink: None,
@@ -81,6 +89,16 @@ impl ExecutionContext {
 
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
+        self
+    }
+
+    pub fn with_termination_timeout(mut self, timeout: Duration) -> Self {
+        self.termination_timeout = timeout;
         self
     }
 
@@ -99,90 +117,12 @@ impl Default for ExecutionContext {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            startup_timeout: Duration::from_secs(15),
+            termination_timeout: Duration::from_secs(5),
             cancel: None,
             resource_limits: ResourceLimit::default(),
             output_sink: None,
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ExecRequest {
-    pub program: String,
-    pub args: Vec<String>,
-    pub cwd: Option<PathBuf>,
-    pub stdin: Option<Vec<u8>>,
-    pub clear_env: bool,
-    pub env: HashMap<OsString, OsString>,
-}
-
-impl ExecRequest {
-    pub fn new(program: impl Into<String>) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-            cwd: None,
-            stdin: None,
-            clear_env: false,
-            env: HashMap::new(),
-        }
-    }
-
-    pub fn shell(command: impl Into<String>) -> Self {
-        let command = command.into();
-        if cfg!(windows) {
-            Self::new("powershell.exe")
-                .arg("-NoProfile")
-                .arg("-ExecutionPolicy")
-                .arg("Bypass")
-                .arg("-Command")
-                .arg(command)
-        } else {
-            Self::new("sh").arg("-lc").arg(command)
-        }
-    }
-
-    pub fn arg(mut self, arg: impl Into<String>) -> Self {
-        self.args.push(arg.into());
-        self
-    }
-
-    pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.args.extend(args.into_iter().map(Into::into));
-        self
-    }
-
-    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-
-    pub fn stdin(mut self, stdin: impl Into<Vec<u8>>) -> Self {
-        self.stdin = Some(stdin.into());
-        self
-    }
-
-    pub fn env_clear(mut self) -> Self {
-        self.clear_env = true;
-        self
-    }
-
-    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
-        self.env.insert(key.into(), value.into());
-        self
-    }
-
-    pub fn envs<K, V>(mut self, variables: impl IntoIterator<Item = (K, V)>) -> Self
-    where
-        K: Into<OsString>,
-        V: Into<OsString>,
-    {
-        self.env.extend(
-            variables
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into())),
-        );
-        self
     }
 }
 
@@ -548,6 +488,55 @@ impl LocalExecutionEnvironment {
     fn unregister_process(&self, request_id: &str) {
         self.running.lock().unwrap().remove(request_id);
     }
+
+    fn validate_execution_requirements(&self, request: &ExecRequest) -> anyhow::Result<()> {
+        let capabilities = SandboxBackendCapabilities::for_platform(
+            OsSandboxPlatform::current(),
+            self.sandbox_config.windows_backend,
+        );
+        if !request.requirements.deny_read_paths.is_empty() && !capabilities.deny_read {
+            return Err(ExecutionFailure::without_os_error(
+                ExecutionStage::ValidatePolicy,
+                "deny-read requirements need a sandbox backend with authoritative read isolation",
+            )
+            .into());
+        }
+        if !request.requirements.deny_write_paths.is_empty() && !capabilities.deny_write {
+            return Err(ExecutionFailure::without_os_error(
+                ExecutionStage::ValidatePolicy,
+                "deny-write requirements are unsupported by the selected sandbox backend",
+            )
+            .into());
+        }
+        if request.requirements.network == Some(NetworkPolicy::Allow)
+            && self.sandbox_config.network == NetworkPolicy::Deny
+        {
+            return Err(ExecutionFailure::without_os_error(
+                ExecutionStage::ValidatePolicy,
+                "the command requires network access but the sandbox is offline",
+            )
+            .into());
+        }
+        if request.requirements.network == Some(NetworkPolicy::Deny)
+            && !capabilities.network_offline
+        {
+            return Err(ExecutionFailure::without_os_error(
+                ExecutionStage::ValidatePolicy,
+                "offline execution requires a sandbox backend with authoritative network isolation",
+            )
+            .into());
+        }
+        for path in &request.requirements.read_paths {
+            self.resolve_existing_path(path)?;
+        }
+        for path in &request.requirements.deny_read_paths {
+            self.resolve_existing_path(path)?;
+        }
+        for path in &request.requirements.write_paths {
+            self.resolve_write_path(path)?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -577,6 +566,12 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         request: ExecRequest,
         context: ExecutionContext,
     ) -> anyhow::Result<ExecResult> {
+        let initial_cwd = request
+            .cwd
+            .clone()
+            .unwrap_or_else(|| self.workspace_root.clone());
+        let request = crate::tool_adapter::adapt(request, &initial_cwd);
+        self.validate_execution_requirements(&request)?;
         let cwd = request
             .cwd
             .as_deref()
@@ -584,22 +579,57 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             .transpose()?
             .unwrap_or(self.workspace_root_canonical()?);
 
-        let command_plan = build_local_sandbox_command(
-            &request.program,
+        let runtime = resolve_runtime(&request, &cwd, &self.workspace_root, &self.sandbox_config)?;
+        let program = runtime.program.to_string_lossy().into_owned();
+        let mut effective_config = self.sandbox_config.clone();
+        if request.requirements.network == Some(NetworkPolicy::Deny) {
+            effective_config.network = NetworkPolicy::Deny;
+        }
+
+        let command_plan = build_local_sandbox_command_with_options(
+            &program,
             &request.args,
             &cwd,
             &self.workspace_root,
-            &self.sandbox_config,
+            &effective_config,
+            &SandboxLaunchOptions {
+                interactive: false,
+                runtime_read_roots: runtime.read_roots.clone(),
+                environment_keys: environment_keys(&runtime),
+                additional_denied_read_paths: request.requirements.deny_read_paths.clone(),
+                additional_protected_paths: request.requirements.deny_write_paths.clone(),
+                timeout_ms: Some(context.timeout.as_millis().min(u64::MAX as u128) as u64),
+                termination_timeout_ms: Some(
+                    context
+                        .termination_timeout
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                ),
+                max_memory_bytes: context.resource_limits.max_memory_bytes,
+                max_cpu_time_ms: context
+                    .resource_limits
+                    .max_cpu_time
+                    .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+                max_output_bytes: context
+                    .resource_limits
+                    .max_output_bytes
+                    .map(|bytes| bytes.min(u64::MAX as usize) as u64),
+            },
         )?;
         let sandbox = Some(ExecutionSandboxMetadata {
             status: command_plan.status.clone(),
             permission_profile: sandbox_permission_profile(
                 OsSandboxPlatform::current(),
-                &self.sandbox_config,
+                &effective_config,
             ),
-            sandbox_mode: self.sandbox_config.sandbox_mode,
-            network: self.sandbox_config.network,
+            sandbox_mode: effective_config.sandbox_mode,
+            network: effective_config.network,
         });
+        let outer_wait_timeout = sandbox_outer_wait_timeout(
+            &command_plan.status,
+            context.timeout,
+            context.termination_timeout,
+        );
 
         if let SandboxCommandStatus::BestEffortPassthrough { platform, reason } =
             &command_plan.status
@@ -612,27 +642,22 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         }
 
         let mut process = Command::new(&command_plan.program);
-        if request.clear_env {
-            process.env_clear();
-        } else {
-            for key in SENSITIVE_CHILD_ENV_KEYS {
-                process.env_remove(key);
-            }
-        }
+        configure_command_environment(&mut process, &request, &runtime, &effective_config);
         process
             .args(&command_plan.args)
-            .envs(&request.env)
             .envs(command_plan.env.iter().cloned())
             .current_dir(&cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if request.stdin.is_some() {
-            process.stdin(Stdio::piped());
-        }
+        configure_stdio(&mut process, &request);
 
         // Held until the command finishes: the job terminates its members when the last
         // handle closes, so dropping this early would kill the command.
-        let quota = ProcessQuota::prepare(&context.resource_limits)?;
+        let quota = if matches!(command_plan.status, SandboxCommandStatus::Wrapped { .. }) {
+            None
+        } else {
+            ProcessQuota::prepare(&context.resource_limits)?
+        };
         #[cfg(windows)]
         {
             let flags = crate::process_quota::suspended_creation_flags(quota.as_ref());
@@ -641,9 +666,8 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             }
         }
 
-        let mut child = process
-            .spawn()
-            .with_context(|| format!("failed to spawn {}", command_plan.program))?;
+        let mut child =
+            spawn_process(process, context.startup_timeout, &command_plan.program).await?;
 
         if let Some(quota) = quota.as_ref() {
             // Fail closed. The process is still suspended, so killing it here means no
@@ -720,7 +744,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             let ctx_cancel = context.cancel.clone();
             let reg_cancel = cancel_token.clone();
             let limit_reached = output_limit_reached.clone();
-            let timeout_dur = context.timeout;
+            let timeout_dur = outer_wait_timeout;
             let program = command_plan.program.clone();
 
             tokio::select! {
@@ -736,30 +760,31 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    terminate_process(&mut child, context.termination_timeout).await?;
                     Ok(WaitOutcome::Cancelled("execution cancelled by context".to_string()))
                 }
                 _ = reg_cancel.cancelled() => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    terminate_process(&mut child, context.termination_timeout).await?;
                     Ok(WaitOutcome::Cancelled("execution cancelled by request_id".to_string()))
                 }
                 _ = limit_reached.cancelled() => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    terminate_process(&mut child, context.termination_timeout).await?;
                     Ok(WaitOutcome::OutputLimitExceeded)
                 }
                 _ = tokio::time::sleep(timeout_dur) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    terminate_process(&mut child, context.termination_timeout).await?;
                     Ok(WaitOutcome::TimedOut(format!(
-                        "{} timed out after {:?}",
+                        "execution failed during wait: {} timed out after {:?}; process tree terminated",
                         program, timeout_dur
                     )))
                 }
             }
         };
+
+        // Closing the outer Job Object reclaims descendants and closes any
+        // inherited output handles before the readers wait for EOF. This is
+        // required even after the root process exits successfully.
+        drop(quota);
 
         let (stdout, stdout_truncated) = stdout_handle.await.unwrap_or_default();
         let (stderr, stderr_truncated) = stderr_handle.await.unwrap_or_default();
@@ -792,6 +817,23 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             }
         };
 
+        if matches!(command_plan.status, SandboxCommandStatus::Wrapped { .. })
+            && result.exit_code == Some(SANDBOX_ERROR_EXIT_CODE)
+        {
+            let expected_nonce = command_plan
+                .env
+                .iter()
+                .find(|(key, _)| key == SANDBOX_ERROR_NONCE_ENV)
+                .map(|(_, value)| value.as_str());
+            if let Some(message) = sandbox_infrastructure_error(&result.stderr, expected_nonce) {
+                return Err(ExecutionFailure::without_os_error(
+                    ExecutionStage::PrepareSandbox,
+                    message,
+                )
+                .into());
+            }
+        }
+
         if result.truncated {
             if let Some(max) = max_bytes {
                 result.stdout = truncate_output_vec(result.stdout, Some(max));
@@ -807,6 +849,12 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         request: ExecRequest,
         context: ExecutionContext,
     ) -> anyhow::Result<Box<dyn StdioSession>> {
+        let initial_cwd = request
+            .cwd
+            .clone()
+            .unwrap_or_else(|| self.workspace_root.clone());
+        let request = crate::tool_adapter::adapt(request, &initial_cwd);
+        self.validate_execution_requirements(&request)?;
         let cwd = request
             .cwd
             .as_deref()
@@ -814,12 +862,38 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             .transpose()?
             .unwrap_or(self.workspace_root_canonical()?);
 
-        let command_plan = build_local_sandbox_command(
-            &request.program,
+        let runtime = resolve_runtime(&request, &cwd, &self.workspace_root, &self.sandbox_config)?;
+        let program = runtime.program.to_string_lossy().into_owned();
+
+        let command_plan = build_local_sandbox_command_with_options(
+            &program,
             &request.args,
             &cwd,
             &self.workspace_root,
             &self.sandbox_config,
+            &SandboxLaunchOptions {
+                interactive: false,
+                runtime_read_roots: runtime.read_roots.clone(),
+                environment_keys: environment_keys(&runtime),
+                additional_denied_read_paths: request.requirements.deny_read_paths.clone(),
+                additional_protected_paths: request.requirements.deny_write_paths.clone(),
+                timeout_ms: Some(context.timeout.as_millis().min(u64::MAX as u128) as u64),
+                termination_timeout_ms: Some(
+                    context
+                        .termination_timeout
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                ),
+                max_memory_bytes: context.resource_limits.max_memory_bytes,
+                max_cpu_time_ms: context
+                    .resource_limits
+                    .max_cpu_time
+                    .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+                max_output_bytes: context
+                    .resource_limits
+                    .max_output_bytes
+                    .map(|bytes| bytes.min(u64::MAX as usize) as u64),
+            },
         )?;
         let sandbox = Some(ExecutionSandboxMetadata {
             status: command_plan.status.clone(),
@@ -830,24 +904,26 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             sandbox_mode: self.sandbox_config.sandbox_mode,
             network: self.sandbox_config.network,
         });
+        let outer_wait_timeout = sandbox_outer_wait_timeout(
+            &command_plan.status,
+            context.timeout,
+            context.termination_timeout,
+        );
         let mut process = Command::new(&command_plan.program);
-        if request.clear_env {
-            process.env_clear();
-        } else {
-            for key in SENSITIVE_CHILD_ENV_KEYS {
-                process.env_remove(key);
-            }
-        }
+        configure_command_environment(&mut process, &request, &runtime, &self.sandbox_config);
         process
             .args(&command_plan.args)
-            .envs(&request.env)
             .envs(command_plan.env.iter().cloned())
             .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let quota = ProcessQuota::prepare(&context.resource_limits)?;
+        let quota = if matches!(command_plan.status, SandboxCommandStatus::Wrapped { .. }) {
+            None
+        } else {
+            ProcessQuota::prepare(&context.resource_limits)?
+        };
         #[cfg(windows)]
         {
             let flags = crate::process_quota::suspended_creation_flags(quota.as_ref());
@@ -856,9 +932,8 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             }
         }
 
-        let mut child = process
-            .spawn()
-            .with_context(|| format!("failed to spawn {}", command_plan.program))?;
+        let mut child =
+            spawn_process(process, context.startup_timeout, &command_plan.program).await?;
 
         if let Some(quota) = quota.as_ref() {
             if let Err(error) = quota.bind_and_resume(&child) {
@@ -899,7 +974,15 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             request_id: Some(request_id),
             env: Some(Arc::new(self.clone())),
             sandbox,
-            _quota: quota,
+            sandbox_error_nonce: command_plan
+                .env
+                .iter()
+                .find(|(key, _)| key == SANDBOX_ERROR_NONCE_ENV)
+                .map(|(_, value)| value.clone()),
+            stderr_observed: tokio::sync::Mutex::new(Vec::new()),
+            execution_timeout: outer_wait_timeout,
+            termination_timeout: context.termination_timeout,
+            quota: tokio::sync::Mutex::new(quota),
         }))
     }
 
@@ -972,6 +1055,25 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
     }
 }
 
+fn sandbox_outer_wait_timeout(
+    status: &SandboxCommandStatus,
+    command_timeout: Duration,
+    termination_timeout: Duration,
+) -> Duration {
+    if matches!(status, SandboxCommandStatus::Wrapped { .. }) {
+        // The helper owns the authoritative command deadline. Leave enough
+        // time for Job Object termination, exit confirmation, and the
+        // elevated broker/runner result exchange so its staged diagnostic is
+        // not replaced by a generic outer timeout.
+        command_timeout
+            .saturating_add(termination_timeout)
+            .saturating_add(termination_timeout)
+            .saturating_add(Duration::from_secs(20))
+    } else {
+        command_timeout
+    }
+}
+
 async fn read_pipe_with_limit<R: AsyncRead + Unpin>(
     mut reader: R,
     max_bytes: Option<usize>,
@@ -1029,6 +1131,24 @@ fn truncate_output_vec(bytes: Vec<u8>, max_bytes: Option<usize>) -> Vec<u8> {
     }
 }
 
+fn sandbox_infrastructure_error(stderr: &[u8], expected_nonce: Option<&str>) -> Option<String> {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.lines().find_map(|line| {
+        let payload = line.strip_prefix(SANDBOX_ERROR_PREFIX)?;
+        let envelope: serde_json::Value = serde_json::from_str(payload).ok()?;
+        if envelope.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        if envelope.get("nonce").and_then(serde_json::Value::as_str) != expected_nonce {
+            return None;
+        }
+        envelope
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
 pub struct LocalStdioSession {
     child: tokio::sync::Mutex<Option<tokio::process::Child>>,
     stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,
@@ -1039,9 +1159,13 @@ pub struct LocalStdioSession {
     request_id: Option<String>,
     env: Option<std::sync::Arc<LocalExecutionEnvironment>>,
     sandbox: Option<ExecutionSandboxMetadata>,
+    sandbox_error_nonce: Option<String>,
+    stderr_observed: tokio::sync::Mutex<Vec<u8>>,
+    execution_timeout: Duration,
+    termination_timeout: Duration,
     /// Kept for the session's lifetime. The job terminates its members when the last handle
     /// closes, so releasing this before the session ends would kill the child.
-    _quota: Option<ProcessQuota>,
+    quota: tokio::sync::Mutex<Option<ProcessQuota>>,
 }
 
 #[async_trait]
@@ -1066,6 +1190,8 @@ impl StdioSession for LocalStdioSession {
         let mut buf = vec![0u8; 8192];
         let bytes_read = stderr.read(&mut buf).await?;
         buf.truncate(bytes_read);
+        let mut observed = self.stderr_observed.lock().await;
+        append_bounded_diagnostic(&mut observed, &buf);
         Ok(buf)
     }
 
@@ -1083,48 +1209,42 @@ impl StdioSession for LocalStdioSession {
         let mut child = child_guard.take();
 
         if let Some(ref mut child) = child {
-            let wait_result = match (&self.cancel, &self.cancel_token) {
-                (Some(cancel), Some(cancel_token)) => {
-                    let cancel = cancel.clone();
-                    let cancel_token = cancel_token.clone();
-                    tokio::select! {
-                        result = child.wait() => result.map_err(anyhow::Error::from),
-                        _ = cancel.cancelled() => {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            Err(anyhow::anyhow!("stdio session cancelled during wait"))
-                        }
-                        _ = cancel_token.cancelled() => {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            Err(anyhow::anyhow!("stdio session cancelled during wait"))
-                        }
+            let cancel = self.cancel.clone();
+            let cancel_token = self.cancel_token.clone();
+            let wait_result = tokio::select! {
+                result = child.wait() => result.map_err(anyhow::Error::from),
+                _ = async {
+                    if let Some(cancel) = cancel {
+                        cancel.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
                     }
+                } => {
+                    terminate_process(child, self.termination_timeout).await?;
+                    Err(anyhow::anyhow!("stdio session cancelled during wait"))
                 }
-                (Some(cancel), None) => {
-                    let cancel = cancel.clone();
-                    tokio::select! {
-                        result = child.wait() => result.map_err(anyhow::Error::from),
-                        _ = cancel.cancelled() => {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            Err(anyhow::anyhow!("stdio session cancelled during wait"))
-                        }
+                _ = async {
+                    if let Some(cancel) = cancel_token {
+                        cancel.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
                     }
+                } => {
+                    terminate_process(child, self.termination_timeout).await?;
+                    Err(anyhow::anyhow!("stdio session cancelled during wait"))
                 }
-                (None, Some(cancel_token)) => {
-                    let cancel_token = cancel_token.clone();
-                    tokio::select! {
-                        result = child.wait() => result.map_err(anyhow::Error::from),
-                        _ = cancel_token.cancelled() => {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            Err(anyhow::anyhow!("stdio session cancelled during wait"))
-                        }
-                    }
+                _ = tokio::time::sleep(self.execution_timeout) => {
+                    terminate_process(child, self.termination_timeout).await?;
+                    Err(anyhow::anyhow!(
+                        "execution failed during wait: stdio session timed out after {:?}; process tree terminated",
+                        self.execution_timeout
+                    ))
                 }
-                (None, None) => child.wait().await.map_err(anyhow::Error::from),
             };
+
+            // End the entire job before returning or propagating a wait
+            // error; otherwise a descendant can survive the session root.
+            self.quota.lock().await.take();
 
             if let Some(ref request_id) = self.request_id {
                 if let Some(ref env) = self.env {
@@ -1133,6 +1253,21 @@ impl StdioSession for LocalStdioSession {
             }
 
             let exit_status = wait_result?;
+            if exit_status.code() == Some(SANDBOX_ERROR_EXIT_CODE) {
+                let mut remaining = Vec::new();
+                self.stderr.lock().await.read_to_end(&mut remaining).await?;
+                let mut observed = self.stderr_observed.lock().await;
+                append_bounded_diagnostic(&mut observed, &remaining);
+                if let Some(message) =
+                    sandbox_infrastructure_error(&observed, self.sandbox_error_nonce.as_deref())
+                {
+                    return Err(ExecutionFailure::without_os_error(
+                        ExecutionStage::PrepareSandbox,
+                        message,
+                    )
+                    .into());
+                }
+            }
             return Ok(ExecResult {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
@@ -1165,10 +1300,13 @@ impl StdioSession for LocalStdioSession {
         }
 
         let mut child_guard = self.child.lock().await;
-        if let Some(mut child) = child_guard.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
+        let termination = if let Some(mut child) = child_guard.take() {
+            terminate_process(&mut child, self.termination_timeout).await
+        } else {
+            Ok(())
+        };
+        self.quota.lock().await.take();
+        termination?;
 
         if let Some(ref request_id) = self.request_id {
             if let Some(ref env) = self.env {
@@ -1184,10 +1322,44 @@ impl StdioSession for LocalStdioSession {
     }
 }
 
+fn append_bounded_diagnostic(buffer: &mut Vec<u8>, chunk: &[u8]) {
+    const LIMIT: usize = 64 * 1024;
+    buffer.extend_from_slice(chunk);
+    if buffer.len() > LIMIT {
+        buffer.drain(..buffer.len() - LIMIT);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn sandbox_error_envelope_is_distinct_from_a_target_exit_code() {
+        let marked = br#"ordinary stderr
+OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message":"policy unavailable"}
+"#;
+        assert_eq!(
+            sandbox_infrastructure_error(marked, Some("abc123")).as_deref(),
+            Some("policy unavailable")
+        );
+        assert_eq!(
+            sandbox_infrastructure_error(marked, Some("wrong nonce")),
+            None
+        );
+        assert_eq!(
+            sandbox_infrastructure_error(b"target failed", Some("abc123")),
+            None
+        );
+        assert_eq!(
+            sandbox_infrastructure_error(
+                br#"OPENTOPIA_SANDBOX_ERROR {"version":2,"nonce":"abc123","message":"future"}"#,
+                Some("abc123")
+            ),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn local_environment_reads_writes_and_execs() {
@@ -1451,10 +1623,9 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("opentopia-core-execution-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create temp workspace");
-        let env = LocalExecutionEnvironment::with_sandbox_config(
-            root.clone(),
-            LocalSandboxConfig::best_effort(),
-        );
+        let mut config = LocalSandboxConfig::best_effort();
+        config.network = NetworkPolicy::Allow;
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
 
         let exec = env
             .exec(
@@ -1464,12 +1635,16 @@ mod tests {
             .await
             .expect("OpenTopia Windows sandbox should run");
 
-        assert!(exec.success);
+        assert!(
+            exec.success,
+            "sandboxed PowerShell failed: {}",
+            String::from_utf8_lossy(&exec.stderr)
+        );
         assert!(String::from_utf8_lossy(&exec.stdout).contains("ok"));
         let sandbox = exec.sandbox.expect("execution records sandbox metadata");
         assert_eq!(
             sandbox.permission_profile,
-            "opentopia-appcontainer-workspace-write-offline"
+            "opentopia-windows-workspace-write-internet"
         );
         assert!(matches!(
             sandbox.status,
@@ -1493,10 +1668,9 @@ mod tests {
             .expect("workspace parent")
             .join(format!("opentopia-core-outside-{id}.txt"));
         std::fs::create_dir_all(&root).expect("create temp workspace");
-        let env = LocalExecutionEnvironment::with_sandbox_config(
-            root.clone(),
-            LocalSandboxConfig::enforce(),
-        );
+        let mut config = LocalSandboxConfig::enforce();
+        config.network = NetworkPolicy::Allow;
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
         let escaped_outside = outside.to_string_lossy().replace("'", "''");
         let command = format!(
             "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{escaped_outside}' -Value blocked"
@@ -1529,6 +1703,7 @@ mod tests {
         let sandbox_home = std::env::temp_dir().join(format!("opentopia-core-readonly-home-{id}"));
         std::fs::create_dir_all(&root).expect("create temp workspace");
         let mut config = LocalSandboxConfig::enforce().with_sandbox_mode(SandboxMode::ReadOnly);
+        config.network = NetworkPolicy::Allow;
         config.sandbox_home = Some(sandbox_home.clone());
         let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
         let target = root.join("blocked.txt");
@@ -1561,6 +1736,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create temp workspace");
         std::fs::create_dir_all(&extra).expect("create extra writable root");
         let mut config = LocalSandboxConfig::enforce();
+        config.network = NetworkPolicy::Allow;
         config.writable_roots = vec![extra.clone()];
         config.sandbox_home = Some(sandbox_home.clone());
         let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);

@@ -47,6 +47,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
+use schemars::{gen::SchemaSettings, JsonSchema};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -174,6 +176,12 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
+    fn input_error(&self, input: &Value) -> Option<String> {
+        crate::provider::tool_input_schema_error(&self.schema(), input, "arguments")
+    }
+    fn has_derived_input_schema(&self) -> bool {
+        false
+    }
     /// Scheduling facts, separate from the model-facing schema. AgentCore may use
     /// these to run independent observations concurrently without guessing from
     /// tool names. The default is intentionally conservative for plugins/MCP.
@@ -181,6 +189,124 @@ pub trait Tool: Send + Sync {
         ToolExecutionPolicy::conservative()
     }
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult>;
+}
+
+/// Static tools declare their input exactly once. The associated Rust type is
+/// used both to derive the model-facing JSON Schema and to deserialize the
+/// value that reaches policy evaluation and execution. Tools whose contracts
+/// are discovered dynamically (currently MCP) continue to implement `Tool`
+/// directly.
+#[async_trait]
+trait TypedTool: Send + Sync {
+    type Input: DeserializeOwned + JsonSchema + Send + 'static;
+
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn validate_context(&self, _ctx: &ToolContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn execution_policy(&self, _input: &Self::Input) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::conservative()
+    }
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        _ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult>;
+}
+
+fn derived_tool_schema<T: JsonSchema>() -> Value {
+    let mut settings = SchemaSettings::draft07();
+    settings.inline_subschemas = true;
+    settings.meta_schema = None;
+    let schema = settings.into_generator().into_root_schema_for::<T>();
+    let mut value = serde_json::to_value(schema).expect("derived tool schema must serialize");
+    if let Some(object) = value.as_object_mut() {
+        object.remove("title");
+        object.remove("definitions");
+        let object_union = ["anyOf", "oneOf"].iter().any(|keyword| {
+            object
+                .get(*keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|branches| {
+                    !branches.is_empty()
+                        && branches.iter().all(|branch| {
+                            branch.get("type").and_then(Value::as_str) == Some("object")
+                        })
+                })
+        });
+        if object.get("type").is_none() && object_union {
+            // Function-tool transports require an object at the root even when
+            // Draft 7 can infer it from an anyOf/oneOf of object variants.
+            object.insert("type".to_string(), Value::String("object".to_string()));
+        }
+    }
+    value
+}
+
+fn decode_typed_tool_input<T: DeserializeOwned>(
+    tool_name: &str,
+    input: Value,
+) -> anyhow::Result<T> {
+    serde_json::from_value(input)
+        .with_context(|| format!("invalid arguments for tool `{tool_name}`"))
+}
+
+macro_rules! impl_typed_tool {
+    ($tool:ty) => {
+        #[async_trait]
+        impl Tool for $tool {
+            fn name(&self) -> &str {
+                <Self as TypedTool>::name(self)
+            }
+
+            fn description(&self) -> &str {
+                <Self as TypedTool>::description(self)
+            }
+
+            fn schema(&self) -> Value {
+                derived_tool_schema::<<Self as TypedTool>::Input>()
+            }
+
+            fn input_error(&self, input: &Value) -> Option<String> {
+                crate::provider::tool_input_schema_error(&self.schema(), input, "arguments")
+                    .or_else(|| {
+                        serde_json::from_value::<<Self as TypedTool>::Input>(input.clone())
+                            .err()
+                            .map(|error| {
+                                format!("arguments do not match the derived input type: {error}")
+                            })
+                    })
+            }
+
+            fn has_derived_input_schema(&self) -> bool {
+                true
+            }
+
+            fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+                decode_typed_tool_input::<<Self as TypedTool>::Input>(
+                    <Self as TypedTool>::name(self),
+                    call.input.clone(),
+                )
+                .map(|input| <Self as TypedTool>::execution_policy(self, &input))
+                .unwrap_or_else(|_| ToolExecutionPolicy::conservative())
+            }
+
+            async fn execute(
+                &self,
+                call: ToolCall,
+                ctx: ToolContext,
+            ) -> anyhow::Result<ToolResult> {
+                <Self as TypedTool>::validate_context(self, &ctx)?;
+                let input = decode_typed_tool_input::<<Self as TypedTool>::Input>(
+                    <Self as TypedTool>::name(self),
+                    call.input,
+                )?;
+                <Self as TypedTool>::execute_typed(self, call.id, input, ctx).await
+            }
+        }
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,7 +477,7 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum SpreadsheetToolAction {
     Inspect,
@@ -360,28 +486,36 @@ enum SpreadsheetToolAction {
     Write,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SpreadsheetToolInput {
     action: SpreadsheetToolAction,
+    /// Workspace-relative XLSX path for inspect/list/read.
     #[serde(default)]
     path: Option<String>,
+    /// Worksheet name for read_range.
     #[serde(default)]
     sheet: Option<String>,
+    /// Inclusive zero-based range for read_range.
     #[serde(default)]
     range: Option<CellRange>,
+    /// Optional existing XLSX to rebuild before applying writes.
     #[serde(default)]
     source_path: Option<String>,
+    /// Workspace-relative XLSX output path for write.
     #[serde(default)]
     output_path: Option<String>,
     #[serde(default)]
+    #[schemars(length(max = 256))]
     sheets: Vec<SheetWriteRequest>,
 }
 
 pub struct SpreadsheetTool;
 
 #[async_trait]
-impl Tool for SpreadsheetTool {
+impl TypedTool for SpreadsheetTool {
+    type Input = SpreadsheetToolInput;
+
     fn name(&self) -> &str {
         "spreadsheet"
     }
@@ -390,92 +524,24 @@ impl Tool for SpreadsheetTool {
         "Inspect, list, read, create, or update bounded XLSX workbooks. Uses zero-based row and column coordinates; writes preserve values, formulas, sheet order, and visibility but not formatting or embedded workbook objects."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["inspect", "list_sheets", "read_range", "write"]
-                },
-                "path": { "type": "string", "description": "Workspace-relative XLSX path for inspect/list/read." },
-                "sheet": { "type": "string", "description": "Worksheet name for read_range." },
-                "range": {
-                    "type": "object",
-                    "description": "Inclusive zero-based range for read_range.",
-                    "properties": {
-                        "start": { "$ref": "#/$defs/address" },
-                        "end": { "$ref": "#/$defs/address" }
-                    },
-                    "required": ["start", "end"],
-                    "additionalProperties": false
-                },
-                "sourcePath": { "type": "string", "description": "Optional existing XLSX to rebuild before applying writes." },
-                "outputPath": { "type": "string", "description": "Workspace-relative XLSX output path for write." },
-                "sheets": {
-                    "type": "array",
-                    "maxItems": 256,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": { "type": "string" },
-                            "visibility": { "type": "string", "enum": ["visible", "hidden", "very_hidden"] },
-                            "cells": {
-                                "type": "array",
-                                "maxItems": 10000,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "address": { "$ref": "#/$defs/address" },
-                                        "value": {
-                                            "type": "object",
-                                            "properties": {
-                                                "type": { "type": "string", "enum": ["blank", "string", "integer", "number", "boolean", "formula"] },
-                                                "value": {}
-                                            },
-                                            "required": ["type"],
-                                            "additionalProperties": false
-                                        }
-                                    },
-                                    "required": ["address", "value"],
-                                    "additionalProperties": false
-                                }
-                            }
-                        },
-                        "required": ["name"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["action"],
-            "additionalProperties": false,
-            "$defs": {
-                "address": {
-                    "type": "object",
-                    "properties": {
-                        "row": { "type": "integer", "minimum": 0, "maximum": 1048575 },
-                        "column": { "type": "integer", "minimum": 0, "maximum": 16383 }
-                    },
-                    "required": ["row", "column"],
-                    "additionalProperties": false
-                }
-            }
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let input: SpreadsheetToolInput = serde_json::from_value(call.input.clone())
-            .context("spreadsheet received invalid arguments")?;
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         match input.action {
             SpreadsheetToolAction::Inspect
             | SpreadsheetToolAction::ListSheets
             | SpreadsheetToolAction::ReadRange => {
-                execute_spreadsheet_read(call.id, input, ctx).await
+                execute_spreadsheet_read(call_id, input, ctx).await
             }
-            SpreadsheetToolAction::Write => execute_spreadsheet_write(call.id, input, ctx).await,
+            SpreadsheetToolAction::Write => execute_spreadsheet_write(call_id, input, ctx).await,
         }
     }
 }
+
+impl_typed_tool!(SpreadsheetTool);
 
 async fn execute_spreadsheet_read(
     call_id: Uuid,
@@ -742,26 +808,33 @@ const MAX_USER_INPUT_QUESTION_CHARS: usize = 500;
 const MAX_USER_INPUT_LABEL_CHARS: usize = 100;
 const MAX_USER_INPUT_DESCRIPTION_CHARS: usize = 500;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RequestUserInputInput {
+    /// One to three concise planning decisions.
+    #[schemars(length(min = 1, max = 3))]
     questions: Vec<RequestUserInputQuestionInput>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RequestUserInputQuestionInput {
+    /// Stable snake_case identifier.
     id: String,
+    /// Short card heading.
     header: String,
     question: String,
+    #[schemars(length(min = 2, max = 4))]
     options: Vec<RequestUserInputOptionInput>,
+    /// Allow the user to enter a different answer. Defaults to true.
     #[serde(default = "default_allow_custom")]
     allow_custom: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RequestUserInputOptionInput {
+    /// Stable snake_case identifier.
     id: String,
     label: String,
     description: String,
@@ -776,7 +849,9 @@ fn default_allow_custom() -> bool {
 pub struct RequestUserInputTool;
 
 #[async_trait]
-impl Tool for RequestUserInputTool {
+impl TypedTool for RequestUserInputTool {
+    type Input = RequestUserInputInput;
+
     fn name(&self) -> &str {
         "request_user_input"
     }
@@ -785,58 +860,20 @@ impl Tool for RequestUserInputTool {
         "Pause plan generation and ask the user to choose between materially different approaches. Use one to three concise questions with two to four concrete options each. Mark at most one option per question as recommended."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": MAX_USER_INPUT_QUESTIONS,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string", "description": "Stable snake_case identifier." },
-                            "header": { "type": "string", "description": "Short card heading." },
-                            "question": { "type": "string" },
-                            "options": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": MAX_USER_INPUT_OPTIONS,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": { "type": "string", "description": "Stable snake_case identifier." },
-                                        "label": { "type": "string" },
-                                        "description": { "type": "string" },
-                                        "recommended": { "type": "boolean" }
-                                    },
-                                    "required": ["id", "label", "description"],
-                                    "additionalProperties": false
-                                }
-                            },
-                            "allow_custom": {
-                                "type": "boolean",
-                                "description": "Allow the user to enter a different answer. Defaults to true."
-                            }
-                        },
-                        "required": ["id", "header", "question", "options"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["questions"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
         anyhow::ensure!(
             ctx.collaboration_mode == CollaborationMode::Plan,
             "request_user_input is only available in plan mode"
         );
-        let input: RequestUserInputInput = serde_json::from_value(call.input.clone())
-            .context("request_user_input received invalid arguments")?;
+        Ok(())
+    }
+
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        _ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         anyhow::ensure!(
             !input.questions.is_empty() && input.questions.len() <= MAX_USER_INPUT_QUESTIONS,
             "request_user_input requires one to {MAX_USER_INPUT_QUESTIONS} questions"
@@ -912,7 +949,7 @@ impl Tool for RequestUserInputTool {
             questions,
         };
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: format!(
                 "Waiting for the user to answer {} planning decision(s).",
                 request.questions.len()
@@ -922,13 +959,15 @@ impl Tool for RequestUserInputTool {
                 "requestId": request.request_id,
             }))],
             metadata: json!({
-                "toolName": self.name(),
+                "toolName": "request_user_input",
                 "userInputRequest": request,
                 "success": true,
             }),
         })
     }
 }
+
+impl_typed_tool!(RequestUserInputTool);
 
 fn validate_user_input_id(field: &str, value: String) -> anyhow::Result<String> {
     let value = validate_user_input_text(field, value, MAX_USER_INPUT_ID_CHARS)?;
@@ -958,20 +997,25 @@ fn validate_user_input_text(
     Ok(value)
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CompleteTaskInput {
+    /// Concise description of the completed result.
     summary: String,
-    #[serde(default)]
+    /// Commands, checks, or observed results that verify the completed scope.
+    #[schemars(length(max = 20))]
     verification: Vec<String>,
-    #[serde(default)]
+    /// Work intentionally left for a later phase. Empty means no known remaining work.
+    #[schemars(length(max = 20))]
     remaining_work: Vec<String>,
 }
 
 pub struct CompleteTaskTool;
 
 #[async_trait]
-impl Tool for CompleteTaskTool {
+impl TypedTool for CompleteTaskTool {
+    type Input = CompleteTaskInput;
+
     fn name(&self) -> &str {
         "complete_task"
     }
@@ -980,33 +1024,7 @@ impl Tool for CompleteTaskTool {
         "Finish the current user task after its requested scope has been verified. The plan records commitments and evidence, not a mandatory reasoning path. Provide a concise summary, concrete verification evidence, and any deliberately deferred work. This is the final tool call for the turn."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "Concise description of the completed result."
-                },
-                "verification": {
-                    "type": "array",
-                    "maxItems": MAX_TASK_COMPLETION_ITEMS,
-                    "items": { "type": "string" },
-                    "description": "Commands, checks, or observed results that verify the completed scope."
-                },
-                "remaining_work": {
-                    "type": "array",
-                    "maxItems": MAX_TASK_COMPLETION_ITEMS,
-                    "items": { "type": "string" },
-                    "description": "Work intentionally left for a later phase. Empty means no known remaining work."
-                }
-            },
-            "required": ["summary", "verification", "remaining_work"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
         if ctx.collaboration_mode == CollaborationMode::Plan {
             anyhow::bail!("complete_task is unavailable in plan mode");
         }
@@ -1034,8 +1052,15 @@ impl Tool for CompleteTaskTool {
                 "every completed goal step must include verification evidence"
             );
         }
-        let input: CompleteTaskInput = serde_json::from_value(call.input.clone())
-            .context("complete_task received invalid arguments")?;
+        Ok(())
+    }
+
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        _ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let summary =
             validate_completion_text("summary", input.summary, MAX_TASK_COMPLETION_SUMMARY_CHARS)?;
         let verification = validate_completion_items("verification", input.verification)?;
@@ -1067,17 +1092,19 @@ impl Tool for CompleteTaskTool {
             "remainingWork": remaining_work
         });
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output,
             content: vec![ModelContentPart::json(completion.clone())],
             metadata: json!({
-                "toolName": self.name(),
+                "toolName": "complete_task",
                 "taskCompletion": completion,
                 "success": true
             }),
         })
     }
 }
+
+impl_typed_tool!(CompleteTaskTool);
 
 fn validate_completion_text(
     field: &str,
@@ -1113,29 +1140,35 @@ const MAX_TASK_PLAN_CHANGE_REASON_CHARS: usize = 2_000;
 const MAX_TASK_PLAN_STATUS_REASON_CHARS: usize = 1_000;
 const MAX_TASK_PLAN_STEP_ITEMS: usize = 20;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SetPlanInput {
+    /// Exact goal UUID assigned by the server.
     goal_id: String,
+    #[schemars(range(min = 0))]
     expected_revision: u64,
     change_reason: String,
+    #[schemars(length(min = 1, max = 20))]
     steps: Vec<SetPlanStepInput>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SetPlanStepInput {
     id: String,
     title: String,
-    #[serde(default)]
+    #[schemars(length(max = 20))]
     dependencies: Vec<String>,
+    #[schemars(length(min = 1, max = 20))]
     acceptance_criteria: Vec<String>,
 }
 
 pub struct SetPlanTool;
 
 #[async_trait]
-impl Tool for SetPlanTool {
+impl TypedTool for SetPlanTool {
+    type Input = SetPlanInput;
+
     fn name(&self) -> &str {
         "set_plan"
     }
@@ -1144,54 +1177,20 @@ impl Tool for SetPlanTool {
         "Atomically create or replace the dependency-aware external memory for the server-assigned goal. The plan records commitments, progress, and completion evidence; it does not prescribe a fixed execution schedule beyond explicit dependencies. Every step starts pending and may be revised as evidence changes."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "goal_id": {
-                    "type": "string",
-                    "description": "Exact goal UUID assigned by the server."
-                },
-                "expected_revision": { "type": "integer", "minimum": 0 },
-                "change_reason": { "type": "string" },
-                "steps": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": MAX_TASK_PLAN_STEPS,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "title": { "type": "string" },
-                            "dependencies": {
-                                "type": "array",
-                                "maxItems": MAX_TASK_PLAN_STEPS,
-                                "items": { "type": "string" }
-                            },
-                            "acceptance_criteria": {
-                                "type": "array",
-                                "minItems": 1,
-                                "maxItems": MAX_TASK_PLAN_STEP_ITEMS,
-                                "items": { "type": "string" }
-                            }
-                        },
-                        "required": ["id", "title", "dependencies", "acceptance_criteria"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["goal_id", "expected_revision", "change_reason", "steps"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
         anyhow::ensure!(
             ctx.subagent_depth == 0,
             "only the parent agent may set the shared task plan"
         );
-        let input: SetPlanInput = serde_json::from_value(call.input.clone())
-            .context("set_plan received invalid arguments")?;
+        Ok(())
+    }
+
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let goal_id = validate_task_plan_text("goal_id", input.goal_id, MAX_TASK_PLAN_ID_CHARS)?;
         let parsed_goal_id =
             Uuid::parse_str(&goal_id).context("set_plan goal_id must be a UUID")?;
@@ -1256,11 +1255,11 @@ impl Tool for SetPlanTool {
         let next_runnable_step = plan.next_runnable_step().map(|step| step.id.clone());
         let output = plan.render_for_model();
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output,
             content: vec![ModelContentPart::json(serde_json::to_value(&plan)?)],
             metadata: json!({
-                "toolName": self.name(),
+                "toolName": "set_plan",
                 "taskPlan": plan,
                 "nextRunnableStep": next_runnable_step,
                 "success": true
@@ -1269,7 +1268,9 @@ impl Tool for SetPlanTool {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+impl_typed_tool!(SetPlanTool);
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum TaskPlanOperation {
     AppendStep,
@@ -1277,7 +1278,7 @@ enum TaskPlanOperation {
     RemoveStep,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AppendTaskPlanStepInput {
     id: String,
@@ -1290,7 +1291,7 @@ struct AppendTaskPlanStepInput {
     evidence: Vec<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct UpdateTaskPlanStepInput {
     #[serde(default)]
@@ -1318,19 +1319,27 @@ impl UpdateTaskPlanStepInput {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct UpdatePlanInput {
+    /// The single atomic plan-memory mutation to apply.
     operation: TaskPlanOperation,
+    /// Stable identifier for the goal whose plan is being changed.
     goal_id: String,
+    /// Revision currently observed by the caller.
     expected_revision: u64,
+    /// Why this mutation is necessary.
     change_reason: String,
+    /// True only when every step has a terminal, explained outcome.
     #[serde(default)]
     current_scope_complete: bool,
+    /// Target step id for update_step or remove_step.
     #[serde(default)]
     step_id: Option<String>,
+    /// Complete step payload for append_step.
     #[serde(default)]
     step: Option<AppendTaskPlanStepInput>,
+    /// Fields to replace for update_step. Omitted fields remain unchanged.
     #[serde(default)]
     updates: Option<UpdateTaskPlanStepInput>,
 }
@@ -1338,7 +1347,9 @@ struct UpdatePlanInput {
 pub struct UpdatePlanTool;
 
 #[async_trait]
-impl Tool for UpdatePlanTool {
+impl TypedTool for UpdatePlanTool {
+    type Input = UpdatePlanInput;
+
     fn name(&self) -> &str {
         "update_plan"
     }
@@ -1347,112 +1358,20 @@ impl Tool for UpdatePlanTool {
         "Apply one atomic append_step, update_step, or remove_step mutation to the task's external progress memory. Always send the current goal_id and expected_revision; successful changes increment the revision. next_runnable_step is an advisory dependency-aware candidate, not a mandatory scheduler decision. Deferred, blocked, and cancelled steps require a status_reason. Removal requires a concrete change_reason and is rejected while another step depends on the target."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": ["append_step", "update_step", "remove_step"],
-                    "description": "The single atomic plan-memory mutation to apply."
-                },
-                "goal_id": {
-                    "type": "string",
-                    "description": "Stable identifier for the goal whose plan is being changed."
-                },
-                "expected_revision": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Revision currently observed by the caller. Use 0 when appending the first step of a new goal."
-                },
-                "change_reason": {
-                    "type": "string",
-                    "description": "Why this mutation is necessary. Required for every operation and especially for removal."
-                },
-                "current_scope_complete": {
-                    "type": "boolean",
-                    "description": "True only when every step is resolved as completed, deferred, blocked, or cancelled and evidence or explicit status reasons explain the outcome."
-                },
-                "step_id": {
-                    "type": "string",
-                    "description": "Target step id for update_step or remove_step."
-                },
-                "step": {
-                    "type": "object",
-                    "description": "Complete step payload for append_step.",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "title": { "type": "string" },
-                        "status": {
-                            "type": "string",
-                            "enum": ["pending", "in_progress", "completed", "deferred", "blocked", "cancelled"]
-                        },
-                        "status_reason": {
-                            "type": "string",
-                            "description": "Required when status is deferred, blocked, or cancelled."
-                        },
-                        "dependencies": {
-                            "type": "array",
-                            "maxItems": MAX_TASK_PLAN_STEPS,
-                            "items": { "type": "string" }
-                        },
-                        "acceptance_criteria": {
-                            "type": "array",
-                            "maxItems": MAX_TASK_PLAN_STEP_ITEMS,
-                            "items": { "type": "string" }
-                        },
-                        "evidence": {
-                            "type": "array",
-                            "maxItems": MAX_TASK_PLAN_STEP_ITEMS,
-                            "items": { "type": "string" }
-                        }
-                    },
-                    "required": ["id", "title", "status", "dependencies", "acceptance_criteria", "evidence"],
-                    "additionalProperties": false
-                },
-                "updates": {
-                    "type": "object",
-                    "description": "Fields to replace on the target step for update_step. Omitted fields remain unchanged.",
-                    "properties": {
-                        "title": { "type": "string" },
-                        "status": {
-                            "type": "string",
-                            "enum": ["pending", "in_progress", "completed", "deferred", "blocked", "cancelled"]
-                        },
-                        "status_reason": {
-                            "type": "string",
-                            "description": "Required when status is deferred, blocked, or cancelled."
-                        },
-                        "dependencies": {
-                            "type": "array",
-                            "maxItems": MAX_TASK_PLAN_STEPS,
-                            "items": { "type": "string" }
-                        },
-                        "acceptance_criteria": {
-                            "type": "array",
-                            "maxItems": MAX_TASK_PLAN_STEP_ITEMS,
-                            "items": { "type": "string" }
-                        },
-                        "evidence": {
-                            "type": "array",
-                            "maxItems": MAX_TASK_PLAN_STEP_ITEMS,
-                            "items": { "type": "string" }
-                        }
-                    },
-                    "additionalProperties": false
-                }
-            },
-            "required": ["operation", "goal_id", "expected_revision", "change_reason"],
-            "additionalProperties": false
-        })
+    fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            ctx.subagent_depth == 0,
+            "only the parent agent may update the shared task plan"
+        );
+        Ok(())
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        if ctx.subagent_depth > 0 {
-            anyhow::bail!("only the parent agent may update the shared task plan");
-        }
-        let input: UpdatePlanInput = serde_json::from_value(call.input.clone())
-            .context("update_plan received invalid arguments")?;
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let goal_id = validate_task_plan_text("goal_id", input.goal_id, MAX_TASK_PLAN_ID_CHARS)?;
         if let Some(expected_goal_id) = ctx.goal_id {
             anyhow::ensure!(
@@ -1611,7 +1530,7 @@ impl Tool for UpdatePlanTool {
         let value = serde_json::to_value(&plan)?;
         let next_runnable_value = serde_json::to_value(&next_runnable_step)?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: format!(
                 "Plan {} updated to revision {}: {resolved}/{} steps resolved.{}",
                 plan.goal_id,
@@ -1627,7 +1546,7 @@ impl Tool for UpdatePlanTool {
             ),
             content: vec![ModelContentPart::json(value.clone())],
             metadata: json!({
-                "toolName": self.name(),
+                "toolName": "update_plan",
                 "taskPlan": value,
                 "operation": input.operation,
                 "planRevision": plan.plan_revision,
@@ -1647,6 +1566,8 @@ impl Tool for UpdatePlanTool {
         })
     }
 }
+
+impl_typed_tool!(UpdatePlanTool);
 
 fn resolve_task_plan_for_mutation(
     current_plan: Option<TaskPlan>,
@@ -1892,10 +1813,16 @@ fn validate_task_plan(plan: &TaskPlan) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EmptyToolInput {}
+
 pub struct ListSkillsTool;
 
 #[async_trait]
-impl Tool for ListSkillsTool {
+impl TypedTool for ListSkillsTool {
+    type Input = EmptyToolInput;
+
     fn name(&self) -> &str {
         "list_skills"
     }
@@ -1904,15 +1831,16 @@ impl Tool for ListSkillsTool {
         "List available capability instructions (Skills) without loading their instructions."
     }
 
-    fn schema(&self) -> Value {
-        json!({ "type": "object", "properties": {}, "additionalProperties": false })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        _input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let skills = discover_skills(Some(&ctx.workspace_root));
         let value = serde_json::to_value(&skills)?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: serde_json::to_string_pretty(&value)?,
             content: vec![ModelContentPart::json(value)],
             metadata: json!({ "count": skills.len() }),
@@ -1920,10 +1848,28 @@ impl Tool for ListSkillsTool {
     }
 }
 
+impl_typed_tool!(ListSkillsTool);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadSkillInput {
+    /// Skill ID returned by list_skills.
+    id: String,
+    /// Byte offset to start reading from. Defaults to 0.
+    #[serde(default)]
+    offset: u64,
+    /// Maximum bytes to return, capped at 65536.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    limit: Option<u64>,
+}
+
 pub struct ReadSkillTool;
 
 #[async_trait]
-impl Tool for ReadSkillTool {
+impl TypedTool for ReadSkillTool {
+    type Input = ReadSkillInput;
+
     fn name(&self) -> &str {
         "read_skill"
     }
@@ -1932,48 +1878,24 @@ impl Tool for ReadSkillTool {
         "Read one Skill's instructions after deciding it is relevant to the current task. Returns at most 64 KB per call; when the result reports a next offset, call again with that offset to read the rest."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "Skill ID returned by list_skills." },
-                "offset": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Byte offset to start reading from. Defaults to 0. Use the nextOffset reported by a previous call to continue."
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Maximum bytes to return, capped at 65536."
-                }
-            },
-            "required": ["id"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let id = required_string(&call.input, "id")?;
-        let offset = call
-            .input
-            .get("offset")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let limit = call
-            .input
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map_or(MAX_SKILL_BYTES, |value| {
-                (value as usize).min(MAX_SKILL_BYTES)
-            });
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        let id = input.id.trim();
+        anyhow::ensure!(!id.is_empty(), "read_skill id must be a non-empty string");
+        let limit = input.limit.map_or(MAX_SKILL_BYTES, |value| {
+            (value as usize).min(MAX_SKILL_BYTES)
+        });
         // load_skill_slice resolves the opaque ID against the bounded, canonicalized Skill
         // catalog. It cannot be used as a general-purpose path read, including for user Skills
         // that intentionally live outside the thread workspace.
-        let slice = load_skill_slice(Some(&ctx.workspace_root), &id, offset, limit)?;
+        let slice = load_skill_slice(Some(&ctx.workspace_root), id, input.offset, limit)?;
         let output = slice.render_for_model();
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: output.clone(),
             content: vec![ModelContentPart::text(output)],
             metadata: json!({
@@ -1988,28 +1910,41 @@ impl Tool for ReadSkillTool {
     }
 }
 
-#[derive(Debug, Deserialize)]
+impl_typed_tool!(ReadSkillTool);
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateSkillToolInput {
+    /// Short action-oriented lowercase hyphen-case name, at most 64 characters.
     name: String,
+    /// What the Skill does and the concrete situations that should trigger it.
     description: String,
+    /// Concise imperative Markdown for another agent.
     instructions: String,
+    /// Installation scope. Defaults to user.
     #[serde(default)]
     scope: Option<SkillScope>,
+    /// Optional human-facing title.
     #[serde(default)]
     display_name: Option<String>,
+    /// Optional UI summary, at most 64 characters.
     #[serde(default)]
     short_description: Option<String>,
+    /// Optional one-sentence example that mentions the Skill.
     #[serde(default)]
     default_prompt: Option<String>,
+    /// Optional UTF-8 text resources.
     #[serde(default)]
+    #[schemars(length(max = 24))]
     resources: Vec<SkillResourceDraft>,
 }
 
 pub struct CreateSkillTool;
 
 #[async_trait]
-impl Tool for CreateSkillTool {
+impl TypedTool for CreateSkillTool {
+    type Input = CreateSkillToolInput;
+
     fn name(&self) -> &str {
         "create_skill"
     }
@@ -2018,62 +1953,12 @@ impl Tool for CreateSkillTool {
         "Create a reusable Skill directly from the current conversation. Use when the user asks to summarize, preserve, or turn the current work into a Skill. Synthesize concise instructions and any materially useful resources from conversation context, then call this tool without a separate draft/review workflow. Default to a user Skill unless the user explicitly asks for the current project. After success, tell the user the Skill name, purpose, path, and files created."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Short action-oriented lowercase hyphen-case name, at most 64 characters."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "What the Skill does and all concrete user requests or situations that should trigger it."
-                },
-                "instructions": {
-                    "type": "string",
-                    "description": "Concise imperative Markdown for another agent. Include only reusable workflow, constraints, validation, and resource routing; do not include creation-process documentation."
-                },
-                "scope": {
-                    "type": "string",
-                    "enum": ["user", "workspace"],
-                    "description": "Where to install the Skill. Defaults to user; use workspace only when the user asks for a project-specific Skill."
-                },
-                "displayName": {
-                    "type": "string",
-                    "description": "Optional human-facing title. A title is derived from name when omitted."
-                },
-                "shortDescription": {
-                    "type": "string",
-                    "description": "Optional UI summary, at most 64 characters. Derived from description when omitted."
-                },
-                "defaultPrompt": {
-                    "type": "string",
-                    "description": "Optional one-sentence example that explicitly mentions $<skill-name>. A valid prompt is generated when omitted."
-                },
-                "resources": {
-                    "type": "array",
-                    "maxItems": 24,
-                    "description": "Optional UTF-8 text resources. Use references/ for detailed knowledge, scripts/ for deterministic helpers, and assets/ for reusable text templates. Do not include README files, SKILL.md, or agents/openai.yaml.",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "path": { "type": "string" },
-                            "content": { "type": "string" }
-                        },
-                        "required": ["path", "content"]
-                    }
-                }
-            },
-            "required": ["name", "description", "instructions"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let input: CreateSkillToolInput =
-            serde_json::from_value(call.input.clone()).context("create_skill input is invalid")?;
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scope = input.scope.unwrap_or(SkillScope::User);
         let name = input.name.trim().to_ascii_lowercase();
         let description = input.description.trim().to_string();
@@ -2121,7 +2006,7 @@ impl Tool for CreateSkillTool {
         );
         let skill = serde_json::to_value(&created.skill)?;
         Ok(ToolResult::text(
-            call.id,
+            call_id,
             output,
             json!({
                 "success": true,
@@ -2133,6 +2018,8 @@ impl Tool for CreateSkillTool {
         ))
     }
 }
+
+impl_typed_tool!(CreateSkillTool);
 
 fn skill_display_name(name: &str) -> String {
     name.split('-')
@@ -2146,6 +2033,84 @@ fn skill_display_name(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BrowserActionInput {
+    Navigate,
+    Observe,
+    Screenshot,
+    Click,
+    Type,
+    Wait,
+    Download,
+    Close,
+}
+
+impl BrowserActionInput {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::Observe => "observe",
+            Self::Screenshot => "screenshot",
+            Self::Click => "click",
+            Self::Type => "type",
+            Self::Wait => "wait",
+            Self::Download => "download",
+            Self::Close => "close",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BrowserWaitConditionInput {
+    #[default]
+    DocumentComplete,
+    Selector,
+    Text,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserInput {
+    /// Browser action to perform.
+    action: BrowserActionInput,
+    /// URL for navigate or download.
+    #[serde(default)]
+    url: Option<String>,
+    /// CSS selector for a non-mutating wait condition only.
+    #[serde(default)]
+    selector: Option<String>,
+    /// Required for click and type; returned by observe.
+    #[serde(default)]
+    observation_id: Option<String>,
+    /// Required for click and type; returned by observe.
+    #[serde(default)]
+    node_ref: Option<String>,
+    /// Include a screenshot in observe; defaults to false.
+    #[serde(default)]
+    include_screenshot: bool,
+    /// Text for type or a wait text condition.
+    #[serde(default)]
+    text: Option<String>,
+    /// Clear an input before typing; defaults to true.
+    #[serde(default = "default_true")]
+    clear_first: bool,
+    /// Wait condition; defaults to document_complete.
+    #[serde(default)]
+    condition: BrowserWaitConditionInput,
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 120000))]
+    timeout_ms: Option<u64>,
+    /// Optional expected filename for a download.
+    #[serde(default)]
+    expected_filename: Option<String>,
 }
 
 pub struct BrowserTool;
@@ -2183,7 +2148,9 @@ pub fn browser_handoff_for_node(
 }
 
 #[async_trait]
-impl Tool for BrowserTool {
+impl TypedTool for BrowserTool {
+    type Input = BrowserInput;
+
     fn name(&self) -> &str {
         "browser"
     }
@@ -2192,36 +2159,12 @@ impl Tool for BrowserTool {
         "Use the shared local browser. Observe before every click or type, then use the returned observationId and nodeRef. The runtime rejects stale observations; if it reports stale_observation, discard the old node reference and call observe again before retrying. Navigate and follow ordinary links normally. When a page requires a login, verification, upload, payment, publication, or irreversible submission, stop controlling the page and tell the user to complete it in the visible browser. After the user says to continue, observe the page again before interacting."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["navigate", "observe", "screenshot", "click", "type", "wait", "download", "close"],
-                    "description": "Browser action to perform."
-                },
-                "url": { "type": "string", "description": "URL for navigate or download." },
-                "selector": { "type": "string", "description": "CSS selector for a non-mutating wait condition only." },
-                "observationId": { "type": "string", "description": "Required for click and type; returned by observe." },
-                "nodeRef": { "type": "string", "description": "Required for click and type; a node reference returned by observe." },
-                "includeScreenshot": { "type": "boolean", "description": "Include a screenshot in observe; defaults to false." },
-                "text": { "type": "string", "description": "Text for type or a wait text condition." },
-                "clearFirst": { "type": "boolean", "description": "Clear an input before typing; defaults to true." },
-                "condition": {
-                    "type": "string",
-                    "enum": ["document_complete", "selector", "text"],
-                    "description": "Wait condition; defaults to document_complete."
-                },
-                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 120000 },
-                "expectedFilename": { "type": "string", "description": "Optional expected filename for a download." }
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let runtime = ctx
             .browser
             .as_ref()
@@ -2229,42 +2172,40 @@ impl Tool for BrowserTool {
             .clone();
         let thread_id = ctx.thread_id.context("browser requires a thread context")?;
         let session = BrowserSessionId::from_thread(thread_id);
-        let action = required_string(&call.input, "action")?;
-        let timeout = browser_timeout(&call.input);
-        let output = match action.as_str() {
-            "navigate" => {
-                let url = required_string(&call.input, "url")?;
+        let action = input.action.as_str().to_string();
+        let timeout = input
+            .timeout_ms
+            .map(|milliseconds| Duration::from_millis(milliseconds.clamp(1, 120_000)));
+        let output = match input.action {
+            BrowserActionInput::Navigate => {
+                let url = required_typed_string(input.url.as_deref(), "url")?;
                 let mut request = BrowserNavigateRequest::new(url);
                 if let Some(wait) = request.wait.as_mut() {
                     wait.timeout = timeout;
                 }
                 runtime.navigate(session, request).await?
             }
-            "observe" => {
+            BrowserActionInput::Observe => {
                 let observation = runtime
                     .observe(
                         session,
                         BrowserObserveOptions {
-                            include_screenshot: call
-                                .input
-                                .get("includeScreenshot")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
+                            include_screenshot: input.include_screenshot,
                         },
                     )
                     .await?;
                 return Ok(browser_observation_to_tool_result(
-                    call.id,
+                    call_id,
                     action,
                     observation,
                     None,
                 ));
             }
-            "screenshot" => runtime.screenshot(session).await?,
-            "click" => {
+            BrowserActionInput::Screenshot => runtime.screenshot(session).await?,
+            BrowserActionInput::Click => {
                 inspect_browser_interaction(&ctx)?;
-                let observation_id = browser_observation_id(&call.input)?;
-                let node_ref = browser_node_ref(&call.input)?;
+                let observation_id = browser_observation_id(input.observation_id.as_deref())?;
+                let node_ref = browser_node_ref(input.node_ref.as_deref())?;
                 let target = runtime
                     .observation_node(session, observation_id, node_ref)
                     .await?;
@@ -2280,16 +2221,16 @@ impl Tool for BrowserTool {
                     .observe(session, BrowserObserveOptions::default())
                     .await?;
                 return Ok(browser_observation_to_tool_result(
-                    call.id,
+                    call_id,
                     action,
                     observation,
                     Some(receipt),
                 ));
             }
-            "type" => {
+            BrowserActionInput::Type => {
                 inspect_browser_interaction(&ctx)?;
-                let observation_id = browser_observation_id(&call.input)?;
-                let node_ref = browser_node_ref(&call.input)?;
+                let observation_id = browser_observation_id(input.observation_id.as_deref())?;
+                let node_ref = browser_node_ref(input.node_ref.as_deref())?;
                 let target = runtime
                     .observation_node(session, observation_id, node_ref)
                     .await?;
@@ -2302,12 +2243,8 @@ impl Tool for BrowserTool {
                         observation_id,
                         node_ref,
                         BrowserAction::Type {
-                            text: required_string(&call.input, "text")?,
-                            clear_first: call
-                                .input
-                                .get("clearFirst")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(true),
+                            text: required_typed_string(input.text.as_deref(), "text")?,
+                            clear_first: input.clear_first,
                         },
                     )
                     .await?;
@@ -2315,25 +2252,25 @@ impl Tool for BrowserTool {
                     .observe(session, BrowserObserveOptions::default())
                     .await?;
                 return Ok(browser_observation_to_tool_result(
-                    call.id,
+                    call_id,
                     action,
                     observation,
                     Some(receipt),
                 ));
             }
-            "wait" => {
-                let condition = match call
-                    .input
-                    .get("condition")
-                    .and_then(Value::as_str)
-                    .unwrap_or("document_complete")
-                {
-                    "document_complete" => BrowserWaitCondition::DocumentComplete,
-                    "selector" => BrowserWaitCondition::Selector(BrowserSelector::new(
-                        required_string(&call.input, "selector")?,
-                    )?),
-                    "text" => BrowserWaitCondition::Text(required_string(&call.input, "text")?),
-                    other => anyhow::bail!("unsupported browser wait condition: {other}"),
+            BrowserActionInput::Wait => {
+                let condition = match input.condition {
+                    BrowserWaitConditionInput::DocumentComplete => {
+                        BrowserWaitCondition::DocumentComplete
+                    }
+                    BrowserWaitConditionInput::Selector => {
+                        BrowserWaitCondition::Selector(BrowserSelector::new(
+                            required_typed_string(input.selector.as_deref(), "selector")?,
+                        )?)
+                    }
+                    BrowserWaitConditionInput::Text => BrowserWaitCondition::Text(
+                        required_typed_string(input.text.as_deref(), "text")?,
+                    ),
                 };
                 runtime
                     .wait(
@@ -2346,42 +2283,160 @@ impl Tool for BrowserTool {
                     )
                     .await?
             }
-            "download" => {
-                let url = required_string(&call.input, "url")?;
+            BrowserActionInput::Download => {
+                let url = required_typed_string(input.url.as_deref(), "url")?;
                 runtime
                     .download(
                         session,
                         BrowserDownloadRequest {
                             url,
-                            expected_filename: call
-                                .input
-                                .get("expectedFilename")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
+                            expected_filename: input.expected_filename,
                             timeout,
                         },
                     )
                     .await?
             }
-            "close" => {
+            BrowserActionInput::Close => {
                 inspect_browser_interaction(&ctx)?;
                 runtime.close_session(session).await?;
                 return Ok(ToolResult::text(
-                    call.id,
+                    call_id,
                     "Closed this browser tab.",
                     json!({ "sessionId": session.to_string(), "action": action }),
                 ));
             }
-            other => anyhow::bail!("unsupported browser action: {other}"),
         };
-        Ok(browser_output_to_tool_result(call.id, action, output))
+        Ok(browser_output_to_tool_result(call_id, action, output))
     }
+}
+
+impl_typed_tool!(BrowserTool);
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ComputerActionInput {
+    ListWindows,
+    Observe,
+    Click,
+    Type,
+    Keypress,
+    Scroll,
+    Drag,
+    Wait,
+    Close,
+}
+
+impl ComputerActionInput {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ListWindows => "list_windows",
+            Self::Observe => "observe",
+            Self::Click => "click",
+            Self::Type => "type",
+            Self::Keypress => "keypress",
+            Self::Scroll => "scroll",
+            Self::Drag => "drag",
+            Self::Wait => "wait",
+            Self::Close => "close",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ComputerMouseButtonInput {
+    #[default]
+    Left,
+    Right,
+}
+
+impl From<ComputerMouseButtonInput> for ComputerMouseButton {
+    fn from(value: ComputerMouseButtonInput) -> Self {
+        match value {
+            ComputerMouseButtonInput::Left => Self::Left,
+            ComputerMouseButtonInput::Right => Self::Right,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+enum ComputerKeyInput {
+    #[serde(rename = "ENTER")]
+    Enter,
+    #[serde(rename = "TAB")]
+    Tab,
+    #[serde(rename = "ESCAPE")]
+    Escape,
+    #[serde(rename = "BACKSPACE")]
+    Backspace,
+    #[serde(rename = "LEFT")]
+    Left,
+    #[serde(rename = "RIGHT")]
+    Right,
+    #[serde(rename = "UP")]
+    Up,
+    #[serde(rename = "DOWN")]
+    Down,
+}
+
+impl ComputerKeyInput {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enter => "ENTER",
+            Self::Tab => "TAB",
+            Self::Escape => "ESCAPE",
+            Self::Backspace => "BACKSPACE",
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+            Self::Up => "UP",
+            Self::Down => "DOWN",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ComputerInput {
+    action: ComputerActionInput,
+    /// Opaque windowId returned by list_windows; required by observe.
+    #[serde(default)]
+    window_id: Option<String>,
+    /// Required for every action after observe.
+    #[serde(default)]
+    observation_id: Option<String>,
+    #[serde(default)]
+    x: Option<u64>,
+    #[serde(default)]
+    y: Option<u64>,
+    #[serde(default)]
+    end_x: Option<u64>,
+    #[serde(default)]
+    end_y: Option<u64>,
+    /// Mouse button for click; defaults to left.
+    #[serde(default)]
+    button: ComputerMouseButtonInput,
+    /// Ordinary text to type. Secrets are rejected.
+    #[serde(default)]
+    #[schemars(length(max = 4096))]
+    text: Option<String>,
+    #[serde(default)]
+    key: Option<ComputerKeyInput>,
+    /// Vertical wheel delta for scroll.
+    #[serde(default)]
+    #[schemars(range(min = -12000, max = 12000))]
+    delta_y: Option<i64>,
+    /// Wait duration; defaults to 1000ms.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 30000))]
+    duration_ms: Option<u64>,
 }
 
 pub struct ComputerTool;
 
 #[async_trait]
-impl Tool for ComputerTool {
+impl TypedTool for ComputerTool {
+    type Input = ComputerInput;
+
     fn name(&self) -> &str {
         "computer"
     }
@@ -2390,32 +2445,12 @@ impl Tool for ComputerTool {
         "Observe and operate a user-approved desktop window. First list windows, then observe one window. Every input action must use the latest observationId and requires explicit approval. Never use this tool for passwords, secrets, payments, publishing, deletion, UAC, or the entire desktop."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["list_windows", "observe", "click", "type", "keypress", "scroll", "drag", "wait", "close"]
-                },
-                "windowId": { "type": "string", "description": "Opaque windowId returned by list_windows; required by observe." },
-                "observationId": { "type": "string", "description": "Required for every action after observe. It expires when the window changes." },
-                "x": { "type": "integer", "minimum": 0, "description": "X coordinate in the observed screenshot pixel space." },
-                "y": { "type": "integer", "minimum": 0, "description": "Y coordinate in the observed screenshot pixel space." },
-                "endX": { "type": "integer", "minimum": 0, "description": "Drag end X in the observed screenshot pixel space." },
-                "endY": { "type": "integer", "minimum": 0, "description": "Drag end Y in the observed screenshot pixel space." },
-                "button": { "type": "string", "enum": ["left", "right"], "description": "Mouse button for click; defaults to left." },
-                "text": { "type": "string", "maxLength": 4096, "description": "Ordinary text to type. Passwords, API keys, and tokens are rejected." },
-                "key": { "type": "string", "enum": ["ENTER", "TAB", "ESCAPE", "BACKSPACE", "LEFT", "RIGHT", "UP", "DOWN"] },
-                "deltaY": { "type": "integer", "minimum": -12000, "maximum": 12000, "description": "Vertical wheel delta for scroll." },
-                "durationMs": { "type": "integer", "minimum": 1, "maximum": 30000, "description": "Wait duration; defaults to 1000ms." }
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let runtime = ctx
             .computer
             .as_ref()
@@ -2425,10 +2460,10 @@ impl Tool for ComputerTool {
             .thread_id
             .context("computer requires a thread context")?;
         let session = ComputerSessionId::from_thread(thread_id);
-        let action_name = required_string(&call.input, "action")?;
+        let action_name = input.action.as_str().to_string();
 
-        match action_name.as_str() {
-            "list_windows" => {
+        match input.action {
+            ComputerActionInput::ListWindows => {
                 require_computer_approval(
                     &ctx,
                     "Listing desktop window titles requires approval.",
@@ -2440,19 +2475,19 @@ impl Tool for ComputerTool {
                     "truncated": false,
                 });
                 return Ok(computer_tool_result(
-                    call.id,
+                    call_id,
                     action_name,
                     value,
                     None,
                     None,
                 ));
             }
-            "observe" => {
+            ComputerActionInput::Observe => {
                 require_computer_approval(
                     &ctx,
                     "Capturing a desktop window requires approval. The grant applies only to this requested window observation.",
                 )?;
-                let window_id = required_string(&call.input, "windowId")?;
+                let window_id = required_typed_string(input.window_id.as_deref(), "windowId")?;
                 let target = runtime
                     .list_windows(session)
                     .await?
@@ -2464,25 +2499,25 @@ impl Tool for ComputerTool {
                     .await?;
                 let value = computer_observation_summary(&observation);
                 return Ok(computer_tool_result(
-                    call.id,
+                    call_id,
                     action_name,
                     value,
                     Some(observation),
                     None,
                 ));
             }
-            "close" => {
+            ComputerActionInput::Close => {
                 runtime.close_session(session).await?;
                 return Ok(ToolResult::text(
-                    call.id,
+                    call_id,
                     "Closed the desktop computer session for this thread.",
-                    json!({ "toolName": self.name(), "sessionId": session, "success": true }),
+                    json!({ "toolName": "computer", "sessionId": session, "success": true }),
                 ));
             }
             _ => {}
         }
 
-        let action = parse_computer_action(&call.input, &action_name)?;
+        let action = parse_computer_action(input)?;
         if action.contains_sensitive_text() {
             anyhow::bail!("refused: input appears to contain a password, token, or other secret");
         }
@@ -2509,7 +2544,7 @@ impl Tool for ComputerTool {
             "observation": computer_observation_summary(&observation),
         });
         Ok(computer_tool_result(
-            call.id,
+            call_id,
             action_name,
             value,
             Some(observation),
@@ -2518,6 +2553,8 @@ impl Tool for ComputerTool {
     }
 }
 
+impl_typed_tool!(ComputerTool);
+
 fn require_computer_approval(ctx: &ToolContext, reason: &str) -> anyhow::Result<()> {
     if ctx.approval_granted {
         return Ok(());
@@ -2525,67 +2562,54 @@ fn require_computer_approval(ctx: &ToolContext, reason: &str) -> anyhow::Result<
     Err(ApprovalRequired::new(reason).into())
 }
 
-fn parse_computer_action(input: &Value, action: &str) -> anyhow::Result<ComputerAction> {
-    let observation_id = || required_string(input, "observationId");
-    match action {
-        "click" => {
-            let button = match input
-                .get("button")
-                .and_then(Value::as_str)
-                .unwrap_or("left")
-                .to_ascii_lowercase()
+fn parse_computer_action(input: ComputerInput) -> anyhow::Result<ComputerAction> {
+    let observation_id = || required_typed_string(input.observation_id.as_deref(), "observationId");
+    match input.action {
+        ComputerActionInput::Click => Ok(ComputerAction::Click {
+            observation_id: observation_id()?,
+            x: computer_coordinate(input.x, "x")?,
+            y: computer_coordinate(input.y, "y")?,
+            button: input.button.into(),
+        }),
+        ComputerActionInput::Type => Ok(ComputerAction::Type {
+            observation_id: observation_id()?,
+            text: required_typed_string(input.text.as_deref(), "text")?,
+        }),
+        ComputerActionInput::Keypress => Ok(ComputerAction::Keypress {
+            observation_id: observation_id()?,
+            key: input
+                .key
+                .context("key is required for keypress")?
                 .as_str()
-            {
-                "left" => ComputerMouseButton::Left,
-                "right" => ComputerMouseButton::Right,
-                other => anyhow::bail!("unsupported computer mouse button: {other}"),
-            };
-            Ok(ComputerAction::Click {
-                observation_id: observation_id()?,
-                x: computer_coordinate(input, "x")?,
-                y: computer_coordinate(input, "y")?,
-                button,
-            })
-        }
-        "type" => Ok(ComputerAction::Type {
-            observation_id: observation_id()?,
-            text: required_string(input, "text")?,
+                .to_string(),
         }),
-        "keypress" => Ok(ComputerAction::Keypress {
-            observation_id: observation_id()?,
-            key: required_string(input, "key")?,
-        }),
-        "scroll" => Ok(ComputerAction::Scroll {
+        ComputerActionInput::Scroll => Ok(ComputerAction::Scroll {
             observation_id: observation_id()?,
             delta_y: input
-                .get("deltaY")
-                .and_then(Value::as_i64)
+                .delta_y
                 .context("deltaY must be an integer")?
                 .clamp(-12_000, 12_000) as i32,
         }),
-        "drag" => Ok(ComputerAction::Drag {
+        ComputerActionInput::Drag => Ok(ComputerAction::Drag {
             observation_id: observation_id()?,
-            start_x: computer_coordinate(input, "x")?,
-            start_y: computer_coordinate(input, "y")?,
-            end_x: computer_coordinate(input, "endX")?,
-            end_y: computer_coordinate(input, "endY")?,
+            start_x: computer_coordinate(input.x, "x")?,
+            start_y: computer_coordinate(input.y, "y")?,
+            end_x: computer_coordinate(input.end_x, "endX")?,
+            end_y: computer_coordinate(input.end_y, "endY")?,
         }),
-        "wait" => Ok(ComputerAction::Wait {
+        ComputerActionInput::Wait => Ok(ComputerAction::Wait {
             observation_id: observation_id()?,
-            duration_ms: input
-                .get("durationMs")
-                .and_then(Value::as_u64)
-                .unwrap_or(1_000)
-                .clamp(1, 30_000),
+            duration_ms: input.duration_ms.unwrap_or(1_000).clamp(1, 30_000),
         }),
-        other => anyhow::bail!("unsupported computer action: {other}"),
+        other => anyhow::bail!(
+            "unsupported computer action for an observed window: {}",
+            other.as_str()
+        ),
     }
 }
 
-fn computer_coordinate(input: &Value, field: &str) -> anyhow::Result<u32> {
-    input
-        .get(field)
-        .and_then(Value::as_u64)
+fn computer_coordinate(value: Option<u64>, field: &str) -> anyhow::Result<u32> {
+    value
         .and_then(|value| u32::try_from(value).ok())
         .with_context(|| format!("{field} must be a non-negative integer"))
 }
@@ -2630,13 +2654,6 @@ fn computer_tool_result(
             "error": error,
         }),
     }
-}
-
-fn browser_timeout(input: &Value) -> Option<Duration> {
-    input
-        .get("timeoutMs")
-        .and_then(Value::as_u64)
-        .map(|milliseconds| Duration::from_millis(milliseconds.clamp(1, 120_000)))
 }
 
 fn inspect_browser_interaction(ctx: &ToolContext) -> anyhow::Result<()> {
@@ -2699,13 +2716,16 @@ fn browser_output_to_tool_result(
     }
 }
 
-fn browser_observation_id(input: &Value) -> anyhow::Result<BrowserObservationId> {
-    serde_json::from_value(Value::String(required_string(input, "observationId")?))
-        .context("observationId must be a browser observation ID")
+fn browser_observation_id(input: Option<&str>) -> anyhow::Result<BrowserObservationId> {
+    serde_json::from_value(Value::String(required_typed_string(
+        input,
+        "observationId",
+    )?))
+    .context("observationId must be a browser observation ID")
 }
 
-fn browser_node_ref(input: &Value) -> anyhow::Result<BrowserNodeRef> {
-    serde_json::from_value(Value::String(required_string(input, "nodeRef")?))
+fn browser_node_ref(input: Option<&str>) -> anyhow::Result<BrowserNodeRef> {
+    serde_json::from_value(Value::String(required_typed_string(input, "nodeRef")?))
         .context("nodeRef must be a browser node reference")
 }
 
@@ -2754,10 +2774,73 @@ fn browser_observation_to_tool_result(
     }
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum ForkTurnsInput {
+    Label(String),
+    Count(u64),
+}
+
+impl ForkTurnsInput {
+    fn into_string(self) -> String {
+        match self {
+            Self::Label(value) => value,
+            Self::Count(value) => value.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SubagentWorkspaceModeInput {
+    #[default]
+    Auto,
+    SharedReadOnly,
+    SharedCoordinated,
+    IsolatedWorktree,
+}
+
+impl SubagentWorkspaceModeInput {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SharedReadOnly => "shared_read_only",
+            Self::SharedCoordinated => "shared_coordinated",
+            Self::IsolatedWorktree => "isolated_worktree",
+        }
+    }
+}
+
+fn default_agent_type() -> String {
+    "default".to_string()
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SpawnAgentInput {
+    /// Stable lowercase task name used in the canonical agent path.
+    #[serde(alias = "name")]
+    task_name: String,
+    /// Concrete initial task for the child agent.
+    #[serde(alias = "input")]
+    message: String,
+    /// Parent history to copy: none, all, or a positive number of turns.
+    #[serde(default)]
+    fork_turns: Option<ForkTurnsInput>,
+    /// Built-in or project agent profile name. Defaults to default.
+    #[serde(default = "default_agent_type")]
+    agent_type: String,
+    /// Harness workspace contract.
+    #[serde(default)]
+    workspace_mode: SubagentWorkspaceModeInput,
+}
+
 pub struct SpawnAgentTool;
 
 #[async_trait]
-impl Tool for SpawnAgentTool {
+impl TypedTool for SpawnAgentTool {
+    type Input = SpawnAgentInput;
+
     fn name(&self) -> &str {
         "spawn_agent"
     }
@@ -2766,28 +2849,12 @@ impl Tool for SpawnAgentTool {
         "Create an independently running child agent. The harness can keep read-only work shared or prepare an isolated Git worktree for an independent writer; the parent remains responsible for selecting and integrating results."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task_name": { "type": "string", "description": "Stable lowercase task name used in the canonical agent path." },
-                "message": { "type": "string", "description": "Concrete initial task for the child agent." },
-                "fork_turns": { "type": ["string", "integer"], "description": "Parent history to copy: none, all, or a positive number of turns." },
-                "agent_type": { "type": "string", "description": "Built-in or project agent profile name. Defaults to default." },
-                "workspace_mode": {
-                    "type": "string",
-                    "enum": ["auto", "shared_read_only", "shared_coordinated", "isolated_worktree"],
-                    "description": "Harness workspace contract. auto uses shared_read_only for a read-only profile and shared_coordinated otherwise. Use isolated_worktree for independent code changes that the parent will integrate."
-                },
-                "name": { "type": "string", "description": "Deprecated alias for task_name." },
-                "input": { "type": "string", "description": "Deprecated alias for message." }
-            },
-            "required": ["task_name", "message"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
             .as_ref()
@@ -2798,26 +2865,15 @@ impl Tool for SpawnAgentTool {
         let parent_turn_id = ctx
             .parent_turn_id
             .context("subagent parent turn is unavailable")?;
-        let name = string_alias(&call.input, "task_name", "name")?;
-        let input = string_alias(&call.input, "message", "input")?;
-        let fork_turns = call
-            .input
-            .get("fork_turns")
-            .map(|value| match value {
-                Value::String(value) => Ok(value.clone()),
-                Value::Number(value) => Ok(value.to_string()),
-                _ => {
-                    anyhow::bail!("spawn_agent fork_turns must be none, all, or a positive integer")
-                }
-            })
-            .transpose()?
+        let name = input.task_name.trim().to_string();
+        anyhow::ensure!(!name.is_empty(), "task_name must be a non-empty string");
+        let message = input.message.trim().to_string();
+        anyhow::ensure!(!message.is_empty(), "message must be a non-empty string");
+        let fork_turns = input
+            .fork_turns
+            .map(ForkTurnsInput::into_string)
             .unwrap_or_else(|| "all".to_string());
-        let agent_type = call
-            .input
-            .get("agent_type")
-            .and_then(Value::as_str)
-            .unwrap_or("default")
-            .to_string();
+        let agent_type = input.agent_type;
         let profiles = AgentProfileRegistry::load(&ctx.workspace_root);
         if profiles.get(&agent_type).is_none() {
             anyhow::bail!(
@@ -2827,11 +2883,7 @@ impl Tool for SpawnAgentTool {
         let profile = profiles
             .get(&agent_type)
             .context("validated agent profile disappeared")?;
-        let workspace_mode = call
-            .input
-            .get("workspace_mode")
-            .and_then(Value::as_str)
-            .unwrap_or("auto");
+        let workspace_mode = input.workspace_mode.as_str();
         let execution_contract = subagent_execution_contract(
             &ctx,
             &name,
@@ -2847,7 +2899,7 @@ impl Tool for SpawnAgentTool {
                 parent_agent_path: ctx.agent_path.clone(),
                 name,
                 agent_type,
-                input,
+                input: message,
                 fork_turns,
                 depth: ctx.subagent_depth.saturating_add(1),
                 initial_conversation,
@@ -2856,11 +2908,11 @@ impl Tool for SpawnAgentTool {
             execution_contract.clone(),
         )?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: serde_json::to_string(&run)?,
             content: Vec::new(),
             metadata: json!({
-                "toolName": self.name(),
+                "toolName": "spawn_agent",
                 "runId": run.id,
                 "agentPath": run.agent_path,
                 "status": run.status,
@@ -2870,6 +2922,8 @@ impl Tool for SpawnAgentTool {
         })
     }
 }
+
+impl_typed_tool!(SpawnAgentTool);
 
 async fn subagent_execution_contract(
     ctx: &ToolContext,
@@ -2979,10 +3033,52 @@ fn select_fork_conversation(
     conversation[start..].to_vec()
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AgentTargetMessageInput {
+    /// Agent UUID, canonical path, or direct child task name.
+    target: String,
+    /// Message or follow-up task to deliver.
+    message: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AgentTargetInput {
+    /// Agent UUID, canonical path, or direct child task name.
+    target: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ListAgentsInput {
+    /// Optional canonical path prefix.
+    #[serde(default)]
+    path_prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentRunInput {
+    /// Child run UUID.
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentRunMessageInput {
+    /// Child run UUID.
+    run_id: String,
+    /// Additional instructions.
+    input: String,
+}
+
 pub struct SendAgentMessageTool;
 
 #[async_trait]
-impl Tool for SendAgentMessageTool {
+impl TypedTool for SendAgentMessageTool {
+    type Input = AgentTargetMessageInput;
+
     fn name(&self) -> &str {
         "send_message"
     }
@@ -2991,31 +3087,24 @@ impl Tool for SendAgentMessageTool {
         "Queue a message for any visible agent in the current task tree. This does not start a new turn when the target is idle."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "target": { "type": "string", "description": "Agent UUID, canonical path, or direct child task name." },
-                "message": { "type": "string", "description": "Message to deliver." }
-            },
-            "required": ["target", "message"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = subagent_scheduler(&ctx)?;
-        let delivery = scheduler.send_message_scoped(
-            subagent_scope(&ctx)?,
-            &required_string(&call.input, "target")?,
-            required_string(&call.input, "message")?,
-        )?;
+        let target = input.target.trim();
+        anyhow::ensure!(!target.is_empty(), "target must be a non-empty string");
+        let message = input.message.trim().to_string();
+        anyhow::ensure!(!message.is_empty(), "message must be a non-empty string");
+        let delivery = scheduler.send_message_scoped(subagent_scope(&ctx)?, target, message)?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: serde_json::to_string(&delivery)?,
             content: Vec::new(),
             metadata: json!({
-                "toolName": self.name(),
+                "toolName": "send_message",
                 "runId": delivery.target_id,
                 "agentPath": delivery.agent_path,
                 "queued": delivery.queued,
@@ -3025,10 +3114,14 @@ impl Tool for SendAgentMessageTool {
     }
 }
 
+impl_typed_tool!(SendAgentMessageTool);
+
 pub struct FollowupAgentTaskTool;
 
 #[async_trait]
-impl Tool for FollowupAgentTaskTool {
+impl TypedTool for FollowupAgentTaskTool {
+    type Input = AgentTargetMessageInput;
+
     fn name(&self) -> &str {
         "followup_task"
     }
@@ -3037,38 +3130,35 @@ impl Tool for FollowupAgentTaskTool {
         "Give an existing agent a follow-up task, starting a new turn when it is idle or delivering at the next boundary when it is active."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "target": { "type": "string", "description": "Agent UUID, canonical path, or direct child task name." },
-                "message": { "type": "string", "description": "Follow-up task." }
-            },
-            "required": ["target", "message"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = subagent_scheduler(&ctx)?;
-        let run = scheduler.followup_task_scoped(
-            subagent_scope(&ctx)?,
-            &required_string(&call.input, "target")?,
-            required_string(&call.input, "message")?,
-        )?;
+        let target = input.target.trim();
+        anyhow::ensure!(!target.is_empty(), "target must be a non-empty string");
+        let message = input.message.trim().to_string();
+        anyhow::ensure!(!message.is_empty(), "message must be a non-empty string");
+        let run = scheduler.followup_task_scoped(subagent_scope(&ctx)?, target, message)?;
         Ok(agent_tool_result(
-            call.id,
-            self.name(),
+            call_id,
+            "followup_task",
             &run,
             format!("Follow-up delivered to {}.", run.agent_path),
         ))
     }
 }
 
+impl_typed_tool!(FollowupAgentTaskTool);
+
 pub struct InterruptAgentTool;
 
 #[async_trait]
-impl Tool for InterruptAgentTool {
+impl TypedTool for InterruptAgentTool {
+    type Input = AgentTargetInput;
+
     fn name(&self) -> &str {
         "interrupt_agent"
     }
@@ -3077,37 +3167,34 @@ impl Tool for InterruptAgentTool {
         "Interrupt an agent's current turn. The agent identity remains available for a later followup_task."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "target": { "type": "string", "description": "Agent UUID, canonical path, or direct child task name." }
-            },
-            "required": ["target"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = subagent_scheduler(&ctx)?;
-        let run = scheduler.resolve_scoped(
-            subagent_scope(&ctx)?,
-            &required_string(&call.input, "target")?,
-        )?;
+        let target = input.target.trim();
+        anyhow::ensure!(!target.is_empty(), "target must be a non-empty string");
+        let run = scheduler.resolve_scoped(subagent_scope(&ctx)?, target)?;
         scheduler.cancel_scoped(subagent_scope(&ctx)?, run.id)?;
         Ok(agent_tool_result(
-            call.id,
-            self.name(),
+            call_id,
+            "interrupt_agent",
             &run,
             format!("Interrupt requested for {}.", run.agent_path),
         ))
     }
 }
 
+impl_typed_tool!(InterruptAgentTool);
+
 pub struct ListAgentsTool;
 
 #[async_trait]
-impl Tool for ListAgentsTool {
+impl TypedTool for ListAgentsTool {
+    type Input = ListAgentsInput;
+
     fn name(&self) -> &str {
         "list_agents"
     }
@@ -3116,22 +3203,14 @@ impl Tool for ListAgentsTool {
         "List visible agents in the current root task tree with their canonical paths, profiles, status, and latest task."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path_prefix": { "type": "string", "description": "Optional canonical path prefix." }
-            },
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = subagent_scheduler(&ctx)?;
-        let runs = scheduler.list_scoped(
-            subagent_scope(&ctx)?,
-            call.input.get("path_prefix").and_then(Value::as_str),
-        );
+        let runs = scheduler.list_scoped(subagent_scope(&ctx)?, input.path_prefix.as_deref());
         let run_count = runs.len();
         let profiles = AgentProfileRegistry::load(&ctx.workspace_root);
         let value = json!({
@@ -3141,18 +3220,22 @@ impl Tool for ListAgentsTool {
         });
         let output = serde_json::to_string_pretty(&value)?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output,
             content: vec![ModelContentPart::json(value)],
-            metadata: json!({ "toolName": self.name(), "count": run_count, "success": true }),
+            metadata: json!({ "toolName": "list_agents", "count": run_count, "success": true }),
         })
     }
 }
 
+impl_typed_tool!(ListAgentsTool);
+
 pub struct SendAgentInputTool;
 
 #[async_trait]
-impl Tool for SendAgentInputTool {
+impl TypedTool for SendAgentInputTool {
+    type Input = AgentRunMessageInput;
+
     fn name(&self) -> &str {
         "send_input"
     }
@@ -3161,42 +3244,37 @@ impl Tool for SendAgentInputTool {
         "Send additional input to an active child agent."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "runId": { "type": "string", "description": "Child run UUID." },
-                "input": { "type": "string", "description": "Additional instructions." }
-            },
-            "required": ["runId", "input"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
             .as_ref()
             .context("subagent runtime is unavailable")?;
-        let run_id = required_uuid(&call.input, "runId")?;
-        scheduler.send_input_scoped(
-            subagent_scope(&ctx)?,
-            run_id,
-            required_string(&call.input, "input")?,
-        )?;
+        let run_id = Uuid::parse_str(input.run_id.trim()).context("runId must be a UUID")?;
+        let message = input.input.trim().to_string();
+        anyhow::ensure!(!message.is_empty(), "input must be a non-empty string");
+        scheduler.send_input_scoped(subagent_scope(&ctx)?, run_id, message)?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: format!("Input delivered to subagent {run_id}."),
             content: Vec::new(),
-            metadata: json!({ "toolName": self.name(), "runId": run_id, "success": true }),
+            metadata: json!({ "toolName": "send_input", "runId": run_id, "success": true }),
         })
     }
 }
 
+impl_typed_tool!(SendAgentInputTool);
+
 pub struct CancelAgentTool;
 
 #[async_trait]
-impl Tool for CancelAgentTool {
+impl TypedTool for CancelAgentTool {
+    type Input = AgentRunInput;
+
     fn name(&self) -> &str {
         "cancel_agent"
     }
@@ -3205,35 +3283,47 @@ impl Tool for CancelAgentTool {
         "Cancel an active child agent."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "runId": { "type": "string", "description": "Child run UUID." } },
-            "required": ["runId"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
             .as_ref()
             .context("subagent runtime is unavailable")?;
-        let run_id = required_uuid(&call.input, "runId")?;
+        let run_id = Uuid::parse_str(input.run_id.trim()).context("runId must be a UUID")?;
         scheduler.cancel_scoped(subagent_scope(&ctx)?, run_id)?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: format!("Cancellation requested for subagent {run_id}."),
             content: Vec::new(),
-            metadata: json!({ "toolName": self.name(), "runId": run_id, "success": true }),
+            metadata: json!({ "toolName": "cancel_agent", "runId": run_id, "success": true }),
         })
     }
+}
+
+impl_typed_tool!(CancelAgentTool);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WaitAgentInput {
+    /// Optional agent UUID or canonical path.
+    #[serde(default, alias = "runId")]
+    target: Option<String>,
+    /// How long to block, up to one hour.
+    #[serde(default, alias = "timeoutMs")]
+    #[schemars(range(min = 1, max = 3600000))]
+    timeout_ms: Option<u64>,
 }
 
 pub struct WaitAgentTool;
 
 #[async_trait]
-impl Tool for WaitAgentTool {
+impl TypedTool for WaitAgentTool {
+    type Input = WaitAgentInput;
+
     fn name(&self) -> &str {
         "wait_agent"
     }
@@ -3242,38 +3332,22 @@ impl Tool for WaitAgentTool {
         "Wait for agent mailbox activity. With target/runId, wait for that agent's current turn and return its messages with the terminal result; without one, return the next mailbox or terminal update in the visible task tree."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "target": { "type": "string", "description": "Optional agent UUID or canonical path." },
-                "runId": { "type": "string", "description": "Deprecated target UUID alias." },
-                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "description": "How long to block, up to one hour. Waiting costs nothing, so prefer one long wait over repeated short ones." },
-                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 3600000, "description": "Deprecated alias for timeout_ms." }
-            },
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
             .as_ref()
             .context("subagent runtime is unavailable")?;
-        let timeout_ms = call
-            .input
-            .get("timeout_ms")
-            .or_else(|| call.input.get("timeoutMs"))
-            .and_then(Value::as_u64)
+        let timeout_ms = input
+            .timeout_ms
             .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
             .clamp(1, MAX_WAIT_TIMEOUT_MS);
         let scope = subagent_scope(&ctx)?;
-        if let Some(target) = call
-            .input
-            .get("target")
-            .or_else(|| call.input.get("runId"))
-            .and_then(Value::as_str)
-        {
+        if let Some(target) = input.target.as_deref() {
             let run = scheduler.resolve_scoped(scope.clone(), target)?;
             let run = await_cancellable(
                 ctx.cancel.as_ref(),
@@ -3287,11 +3361,11 @@ impl Tool for WaitAgentTool {
                 "messages": messages,
             });
             return Ok(ToolResult {
-                call_id: call.id,
+                call_id,
                 output: serde_json::to_string_pretty(&value)?,
                 content: vec![ModelContentPart::json(value)],
                 metadata: json!({
-                    "toolName": self.name(),
+                    "toolName": "wait_agent",
                     "runId": run.id,
                     "agentPath": run.agent_path,
                     "status": run.status,
@@ -3310,11 +3384,11 @@ impl Tool for WaitAgentTool {
         let message_count = activity.messages.len();
         let value = serde_json::to_value(activity)?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: serde_json::to_string_pretty(&value)?,
             content: vec![ModelContentPart::json(value)],
             metadata: json!({
-                "toolName": self.name(),
+                "toolName": "wait_agent",
                 "updateCount": update_count,
                 "messageCount": message_count,
                 "success": true
@@ -3323,12 +3397,28 @@ impl Tool for WaitAgentTool {
     }
 }
 
+impl_typed_tool!(WaitAgentTool);
+
 const MAX_BATCH_WAIT_AGENTS: usize = 8;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WaitAgentsInput {
+    /// Child run UUIDs.
+    #[schemars(length(min = 1, max = 8))]
+    run_ids: Vec<String>,
+    /// How long to block, up to one hour.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 3600000))]
+    timeout_ms: Option<u64>,
+}
 
 pub struct WaitAgentsTool;
 
 #[async_trait]
-impl Tool for WaitAgentsTool {
+impl TypedTool for WaitAgentsTool {
+    type Input = WaitAgentsInput;
+
     fn name(&self) -> &str {
         "wait_agents"
     }
@@ -3337,42 +3427,22 @@ impl Tool for WaitAgentsTool {
         "Wait on several child agents at once and return as soon as the first one finishes, together with any other agent that is already done. Agents still working are reported in stillRunning and keep going; their results arrive on their own once they finish."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "runIds": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": MAX_BATCH_WAIT_AGENTS,
-                    "items": { "type": "string", "description": "Child run UUID." }
-                },
-                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 3600000, "description": "How long to block, up to one hour. Waiting costs nothing, so prefer one long wait over repeated short ones." }
-            },
-            "required": ["runIds"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
             .as_ref()
             .context("subagent runtime is unavailable")?;
-        let raw_ids = call
-            .input
-            .get("runIds")
-            .and_then(Value::as_array)
-            .context("wait_agents requires runIds")?;
-        if raw_ids.is_empty() || raw_ids.len() > MAX_BATCH_WAIT_AGENTS {
+        if input.run_ids.is_empty() || input.run_ids.len() > MAX_BATCH_WAIT_AGENTS {
             anyhow::bail!("wait_agents requires between 1 and {MAX_BATCH_WAIT_AGENTS} run IDs");
         }
         let mut unique = HashSet::new();
-        let mut run_ids = Vec::with_capacity(raw_ids.len());
-        for value in raw_ids {
-            let raw = value
-                .as_str()
-                .context("wait_agents runIds must contain UUID strings")?;
+        let mut run_ids = Vec::with_capacity(input.run_ids.len());
+        for raw in &input.run_ids {
             let run_id = Uuid::parse_str(raw).context("wait_agents received an invalid run ID")?;
             if !unique.insert(run_id) {
                 anyhow::bail!("wait_agents received duplicate run ID {run_id}");
@@ -3380,10 +3450,8 @@ impl Tool for WaitAgentsTool {
             run_ids.push(run_id);
         }
 
-        let timeout_ms = call
-            .input
-            .get("timeoutMs")
-            .and_then(Value::as_u64)
+        let timeout_ms = input
+            .timeout_ms
             .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
             .clamp(1, MAX_WAIT_TIMEOUT_MS);
         let timeout = Duration::from_millis(timeout_ms);
@@ -3479,11 +3547,11 @@ impl Tool for WaitAgentsTool {
             },
         });
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: serde_json::to_string_pretty(&value)?,
             content: vec![ModelContentPart::json(value.clone())],
             metadata: json!({
-                "toolName": self.name(),
+                "toolName": "wait_agents",
                 "runCount": run_ids.len(),
                 "settledCount": settled.len(),
                 "stillRunningCount": still_running.len(),
@@ -3494,6 +3562,8 @@ impl Tool for WaitAgentsTool {
         })
     }
 }
+
+impl_typed_tool!(WaitAgentsTool);
 
 /// Longest a wait tool may block.
 ///
@@ -3564,70 +3634,50 @@ fn agent_tool_result(
     }
 }
 
-fn string_alias(input: &Value, primary: &str, alias: &str) -> anyhow::Result<String> {
+fn required_typed_string(input: Option<&str>, key: &str) -> anyhow::Result<String> {
     input
-        .get(primary)
-        .or_else(|| input.get(alias))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .with_context(|| format!("{primary} must be a non-empty string"))
-}
-
-fn required_string(input: &Value, key: &str) -> anyhow::Result<String> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .with_context(|| format!("{key} must be a non-empty string"))
 }
 
-fn required_uuid(input: &Value, key: &str) -> anyhow::Result<Uuid> {
-    let value = required_string(input, key)?;
-    Uuid::parse_str(&value).with_context(|| format!("{key} must be a UUID"))
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ListFilesInput {
+    /// Directory path relative to workspace. Use `.` for the workspace root.
+    path: String,
 }
 
 pub struct ListFilesTool;
 
 #[async_trait]
-impl Tool for ListFilesTool {
+impl TypedTool for ListFilesTool {
+    type Input = ListFilesInput;
+
     fn name(&self) -> &str {
         "list_files"
     }
 
     fn description(&self) -> &str {
-        "List direct children of a directory inside the workspace."
+        "List direct children of a directory inside the workspace. Use `.` for the workspace root."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Directory path relative to workspace." }
-            },
-            "required": ["path"]
-        })
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec![tool_resource_key("dir", &input.path)])
     }
 
-    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
-        ToolExecutionPolicy::read_only(vec![tool_resource_key(
-            "dir",
-            call.input
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("."),
-        )])
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let relative = call
-            .input
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or(".");
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        let relative = input.path.trim();
+        anyhow::ensure!(
+            !relative.is_empty(),
+            "list_files requires a path; use `.` for the workspace root"
+        );
         let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
         enforce_read_policy(&ctx, &logical_path)?;
         let path = ctx.environment.resolve_read_path(&logical_path)?;
@@ -3636,7 +3686,7 @@ impl Tool for ListFilesTool {
             .await
             .context("list_files task failed")??;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: entries.join("\n"),
             content: Vec::new(),
             metadata: json!({ "count": entries.len() }),
@@ -3644,13 +3694,31 @@ impl Tool for ListFilesTool {
     }
 }
 
-pub struct ReadFileTool;
+impl_typed_tool!(ListFilesTool);
 
 const READ_FILE_ARTIFACT_THRESHOLD: usize = 64_000;
 const READ_FILE_WINDOW_CHARS: usize = 16_000;
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FileReadInput {
+    /// File path relative to workspace.
+    path: String,
+    /// Character offset to start reading from. Defaults to 0.
+    #[serde(default)]
+    offset: u64,
+    /// Maximum characters to return, capped at 16000.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 16000))]
+    limit: Option<u64>,
+}
+
+pub struct ReadFileTool;
+
 #[async_trait]
-impl Tool for ReadFileTool {
+impl TypedTool for ReadFileTool {
+    type Input = FileReadInput;
+
     fn name(&self) -> &str {
         "read_file"
     }
@@ -3659,42 +3727,18 @@ impl Tool for ReadFileTool {
         "Read a UTF-8 text file inside the workspace. Returns at most 16000 characters per call; when the result reports a next offset, call again with that offset to read the rest."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "File path relative to workspace." },
-                "offset": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Character offset to start reading from. Defaults to 0. Use the nextOffset reported by a previous call to continue."
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Maximum characters to return, capped at 16000."
-                }
-            },
-            "required": ["path"]
-        })
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec![tool_resource_key("file", &input.path)])
     }
 
-    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
-        ToolExecutionPolicy::read_only(vec![tool_resource_key(
-            "file",
-            call.input
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("*"),
-        )])
-    }
-
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let relative = call
-            .input
-            .get("path")
-            .and_then(Value::as_str)
-            .context("read_file requires a path")?;
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        let relative = input.path.trim();
+        anyhow::ensure!(!relative.is_empty(), "read_file requires a path");
         let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
         enforce_read_policy(&ctx, &logical_path)?;
         let path = ctx.environment.resolve_read_path(&logical_path)?;
@@ -3711,18 +3755,10 @@ impl Tool for ReadFileTool {
         // first 16000 characters of a file was simply unreachable through this
         // tool, and the model could not tell that from a short file.
         let total_chars = contents.chars().count();
-        let offset = call
-            .input
-            .get("offset")
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as usize;
-        let limit = call
-            .input
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map_or(READ_FILE_WINDOW_CHARS, |value| {
-                (value as usize).clamp(1, READ_FILE_WINDOW_CHARS)
-            });
+        let offset = input.offset as usize;
+        let limit = input.limit.map_or(READ_FILE_WINDOW_CHARS, |value| {
+            (value as usize).clamp(1, READ_FILE_WINDOW_CHARS)
+        });
         let window: String = contents.chars().skip(offset).take(limit).collect();
         let read_to = offset.saturating_add(window.chars().count());
         let next_offset = (read_to < total_chars).then_some(read_to);
@@ -3746,7 +3782,7 @@ impl Tool for ReadFileTool {
             if let Some(ref store) = ctx.store {
                 if let Some(thread_id) = ctx.thread_id {
                     let tool_result = ToolResult {
-                        call_id: call.id,
+                        call_id,
                         output: contents,
                         content: Vec::new(),
                         metadata: metadata.clone(),
@@ -3775,7 +3811,7 @@ impl Tool for ReadFileTool {
         }
 
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output,
             content: Vec::new(),
             metadata,
@@ -3783,13 +3819,24 @@ impl Tool for ReadFileTool {
     }
 }
 
+impl_typed_tool!(ReadFileTool);
+
 pub struct ReadFilesTool;
 
 const READ_FILES_MAX_ITEMS: usize = 8;
 const READ_FILES_TOTAL_CHARS: usize = 64_000;
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadFilesInput {
+    #[schemars(length(min = 1, max = 8))]
+    files: Vec<FileReadInput>,
+}
+
 #[async_trait]
-impl Tool for ReadFilesTool {
+impl TypedTool for ReadFilesTool {
+    type Input = ReadFilesInput;
+
     fn name(&self) -> &str {
         "read_files"
     }
@@ -3798,96 +3845,56 @@ impl Tool for ReadFilesTool {
         "Read up to 8 independent UTF-8 files concurrently. Each item supports the same character offset/limit window as read_file; the combined response is capped at 64000 characters."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "files": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": READ_FILES_MAX_ITEMS,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string", "description": "File path relative to workspace." },
-                            "offset": { "type": "integer", "minimum": 0 },
-                            "limit": { "type": "integer", "minimum": 1, "maximum": READ_FILE_WINDOW_CHARS }
-                        },
-                        "required": ["path"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["files"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
-        let keys = call
-            .input
-            .get("files")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(|item| {
-                tool_resource_key(
-                    "file",
-                    item.get("path").and_then(Value::as_str).unwrap_or("*"),
-                )
-            })
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        let keys = input
+            .files
+            .iter()
+            .map(|item| tool_resource_key("file", &item.path))
             .collect();
         ToolExecutionPolicy::read_only(keys)
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let files = call
-            .input
-            .get("files")
-            .and_then(Value::as_array)
-            .context("read_files requires a files array")?;
-        if files.is_empty() || files.len() > READ_FILES_MAX_ITEMS {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        if input.files.is_empty() || input.files.len() > READ_FILES_MAX_ITEMS {
             anyhow::bail!("read_files accepts between 1 and {READ_FILES_MAX_ITEMS} files per call");
         }
 
         // Validate every authorization boundary before starting concurrent I/O.
         // This ensures one denied path suspends the whole tool call for approval
         // instead of being hidden inside an ordinary per-file error.
-        for item in files {
-            let relative = item
-                .get("path")
-                .and_then(Value::as_str)
-                .context("each read_files item requires a path")?;
+        for item in &input.files {
+            let relative = item.path.trim();
+            anyhow::ensure!(!relative.is_empty(), "each read_files item requires a path");
             let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
             enforce_read_policy(&ctx, &logical_path)?;
         }
 
-        let per_file_cap = (READ_FILES_TOTAL_CHARS / files.len()).min(READ_FILE_WINDOW_CHARS);
+        let file_count = input.files.len();
+        let per_file_cap = (READ_FILES_TOTAL_CHARS / file_count).min(READ_FILE_WINDOW_CHARS);
         let mut pending = FuturesUnordered::new();
-        for (index, item) in files.iter().cloned().enumerate() {
-            let mut input = item;
-            let requested = input
-                .get("limit")
-                .and_then(Value::as_u64)
+        for (index, mut item) in input.files.into_iter().enumerate() {
+            let requested = item
+                .limit
                 .map(|value| value as usize)
                 .unwrap_or(per_file_cap)
                 .clamp(1, per_file_cap);
-            input["limit"] = json!(requested);
+            item.limit = Some(requested as u64);
             let item_ctx = ctx.clone();
             pending.push(async move {
-                let path = input
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<missing>")
-                    .to_string();
+                let path = item.path.clone();
                 let result = ReadFileTool
-                    .execute(ToolCall::new("read_file", input), item_ctx)
+                    .execute_typed(Uuid::new_v4(), item, item_ctx)
                     .await;
                 (index, path, result)
             });
         }
 
-        let mut ordered = vec![None; files.len()];
+        let mut ordered = vec![None; file_count];
         while let Some((index, path, result)) = pending.next().await {
             ordered[index] = Some(match result {
                 Ok(result) => json!({
@@ -3910,24 +3917,37 @@ impl Tool for ReadFilesTool {
             .count();
         let value = json!({ "files": results });
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: serde_json::to_string_pretty(&value)?,
             content: Vec::new(),
             metadata: json!({
-                "count": files.len(),
+                "count": file_count,
                 "succeeded": succeeded,
-                "failed": files.len().saturating_sub(succeeded),
+                "failed": file_count.saturating_sub(succeeded),
                 "perFileLimit": per_file_cap,
-                "success": succeeded == files.len()
+                "success": succeeded == file_count
             }),
         })
     }
 }
 
+impl_typed_tool!(ReadFilesTool);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WriteFileInput {
+    /// File path relative to workspace.
+    path: String,
+    /// Full file contents to write.
+    content: String,
+}
+
 pub struct WriteFileTool;
 
 #[async_trait]
-impl Tool for WriteFileTool {
+impl TypedTool for WriteFileTool {
+    type Input = WriteFileInput;
+
     fn name(&self) -> &str {
         "write_file"
     }
@@ -3936,53 +3956,33 @@ impl Tool for WriteFileTool {
         "Write a UTF-8 text file inside the workspace."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "File path relative to workspace." },
-                "content": { "type": "string", "description": "Full file contents to write." }
-            },
-            "required": ["path", "content"]
-        })
-    }
-
-    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
         ToolExecutionPolicy {
             read_only: false,
             idempotent: true,
             parallel_safe: false,
             side_effect: ToolSideEffect::WorkspaceWrite,
-            resource_keys: vec![tool_resource_key(
-                "file",
-                call.input
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("*"),
-            )],
+            resource_keys: vec![tool_resource_key("file", &input.path)],
         }
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let relative = call
-            .input
-            .get("path")
-            .and_then(Value::as_str)
-            .context("write_file requires a path")?;
-        let content = call
-            .input
-            .get("content")
-            .and_then(Value::as_str)
-            .context("write_file requires content")?;
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        let relative = input.path.trim();
+        anyhow::ensure!(!relative.is_empty(), "write_file requires a path");
         let path = normalize_workspace_path(&ctx.workspace_root, relative)?;
         enforce_policy_decision(ctx.policy.inspect_write(&path), ctx.approval_granted)?;
 
         let written = ctx
             .environment
-            .write_file(FileWriteRequest::new(&path, content.as_bytes().to_vec()))
+            .write_file(FileWriteRequest::new(&path, input.content.into_bytes()))
             .await?;
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: format!(
                 "Wrote {} bytes to {}",
                 written.bytes_written,
@@ -3997,6 +3997,8 @@ impl Tool for WriteFileTool {
     }
 }
 
+impl_typed_tool!(WriteFileTool);
+
 pub struct SearchTool;
 
 const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
@@ -4005,8 +4007,30 @@ const SEARCH_OUTPUT_MAX_BYTES: usize = 32_000;
 const SEARCH_ARTIFACT_THRESHOLD: usize = 32_000;
 const FALLBACK_MAX_FILE_BYTES: u64 = 1_048_576;
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SearchInput {
+    /// Search pattern passed to rg, or substring for fallback search.
+    query: String,
+    /// Optional file or directory path relative to workspace.
+    #[serde(default)]
+    path: Option<String>,
+    /// Treat the query as literal text instead of a regular expression.
+    #[serde(default, alias = "fixed_strings")]
+    fixed_strings: bool,
+    /// Return only matches bounded by non-word characters.
+    #[serde(default, alias = "word_match")]
+    word_match: bool,
+    /// Maximum matching lines to return.
+    #[serde(default, alias = "max_results")]
+    #[schemars(range(min = 1, max = 1000))]
+    max_results: Option<usize>,
+}
+
 #[async_trait]
-impl Tool for SearchTool {
+impl TypedTool for SearchTool {
+    type Input = SearchInput;
+
     fn name(&self) -> &str {
         "search"
     }
@@ -4015,66 +4039,34 @@ impl Tool for SearchTool {
         "Recursively search workspace text for candidate definitions and references with ripgrep, falling back to a literal scan. Text matches are evidence to confirm by reading code, not semantic symbol resolution."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Search pattern passed to rg, or substring for fallback search." },
-                "path": { "type": "string", "description": "Optional file or directory path relative to workspace." },
-                "fixedStrings": { "type": "boolean", "description": "Treat the query as literal text instead of a regular expression." },
-                "wordMatch": { "type": "boolean", "description": "Return only matches bounded by non-word characters; useful for exact identifiers." },
-                "maxResults": { "type": "number", "description": "Maximum matching lines to return." }
-            },
-            "required": ["query"]
-        })
-    }
-
-    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
         ToolExecutionPolicy::read_only(vec![tool_resource_key(
             "tree",
-            call.input
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("."),
+            input.path.as_deref().unwrap_or("."),
         )])
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let query = call
-            .input
-            .get("query")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("search requires a query")?;
-        let relative = call
-            .input
-            .get("path")
-            .and_then(Value::as_str)
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        let query = input.query.trim();
+        anyhow::ensure!(!query.is_empty(), "search requires a query");
+        let relative = input
+            .path
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(".");
-        let max_results = call
-            .input
-            .get("maxResults")
-            .or_else(|| call.input.get("max_results"))
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
+        let max_results = input
+            .max_results
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
             .min(SEARCH_MAX_RESULTS_LIMIT);
-        let fixed_strings = call
-            .input
-            .get("fixedStrings")
-            .or_else(|| call.input.get("fixed_strings"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let word_match = call
-            .input
-            .get("wordMatch")
-            .or_else(|| call.input.get("word_match"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let fixed_strings = input.fixed_strings;
+        let word_match = input.word_match;
 
         let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
         enforce_read_policy(&ctx, &logical_path)?;
@@ -4121,7 +4113,7 @@ impl Tool for SearchTool {
         });
 
         let mut tool_result = ToolResult {
-            call_id: call.id,
+            call_id,
             output: result.output,
             content: Vec::new(),
             metadata,
@@ -4169,6 +4161,8 @@ impl Tool for SearchTool {
     }
 }
 
+impl_typed_tool!(SearchTool);
+
 pub struct ShellTool;
 
 /// Display copies of the streams kept in result metadata. They are smaller than
@@ -4195,8 +4189,37 @@ fn background_scope(ctx: &ToolContext) -> anyhow::Result<BackgroundScope> {
 
 pub struct BackgroundOutputTool;
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BackgroundOutputActionInput {
+    #[default]
+    Read,
+    List,
+    Write,
+    Stop,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackgroundOutputInput {
+    /// Operation to perform. Defaults to read.
+    #[serde(default)]
+    action: BackgroundOutputActionInput,
+    /// Job UUID returned by shell. Required except for list.
+    #[serde(default)]
+    job_id: Option<String>,
+    /// Input to send for write.
+    #[serde(default)]
+    data: Option<String>,
+    /// Append a newline to data. Defaults to false.
+    #[serde(default)]
+    append_newline: bool,
+}
+
 #[async_trait]
-impl Tool for BackgroundOutputTool {
+impl TypedTool for BackgroundOutputTool {
+    type Input = BackgroundOutputInput;
+
     fn name(&self) -> &str {
         "background_output"
     }
@@ -4205,77 +4228,51 @@ impl Tool for BackgroundOutputTool {
         "Control commands and persistent stdio sessions you started: list them, read new output, write input to an interactive session, or stop one. You do not need to poll for completion; a finished command reports itself."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["read", "list", "write", "stop"],
-                    "description": "read returns new output for one job, list summarizes every job you own, write sends input to an interactive session, and stop ends one job."
-                },
-                "jobId": { "type": "string", "description": "Job UUID returned by shell. Required for read, write, and stop." },
-                "data": { "type": "string", "description": "Input to send for write." },
-                "appendNewline": { "type": "boolean", "description": "Append a newline to data. Defaults to false." }
-            },
-            "additionalProperties": false
-        })
-    }
-
-    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
-        let action = call
-            .input
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("read");
-        let key = format!(
-            "session:{}",
-            call.input
-                .get("jobId")
-                .and_then(Value::as_str)
-                .unwrap_or("*")
-        );
-        match action {
-            "list" => ToolExecutionPolicy::read_only(vec!["sessions:self".to_string()]),
-            "read" => ToolExecutionPolicy {
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        let key = format!("session:{}", input.job_id.as_deref().unwrap_or("*"));
+        match input.action {
+            BackgroundOutputActionInput::List => {
+                ToolExecutionPolicy::read_only(vec!["sessions:self".to_string()])
+            }
+            BackgroundOutputActionInput::Read => ToolExecutionPolicy {
                 read_only: false,
                 idempotent: false,
                 parallel_safe: false,
                 side_effect: ToolSideEffect::SessionMutation,
                 resource_keys: vec![key],
             },
-            "write" | "stop" => ToolExecutionPolicy {
-                read_only: false,
-                idempotent: false,
-                parallel_safe: false,
-                side_effect: ToolSideEffect::SessionMutation,
-                resource_keys: vec![key],
-            },
-            _ => ToolExecutionPolicy::conservative(),
+            BackgroundOutputActionInput::Write | BackgroundOutputActionInput::Stop => {
+                ToolExecutionPolicy {
+                    read_only: false,
+                    idempotent: false,
+                    parallel_safe: false,
+                    side_effect: ToolSideEffect::SessionMutation,
+                    resource_keys: vec![key],
+                }
+            }
         }
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let registry = ctx
             .background
             .as_ref()
             .context("background commands are unavailable in this runtime")?;
         let scope = background_scope(&ctx)?;
-        let action = call
-            .input
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("read");
-        let job_id = call
-            .input
-            .get("jobId")
-            .and_then(Value::as_str)
+        let job_id = input
+            .job_id
+            .as_deref()
             .map(Uuid::parse_str)
             .transpose()
             .context("jobId must be a UUID")?;
 
-        let (value, metadata) = match action {
-            "list" => {
+        let (value, metadata) = match input.action {
+            BackgroundOutputActionInput::List => {
                 let jobs = registry.list(&scope);
                 let running = jobs.iter().filter(|job| !job.status.is_terminal()).count();
                 (
@@ -4283,7 +4280,7 @@ impl Tool for BackgroundOutputTool {
                     json!({ "jobCount": jobs.len(), "running": running, "success": true }),
                 )
             }
-            "stop" => {
+            BackgroundOutputActionInput::Stop => {
                 let job_id = job_id.context("background_output stop requires jobId")?;
                 registry.stop(&scope, job_id)?;
                 (
@@ -4295,20 +4292,13 @@ impl Tool for BackgroundOutputTool {
                     json!({ "jobId": job_id, "success": true }),
                 )
             }
-            "write" => {
+            BackgroundOutputActionInput::Write => {
                 let job_id = job_id.context("background_output write requires jobId")?;
-                let mut data = call
-                    .input
-                    .get("data")
-                    .and_then(Value::as_str)
+                let mut data = input
+                    .data
                     .context("background_output write requires data")?
                     .to_string();
-                if call
-                    .input
-                    .get("appendNewline")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
+                if input.append_newline {
                     data.push('\n');
                 }
                 registry
@@ -4319,7 +4309,7 @@ impl Tool for BackgroundOutputTool {
                     json!({ "jobId": job_id, "bytesWritten": data.len(), "success": true }),
                 )
             }
-            "read" => {
+            BackgroundOutputActionInput::Read => {
                 let job_id = job_id.context("background_output read requires jobId")?;
                 let chunk = registry.read_output(&scope, job_id)?;
                 let metadata = json!({
@@ -4331,17 +4321,16 @@ impl Tool for BackgroundOutputTool {
                 });
                 (serde_json::to_value(&chunk)?, metadata)
             }
-            other => anyhow::bail!("unsupported background_output action: {other}"),
         };
 
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: serde_json::to_string_pretty(&value)?,
             content: vec![ModelContentPart::json(value)],
             metadata: {
                 let mut metadata = metadata;
                 if let Some(object) = metadata.as_object_mut() {
-                    object.insert("toolName".to_string(), json!(self.name()));
+                    object.insert("toolName".to_string(), json!("background_output"));
                 }
                 metadata
             },
@@ -4349,8 +4338,31 @@ impl Tool for BackgroundOutputTool {
     }
 }
 
+impl_typed_tool!(BackgroundOutputTool);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShellInput {
+    /// Command interpreted by the platform shell.
+    command: String,
+    /// Existing workspace-relative directory. Defaults to the workspace root.
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Timeout in seconds.
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    /// Run detached and return a job id immediately.
+    #[serde(default)]
+    background: bool,
+    /// Keep stdin open as a persistent stdio session.
+    #[serde(default)]
+    interactive: bool,
+}
+
 #[async_trait]
-impl Tool for ShellTool {
+impl TypedTool for ShellTool {
+    type Input = ShellInput;
+
     fn name(&self) -> &str {
         "shell"
     }
@@ -4359,27 +4371,7 @@ impl Tool for ShellTool {
         "Run a shell command in a workspace directory with timeout and output caps. Set background for slow commands, or interactive for a persistent stdio session that accepts input through background_output. Both return a job id immediately and report completion automatically."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "Command to run. The platform shell interprets it, so substitutions and redirection inside the string are executed." },
-                "workdir": { "type": "string", "description": "Existing workspace-relative directory in which to run. Defaults to the workspace root." },
-                "timeoutSeconds": { "type": "number", "description": "Timeout in seconds. Up to 1800 in the foreground, or 21600 in the background." },
-                "background": {
-                    "type": "boolean",
-                    "description": "Run detached and return a job id right away. Use background_output to read progress or stop the job; the finished result reaches you on its own."
-                },
-                "interactive": {
-                    "type": "boolean",
-                    "description": "Keep stdin open as a persistent stdio session. Use background_output write/read/stop with the returned job id."
-                }
-            },
-            "required": ["command"]
-        })
-    }
-
-    fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+    fn execution_policy(&self, _input: &Self::Input) -> ToolExecutionPolicy {
         ToolExecutionPolicy {
             read_only: false,
             idempotent: false,
@@ -4389,40 +4381,27 @@ impl Tool for ShellTool {
         }
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        let command = call
-            .input
-            .get("command")
-            .and_then(Value::as_str)
-            .context("shell requires a command")?;
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        let command = input.command.trim();
+        anyhow::ensure!(!command.is_empty(), "shell requires a command");
         enforce_policy_decision(ctx.policy.inspect_command(command), ctx.approval_granted)?;
 
-        let interactive = call
-            .input
-            .get("interactive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let background = interactive
-            || call
-                .input
-                .get("background")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        let requested_workdir = call
-            .input
-            .get("workdir")
-            .and_then(Value::as_str)
-            .unwrap_or(".");
+        let interactive = input.interactive;
+        let background = interactive || input.background;
+        let requested_workdir = input.workdir.as_deref().unwrap_or(".");
         let logical_workdir = normalize_workspace_path(&ctx.workspace_root, requested_workdir)?;
         enforce_read_policy(&ctx, &logical_workdir)?;
         let workdir = ctx.environment.resolve_read_path(&logical_workdir)?;
         if !workdir.is_dir() {
             anyhow::bail!("shell workdir is not a directory: {}", workdir.display());
         }
-        let timeout_seconds = call
-            .input
-            .get("timeoutSeconds")
-            .and_then(Value::as_u64)
+        let timeout_seconds = input
+            .timeout_seconds
             .unwrap_or(if background {
                 DEFAULT_BACKGROUND_TIMEOUT_SECONDS
             } else {
@@ -4461,11 +4440,11 @@ impl Tool for ShellTool {
                 "note": "The persistent stdio session is running. Use background_output write/read/stop with this job id."
             });
             return Ok(ToolResult {
-                call_id: call.id,
+                call_id,
                 output: serde_json::to_string_pretty(&value)?,
                 content: vec![ModelContentPart::json(value)],
                 metadata: json!({
-                    "toolName": self.name(),
+                    "toolName": "shell",
                     "background": true,
                     "interactive": true,
                     "transport": "stdio",
@@ -4499,11 +4478,11 @@ impl Tool for ShellTool {
                 "note": "The command is running detached. Carry on with other work: its output and exit status are delivered to you when it finishes, and background_output reads progress or stops it in the meantime."
             });
             return Ok(ToolResult {
-                call_id: call.id,
+                call_id,
                 output: serde_json::to_string_pretty(&value)?,
                 content: vec![ModelContentPart::json(value)],
                 metadata: json!({
-                    "toolName": self.name(),
+                    "toolName": "shell",
                     "background": true,
                     "jobId": job.job_id,
                     "workdir": workdir.display().to_string(),
@@ -4545,7 +4524,7 @@ impl Tool for ShellTool {
         // from these structured fields instead of re-parsing that text, so a
         // terminal view can separate the command, stdout and stderr reliably.
         let mut result = ToolResult {
-            call_id: call.id,
+            call_id,
             output: combined,
             content: Vec::new(),
             metadata: json!({
@@ -4599,10 +4578,14 @@ impl Tool for ShellTool {
     }
 }
 
+impl_typed_tool!(ShellTool);
+
 pub struct GitDiffTool;
 
 #[async_trait]
-impl Tool for GitDiffTool {
+impl TypedTool for GitDiffTool {
+    type Input = EmptyToolInput;
+
     fn name(&self) -> &str {
         "git_diff"
     }
@@ -4611,15 +4594,16 @@ impl Tool for GitDiffTool {
         "Show the current git diff for the workspace."
     }
 
-    fn schema(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
-    }
-
-    fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+    fn execution_policy(&self, _input: &Self::Input) -> ToolExecutionPolicy {
         ToolExecutionPolicy::read_only(vec!["git:index-and-worktree".to_string()])
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        _input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
         let output = ctx
             .environment
             .exec(
@@ -4639,7 +4623,7 @@ impl Tool for GitDiffTool {
             truncate(&stdout, 32_000)
         };
         Ok(ToolResult {
-            call_id: call.id,
+            call_id,
             output: text,
             content: Vec::new(),
             metadata: json!({
@@ -4651,17 +4635,40 @@ impl Tool for GitDiffTool {
     }
 }
 
+impl_typed_tool!(GitDiffTool);
+
 pub struct ApplyPatchTool;
 
 /// Provider-native patch calls are normalized here instead of teaching the
 /// workspace executor about any one transport. Their `diff` is commonly a bare
 /// unified hunk (`@@ ...`) and therefore cannot be passed directly to `git apply`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativePatchOperation {
     CreateFile { path: String, diff: String },
     UpdateFile { path: String, diff: String },
     DeleteFile { path: String },
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum ApplyPatchInput {
+    Portable(PortablePatchInput),
+    Structured(StructuredPatchInput),
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PortablePatchInput {
+    /// Portable unified diff patch.
+    patch: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StructuredPatchInput {
+    /// Structured provider-native operation.
+    operation: NativePatchOperation,
 }
 
 impl NativePatchOperation {
@@ -4675,7 +4682,9 @@ impl NativePatchOperation {
 }
 
 #[async_trait]
-impl Tool for ApplyPatchTool {
+impl TypedTool for ApplyPatchTool {
+    type Input = ApplyPatchInput;
+
     fn name(&self) -> &str {
         "apply_patch"
     }
@@ -4684,39 +4693,11 @@ impl Tool for ApplyPatchTool {
         "Apply either a portable unified diff patch or one structured create_file/update_file/delete_file operation to the workspace."
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "patch": { "type": "string", "description": "Portable unified diff patch." },
-                "operation": {
-                    "type": "object",
-                    "description": "Structured provider-native operation. Supply this instead of patch.",
-                    "properties": {
-                        "type": { "type": "string", "enum": ["create_file", "update_file", "delete_file"] },
-                        "path": { "type": "string", "description": "Workspace-relative target path." },
-                        "diff": { "type": "string", "description": "Unified diff hunks; required for create_file and update_file." }
-                    },
-                    "required": ["type", "path"],
-                    "additionalProperties": false
-                }
-            },
-            "oneOf": [
-                { "required": ["patch"] },
-                { "required": ["operation"] }
-            ],
-            "additionalProperties": false
-        })
-    }
-
-    fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
-        let key = call
-            .input
-            .get("operation")
-            .and_then(|operation| operation.get("path"))
-            .and_then(Value::as_str)
-            .map(|path| tool_resource_key("file", path))
-            .unwrap_or_else(|| "workspace:*".to_string());
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        let key = match input {
+            ApplyPatchInput::Portable(_) => "workspace:*".to_string(),
+            ApplyPatchInput::Structured(input) => tool_resource_key("file", input.operation.path()),
+        };
         ToolExecutionPolicy {
             read_only: false,
             idempotent: false,
@@ -4726,21 +4707,24 @@ impl Tool for ApplyPatchTool {
         }
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
-        if let Some(operation) = call.input.get("operation") {
-            let operation: NativePatchOperation = serde_json::from_value(operation.clone())
-                .context("apply_patch operation is invalid")?;
-            return execute_native_patch_operation(call.id, operation, ctx).await;
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        match input {
+            ApplyPatchInput::Portable(input) => {
+                execute_portable_patch(call_id, &input.patch, ctx).await
+            }
+            ApplyPatchInput::Structured(input) => {
+                execute_native_patch_operation(call_id, input.operation, ctx).await
+            }
         }
-
-        let patch =
-            call.input.get("patch").and_then(Value::as_str).context(
-                "apply_patch requires either a portable patch or a structured operation",
-            )?;
-
-        execute_portable_patch(call.id, patch, ctx).await
     }
 }
+
+impl_typed_tool!(ApplyPatchTool);
 
 async fn execute_portable_patch(
     call_id: Uuid,
@@ -5530,6 +5514,74 @@ mod tests {
         assert_eq!(defaults.source("read_file"), Some(ToolSource::Core));
     }
 
+    fn schema_contains_reference(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key("$ref") || object.values().any(schema_contains_reference)
+            }
+            Value::Array(values) => values.iter().any(schema_contains_reference),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn every_static_builtin_uses_an_inline_derived_input_schema() {
+        let registry = ToolRegistry::with_builtins();
+
+        for (name, tool) in registry.tools.iter() {
+            assert!(
+                tool.has_derived_input_schema(),
+                "static tool {name} bypasses the typed schema adapter"
+            );
+            let schema = tool.schema();
+            assert!(schema.is_object(), "tool {name} schema is not an object");
+            assert_eq!(
+                schema.get("type").and_then(Value::as_str),
+                Some("object"),
+                "tool {name} must expose an object-root schema: {schema}"
+            );
+            assert!(
+                !schema_contains_reference(&schema),
+                "tool {name} schema contains a non-portable reference: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_schema_and_typed_decoder_reject_the_same_invalid_shapes() {
+        assert_eq!(
+            ListFilesTool.input_error(&json!({})).as_deref(),
+            Some("arguments.path is required")
+        );
+        assert_eq!(
+            ListFilesTool
+                .input_error(&json!({ "path": ".", "unexpected": true }))
+                .as_deref(),
+            Some("arguments.unexpected is not allowed")
+        );
+        assert!(SearchTool
+            .input_error(&json!({
+                "query": "TypedTool",
+                "fixedStrings": true,
+                "maxResults": 10
+            }))
+            .is_none());
+        assert!(ApplyPatchTool
+            .input_error(&json!({
+                "patch": "diff --git a/a b/a",
+                "operation": { "type": "delete_file", "path": "a" }
+            }))
+            .is_some());
+    }
+
+    #[test]
+    fn list_files_requires_an_explicit_workspace_relative_path() {
+        let schema = ListFilesTool.schema();
+
+        assert_eq!(schema["required"], json!(["path"]));
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+    }
+
     struct PendingExecutor;
 
     struct ImmediateExecutor;
@@ -5650,9 +5702,7 @@ mod tests {
 
         assert_eq!(properties["fixedStrings"]["type"], "boolean");
         assert_eq!(properties["wordMatch"]["type"], "boolean");
-        assert!(SearchTool
-            .description()
-            .contains("not semantic symbol resolution"));
+        assert!(Tool::description(&SearchTool).contains("not semantic symbol resolution"));
     }
 
     #[test]
@@ -5689,7 +5739,10 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local(workspace_root.clone(), policy);
+        let mut sandbox = LocalSandboxConfig::enforce();
+        sandbox.network = crate::sandbox::NetworkPolicy::Allow;
+        let context =
+            ToolContext::local_with_sandbox_config(workspace_root.clone(), policy, sandbox);
 
         let searched = SearchTool
             .execute(
@@ -5707,7 +5760,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(searched.output.contains("definition.rs"));
+        assert!(
+            searched.output.contains("definition.rs"),
+            "unexpected search output: {:?}; metadata: {}",
+            searched.output,
+            searched.metadata
+        );
         assert!(searched.output.contains("caller.rs"));
         assert!(!searched.output.contains("preload"));
         assert_eq!(searched.metadata["matches"], 2);
@@ -6760,12 +6818,10 @@ mod tests {
 
     #[test]
     fn plan_tools_describe_memory_and_evidence_without_mandating_a_scheduler() {
-        assert!(SetPlanTool.description().contains("external memory"));
-        assert!(UpdatePlanTool.description().contains("advisory"));
-        assert!(!UpdatePlanTool.description().contains("one step at a time"));
-        assert!(CompleteTaskTool
-            .description()
-            .contains("verification evidence"));
+        assert!(Tool::description(&SetPlanTool).contains("external memory"));
+        assert!(Tool::description(&UpdatePlanTool).contains("advisory"));
+        assert!(!Tool::description(&UpdatePlanTool).contains("one step at a time"));
+        assert!(Tool::description(&CompleteTaskTool).contains("verification evidence"));
     }
 
     #[tokio::test]

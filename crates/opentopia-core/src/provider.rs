@@ -754,6 +754,7 @@ impl OpenAiCompatibleProvider {
         &self,
         preferred_kind: ProviderKind,
     ) -> anyhow::Result<ProviderHealthCheck> {
+        const TOOL_PROBE_TOKEN: &str = "opentopia-tool-probe-v1";
         let start = std::time::Instant::now();
         let chat_payload = json!({
             "model": self.model,
@@ -775,18 +776,22 @@ impl OpenAiCompatibleProvider {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": "System compatibility probe."},
-                {"role": "user", "content": "Reply with OK."}
+                {"role": "user", "content": format!("Call compatibility_probe exactly once with token {TOOL_PROBE_TOKEN}.")}
             ],
             "tools": [{
                 "type": "function",
                 "function": {
                     "name": "compatibility_probe",
-                    "description": "Validates function tool support without invoking a tool.",
-                    "parameters": {"type": "object", "properties": {}}
+                    "description": "Returns the exact compatibility token supplied by the user.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"token": {"type": "string", "const": TOOL_PROBE_TOKEN}},
+                        "required": ["token"]
+                    }
                 }
             }],
-            "tool_choice": "none",
-            "max_tokens": 16,
+            "tool_choice": {"type": "function", "function": {"name": "compatibility_probe"}},
+            "max_tokens": 32,
             "stream": false
         });
         let responses_native_tools_payload = json!({
@@ -800,15 +805,19 @@ impl OpenAiCompatibleProvider {
         });
         let responses_function_tools_payload = json!({
             "model": self.model,
-            "input": "Reply with OK.",
+            "input": format!("Call compatibility_probe exactly once with token {TOOL_PROBE_TOKEN}."),
             "tools": [{
                 "type": "function",
                 "name": "compatibility_probe",
-                "description": "Validates Responses function-tool support without invoking a tool.",
-                "parameters": {"type": "object", "properties": {}}
+                "description": "Returns the exact compatibility token supplied by the user.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"token": {"type": "string", "const": TOOL_PROBE_TOKEN}},
+                    "required": ["token"]
+                }
             }],
-            "tool_choice": "none",
-            "max_output_tokens": 16,
+            "tool_choice": {"type": "function", "name": "compatibility_probe"},
+            "max_output_tokens": 32,
             "stream": false,
             "store": false
         });
@@ -845,9 +854,17 @@ impl OpenAiCompatibleProvider {
         ) = tokio::join!(
             self.probe_openai_endpoint("/chat/completions", chat_payload, false),
             self.probe_openai_endpoint("/responses", responses_payload, false),
-            self.probe_openai_endpoint("/chat/completions", chat_tools_payload, true),
+            self.probe_openai_function_tool_roundtrip(
+                "/chat/completions",
+                chat_tools_payload,
+                TOOL_PROBE_TOKEN,
+            ),
             self.probe_openai_endpoint("/responses", responses_native_tools_payload, true),
-            self.probe_openai_endpoint("/responses", responses_function_tools_payload, true),
+            self.probe_openai_function_tool_roundtrip(
+                "/responses",
+                responses_function_tools_payload,
+                TOOL_PROBE_TOKEN,
+            ),
             self.probe_openai_endpoint("/responses", responses_custom_tools_payload, true),
             self.probe_openai_endpoint("/responses", responses_apply_patch_payload, true),
         );
@@ -1036,6 +1053,87 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    async fn probe_openai_function_tool_roundtrip(
+        &self,
+        path: &str,
+        payload: Value,
+        expected_token: &str,
+    ) -> OpenAiProbeOutcome {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let response = tokio::time::timeout(
+            Duration::from_secs(20),
+            self.client
+                .post(url)
+                .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                .header(CONTENT_TYPE, "application/json")
+                .json(&payload)
+                .send(),
+        )
+        .await;
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return OpenAiProbeOutcome {
+                    support: ProviderFeatureSupport::Unknown,
+                    detail: Some(error.to_string()),
+                }
+            }
+            Err(_) => {
+                return OpenAiProbeOutcome {
+                    support: ProviderFeatureSupport::Unknown,
+                    detail: Some("request timed out after 20 seconds".to_string()),
+                }
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return OpenAiProbeOutcome {
+                support: if matches!(status.as_u16(), 400 | 404 | 405 | 422 | 501) {
+                    ProviderFeatureSupport::Unsupported
+                } else {
+                    ProviderFeatureSupport::Unknown
+                },
+                detail: Some(format!(
+                    "HTTP {}: {}",
+                    status.as_u16(),
+                    truncate_observation_text(body.trim())
+                )),
+            };
+        }
+        let parsed = serde_json::from_str::<Value>(&body)
+            .map_err(|error| format!("HTTP 200 returned invalid JSON: {error}"))
+            .and_then(|body| {
+                extract_provider_tool_calls(&body)
+                    .map_err(|error| error.to_string())
+                    .and_then(|calls| {
+                        calls
+                            .iter()
+                            .find(|call| call.name == "compatibility_probe")
+                            .ok_or_else(|| "HTTP 200 returned no compatibility_probe call".to_string())
+                            .and_then(|call| {
+                                (call.arguments.get("token").and_then(Value::as_str)
+                                    == Some(expected_token))
+                                .then_some(())
+                                .ok_or_else(|| {
+                                    "HTTP 200 returned a tool call without the required token argument"
+                                        .to_string()
+                                })
+                            })
+                    })
+            });
+        match parsed {
+            Ok(()) => OpenAiProbeOutcome {
+                support: ProviderFeatureSupport::Supported,
+                detail: None,
+            },
+            Err(detail) => OpenAiProbeOutcome {
+                support: ProviderFeatureSupport::Unsupported,
+                detail: Some(detail),
+            },
+        }
+    }
+
     pub(crate) fn for_guardian(mut self) -> Self {
         self.temperature = Some(0.0);
         self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
@@ -1065,12 +1163,16 @@ impl OpenAiCompatibleProvider {
         } else {
             openai_messages(&request)
         };
+        let stream = request.tool_candidates.is_empty()
+            || !openai_chat_nonstream_tools_cached(&self.base_url, &self.model);
         let mut payload = json!({
             "model": self.model,
             "messages": messages,
-            "stream": true,
-            "stream_options": { "include_usage": true }
+            "stream": stream
         });
+        if stream {
+            payload["stream_options"] = json!({ "include_usage": true });
+        }
         // Reasoning models reject any explicit temperature with a 400, so the
         // field is omitted rather than clamped.
         if model_accepts_temperature(&self.model) {
@@ -1236,39 +1338,183 @@ impl OpenAiCompatibleProvider {
             anyhow::bail!("provider request failed ({status}): {body}");
         }
 
-        let mut decoder = SseDecoder::default();
-        let mut accumulator = OpenAiStreamAccumulator::default();
-        let idle_timeout = stream_idle_timeout();
-        loop {
-            let Some(chunk) = next_stream_chunk(&mut response, idle_timeout).await? else {
-                break;
-            };
-            for data in decoder.push(&chunk)? {
-                if data == "[DONE]" {
-                    continue;
+        let streamed = prepared
+            .body
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let decoded = decode_openai_chat_response(response, streamed, on_delta, true).await;
+        let response = match decoded.and_then(|response| {
+            validate_provider_tool_response(&prepared.logical_request.tool_candidates, response)
+        }) {
+            Ok(response) => response,
+            Err(error)
+                if streamed
+                    && !prepared.logical_request.tool_candidates.is_empty()
+                    && is_tool_call_protocol_error(&error) =>
+            {
+                on_transport(ProviderTransportEvent::Response {
+                    attempt,
+                    status: Some(status.as_u16()),
+                    response_id: None,
+                    body: json!({
+                        "providerProtocolError": error.to_string(),
+                        "recovery": "retry_non_streaming_once",
+                    }),
+                })?;
+                attempt += 1;
+                prepared.body["stream"] = json!(false);
+                if let Some(body) = prepared.body.as_object_mut() {
+                    body.remove("stream_options");
                 }
-                let event: Value = serde_json::from_str(&data)
-                    .map_err(|err| anyhow::anyhow!("invalid provider SSE data: {err}: {data}"))?;
-                accumulator.apply(&event, on_delta)?;
+                on_transport(ProviderTransportEvent::Retry {
+                    attempt,
+                    reason: "streamed tool-call arguments violated the provider contract; retrying once with the non-streaming transport"
+                        .to_string(),
+                    body: redact_transport_value(&prepared.body),
+                })?;
+                let retry = self
+                    .client
+                    .post(&prepared.endpoint)
+                    .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&prepared.body)
+                    .send()
+                    .await?;
+                let retry_status = retry.status();
+                if !retry_status.is_success() {
+                    let retry_body = retry.text().await?;
+                    on_transport(ProviderTransportEvent::Response {
+                        attempt,
+                        status: Some(retry_status.as_u16()),
+                        response_id: None,
+                        body: json!({ "error": truncate_observation_text(&retry_body) }),
+                    })?;
+                    anyhow::bail!(
+                        "provider tool-call compatibility recovery failed ({retry_status}): {retry_body}"
+                    );
+                }
+                let recovered = decode_openai_chat_response(retry, false, on_delta, false)
+                    .await
+                    .and_then(|response| {
+                        validate_provider_tool_response(
+                            &prepared.logical_request.tool_candidates,
+                            response,
+                        )
+                    });
+                match recovered {
+                    Ok(response) => {
+                        remember_openai_chat_nonstream_tools(&self.base_url, &self.model);
+                        response
+                    }
+                    Err(recovery_error) => {
+                        on_transport(ProviderTransportEvent::Response {
+                            attempt,
+                            status: Some(retry_status.as_u16()),
+                            response_id: None,
+                            body: json!({
+                                "providerProtocolError": recovery_error.to_string(),
+                                "recovery": "non_streaming_failed",
+                            }),
+                        })?;
+                        return Err(recovery_error.context(format!(
+                            "provider returned an invalid tool call over both streaming and non-streaming transports; first error: {error}"
+                        )));
+                    }
+                }
             }
-        }
-        for data in decoder.finish()? {
-            if data != "[DONE]" {
-                let event: Value = serde_json::from_str(&data)
-                    .map_err(|err| anyhow::anyhow!("invalid provider SSE data: {err}: {data}"))?;
-                accumulator.apply(&event, on_delta)?;
+            Err(error) => {
+                on_transport(ProviderTransportEvent::Response {
+                    attempt,
+                    status: Some(status.as_u16()),
+                    response_id: None,
+                    body: json!({ "providerProtocolError": error.to_string() }),
+                })?;
+                return Err(error);
             }
-        }
-
-        let response = accumulator.finish()?;
+        };
         on_transport(ProviderTransportEvent::Response {
             attempt,
-            status: Some(status.as_u16()),
+            status: Some(200),
             response_id: response.response_id.clone(),
             body: model_response_observation(&response),
         })?;
         Ok(response)
     }
+}
+
+fn is_tool_call_protocol_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("provider tool-call protocol error")
+    })
+}
+
+fn validate_provider_tool_response(
+    candidates: &[ProviderToolCandidate],
+    response: ModelResponse,
+) -> anyhow::Result<ModelResponse> {
+    if let Some(error) = provider_tool_call_schema_error(candidates, &response.tool_calls) {
+        anyhow::bail!(error);
+    }
+    Ok(response)
+}
+
+async fn decode_openai_chat_response(
+    mut response: reqwest::Response,
+    streamed: bool,
+    on_delta: &mut ModelStreamCallback<'_>,
+    emit_nonstream_deltas: bool,
+) -> anyhow::Result<ModelResponse> {
+    if !streamed {
+        let body: Value = response.json().await?;
+        let response = parse_model_response_body(&body)?;
+        if emit_nonstream_deltas {
+            if !response.text.is_empty() {
+                on_delta(ModelStreamDelta::Text {
+                    text: response.text.clone(),
+                })?;
+            }
+            for (index, call) in response.tool_calls.iter().enumerate() {
+                on_delta(ModelStreamDelta::ToolCall {
+                    index,
+                    id: Some(call.id.clone()),
+                    name: Some(call.name.clone()),
+                    arguments_delta: call.arguments.to_string(),
+                })?;
+            }
+            if let Some(usage) = response.usage.clone() {
+                on_delta(ModelStreamDelta::Usage { usage })?;
+            }
+        }
+        return Ok(response);
+    }
+
+    let mut decoder = SseDecoder::default();
+    let mut accumulator = OpenAiStreamAccumulator::default();
+    let idle_timeout = stream_idle_timeout();
+    loop {
+        let Some(chunk) = next_stream_chunk(&mut response, idle_timeout).await? else {
+            break;
+        };
+        for data in decoder.push(&chunk)? {
+            if data == "[DONE]" {
+                continue;
+            }
+            let event: Value = serde_json::from_str(&data)
+                .map_err(|err| anyhow::anyhow!("invalid provider SSE data: {err}: {data}"))?;
+            accumulator.apply(&event, on_delta)?;
+        }
+    }
+    for data in decoder.finish()? {
+        if data != "[DONE]" {
+            let event: Value = serde_json::from_str(&data)
+                .map_err(|err| anyhow::anyhow!("invalid provider SSE data: {err}: {data}"))?;
+            accumulator.apply(&event, on_delta)?;
+        }
+    }
+    accumulator.finish()
 }
 
 #[derive(Debug, Clone)]
@@ -2099,6 +2345,8 @@ struct StreamingToolCall {
     id: String,
     name: String,
     arguments: String,
+    arguments_present: bool,
+    argument_wire_types: HashSet<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -2110,6 +2358,121 @@ struct OpenAiStreamAccumulator {
 }
 
 impl OpenAiStreamAccumulator {
+    fn apply_tool_call_deltas(
+        &mut self,
+        tool_calls: &[Value],
+        on_delta: &mut ModelStreamCallback<'_>,
+    ) -> anyhow::Result<()> {
+        for (fallback_index, value) in tool_calls.iter().enumerate() {
+            let index = value
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(fallback_index);
+            let id_delta = value.get("id").and_then(Value::as_str);
+            let name_delta = value
+                .pointer("/function/name")
+                .or_else(|| value.get("name"))
+                .and_then(Value::as_str);
+            let arguments = value
+                .pointer("/function/arguments")
+                .or_else(|| value.get("arguments"))
+                .or_else(|| value.get("input"));
+            let arguments_delta = match arguments {
+                Some(Value::String(arguments)) => arguments.clone(),
+                Some(Value::Null) | None => String::new(),
+                Some(arguments) => arguments.to_string(),
+            };
+            let call = self.tool_calls.entry(index).or_default();
+            if let Some(id) = id_delta {
+                call.id.push_str(id);
+            }
+            if let Some(name) = name_delta {
+                call.name.push_str(name);
+            }
+            match arguments {
+                // Standard OpenAI streams split a JSON string across deltas.
+                Some(Value::String(_)) => {
+                    call.arguments_present = true;
+                    call.argument_wire_types.insert("string");
+                    call.arguments.push_str(&arguments_delta);
+                }
+                // Compatible gateways sometimes send the completed argument
+                // object directly. Treat that as a snapshot, not a fragment.
+                Some(Value::Null) => {
+                    call.argument_wire_types.insert("null");
+                }
+                None => {}
+                Some(value) => {
+                    call.arguments_present = true;
+                    call.argument_wire_types.insert(match value {
+                        Value::Object(_) => "object",
+                        Value::Array(_) => "array",
+                        Value::Bool(_) => "boolean",
+                        Value::Number(_) => "number",
+                        _ => "other",
+                    });
+                    call.arguments.clone_from(&arguments_delta);
+                }
+            }
+            on_delta(ModelStreamDelta::ToolCall {
+                index,
+                id: id_delta.map(str::to_string),
+                name: name_delta.map(str::to_string),
+                arguments_delta,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn apply_tool_call_snapshots(&mut self, tool_calls: &[Value]) {
+        for (fallback_index, value) in tool_calls.iter().enumerate() {
+            let index = value
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(fallback_index);
+            let call = self.tool_calls.entry(index).or_default();
+            if let Some(id) = value
+                .get("id")
+                .or_else(|| value.get("call_id"))
+                .and_then(Value::as_str)
+            {
+                call.id = id.to_string();
+            }
+            if let Some(name) = value
+                .pointer("/function/name")
+                .or_else(|| value.get("name"))
+                .and_then(Value::as_str)
+            {
+                call.name = name.to_string();
+            }
+            if let Some(arguments) = value
+                .pointer("/function/arguments")
+                .or_else(|| value.get("arguments"))
+                .or_else(|| value.get("input"))
+            {
+                call.argument_wire_types.insert(match arguments {
+                    Value::String(_) => "string",
+                    Value::Null => "null",
+                    Value::Object(_) => "object",
+                    Value::Array(_) => "array",
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                });
+                let arguments = match arguments {
+                    Value::String(arguments) => arguments.clone(),
+                    Value::Null => String::new(),
+                    arguments => arguments.to_string(),
+                };
+                if !arguments.trim().is_empty() {
+                    call.arguments_present = true;
+                    call.arguments = arguments;
+                }
+            }
+        }
+    }
+
     fn apply(
         &mut self,
         event: &Value,
@@ -2131,48 +2494,28 @@ impl OpenAiStreamAccumulator {
             self.finish_reason = Some(chat_finish_reason(reason));
         }
 
-        let Some(delta) = event.pointer("/choices/0/delta") else {
-            return Ok(());
-        };
-        let reasoning = extract_stream_reasoning(delta);
-        if !reasoning.is_empty() {
-            on_delta(ModelStreamDelta::Reasoning { text: reasoning })?;
-        }
-        let text = extract_stream_text(delta.get("content"));
-        if !text.is_empty() {
-            self.text.push_str(&text);
-            on_delta(ModelStreamDelta::Text { text })?;
+        if let Some(delta) = event.pointer("/choices/0/delta") {
+            let reasoning = extract_stream_reasoning(delta);
+            if !reasoning.is_empty() {
+                on_delta(ModelStreamDelta::Reasoning { text: reasoning })?;
+            }
+            let text = extract_stream_text(delta.get("content"));
+            if !text.is_empty() {
+                self.text.push_str(&text);
+                on_delta(ModelStreamDelta::Text { text })?;
+            }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                self.apply_tool_call_deltas(tool_calls, on_delta)?;
+            }
         }
 
-        let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) else {
-            return Ok(());
-        };
-        for (fallback_index, value) in tool_calls.iter().enumerate() {
-            let index = value
-                .get("index")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize)
-                .unwrap_or(fallback_index);
-            let id_delta = value.get("id").and_then(Value::as_str);
-            let name_delta = value.pointer("/function/name").and_then(Value::as_str);
-            let arguments_delta = value
-                .pointer("/function/arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let call = self.tool_calls.entry(index).or_default();
-            if let Some(id) = id_delta {
-                call.id.push_str(id);
-            }
-            if let Some(name) = name_delta {
-                call.name.push_str(name);
-            }
-            call.arguments.push_str(arguments_delta);
-            on_delta(ModelStreamDelta::ToolCall {
-                index,
-                id: id_delta.map(str::to_string),
-                name: name_delta.map(str::to_string),
-                arguments_delta: arguments_delta.to_string(),
-            })?;
+        // Some OpenAI-compatible gateways put the completed tool call on the
+        // final `message` even when the preceding deltas only carried its name.
+        if let Some(tool_calls) = event
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(Value::as_array)
+        {
+            self.apply_tool_call_snapshots(tool_calls);
         }
         Ok(())
     }
@@ -2190,10 +2533,24 @@ impl OpenAiStreamAccumulator {
                 } else {
                     call.id
                 };
+                if !call.arguments_present {
+                    let wire_types = if call.argument_wire_types.is_empty() {
+                        "missing".to_string()
+                    } else {
+                        call.argument_wire_types.into_iter().collect::<Vec<_>>().join(",")
+                    };
+                    anyhow::bail!(
+                        "provider tool-call protocol error: function.arguments was absent for call '{id}' ({}, wire types: {wire_types})",
+                        call.name
+                    );
+                }
                 Ok(ProviderToolCall {
                     id,
                     name: call.name,
-                    arguments: parse_tool_arguments(Some(&Value::String(call.arguments)))?,
+                    arguments: parse_required_tool_arguments(
+                        Some(&Value::String(call.arguments)),
+                        "streamed function.arguments",
+                    )?,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -2354,6 +2711,8 @@ impl ResponsesStreamAccumulator {
                                     id: parsed.id,
                                     name: parsed.name,
                                     arguments: parsed.arguments.to_string(),
+                                    arguments_present: true,
+                                    ..StreamingToolCall::default()
                                 },
                             );
                         } else {
@@ -2432,6 +2791,8 @@ impl ResponsesStreamAccumulator {
                                 id: call.id,
                                 name: call.name,
                                 arguments: call.arguments.to_string(),
+                                arguments_present: true,
+                                ..StreamingToolCall::default()
                             },
                         )
                     })
@@ -2587,6 +2948,7 @@ fn model_prefers_compatibility_messages(model: &str) -> bool {
 }
 
 static OPENAI_MESSAGE_COMPATIBILITY_CACHE: OnceLock<StdRwLock<HashSet<String>>> = OnceLock::new();
+static OPENAI_CHAT_NONSTREAM_TOOLS_CACHE: OnceLock<StdRwLock<HashSet<String>>> = OnceLock::new();
 static OPENAI_ENHANCED_TOOLS_UNSUPPORTED_CACHE: OnceLock<StdRwLock<HashSet<String>>> =
     OnceLock::new();
 
@@ -2615,6 +2977,20 @@ fn remember_openai_message_compatibility(base_url: &str, model: &str, required: 
         cache.insert(key);
     } else {
         cache.remove(&key);
+    }
+}
+
+fn openai_chat_nonstream_tools_cached(base_url: &str, model: &str) -> bool {
+    OPENAI_CHAT_NONSTREAM_TOOLS_CACHE
+        .get()
+        .and_then(|cache| cache.read().ok())
+        .is_some_and(|cache| cache.contains(&openai_compatibility_cache_key(base_url, model)))
+}
+
+fn remember_openai_chat_nonstream_tools(base_url: &str, model: &str) {
+    let cache = OPENAI_CHAT_NONSTREAM_TOOLS_CACHE.get_or_init(|| StdRwLock::new(HashSet::new()));
+    if let Ok(mut cache) = cache.write() {
+        cache.insert(openai_compatibility_cache_key(base_url, model));
     }
 }
 
@@ -3699,7 +4075,6 @@ fn model_response_observation(response: &ModelResponse) -> Value {
     })
 }
 
-#[cfg(test)]
 fn parse_model_response_body(body: &Value) -> anyhow::Result<ModelResponse> {
     Ok(ModelResponse {
         text: extract_response_text(body),
@@ -4003,7 +4378,7 @@ fn parse_chat_tool_call(value: &Value, index: usize) -> anyhow::Result<ProviderT
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("tool call missing function name: {value}"))?;
-    let arguments = parse_tool_arguments(function.get("arguments"))?;
+    let arguments = parse_required_tool_arguments(function.get("arguments"), "function.arguments")?;
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -4025,7 +4400,10 @@ fn parse_legacy_function_call(value: &Value, index: usize) -> anyhow::Result<Pro
     Ok(ProviderToolCall {
         id: format!("call_{index}"),
         name: name.to_string(),
-        arguments: parse_tool_arguments(value.get("arguments"))?,
+        arguments: parse_required_tool_arguments(
+            value.get("arguments"),
+            "legacy function_call.arguments",
+        )?,
     })
 }
 
@@ -4044,7 +4422,10 @@ fn parse_responses_function_call(value: &Value, index: usize) -> anyhow::Result<
     Ok(ProviderToolCall {
         id,
         name: name.to_string(),
-        arguments: parse_tool_arguments(value.get("arguments"))?,
+        arguments: parse_required_tool_arguments(
+            value.get("arguments"),
+            "Responses function_call.arguments",
+        )?,
     })
 }
 
@@ -4120,6 +4501,177 @@ fn parse_tool_arguments(value: Option<&Value>) -> anyhow::Result<Value> {
             .map_err(|err| anyhow::anyhow!("failed to parse tool arguments as JSON: {err}")),
         Some(value) => Ok(value.clone()),
     }
+}
+
+fn parse_required_tool_arguments(value: Option<&Value>, field: &str) -> anyhow::Result<Value> {
+    match value {
+        None | Some(Value::Null) => {
+            anyhow::bail!("provider tool-call protocol error: {field} is missing")
+        }
+        Some(Value::String(arguments)) if arguments.trim().is_empty() => {
+            anyhow::bail!("provider tool-call protocol error: {field} is empty")
+        }
+        Some(Value::String(arguments)) => serde_json::from_str(arguments).map_err(|err| {
+            anyhow::anyhow!("provider tool-call protocol error: {field} is not valid JSON: {err}")
+        }),
+        Some(value) => Ok(value.clone()),
+    }
+}
+
+fn json_value_matches_schema_type(value: &Value, kind: &str) -> bool {
+    match kind {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "string" => value.is_string(),
+        _ => true,
+    }
+}
+
+pub(crate) fn tool_input_schema_error(schema: &Value, value: &Value, path: &str) -> Option<String> {
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if let Some(error) = tool_input_schema_error(branch, value, path) {
+                return Some(error);
+            }
+        }
+    }
+    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
+        if !branches
+            .iter()
+            .any(|branch| tool_input_schema_error(branch, value, path).is_none())
+        {
+            return Some(format!("{path} does not match any allowed input shape"));
+        }
+    }
+    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+        let matches = branches
+            .iter()
+            .filter(|branch| tool_input_schema_error(branch, value, path).is_none())
+            .count();
+        if matches != 1 {
+            return Some(format!("{path} must match exactly one allowed input shape"));
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.contains(value) {
+            return Some(format!("{path} is not one of the allowed values"));
+        }
+    }
+    if let Some(constant) = schema.get("const") {
+        if constant != value {
+            return Some(format!("{path} does not match the required constant"));
+        }
+    }
+    if let Some(types) = schema.get("type") {
+        let matches = match types {
+            Value::String(kind) => json_value_matches_schema_type(value, kind),
+            Value::Array(kinds) => kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|kind| json_value_matches_schema_type(value, kind)),
+            _ => true,
+        };
+        if !matches {
+            let expected = match types {
+                Value::String(kind) => kind.clone(),
+                Value::Array(kinds) => kinds
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                _ => "the advertised JSON type".to_string(),
+            };
+            return Some(format!("{path} must be {expected}"));
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+            if number < minimum {
+                return Some(format!("{path} must be at least {minimum}"));
+            }
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+            if number > maximum {
+                return Some(format!("{path} must be at most {maximum}"));
+            }
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64) {
+            if length < minimum {
+                return Some(format!("{path} must contain at least {minimum} characters"));
+            }
+        }
+        if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64) {
+            if length > maximum {
+                return Some(format!("{path} must contain at most {maximum} characters"));
+            }
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for key in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(key) {
+                    return Some(format!("{path}.{key} is required"));
+                }
+            }
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (key, item) in object {
+                if let Some(property_schema) = properties.get(key) {
+                    if let Some(error) =
+                        tool_input_schema_error(property_schema, item, &format!("{path}.{key}"))
+                    {
+                        return Some(error);
+                    }
+                } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                    return Some(format!("{path}.{key} is not allowed"));
+                }
+            }
+        }
+    }
+    if let (Some(items), Some(values)) = (schema.get("items"), value.as_array()) {
+        if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64) {
+            if (values.len() as u64) < minimum {
+                return Some(format!("{path} must contain at least {minimum} items"));
+            }
+        }
+        if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64) {
+            if (values.len() as u64) > maximum {
+                return Some(format!("{path} must contain at most {maximum} items"));
+            }
+        }
+        for (index, item) in values.iter().enumerate() {
+            if let Some(error) = tool_input_schema_error(items, item, &format!("{path}[{index}]")) {
+                return Some(error);
+            }
+        }
+    }
+    None
+}
+
+fn provider_tool_call_schema_error(
+    candidates: &[ProviderToolCandidate],
+    calls: &[ProviderToolCall],
+) -> Option<String> {
+    calls.iter().find_map(|call| {
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.name == call.name)?;
+        tool_input_schema_error(&candidate.input_schema, &call.arguments, "arguments").map(
+            |error| {
+                format!(
+                    "provider tool-call protocol error for '{}' ({}): {error}",
+                    call.name, call.id
+                )
+            },
+        )
+    })
 }
 
 #[async_trait]
@@ -6573,6 +7125,119 @@ mod tests {
     }
 
     #[test]
+    fn accepts_object_tool_arguments_from_compatible_chat_streams() {
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        let mut collect = |_| Ok(());
+
+        accumulator
+            .apply(
+                &json!({
+                    "choices": [{"delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_read",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": {"path": "src/lib.rs"}
+                            }
+                        }]
+                    }}]
+                }),
+                &mut collect,
+            )
+            .unwrap();
+
+        let response = accumulator.finish().unwrap();
+        assert_eq!(
+            response.tool_calls,
+            vec![ProviderToolCall {
+                id: "call_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "src/lib.rs" }),
+            }]
+        );
+    }
+
+    #[test]
+    fn uses_final_message_tool_argument_snapshot_when_deltas_omit_it() {
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        let mut collect = |_| Ok(());
+
+        accumulator
+            .apply(
+                &json!({
+                    "choices": [{"delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_shell",
+                            "function": {"name": "shell"}
+                        }]
+                    }}]
+                }),
+                &mut collect,
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                &json!({
+                    "choices": [{
+                        "message": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_shell",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": {"command": "cargo test"}
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                &mut collect,
+            )
+            .unwrap();
+
+        let response = accumulator.finish().unwrap();
+        assert_eq!(response.finish_reason, ModelFinishReason::ToolCalls);
+        assert_eq!(
+            response.tool_calls,
+            vec![ProviderToolCall {
+                id: "call_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({ "command": "cargo test" }),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_streamed_tool_calls_that_never_carry_arguments() {
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        accumulator
+            .apply(
+                &json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_missing",
+                                "function": {"name": "shell"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+
+        let error = accumulator
+            .finish()
+            .expect_err("missing arguments must fail");
+        assert!(error.to_string().contains("function.arguments was absent"));
+    }
+
+    #[test]
     fn emits_provider_supplied_reasoning_deltas_without_synthesizing_text() {
         let mut accumulator = OpenAiStreamAccumulator::default();
         let mut deltas = Vec::new();
@@ -6731,6 +7396,86 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn chat_provider_recovers_invalid_streamed_tool_arguments_once_and_caches_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_http_request(&mut first).await;
+            assert!(first_request.contains(r#""stream":true"#));
+            first
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_shell\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first.shutdown().await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let second_request = read_http_request(&mut second).await;
+            assert!(second_request.contains(r#""stream":false"#));
+            let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_shell_recovered","type":"function","function":{"name":"shell","arguments":"{\"command\":\"cargo test\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+            second
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            second.shutdown().await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1"),
+            "test-key",
+            "tool-recovery-model",
+        );
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "shell".to_string(),
+            description: "Run a command".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }),
+        }];
+        let mut transport = Vec::new();
+        let response = provider
+            .stream_prepared(
+                provider.prepare(Uuid::new_v4(), request.clone()).unwrap(),
+                &mut |_| Ok(()),
+                &mut |event| {
+                    transport.push(event);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.tool_calls[0].arguments["command"], "cargo test");
+        assert!(transport.iter().any(|event| matches!(
+            event,
+            ProviderTransportEvent::Retry { reason, .. }
+                if reason.contains("non-streaming transport")
+        )));
+        let cached = provider.prepare(Uuid::new_v4(), request).unwrap();
+        assert_eq!(cached.body["stream"], false);
+        assert!(cached.body.get("stream_options").is_none());
     }
 
     #[tokio::test]
@@ -6899,12 +7644,19 @@ mod tests {
                 let request = read_http_request(&mut socket).await;
                 let is_responses = request.starts_with("POST /v1/responses ");
                 let has_developer = request.contains(r#""role":"developer""#);
+                let forces_tool = request.contains(r#""name":"compatibility_probe""#)
+                    && request.contains("opentopia-tool-probe-v1");
                 let (status, body) = if is_responses {
                     ("404 Not Found", r#"{"error":"not found"}"#)
                 } else if has_developer {
                     (
                         "400 Bad Request",
                         r#"{"error":"unsupported developer role"}"#,
+                    )
+                } else if forces_tool {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"probe_call","type":"function","function":{"name":"compatibility_probe","arguments":"{\"token\":\"opentopia-tool-probe-v1\"}"}}]},"finish_reason":"tool_calls"}]}"#,
                     )
                 } else {
                     ("200 OK", "{}")
@@ -6968,11 +7720,24 @@ mod tests {
             for _ in 0..8 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut socket).await;
+                let is_responses = request.starts_with("POST /v1/responses ");
                 let has_developer = request.contains(r#""role":"developer""#);
+                let forces_tool = request.contains(r#""name":"compatibility_probe""#)
+                    && request.contains("opentopia-tool-probe-v1");
                 let (status, body) = if has_developer {
                     (
                         "400 Bad Request",
                         r#"{"error":"unsupported developer role"}"#,
+                    )
+                } else if forces_tool && is_responses {
+                    (
+                        "200 OK",
+                        r#"{"output":[{"type":"function_call","call_id":"probe_call","name":"compatibility_probe","arguments":"{\"token\":\"opentopia-tool-probe-v1\"}"}]}"#,
+                    )
+                } else if forces_tool {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"probe_call","type":"function","function":{"name":"compatibility_probe","arguments":"{\"token\":\"opentopia-tool-probe-v1\"}"}}]},"finish_reason":"tool_calls"}]}"#,
                     )
                 } else {
                     ("200 OK", "{}")
@@ -7027,6 +7792,8 @@ mod tests {
                 let is_responses = request.starts_with("POST /v1/responses ");
                 let has_native_web_search = request.contains(r#""type":"web_search""#);
                 let has_developer = request.contains(r#""role":"developer""#);
+                let forces_tool = request.contains(r#""name":"compatibility_probe""#)
+                    && request.contains("opentopia-tool-probe-v1");
                 let (status, body) = if is_responses && has_native_web_search {
                     (
                         "400 Bad Request",
@@ -7036,6 +7803,16 @@ mod tests {
                     (
                         "400 Bad Request",
                         r#"{"error":"unsupported developer role"}"#,
+                    )
+                } else if forces_tool && is_responses {
+                    (
+                        "200 OK",
+                        r#"{"output":[{"type":"function_call","call_id":"probe_call","name":"compatibility_probe","arguments":"{\"token\":\"opentopia-tool-probe-v1\"}"}]}"#,
+                    )
+                } else if forces_tool {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"probe_call","type":"function","function":{"name":"compatibility_probe","arguments":"{\"token\":\"opentopia-tool-probe-v1\"}"}}]},"finish_reason":"tool_calls"}]}"#,
                     )
                 } else {
                     ("200 OK", "{}")

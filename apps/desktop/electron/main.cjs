@@ -16,6 +16,11 @@ const fs = require("node:fs");
 const net = require("node:net");
 const updater = require("./updater.cjs");
 const { createDesktopBrowserHost } = require("./browser-host.cjs");
+const {
+  inspectSandboxProtocol,
+  loadRuntimeBundle,
+  runtimeManifestName,
+} = require("./runtime-bundle.cjs");
 
 const isDev = !app.isPackaged;
 if (isDev) {
@@ -59,6 +64,8 @@ let crashLogsDirPath = null;
 let nextOpenRequestId = 1;
 let desktopBrowserHost = null;
 let desktopBrowserBroker = null;
+let packagedRuntimeBundle = null;
+let packagedRuntimeBundleError = null;
 
 function evalRuntimeFilePath() {
   return (
@@ -822,6 +829,10 @@ function createBackendEnv(repoRoot, options = {}) {
       const sandbox = resolveOpenTopiaWindowsSandboxBinary(repoRoot);
       if (sandbox.exists) {
         env.OPENTOPIA_WINDOWS_SANDBOX_BIN = sandbox.path;
+        writeLog("info", "sandbox.helper.selected", {
+          path: sandbox.path,
+          mode: isDev ? "development" : "packaged",
+        });
       } else if (sandbox.reason) {
         env.OPENTOPIA_SANDBOX_BACKEND_ERROR = sandbox.reason;
         writeLog("error", "sandbox.helper.missing", {
@@ -1393,19 +1404,29 @@ function serverBinaryName() {
 }
 
 function resolvePackagedServerBinary() {
-  const binaryName = serverBinaryName();
-  const candidates = [
-    path.join(process.resourcesPath || "", binaryName),
-    path.join(process.resourcesPath || "", "resources", binaryName),
-    path.join(__dirname, "..", "resources", binaryName),
-  ];
-  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  const bundle = resolvePackagedRuntimeBundle();
+  return bundle
+    ? { path: bundle.server, exists: true, candidates: [bundle.server] }
+    : {
+        path: path.join(process.resourcesPath || "", serverBinaryName()),
+        exists: false,
+        candidates: [
+          path.join(process.resourcesPath || "", runtimeManifestName),
+        ],
+        reason: packagedRuntimeBundleError?.message,
+      };
+}
 
-  return {
-    path: found || candidates[0],
-    exists: Boolean(found),
-    candidates,
-  };
+function resolvePackagedRuntimeBundle() {
+  if (packagedRuntimeBundle || packagedRuntimeBundleError) {
+    return packagedRuntimeBundle;
+  }
+  try {
+    packagedRuntimeBundle = loadRuntimeBundle(process.resourcesPath || "");
+  } catch (error) {
+    packagedRuntimeBundleError = error;
+  }
+  return packagedRuntimeBundle;
 }
 
 function openTopiaWindowsSandboxBinaryName() {
@@ -1424,20 +1445,31 @@ function cargoTargetDir(repoRoot) {
 
 function resolveOpenTopiaWindowsSandboxBinary(repoRoot) {
   const binaryName = openTopiaWindowsSandboxBinaryName();
-  const candidates = [
-    process.env.OPENTOPIA_WINDOWS_SANDBOX_BIN,
-    path.join(process.resourcesPath || "", "opentopia-sandbox", binaryName),
-    path.join(__dirname, "..", "resources", "opentopia-sandbox", binaryName),
-    path.join(cargoTargetDir(repoRoot), "debug", binaryName),
-  ].filter(Boolean);
-  const found = candidates.find((candidate) => fs.existsSync(candidate));
-  return {
-    path: found || candidates[0] || binaryName,
-    exists: Boolean(found),
-    reason: found
-      ? null
-      : `OpenTopia Windows sandbox helper was not found. Checked: ${candidates.join(", ")}`,
-  };
+  const explicit = process.env.OPENTOPIA_WINDOWS_SANDBOX_BIN;
+  const bundle = isDev ? null : resolvePackagedRuntimeBundle();
+  const selected =
+    explicit ||
+    (isDev
+      ? path.join(cargoTargetDir(repoRoot), "debug", binaryName)
+      : bundle?.sandbox);
+  if (!selected || !fs.existsSync(selected)) {
+    return {
+      path: selected || binaryName,
+      exists: false,
+      reason:
+        packagedRuntimeBundleError?.message ||
+        `OpenTopia Windows sandbox helper was not found at the runtime-owned path: ${selected || binaryName}`,
+    };
+  }
+  try {
+    const protocol =
+      bundle?.sandbox === selected
+        ? bundle.sandboxProtocol
+        : inspectSandboxProtocol(selected, bundle?.manifest?.sandboxProtocol);
+    return { path: selected, exists: true, reason: null, protocol };
+  } catch (error) {
+    return { path: selected, exists: false, reason: error.message };
+  }
 }
 
 // A dev backend is compiled ahead of time via `cargo build` and then spawned

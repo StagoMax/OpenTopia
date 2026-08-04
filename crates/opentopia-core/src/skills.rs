@@ -1,4 +1,5 @@
 use crate::plugins::{discover_plugins, PluginScope};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -25,7 +26,7 @@ pub struct SkillDescriptor {
     pub plugin_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillScope {
     Workspace,

@@ -1,6 +1,86 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsSandboxBackend {
+    #[default]
+    Auto,
+    Elevated,
+    Unelevated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxBackendCapabilities {
+    pub recursive_read_allowlist: bool,
+    pub recursive_write_allowlist: bool,
+    pub deny_read: bool,
+    pub deny_write: bool,
+    pub network_offline: bool,
+    pub network_online: bool,
+    pub private_desktop: bool,
+}
+
+impl SandboxBackendCapabilities {
+    pub fn for_platform(platform: OsSandboxPlatform, backend: WindowsSandboxBackend) -> Self {
+        match platform {
+            OsSandboxPlatform::Windows => match backend {
+                WindowsSandboxBackend::Elevated => Self {
+                    // A dedicated local user removes access to the host user's
+                    // private profile and supports explicit deny-read ACEs, but
+                    // Windows still has machine paths readable by all Users.
+                    // Do not advertise a complete read allowlist.
+                    recursive_read_allowlist: false,
+                    recursive_write_allowlist: true,
+                    deny_read: true,
+                    deny_write: true,
+                    network_offline: true,
+                    network_online: true,
+                    // Do not claim a private interactive desktop until the
+                    // backend creates and assigns one.
+                    private_desktop: false,
+                },
+                WindowsSandboxBackend::Auto | WindowsSandboxBackend::Unelevated => Self {
+                    // WRITE_RESTRICTED constrains writes, not reads. The
+                    // fallback deliberately preserves normal host-user reads.
+                    recursive_read_allowlist: false,
+                    recursive_write_allowlist: true,
+                    deny_read: false,
+                    deny_write: true,
+                    network_offline: false,
+                    network_online: true,
+                    private_desktop: false,
+                },
+            },
+            OsSandboxPlatform::Linux | OsSandboxPlatform::Macos => Self {
+                recursive_read_allowlist: true,
+                recursive_write_allowlist: true,
+                // Existing bwrap/Seatbelt profiles expose an allowlist, but
+                // the portable request layer does not yet translate arbitrary
+                // per-command deny-read exceptions on these platforms.
+                deny_read: false,
+                deny_write: true,
+                network_offline: true,
+                network_online: true,
+                private_desktop: false,
+            },
+            OsSandboxPlatform::Unsupported => Self {
+                recursive_read_allowlist: false,
+                recursive_write_allowlist: false,
+                deny_read: false,
+                deny_write: false,
+                network_offline: false,
+                network_online: false,
+                private_desktop: false,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -90,6 +170,8 @@ pub struct LocalSandboxConfig {
     pub writable_roots: Vec<PathBuf>,
     #[serde(default)]
     pub sandbox_home: Option<PathBuf>,
+    #[serde(default)]
+    pub windows_backend: WindowsSandboxBackend,
     /// Exact paths approved only for the replay of one user-approved tool call.
     #[serde(skip)]
     pub approved_read_paths: Vec<PathBuf>,
@@ -109,6 +191,7 @@ impl Default for LocalSandboxConfig {
             sandbox_mode: SandboxMode::WorkspaceWrite,
             writable_roots: Vec::new(),
             sandbox_home: None,
+            windows_backend: WindowsSandboxBackend::Auto,
             approved_read_paths: Vec::new(),
             approved_write_paths: Vec::new(),
         }
@@ -183,6 +266,13 @@ impl LocalSandboxConfig {
             .any(|approved| paths_equal(path, approved))
     }
 
+    pub fn has_approved_write_within(&self, root: &Path) -> bool {
+        let root = canonicalize_existing_ancestor(&absolute_path(root));
+        self.approved_write_paths.iter().any(|approved| {
+            canonicalize_existing_ancestor(&absolute_path(approved)).starts_with(&root)
+        })
+    }
+
     pub fn from_env() -> Self {
         let mode_value = std::env::var("OPENTOPIA_SANDBOX_MODE")
             .unwrap_or_else(|_| "workspace-write".to_string())
@@ -234,6 +324,17 @@ impl LocalSandboxConfig {
             sandbox_home: std::env::var("OPENTOPIA_SANDBOX_HOME")
                 .ok()
                 .map(PathBuf::from),
+            windows_backend: match std::env::var("OPENTOPIA_WINDOWS_SANDBOX") {
+                Ok(value) => match value.to_ascii_lowercase().as_str() {
+                    "auto" => WindowsSandboxBackend::Auto,
+                    "elevated" => WindowsSandboxBackend::Elevated,
+                    "unelevated" | "legacy" => WindowsSandboxBackend::Unelevated,
+                    // Fail closed: an invalid backend name must not silently
+                    // select the weaker fallback.
+                    _ => WindowsSandboxBackend::Elevated,
+                },
+                Err(_) => WindowsSandboxBackend::Auto,
+            },
             approved_read_paths: Vec::new(),
             approved_write_paths: Vec::new(),
         }
@@ -252,6 +353,39 @@ impl LocalSandboxConfig {
                         .iter()
                         .filter_map(|path| path.parent().map(Path::to_path_buf)),
                 ),
+        )
+    }
+
+    pub fn effective_sandbox_home(&self, workspace_root: &Path) -> Option<PathBuf> {
+        if !self.is_enabled() {
+            return self.sandbox_home.clone();
+        }
+        self.sandbox_home.clone().or_else(|| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            absolute_path(workspace_root).hash(&mut hasher);
+            Some(
+                std::env::temp_dir()
+                    .join("OpenTopia")
+                    .join("sandbox-home")
+                    .join(format!("{:016x}", hasher.finish())),
+            )
+        })
+    }
+
+    pub fn effective_command_writable_roots(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        dedup_paths(
+            self.effective_writable_roots(workspace_root)
+                .into_iter()
+                .chain(self.effective_sandbox_home(workspace_root)),
+        )
+    }
+
+    pub fn effective_command_readable_roots(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        dedup_paths(
+            self.effective_readable_roots(workspace_root)
+                .into_iter()
+                .chain(self.effective_sandbox_home(workspace_root)),
         )
     }
 
@@ -380,6 +514,20 @@ pub struct SandboxCommandPlan {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub status: SandboxCommandStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SandboxLaunchOptions {
+    pub interactive: bool,
+    pub runtime_read_roots: Vec<PathBuf>,
+    pub environment_keys: Vec<String>,
+    pub additional_denied_read_paths: Vec<PathBuf>,
+    pub additional_protected_paths: Vec<PathBuf>,
+    pub timeout_ms: Option<u64>,
+    pub termination_timeout_ms: Option<u64>,
+    pub max_memory_bytes: Option<u64>,
+    pub max_cpu_time_ms: Option<u64>,
+    pub max_output_bytes: Option<u64>,
 }
 
 impl SandboxCommandPlan {
@@ -527,13 +675,32 @@ pub fn build_local_sandbox_command(
     workspace_root: &Path,
     config: &LocalSandboxConfig,
 ) -> anyhow::Result<SandboxCommandPlan> {
-    build_local_sandbox_command_for_platform(
+    build_local_sandbox_command_with_options(
+        program,
+        args,
+        cwd,
+        workspace_root,
+        config,
+        &SandboxLaunchOptions::default(),
+    )
+}
+
+pub fn build_local_sandbox_command_with_options(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    workspace_root: &Path,
+    config: &LocalSandboxConfig,
+    options: &SandboxLaunchOptions,
+) -> anyhow::Result<SandboxCommandPlan> {
+    build_local_sandbox_command_for_platform_with_options(
         OsSandboxPlatform::current(),
         program,
         args,
         cwd,
         workspace_root,
         config,
+        options,
     )
 }
 
@@ -544,6 +711,26 @@ pub fn build_local_sandbox_command_for_platform(
     cwd: &Path,
     workspace_root: &Path,
     config: &LocalSandboxConfig,
+) -> anyhow::Result<SandboxCommandPlan> {
+    build_local_sandbox_command_for_platform_with_options(
+        platform,
+        program,
+        args,
+        cwd,
+        workspace_root,
+        config,
+        &SandboxLaunchOptions::default(),
+    )
+}
+
+pub fn build_local_sandbox_command_for_platform_with_options(
+    platform: OsSandboxPlatform,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    workspace_root: &Path,
+    config: &LocalSandboxConfig,
+    options: &SandboxLaunchOptions,
 ) -> anyhow::Result<SandboxCommandPlan> {
     if config.sandbox_mode == SandboxMode::DangerFullAccess {
         return Ok(SandboxCommandPlan::unrestricted(program, args));
@@ -560,7 +747,7 @@ pub fn build_local_sandbox_command_for_platform(
             build_sandbox_exec_command(program, args, workspace_root, config)
         }
         OsSandboxPlatform::Windows => {
-            build_windows_sandbox_command(program, args, cwd, workspace_root, config)
+            build_windows_sandbox_command(program, args, cwd, workspace_root, config, options)
         }
         OsSandboxPlatform::Unsupported => {
             build_unsupported_sandbox_command(platform, program, args, config)
@@ -692,13 +879,34 @@ fn build_windows_sandbox_command(
     cwd: &Path,
     workspace_root: &Path,
     config: &LocalSandboxConfig,
+    options: &SandboxLaunchOptions,
 ) -> anyhow::Result<SandboxCommandPlan> {
-    let Some(sandbox) = resolve_opentopia_sandbox_binary() else {
-        let reason = std::env::var("OPENTOPIA_SANDBOX_BACKEND_ERROR")
-            .unwrap_or_else(|_| "OpenTopia Windows sandbox backend was not found".to_string());
-        return unavailable_backend(OsSandboxPlatform::Windows, reason, program, args, config);
+    let sandbox = match resolve_opentopia_sandbox_binary() {
+        Ok(Some(sandbox)) => sandbox,
+        Ok(None) => {
+            let reason = std::env::var("OPENTOPIA_SANDBOX_BACKEND_ERROR")
+                .unwrap_or_else(|_| "OpenTopia Windows sandbox backend was not found".to_string());
+            return unavailable_backend(OsSandboxPlatform::Windows, reason, program, args, config);
+        }
+        Err(error) => {
+            return unavailable_backend(
+                OsSandboxPlatform::Windows,
+                error.to_string(),
+                program,
+                args,
+                config,
+            )
+        }
     };
-    build_windows_sandbox_command_with_binary(sandbox, program, args, cwd, workspace_root, config)
+    build_windows_sandbox_command_with_binary(
+        sandbox,
+        program,
+        args,
+        cwd,
+        workspace_root,
+        config,
+        options,
+    )
 }
 
 fn build_windows_sandbox_command_with_binary(
@@ -708,15 +916,46 @@ fn build_windows_sandbox_command_with_binary(
     cwd: &Path,
     workspace_root: &Path,
     config: &LocalSandboxConfig,
+    options: &SandboxLaunchOptions,
 ) -> anyhow::Result<SandboxCommandPlan> {
+    const ERROR_NONCE_ENV: &str = "OPENTOPIA_SANDBOX_ERROR_NONCE";
     let workspace_root = absolute_path(workspace_root);
+    let error_nonce = Uuid::new_v4().simple().to_string();
     let mut sandbox_args = vec![
         "run".to_string(),
         "--cwd".to_string(),
         path_to_string(&absolute_path(cwd)),
+        "--backend".to_string(),
+        match config.windows_backend {
+            WindowsSandboxBackend::Auto => "auto",
+            WindowsSandboxBackend::Elevated => "elevated",
+            WindowsSandboxBackend::Unelevated => "unelevated",
+        }
+        .to_string(),
     ];
+    if options.interactive {
+        sandbox_args.push("--interactive".to_string());
+    }
+    if let Some(timeout_ms) = options.timeout_ms {
+        sandbox_args.extend(["--timeout-ms".to_string(), timeout_ms.to_string()]);
+    }
+    if let Some(timeout_ms) = options.termination_timeout_ms {
+        sandbox_args.extend([
+            "--termination-timeout-ms".to_string(),
+            timeout_ms.to_string(),
+        ]);
+    }
+    if let Some(bytes) = options.max_memory_bytes {
+        sandbox_args.extend(["--max-memory-bytes".to_string(), bytes.to_string()]);
+    }
+    if let Some(milliseconds) = options.max_cpu_time_ms {
+        sandbox_args.extend(["--max-cpu-time-ms".to_string(), milliseconds.to_string()]);
+    }
+    if let Some(bytes) = options.max_output_bytes {
+        sandbox_args.extend(["--max-output-bytes".to_string(), bytes.to_string()]);
+    }
     for root in config
-        .effective_readable_roots(&workspace_root)
+        .effective_command_readable_roots(&workspace_root)
         .into_iter()
         .filter(|root| root.exists())
     {
@@ -725,8 +964,20 @@ fn build_windows_sandbox_command_with_binary(
             path_to_string(&absolute_path(root)),
         ]);
     }
+    for root in options
+        .runtime_read_roots
+        .iter()
+        .cloned()
+        .chain(windows_minimal_runtime_roots())
+        .filter(|root| root.exists())
+    {
+        sandbox_args.extend([
+            "--runtime-root".to_string(),
+            path_to_string(&absolute_path(root)),
+        ]);
+    }
     for root in config
-        .effective_writable_roots(&workspace_root)
+        .effective_command_writable_roots(&workspace_root)
         .into_iter()
         .filter(|root| root.exists())
     {
@@ -735,12 +986,33 @@ fn build_windows_sandbox_command_with_binary(
             path_to_string(&absolute_path(root)),
         ]);
     }
-    for path in protected_paths(&workspace_root, config)
+    let (protected, approved_protected): (Vec<_>, Vec<_>) =
+        protected_paths(&workspace_root, config)
+            .into_iter()
+            .partition(|path| !config.has_approved_write_within(path));
+    for path in approved_protected.into_iter().filter(|path| path.exists()) {
+        sandbox_args.extend([
+            "--allow-protected-root".to_string(),
+            path_to_string(&absolute_path(path)),
+        ]);
+    }
+    for path in protected
         .into_iter()
+        .chain(options.additional_protected_paths.iter().cloned())
         .filter(|path| path.exists())
     {
         sandbox_args.extend([
             "--protect".to_string(),
+            path_to_string(&absolute_path(path)),
+        ]);
+    }
+    for path in options
+        .additional_denied_read_paths
+        .iter()
+        .filter(|path| path.exists())
+    {
+        sandbox_args.extend([
+            "--deny-read".to_string(),
             path_to_string(&absolute_path(path)),
         ]);
     }
@@ -759,12 +1031,87 @@ fn build_windows_sandbox_command_with_binary(
     Ok(SandboxCommandPlan {
         program: path_to_string(&sandbox),
         args: sandbox_args,
-        env: Vec::new(),
+        env: {
+            let mut env = opentopia_sandbox_state_dir()
+                .map(|path| {
+                    vec![(
+                        "OPENTOPIA_SANDBOX_STATE_DIR".to_string(),
+                        path_to_string(&path),
+                    )]
+                })
+                .unwrap_or_default();
+            let mut keys = windows_sandbox_environment_keys();
+            keys.extend(options.environment_keys.iter().cloned());
+            keys.push("OPENTOPIA_SANDBOX_STATE_DIR".to_string());
+            keys.sort_by_key(|key| key.to_ascii_uppercase());
+            keys.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+            env.push(("OPENTOPIA_SANDBOX_ENV_KEYS".to_string(), keys.join(";")));
+            env.push((ERROR_NONCE_ENV.to_string(), error_nonce));
+            env
+        },
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Windows,
-            backend: "opentopia-windows-appcontainer".to_string(),
+            backend: match config.windows_backend {
+                WindowsSandboxBackend::Auto => "opentopia-windows-auto",
+                WindowsSandboxBackend::Elevated => "opentopia-windows-elevated",
+                WindowsSandboxBackend::Unelevated => "opentopia-windows-restricted-token",
+            }
+            .to_string(),
         },
     })
+}
+
+fn windows_sandbox_environment_keys() -> Vec<String> {
+    [
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATH",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "USERPROFILE",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "NO_COLOR",
+        "TERM",
+        "PAGER",
+        "GIT_PAGER",
+        "GH_PAGER",
+        "CI",
+        "OPENTOPIA_SANDBOX",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn opentopia_sandbox_state_dir() -> Option<PathBuf> {
+    std::env::var_os("OPENTOPIA_SANDBOX_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map(|root| root.join("OpenTopia").join("sandbox"))
+        })
+}
+
+fn windows_minimal_runtime_roots() -> impl Iterator<Item = PathBuf> {
+    [
+        std::env::var_os("SystemRoot").map(PathBuf::from),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+        std::env::var_os("ProgramData").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|path| path.exists())
 }
 
 fn build_unsupported_sandbox_command(
@@ -810,18 +1157,99 @@ fn unavailable_backend(
 
 fn windows_permission_profile(config: &LocalSandboxConfig) -> &'static str {
     match (config.sandbox_mode, config.network) {
-        (SandboxMode::ReadOnly, NetworkPolicy::Deny) => "opentopia-appcontainer-read-only-offline",
+        (SandboxMode::ReadOnly, NetworkPolicy::Deny) => "opentopia-windows-read-only-offline",
         (SandboxMode::WorkspaceWrite, NetworkPolicy::Deny) => {
-            "opentopia-appcontainer-workspace-write-offline"
+            "opentopia-windows-workspace-write-offline"
         }
-        (SandboxMode::ReadOnly, _) => "opentopia-appcontainer-read-only-internet",
-        (SandboxMode::WorkspaceWrite, _) => "opentopia-appcontainer-workspace-write-internet",
+        (SandboxMode::ReadOnly, _) => "opentopia-windows-read-only-internet",
+        (SandboxMode::WorkspaceWrite, _) => "opentopia-windows-workspace-write-internet",
         (SandboxMode::DangerFullAccess, _) => "danger-full-access",
     }
 }
 
-fn resolve_opentopia_sandbox_binary() -> Option<PathBuf> {
+static WINDOWS_SANDBOX_PROTOCOL_CACHE: OnceLock<Mutex<HashMap<String, Result<(), String>>>> =
+    OnceLock::new();
+
+fn sandbox_binary_fingerprint(path: &Path) -> anyhow::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(format!(
+        "{}\n{}\n{modified}",
+        path.display(),
+        metadata.len()
+    ))
+}
+
+fn verify_opentopia_sandbox_binary(path: &Path) -> anyhow::Result<()> {
+    let fingerprint = sandbox_binary_fingerprint(path)?;
+    let cache = WINDOWS_SANDBOX_PROTOCOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(result) = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&fingerprint).cloned())
+    {
+        return result.map_err(anyhow::Error::msg);
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        let output = Command::new(path)
+            .args(["protocol", "--json"])
+            .output()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to start OpenTopia sandbox protocol handshake at '{}': {error}",
+                    path.display()
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "OpenTopia sandbox helper at '{}' does not implement the required protocol handshake (exit {}): {}. Rebuild the server and helper as one runtime bundle.",
+                path.display(),
+                output.status.code().unwrap_or(-1),
+                if stderr.is_empty() { "no diagnostic" } else { &stderr }
+            );
+        }
+        let info: opentopia_sandbox_protocol::SandboxProtocolInfo =
+            serde_json::from_slice(&output.stdout).map_err(|error| {
+                anyhow::anyhow!(
+                    "OpenTopia sandbox helper at '{}' returned an invalid protocol descriptor: {error}",
+                    path.display()
+                )
+            })?;
+        if let Some(error) = info.compatibility_error() {
+            anyhow::bail!(
+                "OpenTopia sandbox helper at '{}' is incompatible: {error}. Rebuild the server and helper as one runtime bundle.",
+                path.display()
+            );
+        }
+        Ok(())
+    })()
+    .map_err(|error| error.to_string());
+
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(fingerprint, result.clone());
+    }
+    result.map_err(anyhow::Error::msg)
+}
+
+fn resolve_opentopia_sandbox_binary() -> anyhow::Result<Option<PathBuf>> {
     let configured = std::env::var_os("OPENTOPIA_WINDOWS_SANDBOX_BIN").map(PathBuf::from);
+    if let Some(configured) = configured {
+        if !configured.is_file() {
+            anyhow::bail!(
+                "configured OpenTopia Windows sandbox helper was not found at '{}'",
+                configured.display()
+            );
+        }
+        verify_opentopia_sandbox_binary(&configured)?;
+        return Ok(Some(configured));
+    }
     let (sibling, cargo_debug_sibling) = std::env::current_exe()
         .ok()
         .map(|path| {
@@ -838,11 +1266,23 @@ fn resolve_opentopia_sandbox_binary() -> Option<PathBuf> {
             (sibling, cargo_debug_sibling)
         })
         .unwrap_or((None, None));
-    configured
+    let candidates = sibling
         .into_iter()
-        .chain(sibling)
         .chain(cargo_debug_sibling)
-        .find(|path| path.is_file())
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    let mut incompatibilities = Vec::new();
+    for candidate in candidates {
+        match verify_opentopia_sandbox_binary(&candidate) {
+            Ok(()) => return Ok(Some(candidate)),
+            Err(error) => incompatibilities.push(error.to_string()),
+        }
+    }
+    if incompatibilities.is_empty() {
+        Ok(None)
+    } else {
+        anyhow::bail!(incompatibilities.join("; "))
+    }
 }
 
 fn first_existing_executable(candidates: &[PathBuf]) -> Option<PathBuf> {
@@ -1212,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_adapter_builds_first_party_appcontainer_command() {
+    fn windows_adapter_builds_first_party_broker_command() {
         let root =
             std::env::temp_dir().join(format!("opentopia-windows-plan-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
@@ -1230,6 +1670,11 @@ mod tests {
             &workspace,
             &workspace,
             &config,
+            &SandboxLaunchOptions {
+                interactive: true,
+                max_output_bytes: Some(65_536),
+                ..SandboxLaunchOptions::default()
+            },
         )
         .expect("build first-party Windows sandbox plan");
 
@@ -1255,14 +1700,23 @@ mod tests {
         assert!(plan
             .args
             .windows(2)
+            .any(|args| args == ["--max-output-bytes", "65536"]));
+        assert!(plan.args.iter().any(|arg| arg == "--interactive"));
+        assert!(plan
+            .args
+            .windows(2)
             .any(|args| args == ["--", "powershell.exe"]));
         assert!(matches!(
             plan.status,
             SandboxCommandStatus::Wrapped {
                 platform: OsSandboxPlatform::Windows,
                 ref backend,
-            } if backend == "opentopia-windows-appcontainer"
+            } if backend == "opentopia-windows-auto"
         ));
+        assert!(plan
+            .env
+            .iter()
+            .any(|(key, value)| key == "OPENTOPIA_SANDBOX_ERROR_NONCE" && !value.is_empty()));
 
         let _ = std::fs::remove_dir_all(root);
     }
