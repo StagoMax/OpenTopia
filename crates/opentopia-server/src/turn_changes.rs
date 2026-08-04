@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 const MAX_MERGE_FILE_BYTES: usize = 16 * 1024 * 1024;
 const TURN_FILE_DIFF_PAGE_BYTES: usize = 96 * 1024;
+const GIT_FAILURE_DETAIL_CHARS: usize = 600;
 
 #[derive(Clone)]
 pub struct TurnChangeManager {
@@ -1215,10 +1216,45 @@ fn ensure_git_success(output: &Output, action: &str) -> anyhow::Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    anyhow::bail!(
-        "{action} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
+    anyhow::bail!("{action} failed: {}", git_failure_detail(&output.stderr))
+}
+
+fn git_failure_detail(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let lines = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let decisive = lines
+        .iter()
+        .copied()
+        .filter(|line| {
+            let line = line.to_ascii_lowercase();
+            line.starts_with("error:") || line.starts_with("fatal:")
+        })
+        .collect::<Vec<_>>();
+    let selected = if decisive.is_empty() {
+        lines.iter().rev().take(4).copied().collect::<Vec<_>>()
+    } else {
+        decisive.into_iter().rev().take(4).collect::<Vec<_>>()
+    };
+    let detail = selected.into_iter().rev().collect::<Vec<_>>().join(" ");
+    let detail = if detail.is_empty() {
+        "unknown Git error".to_string()
+    } else {
+        detail
+    };
+    let mut chars = detail.chars();
+    let truncated = chars
+        .by_ref()
+        .take(GIT_FAILURE_DETAIL_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 fn expected_entry(oid: Option<&str>, mode: Option<&str>) -> anyhow::Result<TreeEntry> {
@@ -1363,6 +1399,19 @@ mod tests {
             .insert_turn(TurnRecord::running(thread_id, message.id))
             .unwrap()
             .turn_id
+    }
+
+    #[test]
+    fn git_failure_detail_prefers_actionable_errors_over_noisy_warnings() {
+        let stderr = format!(
+            "{}error: open(\"app\"): Function not implemented\nerror: unable to index file 'app'\nfatal: adding files failed\n",
+            "warning: LF will be replaced by CRLF\n".repeat(200)
+        );
+        let detail = git_failure_detail(stderr.as_bytes());
+        assert!(detail.contains("unable to index file 'app'"));
+        assert!(detail.contains("fatal: adding files failed"));
+        assert!(!detail.contains("LF will be replaced"));
+        assert!(detail.chars().count() <= GIT_FAILURE_DETAIL_CHARS + 1);
     }
 
     #[tokio::test]
