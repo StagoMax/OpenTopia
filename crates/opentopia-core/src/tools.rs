@@ -14,7 +14,7 @@ use crate::computer::{
     ComputerAction, ComputerMouseButton, ComputerPolicyContext, ComputerRuntime, ComputerSessionId,
     ObserveOptions,
 };
-use crate::enterprise::DataClassification;
+use crate::enterprise::{CapabilityProjection, DataClassification};
 use crate::execution::{
     ExecRequest, ExecutionContext, ExecutionEnvironment, FileDeleteRequest, FileReadRequest,
     FileWriteRequest, LocalExecutionEnvironment,
@@ -87,6 +87,9 @@ pub struct ToolContext {
     /// Browser navigation uses this as a one-time fallback when a caller does not have a
     /// persistent session store from which it can read the approved domain.
     pub approval_granted: bool,
+    /// The same fail-closed projection used to build the provider catalog.
+    /// Discovery tools must apply it to their result contents as well.
+    pub capability_projection: CapabilityProjection,
 }
 
 impl ToolContext {
@@ -123,6 +126,7 @@ impl ToolContext {
             collaboration_mode: CollaborationMode::Default,
             goal_id: None,
             approval_granted: false,
+            capability_projection: CapabilityProjection::unrestricted(),
         }
     }
 
@@ -151,6 +155,7 @@ impl ToolContext {
             collaboration_mode: CollaborationMode::Default,
             goal_id: None,
             approval_granted: false,
+            capability_projection: CapabilityProjection::unrestricted(),
         }
     }
 
@@ -1963,7 +1968,16 @@ impl TypedTool for ListSkillsTool {
         _input: Self::Input,
         ctx: ToolContext,
     ) -> anyhow::Result<ToolResult> {
-        let skills = discover_skills(Some(&ctx.workspace_root));
+        let skills = discover_skills(Some(&ctx.workspace_root))
+            .into_iter()
+            .filter(|skill| {
+                ctx.capability_projection.allows_skill(&skill.id)
+                    && skill
+                        .plugin_id
+                        .as_ref()
+                        .is_none_or(|plugin_id| ctx.capability_projection.allows_plugin(plugin_id))
+            })
+            .collect::<Vec<_>>();
         let value = serde_json::to_value(&skills)?;
         Ok(ToolResult {
             call_id,
@@ -2012,6 +2026,10 @@ impl TypedTool for ReadSkillTool {
     ) -> anyhow::Result<ToolResult> {
         let id = input.id.trim();
         anyhow::ensure!(!id.is_empty(), "read_skill id must be a non-empty string");
+        anyhow::ensure!(
+            ctx.capability_projection.allows_skill(id),
+            "Skill is outside the active ExecutionContext projection: {id}"
+        );
         let limit = input.limit.map_or(MAX_SKILL_BYTES, |value| {
             (value as usize).min(MAX_SKILL_BYTES)
         });
@@ -2019,6 +2037,12 @@ impl TypedTool for ReadSkillTool {
         // catalog. It cannot be used as a general-purpose path read, including for user Skills
         // that intentionally live outside the thread workspace.
         let slice = load_skill_slice(Some(&ctx.workspace_root), id, input.offset, limit)?;
+        if let Some(plugin_id) = slice.descriptor.plugin_id.as_ref() {
+            anyhow::ensure!(
+                ctx.capability_projection.allows_plugin(plugin_id),
+                "Skill plugin is outside the active ExecutionContext projection: {plugin_id}"
+            );
+        }
         let output = slice.render_for_model();
         Ok(ToolResult {
             call_id,
@@ -5656,6 +5680,40 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn skill_discovery_and_reads_honor_execution_context_projection() {
+        let workspace = std::env::current_dir().unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut context = ToolContext::local(workspace, policy);
+        context.capability_projection = CapabilityProjection::deny_all();
+
+        let listed = ListSkillsTool
+            .execute_typed(Uuid::new_v4(), EmptyToolInput {}, context.clone())
+            .await
+            .unwrap();
+        let catalog: Value = serde_json::from_str(&listed.output).unwrap();
+        assert_eq!(catalog, serde_json::json!([]));
+
+        let error = ReadSkillTool
+            .execute_typed(
+                Uuid::new_v4(),
+                ReadSkillInput {
+                    id: "unavailable-skill".to_string(),
+                    offset: 0,
+                    limit: None,
+                },
+                context,
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside the active ExecutionContext projection"));
     }
 
     fn schema_contains_reference(value: &Value) -> bool {

@@ -1888,6 +1888,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 ctx.cancel = cancellation.clone();
                 ctx.browser = Some(self.browser.clone());
                 ctx.computer = Some(self.computer.clone());
+                ctx.capability_projection = self.capability_projection.clone();
                 self.apply_subagent_context(&mut ctx, user_message_id);
                 ctx.fork_conversation = conversation.clone();
                 ctx.fork_conversation.push(ModelConversationMessage {
@@ -2656,6 +2657,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         let plugin_enabled = match self.tools.source(name) {
             Some(ToolSource::BundledPlugin { plugin_name }) => {
                 self.enabled_bundled_plugins.contains(&plugin_name)
+                    && self.capability_projection.allows_plugin(&plugin_name)
             }
             _ => true,
         };
@@ -2730,6 +2732,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         ctx.approval_granted = true;
         ctx.browser = Some(self.browser.clone());
         ctx.computer = Some(self.computer.clone());
+        ctx.capability_projection = self.capability_projection.clone();
         self.apply_subagent_context(&mut ctx, fallback_turn_id);
         match self
             .execute_provider_tool_call(call, fallback_turn_id, ctx, events)

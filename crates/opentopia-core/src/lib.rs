@@ -98,10 +98,14 @@ pub use effect_journal::{
     EffectJournalRecord, EffectKind, EffectSideEffectClass, EffectStatus,
 };
 pub use enterprise::{
-    AgentDefinitionV1, AuditEventV1, CapabilityProjection, DataClassification,
+    AgentBudgetV1, AgentDefinitionV1, AgentInstanceStatusV1, AgentInstanceV1, AgentModelBindingV1,
+    AgentModelPolicyV1, AgentRiskClassV1, AgentTemplateDiffV1, AgentTemplateError,
+    AgentTemplateSpecV1, AgentTemplateStatusV1, AgentTemplateVersionV1, AuditEventV1,
+    CapabilityChangeKindV1, CapabilityChangeV1, CapabilityProjection, DataClassification,
     EnterpriseExecutionContextV1, EvidenceRecordV1, ExecutionBoundaryError, ExecutionIdentityRoute,
     ExecutionIdentityRouter, ExecutionResourceGrantV1, ExperienceSurfaceProfile, FlowDefinitionV1,
     GraphDefinitionV1, GraphEdgeV1, GraphNodeV1, ResourceKind, ENTERPRISE_SCHEMA_VERSION_V1,
+    MAX_AGENT_DELEGATION_DEPTH,
 };
 pub use execution::{
     ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
@@ -230,8 +234,8 @@ pub use spreadsheet::{
     MAX_OUTPUT_FILE_BYTES as MAX_SPREADSHEET_OUTPUT_BYTES,
 };
 pub use store::{
-    normalize_workspace_key, ContextBudget, ProviderContextStateKind, ProviderConversationState,
-    SessionStore, SqliteSessionStore, StoreError,
+    normalize_workspace_key, AgentTemplateStoreError, ContextBudget, ProviderContextStateKind,
+    ProviderConversationState, SessionStore, SqliteSessionStore, StoreError,
 };
 pub use subagents::{
     AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDelivery, AgentWaitActivity,

@@ -1501,6 +1501,109 @@ export type CapabilityProjection = {
   workspaceRoots: string[];
 };
 
+export type DataClassification =
+  "public" | "internal" | "confidential" | "restricted";
+
+export type ExecutionResourceGrant = {
+  bindingId: string;
+  kind: "file" | "network" | "database";
+  resource: string;
+  canRead: boolean;
+  canWrite: boolean;
+  maxDataClassification: DataClassification;
+};
+
+export type AgentModelBinding = {
+  providerId: string;
+  modelId: string;
+};
+
+export type AgentModelPolicy = {
+  allowAllModels: boolean;
+  allowedModels: AgentModelBinding[];
+};
+
+export type AgentTemplateSpec = {
+  description: string;
+  instructions: string;
+  capabilities: CapabilityProjection;
+  resourceGrants: ExecutionResourceGrant[];
+  modelPolicy: AgentModelPolicy;
+  stateSchema: unknown;
+  outputSchema: unknown;
+  allowAllDelegates: boolean;
+  delegateTemplateIds: string[];
+  budget: {
+    maxTurns: number;
+    maxToolCalls: number;
+    maxDurationSeconds: number;
+  };
+  riskClass: "low" | "medium" | "high" | "critical";
+};
+
+export type AgentTemplateVersion = {
+  schemaVersion: number;
+  templateId: string;
+  version: number;
+  name: string;
+  owner: string;
+  spec: AgentTemplateSpec;
+  status: "draft" | "published";
+  contentHash: string;
+  createdAt: string;
+  publishedAt: string | null;
+  publishedBy: string | null;
+};
+
+export type AgentCapabilityChange = {
+  scope: string;
+  value: string;
+  kind: "added" | "removed" | "expanded" | "reduced";
+};
+
+export type AgentTemplateVersionView = {
+  template: AgentTemplateVersion;
+  diff: {
+    fromVersion: number | null;
+    toVersion: number;
+    changes: AgentCapabilityChange[];
+    widensCapabilities: boolean;
+  };
+};
+
+export type AgentInstanceStatus =
+  "active" | "suspended" | "completed" | "revoked";
+
+export type EnterpriseExecutionContext = {
+  schemaVersion: number;
+  agentId: string;
+  threadId: string;
+  mode: ExperienceMode;
+  templateId: string;
+  templateVersion: number;
+  parentAgentId: string | null;
+  delegationChain: string[];
+  capabilities: CapabilityProjection;
+  resourceGrants: ExecutionResourceGrant[];
+  modelPolicy: AgentModelPolicy;
+};
+
+export type AgentInstance = {
+  schemaVersion: number;
+  id: string;
+  templateId: string;
+  templateVersion: number;
+  threadId: string;
+  parentInstanceId: string | null;
+  delegationDepth: number;
+  executionContext: EnterpriseExecutionContext;
+  state: unknown;
+  stateRevision: number;
+  status: AgentInstanceStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type ThreadCapabilities = {
   threadId: string;
   experienceMode: ExperienceMode;

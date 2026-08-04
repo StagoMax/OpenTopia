@@ -1,4 +1,4 @@
-use super::{ensure_thread, sync_plugin_mcp_configs, ApiError, AppState};
+use super::{ensure_thread, load_bound_agent_context, sync_plugin_mcp_configs, ApiError, AppState};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, put};
 use axum::{Json, Router};
@@ -307,6 +307,11 @@ async fn get_thread_capabilities(
 ) -> Result<Json<ThreadCapabilitiesResponse>, ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
     let surface_profile = ExperienceSurfaceProfile::for_mode(thread.experience_mode);
+    let mut effective_capabilities = surface_profile.capabilities.clone();
+    if let (Some(instance), _) = load_bound_agent_context(&state, &thread)? {
+        effective_capabilities =
+            effective_capabilities.intersect(&instance.execution_context.capabilities);
+    }
     let mut plugins = Vec::new();
     for plugin in discover_plugins(Some(&thread.workspace_root)) {
         let manifest = inspect_plugin_control_manifest(&plugin)
@@ -321,8 +326,8 @@ async fn get_thread_capabilities(
             Some(thread_id),
         )?;
         let enabled = configured_enabled
-            && (surface_profile.capabilities.allows_plugin(&plugin.id)
-                || surface_profile.capabilities.allows_plugin(&plugin.name));
+            && (effective_capabilities.allows_plugin(&plugin.id)
+                || effective_capabilities.allows_plugin(&plugin.name));
         let grants = state.store.list_plugin_permission_grants(&plugin.id)?;
         let granted_permissions =
             effective_granted_permissions(&grants, &thread.workspace_root, thread_id);
@@ -344,7 +349,7 @@ async fn get_thread_capabilities(
         thread_id,
         experience_mode: thread.experience_mode,
         prompt_profile_id: surface_profile.prompt_profile_id,
-        capability_projection: surface_profile.capabilities,
+        capability_projection: effective_capabilities,
         workspace_root: thread.workspace_root,
         generated_at: Utc::now(),
         snapshot,

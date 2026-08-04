@@ -105,6 +105,7 @@ import {
 } from "./components/ApprovalDialog";
 import { PlanChoiceCard } from "./components/PlanChoiceCard";
 import { PreviewHost } from "./components/PreviewHost";
+import { AgentTemplatePanel } from "./components/AgentTemplatePanel";
 import { RightContextRail } from "./components/RightContextRail";
 import { SettingsPanel as RedesignedSettingsPanel } from "./components/SettingsPanel";
 import { TaskSearchDialog } from "./components/TaskSearchDialog";
@@ -10873,25 +10874,34 @@ function RightPanel({
       aria-label="右侧上下文摘要"
       aria-hidden={!contextRailOpen}
     >
-      <RightContextRail
-        client={client}
-        threadId={thread?.id ?? null}
-        workspaceRoot={workspaceRoot}
-        workspaceDiff={workspaceDiff}
-        terminalEvents={terminalEvents}
-        terminalSession={terminalSession}
-        agentEvents={events}
-        subagentRuns={subagentRuns}
-        artifacts={artifacts}
-        messages={messages}
-        onOpenDiff={() => onOpenToolTab("diff")}
-        onOpenTerminal={() => onOpenToolTab("terminal")}
-        onOpenFiles={() => onOpenToolTab("files")}
-        onOpenEnvironment={() => onOpenToolTab("sandbox")}
-        onAddSource={onAddContextSources}
-        onCancelSubagent={onCancelSubagent}
-        onGitChanged={onRefreshWorkbench}
-      />
+      {thread?.experienceMode === "flow" ? (
+        <AgentTemplatePanel
+          client={client}
+          threadId={thread.id}
+          workspaceRoot={workspaceRoot}
+          settings={settings}
+        />
+      ) : (
+        <RightContextRail
+          client={client}
+          threadId={thread?.id ?? null}
+          workspaceRoot={workspaceRoot}
+          workspaceDiff={workspaceDiff}
+          terminalEvents={terminalEvents}
+          terminalSession={terminalSession}
+          agentEvents={events}
+          subagentRuns={subagentRuns}
+          artifacts={artifacts}
+          messages={messages}
+          onOpenDiff={() => onOpenToolTab("diff")}
+          onOpenTerminal={() => onOpenToolTab("terminal")}
+          onOpenFiles={() => onOpenToolTab("files")}
+          onOpenEnvironment={() => onOpenToolTab("sandbox")}
+          onAddSource={onAddContextSources}
+          onCancelSubagent={onCancelSubagent}
+          onGitChanged={onRefreshWorkbench}
+        />
+      )}
     </aside>
   );
 }

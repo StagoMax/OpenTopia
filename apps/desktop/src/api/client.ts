@@ -1,4 +1,9 @@
 import type {
+  AgentInstance,
+  AgentInstanceStatus,
+  AgentModelPolicy,
+  AgentTemplateSpec,
+  AgentTemplateVersionView,
   AgentEvent,
   AgentRuntimeSettings,
   AppViewMessage,
@@ -85,6 +90,8 @@ import type {
   WorkspaceDiffHunkAction,
   WorkspaceFilePreview,
   WorkspaceTree,
+  CapabilityProjection,
+  ExecutionResourceGrant,
 } from "../types";
 import { getLoadedApiToken } from "../platform";
 import {
@@ -359,6 +366,97 @@ export class ApiClient {
     return this.get(
       `/api/threads/${encodeURIComponent(threadId)}/capabilities`,
     );
+  }
+
+  async listAgentTemplates(
+    includeArchived = false,
+  ): Promise<AgentTemplateVersionView[]> {
+    return this.get(
+      `/api/agent-templates${queryString({
+        includeArchived: includeArchived ? "true" : undefined,
+      })}`,
+    );
+  }
+
+  async createAgentTemplateVersion(input: {
+    templateId: string;
+    name: string;
+    owner: string;
+    spec: AgentTemplateSpec;
+  }): Promise<AgentTemplateVersionView> {
+    return this.post("/api/agent-templates", input);
+  }
+
+  async publishAgentTemplateVersion(
+    templateId: string,
+    version: number,
+    input: {
+      approvedBy: string;
+      approveCapabilityExpansion: boolean;
+    },
+  ): Promise<AgentTemplateVersionView> {
+    return this.post(
+      `/api/agent-templates/${encodeURIComponent(templateId)}/versions/${version}/publish`,
+      input,
+    );
+  }
+
+  async deleteAgentTemplateVersion(
+    templateId: string,
+    version: number,
+  ): Promise<void> {
+    await this.delete(
+      `/api/agent-templates/${encodeURIComponent(templateId)}/versions/${version}`,
+    );
+  }
+
+  async archiveAgentTemplate(templateId: string): Promise<void> {
+    await this.delete(`/api/agent-templates/${encodeURIComponent(templateId)}`);
+  }
+
+  async createAgentInstance(input: {
+    templateId: string;
+    templateVersion?: number;
+    threadId: string;
+    parentInstanceId?: string;
+    requestedCapabilities?: CapabilityProjection;
+    requestedResourceGrants?: ExecutionResourceGrant[];
+    requestedModelPolicy?: AgentModelPolicy;
+    initialState: unknown;
+    bindToThread?: boolean;
+  }): Promise<{ instance: AgentInstance; bound: boolean }> {
+    return this.post("/api/agent-instances", input);
+  }
+
+  async listThreadAgentInstances(threadId: string): Promise<AgentInstance[]> {
+    return this.get(`/api/threads/${threadId}/agent-instances`);
+  }
+
+  async getBoundThreadAgentInstance(
+    threadId: string,
+  ): Promise<AgentInstance | null> {
+    return this.get(`/api/threads/${threadId}/agent-instance`);
+  }
+
+  async bindThreadAgentInstance(
+    threadId: string,
+    instanceId: string,
+  ): Promise<AgentInstance> {
+    return this.put(
+      `/api/threads/${threadId}/agent-instance/${instanceId}`,
+      {},
+    );
+  }
+
+  async updateAgentInstance(
+    instanceId: string,
+    input: {
+      state?: unknown;
+      expectedStateRevision?: number;
+      status?: AgentInstanceStatus;
+    },
+  ): Promise<AgentInstance> {
+    return this.patch(`/api/agent-instances/${instanceId}`, input);
   }
 
   async getContributionHosts(

@@ -97,6 +97,13 @@ the server deployment environment (it is not a writable client preference):
 $env:OPENTOPIA_ENTERPRISE_ENABLED="true"
 ```
 
+With the gate enabled, Flow sessions expose the Agent template control plane
+in the right review rail. Template updates create a new immutable version;
+publishing records owner approval and requires an explicit capability-expansion
+decision. A published version can be instantiated more than once with isolated
+state, while the instance bound to a Flow thread deterministically narrows the
+Harness tool, Skill, plugin, MCP, workspace, resource, and model projection.
+
 Sandbox and approval are configured independently. The desktop defaults to a
 network-enabled, workspace-write sandbox; development may explicitly fall
 back when the platform helper is unavailable, while packaged builds fail closed:
