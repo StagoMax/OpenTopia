@@ -6,11 +6,12 @@ use chrono::{DateTime, Utc};
 use opentopia_core::{
     discover_plugins, inspect_plugin_control_manifest, permission_requested,
     validate_plugin_settings, CapabilityActivationRequest, CapabilityActivationScope,
-    CapabilityActivationSnapshot, CapabilityRegistry, PluginActivation, PluginActivationRecord,
-    PluginContribution, PluginContributionRecord, PluginControlManifest, PluginControlScope,
-    PluginControlScopeType, PluginDescriptor, PluginPermission, PluginPermissionGrantRecord,
-    PluginPermissionGrantStatus, PluginRuntimeHealthRecord, PluginSecretBindingRecord,
-    PluginSettingsRecord, SessionStore, SqliteSessionStore, Thread,
+    CapabilityActivationSnapshot, CapabilityProjection, CapabilityRegistry, ExperienceMode,
+    ExperienceSurfaceProfile, PluginActivation, PluginActivationRecord, PluginContribution,
+    PluginContributionRecord, PluginControlManifest, PluginControlScope, PluginControlScopeType,
+    PluginDescriptor, PluginPermission, PluginPermissionGrantRecord, PluginPermissionGrantStatus,
+    PluginRuntimeHealthRecord, PluginSecretBindingRecord, PluginSettingsRecord, SessionStore,
+    SqliteSessionStore, Thread,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -305,6 +306,7 @@ async fn get_thread_capabilities(
     Path(thread_id): Path<Uuid>,
 ) -> Result<Json<ThreadCapabilitiesResponse>, ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
+    let surface_profile = ExperienceSurfaceProfile::for_mode(thread.experience_mode);
     let mut plugins = Vec::new();
     for plugin in discover_plugins(Some(&thread.workspace_root)) {
         let manifest = inspect_plugin_control_manifest(&plugin)
@@ -312,12 +314,15 @@ async fn get_thread_capabilities(
         state
             .store
             .replace_plugin_contributions(&plugin.id, &manifest.contributions)?;
-        let enabled = state.store.plugin_effectively_enabled(
+        let configured_enabled = state.store.plugin_effectively_enabled(
             &plugin.id,
             plugin.default_enabled,
             Some(&thread.workspace_root),
             Some(thread_id),
         )?;
+        let enabled = configured_enabled
+            && (surface_profile.capabilities.allows_plugin(&plugin.id)
+                || surface_profile.capabilities.allows_plugin(&plugin.name));
         let grants = state.store.list_plugin_permission_grants(&plugin.id)?;
         let granted_permissions =
             effective_granted_permissions(&grants, &thread.workspace_root, thread_id);
@@ -337,6 +342,9 @@ async fn get_thread_capabilities(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(Json(ThreadCapabilitiesResponse {
         thread_id,
+        experience_mode: thread.experience_mode,
+        prompt_profile_id: surface_profile.prompt_profile_id,
+        capability_projection: surface_profile.capabilities,
         workspace_root: thread.workspace_root,
         generated_at: Utc::now(),
         snapshot,
@@ -705,6 +713,9 @@ fn empty_json_object() -> Value {
 #[serde(rename_all = "camelCase")]
 struct ThreadCapabilitiesResponse {
     thread_id: Uuid,
+    experience_mode: ExperienceMode,
+    prompt_profile_id: String,
+    capability_projection: CapabilityProjection,
     workspace_root: PathBuf,
     generated_at: DateTime<Utc>,
     snapshot: CapabilityActivationSnapshot,

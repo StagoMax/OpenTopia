@@ -6,10 +6,12 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use opentopia_core::{ExperienceMode, SessionStore};
 use serde_json::json;
 use std::env;
 use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use uuid::Uuid;
 
 const API_TOKEN_ENV: &str = "OPENTOPIA_API_TOKEN";
 const DEV_ORIGIN_ENV: &str = "OPENTOPIA_DEV_ORIGIN";
@@ -126,9 +128,50 @@ pub(crate) async fn authorize(
     next: Next,
 ) -> Response {
     match state.auth.request_allowed(request.headers()) {
-        Ok(()) => next.run(request).await,
+        Ok(()) => {
+            if !state
+                .settings
+                .read()
+                .expect("settings lock poisoned")
+                .enterprise
+                .enabled
+            {
+                if let Some(thread_id) = thread_id_from_path(request.uri().path()) {
+                    match state.store.get_thread(thread_id) {
+                        Ok(Some(thread)) if thread.experience_mode == ExperienceMode::Flow => {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                Json(json!({ "error": "thread not found" })),
+                            )
+                                .into_response();
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({ "error": "thread boundary check failed" })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            next.run(request).await
+        }
         Err(rejection) => rejection.into_response(),
     }
+}
+
+fn thread_id_from_path(path: &str) -> Option<Uuid> {
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    while let Some(segment) = segments.next() {
+        if segment == "threads" {
+            return segments
+                .next()
+                .and_then(|value| Uuid::parse_str(value).ok());
+        }
+    }
+    None
 }
 
 enum AuthRejection {
@@ -220,6 +263,17 @@ mod tests {
             auth().request_allowed(&headers),
             Err(AuthRejection::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn extracts_only_concrete_thread_resource_ids() {
+        let thread_id = Uuid::new_v4();
+        assert_eq!(
+            thread_id_from_path(&format!("/api/threads/{thread_id}/messages")),
+            Some(thread_id)
+        );
+        assert_eq!(thread_id_from_path("/api/threads"), None);
+        assert_eq!(thread_id_from_path("/api/projects/not-a-thread"), None);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::computer::{
     ComputerAction, ComputerMouseButton, ComputerPolicyContext, ComputerRuntime, ComputerSessionId,
     ObserveOptions,
 };
+use crate::enterprise::DataClassification;
 use crate::execution::{
     ExecRequest, ExecutionContext, ExecutionEnvironment, FileDeleteRequest, FileReadRequest,
     FileWriteRequest, LocalExecutionEnvironment,
@@ -333,6 +334,39 @@ pub struct ToolExecutionPolicy {
     pub resource_keys: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalMode {
+    Never,
+    PolicyControlled,
+    Always,
+}
+
+/// Registry metadata is control-plane data. It is intentionally kept out of
+/// the provider function schema so governance does not consume model tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCapabilityDescriptor {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub source: String,
+    pub risk: ToolRiskLevel,
+    pub potential_side_effects: Vec<ToolSideEffect>,
+    pub approval: ToolApprovalMode,
+    pub max_data_classification: DataClassification,
+}
+
 impl ToolExecutionPolicy {
     pub fn conservative() -> Self {
         Self {
@@ -467,6 +501,98 @@ impl ToolRegistry {
 
     pub fn execution_policy(&self, name: &str, call: &ToolCall) -> Option<ToolExecutionPolicy> {
         self.tools.get(name).map(|tool| tool.execution_policy(call))
+    }
+
+    pub fn capability_catalog(&self) -> Vec<ToolCapabilityDescriptor> {
+        self.tools
+            .iter()
+            .map(|(name, tool)| {
+                let source = self.sources.get(name).cloned().unwrap_or(ToolSource::Core);
+                let (risk, potential_side_effects, approval, max_data_classification) =
+                    tool_governance_metadata(name, &source);
+                ToolCapabilityDescriptor {
+                    name: name.clone(),
+                    description: tool.description().to_string(),
+                    input_schema: tool.schema(),
+                    source: match &source {
+                        ToolSource::Core => "core".to_string(),
+                        ToolSource::BundledPlugin { plugin_name } => {
+                            format!("bundled_plugin:{plugin_name}")
+                        }
+                        ToolSource::Mcp => "mcp".to_string(),
+                    },
+                    risk,
+                    potential_side_effects,
+                    approval,
+                    max_data_classification,
+                }
+            })
+            .collect()
+    }
+}
+
+fn tool_governance_metadata(
+    name: &str,
+    source: &ToolSource,
+) -> (
+    ToolRiskLevel,
+    Vec<ToolSideEffect>,
+    ToolApprovalMode,
+    DataClassification,
+) {
+    if matches!(source, ToolSource::Mcp) {
+        return (
+            ToolRiskLevel::High,
+            vec![ToolSideEffect::External],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Public,
+        );
+    }
+    match name {
+        "list_files" | "read_file" | "read_files" | "search" | "git_diff" | "background_output"
+        | "list_agents" | "wait_agent" | "wait_agents" | "list_skills" | "read_skill" => (
+            ToolRiskLevel::Low,
+            vec![ToolSideEffect::None],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Restricted,
+        ),
+        "write_file" | "apply_patch" | "create_skill" | "spreadsheet" => (
+            ToolRiskLevel::High,
+            vec![ToolSideEffect::WorkspaceWrite],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Restricted,
+        ),
+        "shell" => (
+            ToolRiskLevel::High,
+            vec![ToolSideEffect::Process],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Restricted,
+        ),
+        "browser" | "computer" => (
+            ToolRiskLevel::High,
+            vec![ToolSideEffect::External],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Public,
+        ),
+        "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent" | "send_input"
+        | "cancel_agent" => (
+            ToolRiskLevel::Medium,
+            vec![ToolSideEffect::ControlPlane],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Confidential,
+        ),
+        "request_user_input" | "set_plan" | "update_plan" | "complete_task" => (
+            ToolRiskLevel::Medium,
+            vec![ToolSideEffect::SessionMutation],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Confidential,
+        ),
+        _ => (
+            ToolRiskLevel::Unknown,
+            vec![ToolSideEffect::Unknown],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Public,
+        ),
     }
 }
 
@@ -5512,6 +5638,24 @@ mod tests {
             })
         );
         assert_eq!(defaults.source("read_file"), Some(ToolSource::Core));
+    }
+
+    #[test]
+    fn builtin_registry_has_governance_metadata_and_input_schemas() {
+        let catalog = ToolRegistry::with_builtins().capability_catalog();
+        assert!(!catalog.is_empty());
+        for tool in catalog {
+            assert!(!tool.description.trim().is_empty(), "{}", tool.name);
+            assert!(tool.input_schema.is_object(), "{}", tool.name);
+            assert_ne!(tool.risk, ToolRiskLevel::Unknown, "{}", tool.name);
+            assert!(
+                !tool
+                    .potential_side_effects
+                    .contains(&ToolSideEffect::Unknown),
+                "{}",
+                tool.name
+            );
+        }
     }
 
     fn schema_contains_reference(value: &Value) -> bool {

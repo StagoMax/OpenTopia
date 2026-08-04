@@ -4,6 +4,7 @@ use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime};
 use crate::effect_journal::{EffectIntent, EffectKind, EffectSideEffectClass, EffectStatus};
+use crate::enterprise::CapabilityProjection;
 use crate::guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext,
     GuardianReviewSessionManager, GuardianReviewStatus, GuardianRolloutDecision,
@@ -472,6 +473,7 @@ pub struct AgentCore {
     subagent_parent_turn_id: Option<Uuid>,
     agent_path: String,
     additional_developer_instructions: Option<String>,
+    capability_projection: CapabilityProjection,
     allowed_tools: Option<HashSet<String>>,
     denied_tools: HashSet<String>,
     tool_exposure_policy: ToolExposurePolicy,
@@ -506,6 +508,7 @@ impl Default for AgentCore {
             subagent_parent_turn_id: None,
             agent_path: "/root".to_string(),
             additional_developer_instructions: None,
+            capability_projection: CapabilityProjection::unrestricted(),
             allowed_tools: None,
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
@@ -541,6 +544,7 @@ impl AgentCore {
             subagent_parent_turn_id: None,
             agent_path: "/root".to_string(),
             additional_developer_instructions: None,
+            capability_projection: CapabilityProjection::unrestricted(),
             allowed_tools: None,
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
@@ -570,6 +574,7 @@ impl AgentCore {
             subagent_parent_turn_id: None,
             agent_path: "/root".to_string(),
             additional_developer_instructions: None,
+            capability_projection: CapabilityProjection::unrestricted(),
             allowed_tools: None,
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
@@ -596,6 +601,7 @@ impl AgentCore {
             subagent_parent_turn_id: None,
             agent_path: "/root".to_string(),
             additional_developer_instructions: None,
+            capability_projection: CapabilityProjection::unrestricted(),
             allowed_tools: None,
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
@@ -638,6 +644,16 @@ impl AgentCore {
             Some(existing) => existing.intersection(&requested).cloned().collect(),
             None => requested,
         });
+    }
+
+    /// Applies a deterministic ExecutionContext projection. Repeated calls
+    /// intersect, so profiles and delegated contexts can only remove access.
+    pub fn restrict_capabilities(&mut self, projection: &CapabilityProjection) {
+        self.capability_projection = self.capability_projection.intersect(projection);
+    }
+
+    pub fn capability_projection(&self) -> &CapabilityProjection {
+        &self.capability_projection
     }
 
     pub fn set_browser_runtime(&mut self, browser: Arc<dyn BrowserRuntime>) {
@@ -1335,6 +1351,13 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         }
     }
 
+    pub fn eligible_mcp_tool_count(&self) -> usize {
+        self.eligible_provider_tool_candidates()
+            .iter()
+            .filter(|candidate| self.tools.source(&candidate.name) == Some(ToolSource::Mcp))
+            .count()
+    }
+
     pub fn provider_tool_catalog(&self) -> Vec<ProviderToolCandidate> {
         self.provider_tool_candidates()
     }
@@ -1402,6 +1425,15 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         model_context: Option<CompiledModelContext>,
         sender: Option<AgentEventSender>,
     ) -> anyhow::Result<AgentTurnResult> {
+        if !self
+            .capability_projection
+            .allows_workspace_root(&input.workspace_root)
+        {
+            anyhow::bail!(
+                "workspace root is outside the active ExecutionContext projection: {}",
+                input.workspace_root.display()
+            );
+        }
         let mut events = TurnEvents::new(sender);
         let mut budget = input.context_budget;
         let mut rollout_budget = self.rollout_budget_settings.clone().map(RolloutBudget::new);
@@ -2628,6 +2660,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             _ => true,
         };
         plugin_enabled
+            && self.capability_projection.allows_tool(name)
             && !self.denied_tools.contains(name)
             && self
                 .allowed_tools
@@ -4572,6 +4605,29 @@ mod tests {
         agent.restrict_to_tools(["complete_task"]);
         assert!(agent.tool_is_allowed("complete_task"));
         assert!(!agent.tool_is_allowed("read_file"));
+    }
+
+    #[test]
+    fn execution_context_projection_filters_catalog_and_execution_guard() {
+        let mut agent = AgentCore::default();
+        agent.restrict_capabilities(&CapabilityProjection::only_tools([
+            "read_file",
+            "complete_task",
+        ]));
+        let names = agent
+            .provider_tool_catalog()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from(["read_file".to_string(), "complete_task".to_string()])
+        );
+        assert!(!agent.tool_is_allowed("shell"));
+
+        agent.restrict_capabilities(&CapabilityProjection::only_tools(["complete_task"]));
+        assert!(!agent.tool_is_allowed("read_file"));
+        assert!(agent.tool_is_allowed("complete_task"));
     }
 
     #[test]

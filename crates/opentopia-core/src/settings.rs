@@ -1048,6 +1048,28 @@ impl From<&SandboxSettings> for LocalSandboxConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnterpriseSettings {
+    /// Deployment-owned gate. It is intentionally not writable through the
+    /// settings API, so a consumer session cannot enable enterprise surfaces.
+    pub enabled: bool,
+}
+
+impl EnterpriseSettings {
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("OPENTOPIA_ENTERPRISE_ENABLED")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        Self { enabled }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -1062,6 +1084,8 @@ pub struct AppSettings {
     pub default_workspace_root: Option<PathBuf>,
     #[serde(default)]
     pub sandbox: SandboxSettings,
+    #[serde(default)]
+    pub enterprise: EnterpriseSettings,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -1075,6 +1099,7 @@ impl AppSettings {
             agent_runtime: AgentRuntimeSettings::default(),
             default_workspace_root: None,
             sandbox: SandboxSettings::from_env(),
+            enterprise: EnterpriseSettings::from_env(),
             updated_at: Utc::now(),
         }
     }
@@ -1691,6 +1716,7 @@ mod tests {
             agent_runtime: AgentRuntimeSettings::default(),
             default_workspace_root: None,
             sandbox: SandboxSettings::default(),
+            enterprise: EnterpriseSettings::default(),
             updated_at: Utc::now(),
         };
         let mut value = serde_json::to_value(settings).unwrap();

@@ -90,6 +90,13 @@ $env:OPENTOPIA_ROLLOUT_INPUT_WEIGHT="1.0"
 cargo run -p opentopia-server -- --permission auto
 ```
 
+The enterprise Flow surface is disabled by default and can only be enabled by
+the server deployment environment (it is not a writable client preference):
+
+```powershell
+$env:OPENTOPIA_ENTERPRISE_ENABLED="true"
+```
+
 Sandbox and approval are configured independently. The desktop defaults to a
 network-enabled, workspace-write sandbox; development may explicitly fall
 back when the platform helper is unavailable, while packaged builds fail closed:

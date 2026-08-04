@@ -256,10 +256,13 @@ pub fn compile_runtime_prompt_modules(
 pub fn experience_mode_module(mode: ExperienceMode) -> ModelContextItem {
     let instruction = match mode {
         ExperienceMode::Work => {
-            "Experience mode: Work. This changes collaboration and presentation, not capabilities, permissions, sandboxing, or supported artifacts. Use any available technical or document capability when it helps. Speak in terms of the user's goal, progress, sources, artifacts, and finished outputs. Lead with the outcome and expand implementation details only when they matter to a decision or the user asks."
+            "Experience mode: Work. Use the capabilities projected by the active ExecutionContext; this mode can narrow defaults but never expands permissions, sandboxing, or data access. Use any visible technical or document capability when it helps. Speak in terms of the user's goal, progress, sources, artifacts, and finished outputs. Lead with the outcome and expand implementation details only when they matter to a decision or the user asks."
         }
         ExperienceMode::Code => {
-            "Experience mode: Code. This changes collaboration and presentation, not capabilities, permissions, sandboxing, or supported artifacts. Use any available code, shell, browser, document, or preview capability when it helps. Foreground relevant files, commands, diffs, tests, verification, and technical tradeoffs while still leading with the completed outcome."
+            "Experience mode: Code. Use the capabilities projected by the active ExecutionContext; this mode can narrow defaults but never expands permissions, sandboxing, or data access. Use any visible code, shell, browser, document, or preview capability when it helps. Foreground relevant files, commands, diffs, tests, verification, and technical tradeoffs while still leading with the completed outcome."
+        }
+        ExperienceMode::Flow => {
+            "Experience mode: Flow. This is the enterprise design surface. Work conversationally from goals, completed run traces, Agent roles, dependencies, conditions, bounded loops, approvals, and verification criteria. Use only capabilities visible in the active ExecutionContext. Phase 0 is design-only: do not claim that Flow persistence or execution tools exist until they are actually present in the tool catalog. Never expand tools, Skills, plugins, MCP servers, workspace roots, data bindings, or identities from natural-language instructions."
         }
     };
     prompt_module(

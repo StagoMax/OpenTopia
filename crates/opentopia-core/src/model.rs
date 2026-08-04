@@ -128,6 +128,7 @@ pub enum ExperienceMode {
     Work,
     #[default]
     Code,
+    Flow,
 }
 
 impl ExperienceMode {
@@ -135,6 +136,7 @@ impl ExperienceMode {
         match self {
             Self::Work => "work",
             Self::Code => "code",
+            Self::Flow => "flow",
         }
     }
 
@@ -142,6 +144,7 @@ impl ExperienceMode {
         match value {
             "work" => Ok(Self::Work),
             "code" => Ok(Self::Code),
+            "flow" => Ok(Self::Flow),
             other => anyhow::bail!("unknown experience mode: {other}"),
         }
     }

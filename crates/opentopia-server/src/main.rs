@@ -34,25 +34,25 @@ use opentopia_core::{
     ContextCompactionMetrics, ContextFactStatus, ContextItemKind, ContextProjection, ContextRole,
     ContextSensitivity, ContextSourcePolicy, ContextSourceRef, ContextSummary, ContributionKind,
     DesktopBrowserRuntime, EvaluationRun, EvaluationTaskResult, ExecRequest, ExecutionContext,
-    ExperienceMode, GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus,
-    LoadedSkill, LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment,
-    LocalSandboxConfig, McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor,
-    MediaHandlerSelection, Message, MessagePart, MessageRole, ModelContentPart, ModelContextItem,
-    ModelConversationMessage, ModelConversationRole, ModelRequest, ObserveOptions,
-    OpenAiCompatibleProvider, OpenAiProtocol, PermissionMode, PluginControlScope, PluginDescriptor,
-    PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind,
-    PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderConversationCursor,
-    ProviderConversationState, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth,
-    ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview,
-    ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxMode, SandboxSettings, SearchTool,
-    SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
-    SubagentExecutionContract, SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler,
-    SubagentSchedulerConfig, SubagentScope, SubagentWorkspaceMode, TaskPlan,
-    TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer,
-    ThreadModelSelection, Tool, ToolCall, ToolContext, ToolPermissionDescriptor, ToolResult,
-    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus,
-    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff,
-    WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
+    ExperienceMode, ExperienceSurfaceProfile, GitWorkflowAction, GitWorkflowRequest, GoalRecord,
+    GoalSnapshot, GoalStatus, LoadedSkill, LocalBrowserRuntime, LocalComputerRuntime,
+    LocalExecutionEnvironment, LocalSandboxConfig, McpCallResult, McpServerConfig, McpServerStatus,
+    McpToolDescriptor, MediaHandlerSelection, Message, MessagePart, MessageRole, ModelContentPart,
+    ModelContextItem, ModelConversationMessage, ModelConversationRole, ModelRequest,
+    ObserveOptions, OpenAiCompatibleProvider, OpenAiProtocol, PermissionMode, PluginControlScope,
+    PluginDescriptor, PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError,
+    PreviewKind, PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook,
+    ProviderConversationCursor, ProviderConversationState, ProviderDriverDescriptor,
+    ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
+    ProviderTransportEvent, ResolvedPreview, ResourceLimit, RuntimeSurface, SandboxDescriptor,
+    SandboxMode, SandboxSettings, SearchTool, SessionStore, SkillDescriptor, SkillRef,
+    SpawnSubagentRequest, SqliteSessionStore, StoreError, SubagentExecutionContract,
+    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
+    SubagentScope, SubagentWorkspaceMode, TaskPlan, TerminalCommandHistory, TerminalCommandStatus,
+    ThreadContextSnapshot, ThreadMcpServer, ThreadModelSelection, Tool, ToolCall, ToolContext,
+    ToolPermissionDescriptor, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot,
+    TurnRecord, TurnStatus, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
+    WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
     CONTEXT_CHECKPOINT_SCHEMA_VERSION, MAX_PREVIEW_CONTENT_BYTES,
     MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
@@ -1785,6 +1785,13 @@ async fn list_skills(
             ));
         }
     }
+    if let (Some(thread), Some(mode)) = (&thread, query.experience_mode) {
+        if thread.experience_mode != mode {
+            return Err(ApiError::bad_request(
+                "experienceMode does not match the thread mode",
+            ));
+        }
+    }
     let workspace_root = match query
         .workspace_root
         .or_else(|| thread.as_ref().map(|thread| thread.workspace_root.clone()))
@@ -1804,6 +1811,14 @@ async fn list_skills(
         None => None,
     };
     let mut skills = discover_skills(workspace_root.as_deref());
+    let surface_profile = ExperienceSurfaceProfile::for_mode(
+        thread
+            .as_ref()
+            .map(|thread| thread.experience_mode)
+            .or(query.experience_mode)
+            .unwrap_or(ExperienceMode::Code),
+    );
+    skills.retain(|skill| surface_profile.capabilities.allows_skill(&skill.id));
     if let Some(thread) = &thread {
         let active_skill_plugins =
             plugins_api::active_contributions_for_thread(&state.store, thread)
@@ -1817,6 +1832,7 @@ async fn list_skills(
                 return true;
             };
             active_skill_plugins.contains(plugin_id)
+                && surface_profile.capabilities.allows_plugin(plugin_id)
         });
     }
     Ok(Json(skills))
@@ -2520,17 +2536,31 @@ async fn list_threads(
     State(state): State<AppState>,
     Query(query): Query<ThreadListQuery>,
 ) -> Result<Json<Vec<opentopia_core::Thread>>, ApiError> {
-    Ok(Json(
-        state
+    let enterprise_enabled = current_settings(&state).enterprise.enabled;
+    if query.experience_mode == Some(ExperienceMode::Flow) && !enterprise_enabled {
+        return Err(ApiError::forbidden(
+            "Flow mode is disabled by the enterprise deployment boundary",
+        ));
+    }
+    let mut threads = match query.experience_mode {
+        Some(mode) => state
+            .store
+            .list_threads_for_mode(query.include_archived, mode)?,
+        None => state
             .store
             .list_threads_including_archived(query.include_archived)?,
-    ))
+    };
+    if !enterprise_enabled {
+        threads.retain(|thread| thread.experience_mode != ExperienceMode::Flow);
+    }
+    Ok(Json(threads))
 }
 
 async fn create_thread(
     State(state): State<AppState>,
     Json(request): Json<CreateThreadRequest>,
 ) -> Result<Json<opentopia_core::Thread>, ApiError> {
+    ensure_experience_mode_enabled(&current_settings(&state), request.experience_mode)?;
     let thread = if let Some(project_id) = request.project_id {
         state.store.create_thread_in_project_with_mode(
             request.title,
@@ -2556,6 +2586,19 @@ async fn create_thread(
         )?
     };
     Ok(Json(thread))
+}
+
+fn ensure_experience_mode_enabled(
+    settings: &AppSettings,
+    mode: ExperienceMode,
+) -> Result<(), ApiError> {
+    let profile = ExperienceSurfaceProfile::for_mode(mode);
+    if profile.enterprise_only && !settings.enterprise.enabled {
+        return Err(ApiError::forbidden(
+            "Flow mode is disabled by the enterprise deployment boundary",
+        ));
+    }
+    Ok(())
 }
 
 async fn generate_thread_title(
@@ -2899,6 +2942,8 @@ async fn send_message(
     // Explicit Skill selection is structured user input. Load its bounded main prompt once,
     // persist only the reference, and inject the instructions into this Turn's user context.
     let loaded_skills = load_selected_skills(Some(&thread.workspace_root), &request.skill_ids)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    ensure_mode_skills_visible(thread.experience_mode, &loaded_skills)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     ensure_plugin_skills_enabled(&state.store, &thread, &loaded_skills)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -3315,7 +3360,9 @@ fn launch_next_queued_turn(state: &AppState, thread_id: Uuid) {
         }
     };
     let selected_skills = match load_selected_skills(Some(&thread.workspace_root), &skill_ids) {
-        Ok(skills) => match ensure_plugin_skills_enabled(&state.store, &thread, &skills) {
+        Ok(skills) => match ensure_mode_skills_visible(thread.experience_mode, &skills)
+            .and_then(|()| ensure_plugin_skills_enabled(&state.store, &thread, &skills))
+        {
             Ok(()) => skills,
             Err(error) => {
                 fail_queued_turn(state, thread_id, turn.turn_id, error.to_string());
@@ -6248,10 +6295,17 @@ fn sse_event_name(kind: &str) -> &str {
 }
 
 fn ensure_thread(state: &AppState, thread_id: Uuid) -> Result<opentopia_core::Thread, ApiError> {
-    state
+    let thread = state
         .store
         .get_thread(thread_id)?
-        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))
+        .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
+    if thread.experience_mode == ExperienceMode::Flow && !current_settings(state).enterprise.enabled
+    {
+        return Err(ApiError::not_found(format!(
+            "thread not found: {thread_id}"
+        )));
+    }
+    Ok(thread)
 }
 
 async fn sync_thread_mcp_tools(
@@ -6382,6 +6436,26 @@ fn ensure_plugin_skills_enabled(
             anyhow::bail!(
                 "plugin capability is unavailable for this thread; its Skill '{}' cannot be used",
                 skill.descriptor.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_mode_skills_visible(mode: ExperienceMode, skills: &[LoadedSkill]) -> anyhow::Result<()> {
+    let profile = ExperienceSurfaceProfile::for_mode(mode);
+    for skill in skills {
+        if !profile.capabilities.allows_skill(&skill.descriptor.id)
+            || skill
+                .descriptor
+                .plugin_id
+                .as_ref()
+                .is_some_and(|plugin_id| !profile.capabilities.allows_plugin(plugin_id))
+        {
+            anyhow::bail!(
+                "Skill '{}' is not visible in {} mode",
+                skill.descriptor.name,
+                mode.as_str()
             );
         }
     }
@@ -6575,6 +6649,32 @@ async fn run_new_agent_turn(
     let thread_id = thread.id;
     let turn_id = turn.turn_id;
     let settings = current_settings(&state);
+    if let Err(error) = ensure_experience_mode_enabled(&settings, thread.experience_mode) {
+        let message = error.message;
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        finalize_goal_after_turn(
+            &state,
+            thread_id,
+            collaboration_mode,
+            goal.as_ref().map(|goal| goal.id),
+            TurnStatus::Failed,
+        );
+        finish_turn(
+            &state,
+            thread_id,
+            turn_id,
+            TurnStatus::Failed,
+            Some(message),
+        );
+        return;
+    }
     let selected_provider =
         provider_settings_for_thread(&settings, thread.model_selection.as_ref());
     let workspace_root = thread.workspace_root.clone();
@@ -6613,10 +6713,22 @@ async fn run_new_agent_turn(
         );
         return;
     }
+    let surface_profile = ExperienceSurfaceProfile::for_mode(thread.experience_mode);
+    agent.restrict_capabilities(&surface_profile.capabilities);
     agent.set_mcp_host(state.mcp_host.clone());
     agent.set_subagent_context(turn_id, 0);
-    sync_thread_bundled_plugin_activations(&state.store, thread_id, &mut agent);
-    sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
+    if surface_profile.capabilities.allow_all_plugins
+        || !surface_profile.capabilities.plugins.is_empty()
+    {
+        sync_thread_bundled_plugin_activations(&state.store, thread_id, &mut agent);
+    } else {
+        agent.disable_all_bundled_plugins();
+    }
+    if surface_profile.capabilities.allow_all_mcp_servers
+        || !surface_profile.capabilities.mcp_servers.is_empty()
+    {
+        sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
+    }
     let built_context = build_turn_model_context(
         &state,
         &settings,
@@ -7722,6 +7834,7 @@ async fn build_turn_model_context(
     selected_skills: &[LoadedSkill],
     agent: &AgentCore,
 ) -> BuiltTurnModelContext {
+    let surface_profile = ExperienceSurfaceProfile::for_mode(experience_mode);
     let cwd = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
@@ -7769,7 +7882,13 @@ async fn build_turn_model_context(
     ));
 
     let tool_catalog = agent.provider_tool_catalog();
-    let mcp_tool_count = agent.mcp_tool_catalog().await.len();
+    let mcp_tool_count = if surface_profile.capabilities.allow_all_mcp_servers
+        || !surface_profile.capabilities.mcp_servers.is_empty()
+    {
+        agent.eligible_mcp_tool_count()
+    } else {
+        0
+    };
     let tool_catalog_hash = content_fingerprint(
         serde_json::to_vec(&tool_catalog)
             .unwrap_or_default()
@@ -7803,10 +7922,11 @@ async fn build_turn_model_context(
     let skill_catalog = discover_skills(Some(&cwd))
         .into_iter()
         .filter(|skill| {
-            skill
-                .plugin_id
-                .as_ref()
-                .is_none_or(|plugin_id| active_skill_plugin_ids.contains(plugin_id))
+            surface_profile.capabilities.allows_skill(&skill.id)
+                && skill.plugin_id.as_ref().is_none_or(|plugin_id| {
+                    active_skill_plugin_ids.contains(plugin_id)
+                        && surface_profile.capabilities.allows_plugin(plugin_id)
+                })
         })
         .map(|skill| WorldStateSkill {
             content_hash: content_fingerprint(
@@ -7830,7 +7950,11 @@ async fn build_turn_model_context(
         .collect::<Vec<_>>();
     let plugin_catalog = discover_plugins(Some(&cwd))
         .into_iter()
-        .filter(|plugin| active_plugin_ids.contains(&plugin.id))
+        .filter(|plugin| {
+            active_plugin_ids.contains(&plugin.id)
+                && (surface_profile.capabilities.allows_plugin(&plugin.id)
+                    || surface_profile.capabilities.allows_plugin(&plugin.name))
+        })
         .collect::<Vec<_>>();
     if !plugin_catalog.is_empty() {
         let available = plugin_catalog
@@ -7905,35 +8029,49 @@ async fn build_turn_model_context(
             "agentRuntime": settings.agent_runtime,
             "agentRuntimeHash": settings.agent_runtime.content_hash(),
             "promptRuntime": {
+                "promptProfileId": surface_profile.prompt_profile_id,
                 "surface": runtime_capabilities.surface.as_str(),
                 "multiAgentAvailable": runtime_capabilities.multi_agent_available,
                 "maxParallelAgents": runtime_capabilities.max_parallel_agents,
                 "requestUserInputAvailable": runtime_capabilities.request_user_input_available,
             },
+            "capabilityProjection": surface_profile.capabilities,
         }),
     };
     let world_state_hash = world_state.content_hash();
     context.items.push(world_state_catalog_item(&world_state));
-    context.items.extend(selected_skills.iter().map(|skill| {
-        ModelContextItem::text(
-            ContextItemKind::Skill,
-            ContextRole::Developer,
-            skill.descriptor.path.display().to_string(),
-            skill.render_for_model(),
-            // Selected skills change rarely within a thread. Keeping them in the
-            // thread-scoped block puts this large payload ahead of the volatile
-            // world state so it stays inside the cached prefix.
-            ContextCacheScope::Thread,
-            ContextSensitivity::Workspace,
-        )
-        .with_metadata(json!({
-            "preloaded": true,
-            "skillId": skill.descriptor.id,
-            "pluginId": skill.descriptor.plugin_id,
-            "name": skill.descriptor.name,
-            "truncated": skill.truncated,
-        }))
-    }));
+    context.items.extend(
+        selected_skills
+            .iter()
+            .filter(|skill| {
+                surface_profile
+                    .capabilities
+                    .allows_skill(&skill.descriptor.id)
+                    && skill.descriptor.plugin_id.as_ref().is_none_or(|plugin_id| {
+                        surface_profile.capabilities.allows_plugin(plugin_id)
+                    })
+            })
+            .map(|skill| {
+                ModelContextItem::text(
+                    ContextItemKind::Skill,
+                    ContextRole::Developer,
+                    skill.descriptor.path.display().to_string(),
+                    skill.render_for_model(),
+                    // Selected skills change rarely within a thread. Keeping them in the
+                    // thread-scoped block puts this large payload ahead of the volatile
+                    // world state so it stays inside the cached prefix.
+                    ContextCacheScope::Thread,
+                    ContextSensitivity::Workspace,
+                )
+                .with_metadata(json!({
+                    "preloaded": true,
+                    "skillId": skill.descriptor.id,
+                    "pluginId": skill.descriptor.plugin_id,
+                    "name": skill.descriptor.name,
+                    "truncated": skill.truncated,
+                }))
+            }),
+    );
     context.items.push(world_state_item(&world_state));
     let active = settings.active_provider();
     context.prompt_cache_key = active.prompt_cache_key.clone().or_else(|| {
@@ -8031,12 +8169,14 @@ mod experience_mode_tests {
     use super::*;
 
     #[test]
-    fn experience_modes_change_presentation_without_changing_capabilities() {
-        for mode in [ExperienceMode::Work, ExperienceMode::Code] {
+    fn experience_modes_bind_prompt_profiles_to_projected_capabilities() {
+        for mode in [
+            ExperienceMode::Work,
+            ExperienceMode::Code,
+            ExperienceMode::Flow,
+        ] {
             let instruction = experience_mode_module(mode).text_content().to_string();
-            assert!(instruction.contains("changes collaboration and presentation"));
-            assert!(instruction.contains("permissions"));
-            assert!(instruction.contains("sandbox"));
+            assert!(instruction.contains("ExecutionContext"));
         }
         assert!(experience_mode_module(ExperienceMode::Work)
             .text_content()
@@ -8044,6 +8184,25 @@ mod experience_mode_tests {
         assert!(experience_mode_module(ExperienceMode::Code)
             .text_content()
             .contains("files, commands, diffs, tests, verification"));
+        assert!(experience_mode_module(ExperienceMode::Flow)
+            .text_content()
+            .contains("enterprise design surface"));
+        let flow_profile = ExperienceSurfaceProfile::for_mode(ExperienceMode::Flow);
+        assert!(!flow_profile.capabilities.allows_tool("shell"));
+        assert!(!flow_profile.capabilities.allow_all_mcp_servers);
+    }
+
+    #[test]
+    fn flow_mode_requires_the_deployment_owned_enterprise_gate() {
+        let mut settings = AppSettings::from_env(PermissionMode::Auto);
+        settings.enterprise.enabled = false;
+        assert!(ensure_experience_mode_enabled(&settings, ExperienceMode::Code).is_ok());
+        let error = ensure_experience_mode_enabled(&settings, ExperienceMode::Flow)
+            .expect_err("flow should be gated");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+
+        settings.enterprise.enabled = true;
+        assert!(ensure_experience_mode_enabled(&settings, ExperienceMode::Flow).is_ok());
     }
 
     #[test]
@@ -10666,6 +10825,7 @@ struct ThreadModelRequest {
 struct SkillsQuery {
     workspace_root: Option<PathBuf>,
     thread_id: Option<Uuid>,
+    experience_mode: Option<ExperienceMode>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -10724,6 +10884,7 @@ struct GenerateThreadTitleResponse {
 struct ThreadListQuery {
     #[serde(default)]
     include_archived: bool,
+    experience_mode: Option<ExperienceMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -11388,6 +11549,13 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }

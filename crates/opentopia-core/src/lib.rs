@@ -9,6 +9,7 @@ pub mod context_sources;
 pub mod contribution_hosts;
 pub mod desktop_browser;
 pub mod effect_journal;
+pub mod enterprise;
 pub mod execution;
 mod execution_runtime;
 pub mod execution_spec;
@@ -95,6 +96,12 @@ pub use desktop_browser::{DesktopBrowserRuntime, DesktopBrowserRuntimeConfig};
 pub use effect_journal::{
     valid_effect_transition, validate_effect_intent, EffectIntent, EffectJournalError,
     EffectJournalRecord, EffectKind, EffectSideEffectClass, EffectStatus,
+};
+pub use enterprise::{
+    AgentDefinitionV1, AuditEventV1, CapabilityProjection, DataClassification,
+    EnterpriseExecutionContextV1, EvidenceRecordV1, ExecutionBoundaryError, ExecutionIdentityRoute,
+    ExecutionIdentityRouter, ExecutionResourceGrantV1, ExperienceSurfaceProfile, FlowDefinitionV1,
+    GraphDefinitionV1, GraphEdgeV1, GraphNodeV1, ResourceKind, ENTERPRISE_SCHEMA_VERSION_V1,
 };
 pub use execution::{
     ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
@@ -205,10 +212,11 @@ pub use scm_connector::{
     SCM_CONNECTOR_HOST_API_VERSION,
 };
 pub use settings::{
-    AppSettings, NativeCompactionProtocol, OpenAiCompatibilityReport, OpenAiProtocol,
-    ProviderCapabilities, ProviderFeatureSupport, ProviderHealth, ProviderHealthCheck,
-    ProviderKind, ProviderModelCapabilities, ProviderModelSettings, ProviderSettings,
-    RolloutBudgetSettings, SandboxEnforcement, SandboxSettings, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
+    AppSettings, EnterpriseSettings, NativeCompactionProtocol, OpenAiCompatibilityReport,
+    OpenAiProtocol, ProviderCapabilities, ProviderFeatureSupport, ProviderHealth,
+    ProviderHealthCheck, ProviderKind, ProviderModelCapabilities, ProviderModelSettings,
+    ProviderSettings, RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
+    MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,
@@ -237,8 +245,9 @@ pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
     BrowserTool, ComputerTool, GitDiffTool, ListFilesTool, ListSkillsTool, McpToolWrapper,
     NativePatchOperation, ReadFileTool, ReadSkillTool, RequestUserInputTool, SearchTool,
-    SetPlanTool, ShellTool, SpreadsheetTool, Tool, ToolContext, ToolRegistry, ToolSource,
-    UpdatePlanTool, WaitAgentsTool, WriteFileTool,
+    SetPlanTool, ShellTool, SpreadsheetTool, Tool, ToolApprovalMode, ToolCapabilityDescriptor,
+    ToolContext, ToolRegistry, ToolRiskLevel, ToolSource, UpdatePlanTool, WaitAgentsTool,
+    WriteFileTool,
 };
 pub use workspace::{
     ChangedFile, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,

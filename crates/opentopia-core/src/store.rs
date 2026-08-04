@@ -81,6 +81,11 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         &self,
         include_archived: bool,
     ) -> anyhow::Result<Vec<Thread>>;
+    fn list_threads_for_mode(
+        &self,
+        include_archived: bool,
+        experience_mode: ExperienceMode,
+    ) -> anyhow::Result<Vec<Thread>>;
     fn update_thread(
         &self,
         id: Uuid,
@@ -509,7 +514,7 @@ impl SqliteSessionStore {
                 workspace_root TEXT NOT NULL,
                 project_id TEXT,
                 experience_mode TEXT NOT NULL DEFAULT 'code'
-                    CHECK(experience_mode IN ('work', 'code')),
+                    CHECK(experience_mode IN ('work', 'code', 'flow')),
                 model_selection TEXT,
                 archived_at TEXT,
                 created_at TEXT NOT NULL,
@@ -1080,6 +1085,50 @@ impl SqliteSessionStore {
                 "#,
             )?;
         }
+        if schema_version < 11 {
+            // SQLite cannot alter a CHECK constraint in place. Rebuild only
+            // the threads table while foreign-key enforcement is paused, then
+            // verify the complete database before accepting the migration.
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = OFF;
+                CREATE TABLE threads_v11 (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    workspace_root TEXT NOT NULL,
+                    project_id TEXT,
+                    experience_mode TEXT NOT NULL DEFAULT 'code'
+                        CHECK(experience_mode IN ('work', 'code', 'flow')),
+                    model_selection TEXT,
+                    archived_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
+                );
+                INSERT INTO threads_v11 (
+                    id, title, workspace_root, project_id, experience_mode,
+                    model_selection, archived_at, created_at, updated_at
+                )
+                SELECT id, title, workspace_root, project_id, experience_mode,
+                       model_selection, archived_at, created_at, updated_at
+                FROM threads;
+                DROP TABLE threads;
+                ALTER TABLE threads_v11 RENAME TO threads;
+                CREATE INDEX IF NOT EXISTS idx_threads_project_updated
+                    ON threads(project_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_threads_archived_updated
+                    ON threads(archived_at, updated_at DESC);
+                PRAGMA foreign_keys = ON;
+                PRAGMA user_version = 11;
+                "#,
+            )?;
+            let foreign_key_error: Option<String> = conn
+                .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+                .optional()?;
+            if let Some(table) = foreign_key_error {
+                anyhow::bail!("schema v11 foreign-key check failed for table {table}");
+            }
+        }
         let recovered_at = Utc::now().to_rfc3339();
         conn.execute(
             r#"
@@ -1137,6 +1186,9 @@ impl SqliteSessionStore {
         match settings_json {
             Some(settings_json) => {
                 let mut settings: AppSettings = serde_json::from_str(&settings_json)?;
+                // Enterprise availability is a deployment boundary, not a
+                // persisted preference that a client can turn on.
+                settings.enterprise = crate::settings::EnterpriseSettings::from_env();
                 if settings.providers.is_empty() {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&settings_json) {
                         if let Some(provider) = value.get("provider") {
@@ -1880,6 +1932,32 @@ impl SessionStore for SqliteSessionStore {
         };
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], map_thread)?;
+        collect_rows(rows)
+    }
+
+    fn list_threads_for_mode(
+        &self,
+        include_archived: bool,
+        experience_mode: ExperienceMode,
+    ) -> anyhow::Result<Vec<Thread>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let sql = if include_archived {
+            r#"
+            SELECT id, title, workspace_root, project_id, archived_at, experience_mode, model_selection, created_at, updated_at
+            FROM threads
+            WHERE experience_mode = ?1
+            ORDER BY updated_at DESC
+            "#
+        } else {
+            r#"
+            SELECT id, title, workspace_root, project_id, archived_at, experience_mode, model_selection, created_at, updated_at
+            FROM threads
+            WHERE archived_at IS NULL AND experience_mode = ?1
+            ORDER BY updated_at DESC
+            "#
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![experience_mode.as_str()], map_thread)?;
         collect_rows(rows)
     }
 
@@ -5784,7 +5862,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_experience_mode_defaults_to_code_and_round_trips_work() {
+    fn thread_experience_modes_round_trip_and_filter_on_the_server() {
         let store = SqliteSessionStore::open(":memory:").expect("open memory store");
         let project = store
             .create_project(
@@ -5812,6 +5890,29 @@ mod tests {
             .expect("load work thread")
             .expect("work thread exists");
         assert_eq!(loaded.experience_mode, ExperienceMode::Work);
+
+        let flow_thread = store
+            .create_thread_in_project_with_mode(
+                Some("Flow design".to_string()),
+                project.id,
+                ExperienceMode::Flow,
+            )
+            .expect("create flow thread");
+        let loaded = store
+            .get_thread(flow_thread.id)
+            .expect("load flow thread")
+            .expect("flow thread exists");
+        assert_eq!(loaded.experience_mode, ExperienceMode::Flow);
+        let flow_threads = store
+            .list_threads_for_mode(false, ExperienceMode::Flow)
+            .expect("list flow threads");
+        assert_eq!(flow_threads.len(), 1);
+        assert_eq!(flow_threads[0].id, flow_thread.id);
+        assert!(store
+            .list_threads_for_mode(false, ExperienceMode::Code)
+            .expect("list code threads")
+            .iter()
+            .all(|thread| thread.experience_mode == ExperienceMode::Code));
     }
 
     #[test]
