@@ -1,8 +1,15 @@
 #![cfg(windows)]
 
 use std::net::TcpListener;
+use std::path::Path;
 use std::process::Command;
 use uuid::Uuid;
+
+fn sandbox_command(state_dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"));
+    command.env("OPENTOPIA_SANDBOX_STATE_DIR", state_dir);
+    command
+}
 
 #[test]
 fn restricted_token_can_write_only_to_granted_workspace() {
@@ -17,7 +24,7 @@ fn restricted_token_can_write_only_to_granted_workspace() {
     std::fs::write(&protected, "original").expect("create existing protected file");
 
     let allowed_command = format!("echo inside>{}", inside.display());
-    let allowed = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"))
+    let allowed = sandbox_command(&root.join("sandbox-state"))
         .args([
             "run",
             "--cwd",
@@ -48,7 +55,7 @@ fn restricted_token_can_write_only_to_granted_workspace() {
     );
     assert!(inside.is_file(), "granted workspace write should succeed");
     let denied_command = format!("echo outside>{}", outside.display());
-    let denied = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"))
+    let denied = sandbox_command(&root.join("sandbox-state"))
         .args([
             "run",
             "--cwd",
@@ -77,7 +84,7 @@ fn restricted_token_can_write_only_to_granted_workspace() {
     );
 
     let denied_protected_command = format!("echo protected>{}", protected.display());
-    let denied_protected = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"))
+    let denied_protected = sandbox_command(&root.join("sandbox-state"))
         .args([
             "run",
             "--cwd",
@@ -124,7 +131,7 @@ fn unelevated_backend_rejects_an_offline_guarantee_it_cannot_enforce() {
         "$ErrorActionPreference='Stop'; $client = New-Object System.Net.Sockets.TcpClient; $client.Connect('127.0.0.1', {port}); exit 0"
     );
 
-    let result = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"))
+    let result = sandbox_command(&root.join("sandbox-state"))
         .args([
             "run",
             "--cwd",
@@ -170,8 +177,7 @@ fn elevated_state_cannot_be_exposed_to_a_host_identity_child() {
     std::fs::create_dir_all(&state).expect("create state fixture");
     std::fs::write(state.join("credentials.dpapi"), b"opaque").expect("create credential marker");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"))
-        .env("OPENTOPIA_SANDBOX_STATE_DIR", &state)
+    let result = sandbox_command(&state)
         .env("OPENTOPIA_SANDBOX_ERROR_NONCE", "credential-test")
         .args([
             "run",
@@ -210,7 +216,7 @@ fn restricted_token_preserves_recursive_host_reads() {
     std::fs::create_dir_all(nested.parent().expect("nested parent")).expect("create read root");
     std::fs::write(&nested, "recursive-read-ok").expect("write read fixture");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"))
+    let output = sandbox_command(&root.join("sandbox-state"))
         .args([
             "run",
             "--cwd",
@@ -256,7 +262,7 @@ fn helper_timeout_terminates_the_process_tree() {
         "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-Command',\"{}\"); Start-Sleep -Seconds 30",
         child_script.replace('"', "`\"")
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"))
+    let output = sandbox_command(&root.join("sandbox-state"))
         .args([
             "run",
             "--cwd",
@@ -315,7 +321,7 @@ fn real_git_status_runs_headlessly_with_protected_metadata() {
         .parent()
         .and_then(|parent| parent.parent())
         .unwrap_or_else(|| git.parent().expect("git parent"));
-    let output = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"))
+    let output = sandbox_command(&root.join("sandbox-state"))
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
@@ -356,6 +362,72 @@ fn real_git_status_runs_headlessly_with_protected_metadata() {
         String::from_utf8_lossy(&output.stderr)
     );
     std::fs::remove_dir_all(root).expect("remove git fixture");
+}
+
+#[test]
+fn git_apply_can_replace_a_workspace_file() {
+    let root = std::env::temp_dir().join(format!("opentopia-git-apply-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create git apply fixture");
+    let initialized = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&root)
+        .status()
+        .expect("start git init");
+    assert!(initialized.success(), "git init failed");
+    std::fs::write(root.join("tracked.txt"), "before\n").expect("write tracked fixture");
+    std::fs::write(
+        root.join("change.patch"),
+        "--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-before\n+after\n",
+    )
+    .expect("write patch fixture");
+
+    let git = resolve_git_executable();
+    let git_root = git
+        .parent()
+        .and_then(|parent| parent.parent())
+        .unwrap_or_else(|| git.parent().expect("git parent"));
+    let output = sandbox_command(&root.join("sandbox-state"))
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "run",
+            "--cwd",
+            root.to_str().expect("workspace utf-8"),
+            "--read-root",
+            root.to_str().expect("workspace utf-8"),
+            "--runtime-root",
+            git_root.to_str().expect("git root utf-8"),
+            "--write-root",
+            root.to_str().expect("workspace utf-8"),
+            "--protect",
+            root.join(".git").to_str().expect("git metadata utf-8"),
+            "--network",
+            "internet",
+            "--backend",
+            "unelevated",
+            "--timeout-ms",
+            "10000",
+            "--",
+            git.to_str().expect("git executable utf-8"),
+            "apply",
+            "--whitespace=nowarn",
+            "change.patch",
+        ])
+        .output()
+        .expect("run sandboxed git apply");
+    assert!(
+        output.status.success(),
+        "sandboxed git apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt"))
+            .expect("read patched fixture")
+            .replace("\r\n", "\n"),
+        "after\n"
+    );
+    std::fs::remove_dir_all(root).expect("remove git apply fixture");
 }
 
 fn resolve_git_executable() -> std::path::PathBuf {

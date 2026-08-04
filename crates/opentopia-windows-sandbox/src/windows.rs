@@ -55,6 +55,8 @@ use windows_sys::Win32::Security::TOKEN_DUPLICATE;
 use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::Security::WRITE_RESTRICTED;
 use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
@@ -102,6 +104,10 @@ const TRUSTEE_IS_UNKNOWN_VALUE: i32 = TRUSTEE_IS_UNKNOWN;
 const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 const WIN_WORLD_SID: i32 = 1;
 const GENERIC_ALL: u32 = 0x1000_0000;
+const WORKSPACE_WRITE_PERMISSIONS: u32 =
+    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
+const WRITE_RESTRICTION_PERMISSIONS: u32 = FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
+const ACL_ENTRY_PERMISSIONS_VERSION: u32 = 2;
 
 #[repr(C)]
 struct TokenDefaultDaclInfo {
@@ -149,24 +155,15 @@ fn run_unelevated(request: SandboxRequest) -> Result<i32> {
             "stage=validate_policy unelevated backend cannot authoritatively enforce offline networking; run elevated setup or allow network"
         )
     }
-    let mut capability = SidBuffer::random_capability();
+    let mut capability = SidBuffer::opentopia_capability();
     let capability_sid = capability.as_ptr();
-    let mut acl = AclTransaction::default();
-    for root in &request.write_roots {
-        acl.grant(
-            root,
-            capability_sid,
-            true,
-            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE,
-        )
-        .context("stage=apply_acl grant capability content write root")?;
-    }
-    for path in &request.protected_paths {
-        if path.exists() {
-            acl.deny_write(path, capability_sid, true)
-                .context("stage=apply_acl protect metadata path")?;
-        }
-    }
+    ensure_persistent_capability_permissions(&request, capability_sid)
+        .context("stage=apply_acl ensure capability permissions")?;
+    let _protected_write_lock = (!request.allowed_protected_roots.is_empty())
+        .then(NamedAclMutex::acquire)
+        .transpose()?;
+    let _protected_write_window =
+        ProtectedWriteWindow::open(request.allowed_protected_roots.clone(), capability_sid)?;
 
     let restricted_token = RestrictedToken::for_capability(capability_sid)
         .context("stage=prepare_sandbox create restricted token")?;
@@ -187,7 +184,6 @@ fn run_unelevated(request: SandboxRequest) -> Result<i32> {
     );
     let exit_code = launch(&request, restricted_token.handle)
         .context("stage=spawn launch unelevated target")?;
-    drop(acl);
     Ok(exit_code as i32)
 }
 
@@ -198,6 +194,7 @@ struct ElevatedRunnerResult {
 }
 
 const ELEVATED_RUNNER_PROTOCOL_VERSION: u32 = 1;
+const UNELEVATED_CAPABILITY_PRINCIPAL: &str = "opentopia:unelevated-capability:v1";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ElevatedRunnerRequestEnvelope {
@@ -596,6 +593,12 @@ struct PersistentAclEntry {
     account: String,
     path: std::path::PathBuf,
     kind: PersistentAclKind,
+    #[serde(default = "legacy_acl_entry_permissions_version")]
+    permissions_version: u32,
+}
+
+fn legacy_acl_entry_permissions_version() -> u32 {
+    1
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -717,6 +720,7 @@ fn ensure_persistent_user_permissions(
             account: account.to_string(),
             path: path.clone(),
             kind: kind.clone(),
+            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
         };
         if ledger.entries.contains(&entry) {
             continue;
@@ -725,17 +729,66 @@ fn ensure_persistent_user_permissions(
             PersistentAclKind::Read => {
                 transaction.grant(&path, sid, true, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
             }
-            PersistentAclKind::Write => transaction.grant(
-                &path,
-                sid,
-                true,
-                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE,
-            )?,
+            PersistentAclKind::Write => {
+                transaction.grant(&path, sid, true, WORKSPACE_WRITE_PERMISSIONS)?
+            }
             PersistentAclKind::DenyRead => {
                 transaction.deny(&path, sid, true, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
             }
             PersistentAclKind::DenyWrite => transaction.deny_write(&path, sid, true)?,
         }
+        ledger.entries.retain(|existing| {
+            existing.account != entry.account
+                || existing.path != entry.path
+                || existing.kind != entry.kind
+        });
+        ledger.entries.push(entry);
+    }
+    save_acl_ledger(&ledger)?;
+    transaction.commit();
+    Ok(())
+}
+
+fn ensure_persistent_capability_permissions(request: &SandboxRequest, sid: PSID) -> Result<()> {
+    let _guard = NamedAclMutex::acquire()?;
+    let mut ledger = load_acl_ledger()?;
+    let mut transaction = AclTransaction::default();
+    let desired = request
+        .write_roots
+        .iter()
+        .cloned()
+        .map(|path| (path, PersistentAclKind::Write))
+        .chain(
+            request
+                .protected_paths
+                .iter()
+                .filter(|path| path.exists())
+                .cloned()
+                .map(|path| (path, PersistentAclKind::DenyWrite)),
+        );
+
+    for (path, kind) in desired {
+        let entry = PersistentAclEntry {
+            account: UNELEVATED_CAPABILITY_PRINCIPAL.to_string(),
+            path: path.clone(),
+            kind: kind.clone(),
+            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+        };
+        if ledger.entries.contains(&entry) {
+            continue;
+        }
+        match kind {
+            PersistentAclKind::Write => {
+                transaction.grant(&path, sid, true, WORKSPACE_WRITE_PERMISSIONS)?
+            }
+            PersistentAclKind::DenyWrite => transaction.deny_write(&path, sid, true)?,
+            PersistentAclKind::Read | PersistentAclKind::DenyRead => unreachable!(),
+        }
+        ledger.entries.retain(|existing| {
+            existing.account != entry.account
+                || existing.path != entry.path
+                || existing.kind != entry.kind
+        });
         ledger.entries.push(entry);
     }
     save_acl_ledger(&ledger)?;
@@ -762,7 +815,7 @@ pub(super) fn cleanup_workspace_acl(args: &[String]) -> Result<i32> {
         path_starts_with(&entry.path, &workspace)
             && revoked.insert((entry.account.clone(), entry.path.clone()))
     }) {
-        let mut sid = account_sid(&entry.account)?;
+        let mut sid = acl_principal_sid(&entry.account)?;
         update_dacl(&entry.path, sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
     }
     ledger
@@ -846,7 +899,13 @@ impl ProtectedWriteWindow {
 impl Drop for ProtectedWriteWindow {
     fn drop(&mut self) {
         for path in &self.paths {
-            let _ = update_dacl(path, self.sid, DENY_ACCESS, true, FILE_GENERIC_WRITE);
+            let _ = update_dacl(
+                path,
+                self.sid,
+                DENY_ACCESS,
+                true,
+                WRITE_RESTRICTION_PERMISSIONS,
+            );
         }
     }
 }
@@ -888,6 +947,14 @@ fn account_sid(account: &str) -> Result<SidBuffer> {
     }
     sid.truncate(sid_len as usize);
     Ok(SidBuffer(sid))
+}
+
+fn acl_principal_sid(principal: &str) -> Result<SidBuffer> {
+    if principal == UNELEVATED_CAPABILITY_PRINCIPAL {
+        Ok(SidBuffer::opentopia_capability())
+    } else {
+        account_sid(principal)
+    }
 }
 
 fn current_profile_home() -> Result<std::path::PathBuf> {
@@ -1068,14 +1135,18 @@ fn set_default_dacl(token: HANDLE, sids: &[PSID]) -> Result<()> {
 struct SidBuffer(Vec<u8>);
 
 impl SidBuffer {
-    fn random_capability() -> Self {
-        let random = *Uuid::new_v4().as_bytes();
+    fn opentopia_capability() -> Self {
+        // A stable restricting SID lets the helper install each workspace ACL
+        // once. The previous per-process random SID required recursive ACL
+        // propagation before and after every command; if the broker was killed
+        // during that window, stale ACEs accumulated and eventually made every
+        // subsequent tool call time out while preparing the sandbox.
         let values = [
             21_u32,
-            u32::from_le_bytes(random[0..4].try_into().expect("uuid segment")),
-            u32::from_le_bytes(random[4..8].try_into().expect("uuid segment")),
-            u32::from_le_bytes(random[8..12].try_into().expect("uuid segment")),
-            u32::from_le_bytes(random[12..16].try_into().expect("uuid segment")),
+            u32::from_le_bytes(*b"Open"),
+            u32::from_le_bytes(*b"Topi"),
+            u32::from_le_bytes(*b"aSan"),
+            u32::from_le_bytes(*b"dbox"),
         ];
         let mut bytes = Vec::with_capacity(8 + values.len() * 4);
         bytes.extend([1, values.len() as u8, 0, 0, 0, 0, 0, 5]);
@@ -1178,7 +1249,7 @@ impl AclTransaction {
     }
 
     fn deny_write(&mut self, path: &Path, sid: PSID, inherit: bool) -> Result<()> {
-        self.deny(path, sid, inherit, FILE_GENERIC_WRITE)
+        self.deny(path, sid, inherit, WRITE_RESTRICTION_PERMISSIONS)
     }
 
     fn deny(&mut self, path: &Path, sid: PSID, inherit: bool, permissions: u32) -> Result<()> {
@@ -1634,5 +1705,13 @@ mod tests {
         let decoded: ElevatedRunnerRequestEnvelope =
             serde_json::from_slice(&encoded).expect("deserialize request envelope");
         assert_eq!(decoded.protocol_version, ELEVATED_RUNNER_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn unelevated_capability_principal_resolves_to_a_stable_sid() {
+        let first = SidBuffer::opentopia_capability();
+        let second = acl_principal_sid(UNELEVATED_CAPABILITY_PRINCIPAL)
+            .expect("resolve stable capability principal");
+        assert_eq!(first.0, second.0);
     }
 }
