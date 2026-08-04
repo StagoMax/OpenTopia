@@ -625,7 +625,7 @@ fn load_acl_ledger() -> Result<PersistentAclLedger> {
     if !path.exists() {
         return Ok(PersistentAclLedger::default());
     }
-    let ledger: PersistentAclLedger = serde_json::from_slice(
+    let mut ledger: PersistentAclLedger = serde_json::from_slice(
         &std::fs::read(&path).with_context(|| format!("read ACL ledger {}", path.display()))?,
     )
     .with_context(|| format!("parse ACL ledger {}", path.display()))?;
@@ -636,6 +636,7 @@ fn load_acl_ledger() -> Result<PersistentAclLedger> {
             ACL_LEDGER_VERSION
         )
     }
+    ledger.entries.retain(|entry| entry.path.exists());
     Ok(ledger)
 }
 
