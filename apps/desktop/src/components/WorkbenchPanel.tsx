@@ -1379,19 +1379,35 @@ function TerminalView({
   return (
     <div className="terminal-view">
       <div className="terminal-toolbar" role="toolbar" aria-label="终端控制">
-        <span className="terminal-session-label">
+        <span
+          className="terminal-session-label"
+          aria-label={
+            terminalSession
+              ? `${terminalSession.shell}，正在运行`
+              : "终端未启动"
+          }
+          title={terminalSession?.shell}
+        >
           <TerminalSquare size={14} aria-hidden="true" />
-          {terminalSession
-            ? `${terminalSession.shell} · 持久会话`
-            : "终端未启动"}
+          <strong>
+            {terminalSession
+              ? terminalShellName(terminalSession.shell)
+              : "终端未启动"}
+          </strong>
+          {terminalSession && <Badge variant="success">正在运行</Badge>}
         </span>
+        {terminalSession && (
+          <span className="terminal-session-cwd" title={terminalSession.cwd}>
+            {terminalSession.cwd}
+          </span>
+        )}
         <span className="terminal-toolbar-spacer" />
         {thread && terminalSession ? (
           <IconButton
             size="compact"
             variant="quiet"
-            title="关闭终端会话"
-            aria-label="关闭终端会话"
+            title="终止终端"
+            aria-label="终止终端"
             onClick={() => onCloseSession(thread.id, terminalSession.sessionId)}
           >
             <Square size={14} aria-hidden="true" />
@@ -1403,8 +1419,12 @@ function TerminalView({
             disabled={!thread || isStartingSession}
             onClick={handleRestart}
           >
-            <TerminalSquare size={14} aria-hidden="true" />
-            {isStartingSession ? "启动中" : "启动终端"}
+            {isStartingSession ? (
+              <Loader2 className="spin" size={14} aria-hidden="true" />
+            ) : (
+              <Plus size={14} aria-hidden="true" />
+            )}
+            {isStartingSession ? "启动中" : "新建终端"}
           </Button>
         )}
         <IconButton
@@ -1455,6 +1475,21 @@ function TerminalView({
       </details>
     </div>
   );
+}
+
+export function terminalShellName(shell: string): string {
+  const executable = shell.split(/[\\/]/).at(-1) ?? shell;
+  const name = executable.replace(/\.exe$/i, "");
+  switch (name.toLowerCase()) {
+    case "cmd":
+      return "命令提示符";
+    case "powershell":
+      return "Windows PowerShell";
+    case "pwsh":
+      return "PowerShell";
+    default:
+      return name;
+  }
 }
 
 function writeTerminalEventToXterm(

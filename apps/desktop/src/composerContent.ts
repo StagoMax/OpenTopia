@@ -7,6 +7,33 @@ export type ComposerHistorySnapshot = {
   caretOffset: number;
 };
 
+export type ComposerExternalValueSyncAction = "ignore" | "defer" | "apply";
+
+export function composerExternalValueSyncAction({
+  value,
+  lastLocallyPublishedValue,
+  compositionPending,
+}: {
+  value: string;
+  lastLocallyPublishedValue: string | null;
+  compositionPending: boolean;
+}): ComposerExternalValueSyncAction {
+  if (value === lastLocallyPublishedValue) return "ignore";
+  return compositionPending ? "defer" : "apply";
+}
+
+export function composerInputCommitPending({
+  isComposing,
+  compositionSnapshotPending,
+  nativeIsComposing,
+}: {
+  isComposing: boolean;
+  compositionSnapshotPending: boolean;
+  nativeIsComposing: boolean;
+}): boolean {
+  return isComposing || compositionSnapshotPending || nativeIsComposing;
+}
+
 type ComposerContentToken =
   { type: "text"; text: string } | { type: "image_ref"; imageId: string };
 

@@ -103,6 +103,29 @@
   --syntax-punctuation: #6b7280;
   --syntax-comment: #71808c;
 
+  /* Integrated terminal: Windows Terminal-inspired light palette. */
+  --terminal-background: #ffffff;
+  --terminal-foreground: #1f1f1f;
+  --terminal-border: #e1e5e9;
+  --terminal-cursor: #1f1f1f;
+  --terminal-selection: #add6ff;
+  --terminal-ansi-black: #0c0c0c;
+  --terminal-ansi-bright-black: #767676;
+  --terminal-ansi-red: #c50f1f;
+  --terminal-ansi-bright-red: #e74856;
+  --terminal-ansi-green: #13a10e;
+  --terminal-ansi-bright-green: #16c60c;
+  --terminal-ansi-yellow: #c19c00;
+  --terminal-ansi-bright-yellow: #e5a900;
+  --terminal-ansi-blue: #0037da;
+  --terminal-ansi-bright-blue: #3b78ff;
+  --terminal-ansi-magenta: #881798;
+  --terminal-ansi-bright-magenta: #b4009e;
+  --terminal-ansi-cyan: #3a96dd;
+  --terminal-ansi-bright-cyan: #007acc;
+  --terminal-ansi-white: #cccccc;
+  --terminal-ansi-bright-white: #f2f2f2;
+
   --control-height-sm: 28px;
   --control-height-md: 32px;
   --control-height-lg: 36px;
@@ -188,4 +211,27 @@
   --syntax-type: #7cbcfa;
   --syntax-punctuation: #9aa3b2;
   --syntax-comment: #8d9aa6;
+
+  /* Integrated terminal: VS Code-inspired dark palette. */
+  --terminal-background: #181818;
+  --terminal-foreground: #cccccc;
+  --terminal-border: #333333;
+  --terminal-cursor: #ffffff;
+  --terminal-selection: #264f78;
+  --terminal-ansi-black: #000000;
+  --terminal-ansi-bright-black: #666666;
+  --terminal-ansi-red: #cd3131;
+  --terminal-ansi-bright-red: #f14c4c;
+  --terminal-ansi-green: #0dbc79;
+  --terminal-ansi-bright-green: #23d18b;
+  --terminal-ansi-yellow: #e5e510;
+  --terminal-ansi-bright-yellow: #f5f543;
+  --terminal-ansi-blue: #2472c8;
+  --terminal-ansi-bright-blue: #3b8eea;
+  --terminal-ansi-magenta: #bc3fbc;
+  --terminal-ansi-bright-magenta: #d670d6;
+  --terminal-ansi-cyan: #11a8cd;
+  --terminal-ansi-bright-cyan: #29b8db;
+  --terminal-ansi-white: #e5e5e5;
+  --terminal-ansi-bright-white: #ffffff;
 }

@@ -71,11 +71,14 @@ export const XtermTerminal = forwardRef<
     const terminal = new Terminal({
       theme: readTerminalTheme(),
       cursorBlink: true,
-      cursorStyle: "bar",
+      cursorStyle: "block",
+      cursorInactiveStyle: "outline",
       fontSize: readCssNumber("--font-size-code", 12),
       fontFamily: readCssToken("--font-mono"),
       lineHeight: readCssNumber("--line-height-body", 1.45),
       letterSpacing: 0,
+      minimumContrastRatio: 4.5,
+      disableStdin: disabled,
       scrollback: 10_000,
       convertEol: false,
       cols: 100,
@@ -127,7 +130,21 @@ export const XtermTerminal = forwardRef<
     };
   }, [fitTerminal]);
 
-  return <div ref={containerRef} className="xterm-container" />;
+  useEffect(() => {
+    if (!terminalRef.current) return;
+    terminalRef.current.options.disableStdin = disabled;
+    terminalRef.current.options.cursorBlink = !disabled;
+  }, [disabled]);
+
+  return (
+    <div
+      ref={containerRef}
+      className="xterm-container"
+      role="region"
+      aria-label="终端输入区"
+      aria-disabled={disabled}
+    />
+  );
 });
 
 function readCssToken(name: string): string {
@@ -142,26 +159,26 @@ function readCssNumber(name: string, fallback: number): number {
 
 function readTerminalTheme(): ITheme {
   return {
-    background: readCssToken("--surface"),
-    foreground: readCssToken("--text"),
-    cursor: readCssToken("--text"),
-    cursorAccent: readCssToken("--surface"),
-    selectionBackground: readCssToken("--accent-subtle"),
-    black: readCssToken("--surface-chrome"),
-    brightBlack: readCssToken("--text-muted"),
-    red: readCssToken("--danger"),
-    brightRed: readCssToken("--danger"),
-    green: readCssToken("--success"),
-    brightGreen: readCssToken("--success"),
-    yellow: readCssToken("--warning"),
-    brightYellow: readCssToken("--warning"),
-    blue: readCssToken("--accent"),
-    brightBlue: readCssToken("--accent-hover"),
-    magenta: readCssToken("--syntax-keyword"),
-    brightMagenta: readCssToken("--syntax-keyword"),
-    cyan: readCssToken("--syntax-type"),
-    brightCyan: readCssToken("--syntax-type"),
-    white: readCssToken("--text-secondary"),
-    brightWhite: readCssToken("--text"),
+    background: readCssToken("--terminal-background"),
+    foreground: readCssToken("--terminal-foreground"),
+    cursor: readCssToken("--terminal-cursor"),
+    cursorAccent: readCssToken("--terminal-background"),
+    selectionBackground: readCssToken("--terminal-selection"),
+    black: readCssToken("--terminal-ansi-black"),
+    brightBlack: readCssToken("--terminal-ansi-bright-black"),
+    red: readCssToken("--terminal-ansi-red"),
+    brightRed: readCssToken("--terminal-ansi-bright-red"),
+    green: readCssToken("--terminal-ansi-green"),
+    brightGreen: readCssToken("--terminal-ansi-bright-green"),
+    yellow: readCssToken("--terminal-ansi-yellow"),
+    brightYellow: readCssToken("--terminal-ansi-bright-yellow"),
+    blue: readCssToken("--terminal-ansi-blue"),
+    brightBlue: readCssToken("--terminal-ansi-bright-blue"),
+    magenta: readCssToken("--terminal-ansi-magenta"),
+    brightMagenta: readCssToken("--terminal-ansi-bright-magenta"),
+    cyan: readCssToken("--terminal-ansi-cyan"),
+    brightCyan: readCssToken("--terminal-ansi-bright-cyan"),
+    white: readCssToken("--terminal-ansi-white"),
+    brightWhite: readCssToken("--terminal-ansi-bright-white"),
   };
 }

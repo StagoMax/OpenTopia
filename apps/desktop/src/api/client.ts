@@ -87,6 +87,10 @@ import type {
   WorkspaceTree,
 } from "../types";
 import { getLoadedApiToken } from "../platform";
+import {
+  shouldRecoverEventSequenceGap,
+  type EventSequencePolicy,
+} from "../eventStreamSequence";
 
 export type StreamHandle = { close(): void };
 
@@ -1253,6 +1257,7 @@ export class ApiClient {
     return this.openAuthenticatedSse(
       `/api/threads/${threadId}/events/stream${query}`,
       (data) => onEvent(JSON.parse(data) as AgentEvent),
+      "projected",
     );
   }
 
@@ -1374,6 +1379,7 @@ export class ApiClient {
   private openAuthenticatedSse(
     path: string,
     onData: (data: string) => void,
+    sequencePolicy: EventSequencePolicy = "contiguous",
   ): StreamHandle {
     const controller = new AbortController();
     let lastSequence = readSince(path);
@@ -1411,11 +1417,14 @@ export class ApiClient {
               }
               if (
                 typeof sequence === "number" &&
-                lastSequence !== undefined &&
-                sequence > lastSequence + 1
+                shouldRecoverEventSequenceGap(
+                  lastSequence,
+                  sequence,
+                  sequencePolicy,
+                )
               ) {
                 console.warn(
-                  `OpenTopia event stream skipped sequences ${lastSequence + 1}-${sequence - 1}; reconnecting to replay them`,
+                  `OpenTopia event stream skipped sequences ${lastSequence! + 1}-${sequence - 1}; reconnecting to replay them`,
                 );
                 return false;
               }

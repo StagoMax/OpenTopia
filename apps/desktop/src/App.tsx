@@ -115,11 +115,17 @@ import {
 } from "./components/TurnActivityTimeline";
 import { WebPreviewSurface } from "./components/WebPreviewSurface";
 import { ComputerPanel } from "./components/ComputerPanel";
-import { WorkbenchPanel, type WorkbenchTab } from "./components/WorkbenchPanel";
+import {
+  terminalShellName,
+  WorkbenchPanel,
+  type WorkbenchTab,
+} from "./components/WorkbenchPanel";
 import { Button, IconButton, Popover } from "./components/ui";
 import { normalizeCopiedText } from "./clipboardText";
 import {
   composerContentText,
+  composerExternalValueSyncAction,
+  composerInputCommitPending,
   composerUndoEntries,
   composerVisibleText,
   normalizeComposerContentParts,
@@ -131,6 +137,7 @@ import { isConversationScrollNearEnd } from "./conversationScroll";
 import {
   cacheConversation,
   mergeConversationEvents,
+  mergeConversationMessages,
   type ConversationCacheEntry,
 } from "./conversationCache";
 import {
@@ -139,6 +146,7 @@ import {
   type ConversationStreamEventTrace,
 } from "./conversationRenderTrace";
 import { threadTitleRetryDelay } from "./threadTitleRetry";
+import { closeToolTabState } from "./toolTabState";
 import { resolveMarkdownLink } from "./markdownLinks";
 import {
   useWorkspacePathIndex,
@@ -637,7 +645,10 @@ export function App() {
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [skillsRevision, setSkillsRevision] = useState(0);
-  const [isSending, setIsSending] = useState(false);
+  const [isCreatingThread, setIsCreatingThread] = useState(false);
+  const [sendingThreadIds, setSendingThreadIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const pendingThreadTitleRetriesRef = useRef(
     new Map<string, PendingThreadTitleRetry>(),
@@ -645,8 +656,8 @@ export function App() {
   const threadTitleRetryInFlightRef = useRef(new Set<string>());
   const threadTitleRetryTimerRef = useRef<number | null>(null);
   const [threadTitleRetryRevision, setThreadTitleRetryRevision] = useState(0);
-  const [pendingTurnFeedback, setPendingTurnFeedback] =
-    useState<PendingTurnFeedback | null>(null);
+  const [pendingTurnFeedbackByThread, setPendingTurnFeedbackByThread] =
+    useState<Record<string, PendingTurnFeedback>>({});
   const [threadActivityStatuses, setThreadActivityStatuses] = useState<
     Record<string, ThreadActivityStatus>
   >({});
@@ -806,10 +817,68 @@ export function App() {
     [],
   );
 
+  const setThreadSending = useCallback(
+    (threadId: string, sending: boolean) => {
+      setSendingThreadIds((current) => {
+        const alreadySending = current.has(threadId);
+        if (alreadySending === sending) return current;
+        const next = new Set(current);
+        if (sending) next.add(threadId);
+        else next.delete(threadId);
+        return next;
+      });
+    },
+    [],
+  );
+
+  const updatePendingTurnFeedback = useCallback(
+    (
+      threadId: string,
+      update:
+        | PendingTurnFeedback
+        | null
+        | ((current: PendingTurnFeedback | null) => PendingTurnFeedback | null),
+    ) => {
+      setPendingTurnFeedbackByThread((current) => {
+        const previous = current[threadId] ?? null;
+        const next = typeof update === "function" ? update(previous) : update;
+        if (next === previous) return current;
+        if (!next) {
+          if (!previous) return current;
+          const remaining = { ...current };
+          delete remaining[threadId];
+          return remaining;
+        }
+        return { ...current, [threadId]: next };
+      });
+    },
+    [],
+  );
+
+  const mergeMessagesForThread = useCallback(
+    (threadId: string, incoming: Message[]) => {
+      const cached = conversationCacheRef.current.get(threadId);
+      cacheConversation(conversationCacheRef.current, threadId, {
+        messages: mergeConversationMessages(cached?.messages ?? [], incoming),
+        events: cached?.events ?? [],
+      });
+      if (activeThreadIdRef.current === threadId) {
+        setMessages((current) => mergeConversationMessages(current, incoming));
+      }
+    },
+    [],
+  );
+
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
     [threads, activeThreadId],
   );
+  const isSending = activeThreadId
+    ? sendingThreadIds.has(activeThreadId)
+    : isCreatingThread;
+  const pendingTurnFeedback = activeThreadId
+    ? (pendingTurnFeedbackByThread[activeThreadId] ?? null)
+    : null;
   const isConversationReady =
     activeThreadId !== null &&
     conversationLoadState.threadId === activeThreadId &&
@@ -907,10 +976,10 @@ export function App() {
         : event.createdAt >= pendingTurnFeedback.startedAt;
     });
     if (!feedbackHasResolved) return;
-    setPendingTurnFeedback((current) =>
+    updatePendingTurnFeedback(pendingTurnFeedback.threadId, (current) =>
       current?.startedAt === pendingTurnFeedback.startedAt ? null : current,
     );
-  }, [events, pendingTurnFeedback]);
+  }, [events, pendingTurnFeedback, updatePendingTurnFeedback]);
 
   useEffect(() => {
     if (!activeApproval) return;
@@ -1203,11 +1272,7 @@ export function App() {
 
       if (event.payload.type === "assistant_message") {
         const assistantMessage = event.payload.message;
-        setMessages((current) => {
-          if (current.some((message) => message.id === assistantMessage.id))
-            return current;
-          return [...current, assistantMessage];
-        });
+        mergeMessagesForThread(event.threadId, [assistantMessage]);
       }
 
       if (event.payload.type === "goal_updated") {
@@ -1403,7 +1468,11 @@ export function App() {
         );
       }
     },
-    [deliverTaskCompletionNotification, setThreadActivityStatus],
+    [
+      deliverTaskCompletionNotification,
+      mergeMessagesForThread,
+      setThreadActivityStatus,
+    ],
   );
 
   useLayoutEffect(() => {
@@ -1698,7 +1767,9 @@ export function App() {
     void messagesRequest
       .then((loadedMessages) => {
         if (cancelled) return;
-        setMessages(loadedMessages);
+        setMessages((current) =>
+          mergeConversationMessages(current, loadedMessages),
+        );
         setConversationLoadState({ threadId, status: "ready", error: null });
       })
       .catch((error) => {
@@ -1834,6 +1905,13 @@ export function App() {
         controller.signal,
       );
       if (cancelled) return;
+      const session = await client.ensureTerminalSession(activeThreadId);
+      if (cancelled) return;
+
+      // Windows console shells may emit a cursor-position query (ESC[6n)
+      // before drawing the first prompt. Commit the writable session before
+      // replaying history so xterm's automatic reply is not dropped.
+      setTerminalSession(session);
       setTerminalEvents(history);
       const since = history.at(-1)?.seq;
       source = client.openTerminalStream(
@@ -1841,8 +1919,6 @@ export function App() {
         since,
         ingestTerminalEvent,
       );
-      const session = await client.ensureTerminalSession(activeThreadId);
-      if (!cancelled) setTerminalSession(session);
     })().catch((error) => {
       if (!cancelled && !isAbortError(error))
         setWorkbenchError(
@@ -1928,9 +2004,11 @@ export function App() {
 
   function selectThread(threadId: string) {
     const thread = threads.find((item) => item.id === threadId);
+    activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
     if (thread) setExperienceMode(thread.experienceMode);
     setDraftProjectId(null);
+    setComposer("");
     setContextSources([]);
     setSelectedSkillIds([]);
     if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
@@ -1949,9 +2027,11 @@ export function App() {
         setThreads(nextThreads);
         const thread = nextThreads.find((item) => item.id === request.threadId);
         if (!thread) return;
+        activeThreadIdRef.current = thread.id;
         setActiveThreadId(thread.id);
         setExperienceMode(thread.experienceMode);
         setDraftProjectId(null);
+        setComposer("");
         setContextSources([]);
         setSelectedSkillIds([]);
         setSelectedWorkspaceRoot(thread.workspaceRoot);
@@ -1983,6 +2063,7 @@ export function App() {
     workspaceRoot: string | null,
     projectId: string | null = null,
   ) {
+    activeThreadIdRef.current = null;
     setActiveThreadId(null);
     setMessages([]);
     setEvents([]);
@@ -2300,15 +2381,15 @@ export function App() {
 
   function closeToolTab(tabId: string) {
     setToolTabs((current) => {
-      const closingIndex = current.findIndex((tab) => tab.id === tabId);
-      const next = current.filter((tab) => tab.id !== tabId);
-      if (activeToolTabId === tabId) {
-        const replacement =
-          next[Math.min(Math.max(closingIndex, 0), next.length - 1)] ?? null;
-        setActiveToolTabId(replacement?.id ?? null);
-        if (!replacement) setConversationCollapsed(false);
+      const next = closeToolTabState(current, activeToolTabId, tabId);
+      if (next.activeTabId !== activeToolTabId) {
+        setActiveToolTabId(next.activeTabId);
       }
-      return next;
+      if (next.shouldCollapse) {
+        setToolStageOpen(false);
+        setConversationCollapsed(false);
+      }
+      return next.tabs;
     });
   }
 
@@ -2837,7 +2918,7 @@ export function App() {
     imageAttachments: InlineImageAttachment[] = [],
     contentParts: InlineMessageContentPart[] = [],
   ): Promise<boolean> {
-    if (!client) return false;
+    if (!client || isCreatingThread) return false;
     if (newTaskLaunchMode === "new_worktree") {
       setActionError(
         "“新工作树”启动模式尚未接入线程创建；请选择“在本地处理”后继续。",
@@ -2871,12 +2952,17 @@ export function App() {
     if (!project?.workspaceRoot) project = await chooseWorkspace(true);
     if (!project?.workspaceRoot) return false;
 
-    setIsSending(
+    const shouldSendInitialPrompt =
       Boolean(initialPrompt?.trim()) ||
-        contextSources.length > 0 ||
-        imageAttachments.length > 0 ||
-        selectedSkillIds.length > 0,
-    );
+      contextSources.length > 0 ||
+      imageAttachments.length > 0 ||
+      selectedSkillIds.length > 0;
+    const submittedContextPaths = contextSources.map((source) => source.path);
+    const submittedSkillIds = [...selectedSkillIds];
+    const submittedCollaborationMode = collaborationMode;
+    const submittedModelSelection = draftModelSelection;
+    let createdThreadId: string | null = null;
+    setIsCreatingThread(true);
     let pendingFeedbackStartedAt: string | null = null;
     setActionError(null);
     try {
@@ -2887,16 +2973,19 @@ export function App() {
         projectId: project.id,
         experienceMode,
       });
-      if (draftModelSelection) {
+      createdThreadId = thread.id;
+      if (shouldSendInitialPrompt) setThreadSending(thread.id, true);
+      if (submittedModelSelection) {
         // Pin before the first turn runs, so the conversation starts on the
         // model picked in the draft composer rather than the connection default.
         try {
-          thread = await client.setThreadModel(thread.id, draftModelSelection);
+          thread = await client.setThreadModel(thread.id, submittedModelSelection);
         } catch (error) {
           console.warn("OpenTopia could not pin the task model", error);
         }
       }
       setThreads((current) => [thread, ...current]);
+      activeThreadIdRef.current = thread.id;
       setActiveThreadId(thread.id);
       setSelectedWorkspaceRoot(thread.workspaceRoot);
       setDraftProjectId(null);
@@ -2914,15 +3003,10 @@ export function App() {
       }
       if (directCommand) {
         await runDirectToolCommand(thread.id, directCommand);
-        setComposer("");
-      } else if (
-        initialPrompt?.trim() ||
-        contextSources.length > 0 ||
-        imageAttachments.length > 0 ||
-        selectedSkillIds.length > 0
-      ) {
+        if (activeThreadIdRef.current === thread.id) setComposer("");
+      } else if (shouldSendInitialPrompt) {
         pendingFeedbackStartedAt = new Date().toISOString();
-        setPendingTurnFeedback({
+        updatePendingTurnFeedback(thread.id, {
           threadId: thread.id,
           turnId: null,
           phase: "thinking",
@@ -2932,41 +3016,51 @@ export function App() {
           thread.id,
           initialPrompt?.trim() ?? "",
           imageAttachments,
-          draftModelSelection,
+          submittedModelSelection,
         );
         const { message, turnId } = await client.sendMessage(
           thread.id,
           prepared.prompt,
-          contextSources.map((source) => source.path),
-          selectedSkillIds,
-          collaborationMode,
+          submittedContextPaths,
+          submittedSkillIds,
+          submittedCollaborationMode,
           undefined,
           prepared.imageAttachments,
           prepared.imageAttachments.length > 0 ? contentParts : [],
         );
-        setMessages([message]);
+        mergeMessagesForThread(thread.id, [message]);
         setThreadActivityStatus(thread.id, "processing");
-        if (turnId) setActiveTurnId(turnId);
-        setPendingTurnFeedback((current) =>
+        if (turnId && activeThreadIdRef.current === thread.id) {
+          setActiveTurnId(turnId);
+        }
+        updatePendingTurnFeedback(thread.id, (current) =>
           current?.startedAt === pendingFeedbackStartedAt
             ? { ...current, turnId }
             : current,
         );
-        setComposer("");
-        setContextSources([]);
-        setSelectedSkillIds([]);
+        if (activeThreadIdRef.current === thread.id) {
+          setComposer("");
+          setContextSources([]);
+          setSelectedSkillIds([]);
+        }
       }
-      return true;
+      return activeThreadIdRef.current === thread.id;
     } catch (error) {
-      if (pendingFeedbackStartedAt) {
-        setPendingTurnFeedback((current) =>
+      if (pendingFeedbackStartedAt && createdThreadId) {
+        updatePendingTurnFeedback(createdThreadId, (current) =>
           current?.startedAt === pendingFeedbackStartedAt ? null : current,
         );
       }
-      setActionError(`创建任务失败：${errorMessage(error)}`);
+      if (
+        createdThreadId === null ||
+        activeThreadIdRef.current === createdThreadId
+      ) {
+        setActionError(`创建任务失败：${errorMessage(error)}`);
+      }
       return false;
     } finally {
-      setIsSending(false);
+      setIsCreatingThread(false);
+      if (createdThreadId) setThreadSending(createdThreadId, false);
     }
   }
 
@@ -3067,41 +3161,49 @@ export function App() {
       setActionError("Direct tool commands cannot include agent context.");
       return false;
     }
-    setIsSending(true);
+    const threadId = activeThread.id;
+    const submittedContextPaths = contextSources.map((source) => source.path);
+    const submittedSkillIds = [...selectedSkillIds];
+    const submittedCollaborationMode = collaborationMode;
+    const submittedGoalId = reusableGoalId(collaborationMode, goalSnapshot);
+    const submittedModelSelection = activeThread.modelSelection;
+    setThreadSending(threadId, true);
     let pendingFeedbackStartedAt: string | null = null;
     try {
       if (directCommand) {
-        await runDirectToolCommand(activeThread.id, directCommand);
-        setComposer("");
-        return true;
+        await runDirectToolCommand(threadId, directCommand);
+        if (activeThreadIdRef.current === threadId) setComposer("");
+        return activeThreadIdRef.current === threadId;
       }
       pendingFeedbackStartedAt = new Date().toISOString();
-      setPendingTurnFeedback({
-        threadId: activeThread.id,
+      updatePendingTurnFeedback(threadId, {
+        threadId,
         turnId: null,
         phase: "thinking",
         startedAt: pendingFeedbackStartedAt,
       });
       const prepared = await prepareImageSubmission(
-        activeThread.id,
+        threadId,
         messageText,
         imageAttachments,
-        activeThread.modelSelection,
+        submittedModelSelection,
       );
       const { message, turnId, queued } = await client.sendMessage(
-        activeThread.id,
+        threadId,
         prepared.prompt,
-        contextSources.map((source) => source.path),
-        selectedSkillIds,
-        collaborationMode,
-        reusableGoalId(collaborationMode, goalSnapshot),
+        submittedContextPaths,
+        submittedSkillIds,
+        submittedCollaborationMode,
+        submittedGoalId,
         prepared.imageAttachments,
         prepared.imageAttachments.length > 0 ? contentParts : [],
       );
-      setMessages((current) => [...current, message]);
-      setThreadActivityStatus(activeThread.id, "processing");
-      if (turnId) setActiveTurnId(turnId);
-      setPendingTurnFeedback((current) =>
+      mergeMessagesForThread(threadId, [message]);
+      setThreadActivityStatus(threadId, "processing");
+      if (turnId && activeThreadIdRef.current === threadId) {
+        setActiveTurnId(turnId);
+      }
+      updatePendingTurnFeedback(threadId, (current) =>
         current?.startedAt === pendingFeedbackStartedAt
           ? {
               ...current,
@@ -3110,32 +3212,38 @@ export function App() {
             }
           : current,
       );
-      if (queued) setQueuedMessageCount((current) => current + 1);
-      setComposer("");
-      setContextSources([]);
-      setSelectedSkillIds([]);
+      if (activeThreadIdRef.current === threadId) {
+        if (queued) setQueuedMessageCount((current) => current + 1);
+        setComposer("");
+        setContextSources([]);
+        setSelectedSkillIds([]);
+      }
       try {
-        const turnStatus = await client.getTurnStatus(activeThread.id);
-        setActiveTurnId(
-          turnStatus?.status === "running" ||
-            turnStatus?.status === "cancelling"
-            ? turnStatus.turnId
-            : null,
-        );
+        const turnStatus = await client.getTurnStatus(threadId);
+        if (activeThreadIdRef.current === threadId) {
+          setActiveTurnId(
+            turnStatus?.status === "running" ||
+              turnStatus?.status === "cancelling"
+              ? turnStatus.turnId
+              : null,
+          );
+        }
       } catch {
         // The persisted event stream will reconcile Turn state after a successful send.
       }
-      return true;
+      return activeThreadIdRef.current === threadId;
     } catch (error) {
       if (pendingFeedbackStartedAt) {
-        setPendingTurnFeedback((current) =>
+        updatePendingTurnFeedback(threadId, (current) =>
           current?.startedAt === pendingFeedbackStartedAt ? null : current,
         );
       }
-      setActionError(errorMessage(error));
+      if (activeThreadIdRef.current === threadId) {
+        setActionError(errorMessage(error));
+      }
       return false;
     } finally {
-      setIsSending(false);
+      setThreadSending(threadId, false);
     }
   }
 
@@ -8611,6 +8719,8 @@ function Composer({
     null,
   );
   const isComposingRef = useRef(false);
+  const lastLocallyPublishedValueRef = useRef<string | null>(null);
+  const deferredExternalValueRef = useRef<{ value: string } | null>(null);
 
   useEffect(() => {
     imageAttachmentsRef.current = imageAttachments;
@@ -8625,13 +8735,15 @@ function Composer({
     [],
   );
 
-  useLayoutEffect(() => {
+  function applyExternalComposerValue(nextValue: string) {
     const editor = editorRef.current;
     if (!editor) return;
+    deferredExternalValueRef.current = null;
+    lastLocallyPublishedValueRef.current = null;
     const current = composerSnapshotAtSelection(editor);
     const currentText = composerVisibleText(current.parts);
-    if (currentComposerSnapshotRef.current && currentText === value) return;
-    if (!currentComposerSnapshotRef.current && currentText === value) {
+    if (currentComposerSnapshotRef.current && currentText === nextValue) return;
+    if (!currentComposerSnapshotRef.current && currentText === nextValue) {
       currentComposerSnapshotRef.current = current;
       return;
     }
@@ -8643,12 +8755,31 @@ function Composer({
     setImageAttachments([]);
     setHasInlineImageReferences(false);
     setPreviewIndex(null);
-    editor.textContent = value;
+    editor.textContent = nextValue;
     const next = readComposerContent(editor);
     currentComposerSnapshotRef.current = next;
     composerUndoHistoryRef.current = [];
     composerRedoHistoryRef.current = [];
-    setDraft(value);
+    setDraft(nextValue);
+  }
+
+  useLayoutEffect(() => {
+    const compositionPending =
+      isComposingRef.current || Boolean(compositionStartSnapshotRef.current);
+    const action = composerExternalValueSyncAction({
+      value,
+      lastLocallyPublishedValue: lastLocallyPublishedValueRef.current,
+      compositionPending,
+    });
+    if (action === "ignore") {
+      deferredExternalValueRef.current = null;
+      return;
+    }
+    if (action === "defer") {
+      deferredExternalValueRef.current = { value };
+      return;
+    }
+    applyExternalComposerValue(value);
   }, [value]);
 
   useEffect(() => {
@@ -8721,6 +8852,7 @@ function Composer({
       return attachment && !usedIds.has(attachment.id) ? null : current;
     });
     setDraft(text);
+    lastLocallyPublishedValueRef.current = text;
     onChange(text);
   }
 
@@ -8756,12 +8888,6 @@ function Composer({
     publishComposerSnapshot(after);
   }
 
-  function publishUncommittedComposerState() {
-    const editor = editorRef.current;
-    if (!editor) return;
-    publishComposerSnapshot(composerSnapshotAtSelection(editor));
-  }
-
   function restoreComposerHistorySnapshot(snapshot: ComposerHistorySnapshot) {
     const editor = editorRef.current;
     if (!editor) return;
@@ -8778,6 +8904,7 @@ function Composer({
     currentComposerSnapshotRef.current = restored;
     compositionStartSnapshotRef.current = null;
     pendingBeforeInputSnapshotRef.current = null;
+    deferredExternalValueRef.current = null;
     setImageContextMenu(null);
     editor.focus();
     publishComposerSnapshot(restored);
@@ -8929,7 +9056,9 @@ function Composer({
     composerRedoHistoryRef.current = [];
     compositionStartSnapshotRef.current = null;
     pendingBeforeInputSnapshotRef.current = null;
+    deferredExternalValueRef.current = null;
     setDraft("");
+    lastLocallyPublishedValueRef.current = "";
     onChange("");
   };
 
@@ -9291,6 +9420,7 @@ function Composer({
           onCompositionStart={() => {
             const editor = editorRef.current;
             isComposingRef.current = true;
+            pendingBeforeInputSnapshotRef.current = null;
             compositionStartSnapshotRef.current = editor
               ? composerSnapshotAtSelection(editor)
               : currentComposerSnapshotRef.current;
@@ -9301,19 +9431,26 @@ function Composer({
               const before = compositionStartSnapshotRef.current;
               compositionStartSnapshotRef.current = null;
               pendingBeforeInputSnapshotRef.current = null;
+              const deferredExternalValue = deferredExternalValueRef.current;
+              if (deferredExternalValue) {
+                applyExternalComposerValue(deferredExternalValue.value);
+                return;
+              }
               commitComposerMutation(true, before);
             });
           }}
           onInput={(event) => {
             const nativeEvent = event.nativeEvent as InputEvent;
             if (
-              isComposingRef.current ||
-              compositionStartSnapshotRef.current ||
-              nativeEvent.isComposing
-            ) {
-              publishUncommittedComposerState();
+              composerInputCommitPending({
+                isComposing: isComposingRef.current,
+                compositionSnapshotPending: Boolean(
+                  compositionStartSnapshotRef.current,
+                ),
+                nativeIsComposing: nativeEvent.isComposing,
+              })
+            )
               return;
-            }
             const before = pendingBeforeInputSnapshotRef.current;
             pendingBeforeInputSnapshotRef.current = null;
             commitComposerMutation(
@@ -10711,6 +10848,9 @@ function RightPanel({
         <ToolTabStrip
           tabs={toolTabs}
           activeTabId={activeToolTab?.id ?? null}
+          terminalTitle={
+            terminalSession ? terminalShellName(terminalSession.shell) : null
+          }
           onActivate={onActivateToolTab}
           onClose={onCloseToolTab}
           onOpen={onOpenToolTab}
@@ -10839,6 +10979,7 @@ function ToolStageLauncher({
 function ToolTabStrip({
   tabs,
   activeTabId,
+  terminalTitle,
   onActivate,
   onClose,
   onOpen,
@@ -10850,6 +10991,7 @@ function ToolTabStrip({
 }: {
   tabs: ToolTab[];
   activeTabId: string | null;
+  terminalTitle: string | null;
   onActivate(tabId: string): void;
   onClose(tabId: string): void;
   onOpen(kind: ToolTabKind): void;
@@ -10869,6 +11011,10 @@ function ToolTabStrip({
       <div className="tool-tab-list" role="tablist" aria-label="工作工具">
         {tabs.map((tab) => {
           const Icon = toolTabIcon(tab.kind);
+          const title =
+            tab.kind === "terminal" && terminalTitle
+              ? terminalTitle
+              : tab.title;
           return (
             <div
               className={`tool-stage-tab ${tab.id === activeTabId ? "active" : ""}`}
@@ -10879,15 +11025,16 @@ function ToolTabStrip({
                 type="button"
                 role="tab"
                 aria-selected={tab.id === activeTabId}
+                title={title}
                 onClick={() => onActivate(tab.id)}
               >
                 <Icon size={13} />
-                <span>{tab.title}</span>
+                <span>{title}</span>
               </button>
               <button
                 className="tool-tab-close"
                 type="button"
-                aria-label={`关闭 ${tab.title}`}
+                aria-label={`关闭 ${title}`}
                 onClick={(event) => {
                   event.stopPropagation();
                   onClose(tab.id);
