@@ -394,9 +394,8 @@ const workspaceLeftMax = 420;
 function readExperienceMode(): ExperienceMode {
   if (typeof window === "undefined") return "code";
   try {
-    return window.localStorage.getItem(experienceModeStorageKey) === "work"
-      ? "work"
-      : "code";
+    const stored = window.localStorage.getItem(experienceModeStorageKey);
+    return stored === "work" || stored === "flow" ? stored : "code";
   } catch {
     return "code";
   }
@@ -817,19 +816,16 @@ export function App() {
     [],
   );
 
-  const setThreadSending = useCallback(
-    (threadId: string, sending: boolean) => {
-      setSendingThreadIds((current) => {
-        const alreadySending = current.has(threadId);
-        if (alreadySending === sending) return current;
-        const next = new Set(current);
-        if (sending) next.add(threadId);
-        else next.delete(threadId);
-        return next;
-      });
-    },
-    [],
-  );
+  const setThreadSending = useCallback((threadId: string, sending: boolean) => {
+    setSendingThreadIds((current) => {
+      const alreadySending = current.has(threadId);
+      if (alreadySending === sending) return current;
+      const next = new Set(current);
+      if (sending) next.add(threadId);
+      else next.delete(threadId);
+      return next;
+    });
+  }, []);
 
   const updatePendingTurnFeedback = useCallback(
     (
@@ -923,6 +919,8 @@ export function App() {
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
   );
+  const terminalToolActive =
+    toolStageOpen && activeToolTab?.kind === "terminal";
   const pendingApprovalQueue = useMemo(
     () =>
       conversationEvents
@@ -1087,6 +1085,16 @@ export function App() {
   }, [experienceMode]);
 
   useEffect(() => {
+    if (
+      settings &&
+      !settings.enterprise.enabled &&
+      experienceMode === "flow"
+    ) {
+      setExperienceMode("code");
+    }
+  }, [experienceMode, settings]);
+
+  useEffect(() => {
     taskNotificationPreferencesRef.current = taskNotificationPreferences;
     writeTaskNotificationPreferences(taskNotificationPreferences);
   }, [taskNotificationPreferences]);
@@ -1156,7 +1164,7 @@ export function App() {
     if (!client) return;
     let cancelled = false;
     void client
-      .listSkills(currentWorkspaceRoot, activeThread?.id)
+      .listSkills(currentWorkspaceRoot, activeThread?.id, experienceMode)
       .then((available) => {
         if (cancelled) return;
         setSkills(available);
@@ -1169,7 +1177,13 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeThread?.id, client, currentWorkspaceRoot, skillsRevision]);
+  }, [
+    activeThread?.id,
+    client,
+    currentWorkspaceRoot,
+    experienceMode,
+    skillsRevision,
+  ]);
 
   useEffect(() => {
     if (!client) return;
@@ -1581,7 +1595,7 @@ export function App() {
           }
         }
 
-        loadedThreads = await nextClient.listThreads(true);
+        loadedThreads = await nextClient.listThreads(true, experienceMode);
 
         if (cancelled) return;
         setProjects(sortProjects(loadedProjects));
@@ -1887,7 +1901,7 @@ export function App() {
   ]);
 
   useEffect(() => {
-    if (!client || !activeThreadId) {
+    if (!client || !activeThreadId || !terminalToolActive) {
       setTerminalEvents([]);
       setTerminalSession(null);
       return;
@@ -1931,7 +1945,7 @@ export function App() {
       controller.abort();
       source?.close();
     };
-  }, [activeThreadId, client, ingestTerminalEvent]);
+  }, [activeThreadId, client, ingestTerminalEvent, terminalToolActive]);
 
   const refreshWorkbench = useCallback(
     async (path?: string) => {
@@ -1984,7 +1998,7 @@ export function App() {
   );
 
   useEffect(() => {
-    if (!activeThreadId) {
+    if (!activeThreadId || !isConversationReady) {
       workbenchRefreshControllerRef.current?.abort();
       workbenchRefreshControllerRef.current = null;
       setWorkspaceTree(null);
@@ -2000,7 +2014,7 @@ export function App() {
     return () => {
       workbenchRefreshControllerRef.current?.abort();
     };
-  }, [activeThreadId, refreshWorkbench]);
+  }, [activeThreadId, isConversationReady, refreshWorkbench]);
 
   function selectThread(threadId: string) {
     const thread = threads.find((item) => item.id === threadId);
@@ -2085,6 +2099,14 @@ export function App() {
     if (nextMode === experienceMode) return;
     const project = activeProject ?? draftProject;
     setExperienceMode(nextMode);
+    if (client) {
+      void client
+        .listThreads(true, nextMode)
+        .then(setThreads)
+        .catch((error) => {
+          setActionError(`加载 ${nextMode} 模式任务失败：${errorMessage(error)}`);
+        });
+    }
     prepareNewThread(
       project?.workspaceRoot ?? currentWorkspaceRoot,
       project?.id ?? draftProjectId,
@@ -2565,7 +2587,11 @@ export function App() {
           workspaceRoot: currentWorkspaceRoot,
           threadId: activeThread?.id,
         }),
-        client.listSkills(currentWorkspaceRoot, activeThread?.id),
+        client.listSkills(
+          currentWorkspaceRoot,
+          activeThread?.id,
+          experienceMode,
+        ),
         client.listMcpServers(),
         activeThread
           ? client.listThreadMcpServers(activeThread.id)
@@ -2979,7 +3005,10 @@ export function App() {
         // Pin before the first turn runs, so the conversation starts on the
         // model picked in the draft composer rather than the connection default.
         try {
-          thread = await client.setThreadModel(thread.id, submittedModelSelection);
+          thread = await client.setThreadModel(
+            thread.id,
+            submittedModelSelection,
+          );
         } catch (error) {
           console.warn("OpenTopia could not pin the task model", error);
         }
@@ -4135,7 +4164,6 @@ export function App() {
             style={workspaceStyle}
           >
             <Sidebar
-              client={client}
               projects={projects}
               threads={threads}
               threadActivityStatuses={threadActivityStatuses}
@@ -4145,6 +4173,7 @@ export function App() {
               workspaceError={workspaceError}
               isPickingWorkspace={isPickingWorkspace}
               experienceMode={experienceMode}
+              flowModeEnabled={settings?.enterprise.enabled ?? false}
               onExperienceModeChange={changeExperienceMode}
               onSelect={selectThread}
               onNew={beginNewThread}
@@ -6324,7 +6353,6 @@ function SettingsPanel({
 }
 
 function Sidebar({
-  client,
   projects,
   threads,
   threadActivityStatuses,
@@ -6334,6 +6362,7 @@ function Sidebar({
   workspaceError,
   isPickingWorkspace,
   experienceMode,
+  flowModeEnabled,
   onExperienceModeChange,
   onSelect,
   onNew,
@@ -6351,7 +6380,6 @@ function Sidebar({
   onOpenTaskSearch,
   onSettings,
 }: {
-  client: ApiClient | null;
   projects: Project[];
   threads: Thread[];
   threadActivityStatuses: Record<string, ThreadActivityStatus>;
@@ -6361,6 +6389,7 @@ function Sidebar({
   workspaceError: string | null;
   isPickingWorkspace: boolean;
   experienceMode: ExperienceMode;
+  flowModeEnabled: boolean;
   onExperienceModeChange(mode: ExperienceMode): void;
   onSelect(id: string): void;
   onNew(): void;
@@ -6402,10 +6431,24 @@ function Sidebar({
   const experienceMenuRef = useDismissiblePopover(experienceMenuOpen, () =>
     setExperienceMenuOpen(false),
   );
-  const unassignedThreads = threads.filter(
+  const modeThreads = threads.filter(
+    (thread) => thread.experienceMode === experienceMode,
+  );
+  const unassignedThreads = modeThreads.filter(
     (thread) => !thread.projectId && !thread.archivedAt,
   );
-  const archivedThreads = threads.filter((thread) => thread.archivedAt);
+  const archivedThreads = modeThreads.filter((thread) => thread.archivedAt);
+  const experienceModeOptions = (
+    [
+      { id: "work", label: "Work", icon: BriefcaseBusiness },
+      { id: "code", label: "Code", icon: Code2 },
+      { id: "flow", label: "Flow", icon: Workflow },
+    ] as const
+  ).filter((option) => option.id !== "flow" || flowModeEnabled);
+  const activeExperienceMode =
+    experienceModeOptions.find((option) => option.id === experienceMode) ??
+    experienceModeOptions.find((option) => option.id === "code")!;
+  const ActiveExperienceModeIcon = activeExperienceMode.icon;
 
   function toggleExpandedProject(projectId: string) {
     setExpandedProjects((prev) => {
@@ -6449,17 +6492,13 @@ function Sidebar({
             <button
               type="button"
               className="experience-mode-trigger"
-              aria-label={`当前模式：${experienceMode === "work" ? "Work" : "Code"}`}
+              aria-label={`当前模式：${activeExperienceMode.label}`}
               aria-haspopup="menu"
               aria-expanded={experienceMenuOpen}
               onClick={() => setExperienceMenuOpen((current) => !current)}
             >
-              {experienceMode === "work" ? (
-                <BriefcaseBusiness size={15} aria-hidden="true" />
-              ) : (
-                <Code2 size={15} aria-hidden="true" />
-              )}
-              <span>{experienceMode === "work" ? "Work" : "Code"}</span>
+              <ActiveExperienceModeIcon size={15} aria-hidden="true" />
+              <span>{activeExperienceMode.label}</span>
               <ChevronDown
                 className={experienceMenuOpen ? "open" : undefined}
                 size={14}
@@ -6468,12 +6507,7 @@ function Sidebar({
             </button>
             {experienceMenuOpen && (
               <div className="tool-popover experience-mode-popover" role="menu">
-                {(
-                  [
-                    { id: "work", label: "Work", icon: BriefcaseBusiness },
-                    { id: "code", label: "Code", icon: Code2 },
-                  ] as const
-                ).map((option) => {
+                {experienceModeOptions.map((option) => {
                   const Icon = option.icon;
                   const selected = option.id === experienceMode;
                   return (
@@ -6574,7 +6608,7 @@ function Sidebar({
         </div>
         <div className="project-tree">
           {projects.map((project, projectIndex) => {
-            const projectThreads = threads.filter(
+            const projectThreads = modeThreads.filter(
               (thread) => thread.projectId === project.id && !thread.archivedAt,
             );
             const isActive = project.id === activeProjectId;
@@ -6712,7 +6746,6 @@ function Sidebar({
                       <SidebarThreadRow
                         active={thread.id === activeThreadId}
                         activityStatus={threadActivityStatuses[thread.id]}
-                        client={client}
                         key={thread.id}
                         project={project}
                         thread={thread}
@@ -6752,7 +6785,6 @@ function Sidebar({
                     <SidebarThreadRow
                       active={thread.id === activeThreadId}
                       activityStatus={threadActivityStatuses[thread.id]}
-                      client={client}
                       key={thread.id}
                       project={null}
                       thread={thread}
@@ -6785,7 +6817,6 @@ function Sidebar({
                       archived
                       active={false}
                       activityStatus={threadActivityStatuses[thread.id]}
-                      client={client}
                       key={thread.id}
                       project={
                         projects.find(
@@ -6973,7 +7004,6 @@ function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
 }
 
 function SidebarThreadRow({
-  client,
   thread,
   project,
   active,
@@ -6985,7 +7015,6 @@ function SidebarThreadRow({
   onToggleProjectPinned,
   onRestore,
 }: {
-  client: ApiClient | null;
   thread: Thread;
   project: Project | null;
   active: boolean;
@@ -6998,21 +7027,13 @@ function SidebarThreadRow({
   onRestore?(): void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const [hoverCardPosition, setHoverCardPosition] = useState<{
-    left: number;
-    top: number;
-  } | null>(null);
-  const [gitBranch, setGitBranch] = useState<string | null>(null);
-  const [isGitBranchLoading, setIsGitBranchLoading] = useState(false);
   const [titleOverflow, setTitleOverflow] = useState({
     distance: 0,
     durationMs: 0,
   });
   const titleViewportRef = useRef<HTMLSpanElement>(null);
   const titleTextRef = useRef<HTMLSpanElement>(null);
-  const branchRequestIdRef = useRef(0);
   const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
-  const hoverCardId = `thread-hover-card-${thread.id}`;
 
   useEffect(() => {
     const viewport = titleViewportRef.current;
@@ -7050,63 +7071,20 @@ function SidebarThreadRow({
         } as CSSProperties)
       : undefined;
 
-  function showHoverCard(target: HTMLButtonElement) {
-    const bounds = target.getBoundingClientRect();
-    const cardWidth = 320;
-    const viewportMargin = 8;
-    const cardHeight = 128;
-    const left = Math.min(
-      bounds.right + viewportMargin,
-      window.innerWidth - cardWidth - viewportMargin,
-    );
-    setHoverCardPosition({
-      left: Math.max(viewportMargin, left),
-      top: Math.max(
-        viewportMargin,
-        Math.min(bounds.top, window.innerHeight - cardHeight - viewportMargin),
-      ),
-    });
-
-    if (!client) {
-      setGitBranch(null);
-      setIsGitBranchLoading(false);
-      return;
-    }
-    const requestId = branchRequestIdRef.current + 1;
-    branchRequestIdRef.current = requestId;
-    setGitBranch(null);
-    setIsGitBranchLoading(true);
-    void client
-      .getGitStatus(thread.id)
-      .then((status) => {
-        if (branchRequestIdRef.current === requestId) {
-          setGitBranch(status.branch);
-          setIsGitBranchLoading(false);
-        }
-      })
-      .catch(() => {
-        if (branchRequestIdRef.current === requestId) {
-          setGitBranch(null);
-          setIsGitBranchLoading(false);
-        }
-      });
-  }
-
-  function hideHoverCard() {
-    setHoverCardPosition(null);
-  }
-
   return (
     <div className={`thread-row-wrap ${menuOpen ? "menu-open" : ""}`}>
       <button
         className={`thread-row ${active ? "active" : ""}`}
-        onClick={onSelect}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          onSelect();
+        }}
+        onClick={(event) => {
+          if (event.detail !== 0) return;
+          onSelect();
+        }}
         aria-label={thread.title}
-        aria-describedby={hoverCardPosition ? hoverCardId : undefined}
-        onMouseEnter={(event) => showHoverCard(event.currentTarget)}
-        onMouseLeave={hideHoverCard}
-        onFocus={(event) => showHoverCard(event.currentTarget)}
-        onBlur={hideHoverCard}
+        title={thread.title}
       >
         <span
           className={`thread-title-viewport ${titleOverflow.distance > 0 ? "is-overflowing" : ""}`}
@@ -7121,37 +7099,6 @@ function SidebarThreadRow({
           </span>
         </span>
       </button>
-      {hoverCardPosition &&
-        createPortal(
-          <div
-            className="thread-hover-card"
-            id={hoverCardId}
-            role="tooltip"
-            style={hoverCardPosition}
-          >
-            <header>
-              <strong>{thread.title}</strong>
-              <time dateTime={thread.updatedAt}>
-                {formatRelativeThreadTime(thread.updatedAt)}
-              </time>
-            </header>
-            <div className="thread-hover-card__row">
-              <Folder size={16} aria-hidden="true" />
-              <span>
-                {project?.name ?? workspaceName(thread.workspaceRoot)}
-              </span>
-            </div>
-            <div className="thread-hover-card__row">
-              <GitBranch size={16} aria-hidden="true" />
-              <span>
-                {isGitBranchLoading
-                  ? "正在读取 Git 分支"
-                  : (gitBranch ?? "未检测到 Git 分支")}
-              </span>
-            </div>
-          </div>,
-          document.body,
-        )}
       <ThreadStatusIndicator status={activityStatus} />
       <div className="thread-row-menu-wrap" ref={menuRef}>
         <button
@@ -11197,7 +11144,30 @@ function NewTaskState({
   ): Promise<boolean>;
 }) {
   const suggestions =
-    experienceMode === "work"
+    experienceMode === "flow"
+      ? [
+          {
+            icon: Workflow,
+            label: "描述企业流程",
+            prompt: "根据我描述的角色、步骤、条件和审批点整理 Flow 设计",
+          },
+          {
+            icon: Activity,
+            label: "总结已完成流程",
+            prompt: "分析一次已经正确完成的任务，并提炼可复用的 FlowDraft",
+          },
+          {
+            icon: Bot,
+            label: "规划多 Agent 协作",
+            prompt: "设计参与 Agent 的职责、依赖、输入输出与验证闭环",
+          },
+          {
+            icon: ShieldCheck,
+            label: "检查流程边界",
+            prompt: "检查流程中的权限、数据流、审批、预算和终止条件",
+          },
+        ]
+      : experienceMode === "work"
       ? [
           {
             icon: Search,
@@ -11248,12 +11218,20 @@ function NewTaskState({
       <div className="new-task-state">
         <Bot size={34} />
         <h2>
-          {experienceMode === "work" ? "今天想在" : "我们应该在"}{" "}
+          {experienceMode === "flow"
+            ? "要在"
+            : experienceMode === "work"
+              ? "今天想在"
+              : "我们应该在"}{" "}
           <u>
             {projectName ??
               (workspaceRoot ? workspaceName(workspaceRoot) : "项目")}
           </u>{" "}
-          {experienceMode === "work" ? "中完成什么？" : "中构建什么？"}
+          {experienceMode === "flow"
+            ? "中设计什么流程？"
+            : experienceMode === "work"
+              ? "中完成什么？"
+              : "中构建什么？"}
         </h2>
         <div className="task-suggestions">
           {suggestions.map((suggestion) => {
@@ -11828,24 +11806,6 @@ function workspaceName(workspaceRoot: string): string {
   const trimmed = workspaceRoot.replace(/[\\\/]+$/, "");
   const parts = trimmed.split(/[\\\/]/).filter(Boolean);
   return parts.at(-1) || workspaceRoot;
-}
-
-function formatRelativeThreadTime(value: string): string {
-  const updatedAt = Date.parse(value);
-  if (Number.isNaN(updatedAt)) return "";
-
-  const elapsedMinutes = Math.max(
-    0,
-    Math.floor((Date.now() - updatedAt) / (60 * 1_000)),
-  );
-  if (elapsedMinutes < 1) return "刚刚";
-  if (elapsedMinutes < 60) return `${elapsedMinutes} 分`;
-
-  const elapsedHours = Math.floor(elapsedMinutes / 60);
-  if (elapsedHours < 24) return `${elapsedHours} 小时`;
-
-  const elapsedDays = Math.floor(elapsedHours / 24);
-  return `${elapsedDays} 天`;
 }
 
 function workspaceRootKey(workspaceRoot: string): string {

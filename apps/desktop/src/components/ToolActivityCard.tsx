@@ -77,8 +77,7 @@ export function ToolActivityCard({
           {toolActivityIcon(view.kind)}
         </span>
         <span
-          className="tool-activity-title"
-          data-flow={running || undefined}
+          className={`tool-activity-title${running ? " conversation-status-shimmer" : ""}`}
           title={view.detail ? `${view.title} · ${view.detail}` : view.title}
         >
           {view.title}

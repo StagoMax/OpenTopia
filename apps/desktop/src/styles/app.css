@@ -5355,35 +5355,6 @@ button:disabled {
   background: var(--surface-subtle);
 }
 
-.tool-activity-title[data-flow="true"] {
-  background: linear-gradient(
-    100deg,
-    var(--surface-subtle) 0%,
-    var(--surface-subtle) 28%,
-    var(--success-subtle) 44%,
-    var(--success) 52%,
-    var(--success-subtle) 60%,
-    var(--surface-subtle) 76%,
-    var(--surface-subtle) 100%
-  );
-  background-position: 160% 50%;
-  background-size: 240% 100%;
-  color: transparent;
-  -webkit-background-clip: text;
-  background-clip: text;
-  animation: tool-command-text-flow 1.85s ease-in-out infinite;
-}
-
-@keyframes tool-command-text-flow {
-  from {
-    background-position: 160% 50%;
-  }
-
-  to {
-    background-position: -70% 50%;
-  }
-}
-
 .subagent-activity-details {
   display: grid;
   min-width: 0;
@@ -7796,35 +7767,6 @@ button:disabled {
   background: var(--surface-subtle);
 }
 
-.tool-activity-title[data-flow="true"] {
-  background: linear-gradient(
-    100deg,
-    var(--surface-subtle) 0%,
-    var(--surface-subtle) 28%,
-    var(--success-subtle) 44%,
-    var(--success) 52%,
-    var(--success-subtle) 60%,
-    var(--surface-subtle) 76%,
-    var(--surface-subtle) 100%
-  );
-  background-position: 160% 50%;
-  background-size: 240% 100%;
-  color: transparent;
-  -webkit-background-clip: text;
-  background-clip: text;
-  animation: tool-command-text-flow 1.85s ease-in-out infinite;
-}
-
-@keyframes tool-command-text-flow {
-  from {
-    background-position: 160% 50%;
-  }
-
-  to {
-    background-position: -70% 50%;
-  }
-}
-
 .subagent-activity-details {
   display: grid;
   min-width: 0;
@@ -7856,18 +7798,12 @@ button:disabled {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .activity-flow::after,
-  .tool-activity-title[data-flow="true"] {
+  .activity-flow::after {
     animation: none;
   }
 
   .activity-flow::after {
     transform: translateX(48%);
-  }
-
-  .tool-activity-title[data-flow="true"] {
-    background: none;
-    color: var(--success);
   }
 }
 

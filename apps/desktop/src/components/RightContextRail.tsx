@@ -91,8 +91,6 @@ type SourceItem = {
   dedupeKey: string;
 };
 
-type GitRepositoryState = "unknown" | "ready" | "missing";
-
 const SOURCE_LIMIT = 4;
 
 export function RightContextRail({
@@ -115,9 +113,6 @@ export function RightContextRail({
   onGitChanged,
 }: RightContextRailProps) {
   const [gitStatus, setGitStatus] = useState<GitStatusSummary | null>(null);
-  const [gitRepositoryState, setGitRepositoryState] =
-    useState<GitRepositoryState>("unknown");
-  const [gitLoading, setGitLoading] = useState(false);
   const [gitBusy, setGitBusy] = useState<GitWorkflowAction["type"] | null>(
     null,
   );
@@ -137,40 +132,37 @@ export function RightContextRail({
   const subagents = collectSubagents(subagentRuns, agentEvents);
   const allSources = collectSources(messages, agentEvents, artifacts);
   const sources = allSources.slice(0, SOURCE_LIMIT);
-  const gitAvailable = gitRepositoryState === "ready" && Boolean(gitStatus);
+  const gitAvailable = Boolean(gitStatus || workspaceDiff?.branch?.trim());
 
   const refreshGit = useCallback(async () => {
     if (!client || !threadId || !workspaceRoot) {
       setGitStatus(null);
-      setGitRepositoryState("unknown");
       setGitError(null);
-      return;
+      return null;
     }
-    setGitRepositoryState("unknown");
-    setGitLoading(true);
     setGitError(null);
     try {
       const status = await client.getGitStatus(threadId);
       setGitStatus(status);
-      setGitRepositoryState("ready");
+      return status;
     } catch (error) {
       setGitStatus(null);
       const message = readableError(error);
       if (isNotGitRepositoryError(message)) {
-        setGitRepositoryState("missing");
         setGitError(null);
       } else {
-        setGitRepositoryState("unknown");
         setGitError(message);
       }
-    } finally {
-      setGitLoading(false);
+      return null;
     }
   }, [client, threadId, workspaceRoot]);
 
   useEffect(() => {
-    void refreshGit();
-  }, [refreshGit]);
+    setGitStatus(null);
+    setGitError(null);
+    setGitNotice(null);
+    setGitDialogOpen(false);
+  }, [threadId, workspaceRoot]);
 
   async function runGitAction(
     action: GitWorkflowAction,
@@ -194,10 +186,11 @@ export function RightContextRail({
     }
   }
 
-  function openGitDialog() {
-    setGitDialogOpen(true);
+  async function openGitDialog() {
     setGitError(null);
     setGitNotice(null);
+    const status = gitStatus ?? (await refreshGit());
+    if (status) setGitDialogOpen(true);
   }
 
   return (
@@ -248,7 +241,11 @@ export function RightContextRail({
             <RailRow
               icon={GitBranch}
               label="分支"
-              title={gitStatusTitle(gitStatus, workspaceRoot)}
+              title={
+                gitStatus
+                  ? gitStatusTitle(gitStatus, workspaceRoot)
+                  : `当前分支：${branch}`
+              }
               value={
                 <StatusText muted={!gitStatus?.branch}>{branch}</StatusText>
               }
@@ -262,7 +259,7 @@ export function RightContextRail({
                 </StatusText>
               }
               title="提交当前改动或推送当前分支"
-              onClick={openGitDialog}
+              onClick={() => void openGitDialog()}
             />
           </>
         )}

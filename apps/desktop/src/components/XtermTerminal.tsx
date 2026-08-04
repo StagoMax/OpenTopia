@@ -19,27 +19,33 @@ export type XtermTerminalHandle = {
 type XtermTerminalProps = {
   disabled?: boolean;
   onData?: (data: string) => void;
+  onReady?: (terminal: XtermTerminalHandle | null) => void;
   onResize?: (cols: number, rows: number) => void;
 };
 
 export const XtermTerminal = forwardRef<
   XtermTerminalHandle,
   XtermTerminalProps
->(function XtermTerminal({ disabled = false, onData, onResize }, ref) {
+>(function XtermTerminal(
+  { disabled = false, onData, onReady, onResize },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const onDataRef = useRef(onData);
+  const onReadyRef = useRef(onReady);
   const onResizeRef = useRef(onResize);
   const disabledRef = useRef(disabled);
+  const handleRef = useRef<XtermTerminalHandle | null>(null);
 
   onDataRef.current = onData;
+  onReadyRef.current = onReady;
   onResizeRef.current = onResize;
   disabledRef.current = disabled;
 
-  useImperativeHandle(
-    ref,
-    () => ({
+  if (!handleRef.current) {
+    handleRef.current = {
       write(data: string) {
         terminalRef.current?.write(data);
       },
@@ -52,9 +58,10 @@ export const XtermTerminal = forwardRef<
       focus() {
         terminalRef.current?.focus();
       },
-    }),
-    [],
-  );
+    };
+  }
+
+  useImperativeHandle(ref, () => handleRef.current!, []);
 
   const fitTerminal = useCallback(() => {
     try {
@@ -99,6 +106,11 @@ export const XtermTerminal = forwardRef<
 
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
+    queueMicrotask(() => {
+      if (terminalRef.current === terminal) {
+        onReadyRef.current?.(handleRef.current!);
+      }
+    });
 
     const resizeObserver = new ResizeObserver(() => fitTerminal());
     resizeObserver.observe(containerRef.current);
@@ -118,8 +130,11 @@ export const XtermTerminal = forwardRef<
       themeObserver.disconnect();
       dataDisposable.dispose();
       resizeDisposable.dispose();
-      terminalRef.current = null;
-      fitAddonRef.current = null;
+      if (terminalRef.current === terminal) {
+        terminalRef.current = null;
+        onReadyRef.current?.(null);
+      }
+      if (fitAddonRef.current === fitAddon) fitAddonRef.current = null;
 
       // Xterm schedules viewport refreshes internally. Let those finish while
       // its render service is still alive when a tool tab closes quickly.

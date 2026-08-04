@@ -141,7 +141,7 @@ export type ComputerObservation = {
   capturedAt: string;
 };
 
-export type ExperienceMode = "work" | "code";
+export type ExperienceMode = "work" | "code" | "flow";
 export type CollaborationMode = "default" | "plan" | "goal";
 
 export type Thread = {
@@ -252,6 +252,9 @@ export type AppSettings = {
   agentRuntime: AgentRuntimeSettings;
   defaultWorkspaceRoot?: string | null;
   sandbox: SandboxSettings;
+  enterprise: {
+    enabled: boolean;
+  };
   updatedAt: string;
 };
 
@@ -1485,8 +1488,24 @@ export type ThreadPluginCapabilities = {
   grantedPermissions: string[];
 };
 
+export type CapabilityProjection = {
+  allowAllTools: boolean;
+  tools: string[];
+  allowAllSkills: boolean;
+  skills: string[];
+  allowAllPlugins: boolean;
+  plugins: string[];
+  allowAllMcpServers: boolean;
+  mcpServers: string[];
+  allowAllWorkspaceRoots: boolean;
+  workspaceRoots: string[];
+};
+
 export type ThreadCapabilities = {
   threadId: string;
+  experienceMode: ExperienceMode;
+  promptProfileId: string;
+  capabilityProjection: CapabilityProjection;
   workspaceRoot: string;
   generatedAt: string;
   snapshot: CapabilityActivationSnapshot;

@@ -43,7 +43,7 @@
 }
 
 .tool-activity[data-state="running"] .tool-activity-icon {
-  color: var(--success);
+  color: var(--loading-wordmark-accent);
 }
 
 .tool-activity[data-state="error"] .tool-activity-icon {
@@ -56,25 +56,6 @@
   color: inherit;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.tool-activity-title[data-flow="true"] {
-  background: linear-gradient(
-    100deg,
-    var(--surface-subtle) 0%,
-    var(--surface-subtle) 28%,
-    var(--success-subtle) 44%,
-    var(--success) 52%,
-    var(--success-subtle) 60%,
-    var(--surface-subtle) 76%,
-    var(--surface-subtle) 100%
-  );
-  background-position: 160% 50%;
-  background-size: 240% 100%;
-  color: transparent;
-  -webkit-background-clip: text;
-  background-clip: text;
-  animation: tool-command-text-flow 1.85s ease-in-out infinite;
 }
 
 .tool-activity-meta {

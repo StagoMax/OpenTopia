@@ -208,11 +208,13 @@ export class ApiClient {
   async listSkills(
     workspaceRoot?: string | null,
     threadId?: string | null,
+    experienceMode?: ExperienceMode,
   ): Promise<SkillDescriptor[]> {
     return this.get(
       `/api/skills${queryString({
         workspaceRoot: workspaceRoot ?? undefined,
         threadId: threadId ?? undefined,
+        experienceMode,
       })}`,
     );
   }
@@ -546,10 +548,14 @@ export class ApiClient {
     return this.delete(`/api/projects/${projectId}`);
   }
 
-  async listThreads(includeArchived = false): Promise<Thread[]> {
+  async listThreads(
+    includeArchived = false,
+    experienceMode?: ExperienceMode,
+  ): Promise<Thread[]> {
     return this.get(
       `/api/threads${queryString({
         includeArchived: includeArchived ? "true" : undefined,
+        experienceMode,
       })}`,
     );
   }

@@ -74,6 +74,7 @@ import type { XtermTerminalHandle } from "./XtermTerminal";
 import { XtermTerminal } from "./XtermTerminal";
 import { detectLanguage, MonacoEditor } from "./MonacoEditor";
 import { Badge, Button, IconButton } from "./ui";
+import { writePendingTerminalEvents } from "../terminalEventReplay";
 
 export type WorkbenchTab =
   | "files"
@@ -1296,6 +1297,7 @@ function TerminalView({
   onOpenArtifact(threadId: string, artifactId: string): void;
 }) {
   const xtermRef = useRef<XtermTerminalHandle | null>(null);
+  const readyTerminalRef = useRef<XtermTerminalHandle | null>(null);
   const writtenTerminalEventsRef = useRef<Set<string>>(new Set());
   const lastThreadIdRef = useRef<string | null>(null);
   const inputBufferRef = useRef("");
@@ -1313,23 +1315,34 @@ function TerminalView({
     if (lastThreadIdRef.current === threadId) return;
     lastThreadIdRef.current = threadId;
     writtenTerminalEventsRef.current = new Set();
-    xtermRef.current?.clear();
+    readyTerminalRef.current?.clear();
   }, [thread?.id]);
 
   useEffect(() => {
-    if (
-      terminalEvents.length > 0 &&
-      writtenTerminalEventsRef.current.size === 0
-    ) {
-      xtermRef.current?.clear();
-    }
-
-    for (const event of terminalEvents) {
-      if (writtenTerminalEventsRef.current.has(event.id)) continue;
-      writeTerminalEventToXterm(event, xtermRef.current);
-      writtenTerminalEventsRef.current.add(event.id);
-    }
+    writePendingTerminalEvents(
+      terminalEvents,
+      readyTerminalRef.current,
+      writtenTerminalEventsRef.current,
+      writeTerminalEventToXterm,
+    );
   }, [terminalEvents]);
+
+  const handleTerminalReady = useCallback(
+    (terminal: XtermTerminalHandle | null) => {
+      readyTerminalRef.current = terminal;
+      if (!terminal) return;
+      const written = new Set<string>();
+      writtenTerminalEventsRef.current = written;
+      terminal.clear();
+      writePendingTerminalEvents(
+        terminalEvents,
+        terminal,
+        written,
+        writeTerminalEventToXterm,
+      );
+    },
+    [terminalEvents],
+  );
 
   const handleData = useCallback(
     (data: string) => {
@@ -1442,6 +1455,7 @@ function TerminalView({
           ref={xtermRef}
           disabled={inputDisabled}
           onData={handleData}
+          onReady={handleTerminalReady}
           onResize={handleResize}
         />
       </div>

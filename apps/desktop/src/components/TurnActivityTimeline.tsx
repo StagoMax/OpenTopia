@@ -276,10 +276,10 @@ export function TurnActivityTimeline({
               onOpenMarkdownLink={onOpenMarkdownLink}
             />
           ))}
-          {changeSet?.status === "failed" && changeSet.error && (
+          {changeSet?.status === "failed" && (
             <div className="turn-change-set-warning" role="status">
               <AlertCircle size={13} />
-              <span>未能记录本轮文件快照：{changeSet.error}</span>
+              <span>未能记录本轮文件快照，不影响任务结果。</span>
             </div>
           )}
         </div>
