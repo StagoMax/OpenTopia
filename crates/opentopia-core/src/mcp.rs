@@ -101,6 +101,10 @@ pub struct McpToolDescriptor {
     pub description: Option<String>,
     pub input_schema: Value,
     pub annotations: Value,
+    /// Provider-owned extension metadata from the MCP tool's `_meta` field.
+    /// OpenTopia only acts on explicitly namespaced contracts it understands.
+    #[serde(default, rename = "_meta")]
+    pub meta: Value,
     pub permission_labels: Vec<String>,
 }
 

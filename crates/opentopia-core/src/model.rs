@@ -513,6 +513,46 @@ impl TaskPlanStepStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskRequirement {
+    pub id: String,
+    pub statement: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEvidenceKind {
+    Observation,
+    Implementation,
+    Verification,
+    GlobalCheck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEvidenceRef {
+    pub step_id: String,
+    pub requirement_id: String,
+    pub kind: TaskEvidenceKind,
+    pub tool_call_id: String,
+    pub summary: String,
+    pub requirements_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPlanCoverage {
+    pub requirements_revision: u64,
+    pub requirements: Vec<TaskRequirement>,
+    #[serde(default)]
+    pub step_requirements: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub evidence_refs: Vec<TaskEvidenceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskPlanStep {
     #[serde(default)]
     pub id: String,
@@ -542,6 +582,11 @@ pub struct TaskPlan {
         skip_serializing_if = "Option::is_none"
     )]
     pub change_reason: Option<String>,
+    /// Structured requirement coverage for plans created by the current
+    /// runtime. `None` preserves persisted legacy plans without pretending
+    /// their free-form steps were already coverage-complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<TaskPlanCoverage>,
     pub steps: Vec<TaskPlanStep>,
 }
 
@@ -606,6 +651,21 @@ impl TaskPlan {
         if let Some(change_reason) = plan.change_reason.as_deref() {
             lines.push(format!("Last change: {change_reason}"));
         }
+        if let Some(coverage) = plan.coverage.as_ref() {
+            lines.push(format!(
+                "Requirements revision: {}",
+                coverage.requirements_revision
+            ));
+            for requirement in &coverage.requirements {
+                lines.push(format!(
+                    "Requirement {}: {}",
+                    requirement.id, requirement.statement
+                ));
+                if !requirement.source_refs.is_empty() {
+                    lines.push(format!("  Sources: {}", requirement.source_refs.join(", ")));
+                }
+            }
+        }
         for step in &plan.steps {
             lines.push(format!(
                 "{} {}: {}",
@@ -619,11 +679,33 @@ impl TaskPlan {
             if !step.dependencies.is_empty() {
                 lines.push(format!("  Depends on: {}", step.dependencies.join(", ")));
             }
+            if let Some(requirements) = plan
+                .coverage
+                .as_ref()
+                .and_then(|coverage| coverage.step_requirements.get(&step.id))
+            {
+                lines.push(format!("  Covers: {}", requirements.join(", ")));
+            }
             for criterion in &step.acceptance_criteria {
                 lines.push(format!("  Acceptance: {criterion}"));
             }
             for evidence in &step.evidence {
                 lines.push(format!("  Evidence: {evidence}"));
+            }
+            if let Some(coverage) = plan.coverage.as_ref() {
+                for evidence in coverage
+                    .evidence_refs
+                    .iter()
+                    .filter(|evidence| evidence.step_id == step.id)
+                {
+                    lines.push(format!(
+                        "  Evidence ref: {:?} for {} via {} — {}",
+                        evidence.kind,
+                        evidence.requirement_id,
+                        evidence.tool_call_id,
+                        evidence.summary
+                    ));
+                }
             }
         }
         lines.join("\n")

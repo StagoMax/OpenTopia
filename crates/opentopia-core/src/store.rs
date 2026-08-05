@@ -944,6 +944,7 @@ impl SqliteSessionStore {
                 description TEXT,
                 input_schema_json TEXT NOT NULL,
                 annotations_json TEXT NOT NULL,
+                meta_json TEXT NOT NULL DEFAULT '{}',
                 permission_labels_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(server_id, public_name),
@@ -1111,6 +1112,12 @@ impl SqliteSessionStore {
         if !table_has_column(&conn, "mcp_servers", "plugin_server_name")? {
             conn.execute(
                 "ALTER TABLE mcp_servers ADD COLUMN plugin_server_name TEXT",
+                [],
+            )?;
+        }
+        if !table_has_column(&conn, "mcp_server_tools", "meta_json")? {
+            conn.execute(
+                "ALTER TABLE mcp_server_tools ADD COLUMN meta_json TEXT NOT NULL DEFAULT '{}'",
                 [],
             )?;
         }
@@ -1450,7 +1457,23 @@ impl SqliteSessionStore {
                             .unwrap_or_default();
                     }
                 }
+                let migrated_parallel_tool_calls = !settings.parallel_tool_calls_migrated;
+                if migrated_parallel_tool_calls {
+                    for provider in &mut settings.providers {
+                        provider.parallel_tool_calls = true;
+                    }
+                    settings.parallel_tool_calls_migrated = true;
+                }
                 settings.touch();
+                if migrated_parallel_tool_calls {
+                    conn.execute(
+                        "UPDATE app_settings SET settings_json = ?1, updated_at = ?2 WHERE id = 1",
+                        params![
+                            serde_json::to_string(&settings)?,
+                            settings.updated_at.to_rfc3339()
+                        ],
+                    )?;
+                }
                 Ok(settings)
             }
             None => Ok(AppSettings::from_env(default_permission_mode)),
@@ -1716,9 +1739,10 @@ impl SqliteSessionStore {
                 r#"
                 INSERT INTO mcp_server_tools (
                     server_id, public_name, tool_name, description,
-                    input_schema_json, annotations_json, permission_labels_json, updated_at
+                    input_schema_json, annotations_json, meta_json,
+                    permission_labels_json, updated_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 "#,
             )?;
             for tool in tools {
@@ -1729,6 +1753,7 @@ impl SqliteSessionStore {
                     tool.description,
                     serde_json::to_string(&tool.input_schema)?,
                     serde_json::to_string(&tool.annotations)?,
+                    serde_json::to_string(&tool.meta)?,
                     serde_json::to_string(&tool.permission_labels)?,
                     updated_at,
                 ])?;
@@ -1743,7 +1768,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             r#"
             SELECT server_id, public_name, tool_name, description,
-                   input_schema_json, annotations_json, permission_labels_json
+                   input_schema_json, annotations_json, meta_json, permission_labels_json
             FROM mcp_server_tools
             WHERE server_id = ?1
             ORDER BY public_name ASC
@@ -1758,7 +1783,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             r#"
             SELECT server_id, public_name, tool_name, description,
-                   input_schema_json, annotations_json, permission_labels_json
+                   input_schema_json, annotations_json, meta_json, permission_labels_json
             FROM mcp_server_tools
             ORDER BY public_name ASC
             "#,
@@ -5989,7 +6014,8 @@ fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerConfig> 
 fn map_mcp_server_tool(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpToolDescriptor> {
     let input_schema_json: String = row.get(4)?;
     let annotations_json: String = row.get(5)?;
-    let permission_labels_json: String = row.get(6)?;
+    let meta_json: String = row.get(6)?;
+    let permission_labels_json: String = row.get(7)?;
     Ok(McpToolDescriptor {
         server_id: parse_uuid(row.get(0)?, 0)?,
         public_name: row.get(1)?,
@@ -6001,8 +6027,11 @@ fn map_mcp_server_tool(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpToolDescr
         annotations: serde_json::from_str(&annotations_json).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(err))
         })?,
-        permission_labels: serde_json::from_str(&permission_labels_json).map_err(|err| {
+        meta: serde_json::from_str(&meta_json).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(err))
+        })?,
+        permission_labels: serde_json::from_str(&permission_labels_json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(7, Type::Text, Box::new(err))
         })?,
     })
 }
@@ -6153,6 +6182,41 @@ mod tests {
             std::process::id(),
             Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn legacy_parallel_tool_defaults_migrate_once_and_preserve_later_opt_out() {
+        let store = SqliteSessionStore::open(":memory:").expect("open settings store");
+        let mut legacy =
+            serde_json::to_value(AppSettings::from_env(crate::policy::PermissionMode::Auto))
+                .unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("parallelToolCallsMigrated");
+        legacy["providers"][0]["parallelToolCalls"] = serde_json::json!(false);
+        {
+            let conn = store.conn.lock().expect("lock settings store");
+            conn.execute(
+                "INSERT INTO app_settings (id, settings_json, updated_at) VALUES (1, ?1, ?2)",
+                params![legacy.to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let mut migrated = store
+            .load_settings(crate::policy::PermissionMode::Auto)
+            .unwrap();
+        assert!(migrated.parallel_tool_calls_migrated);
+        assert!(migrated.providers[0].parallel_tool_calls);
+
+        migrated.providers[0].parallel_tool_calls = false;
+        store.save_settings(migrated).unwrap();
+        let reloaded = store
+            .load_settings(crate::policy::PermissionMode::Auto)
+            .unwrap();
+        assert!(reloaded.parallel_tool_calls_migrated);
+        assert!(!reloaded.providers[0].parallel_tool_calls);
     }
 
     fn enterprise_template_spec(tools: &[&str]) -> AgentTemplateSpecV1 {
@@ -6343,6 +6407,9 @@ mod tests {
                 "properties": { "path": { "type": "string" } }
             }),
             annotations: serde_json::json!({ "readOnlyHint": true }),
+            meta: serde_json::json!({
+                "com.opentopia/capabilities": ["fixture.capability/v1"]
+            }),
             permission_labels: vec!["read".to_string()],
         }
     }
@@ -6408,7 +6475,42 @@ mod tests {
         assert_eq!(read.description.as_deref(), Some("read description"));
         assert_eq!(read.permission_labels, vec!["read".to_string()]);
         assert_eq!(read.annotations["readOnlyHint"], serde_json::json!(true));
+        assert_eq!(
+            read.meta["com.opentopia/capabilities"][0],
+            "fixture.capability/v1"
+        );
         assert_eq!(read.input_schema["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn migration_adds_mcp_tool_meta_to_existing_catalogs() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        {
+            let conn = store.conn.lock().expect("lock store");
+            conn.execute_batch(
+                r#"
+                DROP TABLE mcp_server_tools;
+                CREATE TABLE mcp_server_tools (
+                    server_id TEXT NOT NULL,
+                    public_name TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    description TEXT,
+                    input_schema_json TEXT NOT NULL,
+                    annotations_json TEXT NOT NULL,
+                    permission_labels_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(server_id, public_name),
+                    FOREIGN KEY(server_id) REFERENCES mcp_servers(server_id) ON DELETE CASCADE
+                );
+                "#,
+            )
+            .expect("restore legacy MCP tool table");
+        }
+
+        store.migrate().expect("migrate legacy MCP tool table");
+        let conn = store.conn.lock().expect("lock migrated store");
+        assert!(table_has_column(&conn, "mcp_server_tools", "meta_json")
+            .expect("inspect migrated table"));
     }
 
     #[test]
@@ -6784,6 +6886,7 @@ mod tests {
             plan_revision: revision,
             goal_id: goal_id.to_string(),
             change_reason: Some(format!("revision {revision}")),
+            coverage: None,
             steps: vec![TaskPlanStep {
                 id: "implement".to_string(),
                 title: "Implement and verify".to_string(),
@@ -6852,6 +6955,7 @@ mod tests {
                 plan_revision: 1,
                 goal_id: goal.goal.id.to_string(),
                 change_reason: Some("start".to_string()),
+                coverage: None,
                 steps: vec![TaskPlanStep {
                     id: "side-effect".to_string(),
                     title: "Perform side effect".to_string(),

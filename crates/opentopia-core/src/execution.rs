@@ -1,3 +1,4 @@
+use crate::execution_authorization::ProcessLifetime;
 use crate::execution_runtime::{
     configure_command_environment, configure_stdio, environment_keys, resolve_runtime,
 };
@@ -71,6 +72,9 @@ pub struct ExecutionContext {
     pub termination_timeout: Duration,
     pub cancel: Option<CancellationToken>,
     pub resource_limits: ResourceLimit,
+    /// Lifecycle is orthogonal to RPC/command timeout. Persistent services are
+    /// stopped only by their owner, never because one request deadline elapsed.
+    pub process_lifetime: ProcessLifetime,
     /// When set, output is forwarded here as it arrives as well as being returned.
     pub output_sink: Option<Arc<dyn BackgroundOutputSink>>,
 }
@@ -83,6 +87,7 @@ impl ExecutionContext {
             termination_timeout: Duration::from_secs(5),
             cancel: None,
             resource_limits: ResourceLimit::default(),
+            process_lifetime: ProcessLifetime::OneShot,
             output_sink: None,
         }
     }
@@ -107,6 +112,11 @@ impl ExecutionContext {
         self
     }
 
+    pub fn with_process_lifetime(mut self, lifetime: ProcessLifetime) -> Self {
+        self.process_lifetime = lifetime;
+        self
+    }
+
     pub fn with_output_sink(mut self, sink: Arc<dyn BackgroundOutputSink>) -> Self {
         self.output_sink = Some(sink);
         self
@@ -121,6 +131,7 @@ impl Default for ExecutionContext {
             termination_timeout: Duration::from_secs(5),
             cancel: None,
             resource_limits: ResourceLimit::default(),
+            process_lifetime: ProcessLifetime::OneShot,
             output_sink: None,
         }
     }

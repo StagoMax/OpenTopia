@@ -11,8 +11,10 @@ pub mod desktop_browser;
 pub mod effect_journal;
 pub mod enterprise;
 pub mod execution;
+pub mod execution_authorization;
 mod execution_runtime;
 pub mod execution_spec;
+pub mod file_mutation;
 pub mod flow;
 pub mod flow_runtime;
 mod flow_tools;
@@ -114,6 +116,13 @@ pub use execution::{
     FileReadResult, FileWriteRequest, LocalExecutionEnvironment, PatchResult, ResourceLimit,
     StdioSession, WriteResult,
 };
+pub use execution_authorization::{
+    ApprovalEscalation, ExecutionGrant, FilesystemAccess, NetworkAccess, ProcessLifetime,
+    ToolExecutionIntent,
+};
+pub use file_mutation::{
+    FileMutationBatch, FileMutationBatchResult, FileMutationTarget, PreparedFileMutation,
+};
 pub use flow::{
     compile_flow, definition_from_draft, flow_content_hash, normalize_flow_spec, simulate_flow,
     validate_flow_spec, CompiledFlowNodeV1, CompiledFlowPlanV1, FlowBudgetV1, FlowDefinitionV1,
@@ -126,7 +135,8 @@ pub use flow::{
 pub use flow_runtime::{
     evaluate_condition as evaluate_flow_condition, prepare_flow_resume, resolve_flow_approval,
     spawn_flow_run, FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness,
-    FlowNodeRunStatusV1, FlowNodeRunV1, FlowRunStatusV1, FlowRunV1,
+    FlowNodeRunStatusV1, FlowNodeRunV1, FlowRunStatusV1, FlowRunV1, FlowTranscriptEntryKindV1,
+    FlowTranscriptEntryV1,
 };
 pub use git_workflow::{
     execute_git_workflow, isolated_subagent_compare_request, isolated_subagent_worktree_request,
@@ -165,9 +175,10 @@ pub use model::{
     ContextSourceRef, ContextSummary, EvaluationRun, EvaluationTaskResult, ExperienceMode,
     GoalAttemptStatus, GoalRecord, GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt,
     GoalTaskStatus, Message, MessagePart, MessageRole, ModelContentPart, Project, SkillRef,
-    TaskPlan, TaskPlanStep, TaskPlanStepStatus, TerminalCommandHistory, TerminalCommandStatus,
-    Thread, ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet, TurnChangeSetStatus,
-    TurnFileChange, TurnFileChangeKind, TurnRecord, TurnStatus, UserInputAnswer, UserInputOption,
+    TaskEvidenceKind, TaskEvidenceRef, TaskPlan, TaskPlanCoverage, TaskPlanStep,
+    TaskPlanStepStatus, TaskRequirement, TerminalCommandHistory, TerminalCommandStatus, Thread,
+    ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnFileChange,
+    TurnFileChangeKind, TurnRecord, TurnStatus, UserInputAnswer, UserInputOption,
     UserInputQuestion, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
     CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };

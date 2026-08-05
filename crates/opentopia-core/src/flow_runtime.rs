@@ -57,6 +57,68 @@ pub enum FlowNodeRunStatusV1 {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowTranscriptEntryKindV1 {
+    Input,
+    ToolCall,
+    ToolResult,
+    Output,
+    Approval,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowTranscriptEntryV1 {
+    pub id: Uuid,
+    pub kind: FlowTranscriptEntryKindV1,
+    pub title: String,
+    pub content: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<Uuid>,
+    #[serde(default)]
+    pub is_error: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl FlowTranscriptEntryV1 {
+    pub fn new(kind: FlowTranscriptEntryKindV1, title: impl Into<String>, content: Value) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind,
+            title: title.into(),
+            content,
+            tool_name: None,
+            call_id: None,
+            is_error: false,
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn tool(
+        kind: FlowTranscriptEntryKindV1,
+        tool_name: impl Into<String>,
+        call_id: Uuid,
+        content: Value,
+        is_error: bool,
+    ) -> Self {
+        let tool_name = tool_name.into();
+        Self {
+            id: Uuid::new_v4(),
+            kind,
+            title: tool_name.clone(),
+            content,
+            tool_name: Some(tool_name),
+            call_id: Some(call_id),
+            is_error,
+            created_at: Utc::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowNodeRunV1 {
@@ -70,6 +132,8 @@ pub struct FlowNodeRunV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub tool_calls: u32,
+    #[serde(default)]
+    pub transcript: Vec<FlowTranscriptEntryV1>,
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
@@ -233,6 +297,8 @@ pub struct FlowNodeExecutionRequestV1 {
 pub struct FlowNodeExecutionResultV1 {
     pub output: Value,
     pub tool_calls: u32,
+    #[serde(default)]
+    pub transcript: Vec<FlowTranscriptEntryV1>,
 }
 
 #[async_trait]
@@ -296,6 +362,15 @@ pub fn resolve_flow_approval(
         FlowNodeRunStatusV1::Cancelled
     };
     node_run.output = Some(output.clone());
+    node_run.transcript.push(FlowTranscriptEntryV1::new(
+        FlowTranscriptEntryKindV1::Approval,
+        if approved {
+            "Approval granted"
+        } else {
+            "Approval rejected"
+        },
+        output.clone(),
+    ));
     node_run.completed_at = Some(Utc::now());
     run.waiting_node_id = None;
     if approved {
@@ -406,6 +481,7 @@ async fn drive_flow_run(run_id: Uuid, context: ToolContext) -> anyhow::Result<()
         let expected = run.revision;
         remove_first(&mut run.ready_nodes, &node_id);
         if node.kind == GraphNodeKindV1::Approval {
+            let transcript_input = input.clone();
             let node_run = FlowNodeRunV1 {
                 id: Uuid::new_v4(),
                 node_id: node_id.clone(),
@@ -415,6 +491,18 @@ async fn drive_flow_run(run_id: Uuid, context: ToolContext) -> anyhow::Result<()
                 output: None,
                 error: None,
                 tool_calls: 0,
+                transcript: vec![
+                    FlowTranscriptEntryV1::new(
+                        FlowTranscriptEntryKindV1::Input,
+                        "Node input",
+                        transcript_input,
+                    ),
+                    FlowTranscriptEntryV1::new(
+                        FlowTranscriptEntryKindV1::Approval,
+                        "Waiting for human approval",
+                        json!({"status": "pending"}),
+                    ),
+                ],
                 started_at: Utc::now(),
                 completed_at: None,
             };
@@ -438,6 +526,11 @@ async fn drive_flow_run(run_id: Uuid, context: ToolContext) -> anyhow::Result<()
             output: None,
             error: None,
             tool_calls: 0,
+            transcript: vec![FlowTranscriptEntryV1::new(
+                FlowTranscriptEntryKindV1::Input,
+                "Node input",
+                input.clone(),
+            )],
             started_at: Utc::now(),
             completed_at: None,
         });
@@ -487,6 +580,12 @@ async fn drive_flow_run(run_id: Uuid, context: ToolContext) -> anyhow::Result<()
                 node_run.status = FlowNodeRunStatusV1::Succeeded;
                 node_run.output = Some(result.output.clone());
                 node_run.tool_calls = result.tool_calls;
+                node_run.transcript.extend(result.transcript);
+                node_run.transcript.push(FlowTranscriptEntryV1::new(
+                    FlowTranscriptEntryKindV1::Output,
+                    "Node output",
+                    result.output.clone(),
+                ));
                 node_run.completed_at = Some(now);
                 run.tool_calls = run.tool_calls.saturating_add(result.tool_calls);
                 run.node_outputs
@@ -507,6 +606,11 @@ async fn drive_flow_run(run_id: Uuid, context: ToolContext) -> anyhow::Result<()
                 {
                     node_run.status = FlowNodeRunStatusV1::Failed;
                     node_run.error = Some(error.to_string());
+                    node_run.transcript.push(FlowTranscriptEntryV1::new(
+                        FlowTranscriptEntryKindV1::Error,
+                        "Node failed",
+                        json!({"message": error.to_string()}),
+                    ));
                     node_run.completed_at = Some(Utc::now());
                 }
                 if let Some(target) = error_route(&run.graph, &node_id) {
@@ -567,6 +671,7 @@ fn execute_runtime_node(
     Ok(FlowNodeExecutionResultV1 {
         output,
         tool_calls: 0,
+        transcript: Vec::new(),
     })
 }
 
@@ -980,6 +1085,17 @@ mod tests {
 
         let completed = wait_for_status(&store, run.id, FlowRunStatusV1::Succeeded).await;
         assert_eq!(completed.node_runs.len(), 2);
+        assert_eq!(
+            completed.node_runs[0]
+                .transcript
+                .iter()
+                .map(|entry| entry.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                FlowTranscriptEntryKindV1::Input,
+                FlowTranscriptEntryKindV1::Output,
+            ]
+        );
         assert_eq!(
             completed.output,
             Some(json!({"matched": true, "value": {"ready": true}}))

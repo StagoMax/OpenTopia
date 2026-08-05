@@ -212,7 +212,7 @@ pub struct ProviderSettings {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub store_responses: bool,
-    #[serde(default)]
+    #[serde(default = "default_parallel_tool_calls")]
     pub parallel_tool_calls: bool,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
@@ -255,7 +255,7 @@ impl Default for ProviderSettings {
             context_window_tokens: None,
             reasoning_effort: None,
             store_responses: false,
-            parallel_tool_calls: false,
+            parallel_tool_calls: default_parallel_tool_calls(),
             prompt_cache_key: None,
             prompt_cache_policy: None,
             responses_compaction_threshold_tokens: None,
@@ -836,6 +836,10 @@ fn default_provider_supports_vision() -> bool {
     true
 }
 
+fn default_parallel_tool_calls() -> bool {
+    true
+}
+
 fn default_rollout_sampling_token_weight() -> f64 {
     1.0
 }
@@ -1086,6 +1090,11 @@ pub struct AppSettings {
     pub sandbox: SandboxSettings,
     #[serde(default)]
     pub enterprise: EnterpriseSettings,
+    /// One-time settings migration marker. Older desktop builds persisted
+    /// `parallelToolCalls: false` as their UI default, so absence means those
+    /// values have not yet been upgraded to the runtime's default-on policy.
+    #[serde(default)]
+    pub parallel_tool_calls_migrated: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -1100,6 +1109,7 @@ impl AppSettings {
             default_workspace_root: None,
             sandbox: SandboxSettings::from_env(),
             enterprise: EnterpriseSettings::from_env(),
+            parallel_tool_calls_migrated: true,
             updated_at: Utc::now(),
         }
     }
@@ -1585,12 +1595,31 @@ mod tests {
         );
         assert_eq!(provider.reasoning_effort, None);
         assert!(!provider.store_responses);
-        assert!(!provider.parallel_tool_calls);
+        assert!(provider.parallel_tool_calls);
         assert_eq!(provider.prompt_cache_key, None);
         assert_eq!(provider.prompt_cache_policy, None);
         assert_eq!(provider.responses_compaction_threshold_tokens, None);
         assert_eq!(provider.rollout_budget, None);
         assert_eq!(provider.openai_compatibility, None);
+    }
+
+    #[test]
+    fn explicit_parallel_tool_call_disable_is_preserved() {
+        let provider: ProviderSettings = serde_json::from_str(
+            r#"{
+                "id": "serial",
+                "kind": "openai_compatible",
+                "baseUrl": "https://example.test/v1",
+                "model": "serial-model",
+                "parallelToolCalls": false,
+                "apiKeySource": "OPENTOPIA_API_KEY",
+                "apiKeyConfigured": true,
+                "healthStatus": null
+            }"#,
+        )
+        .expect("deserialize explicit serial provider setting");
+
+        assert!(!provider.parallel_tool_calls);
     }
 
     #[test]
@@ -1717,6 +1746,7 @@ mod tests {
             default_workspace_root: None,
             sandbox: SandboxSettings::default(),
             enterprise: EnterpriseSettings::default(),
+            parallel_tool_calls_migrated: true,
             updated_at: Utc::now(),
         };
         let mut value = serde_json::to_value(settings).unwrap();
