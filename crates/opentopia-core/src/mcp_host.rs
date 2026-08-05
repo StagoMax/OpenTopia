@@ -1,4 +1,5 @@
 use crate::execution::{ExecRequest, ExecutionContext, ExecutionEnvironment, StdioSession};
+use crate::execution_authorization::ProcessLifetime;
 use crate::mcp::{
     mcp_default_input_schema, mcp_public_tool_name, McpCallResult, McpLifecycleStatus,
     McpServerConfig, McpServerStatus, McpToolDescriptor,
@@ -756,7 +757,8 @@ impl McpProcessSpawner for ExecutionEnvironmentMcpProcessSpawner {
         let session = environment
             .spawn_stdio(
                 request,
-                ExecutionContext::with_timeout(Duration::from_millis(config.timeout_ms.max(1))),
+                ExecutionContext::with_timeout(Duration::from_millis(config.timeout_ms.max(1)))
+                    .with_process_lifetime(ProcessLifetime::PersistentService),
             )
             .await
             .map_err(|error| McpHostError::SpawnRejected {
@@ -1202,6 +1204,8 @@ pub struct McpRawTool {
     pub input_schema: Value,
     #[serde(default = "empty_object")]
     pub annotations: Value,
+    #[serde(default = "empty_object", rename = "_meta")]
+    pub meta: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1503,6 +1507,7 @@ fn descriptor_from_raw_tool(config: &McpServerConfig, raw_tool: McpRawTool) -> M
         description: raw_tool.description,
         input_schema: raw_tool.input_schema,
         annotations: raw_tool.annotations.clone(),
+        meta: raw_tool.meta,
         permission_labels: permission_labels_from_annotations(&raw_tool.annotations),
     }
 }
@@ -1883,12 +1888,42 @@ mod tests {
             .expect("tools/list should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
+        assert_eq!(
+            tools[0].meta["com.opentopia/capabilities"][0],
+            "fixture.echo/v1"
+        );
 
         let call = client
             .call_tool("echo", json!({ "text": "hello" }))
             .await
             .expect("tools/call should succeed");
         assert_eq!(mcp_content_to_text(&call.content, None), "echo: hello");
+
+        client.shutdown().await.expect("shutdown should succeed");
+        server.await.expect("mock server task should finish");
+    }
+
+    #[tokio::test]
+    async fn rpc_timeout_does_not_terminate_persistent_stdio_transport() {
+        let (client_stdin, server_stdin) = duplex(16 * 1024);
+        let (server_stdout, client_stdout) = duplex(16 * 1024);
+        let server = tokio::spawn(run_slow_first_call_mcp_server(server_stdin, server_stdout));
+
+        let mut config = McpServerConfig::new("Slow Server".to_string(), "mock".to_string());
+        config.timeout_ms = 100;
+        let client = McpStdioClient::from_io_for_test(config, client_stdout, client_stdin);
+
+        let first = client.call_tool("echo", json!({ "text": "slow" })).await;
+        assert!(matches!(first, Err(McpHostError::Timeout { .. })));
+
+        let second = client
+            .call_tool("echo", json!({ "text": "still alive" }))
+            .await
+            .expect("transport must remain usable after one RPC timeout");
+        assert_eq!(
+            mcp_content_to_text(&second.content, None),
+            "echo: still alive"
+        );
 
         client.shutdown().await.expect("shutdown should succeed");
         server.await.expect("mock server task should finish");
@@ -2077,6 +2112,7 @@ mod tests {
             description: Some("echo text".to_string()),
             input_schema: json!({ "type": "object" }),
             annotations: json!({ "readOnlyHint": true }),
+            meta: json!({}),
             permission_labels: vec!["read".to_string()],
         };
         let catalog = Arc::new(RecordingCatalogStore::default());
@@ -2218,6 +2254,9 @@ mod tests {
                                     },
                                     "annotations": {
                                         "readOnlyHint": true
+                                    },
+                                    "_meta": {
+                                        "com.opentopia/capabilities": ["fixture.echo/v1"]
                                     }
                                 }]
                             }
@@ -2261,6 +2300,40 @@ mod tests {
                     .await;
                 }
             }
+        }
+    }
+
+    async fn run_slow_first_call_mcp_server(
+        stdin: tokio::io::DuplexStream,
+        mut stdout: tokio::io::DuplexStream,
+    ) {
+        let mut lines = BufReader::new(stdin).lines();
+        let mut calls = 0usize;
+        while let Some(line) = lines.next_line().await.expect("mock read should succeed") {
+            let value: Value = serde_json::from_str(&line).expect("client message should be JSON");
+            if value.get("method").and_then(Value::as_str) != Some("tools/call") {
+                continue;
+            }
+            calls += 1;
+            if calls == 1 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            let text = value
+                .pointer("/params/arguments/text")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            write_json_line(
+                &mut stdout,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": value.get("id").cloned().unwrap_or(Value::Null),
+                    "result": {
+                        "content": [{ "type": "text", "text": format!("echo: {text}") }],
+                        "isError": false
+                    }
+                }),
+            )
+            .await;
         }
     }
 
