@@ -1052,7 +1052,7 @@ impl From<&SandboxSettings> for LocalSandboxConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnterpriseSettings {
     /// Deployment-owned gate. It is intentionally not writable through the
@@ -1060,18 +1060,30 @@ pub struct EnterpriseSettings {
     pub enabled: bool,
 }
 
+impl Default for EnterpriseSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 impl EnterpriseSettings {
     pub fn from_env() -> Self {
-        let enabled = std::env::var("OPENTOPIA_ENTERPRISE_ENABLED")
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            });
+        let value = std::env::var("OPENTOPIA_ENTERPRISE_ENABLED").ok();
+        let enabled = enterprise_enabled_from_env_value(value.as_deref());
         Self { enabled }
     }
+}
+
+fn enterprise_enabled_from_env_value(value: Option<&str>) -> bool {
+    value.map_or_else(
+        || EnterpriseSettings::default().enabled,
+        |value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1267,6 +1279,18 @@ fn env_path_list(name: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn enterprise_flow_is_enabled_by_default_and_can_be_disabled() {
+        assert!(EnterpriseSettings::default().enabled);
+        assert!(enterprise_enabled_from_env_value(None));
+        for value in ["1", "true", "YES", " on "] {
+            assert!(enterprise_enabled_from_env_value(Some(value)));
+        }
+        for value in ["0", "false", "no", "off", "invalid"] {
+            assert!(!enterprise_enabled_from_env_value(Some(value)));
+        }
+    }
 
     #[test]
     fn reasoning_models_do_not_accept_a_temperature() {

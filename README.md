@@ -90,11 +90,11 @@ $env:OPENTOPIA_ROLLOUT_INPUT_WEIGHT="1.0"
 cargo run -p opentopia-server -- --permission auto
 ```
 
-The enterprise Flow surface is disabled by default and can only be enabled by
-the server deployment environment (it is not a writable client preference):
+The enterprise Flow surface is enabled by default. A server deployment can
+explicitly disable it (it is not a writable client preference):
 
 ```powershell
-$env:OPENTOPIA_ENTERPRISE_ENABLED="true"
+$env:OPENTOPIA_ENTERPRISE_ENABLED="false"
 ```
 
 With the gate enabled, Flow sessions expose the Agent template control plane
@@ -114,6 +114,13 @@ $env:OPENTOPIA_SANDBOX_ENFORCEMENT="enforce"  # disabled | best-effort | enforce
 $env:OPENTOPIA_SANDBOX_NETWORK="deny" # deny (default) | allow | inherit
 $env:OPENTOPIA_SANDBOX_WRITABLE_ROOTS="D:\shared"
 $env:OPENTOPIA_WINDOWS_SANDBOX="auto" # auto | elevated | unelevated
+```
+
+A trusted launcher may optionally restrict one server process to a fixed tool
+surface. This is a general runtime policy and is never accepted from chat input:
+
+```powershell
+$env:OPENTOPIA_TOOL_ALLOWLIST="read_file,search"
 ```
 
 Windows uses OpenTopia's first-party dual backend. `elevated` runs commands as

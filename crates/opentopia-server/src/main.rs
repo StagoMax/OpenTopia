@@ -34,19 +34,19 @@ use opentopia_core::{
     ContextCheckpointWorkspace, ContextCompactionDetails, ContextCompactionMetrics,
     ContextFactStatus, ContextItemKind, ContextProjection, ContextRole, ContextSensitivity,
     ContextSourcePolicy, ContextSourceRef, ContextSummary, ContributionKind, DesktopBrowserRuntime,
-    EvaluationRun, EvaluationTaskResult, ExecutionContext, ExperienceMode,
-    ExperienceSurfaceProfile, GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot,
-    GoalStatus, LoadedSkill, LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment,
-    LocalSandboxConfig, McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor,
-    MediaHandlerSelection, Message, MessagePart, MessageRole, ModelContentPart, ModelContextItem,
-    ModelConversationMessage, ModelConversationRole, ModelRequest, ObserveOptions,
-    OpenAiCompatibleProvider, OpenAiProtocol, PermissionMode, PluginControlScope, PluginDescriptor,
-    PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind,
-    PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderConversationCursor,
-    ProviderConversationState, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth,
-    ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview,
-    ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxMode, SandboxSettings, SearchTool,
-    SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
+    ExecutionContext, ExperienceMode, ExperienceSurfaceProfile, GitWorkflowAction,
+    GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill, LocalBrowserRuntime,
+    LocalComputerRuntime, LocalExecutionEnvironment, LocalSandboxConfig, McpCallResult,
+    McpServerConfig, McpServerStatus, McpToolDescriptor, MediaHandlerSelection, Message,
+    MessagePart, MessageRole, ModelContentPart, ModelContextItem, ModelConversationMessage,
+    ModelConversationRole, ModelRequest, ObserveOptions, OpenAiCompatibleProvider, OpenAiProtocol,
+    PermissionMode, PluginControlScope, PluginDescriptor, PluginError, PolicyDecision,
+    PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest,
+    PreviewTarget, PreviewWorkbook, ProviderConversationCursor, ProviderConversationState,
+    ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck,
+    ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit,
+    RuntimeSurface, SandboxDescriptor, SandboxMode, SandboxSettings, SearchTool, SessionStore,
+    SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
     SubagentExecutionContract, SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler,
     SubagentSchedulerConfig, SubagentScope, SubagentWorkspaceMode, TaskPlan,
     TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer,
@@ -177,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
     initial_agent.set_browser_runtime(browser.clone());
     initial_agent.set_computer_runtime(computer.clone());
     initial_agent.set_background_processes(background.clone());
-    apply_evaluation_tool_policy(&mut initial_agent);
+    apply_process_tool_policy(&mut initial_agent);
     let agent = Arc::new(RwLock::new(initial_agent));
     let subagents = SubagentScheduler::new(
         SubagentSchedulerConfig::default(),
@@ -348,11 +348,10 @@ async fn initialize_browser_runtime() -> Arc<dyn BrowserRuntime> {
     Arc::new(LocalBrowserRuntime::new(config))
 }
 
-/// The public application never accepts an allowlist from a chat request. The
-/// evaluator starts a dedicated server process and may narrow that process to a
-/// deterministic tool surface through its trusted launch environment.
-fn apply_evaluation_tool_policy(agent: &mut AgentCore) {
-    let Some(raw) = std::env::var("OPENTOPIA_EVAL_ALLOWED_TOOLS")
+/// Applies a process-wide tool allowlist supplied by the trusted launcher. The
+/// allowlist is never accepted from a chat request.
+fn apply_process_tool_policy(agent: &mut AgentCore) {
+    let Some(raw) = std::env::var("OPENTOPIA_TOOL_ALLOWLIST")
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
@@ -365,10 +364,12 @@ fn apply_evaluation_tool_policy(agent: &mut AgentCore) {
         .map(str::to_string)
         .collect::<HashSet<_>>();
     if tools.is_empty() {
-        warn!("OPENTOPIA_EVAL_ALLOWED_TOOLS did not contain any tool names; ignoring evaluator policy");
+        warn!(
+            "OPENTOPIA_TOOL_ALLOWLIST did not contain any tool names; ignoring process tool policy"
+        );
         return;
     }
-    info!(tools = ?tools, "restricting agent tools for evaluator process");
+    info!(tools = ?tools, "restricting agent tools for this process");
     agent.restrict_to_tools(tools);
 }
 
@@ -382,8 +383,6 @@ fn build_router(state: AppState) -> Router {
         .merge(plugins_api::router())
         .merge(scm_api::router())
         .route("/health", get(health))
-        .route("/api/evaluations", get(list_evaluation_runs))
-        .route("/api/evaluations/import", post(import_evaluation_runs))
         .route("/api/settings", get(get_settings).patch(update_settings))
         .route("/api/skills", get(list_skills))
         .route("/api/plugins", get(list_plugins))
@@ -1328,324 +1327,6 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-const MAX_EVALUATION_SUMMARIES: usize = 200;
-const MAX_EVALUATION_SUMMARY_BYTES: u64 = 1_048_576;
-
-async fn list_evaluation_runs(
-    State(state): State<AppState>,
-    Query(query): Query<EvaluationRunsQuery>,
-) -> Result<Json<Vec<EvaluationRun>>, ApiError> {
-    let workspace_root = canonicalize_workspace_root(query.workspace_root);
-    Ok(Json(state.store.list_evaluation_runs(&workspace_root)?))
-}
-
-async fn import_evaluation_runs(
-    State(state): State<AppState>,
-    Json(request): Json<ImportEvaluationRunsRequest>,
-) -> Result<Json<Vec<EvaluationRun>>, ApiError> {
-    let workspace_root = canonicalize_workspace_root(request.workspace_root);
-    let runs = scan_workspace_evaluation_runs(&workspace_root)?;
-    for run in &runs {
-        state.store.upsert_evaluation_run(run)?;
-    }
-    Ok(Json(state.store.list_evaluation_runs(&workspace_root)?))
-}
-
-fn scan_workspace_evaluation_runs(workspace_root: &FsPath) -> anyhow::Result<Vec<EvaluationRun>> {
-    let evaluation_root = workspace_root.join(".opentopia").join("evaluations");
-    if !evaluation_root.exists() {
-        return Ok(Vec::new());
-    }
-    anyhow::ensure!(
-        evaluation_root.is_dir(),
-        "evaluation path is not a directory: {}",
-        evaluation_root.display()
-    );
-
-    let mut summary_paths = std::fs::read_dir(&evaluation_root)
-        .with_context(|| format!("failed to read {}", evaluation_root.display()))?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(|kind| kind.is_dir())
-                .map(|_| entry.path().join("summary.json"))
-        })
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
-    summary_paths.sort();
-    summary_paths.truncate(MAX_EVALUATION_SUMMARIES);
-
-    let mut runs = Vec::new();
-    for summary_path in summary_paths {
-        match read_evaluation_json(&summary_path)
-            .and_then(|summary| evaluation_run_from_summary(workspace_root, &summary_path, summary))
-        {
-            Ok(run) => runs.push(run),
-            Err(error) => {
-                warn!(path = %summary_path.display(), ?error, "skipping unreadable evaluation summary")
-            }
-        }
-    }
-    runs.sort_by(|left, right| {
-        right
-            .completed_at
-            .or(right.started_at)
-            .cmp(&left.completed_at.or(left.started_at))
-            .then_with(|| right.run_id.cmp(&left.run_id))
-    });
-    Ok(runs)
-}
-
-fn read_evaluation_json(path: &FsPath) -> anyhow::Result<Value> {
-    let metadata =
-        std::fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
-    anyhow::ensure!(
-        metadata.len() <= MAX_EVALUATION_SUMMARY_BYTES,
-        "evaluation JSON exceeds {} bytes: {}",
-        MAX_EVALUATION_SUMMARY_BYTES,
-        path.display()
-    );
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
-}
-
-fn evaluation_run_from_summary(
-    workspace_root: &FsPath,
-    summary_path: &FsPath,
-    summary: Value,
-) -> anyhow::Result<EvaluationRun> {
-    let directory = summary_path
-        .parent()
-        .context("evaluation summary has no parent directory")?;
-    let fallback_id = directory
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("evaluation-run");
-    let run_id =
-        json_string(&summary, &["runId", "suiteId"]).unwrap_or_else(|| fallback_id.to_string());
-    let title = json_string(&summary, &["benchmark", "title", "suiteId"])
-        .unwrap_or_else(|| "OpenTopia evaluation".to_string());
-    let status = json_string(&summary, &["status"]).unwrap_or_else(|| "unknown".to_string());
-    let model = json_string(&summary, &["model"])
-        .or_else(|| json_string_at(&summary, &["provider", "model"]))
-        .or_else(|| json_string_at(&summary, &["provider", "expectedModel"]));
-    let failure_category = json_string(&summary, &["failureCategory"]);
-    let tasks = evaluation_tasks_from_details(directory, &summary).unwrap_or_else(|error| {
-        warn!(path = %directory.display(), ?error, "using summary-only evaluation task details");
-        evaluation_tasks_from_summary(&summary)
-    });
-
-    Ok(EvaluationRun {
-        run_id,
-        workspace_root: workspace_root.to_path_buf(),
-        title,
-        status,
-        model,
-        failure_category,
-        started_at: json_datetime(&summary, "startedAt"),
-        completed_at: json_datetime(&summary, "completedAt"),
-        source_path: directory.to_path_buf(),
-        tasks,
-        summary,
-        updated_at: Utc::now(),
-    })
-}
-
-fn evaluation_tasks_from_details(
-    directory: &FsPath,
-    summary: &Value,
-) -> anyhow::Result<Vec<EvaluationTaskResult>> {
-    let mut tasks = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.file_name().and_then(|name| name.to_str()) == Some("summary.json")
-            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
-        {
-            continue;
-        }
-        let detail = match read_evaluation_json(&path) {
-            Ok(detail) => detail,
-            Err(error) => {
-                warn!(path = %path.display(), ?error, "skipping unreadable evaluation task detail");
-                continue;
-            }
-        };
-        if let Some(task) = evaluation_task_from_detail(&detail) {
-            tasks.push(task);
-        }
-    }
-    if tasks.is_empty() {
-        tasks = evaluation_tasks_from_referenced_runs(directory, summary);
-    }
-    Ok(tasks)
-}
-
-/// A suite summary only contains aggregate task rows. Its per-attempt result
-/// files live next to the suite directory and carry the trajectory metrics we
-/// need for observability. Keep the summary row when an attempt artifact is
-/// missing, rather than inferring a replacement category from the UI.
-fn evaluation_tasks_from_referenced_runs(
-    suite_directory: &FsPath,
-    summary: &Value,
-) -> Vec<EvaluationTaskResult> {
-    let mut tasks = evaluation_tasks_from_summary(summary);
-    let Some(evaluation_root) = suite_directory.parent() else {
-        return tasks;
-    };
-
-    for task in &mut tasks {
-        let Some(run_id) = task.run_id.as_deref() else {
-            continue;
-        };
-        let Some(result_path) = evaluation_result_path(evaluation_root, run_id) else {
-            warn!(%run_id, "skipping unsafe evaluation run id from summary");
-            continue;
-        };
-        let detail = match read_evaluation_json(&result_path) {
-            Ok(detail) => detail,
-            Err(error) => {
-                warn!(path = %result_path.display(), ?error, "evaluation task result artifact is unavailable");
-                continue;
-            }
-        };
-        if let Some(detail_task) = evaluation_task_from_detail(&detail) {
-            // Preserve the suite's task/attempt label while enriching it from
-            // the detailed Harness artifact.
-            let task_id = task.task_id.clone();
-            *task = detail_task;
-            task.task_id = task_id;
-        }
-    }
-    tasks
-}
-
-fn evaluation_result_path(evaluation_root: &FsPath, run_id: &str) -> Option<PathBuf> {
-    let mut components = FsPath::new(run_id).components();
-    let component = components.next()?;
-    if components.next().is_some() || !matches!(component, std::path::Component::Normal(_)) {
-        return None;
-    }
-    Some(evaluation_root.join(run_id).join("result.json"))
-}
-
-fn evaluation_task_from_detail(value: &Value) -> Option<EvaluationTaskResult> {
-    let task = value.get("task")?;
-    let task_id = json_string(task, &["id"])?;
-    let tool_calls_by_name = value
-        .pointer("/trajectoryMetrics/toolCallsByName")
-        .and_then(Value::as_object)
-        .map(|calls| {
-            calls
-                .iter()
-                .filter_map(|(name, count)| count.as_u64().map(|count| (name.clone(), count)))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(EvaluationTaskResult {
-        task_id,
-        run_id: json_string(value, &["runId"]),
-        title: json_string(task, &["title"]),
-        status: json_string(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
-        failure_category: json_string(value, &["failureCategory"]),
-        error: json_string(value, &["error"]),
-        tool_calls_by_name,
-        total_tokens: value
-            .pointer("/trajectoryMetrics/totalTokens")
-            .and_then(Value::as_u64),
-        error_events: value
-            .pointer("/trajectoryMetrics/errorEvents")
-            .and_then(Value::as_u64),
-        recovery_passed: value.get("recoveryPassed").and_then(Value::as_bool),
-        process_contract_passed: value.get("processContractPassed").and_then(Value::as_bool),
-    })
-}
-
-fn evaluation_tasks_from_summary(summary: &Value) -> Vec<EvaluationTaskResult> {
-    let mut tasks = Vec::new();
-    for task in summary
-        .get("tasks")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let task_id = json_string(task, &["taskId", "task"]).unwrap_or_else(|| "task".to_string());
-        let runs = task.get("runs").and_then(Value::as_array);
-        if let Some(runs) = runs.filter(|runs| !runs.is_empty()) {
-            for (index, run) in runs.iter().enumerate() {
-                tasks.push(evaluation_task_from_summary_value(
-                    run,
-                    task_id.clone(),
-                    (runs.len() > 1).then_some(index + 1),
-                ));
-            }
-        } else {
-            tasks.push(evaluation_task_from_summary_value(task, task_id, None));
-        }
-    }
-    tasks
-}
-
-fn evaluation_task_from_summary_value(
-    value: &Value,
-    task_id: String,
-    attempt: Option<usize>,
-) -> EvaluationTaskResult {
-    let task_id = attempt
-        .map(|attempt| format!("{task_id} · {attempt}"))
-        .unwrap_or(task_id);
-    EvaluationTaskResult {
-        task_id,
-        run_id: json_string(value, &["runId"]),
-        title: json_string(value, &["title"]),
-        status: json_string(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
-        failure_category: json_string(value, &["failureCategory"]),
-        error: json_string(value, &["error"]),
-        tool_calls_by_name: BTreeMap::new(),
-        total_tokens: json_u64(value, "totalTokens"),
-        error_events: json_u64(value, "errorEvents"),
-        recovery_passed: value.get("recoveryPassed").and_then(Value::as_bool),
-        process_contract_passed: value.get("processContractPassed").and_then(Value::as_bool),
-    }
-}
-
-fn json_string(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        value
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-}
-
-fn json_string_at(value: &Value, path: &[&str]) -> Option<String> {
-    let value = path
-        .iter()
-        .try_fold(value, |current, key| current.get(*key))?;
-    value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn json_u64(value: &Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(Value::as_u64)
-}
-
-fn json_datetime(value: &Value, key: &str) -> Option<DateTime<Utc>> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&Utc))
-}
-
 async fn get_settings(State(state): State<AppState>) -> Json<AppSettings> {
     Json(current_settings(&state))
 }
@@ -1722,7 +1403,7 @@ async fn update_settings(
         agent.set_computer_runtime(state.computer.clone());
         agent.set_subagent_scheduler(state.subagents.clone());
         agent.set_background_processes(state.background.clone());
-        apply_evaluation_tool_policy(&mut agent);
+        apply_process_tool_policy(&mut agent);
         *agent_guard = agent;
     }
     Ok(Json(settings))
@@ -2169,7 +1850,7 @@ async fn test_provider_connection(
                     agent.set_computer_runtime(state.computer.clone());
                     agent.set_subagent_scheduler(state.subagents.clone());
                     agent.set_background_processes(state.background.clone());
-                    apply_evaluation_tool_policy(&mut agent);
+                    apply_process_tool_policy(&mut agent);
                     *agent_guard = agent;
                 }
             }
@@ -2329,7 +2010,7 @@ async fn sync_provider_models(
         agent.set_computer_runtime(state.computer.clone());
         agent.set_subagent_scheduler(state.subagents.clone());
         agent.set_background_processes(state.background.clone());
-        apply_evaluation_tool_policy(&mut agent);
+        apply_process_tool_policy(&mut agent);
         *agent_guard = agent;
     }
 
@@ -8410,7 +8091,7 @@ mod experience_mode_tests {
             .contains("files, commands, diffs, tests, verification"));
         assert!(experience_mode_module(ExperienceMode::Flow)
             .text_content()
-            .contains("enterprise design surface"));
+            .contains("enterprise design, run, and review surface"));
         let flow_profile = ExperienceSurfaceProfile::for_mode(ExperienceMode::Flow);
         assert!(!flow_profile.capabilities.allows_tool("shell"));
         assert!(!flow_profile.capabilities.allow_all_mcp_servers);
@@ -11029,18 +10710,6 @@ struct HealthResponse {
     api_version: u32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EvaluationRunsQuery {
-    workspace_root: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ImportEvaluationRunsRequest {
-    workspace_root: PathBuf,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GitWorkflowResponse {
@@ -11925,76 +11594,6 @@ mod tests {
             .into_iter()
             .map(|entry| (entry.id, entry.context_window, entry.supports_vision))
             .collect()
-    }
-
-    #[test]
-    fn evaluation_catalog_enriches_suite_tasks_from_result_artifacts() {
-        let workspace_root =
-            std::env::temp_dir().join(format!("opentopia-evaluation-catalog-{}", Uuid::new_v4()));
-        let evaluation_root = workspace_root.join(".opentopia").join("evaluations");
-        let suite_directory = evaluation_root.join("suite-001");
-        let result_directory = evaluation_root.join("attempt-001");
-        std::fs::create_dir_all(&suite_directory).expect("create suite directory");
-        std::fs::create_dir_all(&result_directory).expect("create result directory");
-        std::fs::write(
-            result_directory.join("result.json"),
-            serde_json::to_vec(&json!({
-                "runId": "attempt-001",
-                "status": "failed",
-                "failureCategory": "agent.tool_execution",
-                "error": "tool call was rejected",
-                "task": {
-                    "id": "LONG-001",
-                    "title": "Complex fixture"
-                },
-                "trajectoryMetrics": {
-                    "toolCallsByName": { "read_file": 4, "shell": 2 },
-                    "totalTokens": 1234,
-                    "errorEvents": 1
-                },
-                "recoveryPassed": true,
-                "processContractPassed": false
-            }))
-            .expect("serialize result"),
-        )
-        .expect("write result artifact");
-
-        let summary = json!({
-            "suiteId": "suite-001",
-            "benchmark": "Long horizon",
-            "status": "failed",
-            "tasks": [{
-                "taskId": "LONG-001",
-                "runs": [{
-                    "runId": "attempt-001",
-                    "status": "failed",
-                    "totalTokens": 0
-                }]
-            }]
-        });
-        let run = evaluation_run_from_summary(
-            &workspace_root,
-            &suite_directory.join("summary.json"),
-            summary,
-        )
-        .expect("parse suite summary");
-
-        assert_eq!(run.title, "Long horizon");
-        assert_eq!(run.tasks.len(), 1);
-        let task = &run.tasks[0];
-        assert_eq!(task.task_id, "LONG-001");
-        assert_eq!(task.title.as_deref(), Some("Complex fixture"));
-        assert_eq!(
-            task.failure_category.as_deref(),
-            Some("agent.tool_execution")
-        );
-        assert_eq!(task.tool_calls_by_name.get("read_file"), Some(&4));
-        assert_eq!(task.total_tokens, Some(1234));
-        assert_eq!(task.error_events, Some(1));
-        assert_eq!(task.recovery_passed, Some(true));
-        assert_eq!(task.process_contract_passed, Some(false));
-
-        std::fs::remove_dir_all(workspace_root).expect("remove temporary evaluation catalog");
     }
 
     #[test]
@@ -13160,8 +12759,9 @@ mod tests {
             .expect("create thread");
         let plan = TaskPlan {
             plan_revision: 1,
-            goal_id: "long-evaluation-run".to_string(),
+            goal_id: "long-running-task".to_string(),
             change_reason: None,
+            coverage: None,
             steps: Vec::new(),
         };
 
@@ -13178,6 +12778,7 @@ mod tests {
             plan_revision: 3,
             goal_id: "durable-plan".to_string(),
             change_reason: Some("Keep the backend lifecycle durable.".to_string()),
+            coverage: None,
             steps: vec![opentopia_core::TaskPlanStep {
                 id: "persist-final-status".to_string(),
                 title: "Persist the final status".to_string(),
@@ -13213,6 +12814,7 @@ mod tests {
             plan_revision: 4,
             goal_id: "durable-deferred-plan".to_string(),
             change_reason: Some("Continue in the next requested phase.".to_string()),
+            coverage: None,
             steps: vec![opentopia_core::TaskPlanStep {
                 id: "implement-cli".to_string(),
                 title: "Implement the CLI".to_string(),
@@ -13246,6 +12848,7 @@ mod tests {
             plan_revision: 1,
             goal_id: "restore-plan".to_string(),
             change_reason: None,
+            coverage: None,
             steps: vec![opentopia_core::TaskPlanStep {
                 id: "old-step".to_string(),
                 title: "Old active step".to_string(),
@@ -13260,6 +12863,7 @@ mod tests {
             plan_revision: 2,
             goal_id: "restore-plan".to_string(),
             change_reason: None,
+            coverage: None,
             steps: vec![opentopia_core::TaskPlanStep {
                 id: "old-step".to_string(),
                 title: "Old active step".to_string(),

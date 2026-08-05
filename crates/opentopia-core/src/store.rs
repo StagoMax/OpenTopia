@@ -13,11 +13,11 @@ use crate::flow_runtime::FlowRunV1;
 use crate::mcp::{McpServerConfig, McpToolDescriptor, ThreadMcpServer};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    ArtifactStorage, ArtifactStorageMetadata, EvaluationRun, ExperienceMode, GoalAttemptStatus,
-    GoalRecord, GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message,
-    MessagePart, MessageRole, Project, TaskPlan, TerminalCommandHistory, TerminalCommandStatus,
-    Thread, ThreadModelSelection, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord,
-    TurnStatus, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
+    ArtifactStorage, ArtifactStorageMetadata, ExperienceMode, GoalAttemptStatus, GoalRecord,
+    GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart,
+    MessageRole, Project, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, Thread,
+    ThreadModelSelection, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord, TurnStatus,
+    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::provider::ModelConversationMessage;
 use crate::settings::AppSettings;
@@ -951,23 +951,6 @@ impl SqliteSessionStore {
                 FOREIGN KEY(server_id) REFERENCES mcp_servers(server_id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS evaluation_runs (
-                workspace_key TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                workspace_root TEXT NOT NULL,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL,
-                model TEXT,
-                failure_category TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                source_path TEXT NOT NULL,
-                tasks_json TEXT NOT NULL,
-                summary_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(workspace_key, run_id)
-            );
-
             CREATE TABLE IF NOT EXISTS agent_templates (
                 template_id TEXT PRIMARY KEY,
                 owner TEXT NOT NULL,
@@ -1080,9 +1063,6 @@ impl SqliteSessionStore {
 
             CREATE INDEX IF NOT EXISTS idx_thread_plugin_activations_thread
                 ON thread_plugin_activations(thread_id, updated_at);
-
-            CREATE INDEX IF NOT EXISTS idx_evaluation_runs_workspace_updated
-                ON evaluation_runs(workspace_key, updated_at DESC);
 
             CREATE INDEX IF NOT EXISTS idx_agent_template_versions_status
                 ON agent_template_versions(template_id, status, version DESC);
@@ -1789,74 +1769,6 @@ impl SqliteSessionStore {
             "#,
         )?;
         let rows = stmt.query_map([], map_mcp_server_tool)?;
-        collect_rows(rows)
-    }
-
-    /// Upserts an evaluation catalog entry imported by the server. The source
-    /// summary is stored alongside normalized task fields, so old reports stay
-    /// inspectable when the Harness schema gains additional metrics.
-    pub fn upsert_evaluation_run(&self, run: &EvaluationRun) -> anyhow::Result<()> {
-        let workspace_key = validated_workspace_key(&run.workspace_root)?;
-        let started_at = run.started_at.as_ref().map(DateTime::to_rfc3339);
-        let completed_at = run.completed_at.as_ref().map(DateTime::to_rfc3339);
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        conn.execute(
-            r#"
-            INSERT INTO evaluation_runs (
-                run_id, workspace_key, workspace_root, title, status, model,
-                failure_category, started_at, completed_at, source_path,
-                tasks_json, summary_json, updated_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            ON CONFLICT(workspace_key, run_id) DO UPDATE SET
-                workspace_key = excluded.workspace_key,
-                workspace_root = excluded.workspace_root,
-                title = excluded.title,
-                status = excluded.status,
-                model = excluded.model,
-                failure_category = excluded.failure_category,
-                started_at = excluded.started_at,
-                completed_at = excluded.completed_at,
-                source_path = excluded.source_path,
-                tasks_json = excluded.tasks_json,
-                summary_json = excluded.summary_json,
-                updated_at = excluded.updated_at
-            "#,
-            params![
-                &run.run_id,
-                &workspace_key,
-                run.workspace_root.to_string_lossy(),
-                &run.title,
-                &run.status,
-                &run.model,
-                &run.failure_category,
-                started_at,
-                completed_at,
-                run.source_path.to_string_lossy(),
-                serde_json::to_string(&run.tasks)?,
-                serde_json::to_string(&run.summary)?,
-                run.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_evaluation_runs(
-        &self,
-        workspace_root: &Path,
-    ) -> anyhow::Result<Vec<EvaluationRun>> {
-        let workspace_key = validated_workspace_key(workspace_root)?;
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT run_id, workspace_root, title, status, model, failure_category,
-                   started_at, completed_at, source_path, tasks_json, summary_json, updated_at
-            FROM evaluation_runs
-            WHERE workspace_key = ?1
-            ORDER BY COALESCE(completed_at, updated_at) DESC, run_id DESC
-            "#,
-        )?;
-        let rows = stmt.query_map(params![workspace_key], map_evaluation_run)?;
         collect_rows(rows)
     }
 
@@ -5270,37 +5182,6 @@ fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
-fn map_evaluation_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvaluationRun> {
-    let tasks_json: String = row.get(9)?;
-    let summary_json: String = row.get(10)?;
-    let tasks = serde_json::from_str(&tasks_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(error))
-    })?;
-    let summary = serde_json::from_str(&summary_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
-    })?;
-    let started_at: Option<String> = row.get(6)?;
-    let completed_at: Option<String> = row.get(7)?;
-    Ok(EvaluationRun {
-        run_id: row.get(0)?,
-        workspace_root: PathBuf::from(row.get::<_, String>(1)?),
-        title: row.get(2)?,
-        status: row.get(3)?,
-        model: row.get(4)?,
-        failure_category: row.get(5)?,
-        started_at: started_at
-            .map(|value| parse_datetime(value, 6))
-            .transpose()?,
-        completed_at: completed_at
-            .map(|value| parse_datetime(value, 7))
-            .transpose()?,
-        source_path: PathBuf::from(row.get::<_, String>(8)?),
-        tasks,
-        summary,
-        updated_at: parse_datetime(row.get(11)?, 11)?,
-    })
-}
-
 fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let parts_json: String = row.get(3)?;
     let parts: Vec<MessagePart> = serde_json::from_str(&parts_json)
@@ -7798,53 +7679,6 @@ mod tests {
             .list_terminal_history(thread.id, Some(13))
             .expect("list terminal history after final seq");
         assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn evaluation_runs_are_scoped_by_workspace_and_updated_by_run_id() {
-        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
-        let now = Utc::now();
-        let first = EvaluationRun {
-            run_id: "suite-001".to_string(),
-            workspace_root: PathBuf::from(r"J:\Project\alpha"),
-            title: "Alpha suite".to_string(),
-            status: "failed".to_string(),
-            model: Some("glm-5.2".to_string()),
-            failure_category: Some("provider.compatibility".to_string()),
-            started_at: Some(now),
-            completed_at: Some(now),
-            source_path: PathBuf::from(r"J:\Project\alpha\.opentopia\evaluations\suite-001"),
-            tasks: Vec::new(),
-            summary: serde_json::json!({ "status": "failed" }),
-            updated_at: now,
-        };
-        let mut second = first.clone();
-        second.workspace_root = PathBuf::from(r"J:\Project\beta");
-        second.title = "Beta suite".to_string();
-        second.source_path = PathBuf::from(r"J:\Project\beta\.opentopia\evaluations\suite-001");
-
-        store
-            .upsert_evaluation_run(&first)
-            .expect("persist alpha run");
-        store
-            .upsert_evaluation_run(&second)
-            .expect("persist beta run");
-        second.status = "passed".to_string();
-        store
-            .upsert_evaluation_run(&second)
-            .expect("update beta run");
-
-        let alpha = store
-            .list_evaluation_runs(&first.workspace_root)
-            .expect("list alpha runs");
-        let beta = store
-            .list_evaluation_runs(&second.workspace_root)
-            .expect("list beta runs");
-        assert_eq!(alpha.len(), 1);
-        assert_eq!(alpha[0].status, "failed");
-        assert_eq!(beta.len(), 1);
-        assert_eq!(beta[0].title, "Beta suite");
-        assert_eq!(beta[0].status, "passed");
     }
 
     #[test]
