@@ -155,9 +155,10 @@ fn run_unelevated(request: SandboxRequest) -> Result<i32> {
             "stage=validate_policy unelevated backend cannot authoritatively enforce offline networking; run elevated setup or allow network"
         )
     }
-    let mut capability = SidBuffer::opentopia_capability();
+    let capability_principal = capability_principal(&request);
+    let mut capability = acl_principal_sid(&capability_principal)?;
     let capability_sid = capability.as_ptr();
-    ensure_persistent_capability_permissions(&request, capability_sid)
+    ensure_persistent_capability_permissions(&request, &capability_principal, capability_sid)
         .context("stage=apply_acl ensure capability permissions")?;
     let _protected_write_lock = (!request.allowed_protected_roots.is_empty())
         .then(NamedAclMutex::acquire)
@@ -194,7 +195,9 @@ struct ElevatedRunnerResult {
 }
 
 const ELEVATED_RUNNER_PROTOCOL_VERSION: u32 = 1;
-const UNELEVATED_CAPABILITY_PRINCIPAL: &str = "opentopia:unelevated-capability:v1";
+const LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL: &str = "opentopia:unelevated-capability:v1";
+const UNELEVATED_CAPABILITY_PRINCIPAL_PREFIX: &str = "opentopia:unelevated-capability:v2:";
+const UNELEVATED_CAPABILITY_NAMESPACE: u128 = 0xa678_2ac1_8754_5ef2_99b0_b62a_15c7_c90e;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ElevatedRunnerRequestEnvelope {
@@ -750,10 +753,29 @@ fn ensure_persistent_user_permissions(
     Ok(())
 }
 
-fn ensure_persistent_capability_permissions(request: &SandboxRequest, sid: PSID) -> Result<()> {
+fn ensure_persistent_capability_permissions(
+    request: &SandboxRequest,
+    principal: &str,
+    sid: PSID,
+) -> Result<()> {
     let _guard = NamedAclMutex::acquire()?;
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
+    let legacy_entries = ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.account == LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !legacy_entries.is_empty() {
+        let mut legacy_sid = SidBuffer::legacy_opentopia_capability();
+        for entry in &legacy_entries {
+            update_dacl(&entry.path, legacy_sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
+        }
+        ledger
+            .entries
+            .retain(|entry| entry.account != LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL);
+    }
     let desired = request
         .write_roots
         .iter()
@@ -770,7 +792,7 @@ fn ensure_persistent_capability_permissions(request: &SandboxRequest, sid: PSID)
 
     for (path, kind) in desired {
         let entry = PersistentAclEntry {
-            account: UNELEVATED_CAPABILITY_PRINCIPAL.to_string(),
+            account: principal.to_string(),
             path: path.clone(),
             kind: kind.clone(),
             permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
@@ -951,11 +973,43 @@ fn account_sid(account: &str) -> Result<SidBuffer> {
 }
 
 fn acl_principal_sid(principal: &str) -> Result<SidBuffer> {
-    if principal == UNELEVATED_CAPABILITY_PRINCIPAL {
-        Ok(SidBuffer::opentopia_capability())
+    if principal == LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL {
+        Ok(SidBuffer::legacy_opentopia_capability())
+    } else if let Some(value) = principal.strip_prefix(UNELEVATED_CAPABILITY_PRINCIPAL_PREFIX) {
+        let id = Uuid::parse_str(value).context("parse scoped capability principal")?;
+        Ok(SidBuffer::opentopia_capability(id))
     } else {
         account_sid(principal)
     }
+}
+
+fn capability_principal(request: &SandboxRequest) -> String {
+    let mut roots = request
+        .write_roots
+        .iter()
+        .map(|path| normalized_capability_path(path))
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        roots.push(normalized_capability_path(&request.cwd));
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    let scope = roots.join("\0");
+    let namespace = Uuid::from_u128(UNELEVATED_CAPABILITY_NAMESPACE);
+    let id = Uuid::new_v5(&namespace, scope.as_bytes());
+    format!("{UNELEVATED_CAPABILITY_PRINCIPAL_PREFIX}{}", id.simple())
+}
+
+fn normalized_capability_path(path: &Path) -> String {
+    let normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    normalized
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(&normalized)
+        .to_string()
 }
 
 fn current_profile_home() -> Result<std::path::PathBuf> {
@@ -1136,18 +1190,17 @@ fn set_default_dacl(token: HANDLE, sids: &[PSID]) -> Result<()> {
 struct SidBuffer(Vec<u8>);
 
 impl SidBuffer {
-    fn opentopia_capability() -> Self {
-        // A stable restricting SID lets the helper install each workspace ACL
-        // once. The previous per-process random SID required recursive ACL
-        // propagation before and after every command; if the broker was killed
-        // during that window, stale ACEs accumulated and eventually made every
-        // subsequent tool call time out while preparing the sandbox.
+    fn opentopia_capability(id: Uuid) -> Self {
+        // A stable, scope-specific restricting SID lets the helper install an
+        // authorized root set once without making that grant usable by a
+        // sandbox launched for a different workspace or approval scope.
+        let bytes = *id.as_bytes();
         let values = [
             21_u32,
-            u32::from_le_bytes(*b"Open"),
-            u32::from_le_bytes(*b"Topi"),
-            u32::from_le_bytes(*b"aSan"),
-            u32::from_le_bytes(*b"dbox"),
+            u32::from_le_bytes(bytes[0..4].try_into().expect("uuid segment")),
+            u32::from_le_bytes(bytes[4..8].try_into().expect("uuid segment")),
+            u32::from_le_bytes(bytes[8..12].try_into().expect("uuid segment")),
+            u32::from_le_bytes(bytes[12..16].try_into().expect("uuid segment")),
         ];
         let mut bytes = Vec::with_capacity(8 + values.len() * 4);
         bytes.extend([1, values.len() as u8, 0, 0, 0, 0, 0, 5]);
@@ -1155,6 +1208,10 @@ impl SidBuffer {
             bytes.extend(value.to_le_bytes());
         }
         Self(bytes)
+    }
+
+    fn legacy_opentopia_capability() -> Self {
+        Self::opentopia_capability(Uuid::from_bytes(*b"OpenTopiaSandbox"))
     }
 
     fn well_known(kind: i32) -> Result<Self> {
@@ -1709,10 +1766,38 @@ mod tests {
     }
 
     #[test]
-    fn unelevated_capability_principal_resolves_to_a_stable_sid() {
-        let first = SidBuffer::opentopia_capability();
-        let second = acl_principal_sid(UNELEVATED_CAPABILITY_PRINCIPAL)
+    fn unelevated_capability_principal_is_stable_and_scope_specific() {
+        let request = capability_request(&[r"C:\workspace", r"C:\sandbox-home"]);
+        let reordered = capability_request(&[r"C:\sandbox-home", r"C:\workspace"]);
+        let other = capability_request(&[r"C:\other-workspace", r"C:\sandbox-home"]);
+        let principal = capability_principal(&request);
+        assert_eq!(principal, capability_principal(&reordered));
+        assert_ne!(principal, capability_principal(&other));
+
+        let first = acl_principal_sid(&principal).expect("resolve scoped capability principal");
+        let second = acl_principal_sid(&capability_principal(&request))
             .expect("resolve stable capability principal");
         assert_eq!(first.0, second.0);
+    }
+
+    fn capability_request(write_roots: &[&str]) -> SandboxRequest {
+        SandboxRequest {
+            interactive: false,
+            cwd: Path::new(r"C:\workspace").to_path_buf(),
+            read_roots: Vec::new(),
+            runtime_roots: Vec::new(),
+            write_roots: write_roots.iter().map(std::path::PathBuf::from).collect(),
+            protected_paths: Vec::new(),
+            denied_read_paths: Vec::new(),
+            allowed_protected_roots: Vec::new(),
+            network: NetworkMode::Internet,
+            timeout_ms: Some(1_000),
+            termination_timeout_ms: 500,
+            max_memory_bytes: None,
+            max_cpu_time_ms: None,
+            max_output_bytes: None,
+            backend: BackendMode::Unelevated,
+            command: vec!["cmd.exe".to_string()],
+        }
     }
 }

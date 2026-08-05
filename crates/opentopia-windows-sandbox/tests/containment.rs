@@ -122,6 +122,69 @@ fn restricted_token_can_write_only_to_granted_workspace() {
 }
 
 #[test]
+fn capability_grants_do_not_cross_workspace_scopes() {
+    let root = std::env::temp_dir().join(format!("opentopia-scope-test-{}", Uuid::new_v4()));
+    let first_workspace = root.join("first");
+    let second_workspace = root.join("second");
+    let state = root.join("sandbox-state");
+    std::fs::create_dir_all(&first_workspace).expect("create first workspace");
+    std::fs::create_dir_all(&second_workspace).expect("create second workspace");
+
+    let establish = sandbox_command(&state)
+        .args([
+            "run",
+            "--cwd",
+            first_workspace.to_str().expect("first workspace utf-8"),
+            "--read-root",
+            first_workspace.to_str().expect("first workspace utf-8"),
+            "--write-root",
+            first_workspace.to_str().expect("first workspace utf-8"),
+            "--network",
+            "internet",
+            "--backend",
+            "unelevated",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo established>established.txt",
+        ])
+        .status()
+        .expect("establish first workspace capability");
+    assert!(establish.success(), "first workspace grant should work");
+
+    let leaked = first_workspace.join("leaked.txt");
+    let attempt = format!("echo leaked>{}", leaked.display());
+    let cross_scope = sandbox_command(&state)
+        .args([
+            "run",
+            "--cwd",
+            second_workspace.to_str().expect("second workspace utf-8"),
+            "--read-root",
+            second_workspace.to_str().expect("second workspace utf-8"),
+            "--write-root",
+            second_workspace.to_str().expect("second workspace utf-8"),
+            "--network",
+            "internet",
+            "--backend",
+            "unelevated",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/c",
+            &attempt,
+        ])
+        .status()
+        .expect("attempt cross-workspace write");
+    assert!(!cross_scope.success(), "cross-workspace write must fail");
+    assert!(
+        !leaked.exists(),
+        "a scoped capability leaked into another workspace"
+    );
+    std::fs::remove_dir_all(root).expect("remove scope fixture");
+}
+
+#[test]
 fn unelevated_backend_rejects_an_offline_guarantee_it_cannot_enforce() {
     let root = std::env::temp_dir().join(format!("opentopia-network-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("create workspace");

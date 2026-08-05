@@ -35,7 +35,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.10", features = ["v4", "serde"] }
+uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
 png = "0.17"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
