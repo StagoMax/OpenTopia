@@ -49,10 +49,7 @@ import {
 } from "../conversationRenderTrace";
 import { recordConversationRenderTrace } from "../platform";
 import { shouldShowRecordedTurnChanges } from "../turnChangeOwnership";
-import {
-  activeTurnStatusLabel,
-  type ActiveTurnPhase,
-} from "../turnActivityStatus";
+import type { ActiveTurnPhase } from "../turnActivityStatus";
 import { MarkdownContent } from "./MarkdownContent";
 import { ToolActivityCard, toolActivityIcon } from "./ToolActivityCard";
 import "./TurnActivityTimeline.css";
@@ -196,9 +193,7 @@ export function TurnActivityTimeline({
     isActive || (state === "running" && hasRunningEntry),
   );
   const turnTiming = formatTurnTiming(events, isActive, now, mountedAt);
-  const statusLabel = isActive
-    ? activeTurnStatusLabel(events)
-    : activityStateLabel(state);
+  const statusLabel = isActive ? "处理中" : activityStateLabel(state);
   const traceEvent = events.at(-1);
   useStatusPaintTrace(
     isActive ? statusLabel : null,

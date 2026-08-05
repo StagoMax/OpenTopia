@@ -8,7 +8,11 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { searchTasks, type TaskSearchActivityStatus } from "../taskSearch";
+import { searchTasks } from "../taskSearch";
+import {
+  threadActivityStatusLabel,
+  type ThreadActivityStatus,
+} from "../threadActivityStatus";
 import type { Project, Thread } from "../types";
 import { IconButton } from "./ui";
 import "./TaskSearchDialog.css";
@@ -17,23 +21,14 @@ const resultLimit = 50;
 
 type TaskSearchDialogProps = {
   activeThreadId: string | null;
-  activityStatuses: Record<string, TaskSearchActivityStatus>;
+  activityStatuses: Record<string, ThreadActivityStatus>;
   projects: Project[];
   threads: Thread[];
   onClose(): void;
   onSelectThread(threadId: string): void;
 };
 
-function statusLabel(status?: TaskSearchActivityStatus) {
-  if (status === "processing") return "正在处理";
-  if (status === "succeeded") return "已完成";
-  if (status === "failed") return "运行失败";
-  if (status === "approval") return "等待审批";
-  if (status === "user_action") return "等待手动操作";
-  return null;
-}
-
-function StatusIcon({ status }: { status?: TaskSearchActivityStatus }) {
+function StatusIcon({ status }: { status?: ThreadActivityStatus }) {
   if (status === "processing") {
     return <Loader2 className="spin" size={14} aria-hidden="true" />;
   }
@@ -160,7 +155,9 @@ export function TaskSearchDialog({
   ) {
     const selected = result.thread.id === selectedThreadId;
     const current = result.thread.id === activeThreadId;
-    const label = statusLabel(result.status);
+    const label = result.status
+      ? threadActivityStatusLabel(result.status)
+      : null;
 
     return (
       <button

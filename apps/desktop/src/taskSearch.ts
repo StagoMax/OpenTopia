@@ -1,20 +1,13 @@
 import type { Project, Thread } from "./types";
-
-export type TaskSearchActivityStatus =
-  "processing" | "succeeded" | "failed" | "approval" | "user_action";
+import {
+  threadActivityStatusPriority,
+  type ThreadActivityStatus,
+} from "./threadActivityStatus.ts";
 
 export type TaskSearchResult = {
   projectName: string;
-  status?: TaskSearchActivityStatus;
+  status?: ThreadActivityStatus;
   thread: Thread;
-};
-
-const statusPriority: Record<TaskSearchActivityStatus, number> = {
-  approval: 0,
-  user_action: 1,
-  failed: 2,
-  processing: 3,
-  succeeded: 4,
 };
 
 function normalizeSearchText(value: string) {
@@ -29,7 +22,7 @@ function workspaceName(workspaceRoot: string) {
 export function searchTasks(
   threads: Thread[],
   projects: Project[],
-  activityStatuses: Record<string, TaskSearchActivityStatus>,
+  activityStatuses: Record<string, ThreadActivityStatus>,
   query: string,
 ): TaskSearchResult[] {
   const projectNames = new Map(
@@ -58,9 +51,13 @@ export function searchTasks(
     .filter((result) => result.matches)
     .sort((left, right) => {
       const leftPriority =
-        left.status === undefined ? 4 : statusPriority[left.status];
+        left.status === undefined
+          ? 4
+          : threadActivityStatusPriority[left.status];
       const rightPriority =
-        right.status === undefined ? 4 : statusPriority[right.status];
+        right.status === undefined
+          ? 4
+          : threadActivityStatusPriority[right.status];
       if (leftPriority !== rightPriority) return leftPriority - rightPriority;
 
       const updatedDifference =

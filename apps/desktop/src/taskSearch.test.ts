@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type * as TaskSearchModule from "./taskSearch";
+import type { ThreadActivityStatus } from "./threadActivityStatus";
 import type { Project, Thread } from "./types";
 
 const { searchTasks }: typeof TaskSearchModule = await import(
   "./taskSearch" + ".ts"
 );
-type TaskSearchActivityStatus = TaskSearchModule.TaskSearchActivityStatus;
 
 const projects: Project[] = [
   {
@@ -93,7 +93,7 @@ test("excludes archived tasks and prioritizes tasks with active statuses", () =>
       archivedAt: "2026-07-29T00:00:00Z",
     }),
   ];
-  const statuses: Record<string, TaskSearchActivityStatus> = {
+  const statuses: Record<string, ThreadActivityStatus> = {
     running: "processing",
     approval: "approval",
   };
