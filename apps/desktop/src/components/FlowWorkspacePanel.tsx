@@ -6,6 +6,7 @@ import {
   Clock3,
   GitBranch,
   Library,
+  MessageSquareText,
   Pause,
   Play,
   Plus,
@@ -28,6 +29,7 @@ import type {
   FlowRun,
   FlowRunStatus,
   FlowSpec,
+  FlowTranscriptEntry,
 } from "../types";
 import { AgentTemplatePanel } from "./AgentTemplatePanel";
 import { Badge, Button, Panel, Select, TextField } from "./ui";
@@ -340,7 +342,7 @@ function FlowReviewPanel({
           ))}
           {drafts.length === 0 ? (
             <p className="flow-review-panel__empty">
-              在对话中描述工作流程，Agent 会调用 flow.create
+              在对话中描述工作流程，Agent 会调用 flow_create
               生成草稿；也可先创建空白草稿。
             </p>
           ) : null}
@@ -890,6 +892,27 @@ function FlowRuntimePanel({
                     {formatDuration(nodeRun.startedAt, nodeRun.completedAt)}
                   </small>
                   {nodeRun.error ? <code>{nodeRun.error}</code> : null}
+                  {nodeRun.transcript.length > 0 ? (
+                    <details
+                      className="flow-runtime-panel__transcript"
+                      open={nodeRun.transcript.length <= 6}
+                    >
+                      <summary>
+                        <span>
+                          <MessageSquareText aria-hidden="true" size={14} />
+                          对话与工具过程
+                        </span>
+                        <Badge variant="neutral">
+                          {nodeRun.transcript.length} 条
+                        </Badge>
+                      </summary>
+                      <ol aria-label={`${nodeRun.nodeId} 节点对话过程`}>
+                        {nodeRun.transcript.map((entry) => (
+                          <TranscriptEntry entry={entry} key={entry.id} />
+                        ))}
+                      </ol>
+                    </details>
+                  ) : null}
                   {nodeRun.output !== null ? (
                     <details>
                       <summary>查看输出</summary>
@@ -904,6 +927,49 @@ function FlowRuntimePanel({
       ) : null}
     </Panel>
   );
+}
+
+function TranscriptEntry({ entry }: { entry: FlowTranscriptEntry }) {
+  return (
+    <li
+      className={entry.isError ? "is-error" : undefined}
+      data-kind={entry.kind}
+    >
+      <span className="flow-runtime-panel__transcript-icon">
+        {transcriptIcon(entry.kind)}
+      </span>
+      <div>
+        <span className="flow-runtime-panel__transcript-title">
+          <strong>{transcriptKindLabel(entry.kind)}</strong>
+          <small>{entry.title}</small>
+        </span>
+        <pre>{formatTranscriptContent(entry.content)}</pre>
+      </div>
+    </li>
+  );
+}
+
+function transcriptIcon(kind: FlowTranscriptEntry["kind"]) {
+  if (kind === "tool_call" || kind === "tool_result")
+    return <Wrench aria-hidden="true" size={14} />;
+  if (kind === "approval") return <ShieldCheck aria-hidden="true" size={14} />;
+  if (kind === "error") return <XCircle aria-hidden="true" size={14} />;
+  if (kind === "output") return <CircleDot aria-hidden="true" size={14} />;
+  return <Send aria-hidden="true" size={14} />;
+}
+
+function transcriptKindLabel(kind: FlowTranscriptEntry["kind"]) {
+  if (kind === "input") return "输入";
+  if (kind === "tool_call") return "工具调用";
+  if (kind === "tool_result") return "工具结果";
+  if (kind === "output") return "节点输出";
+  if (kind === "approval") return "人工审批";
+  return "错误";
+}
+
+function formatTranscriptContent(content: unknown) {
+  if (typeof content === "string") return content;
+  return JSON.stringify(content, null, 2) ?? String(content);
 }
 
 function nodeIcon(kind: FlowNodeKind) {
