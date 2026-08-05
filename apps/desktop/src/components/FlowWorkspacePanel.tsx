@@ -3,16 +3,21 @@ import {
   Bot,
   CheckCircle2,
   CircleDot,
+  Clock3,
   GitBranch,
   Library,
+  Pause,
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   Search,
   Send,
   ShieldCheck,
+  Square,
   Wrench,
+  XCircle,
 } from "lucide-react";
 import type { ApiClient } from "../api/client";
 import type {
@@ -20,10 +25,12 @@ import type {
   FlowDefinition,
   FlowDraftView,
   FlowNodeKind,
+  FlowRun,
+  FlowRunStatus,
   FlowSpec,
 } from "../types";
 import { AgentTemplatePanel } from "./AgentTemplatePanel";
-import { Badge, Button, Panel, TextField } from "./ui";
+import { Badge, Button, Panel, Select, TextField } from "./ui";
 import "../styles/flow-workspace-panel.css";
 
 type FlowWorkspacePanelProps = {
@@ -91,11 +98,15 @@ function FlowReviewPanel({
 }: Pick<FlowWorkspacePanelProps, "client" | "threadId">) {
   const [drafts, setDrafts] = useState<FlowDraftView[]>([]);
   const [library, setLibrary] = useState<FlowDefinition[]>([]);
+  const [runs, setRuns] = useState<FlowRun[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState(false);
   const [specText, setSpecText] = useState("");
   const [publisher, setPublisher] = useState("");
+  const [runDefinitionKey, setRunDefinitionKey] = useState("");
+  const [runInputText, setRunInputText] = useState("{}");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -105,25 +116,45 @@ function FlowReviewPanel({
       drafts.find((view) => view.draft.id === selectedId) ?? drafts[0] ?? null,
     [drafts, selectedId],
   );
+  const selectedRun = useMemo(
+    () => runs.find((run) => run.id === selectedRunId) ?? runs[0] ?? null,
+    [runs, selectedRunId],
+  );
 
   const refresh = useCallback(async () => {
     if (!client || !threadId) {
       setDrafts([]);
       setLibrary([]);
+      setRuns([]);
       return;
     }
     setError(null);
     try {
-      const [nextDrafts, nextLibrary] = await Promise.all([
+      const [nextDrafts, nextLibrary, nextRuns] = await Promise.all([
         client.listFlowDrafts(threadId),
         client.searchFlows(query),
+        client.listFlowRuns(threadId),
       ]);
       setDrafts(nextDrafts);
       setLibrary(nextLibrary);
+      setRuns(nextRuns);
       setSelectedId((current) =>
         current && nextDrafts.some((view) => view.draft.id === current)
           ? current
           : (nextDrafts[0]?.draft.id ?? null),
+      );
+      setSelectedRunId((current) =>
+        current && nextRuns.some((run) => run.id === current)
+          ? current
+          : (nextRuns[0]?.id ?? null),
+      );
+      setRunDefinitionKey((current) =>
+        current &&
+        nextLibrary.some((flow) => `${flow.flowId}@${flow.version}` === current)
+          ? current
+          : nextLibrary[0]
+            ? `${nextLibrary[0].flowId}@${nextLibrary[0].version}`
+            : "",
       );
     } catch (refreshError) {
       setError(readableError(refreshError));
@@ -133,6 +164,23 @@ function FlowReviewPanel({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (
+      !client ||
+      !threadId ||
+      !runs.some((run) => !isTerminalRunStatus(run.status))
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void client
+        .listFlowRuns(threadId)
+        .then((nextRuns) => setRuns(nextRuns))
+        .catch((pollError) => setError(readableError(pollError)));
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [client, runs, threadId]);
 
   useEffect(() => {
     if (!editing) {
@@ -189,6 +237,47 @@ function FlowReviewPanel({
       "Flow 草稿已保存，等待重新验证。",
     );
     setEditing(false);
+  }
+
+  async function startRuntime() {
+    if (!client || !threadId || !runDefinitionKey) return;
+    let input: unknown;
+    try {
+      input = JSON.parse(runInputText) as unknown;
+    } catch (parseError) {
+      setError(`Run input 不是有效 JSON：${readableError(parseError)}`);
+      return;
+    }
+    const separator = runDefinitionKey.lastIndexOf("@");
+    const flowId = runDefinitionKey.slice(0, separator);
+    const version = Number(runDefinitionKey.slice(separator + 1));
+    await runAction(
+      "run",
+      async () => {
+        const run = await client.startFlowRun(threadId, {
+          flowId,
+          version,
+          input,
+        });
+        setSelectedRunId(run.id);
+      },
+      "Flow Run 已启动，Trace 会按节点边界持续更新。",
+    );
+  }
+
+  async function controlRuntime(
+    name: string,
+    action: () => Promise<FlowRun>,
+    message: string,
+  ) {
+    await runAction(
+      name,
+      async () => {
+        const run = await action();
+        setSelectedRunId(run.id);
+      },
+      message,
+    );
   }
 
   const validation = selected?.draft.lastValidation ?? null;
@@ -275,6 +364,23 @@ function FlowReviewPanel({
           </details>
         ) : null}
       </Panel>
+
+      <FlowRuntimePanel
+        busy={busy}
+        client={client}
+        library={library}
+        onControl={(name, action, message) =>
+          void controlRuntime(name, action, message)
+        }
+        onDefinitionChange={setRunDefinitionKey}
+        onInputChange={setRunInputText}
+        onRun={() => void startRuntime()}
+        onSelectRun={setSelectedRunId}
+        runDefinitionKey={runDefinitionKey}
+        runInputText={runInputText}
+        runs={runs}
+        selectedRun={selectedRun}
+      />
 
       {error ? (
         <p className="flow-review-panel__message is-error" role="alert">
@@ -509,6 +615,297 @@ function GraphInspector({ spec }: { spec: FlowSpec }) {
   );
 }
 
+type FlowRuntimePanelProps = {
+  busy: string | null;
+  client: ApiClient | null;
+  library: FlowDefinition[];
+  runs: FlowRun[];
+  selectedRun: FlowRun | null;
+  runDefinitionKey: string;
+  runInputText: string;
+  onDefinitionChange(value: string): void;
+  onInputChange(value: string): void;
+  onRun(): void;
+  onSelectRun(runId: string): void;
+  onControl(
+    name: string,
+    action: () => Promise<FlowRun>,
+    message: string,
+  ): void;
+};
+
+function FlowRuntimePanel({
+  busy,
+  client,
+  library,
+  runs,
+  selectedRun,
+  runDefinitionKey,
+  runInputText,
+  onDefinitionChange,
+  onInputChange,
+  onRun,
+  onSelectRun,
+  onControl,
+}: FlowRuntimePanelProps) {
+  const canPause = selectedRun
+    ? selectedRun.status === "queued" || selectedRun.status === "running"
+    : false;
+  const canResume = selectedRun?.status === "paused";
+  const hasInterruptedNode = selectedRun?.nodeRuns.some(
+    (nodeRun) => nodeRun.status === "running",
+  );
+  const waitingApproval = selectedRun?.status === "waiting_approval";
+  const canCancel = selectedRun
+    ? !isTerminalRunStatus(selectedRun.status) &&
+      selectedRun.status !== "cancel_requested"
+    : false;
+
+  return (
+    <Panel
+      title="Runtime & Trace"
+      actions={
+        selectedRun ? <RunStatusBadge status={selectedRun.status} /> : undefined
+      }
+    >
+      <div className="flow-runtime-panel__composer">
+        <Select
+          disabled={busy !== null || library.length === 0}
+          label="选择已发布 Flow"
+          onChange={onDefinitionChange}
+          options={library.map((flow) => ({
+            value: `${flow.flowId}@${flow.version}`,
+            label: `${flow.name} · v${flow.version}`,
+          }))}
+          value={runDefinitionKey}
+        />
+        <label className="flow-review-panel__editor">
+          <span>Run input JSON</span>
+          <textarea
+            aria-label="Flow Run input JSON"
+            onChange={(event) => onInputChange(event.target.value)}
+            spellCheck={false}
+            value={runInputText}
+          />
+        </label>
+        <Button
+          disabled={
+            !client ||
+            busy !== null ||
+            library.length === 0 ||
+            !runDefinitionKey
+          }
+          onClick={onRun}
+          variant="primary"
+        >
+          <Play aria-hidden="true" size={14} />
+          {busy === "run" ? "启动中…" : "运行 Flow"}
+        </Button>
+      </div>
+
+      <div className="flow-runtime-panel__runs" aria-label="Flow Run 列表">
+        {runs.map((run) => (
+          <button
+            className={run.id === selectedRun?.id ? "is-active" : ""}
+            key={run.id}
+            onClick={() => onSelectRun(run.id)}
+            type="button"
+          >
+            <Clock3 aria-hidden="true" size={16} />
+            <span>
+              <strong>
+                {run.flowId}@{run.flowVersion}
+              </strong>
+              <small>
+                {run.nodeExecutions}/{run.budget.maxNodeExecutions} nodes ·{" "}
+                {run.toolCalls}/{run.budget.maxToolCalls} tools
+              </small>
+            </span>
+            <RunStatusBadge status={run.status} />
+          </button>
+        ))}
+        {runs.length === 0 ? (
+          <p className="flow-review-panel__empty">
+            发布 Flow 后可从这里启动。每个节点的输入、输出、重试和错误都会保存在
+            Trace 中。
+          </p>
+        ) : null}
+      </div>
+
+      {selectedRun ? (
+        <div className="flow-runtime-panel__detail" aria-live="polite">
+          <dl className="flow-review-panel__facts">
+            <div>
+              <dt>Run</dt>
+              <dd>
+                <code>{selectedRun.id}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>Ready</dt>
+              <dd>{selectedRun.readyNodes.join(", ") || "none"}</dd>
+            </div>
+            <div>
+              <dt>Loops</dt>
+              <dd>{formatLoopCounts(selectedRun.loopCounts)}</dd>
+            </div>
+            <div>
+              <dt>Updated</dt>
+              <dd>{new Date(selectedRun.updatedAt).toLocaleString()}</dd>
+            </div>
+          </dl>
+
+          <div
+            className="flow-runtime-panel__controls"
+            aria-label="Flow Run 控制"
+          >
+            {canPause ? (
+              <Button
+                disabled={!client || busy !== null}
+                onClick={() =>
+                  onControl(
+                    "pause-run",
+                    () => client!.pauseFlowRun(selectedRun.id),
+                    "已请求在下一个节点边界暂停。",
+                  )
+                }
+                size="compact"
+              >
+                <Pause aria-hidden="true" size={14} /> 暂停
+              </Button>
+            ) : null}
+            {canResume ? (
+              <Button
+                disabled={!client || busy !== null}
+                onClick={() => {
+                  if (
+                    hasInterruptedNode &&
+                    !window.confirm(
+                      "上次进程在节点执行中停止。请先核对外部系统是否已产生副作用；确认后会创建一次新的节点尝试。",
+                    )
+                  ) {
+                    return;
+                  }
+                  onControl(
+                    "resume-run",
+                    () =>
+                      client!.resumeFlowRun(selectedRun.id, {
+                        retryInterruptedNode: hasInterruptedNode,
+                      }),
+                    hasInterruptedNode
+                      ? "中断节点已按人工确认创建新尝试。"
+                      : "Flow 已从持久化检查点恢复。",
+                  );
+                }}
+                size="compact"
+              >
+                <RotateCcw aria-hidden="true" size={14} />
+                {hasInterruptedNode ? "检查后重试" : "恢复"}
+              </Button>
+            ) : null}
+            {waitingApproval ? (
+              <>
+                <Button
+                  disabled={!client || busy !== null}
+                  onClick={() =>
+                    onControl(
+                      "approve-run",
+                      () =>
+                        client!.resumeFlowRun(selectedRun.id, {
+                          approved: true,
+                        }),
+                      "审批通过，Flow 已继续运行。",
+                    )
+                  }
+                  size="compact"
+                  variant="primary"
+                >
+                  <CheckCircle2 aria-hidden="true" size={14} /> 通过
+                </Button>
+                <Button
+                  disabled={!client || busy !== null}
+                  onClick={() =>
+                    onControl(
+                      "reject-run",
+                      () =>
+                        client!.resumeFlowRun(selectedRun.id, {
+                          approved: false,
+                          note: "Rejected from Flow review panel",
+                        }),
+                      "审批已拒绝，Flow Run 已取消。",
+                    )
+                  }
+                  size="compact"
+                  variant="danger"
+                >
+                  <XCircle aria-hidden="true" size={14} /> 拒绝
+                </Button>
+              </>
+            ) : null}
+            {canCancel ? (
+              <Button
+                disabled={!client || busy !== null}
+                onClick={() =>
+                  onControl(
+                    "cancel-run",
+                    () => client!.cancelFlowRun(selectedRun.id),
+                    "已请求在下一个节点边界取消。",
+                  )
+                }
+                size="compact"
+                variant="danger"
+              >
+                <Square aria-hidden="true" size={14} /> 取消
+              </Button>
+            ) : null}
+          </div>
+
+          {selectedRun.error ? (
+            <p className="flow-review-panel__message is-error" role="alert">
+              {selectedRun.error}
+            </p>
+          ) : null}
+
+          <div className="flow-review-panel__section-heading">
+            <span>
+              <GitBranch aria-hidden="true" size={15} /> Node Trace
+            </span>
+            <Badge variant="neutral">
+              {selectedRun.nodeRuns.length} attempts
+            </Badge>
+          </div>
+          <ol className="flow-runtime-panel__trace">
+            {selectedRun.nodeRuns.map((nodeRun) => (
+              <li key={nodeRun.id}>
+                <span className="flow-runtime-panel__trace-index">
+                  {nodeRun.attempt}
+                </span>
+                <div>
+                  <span className="flow-runtime-panel__trace-title">
+                    <strong>{nodeRun.nodeId}</strong>
+                    <RunStatusBadge status={nodeRun.status} />
+                  </span>
+                  <small>
+                    {nodeRun.toolCalls} tool calls ·{" "}
+                    {formatDuration(nodeRun.startedAt, nodeRun.completedAt)}
+                  </small>
+                  {nodeRun.error ? <code>{nodeRun.error}</code> : null}
+                  {nodeRun.output !== null ? (
+                    <details>
+                      <summary>查看输出</summary>
+                      <pre>{JSON.stringify(nodeRun.output, null, 2)}</pre>
+                    </details>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
 function nodeIcon(kind: FlowNodeKind) {
   if (kind === "agent") return <Bot aria-hidden="true" size={15} />;
   if (kind === "tool" || kind === "skill")
@@ -527,6 +924,42 @@ function StatusBadge({ status }: { status: FlowDraftView["draft"]["status"] }) {
         ? "info"
         : "neutral";
   return <Badge variant={variant}>{status.replaceAll("_", " ")}</Badge>;
+}
+
+function RunStatusBadge({ status }: { status: FlowRunStatus }) {
+  const variant =
+    status === "succeeded"
+      ? "success"
+      : status === "failed" || status === "cancelled"
+        ? "danger"
+        : status === "waiting_approval" || status === "paused"
+          ? "warning"
+          : status === "running"
+            ? "info"
+            : "neutral";
+  return <Badge variant={variant}>{status.replaceAll("_", " ")}</Badge>;
+}
+
+function isTerminalRunStatus(status: FlowRunStatus) {
+  return (
+    status === "succeeded" || status === "failed" || status === "cancelled"
+  );
+}
+
+function formatLoopCounts(loopCounts: Record<string, number>) {
+  const entries = Object.entries(loopCounts);
+  return entries.length
+    ? entries.map(([edge, count]) => `edge ${edge}: ${count}`).join(", ")
+    : "none";
+}
+
+function formatDuration(startedAt: string, completedAt: string | null) {
+  const elapsed =
+    new Date(completedAt ?? Date.now()).getTime() -
+    new Date(startedAt).getTime();
+  if (!Number.isFinite(elapsed) || elapsed < 0) return "unknown duration";
+  if (elapsed < 1000) return `${elapsed} ms`;
+  return `${(elapsed / 1000).toFixed(1)} s`;
 }
 
 function sourceLabel(spec: FlowSpec) {

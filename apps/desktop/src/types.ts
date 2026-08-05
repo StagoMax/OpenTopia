@@ -1741,6 +1741,59 @@ export type FlowDefinition = {
   publishedBy: string;
 };
 
+export type FlowRunStatus =
+  | "queued"
+  | "running"
+  | "pause_requested"
+  | "paused"
+  | "waiting_approval"
+  | "succeeded"
+  | "failed"
+  | "cancel_requested"
+  | "cancelled";
+
+export type FlowNodeRun = {
+  id: string;
+  nodeId: string;
+  attempt: number;
+  status: "running" | "waiting_approval" | "succeeded" | "failed" | "cancelled";
+  input: unknown;
+  output: unknown | null;
+  error: string | null;
+  toolCalls: number;
+  startedAt: string;
+  completedAt: string | null;
+};
+
+export type FlowRun = {
+  schemaVersion: number;
+  id: string;
+  threadId: string;
+  flowId: string;
+  flowVersion: number;
+  definitionId: string;
+  definitionContentHash: string;
+  revision: number;
+  status: FlowRunStatus;
+  input: unknown;
+  output: unknown | null;
+  graph: FlowSpec["graph"];
+  effectiveCapabilities: CapabilityProjection;
+  budget: FlowSpec["budget"];
+  readyNodes: string[];
+  nodeRuns: FlowNodeRun[];
+  nodeOutputs: Record<string, unknown>;
+  loopCounts: Record<string, number>;
+  nodeExecutions: number;
+  toolCalls: number;
+  waitingNodeId: string | null;
+  error: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  updatedAt: string;
+};
+
 export type ThreadCapabilities = {
   threadId: string;
   experienceMode: ExperienceMode;

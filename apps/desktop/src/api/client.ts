@@ -26,6 +26,7 @@ import type {
   ExperienceMode,
   FlowDefinition,
   FlowDraftView,
+  FlowRun,
   FlowSpec,
   FlowTrial,
   GitBranchInfo,
@@ -523,6 +524,46 @@ export class ApiClient {
         publishedBy,
       },
     );
+  }
+
+  async listFlowRuns(threadId: string): Promise<FlowRun[]> {
+    return this.get(`/api/threads/${encodeURIComponent(threadId)}/flow-runs`);
+  }
+
+  async getFlowRun(runId: string): Promise<FlowRun> {
+    return this.get(`/api/flow-runs/${encodeURIComponent(runId)}`);
+  }
+
+  async startFlowRun(
+    threadId: string,
+    input: { flowId: string; version?: number; input?: unknown },
+  ): Promise<FlowRun> {
+    return this.post(
+      `/api/threads/${encodeURIComponent(threadId)}/flow-runs`,
+      input,
+    );
+  }
+
+  async pauseFlowRun(runId: string): Promise<FlowRun> {
+    return this.post(`/api/flow-runs/${encodeURIComponent(runId)}/pause`, {});
+  }
+
+  async resumeFlowRun(
+    runId: string,
+    input: {
+      approved?: boolean;
+      note?: string;
+      retryInterruptedNode?: boolean;
+    } = {},
+  ): Promise<FlowRun> {
+    return this.post(
+      `/api/flow-runs/${encodeURIComponent(runId)}/resume`,
+      input,
+    );
+  }
+
+  async cancelFlowRun(runId: string): Promise<FlowRun> {
+    return this.post(`/api/flow-runs/${encodeURIComponent(runId)}/cancel`, {});
   }
 
   async getContributionHosts(

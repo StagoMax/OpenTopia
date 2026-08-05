@@ -61,6 +61,7 @@ import type {
   WorkspaceTree,
 } from "../types";
 import type { ApiClient } from "../api/client";
+import { shouldShowRecordedTurnChanges } from "../turnChangeOwnership";
 import { ArtifactGallery } from "./ArtifactGallery";
 import { EvaluationPanel } from "./EvaluationPanel";
 import { PluginControlPanel } from "./PluginControlPanel";
@@ -1073,6 +1074,7 @@ function buildTurnReviewScopes(events: AgentEvent[]): DiffReviewTurnScope[] {
   for (const event of events) {
     if (event.payload.type !== "turn_changes_recorded") continue;
     const changeSet = event.payload.change_set;
+    if (!shouldShowRecordedTurnChanges(events, changeSet.turnId)) continue;
     if (changeSet.status !== "ready") continue;
     const files = changeSet.files
       .map((file) => ({

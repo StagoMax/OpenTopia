@@ -141,6 +141,8 @@ import {
   mergeConversationMessages,
   type ConversationCacheEntry,
 } from "./conversationCache";
+import { resolveRuntimeTaskPlan } from "./conversationPlan";
+import { shouldShowRecordedTurnChanges } from "./turnChangeOwnership";
 import {
   conversationStreamEventTrace,
   rendererTraceTime,
@@ -157,13 +159,6 @@ import {
   reconcileReasoningEffort,
   resolveDefaultModelId,
 } from "./modelCatalog";
-import { modelSupportsVision } from "./modelCapabilities";
-import {
-  appendImageUnderstandingContext,
-  buildImageUnderstandingArguments,
-  extractImageUnderstandingText,
-  isImageUnderstandingMcpTool,
-} from "./imageProcessing";
 import {
   deleteProviderApiKey,
   getDroppedContextFiles,
@@ -185,6 +180,12 @@ import {
   shouldDeliverTaskNotification,
   writeTaskNotificationPreferences,
 } from "./taskNotifications";
+import {
+  isThreadActivityUnread,
+  readThreadActivityReadAt,
+  writeThreadActivityReadAt,
+  type ThreadActivityReadAt,
+} from "./threadActivityRead";
 import {
   applyAppearance,
   readAppearanceSettings,
@@ -221,7 +222,6 @@ import type {
   InlineMessageContentPart,
   McpServerInput,
   McpServerView,
-  McpToolDescriptor,
   Message,
   MessagePart,
   PlatformInfo,
@@ -264,6 +264,11 @@ import type {
 type ServerStatus = "checking" | "online" | "offline";
 
 type ThreadActivityStatus = TaskSearchActivityStatus;
+
+type LoadedThreadActivityStatus = {
+  status: ThreadActivityStatus;
+  updatedAt: string | null;
+};
 
 type ConversationLoadState = {
   threadId: string | null;
@@ -309,13 +314,20 @@ function resolveThreadActivityStatus(
 async function loadThreadActivityStatuses(
   client: ApiClient,
   threadList: Thread[],
-): Promise<Record<string, ThreadActivityStatus>> {
+  activityReadAt: ThreadActivityReadAt,
+): Promise<Record<string, LoadedThreadActivityStatus>> {
   const entries = await Promise.all(
     threadList.map(async (thread) => {
       try {
         const turnStatus = await client.getTurnStatus(thread.id);
         const status = resolveThreadActivityStatus(turnStatus);
-        return status ? ([thread.id, status] as const) : null;
+        if (!status) return null;
+
+        const updatedAt = turnStatus?.updatedAt ?? null;
+        if (!isThreadActivityUnread(activityReadAt, thread.id, updatedAt)) {
+          return null;
+        }
+        return [thread.id, { status, updatedAt }] as const;
       } catch {
         return null;
       }
@@ -324,7 +336,7 @@ async function loadThreadActivityStatuses(
 
   return Object.fromEntries(
     entries.filter(
-      (entry): entry is readonly [string, ThreadActivityStatus] =>
+      (entry): entry is readonly [string, LoadedThreadActivityStatus] =>
         entry !== null,
     ),
   );
@@ -454,19 +466,16 @@ function resolveComposerTaskPlan(
   events: AgentEvent[],
   snapshot: GoalSnapshot | null,
 ): TaskPlan | null {
-  const latestPlanEvent = [...events]
-    .sort((left, right) => right.seq - left.seq)
-    .find((event) => event.payload.type === "plan_updated");
-  const latestPlan =
-    latestPlanEvent?.payload.type === "plan_updated"
-      ? latestPlanEvent.payload.plan
-      : null;
+  const latestRuntimePlan = resolveRuntimeTaskPlan(events);
   const goalPlan = snapshot ? goalSnapshotAsTaskPlan(snapshot) : null;
 
-  if (goalPlan && (!latestPlan || latestPlan.goalId === goalPlan.goalId)) {
+  if (
+    goalPlan &&
+    (!latestRuntimePlan || latestRuntimePlan.goalId === goalPlan.goalId)
+  ) {
     return goalPlan;
   }
-  return latestPlan ?? goalPlan;
+  return latestRuntimePlan ?? goalPlan;
 }
 
 function readWorkspaceLayoutPreferences(): WorkspaceLayoutPreferences {
@@ -798,6 +807,9 @@ export function App() {
     >(),
   );
   const activeThreadIdRef = useRef<string | null>(null);
+  const threadActivityReadAtRef = useRef<ThreadActivityReadAt>(
+    readThreadActivityReadAt(),
+  );
 
   activeThreadIdRef.current = activeThreadId;
 
@@ -816,6 +828,21 @@ export function App() {
     },
     [],
   );
+
+  const markThreadActivityRead = useCallback((threadId: string) => {
+    const nextReadAt = {
+      ...threadActivityReadAtRef.current,
+      [threadId]: new Date().toISOString(),
+    };
+    threadActivityReadAtRef.current = nextReadAt;
+    writeThreadActivityReadAt(nextReadAt);
+    setThreadActivityStatuses((current) => {
+      if (!(threadId in current)) return current;
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+  }, []);
 
   const setThreadSending = useCallback((threadId: string, sending: boolean) => {
     setSendingThreadIds((current) => {
@@ -1086,11 +1113,7 @@ export function App() {
   }, [experienceMode]);
 
   useEffect(() => {
-    if (
-      settings &&
-      !settings.enterprise.enabled &&
-      experienceMode === "flow"
-    ) {
+    if (settings && !settings.enterprise.enabled && experienceMode === "flow") {
       setExperienceMode("code");
     }
   }, [experienceMode, settings]);
@@ -1271,16 +1294,14 @@ export function App() {
 
           // Streaming events can arrive faster than the renderer can paint.
           setEvents((current) => {
-            const knownIds = new Set(current.map((item) => item.id));
-            const additions: AgentEvent[] = [];
+            const merged = mergeConversationEvents(current, pending);
+            const retainedIds = new Set(merged.map((event) => event.id));
             for (const queuedEvent of pending) {
-              if (knownIds.has(queuedEvent.id)) continue;
-              knownIds.add(queuedEvent.id);
-              additions.push(queuedEvent);
+              if (!retainedIds.has(queuedEvent.id)) {
+                pendingEventCommitTraceRef.current.delete(queuedEvent.id);
+              }
             }
-            return additions.length > 0
-              ? [...current, ...additions].sort((a, b) => a.seq - b.seq)
-              : current;
+            return merged;
           });
         });
       }
@@ -1296,7 +1317,7 @@ export function App() {
 
       if (event.payload.type === "approval_requested") {
         const approvalId = event.payload.approval_id;
-        setThreadActivityStatus(event.threadId, "approval");
+        markThreadActivityRead(event.threadId);
         setApprovalDecisionError(null);
         setConversationCollapsed(false);
         setPendingApprovalIds((current) =>
@@ -1305,7 +1326,7 @@ export function App() {
       }
 
       if (event.payload.type === "browser_handoff_required") {
-        setThreadActivityStatus(event.threadId, "user_action");
+        markThreadActivityRead(event.threadId);
         setConversationCollapsed(false);
       }
 
@@ -1333,19 +1354,20 @@ export function App() {
       }
 
       if (event.payload.type === "error") {
-        setThreadActivityStatus(event.threadId, "failed");
+        markThreadActivityRead(event.threadId);
         setActionError(
           `Agent 请求失败：${friendlyProviderError(event.payload.message)}`,
         );
       }
 
       if (event.payload.type === "turn_started" && event.turnId) {
-        setThreadActivityStatus(event.threadId, "processing");
+        markThreadActivityRead(event.threadId);
         setActiveTurnId(event.turnId);
         setCancellingTurnId(null);
         setQueuedMessageCount((current) => Math.max(0, current - 1));
       } else if (event.payload.type === "turn_finished") {
-        setThreadActivityStatus(event.threadId, "succeeded");
+        // This task is already open, so its completion has been seen.
+        markThreadActivityRead(event.threadId);
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
@@ -1353,7 +1375,7 @@ export function App() {
           !event.turnId || current === event.turnId ? null : current,
         );
       } else if (event.payload.type === "turn_suspended") {
-        setThreadActivityStatus(event.threadId, "approval");
+        markThreadActivityRead(event.threadId);
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
@@ -1485,6 +1507,7 @@ export function App() {
     },
     [
       deliverTaskCompletionNotification,
+      markThreadActivityRead,
       mergeMessagesForThread,
       setThreadActivityStatus,
     ],
@@ -1601,22 +1624,37 @@ export function App() {
         if (cancelled) return;
         setProjects(sortProjects(loadedProjects));
         setThreads(loadedThreads);
-        void loadThreadActivityStatuses(nextClient, loadedThreads).then(
-          (statuses) => {
-            if (cancelled) return;
-            const loadedThreadIds = new Set(
-              loadedThreads.map((thread) => thread.id),
-            );
-            setThreadActivityStatuses((current) => ({
-              ...statuses,
-              ...Object.fromEntries(
-                Object.entries(current).filter(([threadId]) =>
-                  loadedThreadIds.has(threadId),
+        void loadThreadActivityStatuses(
+          nextClient,
+          loadedThreads,
+          threadActivityReadAtRef.current,
+        ).then((statuses) => {
+          if (cancelled) return;
+          const loadedThreadIds = new Set(
+            loadedThreads.map((thread) => thread.id),
+          );
+          const latestStatuses = Object.fromEntries(
+            Object.entries(statuses)
+              .filter(([threadId, activity]) =>
+                isThreadActivityUnread(
+                  threadActivityReadAtRef.current,
+                  threadId,
+                  activity.updatedAt,
                 ),
+              )
+              .map(([threadId, activity]) => [threadId, activity.status]),
+          );
+          setThreadActivityStatuses((current) => {
+            const currentStatuses = Object.fromEntries(
+              Object.entries(current).filter(
+                ([threadId]) =>
+                  loadedThreadIds.has(threadId) &&
+                  !threadActivityReadAtRef.current[threadId],
               ),
-            }));
-          },
-        );
+            );
+            return { ...latestStatuses, ...currentStatuses };
+          });
+        });
         setSettings(loadedSettings);
         setProviderHealth(loadedHealth);
         setMcpServers(loadedMcp);
@@ -1779,39 +1817,18 @@ export function App() {
       controller.signal,
     );
 
-    void messagesRequest
-      .then((loadedMessages) => {
+    void Promise.all([messagesRequest, eventsRequest])
+      .then(([loadedMessages, loadedEvents]) => {
         if (cancelled) return;
         setMessages((current) =>
           mergeConversationMessages(current, loadedMessages),
         );
-        setConversationLoadState({ threadId, status: "ready", error: null });
-      })
-      .catch((error) => {
-        if (cancelled || isAbortError(error)) return;
-        if (cached) {
-          setServerError(
-            error instanceof Error ? error.message : String(error),
-          );
-          return;
-        }
-        const message = error instanceof Error ? error.message : String(error);
-        setConversationLoadState({
-          threadId,
-          status: "error",
-          error: message,
-        });
-        setServerError(message);
-      });
-
-    void eventsRequest
-      .then((loadedEvents) => {
-        if (cancelled) return;
         const nextEvents = mergeConversationEvents(
           cached?.events ?? [],
           loadedEvents,
         );
         setEvents(nextEvents);
+        setConversationLoadState({ threadId, status: "ready", error: null });
         source = client.openEventStream(
           threadId,
           nextEvents.at(-1)?.seq,
@@ -1819,10 +1836,16 @@ export function App() {
         );
       })
       .catch((error) => {
-        if (!cancelled && !isAbortError(error))
-          setServerError(
-            error instanceof Error ? error.message : String(error),
-          );
+        if (cancelled || isAbortError(error)) return;
+        const message = error instanceof Error ? error.message : String(error);
+        if (!cached) {
+          setConversationLoadState({
+            threadId,
+            status: "error",
+            error: message,
+          });
+        }
+        setServerError(message);
       });
 
     void Promise.all([
@@ -1847,12 +1870,11 @@ export function App() {
               ? turnStatus.turnId
               : null,
           );
-          setThreadActivityStatus(
-            threadId,
+          const activityStatus =
             pendingApprovals.length > 0
               ? "approval"
-              : resolveThreadActivityStatus(turnStatus),
-          );
+              : resolveThreadActivityStatus(turnStatus);
+          if (activityStatus) markThreadActivityRead(threadId);
           setPendingApprovalIds(
             pendingApprovals.map((approval) => approval.approvalId),
           );
@@ -1878,6 +1900,7 @@ export function App() {
     client,
     conversationLoadAttempt,
     ingestEvent,
+    markThreadActivityRead,
     setThreadActivityStatus,
   ]);
 
@@ -2019,6 +2042,7 @@ export function App() {
 
   function selectThread(threadId: string) {
     const thread = threads.find((item) => item.id === threadId);
+    markThreadActivityRead(threadId);
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
     if (thread) setExperienceMode(thread.experienceMode);
@@ -2042,6 +2066,7 @@ export function App() {
         setThreads(nextThreads);
         const thread = nextThreads.find((item) => item.id === request.threadId);
         if (!thread) return;
+        markThreadActivityRead(thread.id);
         activeThreadIdRef.current = thread.id;
         setActiveThreadId(thread.id);
         setExperienceMode(thread.experienceMode);
@@ -2105,7 +2130,9 @@ export function App() {
         .listThreads(true, nextMode)
         .then(setThreads)
         .catch((error) => {
-          setActionError(`加载 ${nextMode} 模式任务失败：${errorMessage(error)}`);
+          setActionError(
+            `加载 ${nextMode} 模式任务失败：${errorMessage(error)}`,
+          );
         });
     }
     prepareNewThread(
@@ -2787,82 +2814,6 @@ export function App() {
     setFilePreview(await client.readWorkspaceFile(threadId, command.path));
   }
 
-  async function prepareImageSubmission(
-    threadId: string,
-    prompt: string,
-    imageAttachments: InlineImageAttachment[],
-    modelSelection: ThreadModelSelection | null,
-  ): Promise<{
-    prompt: string;
-    imageAttachments: InlineImageAttachment[];
-  }> {
-    if (!client || imageAttachments.length === 0) {
-      return { prompt, imageAttachments };
-    }
-
-    const providerId =
-      modelSelection?.connectionId ?? settings?.activeProviderId;
-    const provider = settings?.providers.find((item) => item.id === providerId);
-    if (
-      provider &&
-      modelSupportsVision(provider, modelSelection?.modelId ?? provider.model)
-    ) {
-      return { prompt, imageAttachments };
-    }
-
-    const threadServers = await client.listThreadMcpServers(threadId);
-    const configuredServers = threadServers.filter(
-      (view) => view.server.enabled,
-    );
-    const failures: string[] = [];
-
-    for (const view of configuredServers) {
-      let tools: McpToolDescriptor[];
-      try {
-        tools = await client.listMcpTools(view.server.serverId);
-      } catch (error) {
-        failures.push(`${view.server.name}: ${errorMessage(error)}`);
-        continue;
-      }
-      const tool = tools.find(isImageUnderstandingMcpTool);
-      if (!tool) continue;
-
-      try {
-        if (!view.enabled) {
-          await client.setThreadMcpServer(threadId, view.server.serverId, true);
-        }
-        const result = await client.callMcpTool(
-          view.server.serverId,
-          tool.toolName,
-          buildImageUnderstandingArguments(tool, prompt, imageAttachments),
-          threadId,
-        );
-        if (result.isError) {
-          failures.push(
-            `${view.server.name}: ${result.output || "tool returned an error"}`,
-          );
-          continue;
-        }
-        const understanding = extractImageUnderstandingText(result);
-        if (!understanding) {
-          failures.push(`${view.server.name}: tool returned no text`);
-          continue;
-        }
-        return {
-          prompt: appendImageUnderstandingContext(prompt, understanding),
-          imageAttachments: [],
-        };
-      } catch (error) {
-        failures.push(`${view.server.name}: ${errorMessage(error)}`);
-      }
-    }
-
-    const detail = failures.length > 0 ? ` (${failures.join("; ")})` : "";
-    throw new Error(
-      `The selected model does not support image input and no usable image understanding MCP is configured${detail}. Your message and images were kept in the composer.`,
-    );
-  }
-
   function requestThreadTitleGeneration(retry: PendingThreadTitleRetry) {
     if (!client || threadTitleRetryInFlightRef.current.has(retry.threadId)) {
       return;
@@ -3042,24 +2993,18 @@ export function App() {
           phase: "thinking",
           startedAt: pendingFeedbackStartedAt,
         });
-        const prepared = await prepareImageSubmission(
-          thread.id,
-          initialPrompt?.trim() ?? "",
-          imageAttachments,
-          submittedModelSelection,
-        );
         const { message, turnId } = await client.sendMessage(
           thread.id,
-          prepared.prompt,
+          initialPrompt?.trim() ?? "",
           submittedContextPaths,
           submittedSkillIds,
           submittedCollaborationMode,
           undefined,
-          prepared.imageAttachments,
-          prepared.imageAttachments.length > 0 ? contentParts : [],
+          imageAttachments,
+          imageAttachments.length > 0 ? contentParts : [],
         );
         mergeMessagesForThread(thread.id, [message]);
-        setThreadActivityStatus(thread.id, "processing");
+        markThreadActivityRead(thread.id);
         if (turnId && activeThreadIdRef.current === thread.id) {
           setActiveTurnId(turnId);
         }
@@ -3196,7 +3141,6 @@ export function App() {
     const submittedSkillIds = [...selectedSkillIds];
     const submittedCollaborationMode = collaborationMode;
     const submittedGoalId = reusableGoalId(collaborationMode, goalSnapshot);
-    const submittedModelSelection = activeThread.modelSelection;
     setThreadSending(threadId, true);
     let pendingFeedbackStartedAt: string | null = null;
     try {
@@ -3212,24 +3156,18 @@ export function App() {
         phase: "thinking",
         startedAt: pendingFeedbackStartedAt,
       });
-      const prepared = await prepareImageSubmission(
-        threadId,
-        messageText,
-        imageAttachments,
-        submittedModelSelection,
-      );
       const { message, turnId, queued } = await client.sendMessage(
         threadId,
-        prepared.prompt,
+        messageText,
         submittedContextPaths,
         submittedSkillIds,
         submittedCollaborationMode,
         submittedGoalId,
-        prepared.imageAttachments,
-        prepared.imageAttachments.length > 0 ? contentParts : [],
+        imageAttachments,
+        imageAttachments.length > 0 ? contentParts : [],
       );
       mergeMessagesForThread(threadId, [message]);
-      setThreadActivityStatus(threadId, "processing");
+      markThreadActivityRead(threadId);
       if (turnId && activeThreadIdRef.current === threadId) {
         setActiveTurnId(turnId);
       }
@@ -4590,6 +4528,7 @@ export function App() {
                 )
               }
               onSetThreadActivity={setThreadActivityStatus}
+              onMarkThreadActivityRead={markThreadActivityRead}
               onChangePermissionMode={changeExecutionPreset}
               onChangeSandboxMode={changeSandboxMode}
               onOpenSettings={() => setSettingsOpen(true)}
@@ -7073,7 +7012,11 @@ function SidebarThreadRow({
       : undefined;
 
   return (
-    <div className={`thread-row-wrap ${menuOpen ? "menu-open" : ""}`}>
+    <div
+      className={`thread-row-wrap ${active ? "active" : ""} ${
+        menuOpen ? "menu-open" : ""
+      }`}
+    >
       <button
         className={`thread-row ${active ? "active" : ""}`}
         onPointerDown={(event) => {
@@ -7651,7 +7594,11 @@ function MessageList({
         if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
         turnIdsByAssistantMessage.set(event.payload.message.id, turnIds);
       }
-      if (event.turnId && event.payload.type === "turn_changes_recorded") {
+      if (
+        event.turnId &&
+        event.payload.type === "turn_changes_recorded" &&
+        shouldShowRecordedTurnChanges(events, event.turnId)
+      ) {
         changeSetsByTurn.set(event.turnId, event.payload.change_set);
         if (event.payload.change_set.revertedAt) {
           revertedTurnIds.add(event.turnId);
@@ -7912,47 +7859,126 @@ const MessageBubble = memo(function MessageBubble({
   onOpenArtifact(artifactId: string): void;
   onOpenMarkdownLink(href: string): void;
 }) {
-  const referencedImageIds = new Set(
-    message.parts.flatMap((part) =>
-      part.type === "image_ref" ? [part.image_id] : [],
-    ),
+  const renderedParts = useMemo(() => {
+    const referencedImageIds = new Set(
+      message.parts.flatMap((part) =>
+        part.type === "image_ref" ? [part.image_id] : [],
+      ),
+    );
+    const imagesById = new Map(
+      message.parts.flatMap((part) =>
+        part.type === "image" && part.id ? [[part.id, part] as const] : [],
+      ),
+    );
+    let nextImagePreviewIndex = 0;
+
+    return message.parts
+      .filter(
+        (part) =>
+          part.type !== "turn_context" &&
+          part.type !== "tool_call" &&
+          part.type !== "tool_result" &&
+          !(
+            part.type === "image" &&
+            part.id &&
+            referencedImageIds.has(part.id)
+          ),
+      )
+      .map((part) => {
+        const referencedImage =
+          part.type === "image_ref" ? imagesById.get(part.image_id) : undefined;
+        const previewImage = part.type === "image" ? part : referencedImage;
+        const previewIndex = previewImage ? nextImagePreviewIndex++ : null;
+        return { part, referencedImage, previewImage, previewIndex };
+      });
+  }, [message.parts]);
+  const imagePreviews = useMemo<ImageLightboxAttachment[]>(
+    () =>
+      renderedParts.flatMap(({ previewImage }) => {
+        if (!previewImage) return [];
+        const contentType =
+          previewImage.contentType ||
+          (previewImage as typeof previewImage & { content_type?: string })
+            .content_type ||
+          "application/octet-stream";
+        return [
+          {
+            name: previewImage.name || "图片",
+            previewUrl: URL.createObjectURL(
+              new Blob([new Uint8Array(previewImage.data)], {
+                type: contentType,
+              }),
+            ),
+          },
+        ];
+      }),
+    [renderedParts],
   );
-  const imagesById = new Map(
-    message.parts.flatMap((part) =>
-      part.type === "image" && part.id ? [[part.id, part] as const] : [],
-    ),
+  const [activeImagePreviewIndex, setActiveImagePreviewIndex] = useState<
+    number | null
+  >(null);
+
+  useEffect(
+    () => () => {
+      imagePreviews.forEach(({ previewUrl }) =>
+        URL.revokeObjectURL(previewUrl),
+      );
+    },
+    [imagePreviews],
   );
-  const visibleParts = message.parts.filter(
-    (part) =>
-      part.type !== "turn_context" &&
-      part.type !== "tool_call" &&
-      part.type !== "tool_result" &&
-      !(part.type === "image" && part.id && referencedImageIds.has(part.id)),
-  );
-  if (visibleParts.length === 0) return null;
+
+  useEffect(() => {
+    if (
+      activeImagePreviewIndex !== null &&
+      activeImagePreviewIndex >= imagePreviews.length
+    ) {
+      setActiveImagePreviewIndex(null);
+    }
+  }, [activeImagePreviewIndex, imagePreviews.length]);
+
+  if (renderedParts.length === 0) return null;
 
   return (
-    <article className={`message ${message.role}`}>
-      <div className="message-body">
-        {visibleParts.map((part, index) => (
-          <MessagePartView
-            key={index}
-            messageId={message.id}
-            part={part}
-            referencedImage={
-              part.type === "image_ref"
-                ? imagesById.get(part.image_id)
-                : undefined
-            }
-            role={message.role}
-            threadId={threadId}
-            artifacts={artifacts}
-            onOpenArtifact={onOpenArtifact}
-            onOpenMarkdownLink={onOpenMarkdownLink}
-          />
-        ))}
-      </div>
-    </article>
+    <>
+      <article className={`message ${message.role}`}>
+        <div className="message-body">
+          {renderedParts.map(
+            ({ part, referencedImage, previewIndex }, index) => (
+              <MessagePartView
+                key={index}
+                messageId={message.id}
+                part={part}
+                referencedImage={referencedImage}
+                imagePreviewUrl={
+                  previewIndex === null
+                    ? undefined
+                    : imagePreviews[previewIndex]?.previewUrl
+                }
+                onPreviewImage={
+                  previewIndex === null
+                    ? undefined
+                    : () => setActiveImagePreviewIndex(previewIndex)
+                }
+                role={message.role}
+                threadId={threadId}
+                artifacts={artifacts}
+                onOpenArtifact={onOpenArtifact}
+                onOpenMarkdownLink={onOpenMarkdownLink}
+              />
+            ),
+          )}
+        </div>
+      </article>
+      {activeImagePreviewIndex !== null &&
+      imagePreviews[activeImagePreviewIndex] ? (
+        <ImageLightbox
+          attachments={imagePreviews}
+          activeIndex={activeImagePreviewIndex}
+          onChangeIndex={setActiveImagePreviewIndex}
+          onClose={() => setActiveImagePreviewIndex(null)}
+        />
+      ) : null}
+    </>
   );
 });
 
@@ -7960,6 +7986,8 @@ function MessagePartView({
   messageId,
   part,
   referencedImage,
+  imagePreviewUrl,
+  onPreviewImage,
   role,
   threadId,
   artifacts,
@@ -7969,6 +7997,8 @@ function MessagePartView({
   messageId: string;
   part: MessagePart;
   referencedImage?: Extract<MessagePart, { type: "image" }>;
+  imagePreviewUrl?: string;
+  onPreviewImage?(): void;
   role: Message["role"];
   threadId: string;
   artifacts: ArtifactDescriptor[];
@@ -7976,11 +8006,22 @@ function MessagePartView({
   onOpenMarkdownLink(href: string): void;
 }) {
   if (part.type === "image") {
-    return <InlineImageMessagePart part={part} />;
+    return (
+      <InlineImageMessagePart
+        part={part}
+        previewUrl={imagePreviewUrl}
+        onPreview={onPreviewImage}
+      />
+    );
   }
   if (part.type === "image_ref") {
     return referencedImage ? (
-      <InlineImageMessagePart part={referencedImage} compact />
+      <InlineImageMessagePart
+        part={referencedImage}
+        previewUrl={imagePreviewUrl}
+        onPreview={onPreviewImage}
+        compact
+      />
     ) : (
       <span className="message-image-reference-missing">[图片不可用]</span>
     );
@@ -8048,29 +8089,29 @@ function MessagePartView({
 
 function InlineImageMessagePart({
   part,
+  previewUrl,
+  onPreview,
   compact = false,
 }: {
   part: Extract<MessagePart, { type: "image" }>;
+  previewUrl?: string;
+  onPreview?(): void;
   compact?: boolean;
 }) {
-  const contentType =
-    part.contentType ||
-    (part as typeof part & { content_type?: string }).content_type ||
-    "application/octet-stream";
-  const previewUrl = useMemo(
-    () =>
-      URL.createObjectURL(
-        new Blob([new Uint8Array(part.data)], { type: contentType }),
-      ),
-    [contentType, part.data],
-  );
-
-  useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
+  if (!previewUrl) return null;
+  const name = part.name || "图片";
 
   return (
-    <span className={`message-inline-image ${compact ? "is-reference" : ""}`}>
-      <img src={previewUrl} alt={part.name || "已发送图片"} />
-    </span>
+    <button
+      className={`message-inline-image ${compact ? "is-reference" : ""}`}
+      type="button"
+      aria-haspopup="dialog"
+      aria-label={`预览 ${name}`}
+      title={`预览 ${name}`}
+      onClick={onPreview}
+    >
+      <img src={previewUrl} alt={name} decoding="async" loading="lazy" />
+    </button>
   );
 }
 
@@ -8221,6 +8262,11 @@ const MAX_COMPOSER_HISTORY_ENTRIES = 200;
 type ComposerImageAttachment = InlineImageAttachment & {
   previewUrl: string;
   fingerprint: string;
+};
+
+type ImageLightboxAttachment = {
+  previewUrl: string;
+  name?: string;
 };
 
 async function imageFileFingerprint(file: File): Promise<{
@@ -9750,22 +9796,29 @@ function Composer({
   );
 }
 
+const IMAGE_LIGHTBOX_MIN_ZOOM_PERCENT = 20;
+const IMAGE_LIGHTBOX_MAX_ZOOM_PERCENT = 300;
+const IMAGE_LIGHTBOX_ZOOM_STEP_PERCENT = 20;
+const IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT = 100;
+
 function ImageLightbox({
   attachments,
   activeIndex,
   onChangeIndex,
   onClose,
 }: {
-  attachments: ComposerImageAttachment[];
+  attachments: ImageLightboxAttachment[];
   activeIndex: number;
   onChangeIndex(index: number): void;
   onClose(): void;
 }) {
-  const [zoom, setZoom] = useState(1);
+  const [zoomPercent, setZoomPercent] = useState(
+    IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT,
+  );
   const active = attachments[activeIndex];
 
   useEffect(() => {
-    setZoom(1);
+    setZoomPercent(IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT);
   }, [activeIndex]);
 
   useEffect(() => {
@@ -9783,20 +9836,21 @@ function ImageLightbox({
   }, [activeIndex, attachments.length, onChangeIndex, onClose]);
 
   if (!active) return null;
+  const activeName = active.name || "图片";
 
   return createPortal(
     <div
       className="image-lightbox"
       role="dialog"
       aria-modal="true"
-      aria-label={`预览 ${active.name}`}
+      aria-label={`预览 ${activeName}`}
       onPointerDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
     >
       <div className="image-lightbox-dialog">
         <header className="image-lightbox-header">
-          <strong>{active.name}</strong>
+          <strong>{activeName}</strong>
           <span>
             {activeIndex + 1} / {attachments.length}
           </span>
@@ -9816,9 +9870,9 @@ function ImageLightbox({
           <div className="image-lightbox-canvas">
             <img
               src={active.previewUrl}
-              alt={active.name}
+              alt={activeName}
               draggable={false}
-              style={{ transform: `scale(${zoom})` }}
+              style={{ transform: `scale(${zoomPercent / 100})` }}
             />
           </div>
           <IconButton
@@ -9834,8 +9888,8 @@ function ImageLightbox({
           <button
             className="image-lightbox-reset"
             type="button"
-            onClick={() => setZoom(1)}
-            disabled={zoom === 1}
+            onClick={() => setZoomPercent(IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT)}
+            disabled={zoomPercent === IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT}
           >
             <RotateCcw size={16} aria-hidden="true" />
             <span>重置</span>
@@ -9844,17 +9898,31 @@ function ImageLightbox({
             <IconButton
               aria-label="缩小图片"
               title="缩小"
-              disabled={zoom <= 0.5}
-              onClick={() => setZoom((current) => Math.max(0.5, current - 0.5))}
+              disabled={zoomPercent <= IMAGE_LIGHTBOX_MIN_ZOOM_PERCENT}
+              onClick={() =>
+                setZoomPercent((current) =>
+                  Math.max(
+                    IMAGE_LIGHTBOX_MIN_ZOOM_PERCENT,
+                    current - IMAGE_LIGHTBOX_ZOOM_STEP_PERCENT,
+                  ),
+                )
+              }
             >
               <ZoomOut size={16} aria-hidden="true" />
             </IconButton>
-            <span>{Math.round(zoom * 100)}%</span>
+            <span>{zoomPercent}%</span>
             <IconButton
               aria-label="放大图片"
               title="放大"
-              disabled={zoom >= 3}
-              onClick={() => setZoom((current) => Math.min(3, current + 0.5))}
+              disabled={zoomPercent >= IMAGE_LIGHTBOX_MAX_ZOOM_PERCENT}
+              onClick={() =>
+                setZoomPercent((current) =>
+                  Math.min(
+                    IMAGE_LIGHTBOX_MAX_ZOOM_PERCENT,
+                    current + IMAGE_LIGHTBOX_ZOOM_STEP_PERCENT,
+                  ),
+                )
+              }
             >
               <ZoomIn size={16} aria-hidden="true" />
             </IconButton>
@@ -9862,7 +9930,7 @@ function ImageLightbox({
           <a
             className="image-lightbox-download"
             href={active.previewUrl}
-            download={active.name}
+            download={activeName}
           >
             <Download size={15} aria-hidden="true" />
             <span>下载</span>
@@ -9968,6 +10036,7 @@ function SideTaskConversation({
   initialCollaborationMode,
   onThreadUpdated,
   onSetThreadActivity,
+  onMarkThreadActivityRead,
   onChangePermissionMode,
   onChangeSandboxMode,
   onOpenSettings,
@@ -9987,6 +10056,7 @@ function SideTaskConversation({
     threadId: string,
     status: ThreadActivityStatus | null,
   ): void;
+  onMarkThreadActivityRead(threadId: string): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onOpenSettings(): void;
@@ -10060,10 +10130,10 @@ function SideTaskConversation({
         setPendingApprovalIds((current) =>
           current.includes(approvalId) ? current : [...current, approvalId],
         );
-        onSetThreadActivity(threadId, "approval");
+        onMarkThreadActivityRead(threadId);
       }
       if (event.payload.type === "browser_handoff_required") {
-        onSetThreadActivity(threadId, "user_action");
+        onMarkThreadActivityRead(threadId);
       }
       if (event.payload.type === "user_input_requested") {
         const request = event.payload.request;
@@ -10090,20 +10160,20 @@ function SideTaskConversation({
         setActiveTurnId(event.turnId);
         setCancellingTurnId(null);
         setQueuedMessageCount((current) => Math.max(0, current - 1));
-        onSetThreadActivity(threadId, "processing");
+        onMarkThreadActivityRead(threadId);
       } else if (event.payload.type === "turn_finished") {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
         setCancellingTurnId(null);
         setPendingTurnFeedback(null);
-        onSetThreadActivity(threadId, "succeeded");
+        onMarkThreadActivityRead(threadId);
       } else if (event.payload.type === "turn_suspended") {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
         setCancellingTurnId(null);
-        onSetThreadActivity(threadId, "approval");
+        onMarkThreadActivityRead(threadId);
       } else if (event.payload.type === "browser_handoff_required") {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
@@ -10130,10 +10200,10 @@ function SideTaskConversation({
       if (event.payload.type === "error") {
         setPendingTurnFeedback(null);
         setActionError(friendlyProviderError(event.payload.message));
-        onSetThreadActivity(threadId, "failed");
+        onMarkThreadActivityRead(threadId);
       }
     },
-    [onSetThreadActivity, threadId],
+    [onMarkThreadActivityRead, onSetThreadActivity, threadId],
   );
 
   useEffect(() => {
@@ -10181,12 +10251,11 @@ function SideTaskConversation({
             pendingApprovals.map((approval) => approval.approvalId),
           );
           setPendingUserInput(pendingPlanningInput);
-          onSetThreadActivity(
-            threadId,
+          const activityStatus =
             pendingApprovals.length > 0
               ? "approval"
-              : resolveThreadActivityStatus(turnStatus),
-          );
+              : resolveThreadActivityStatus(turnStatus);
+          if (activityStatus) onMarkThreadActivityRead(threadId);
           setLoadState({ threadId, status: "ready", error: null });
           source = client.openEventStream(
             threadId,
@@ -10209,7 +10278,14 @@ function SideTaskConversation({
       controller.abort();
       source?.close();
     };
-  }, [client, ingestSideTaskEvent, loadAttempt, onSetThreadActivity, threadId]);
+  }, [
+    client,
+    ingestSideTaskEvent,
+    loadAttempt,
+    onMarkThreadActivityRead,
+    onSetThreadActivity,
+    threadId,
+  ]);
 
   const pendingApprovalQueue = useMemo(
     () =>
@@ -10308,7 +10384,7 @@ function SideTaskConversation({
       setComposer("");
       setContextSources([]);
       setSelectedSkillIds([]);
-      onSetThreadActivity(thread.id, "processing");
+      onMarkThreadActivityRead(thread.id);
       if (isFirstPrompt && messageText) void updateThreadTitle(messageText);
       return true;
     } catch (error) {
@@ -10316,7 +10392,7 @@ function SideTaskConversation({
         current?.startedAt === startedAt ? null : current,
       );
       setActionError(errorMessage(error));
-      onSetThreadActivity(thread.id, "failed");
+      onMarkThreadActivityRead(thread.id);
       return false;
     } finally {
       setIsSending(false);
@@ -10626,6 +10702,7 @@ function RightPanel({
   onOpenSideTask,
   onThreadUpdated,
   onSetThreadActivity,
+  onMarkThreadActivityRead,
   onChangePermissionMode,
   onChangeSandboxMode,
   onOpenSettings,
@@ -10720,6 +10797,7 @@ function RightPanel({
     threadId: string,
     status: ThreadActivityStatus | null,
   ): void;
+  onMarkThreadActivityRead(threadId: string): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onOpenSettings(): void;
@@ -10827,6 +10905,7 @@ function RightPanel({
                 initialCollaborationMode={collaborationMode}
                 onThreadUpdated={onThreadUpdated}
                 onSetThreadActivity={onSetThreadActivity}
+                onMarkThreadActivityRead={onMarkThreadActivityRead}
                 onChangePermissionMode={onChangePermissionMode}
                 onChangeSandboxMode={onChangeSandboxMode}
                 onOpenSettings={onOpenSettings}
@@ -11178,50 +11257,50 @@ function NewTaskState({
           },
         ]
       : experienceMode === "work"
-      ? [
-          {
-            icon: Search,
-            label: "研究并汇总资料",
-            prompt: "研究这个主题，核对来源并整理成清晰的结论",
-          },
-          {
-            icon: FileText,
-            label: "撰写与整理文档",
-            prompt: "根据项目资料撰写并整理一份完整文档",
-          },
-          {
-            icon: Table2,
-            label: "分析表格与数据",
-            prompt: "分析项目中的表格和数据，并总结关键发现",
-          },
-          {
-            icon: Presentation,
-            label: "制作演示或报告",
-            prompt: "根据项目内容制作一份结构清晰的演示或报告",
-          },
-        ]
-      : [
-          {
-            icon: Search,
-            label: "探索并理解代码",
-            prompt: "分析这个项目的架构和核心模块",
-          },
-          {
-            icon: FileCode2,
-            label: "构建新功能",
-            prompt: "为这个项目实现一个新功能",
-          },
-          {
-            icon: Check,
-            label: "审查代码更改",
-            prompt: "审查当前工作区中的代码更改",
-          },
-          {
-            icon: Activity,
-            label: "修复问题",
-            prompt: "检查并修复当前项目中的问题",
-          },
-        ];
+        ? [
+            {
+              icon: Search,
+              label: "研究并汇总资料",
+              prompt: "研究这个主题，核对来源并整理成清晰的结论",
+            },
+            {
+              icon: FileText,
+              label: "撰写与整理文档",
+              prompt: "根据项目资料撰写并整理一份完整文档",
+            },
+            {
+              icon: Table2,
+              label: "分析表格与数据",
+              prompt: "分析项目中的表格和数据，并总结关键发现",
+            },
+            {
+              icon: Presentation,
+              label: "制作演示或报告",
+              prompt: "根据项目内容制作一份结构清晰的演示或报告",
+            },
+          ]
+        : [
+            {
+              icon: Search,
+              label: "探索并理解代码",
+              prompt: "分析这个项目的架构和核心模块",
+            },
+            {
+              icon: FileCode2,
+              label: "构建新功能",
+              prompt: "为这个项目实现一个新功能",
+            },
+            {
+              icon: Check,
+              label: "审查代码更改",
+              prompt: "审查当前工作区中的代码更改",
+            },
+            {
+              icon: Activity,
+              label: "修复问题",
+              prompt: "检查并修复当前项目中的问题",
+            },
+          ];
 
   return (
     <>

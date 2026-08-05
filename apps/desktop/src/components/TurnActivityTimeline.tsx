@@ -48,6 +48,7 @@ import {
   type ConversationRenderTrace,
 } from "../conversationRenderTrace";
 import { recordConversationRenderTrace } from "../platform";
+import { shouldShowRecordedTurnChanges } from "../turnChangeOwnership";
 import {
   activeTurnStatusLabel,
   type ActiveTurnPhase,
@@ -217,7 +218,9 @@ export function TurnActivityTimeline({
     .reverse()
     .find((event) => event.payload.type === "turn_changes_recorded");
   const changeSet =
-    changeSetEvent?.payload.type === "turn_changes_recorded"
+    changeSetEvent?.payload.type === "turn_changes_recorded" &&
+    changeSetEvent.turnId &&
+    shouldShowRecordedTurnChanges(events, changeSetEvent.turnId)
       ? changeSetEvent.payload.change_set
       : null;
   const hasTurnLifecycle = events.some((event) =>
@@ -276,12 +279,6 @@ export function TurnActivityTimeline({
               onOpenMarkdownLink={onOpenMarkdownLink}
             />
           ))}
-          {changeSet?.status === "failed" && (
-            <div className="turn-change-set-warning" role="status">
-              <AlertCircle size={13} />
-              <span>未能记录本轮文件快照，不影响任务结果。</span>
-            </div>
-          )}
         </div>
       )}
     </section>

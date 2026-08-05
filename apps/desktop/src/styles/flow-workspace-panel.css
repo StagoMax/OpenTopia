@@ -50,6 +50,7 @@
 
 .flow-workspace-panel__tabs button:focus-visible,
 .flow-review-panel__drafts button:focus-visible,
+.flow-runtime-panel__runs button:focus-visible,
 .flow-review-panel__editor textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: var(--space-1);
@@ -337,4 +338,147 @@
   gap: var(--space-2);
   margin: var(--space-4) 0 0;
   padding-left: var(--space-8);
+}
+
+.flow-runtime-panel__composer,
+.flow-runtime-panel__detail {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.flow-runtime-panel__composer > .ot-select {
+  inline-size: 100%;
+}
+
+.flow-runtime-panel__composer .flow-review-panel__editor textarea {
+  min-block-size: calc(var(--control-height-lg) * 3);
+}
+
+.flow-runtime-panel__runs {
+  display: grid;
+  gap: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.flow-runtime-panel__runs button {
+  display: grid;
+  grid-template-columns: var(--icon-size-sm) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-4);
+  min-block-size: var(--control-height-lg);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  padding: var(--space-3) var(--space-4);
+  text-align: left;
+  cursor: pointer;
+}
+
+.flow-runtime-panel__runs button:hover {
+  background: var(--surface-hover);
+}
+
+.flow-runtime-panel__runs button.is-active {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+  color: var(--text);
+}
+
+.flow-runtime-panel__runs button > span {
+  display: grid;
+  min-inline-size: 0;
+}
+
+.flow-runtime-panel__runs strong,
+.flow-runtime-panel__runs small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-runtime-panel__runs strong {
+  color: inherit;
+  font-weight: var(--font-weight-medium);
+}
+
+.flow-runtime-panel__runs small,
+.flow-runtime-panel__trace small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.flow-runtime-panel__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
+.flow-runtime-panel__trace {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.flow-runtime-panel__trace li {
+  display: grid;
+  grid-template-columns: var(--control-height-sm) minmax(0, 1fr);
+  gap: var(--space-4);
+  border-left: var(--space-1) solid var(--border-strong);
+  background: var(--surface-subtle);
+  padding: var(--space-4);
+}
+
+.flow-runtime-panel__trace-index {
+  display: inline-flex;
+  inline-size: var(--control-height-sm);
+  block-size: var(--control-height-sm);
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.flow-runtime-panel__trace li > div {
+  display: grid;
+  gap: var(--space-2);
+  min-inline-size: 0;
+}
+
+.flow-runtime-panel__trace-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.flow-runtime-panel__trace details {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.flow-runtime-panel__trace summary {
+  cursor: pointer;
+}
+
+.flow-runtime-panel__trace pre {
+  max-block-size: calc(var(--control-height-lg) * 8);
+  margin: var(--space-3) 0 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  padding: var(--space-4);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
