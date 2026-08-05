@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { ApiClient } from "../api/client";
+import { formatPathForDisplay } from "../pathDisplay";
 import type {
   AgentEvent,
   ArtifactDescriptor,
@@ -227,7 +228,7 @@ export function RightContextRail({
           <RailRow
             icon={Laptop}
             label="本地"
-            title={workspaceRoot}
+            title={formatPathForDisplay(workspaceRoot)}
             onClick={onOpenFiles}
             value={
               <span className="right-context-rail__inline-value">

@@ -22,7 +22,6 @@ import type {
   ContextStatus,
   ContextSummary,
   DiffFileActionResult,
-  EvaluationRun,
   ExperienceMode,
   FlowDefinition,
   FlowDraftView,
@@ -718,14 +717,6 @@ export class ApiClient {
 
   async listProjects(): Promise<Project[]> {
     return this.get("/api/projects");
-  }
-
-  async listEvaluationRuns(workspaceRoot: string): Promise<EvaluationRun[]> {
-    return this.get(`/api/evaluations${queryString({ workspaceRoot })}`);
-  }
-
-  async importEvaluationRuns(workspaceRoot: string): Promise<EvaluationRun[]> {
-    return this.post("/api/evaluations/import", { workspaceRoot });
   }
 
   async createProject(input: {

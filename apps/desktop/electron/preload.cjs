@@ -36,6 +36,9 @@ const browserHost = Object.freeze({
 });
 
 contextBridge.exposeInMainWorld("opentopia", {
+  newWindow: () => ipcRenderer.invoke("platform:new-window"),
+  closeWindow: () => ipcRenderer.invoke("platform:close-window"),
+  quit: () => ipcRenderer.invoke("platform:quit"),
   getPlatformInfo: () => ipcRenderer.invoke("platform:get-info"),
   getOpenRequests: () => ipcRenderer.invoke("platform:get-open-requests"),
   onOpenRequest: (listener) => {

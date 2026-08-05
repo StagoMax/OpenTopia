@@ -12,6 +12,7 @@ import {
   Square,
 } from "lucide-react";
 import type { ApiClient } from "../api/client";
+import { formatPathForDisplay } from "../pathDisplay";
 import {
   activationForScope,
   parseJsonObject,
@@ -964,7 +965,9 @@ function scopeDescription(
 ): string {
   if (scopeType === "thread") return `Task: ${threadId ?? "unavailable"}`;
   if (scopeType === "workspace")
-    return `Project: ${workspaceRoot ?? "unavailable"}`;
+    return `Project: ${
+      workspaceRoot ? formatPathForDisplay(workspaceRoot) : "unavailable"
+    }`;
   return "Applies across OpenTopia unless overridden by a narrower scope.";
 }
 

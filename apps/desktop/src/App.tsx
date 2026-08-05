@@ -125,6 +125,7 @@ import {
 } from "./components/WorkbenchPanel";
 import { Button, IconButton, Popover } from "./components/ui";
 import { normalizeCopiedText } from "./clipboardText";
+import { formatPathForDisplay } from "./pathDisplay";
 import {
   composerContentText,
   composerExternalValueSyncAction,
@@ -164,13 +165,16 @@ import {
   WorkspacePathIndexContext,
 } from "./components/WorkspacePathProvider";
 import {
+  closeAppWindow,
   deleteProviderApiKey,
   getDroppedContextFiles,
   getRecentWorkspaces,
   listSecretSources,
   loadPlatformInfo,
+  newAppWindow,
   openExternal,
   openPath,
+  quitApp,
   recordConversationRenderTrace,
   selectContextFiles,
   selectPluginDirectory,
@@ -4114,6 +4118,16 @@ export function App() {
       if (!(event.ctrlKey || event.metaKey)) return;
 
       const key = event.key.toLocaleLowerCase();
+      if (!event.altKey && !event.shiftKey && key === "w") {
+        event.preventDefault();
+        void closeAppWindow();
+        return;
+      }
+      if (!event.altKey && !event.shiftKey && key === "q") {
+        event.preventDefault();
+        void quitApp();
+        return;
+      }
       if (taskSearchOpen) return;
       if (key === ",") {
         event.preventDefault();
@@ -4184,8 +4198,12 @@ export function App() {
         <TopBar
           sidebarCollapsed={sidebarCollapsed}
           onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
-          onNewTask={beginNewThread}
+          onNewWindow={() => void newAppWindow()}
+          onNewChat={beginNewThread}
           onOpenWorkspace={() => void chooseWorkspace()}
+          onCloseWindow={() => void closeAppWindow()}
+          onLogout={() => void logoutCodexAccount()}
+          onQuit={() => void quitApp()}
           onToggleTool={toggleToolPanel}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenLogs={() => setLogViewerOpen(true)}
@@ -4219,7 +4237,6 @@ export function App() {
             threadActivityStatuses={threadActivityStatuses}
             activeThreadId={activeThreadId}
             activeProjectId={activeThread?.projectId ?? draftProjectId}
-            activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
             workspaceError={workspaceError}
             isPickingWorkspace={isPickingWorkspace}
             experienceMode={experienceMode}
@@ -4990,8 +5007,12 @@ function isEditableElement(value: EventTarget | null): value is HTMLElement {
 function TopBar({
   sidebarCollapsed,
   onToggleSidebar,
-  onNewTask,
+  onNewWindow,
+  onNewChat,
   onOpenWorkspace,
+  onCloseWindow,
+  onLogout,
+  onQuit,
   onToggleTool,
   onOpenSettings,
   onOpenLogs,
@@ -5001,8 +5022,12 @@ function TopBar({
 }: {
   sidebarCollapsed: boolean;
   onToggleSidebar(): void;
-  onNewTask(): void;
+  onNewWindow(): void;
+  onNewChat(): void;
   onOpenWorkspace(): void;
+  onCloseWindow(): void;
+  onLogout(): void;
+  onQuit(): void;
   onToggleTool(kind: Exclude<ToolTabKind, "preview">): void;
   onOpenSettings(): void;
   onOpenLogs(): void;
@@ -5111,19 +5136,17 @@ function TopBar({
               <button
                 type="button"
                 role="menuitem"
-                onClick={() => runAction(onNewTask)}
+                onClick={() => runAction(onNewWindow)}
               >
-                <span>新建任务</span>
-                <kbd>Ctrl+N</kbd>
+                <span>新建窗口</span>
               </button>
               <button
                 type="button"
                 role="menuitem"
-                disabled
-                title="当前版本不支持多个应用窗口"
+                onClick={() => runAction(onNewChat)}
               >
-                <span>新建窗口</span>
-                <kbd>Ctrl+Shift+N</kbd>
+                <span>新聊天</span>
+                <kbd>Ctrl+N</kbd>
               </button>
               <div className="window-menu-divider" role="separator" />
               <button
@@ -5131,18 +5154,33 @@ function TopBar({
                 role="menuitem"
                 onClick={() => runAction(onOpenWorkspace)}
               >
-                <span>打开工作区...</span>
+                <span>打开文件夹</span>
                 <kbd>Ctrl+O</kbd>
               </button>
               <div className="window-menu-divider" role="separator" />
               <button
                 type="button"
                 role="menuitem"
-                disabled
-                title="当前版本没有关闭任务的独立操作"
+                onClick={() => runAction(onCloseWindow)}
               >
-                <span>关闭任务</span>
+                <span>关闭</span>
                 <kbd>Ctrl+W</kbd>
+              </button>
+              <div className="window-menu-divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onLogout)}
+              >
+                <span>注销</span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => runAction(onQuit)}
+              >
+                <span>退出 ChatGPT</span>
+                <kbd>Ctrl+Q</kbd>
               </button>
             </div>
           ) : null}
@@ -5208,7 +5246,7 @@ function TopBar({
                 role="menuitem"
                 onClick={() => runAction(onOpenSettings)}
               >
-                <span>设置...</span>
+                <span>设置</span>
                 <kbd>Ctrl+,</kbd>
               </button>
             </div>
@@ -5230,24 +5268,6 @@ function TopBar({
               >
                 <span>{sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}</span>
                 <kbd>Ctrl+B</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前布局没有底部面板"
-              >
-                <span>切换底部面板</span>
-                <kbd>Ctrl+J</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本没有置顶摘要面板"
-              >
-                <span>切换置顶摘要</span>
-                <kbd />
               </button>
               <button
                 type="button"
@@ -5282,53 +5302,6 @@ function TopBar({
                 <span>浏览器</span>
                 <kbd />
               </button>
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本没有全局查找面板"
-              >
-                <span>查找</span>
-                <kbd>Ctrl+F</kbd>
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本不支持缩放界面"
-              >
-                <span>放大</span>
-                <kbd>Ctrl+Shift+=</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本不支持缩放界面"
-              >
-                <span>缩小</span>
-                <kbd>Ctrl+-</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本不支持缩放界面"
-              >
-                <span>实际大小</span>
-                <kbd>Ctrl+0</kbd>
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本不支持全屏切换"
-              >
-                <span>切换全屏</span>
-                <kbd>F11</kbd>
-              </button>
             </div>
           ) : null}
         </div>
@@ -5340,28 +5313,10 @@ function TopBar({
               <button
                 type="button"
                 role="menuitem"
-                disabled
-                title="当前版本没有在线文档入口"
-              >
-                <span>文档</span>
-                <kbd />
-              </button>
-              <button
-                type="button"
-                role="menuitem"
                 onClick={() => runAction(onShowKeyboardShortcuts)}
               >
                 <span>键盘快捷键</span>
                 <kbd>Ctrl+/</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本没有更新公告"
-              >
-                <span>更新内容</span>
-                <kbd />
               </button>
               <div className="window-menu-divider" role="separator" />
               <button
@@ -5370,24 +5325,6 @@ function TopBar({
                 onClick={() => runAction(onOpenLogs)}
               >
                 <span>故障排查（日志）</span>
-                <kbd />
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本没有系统状态页"
-              >
-                <span>系统状态</span>
-                <kbd />
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                disabled
-                title="当前版本没有反馈入口"
-              >
-                <span>发送反馈</span>
                 <kbd />
               </button>
               <div className="window-menu-divider" role="separator" />
@@ -5419,8 +5356,10 @@ function KeyboardShortcutsDialog({ onClose }: { onClose(): void }) {
   }, [onClose]);
 
   const shortcuts = [
-    ["新建任务", "Ctrl+N"],
-    ["打开工作区", "Ctrl+O"],
+    ["新聊天", "Ctrl+N"],
+    ["打开文件夹", "Ctrl+O"],
+    ["关闭窗口", "Ctrl+W"],
+    ["退出 ChatGPT", "Ctrl+Q"],
     ["搜索任务", "Ctrl+K"],
     ["切换侧栏", "Ctrl+B"],
     ["设置", "Ctrl+,"],
@@ -6390,13 +6329,14 @@ function SettingsPanel({
   );
 }
 
+const PROJECT_THREAD_PREVIEW_LIMIT = 10;
+
 function Sidebar({
   projects,
   threads,
   threadActivityStatuses,
   activeThreadId,
   activeProjectId,
-  activeWorkspaceRemoteUrl,
   workspaceError,
   isPickingWorkspace,
   experienceMode,
@@ -6424,7 +6364,6 @@ function Sidebar({
   threadActivityStatuses: Record<string, ThreadActivityStatus>;
   activeThreadId: string | null;
   activeProjectId: string | null;
-  activeWorkspaceRemoteUrl: string | null;
   workspaceError: string | null;
   isPickingWorkspace: boolean;
   experienceMode: ExperienceMode;
@@ -6456,6 +6395,9 @@ function Sidebar({
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
     () => new Set(initialNavigationState.expandedProjectIds),
   );
+  const [projectThreadDisplayLimits, setProjectThreadDisplayLimits] = useState<
+    Map<string, number>
+  >(() => new Map());
   const [moreMenuProjectId, setMoreMenuProjectId] = useState<string | null>(
     null,
   );
@@ -6668,6 +6610,13 @@ function Sidebar({
             );
             const isActive = project.id === activeProjectId;
             const isExpanded = expandedProjects.has(project.id);
+            const threadDisplayLimit =
+              projectThreadDisplayLimits.get(project.id) ??
+              PROJECT_THREAD_PREVIEW_LIMIT;
+            const visibleProjectThreads = projectThreads.slice(
+              0,
+              threadDisplayLimit,
+            );
             const isMoreMenuOpen = moreMenuProjectId === project.id;
             const projectInfoId = `project-hover-card-${projectIndex}`;
             return (
@@ -6678,7 +6627,11 @@ function Sidebar({
                 <div className="project-row">
                   <button
                     className="project-select"
-                    title={project.workspaceRoot ?? project.name}
+                    title={
+                      project.workspaceRoot
+                        ? formatPathForDisplay(project.workspaceRoot)
+                        : project.name
+                    }
                     aria-label={`项目 ${project.name}`}
                     aria-describedby={projectInfoId}
                     onMouseEnter={(event) => {
@@ -6689,17 +6642,12 @@ function Sidebar({
                         bounds.right + 8,
                         window.innerWidth - cardWidth - 8,
                       );
-                      const remoteUrl =
-                        project.id === activeProjectId
-                          ? activeWorkspaceRemoteUrl
-                          : null;
                       setHoveredProject({
                         id: projectInfoId,
                         name: project.name,
                         threadCount: projectThreads.length,
                         workspaceRoot: project.workspaceRoot,
                         pinned: project.pinned,
-                        remoteUrl,
                         left: Math.max(8, left),
                         top: Math.max(
                           36,
@@ -6709,6 +6657,14 @@ function Sidebar({
                     }}
                     onMouseLeave={() => setHoveredProject(null)}
                     onClick={() => {
+                      if (isExpanded) {
+                        setProjectThreadDisplayLimits((current) => {
+                          if (!current.has(project.id)) return current;
+                          const next = new Map(current);
+                          next.delete(project.id);
+                          return next;
+                        });
+                      }
                       toggleExpandedProject(project.id);
                       onSelectProject(project);
                     }}
@@ -6797,7 +6753,7 @@ function Sidebar({
                 </div>
                 {isExpanded && (
                   <div className="project-tasks">
-                    {projectThreads.map((thread) => (
+                    {visibleProjectThreads.map((thread) => (
                       <SidebarThreadRow
                         active={thread.id === activeThreadId}
                         activityStatus={activityStatusForThread(thread.id)}
@@ -6811,6 +6767,27 @@ function Sidebar({
                         onToggleProjectPinned={onToggleProjectPinned}
                       />
                     ))}
+                    {projectThreads.length > threadDisplayLimit && (
+                      <Button
+                        className="project-show-more"
+                        size="compact"
+                        variant="quiet"
+                        onClick={() =>
+                          setProjectThreadDisplayLimits((current) => {
+                            const next = new Map(current);
+                            next.set(
+                              project.id,
+                              (current.get(project.id) ??
+                                PROJECT_THREAD_PREVIEW_LIMIT) +
+                                PROJECT_THREAD_PREVIEW_LIMIT,
+                            );
+                            return next;
+                          })
+                        }
+                      >
+                        展开显示
+                      </Button>
+                    )}
                     {projectThreads.length === 0 && (
                       <span className="project-empty">无任务</span>
                     )}
@@ -6951,17 +6928,17 @@ function Sidebar({
             </div>
             <div className="project-hover-card__divider" />
             <div className="project-hover-card__row">
-              <GitFork size={15} aria-hidden="true" />
-              <span title={hoveredProject.remoteUrl ?? undefined}>
-                {hoveredProject.remoteUrl
-                  ? compactRemoteLabel(hoveredProject.remoteUrl)
-                  : "远程仓库信息未加载"}
-              </span>
-            </div>
-            <div className="project-hover-card__row">
               <Folder size={15} aria-hidden="true" />
-              <span title={hoveredProject.workspaceRoot ?? undefined}>
-                {hoveredProject.workspaceRoot ?? "尚未选择工作区"}
+              <span
+                title={
+                  hoveredProject.workspaceRoot
+                    ? formatPathForDisplay(hoveredProject.workspaceRoot)
+                    : undefined
+                }
+              >
+                {hoveredProject.workspaceRoot
+                  ? formatPathForDisplay(hoveredProject.workspaceRoot)
+                  : "尚未选择工作区"}
               </span>
             </div>
           </div>,
@@ -7029,7 +7006,7 @@ function Sidebar({
 
 function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
   if (!status) {
-    return <span className="thread-row-status" aria-hidden="true" />;
+    return null;
   }
 
   const label = threadActivityStatusLabel(status);
@@ -7126,7 +7103,7 @@ function SidebarThreadRow({
     <div
       className={`thread-row-wrap ${active ? "active" : ""} ${
         isThreadActivityProcessing(activityStatus) ? "is-processing" : ""
-      } ${menuOpen ? "menu-open" : ""}`}
+      } ${activityStatus ? "has-status" : ""} ${menuOpen ? "menu-open" : ""}`}
     >
       <button
         className={`thread-row ${active ? "active" : ""}`}
@@ -9478,7 +9455,11 @@ function Composer({
               <button
                 className="composer-context-button"
                 type="button"
-                title={workspaceRoot ?? projectName ?? "项目"}
+                title={
+                  workspaceRoot
+                    ? formatPathForDisplay(workspaceRoot)
+                    : (projectName ?? "项目")
+                }
                 aria-expanded={openMenu === "workspace"}
                 onClick={() =>
                   setOpenMenu((current) =>
@@ -11893,7 +11874,6 @@ type ProjectHoverState = {
   threadCount: number;
   workspaceRoot: string | null;
   pinned: boolean;
-  remoteUrl: string | null;
   left: number;
   top: number;
 };
@@ -12236,7 +12216,6 @@ const toolStageLauncherKinds: Array<{
   { kind: "terminal", label: "终端" },
   { kind: "browser", label: "浏览器" },
   { kind: "files", label: "文件" },
-  { kind: "evaluations", label: "评测" },
 ];
 
 function toolTabTitle(kind: ToolTabKind): string {
@@ -12253,8 +12232,6 @@ function toolTabTitle(kind: ToolTabKind): string {
       return "Plugins";
     case "sandbox":
       return "沙箱";
-    case "evaluations":
-      return "评测";
     case "browser":
       return "浏览器";
     case "computer":
@@ -12282,8 +12259,6 @@ function toolTabIcon(kind: ToolTabKind): typeof Folder {
       return Plug;
     case "sandbox":
       return Box;
-    case "evaluations":
-      return Workflow;
     case "browser":
       return Globe2;
     case "computer":
@@ -12360,18 +12335,4 @@ function workspaceRootKey(workspaceRoot: string): string {
       ? normalized.replace(/\/+$/, "")
       : normalized;
   return withoutTrailingSeparators.toLowerCase();
-}
-
-function compactRemoteLabel(remoteUrl: string): string {
-  const scpRemote = remoteUrl.match(/^[^@]+@([^:]+):(.+)$/);
-  if (scpRemote) {
-    return `${scpRemote[1]}/${scpRemote[2].replace(/\.git$/, "")}`;
-  }
-  try {
-    const parsed = new URL(remoteUrl);
-    const pathname = parsed.pathname.replace(/^\//, "").replace(/\.git$/, "");
-    return pathname ? `${parsed.host}/${pathname}` : parsed.host;
-  } catch {
-    return remoteUrl;
-  }
 }

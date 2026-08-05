@@ -61,9 +61,9 @@ import type {
   WorkspaceTree,
 } from "../types";
 import type { ApiClient } from "../api/client";
+import { formatPathForDisplay } from "../pathDisplay";
 import { shouldShowRecordedTurnChanges } from "../turnChangeOwnership";
 import { ArtifactGallery } from "./ArtifactGallery";
-import { EvaluationPanel } from "./EvaluationPanel";
 import { PluginControlPanel } from "./PluginControlPanel";
 import {
   DiffReviewPanel,
@@ -82,8 +82,7 @@ export type WorkbenchTab =
   | "diff"
   | "terminal"
   | "extensions"
-  | "sandbox"
-  | "evaluations";
+  | "sandbox";
 
 type WorkbenchPanelProps = {
   client: ApiClient | null;
@@ -163,7 +162,6 @@ const tabs: Array<{
   { id: "terminal", label: "Terminal", icon: TerminalSquare },
   { id: "extensions", label: "Plugins", icon: Puzzle },
   { id: "sandbox", label: "Sandbox", icon: Box },
-  { id: "evaluations", label: "Evaluations", icon: Workflow },
 ];
 
 export function WorkbenchPanel({
@@ -304,13 +302,6 @@ export function WorkbenchPanel({
         />
       )}
       {activeTab === "sandbox" && <SandboxView sandbox={sandbox} />}
-      {activeTab === "evaluations" && (
-        <EvaluationPanel
-          client={client}
-          workspaceRoot={shownWorkspaceRoot}
-          onOpenPath={onOpenPath}
-        />
-      )}
     </>
   );
 
@@ -2314,6 +2305,11 @@ function SandboxView({ sandbox }: { sandbox: SandboxDescriptor | null }) {
     return <div className="workbench-empty-state">No sandbox loaded.</div>;
   }
 
+  const workspaceRoot = formatPathForDisplay(sandbox.workspaceRoot);
+  const readableRoots = sandbox.readableRoots.map(formatPathForDisplay);
+  const writableRoots = sandbox.writableRoots.map(formatPathForDisplay);
+  const protectedPaths = sandbox.protectedPaths.map(formatPathForDisplay);
+
   return (
     <div className="sandbox-view">
       <div className="sandbox-status">
@@ -2330,7 +2326,7 @@ function SandboxView({ sandbox }: { sandbox: SandboxDescriptor | null }) {
       <dl className="sandbox-details">
         <div>
           <dt>Workspace</dt>
-          <dd title={sandbox.workspaceRoot}>{sandbox.workspaceRoot}</dd>
+          <dd title={workspaceRoot}>{workspaceRoot}</dd>
         </div>
         <div>
           <dt>Sandbox ID</dt>
@@ -2346,9 +2342,9 @@ function SandboxView({ sandbox }: { sandbox: SandboxDescriptor | null }) {
         </div>
         <div>
           <dt>Readable roots</dt>
-          <dd title={sandbox.readableRoots.join("\n")}>
-            {sandbox.readableRoots.length
-              ? sandbox.readableRoots.join(", ")
+          <dd title={readableRoots.join("\n")}>
+            {readableRoots.length
+              ? readableRoots.join(", ")
               : sandbox.sandboxMode === "danger-full-access"
                 ? "unrestricted"
                 : "none"}
@@ -2356,18 +2352,14 @@ function SandboxView({ sandbox }: { sandbox: SandboxDescriptor | null }) {
         </div>
         <div>
           <dt>Writable roots</dt>
-          <dd title={sandbox.writableRoots.join("\n")}>
-            {sandbox.writableRoots.length
-              ? sandbox.writableRoots.join(", ")
-              : "none"}
+          <dd title={writableRoots.join("\n")}>
+            {writableRoots.length ? writableRoots.join(", ") : "none"}
           </dd>
         </div>
         <div>
           <dt>Protected metadata</dt>
-          <dd title={sandbox.protectedPaths.join("\n")}>
-            {sandbox.protectedPaths.length
-              ? sandbox.protectedPaths.join(", ")
-              : "none"}
+          <dd title={protectedPaths.join("\n")}>
+            {protectedPaths.length ? protectedPaths.join(", ") : "none"}
           </dd>
         </div>
         <div>

@@ -344,35 +344,6 @@ export type ProviderHealthCheckResult = {
   openaiCompatibility?: OpenAiCompatibilityReport | null;
 };
 
-export type EvaluationTaskResult = {
-  taskId: string;
-  runId?: string | null;
-  title?: string | null;
-  status: string;
-  failureCategory?: string | null;
-  error?: string | null;
-  toolCallsByName: Record<string, number>;
-  totalTokens?: number | null;
-  errorEvents?: number | null;
-  recoveryPassed?: boolean | null;
-  processContractPassed?: boolean | null;
-};
-
-export type EvaluationRun = {
-  runId: string;
-  workspaceRoot: string;
-  title: string;
-  status: string;
-  model?: string | null;
-  failureCategory?: string | null;
-  startedAt?: string | null;
-  completedAt?: string | null;
-  sourcePath: string;
-  tasks: EvaluationTaskResult[];
-  summary: unknown;
-  updatedAt: string;
-};
-
 export type CodexAccountStatus = {
   loggedIn: boolean;
   authMode?: string | null;
@@ -2391,6 +2362,9 @@ export type PlatformOpenRequest = {
 declare global {
   interface Window {
     opentopia?: {
+      newWindow(): Promise<boolean>;
+      closeWindow(): Promise<boolean>;
+      quit(): Promise<boolean>;
       getPlatformInfo(): Promise<PlatformInfo>;
       getOpenRequests(): Promise<PlatformOpenRequest[]>;
       onOpenRequest(

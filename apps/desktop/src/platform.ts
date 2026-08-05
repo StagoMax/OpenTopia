@@ -46,6 +46,30 @@ export function getLoadedApiToken(): string {
   return loadedApiToken;
 }
 
+export async function newAppWindow(): Promise<void> {
+  if (window.opentopia) {
+    await window.opentopia.newWindow();
+    return;
+  }
+  window.open(window.location.href, "_blank", "noopener,noreferrer");
+}
+
+export async function closeAppWindow(): Promise<void> {
+  if (window.opentopia) {
+    await window.opentopia.closeWindow();
+    return;
+  }
+  window.close();
+}
+
+export async function quitApp(): Promise<void> {
+  if (window.opentopia) {
+    await window.opentopia.quit();
+    return;
+  }
+  window.close();
+}
+
 export async function selectWorkspace(options?: {
   defaultPath?: string;
 }): Promise<WorkspacePickResult> {

@@ -2894,6 +2894,23 @@ button:disabled {
   padding-left: 24px;
 }
 
+.ot-button.project-show-more {
+  width: fit-content;
+  min-height: var(--control-height-sm);
+  border-color: transparent;
+  background: transparent;
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+  font-weight: var(--font-weight-regular);
+}
+
+.ot-button.project-show-more:not(:disabled):hover,
+.ot-button.project-show-more:not(:disabled):active {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
 .thread-row {
   display: block;
   width: 100%;
@@ -2922,14 +2939,49 @@ button:disabled {
 
 .thread-title-viewport.is-overflowing {
   text-overflow: clip;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    var(--text) 0,
+    var(--text) calc(100% - var(--space-8)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    var(--text) 0,
+    var(--text) calc(100% - var(--space-8)),
+    transparent 100%
+  );
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
 }
 
 .thread-row-wrap:hover .thread-title-viewport.is-overflowing .thread-title-text,
+.thread-row-wrap:focus-within
+  .thread-title-viewport.is-overflowing
+  .thread-title-text,
 .thread-row:focus-visible
   .thread-title-viewport.is-overflowing
   .thread-title-text {
-  animation: thread-title-scroll var(--thread-title-scroll-duration) ease-in-out
-    forwards;
+  animation: thread-title-scroll var(--thread-title-scroll-duration)
+    var(--ease-standard) forwards;
+}
+
+.thread-row-wrap:hover .thread-title-viewport.is-overflowing,
+.thread-row-wrap:focus-within .thread-title-viewport.is-overflowing {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    var(--text) var(--space-5),
+    var(--text) calc(100% - var(--space-5)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    var(--text) var(--space-5),
+    var(--text) calc(100% - var(--space-5)),
+    transparent 100%
+  );
 }
 
 @keyframes thread-title-scroll {
@@ -2960,10 +3012,29 @@ button:disabled {
   .thread-row-wrap:hover
     .thread-title-viewport.is-overflowing
     .thread-title-text,
+  .thread-row-wrap:focus-within
+    .thread-title-viewport.is-overflowing
+    .thread-title-text,
   .thread-row:focus-visible
     .thread-title-viewport.is-overflowing
     .thread-title-text {
     animation: none;
+  }
+
+  .thread-row-wrap:hover .thread-title-viewport.is-overflowing,
+  .thread-row-wrap:focus-within .thread-title-viewport.is-overflowing {
+    -webkit-mask-image: linear-gradient(
+      to right,
+      var(--text) 0,
+      var(--text) calc(100% - var(--space-8)),
+      transparent 100%
+    );
+    mask-image: linear-gradient(
+      to right,
+      var(--text) 0,
+      var(--text) calc(100% - var(--space-8)),
+      transparent 100%
+    );
   }
 }
 
@@ -12830,14 +12901,17 @@ button:disabled {
 }
 
 .thread-row-wrap {
-  grid-template-columns: minmax(0, 1fr) var(--control-height-sm) 0;
+  grid-template-columns: minmax(0, 1fr) 0 0;
+  transition: grid-template-columns var(--motion-fast) var(--ease-standard);
 }
 
 .project-tasks {
   padding-left: calc(var(--space-12) - var(--space-3));
 }
 
+.thread-row-wrap.has-status,
 .thread-row-wrap:hover,
+.thread-row-wrap:focus-within,
 .thread-row-wrap.menu-open {
   grid-template-columns: minmax(0, 1fr) var(--control-height-sm) 0;
 }
@@ -12849,19 +12923,45 @@ button:disabled {
 }
 
 .thread-row-wrap:hover .thread-row-status:not(.is-processing),
+.thread-row-wrap:focus-within .thread-row-status:not(.is-processing),
 .thread-row-wrap.menu-open .thread-row-status:not(.is-processing) {
   visibility: hidden;
 }
 
 .thread-row-wrap.is-processing:hover .thread-row-menu-wrap,
+.thread-row-wrap.is-processing:focus-within .thread-row-menu-wrap,
 .thread-row-wrap.is-processing.menu-open .thread-row-menu-wrap {
   visibility: hidden;
 }
 
 .thread-row-wrap:hover .thread-row-menu-wrap,
+.thread-row-wrap:focus-within .thread-row-menu-wrap,
 .thread-row-wrap.menu-open .thread-row-menu-wrap {
   grid-column: 2;
   grid-row: 1;
+}
+
+.thread-row-wrap:focus-within .thread-row-more {
+  visibility: visible;
+  opacity: 1;
+}
+
+.thread-row,
+.thread-row-status,
+.thread-row-menu-wrap {
+  grid-row: 1;
+}
+
+.thread-row {
+  grid-column: 1;
+}
+
+.thread-row-status {
+  grid-column: 2;
+}
+
+.thread-row-menu-wrap {
+  grid-column: 3;
 }
 
 .thread-row-status {

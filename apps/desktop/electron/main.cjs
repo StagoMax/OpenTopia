@@ -37,7 +37,6 @@ let defaultBackendUrl =
   process.env.OPENTOPIA_SERVER_URL || "http://127.0.0.1:8787";
 const backendApiToken = crypto.randomBytes(32).toString("base64url");
 const openTopiaProtocol = "opentopia";
-const evalRuntimeFileName = "opentopia-eval-runtime.json";
 
 /*
  * The Windows caption buttons are drawn by the OS, not by our CSS, so they have
@@ -56,6 +55,7 @@ function titleBarOverlayFor(theme) {
 }
 
 let mainWindow = null;
+const appWindows = new Set();
 let backendProcess = null;
 let protocolClientRegistered = false;
 let loggingInitialized = false;
@@ -68,50 +68,6 @@ let desktopBrowserHost = null;
 let desktopBrowserBroker = null;
 let packagedRuntimeBundle = null;
 let packagedRuntimeBundleError = null;
-
-function evalRuntimeFilePath() {
-  return (
-    process.env.OPENTOPIA_EVAL_RUNTIME_FILE ||
-    path.join(app.getPath("userData"), evalRuntimeFileName)
-  );
-}
-
-function writeEvalRuntimeDescriptor() {
-  try {
-    const filePath = evalRuntimeFilePath();
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const descriptor = {
-      schemaVersion: 1,
-      backendUrl: defaultBackendUrl,
-      apiToken: backendApiToken,
-      pid: process.pid,
-      isDev,
-      startedAt: new Date().toISOString(),
-      launcher: process.execPath,
-      launcherArgs:
-        isDev && process.argv[1] ? [path.resolve(process.argv[1])] : [],
-      launcherCwd: process.cwd(),
-    };
-    const temporaryPath = `${filePath}.tmp-${process.pid}`;
-    fs.writeFileSync(temporaryPath, `${JSON.stringify(descriptor)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    fs.renameSync(temporaryPath, filePath);
-  } catch (error) {
-    logConsole("warn", "evaluation.runtime-descriptor.failed", { error });
-  }
-}
-
-function removeEvalRuntimeDescriptor() {
-  try {
-    fs.rmSync(evalRuntimeFilePath(), { force: true });
-  } catch (error) {
-    logConsole("warn", "evaluation.runtime-descriptor.remove-failed", {
-      error,
-    });
-  }
-}
 
 const secretsFilePath = "secrets.json";
 const providerSecretStorageKey = "provider-api-key";
@@ -1186,7 +1142,7 @@ function flushOpenRequestsToRenderer() {
 }
 
 function focusMainWindow() {
-  if (!mainWindow) return false;
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
   if (mainWindow.isMinimized()) mainWindow.restore();
   if (!mainWindow.isVisible()) mainWindow.show();
   mainWindow.focus();
@@ -1545,7 +1501,6 @@ async function startBackendIfNeeded({
   attempts = backendHealthAttempts,
 } = {}) {
   if (await isBackendHealthy()) {
-    writeEvalRuntimeDescriptor();
     return;
   }
 
@@ -1614,7 +1569,6 @@ async function startBackendIfNeeded({
       windowsHide: true,
     });
     backendProcess = spawnedBackend;
-    writeEvalRuntimeDescriptor();
 
     writeLog("info", "backend.spawn.started", {
       pid: backendProcess.pid,
@@ -1745,7 +1699,7 @@ function createMainWindow() {
     pendingOpenRequests: openRequestHistory.length,
   });
 
-  mainWindow = new BrowserWindow({
+  const createdWindow = new BrowserWindow({
     width: 1440,
     height: 900,
     minWidth: 1080,
@@ -1767,47 +1721,62 @@ function createMainWindow() {
     },
   });
 
-  desktopBrowserHost?.attachWindow(mainWindow);
+  appWindows.add(createdWindow);
+  mainWindow = createdWindow;
+  desktopBrowserHost?.attachWindow(createdWindow);
+
+  createdWindow.on("focus", () => {
+    if (createdWindow.isDestroyed() || mainWindow === createdWindow) return;
+    mainWindow = createdWindow;
+    desktopBrowserHost?.attachWindow(createdWindow);
+  });
 
   if (isDev) {
-    mainWindow.on("page-title-updated", (event) => {
+    createdWindow.on("page-title-updated", (event) => {
       event.preventDefault();
-      mainWindow?.setTitle("OpenTopia Dev");
+      createdWindow.setTitle("OpenTopia Dev");
     });
   }
 
-  mainWindow.once("ready-to-show", () => {
-    mainWindow.show();
-    focusMainWindow();
+  createdWindow.once("ready-to-show", () => {
+    createdWindow.show();
+    createdWindow.focus();
     flushOpenRequestsToRenderer();
   });
 
-  mainWindow.webContents.once("did-finish-load", () => {
+  createdWindow.webContents.once("did-finish-load", () => {
     writeLog("info", "window.load.finished", {
-      url: mainWindow?.webContents.getURL(),
+      url: createdWindow.webContents.getURL(),
       pendingOpenRequests: openRequestHistory.length,
     });
     flushOpenRequestsToRenderer();
   });
 
-  mainWindow.on("closed", () => {
+  createdWindow.on("closed", () => {
     writeLog("info", "window.closed");
-    mainWindow = null;
+    appWindows.delete(createdWindow);
+    if (mainWindow !== createdWindow) return;
+    mainWindow = [...appWindows].at(-1) ?? null;
+    if (mainWindow) desktopBrowserHost?.attachWindow(mainWindow);
   });
 
   if (isDev) {
-    mainWindow.loadURL(
+    createdWindow.loadURL(
       process.env.VITE_DEV_SERVER_URL || "http://127.0.0.1:5173",
     );
-    mainWindow.webContents.openDevTools({ mode: "detach" });
+    createdWindow.webContents.openDevTools({ mode: "detach" });
   } else {
-    mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+    createdWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   }
 
-  updater.setupAutoUpdater(mainWindow);
-  if (!isDev) {
+  if (appWindows.size === 1) {
+    updater.setupAutoUpdater(createdWindow);
+  }
+  if (!isDev && appWindows.size === 1) {
     updater.checkForUpdates();
   }
+
+  return createdWindow;
 }
 
 function resolveRepoRoot() {
@@ -1923,6 +1892,33 @@ function registerOpenTopiaProtocolClient() {
 }
 
 function registerIpc() {
+  ipcMain.handle("platform:new-window", (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || !appWindows.has(owner)) {
+      throw new Error("New windows can be opened only by an application window");
+    }
+    createMainWindow();
+    return true;
+  });
+
+  ipcMain.handle("platform:close-window", (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || !appWindows.has(owner)) {
+      throw new Error("Only an application window can close itself");
+    }
+    owner.close();
+    return true;
+  });
+
+  ipcMain.handle("platform:quit", (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || !appWindows.has(owner)) {
+      throw new Error("Only an application window can quit the application");
+    }
+    app.quit();
+    return true;
+  });
+
   ipcMain.handle("platform:get-info", () => ({
     platform: "desktop",
     os: process.platform,
@@ -2386,7 +2382,6 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
-  removeEvalRuntimeDescriptor();
   void desktopBrowserHost?.close().catch((error) => {
     logConsole("warn", "browser.host.close.failed", { error });
   });
