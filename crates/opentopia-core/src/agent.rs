@@ -5,8 +5,12 @@ use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime};
 use crate::effect_journal::{EffectIntent, EffectKind, EffectSideEffectClass, EffectStatus};
 use crate::enterprise::CapabilityProjection;
+use crate::execution_authorization::{ExecutionGrant, NetworkAccess};
 use crate::flow::GraphNodeKindV1;
-use crate::flow_runtime::{FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness};
+use crate::flow_runtime::{
+    FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness,
+    FlowTranscriptEntryKindV1, FlowTranscriptEntryV1,
+};
 use crate::guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext,
     GuardianReviewSessionManager, GuardianReviewStatus, GuardianRolloutDecision,
@@ -16,14 +20,17 @@ use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
     AgentEventPayload, ApprovalStatus, CollaborationMode, GoalRecord, Message, MessagePart,
-    MessageRole, ModelContentPart, TaskPlan, TaskPlanStepStatus, ThreadModelSelection, ToolCall,
-    ToolResult, UserInputRequest, UserInputResponse,
+    MessageRole, ModelContentPart, TaskEvidenceKind, TaskPlan, TaskPlanStepStatus,
+    ThreadModelSelection, ToolCall, ToolResult, UserInputRequest, UserInputResponse,
 };
 use crate::model_context::{
     content_fingerprint, CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole,
     ContextSensitivity, ModelContextItem,
 };
-use crate::policy::{approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode};
+use crate::policy::{
+    approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode, PolicyDecision,
+    PolicyEngine,
+};
 use crate::prompt_runtime::{
     compile_runtime_prompt_modules, AgentRuntimeSettings, MultiAgentMode,
     PromptRuntimeCapabilities, RuntimeSurface,
@@ -37,14 +44,14 @@ use crate::provider::{
 };
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::settings::{AppSettings, RolloutBudgetSettings};
-use crate::skill_authoring::skill_target_path;
-use crate::skills::SkillScope;
 use crate::store::{ProviderContextStateKind, SessionStore};
 use crate::subagents::{SubagentScheduler, SubagentScope};
 use crate::tools::{
-    browser_handoff_required, McpToolWrapper, ToolContext, ToolRegistry, ToolSideEffect, ToolSource,
+    browser_handoff_required, mcp_tool_declares_image_inspection, McpToolWrapper, ToolContext,
+    ToolRegistry, ToolSideEffect, ToolSource,
 };
 use anyhow::Context;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -106,6 +113,9 @@ const STALL_REPEAT_THRESHOLD: usize = 3;
 /// Invalid calls are never useful polling. Stop the turn once a provider repeats
 /// the exact same schema-invalid call instead of spending the rollout budget on it.
 const INVALID_TOOL_CALL_REPEAT_LIMIT: usize = 3;
+/// Keep independent observations bounded so a provider cannot fan out an
+/// unbounded number of filesystem/process reads in one model round.
+const MAX_PARALLEL_READ_ONLY_TOOL_CALLS: usize = 8;
 /// Repeating a call a few times early in a turn is normal, so detection only starts
 /// once enough rounds exist to form a pattern.
 const MIN_ROUNDS_BEFORE_STALL_DETECTION: usize = 6;
@@ -319,7 +329,10 @@ impl TurnEvents {
         }
     }
 
-    fn push(&mut self, payload: AgentEventPayload) {
+    fn push(&mut self, mut payload: AgentEventPayload) {
+        if let AgentEventPayload::ToolCallFinished { result } = &mut payload {
+            ensure_tool_error_record(result);
+        }
         if let Some(sender) = &self.sender {
             let _ = sender.send(payload.clone());
         }
@@ -848,14 +861,14 @@ impl AgentCore {
 You are planning goal {goal_id}: {objective}
 Investigate the workspace using only the tools exposed by the runtime. This mode is strictly read-only: do not execute commands, change files, open interactive browser sessions, or delegate work.
 Before creating the plan, identify any unresolved choice that would materially change architecture, scope, product behavior, dependencies, or risk. If the user has not already made those choices, call request_user_input with one to three concise questions and concrete trade-off descriptions. Do not ask those questions in ordinary assistant text, do not invent a preference, and do not ask about trivial implementation details. After the user's structured answers return, continue investigating if needed.
-When the material decisions are resolved, call set_plan exactly once with goal_id "{goal_id}", the current expected_revision, a complete dependency-aware DAG, and measurable acceptance criteria. Keep every step pending. Do not perform any step from the plan. Your final response should summarize the proposed plan and important risks or decisions."#,
+When the material decisions are resolved, call set_plan exactly once with goal_id "{goal_id}", the current expected_revision, the complete currently known requirements and their source references, a complete dependency-aware DAG, explicit step-to-requirement coverage, and measurable acceptance criteria. Keep every step pending. Do not perform any step from the plan. Your final response should summarize the proposed plan and important risks or decisions."#,
                     goal_id = goal.id,
                     objective = goal.objective,
                 ),
                 CollaborationMode::Goal => format!(
                     r#"[Goal collaboration mode]
 You are executing persistent goal {goal_id}: {objective}
-The server owns this exact goal id. If no plan exists, call set_plan first with goal_id "{goal_id}". Use the DAG as durable external memory: keep the work you have committed to current, respect dependencies, and attach concrete evidence when resolving steps. You may reorder or work on independent runnable steps together when that improves the outcome; update the plan when evidence changes the approach instead of following stale sequencing. If a step cannot proceed, resolve it explicitly as blocked, deferred, or cancelled with a status_reason. Continue until every committed step is resolved. Call complete_task only after the runtime plan has no actionable steps and all completed steps have evidence."#,
+The server owns this exact goal id. If no plan exists, call set_plan first with goal_id "{goal_id}", the complete currently known requirements and source references, and explicit step-to-requirement coverage. Use the DAG as durable external memory: keep the work you have committed to current, respect dependencies, and attach structured references to successful implementation or observation and verification tool results when resolving steps. Replace the requirement set before claiming completion when later evidence changes scope. You may reorder or work on independent runnable steps together when that improves the outcome; update the plan when evidence changes the approach instead of following stale sequencing. If a step cannot proceed, resolve it explicitly as blocked, deferred, or cancelled with a status_reason. Continue until every committed step is resolved. Call complete_task only after the runtime plan has no actionable steps and all completed steps have current tool-backed evidence."#,
                     goal_id = goal.id,
                     objective = goal.objective,
                 ),
@@ -875,7 +888,6 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 "list_files",
                 "read_attachment",
                 "view_attachment",
-                "analyze_attachment",
                 "read_file",
                 "read_files",
                 "search",
@@ -1238,6 +1250,118 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     })),
                     "reason": "Every pending step must be completed or explicitly resolved as deferred, blocked, or cancelled before finalizing.",
                 }));
+            }
+            if self.collaboration_mode != CollaborationMode::Plan {
+                if let Some(coverage) = plan.coverage.as_ref() {
+                    let successful_tool_call_ids =
+                        successful_provider_tool_call_ids(store, thread_id, events)?;
+                    let completed_step_ids = plan
+                        .steps
+                        .iter()
+                        .filter(|step| step.status == TaskPlanStepStatus::Completed)
+                        .map(|step| step.id.as_str())
+                        .collect::<HashSet<_>>();
+                    let covered_requirement_ids = coverage
+                        .step_requirements
+                        .values()
+                        .flatten()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>();
+                    let uncovered = coverage
+                        .requirements
+                        .iter()
+                        .filter(|requirement| {
+                            !covered_requirement_ids.contains(requirement.id.as_str())
+                        })
+                        .map(|requirement| requirement.id.clone())
+                        .collect::<Vec<_>>();
+                    if !uncovered.is_empty() {
+                        blockers.push(json!({
+                            "kind": "requirements_uncovered",
+                            "requirementIds": uncovered,
+                            "requirementsRevision": coverage.requirements_revision,
+                        }));
+                    }
+
+                    let invalid_evidence = coverage
+                        .evidence_refs
+                        .iter()
+                        .filter(|evidence| {
+                            evidence.requirements_revision != coverage.requirements_revision
+                                || !completed_step_ids.contains(evidence.step_id.as_str())
+                                || !successful_tool_call_ids.contains(&evidence.tool_call_id)
+                        })
+                        .map(|evidence| {
+                            json!({
+                                "stepId": evidence.step_id,
+                                "requirementId": evidence.requirement_id,
+                                "kind": evidence.kind,
+                                "toolCallId": evidence.tool_call_id,
+                                "evidenceRevision": evidence.requirements_revision,
+                                "currentRequirementsRevision": coverage.requirements_revision,
+                                "completedStep": completed_step_ids.contains(evidence.step_id.as_str()),
+                                "successfulToolResult": successful_tool_call_ids.contains(&evidence.tool_call_id),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if !invalid_evidence.is_empty() {
+                        blockers.push(json!({
+                            "kind": "plan_evidence_invalid",
+                            "evidence": invalid_evidence,
+                            "reason": "Evidence must reference a successful recorded tool result for a completed step at the current requirements revision.",
+                        }));
+                    }
+
+                    let valid_evidence = coverage
+                        .evidence_refs
+                        .iter()
+                        .filter(|evidence| {
+                            evidence.requirements_revision == coverage.requirements_revision
+                                && completed_step_ids.contains(evidence.step_id.as_str())
+                                && successful_tool_call_ids.contains(&evidence.tool_call_id)
+                        })
+                        .collect::<Vec<_>>();
+                    let missing_fulfillment = coverage
+                        .requirements
+                        .iter()
+                        .filter(|requirement| {
+                            !valid_evidence.iter().any(|evidence| {
+                                evidence.requirement_id == requirement.id
+                                    && matches!(
+                                        evidence.kind,
+                                        TaskEvidenceKind::Implementation
+                                            | TaskEvidenceKind::Observation
+                                    )
+                            })
+                        })
+                        .map(|requirement| requirement.id.clone())
+                        .collect::<Vec<_>>();
+                    if !missing_fulfillment.is_empty() {
+                        blockers.push(json!({
+                            "kind": "requirement_fulfillment_evidence_missing",
+                            "requirementIds": missing_fulfillment,
+                            "reason": "Each requirement needs current successful implementation or observation evidence.",
+                        }));
+                    }
+                    let missing_verification = coverage
+                        .requirements
+                        .iter()
+                        .filter(|requirement| {
+                            !valid_evidence.iter().any(|evidence| {
+                                evidence.requirement_id == requirement.id
+                                    && evidence.kind == TaskEvidenceKind::Verification
+                            })
+                        })
+                        .map(|requirement| requirement.id.clone())
+                        .collect::<Vec<_>>();
+                    if !missing_verification.is_empty() {
+                        blockers.push(json!({
+                            "kind": "requirement_verification_evidence_missing",
+                            "requirementIds": missing_verification,
+                            "reason": "Each requirement needs current successful verification evidence; global checks alone do not prove individual coverage.",
+                        }));
+                    }
+                }
             }
         }
         let mut agent_delivery = None;
@@ -1916,6 +2040,75 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         }
     }
 
+    fn parallel_read_only_batch_len(
+        &self,
+        calls: &[ProviderToolCall],
+        workspace_root: &Path,
+        permission_mode: PermissionMode,
+    ) -> usize {
+        let policy_engine = BasicPolicyEngine::new_with_sandbox_config(
+            workspace_root.to_path_buf(),
+            permission_mode,
+            &self.sandbox_config,
+        );
+        let mut resource_keys = HashSet::new();
+        let mut batch_len = 0;
+
+        for provider_call in calls.iter().take(MAX_PARALLEL_READ_ONLY_TOOL_CALLS) {
+            if !self.tool_is_allowed(&provider_call.name)
+                || self.tools.source(&provider_call.name) != Some(ToolSource::Core)
+                || self.provider_tool_input_error(provider_call).is_some()
+            {
+                break;
+            }
+            let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
+            let Some(tool) = self.tools.get(&provider_call.name) else {
+                break;
+            };
+            let execution_policy = tool.execution_policy(&call);
+            if !execution_policy.read_only
+                || !execution_policy.parallel_safe
+                || execution_policy.side_effect != ToolSideEffect::None
+            {
+                break;
+            }
+
+            // Scheduling is allowed only after the same read boundaries used by
+            // the tools are known to be approval-free. An outside-workspace read
+            // therefore stays on the existing sequential approval path.
+            let intent = tool.execution_intent(&call, workspace_root);
+            if intent.network != NetworkAccess::Deny
+                || !intent.requested_write_paths.is_empty()
+                || intent.requested_read_paths.iter().any(|path| {
+                    if path
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                    {
+                        return true;
+                    }
+                    let resolved = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        workspace_root.join(path)
+                    };
+                    !matches!(policy_engine.inspect_read(&resolved), PolicyDecision::Allow)
+                })
+            {
+                break;
+            }
+
+            let conflicts = execution_policy.resource_keys.iter().any(|key| {
+                key == "*" || resource_keys.contains("*") || resource_keys.contains(key)
+            });
+            if conflicts {
+                break;
+            }
+            resource_keys.extend(execution_policy.resource_keys);
+            batch_len += 1;
+        }
+        batch_len
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn continue_provider_turn(
         &self,
@@ -1947,7 +2140,105 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         events: &mut TurnEvents,
     ) -> anyhow::Result<AgentTurnResult> {
         loop {
-            while let Some(provider_call) = pending_tool_calls.first().cloned() {
+            while !pending_tool_calls.is_empty() {
+                let parallel_batch_len = self.parallel_read_only_batch_len(
+                    &pending_tool_calls,
+                    &workspace_root,
+                    permission_mode,
+                );
+                if parallel_batch_len >= 2 {
+                    let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+                        workspace_root.clone(),
+                        permission_mode,
+                        &self.sandbox_config,
+                    ));
+                    let mut base_ctx = ToolContext::local_with_sandbox_config(
+                        workspace_root.clone(),
+                        policy,
+                        self.sandbox_config.clone(),
+                    );
+                    base_ctx.permission_mode = permission_mode;
+                    base_ctx.store = store.clone();
+                    base_ctx.thread_id = Some(thread_id);
+                    base_ctx.cancel = cancellation.clone();
+                    base_ctx.browser = Some(self.browser.clone());
+                    base_ctx.computer = Some(self.computer.clone());
+                    base_ctx.capability_projection = self.capability_projection.clone();
+                    self.apply_subagent_context(&mut base_ctx, user_message_id);
+                    base_ctx.fork_conversation = conversation.clone();
+                    base_ctx.fork_conversation.push(ModelConversationMessage {
+                        role: ModelConversationRole::User,
+                        content: model_user_message.clone(),
+                        content_parts: model_user_content.clone(),
+                    });
+                    base_ctx.fork_model_context = Some(model_context.clone());
+                    base_ctx.current_task_plan = current_task_plan_for_tool(&base_ctx, events)?;
+
+                    let calls = pending_tool_calls[..parallel_batch_len].to_vec();
+                    let event_sender = events.sender.clone();
+                    let executions = calls.iter().cloned().map(|provider_call| {
+                        let ctx = base_ctx.clone();
+                        let sender = event_sender.clone();
+                        async move {
+                            let mut local_events = TurnEvents::new(sender);
+                            let result = self
+                                .execute_provider_tool_call(
+                                    &provider_call,
+                                    user_message_id,
+                                    ctx,
+                                    &mut local_events,
+                                )
+                                .await;
+                            (provider_call, result, local_events)
+                        }
+                    });
+                    let outcomes = join_all(executions).await;
+
+                    // Live subscribers received each event as it happened. Keep
+                    // the durable turn transcript deterministic in provider-call
+                    // order without sending the events a second time.
+                    for (_, _, local_events) in &outcomes {
+                        events.items.extend(local_events.items.iter().cloned());
+                    }
+                    for (provider_call, result, _) in outcomes {
+                        let result = result.with_context(|| {
+                            format!(
+                                "parallel read-only tool `{}` failed before returning a tool result",
+                                provider_call.name
+                            )
+                        })?;
+                        let user_input_request = result
+                            .metadata
+                            .get("userInputRequest")
+                            .cloned()
+                            .map(serde_json::from_value::<UserInputRequest>)
+                            .transpose()?;
+                        anyhow::ensure!(
+                            user_input_request.is_none(),
+                            "parallel-safe read-only tool `{}` unexpectedly requested user input",
+                            provider_call.name
+                        );
+                        if let Some(ref mut budget) = budget {
+                            budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
+                        }
+                        if self.reveal_tools_from_search_result(&result, &mut tool_candidates) {
+                            compatibility_hash = provider_compatibility_hash(
+                                &model_context,
+                                context_summary.as_deref(),
+                                &tool_candidates,
+                                branch_developer_instructions.as_deref(),
+                            );
+                        }
+                        provider_tool_results.push(result);
+                    }
+                    pending_tool_calls.drain(..parallel_batch_len);
+                    continue;
+                }
+
+                let provider_call = pending_tool_calls
+                    .first()
+                    .cloned()
+                    .expect("non-empty pending tool-call queue");
                 let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
                     workspace_root.clone(),
                     permission_mode,
@@ -2588,6 +2879,13 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             .filter(|name| subagents_available || !is_subagent_tool(name))
             .filter(|name| structured_input_available || name.as_str() != "request_user_input")
             .filter(|name| self.tool_is_allowed(name))
+            // MCP tools bound as attachment-inspection backends are implementation
+            // details of view_attachment, not a competing model-visible route.
+            .filter(|name| {
+                !self.active_mcp_tools.iter().any(|tool| {
+                    tool.public_name == *name && mcp_tool_declares_image_inspection(tool)
+                })
+            })
             .filter_map(|name| {
                 self.tools.get(&name).map(|tool| ProviderToolCandidate {
                     name,
@@ -2790,8 +3088,19 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         approval_source: &str,
         events: &mut TurnEvents,
     ) -> anyhow::Result<ProviderToolResult> {
-        let approved_sandbox =
-            approved_sandbox_config_for_call(&self.sandbox_config, workspace_root, call);
+        let tool_call = ToolCall::new(&call.name, call.arguments.clone());
+        let execution_intent = self
+            .tools
+            .get(&call.name)
+            .map(|tool| tool.execution_intent(&tool_call, workspace_root))
+            .unwrap_or_default();
+        let approved_sandbox = ExecutionGrant::resolve(
+            &self.sandbox_config,
+            workspace_root,
+            &execution_intent,
+            true,
+        )?
+        .sandbox;
         let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
             workspace_root.to_path_buf(),
             permission_mode,
@@ -2833,6 +3142,14 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     "sandboxEscalation": "denied",
                     "sandboxEscalationDenied": true,
                 });
+                insert_tool_error_record(
+                    &mut metadata,
+                    "sandbox_escalation_denied",
+                    "authorization",
+                    false,
+                    false,
+                    &output,
+                );
                 self.insert_tool_source_metadata(&call.name, &mut metadata);
                 Ok(ProviderToolResult {
                     call_id: call.id.clone(),
@@ -2879,6 +3196,14 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 "invalidToolArguments": true,
                 "inputSchemaValidationError": validation_error,
             });
+            insert_tool_error_record(
+                &mut metadata,
+                "invalid_tool_arguments",
+                "validation",
+                false,
+                false,
+                &output,
+            );
             self.insert_tool_source_metadata(&provider_call.name, &mut metadata);
             let result = ProviderToolResult {
                 call_id: provider_call.id.clone(),
@@ -2950,22 +3275,30 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                         } else {
                             "a previous attempt may have produced a non-idempotent side effect"
                         };
+                        let output = format!(
+                            "Tool execution requires reconciliation: {reason}. Inspect the target state or ask the user before attempting the action again."
+                        );
+                        let mut metadata = json!({
+                            "success": false,
+                            "effectId": prepared.effect_id,
+                            "effectStatus": prepared.status,
+                            "reconciliationRequired": true,
+                        });
+                        insert_tool_error_record(
+                            &mut metadata,
+                            "effect_reconciliation_required",
+                            "preflight",
+                            false,
+                            true,
+                            &output,
+                        );
                         let blocked = ProviderToolResult {
                             call_id: provider_call.id.clone(),
                             name: provider_call.name.clone(),
-                            output: format!(
-                                "Tool execution requires reconciliation: {reason}. Inspect the target state or ask the user before attempting the action again."
-                            ),
-                            content: vec![ModelContentPart::text(format!(
-                                "Tool execution requires reconciliation: {reason}. Inspect the target state or ask the user before attempting the action again."
-                            ))],
+                            output: output.clone(),
+                            content: vec![ModelContentPart::text(output)],
                             is_error: true,
-                            metadata: json!({
-                                "success": false,
-                                "effectId": prepared.effect_id,
-                                "effectStatus": prepared.status,
-                                "reconciliationRequired": true,
-                            }),
+                            metadata,
                         };
                         record_provider_tool_result_event(events, call, &blocked);
                         return Ok(blocked);
@@ -3006,6 +3339,14 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     "success": false,
                     "error": err.to_string()
                 });
+                insert_tool_error_record(
+                    &mut metadata,
+                    "tool_execution_failed",
+                    "execution",
+                    true,
+                    false,
+                    &err.to_string(),
+                );
                 self.insert_tool_source_metadata(&provider_call.name, &mut metadata);
                 Ok(ProviderToolResult {
                     call_id: provider_call.id.clone(),
@@ -3068,7 +3409,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             .map_or(MAX_TOOL_SEARCH_RESULTS, |value| value as usize)
             .clamp(1, MAX_TOOL_SEARCH_RESULTS);
 
-        let result = if !search_is_exposed {
+        let mut result = if !search_is_exposed {
             ToolResult {
                 call_id: call.id,
                 output: "tool_search is unavailable because the full eligible tool catalog is already exposed".to_string(),
@@ -3119,6 +3460,15 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 }),
             }
         };
+        if tool_result_is_error(&result) {
+            let (code, phase) = if search_is_exposed {
+                ("invalid_tool_arguments", "validation")
+            } else {
+                ("tool_unavailable", "dispatch")
+            };
+            let message = result.output.clone();
+            insert_tool_error_record(&mut result.metadata, code, phase, false, false, &message);
+        }
         events.push(AgentEventPayload::ToolCallFinished {
             result: result.clone(),
         });
@@ -3159,6 +3509,14 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 "success": false,
                 "error": err.to_string()
             });
+            insert_tool_error_record(
+                &mut metadata,
+                "tool_disabled",
+                "dispatch",
+                false,
+                false,
+                &err.to_string(),
+            );
             self.insert_tool_source_metadata(&name, &mut metadata);
             insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
             merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
@@ -3182,6 +3540,14 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     "success": false,
                     "error": err.to_string()
                 });
+                insert_tool_error_record(
+                    &mut metadata,
+                    "tool_not_registered",
+                    "dispatch",
+                    false,
+                    false,
+                    &err.to_string(),
+                );
                 self.insert_tool_source_metadata(&name, &mut metadata);
                 insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
                 merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
@@ -3257,6 +3623,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         insert_approval_execution_metadata(&mut result.metadata, approval_granted, None);
         merge_metadata_overlay(&mut result.metadata, metadata_overlay.as_ref());
         insert_task_plan_step_metadata(&mut result.metadata, active_plan_step_id.as_deref());
+        ensure_tool_error_record(&mut result);
         events.push(AgentEventPayload::ToolCallFinished {
             result: result.clone(),
         });
@@ -3325,6 +3692,7 @@ impl FlowNodeHarness for AgentCore {
                     })),
                 )
                 .await?;
+            let transcript = flow_transcript_from_events(&events.items);
             anyhow::ensure!(
                 !tool_result_is_error(&result),
                 "Flow tool node {tool_name} returned an error: {}",
@@ -3335,6 +3703,7 @@ impl FlowNodeHarness for AgentCore {
             return Ok(FlowNodeExecutionResultV1 {
                 output,
                 tool_calls: agent.tool_calls_used(),
+                transcript,
             });
         }
 
@@ -3478,8 +3847,52 @@ impl FlowNodeHarness for AgentCore {
         anyhow::ensure!(!text.trim().is_empty(), "Flow node returned no output");
         let output = serde_json::from_str(text.trim()).unwrap_or_else(|_| json!({"text": text}));
         let tool_calls = agent.tool_calls_used();
-        Ok(FlowNodeExecutionResultV1 { output, tool_calls })
+        let transcript = flow_transcript_from_events(&result.events);
+        Ok(FlowNodeExecutionResultV1 {
+            output,
+            tool_calls,
+            transcript,
+        })
     }
+}
+
+fn flow_transcript_from_events(events: &[AgentEventPayload]) -> Vec<FlowTranscriptEntryV1> {
+    let mut tool_names = BTreeMap::new();
+    let mut transcript = Vec::new();
+    for event in events {
+        match event {
+            AgentEventPayload::ToolCallStarted { call } => {
+                tool_names.insert(call.id, call.name.clone());
+                transcript.push(FlowTranscriptEntryV1::tool(
+                    FlowTranscriptEntryKindV1::ToolCall,
+                    call.name.clone(),
+                    call.id,
+                    call.input.clone(),
+                    false,
+                ));
+            }
+            AgentEventPayload::ToolCallFinished { result } => {
+                let tool_name = tool_names
+                    .get(&result.call_id)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".to_string());
+                let output = serde_json::from_str(&result.output)
+                    .unwrap_or_else(|_| json!({"text": result.output}));
+                transcript.push(FlowTranscriptEntryV1::tool(
+                    FlowTranscriptEntryKindV1::ToolResult,
+                    tool_name,
+                    result.call_id,
+                    json!({
+                        "output": output,
+                        "metadata": result.metadata,
+                    }),
+                    tool_result_is_error(result),
+                ));
+            }
+            _ => {}
+        }
+    }
+    transcript
 }
 
 fn insert_task_plan_step_metadata(metadata: &mut Value, step_id: Option<&str>) {
@@ -3802,6 +4215,50 @@ fn latest_task_plan(
             })
         })
         .map(TaskPlan::normalize_legacy)
+}
+
+fn successful_provider_tool_call_ids(
+    store: Option<&Arc<dyn SessionStore>>,
+    thread_id: Uuid,
+    events: &TurnEvents,
+) -> anyhow::Result<HashSet<String>> {
+    fn collect(payload: &AgentEventPayload, ids: &mut HashSet<String>) {
+        let AgentEventPayload::ToolCallFinished { result } = payload else {
+            return;
+        };
+        if tool_result_is_error(result) {
+            return;
+        }
+        let tool_name = result
+            .metadata
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if matches!(
+            tool_name,
+            "set_plan" | "update_plan" | "complete_task" | FINALIZATION_GUARD_TOOL_NAME
+        ) {
+            return;
+        }
+        if let Some(call_id) = result
+            .metadata
+            .get("providerToolCallId")
+            .and_then(Value::as_str)
+        {
+            ids.insert(call_id.to_string());
+        }
+    }
+
+    let mut ids = HashSet::new();
+    if let Some(store) = store {
+        for event in store.list_events(thread_id, None)? {
+            collect(&event.payload, &mut ids);
+        }
+    }
+    for event in &events.items {
+        collect(event, &mut ids);
+    }
+    Ok(ids)
 }
 
 fn latest_task_plan_from_store(
@@ -4375,80 +4832,6 @@ fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
     }
 }
 
-fn approved_sandbox_config_for_call(
-    base: &LocalSandboxConfig,
-    workspace_root: &Path,
-    call: &ProviderToolCall,
-) -> LocalSandboxConfig {
-    let mut config = base.clone();
-    let path = |key: &str| {
-        call.arguments
-            .get(key)
-            .and_then(Value::as_str)
-            .map(|value| approval_path(workspace_root, value))
-    };
-
-    match call.name.as_str() {
-        "shell" | "apply_patch" => {
-            config = LocalSandboxConfig::danger_full_access();
-        }
-        "list_files" | "read_file" | "search" => {
-            if let Some(path) = path("path") {
-                config.grant_read_path(path);
-            }
-        }
-        "read_files" => {
-            for value in call
-                .arguments
-                .get("files")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|item| item.get("path").and_then(Value::as_str))
-            {
-                config.grant_read_path(approval_path(workspace_root, value));
-            }
-        }
-        "write_file" => {
-            if let Some(path) = path("path") {
-                config.grant_write_path(path);
-            }
-        }
-        "create_skill" => {
-            let scope = match call.arguments.get("scope").and_then(Value::as_str) {
-                Some("workspace") => SkillScope::Workspace,
-                _ => SkillScope::User,
-            };
-            if let Some(name) = call.arguments.get("name").and_then(Value::as_str) {
-                let workspace = (scope == SkillScope::Workspace).then_some(workspace_root);
-                if let Ok(target) = skill_target_path(scope, workspace, name) {
-                    config.grant_write_path(target);
-                }
-            }
-        }
-        "spreadsheet" => {
-            if let Some(path) = path("path").or_else(|| path("sourcePath")) {
-                config.grant_read_path(path);
-            }
-            if let Some(path) = path("outputPath") {
-                config.grant_write_path(path);
-            }
-        }
-        _ => {}
-    }
-
-    config
-}
-
-fn approval_path(workspace_root: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        workspace_root.join(path)
-    }
-}
-
 fn tool_result_is_error(result: &ToolResult) -> bool {
     result
         .metadata
@@ -4460,6 +4843,83 @@ fn tool_result_is_error(result: &ToolResult) -> bool {
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+}
+
+fn insert_tool_error_record(
+    metadata: &mut Value,
+    code: &str,
+    phase: &str,
+    executed: bool,
+    retryable: bool,
+    message: &str,
+) {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object.insert("success".to_string(), json!(false));
+    object
+        .entry("error".to_string())
+        .or_insert_with(|| json!(message));
+    object.insert(
+        "errorRecord".to_string(),
+        json!({
+            "recorded": true,
+            "code": code,
+            "phase": phase,
+            "executed": executed,
+            "retryable": retryable,
+            "message": message,
+        }),
+    );
+}
+
+fn ensure_tool_error_record(result: &mut ToolResult) {
+    if !tool_result_is_error(result) || result.metadata.get("errorRecord").is_some() {
+        return;
+    }
+    let (code, phase, executed, retryable) = if result
+        .metadata
+        .get("invalidToolArguments")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        ("invalid_tool_arguments", "validation", false, false)
+    } else if result
+        .metadata
+        .get("reconciliationRequired")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        ("effect_reconciliation_required", "preflight", false, true)
+    } else if result.metadata.get("flowToolCallBudget").is_some() {
+        ("tool_budget_exhausted", "scheduling", false, false)
+    } else if result
+        .metadata
+        .get("approvalRequired")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        ("approval_required", "authorization", false, true)
+    } else {
+        ("tool_execution_failed", "execution", true, false)
+    };
+    let message = result
+        .metadata
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or(&result.output)
+        .to_string();
+    insert_tool_error_record(
+        &mut result.metadata,
+        code,
+        phase,
+        executed,
+        retryable,
+        &message,
+    );
 }
 
 fn effect_side_effect_class(side_effect: ToolSideEffect) -> EffectSideEffectClass {
@@ -4558,6 +5018,11 @@ mod tests {
         requires_approval: bool,
     }
 
+    struct ParallelObservationTestTool {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl Tool for JournalTestTool {
         fn name(&self) -> &str {
@@ -4590,6 +5055,48 @@ mod tests {
             Ok(ToolResult::text(
                 call.id,
                 "executed",
+                json!({ "success": true }),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ParallelObservationTestTool {
+        fn name(&self) -> &str {
+            "parallel_observation_test"
+        }
+
+        fn description(&self) -> &str {
+            "Test-only bounded read-only observation."
+        }
+
+        fn schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": { "resource": { "type": "string" } },
+                "required": ["resource"],
+                "additionalProperties": false
+            })
+        }
+
+        fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::read_only(vec![format!(
+                "test:{}",
+                call.input
+                    .get("resource")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+            )])
+        }
+
+        async fn execute(&self, call: ToolCall, _ctx: ToolContext) -> anyhow::Result<ToolResult> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolResult::text(
+                call.id,
+                "observed",
                 json!({ "success": true }),
             ))
         }
@@ -4669,6 +5176,50 @@ mod tests {
         assert!(agent.reveal_tools_from_search_result(&result, &mut exposed));
         assert!(exposed.iter().any(|tool| tool.name == "mcp_issue_lookup"));
         assert!(!exposed.iter().any(|tool| tool.name == "mcp_invoice_send"));
+    }
+
+    #[test]
+    fn attachment_capability_backend_is_hidden_behind_view_attachment() {
+        let public_name = "opaque_server__run";
+        let mut registry = ToolRegistry::with_builtins();
+        registry.insert_mcp(
+            public_name.to_string(),
+            Arc::new(CatalogTestTool {
+                name: public_name.to_string(),
+                description: "Process a supplied asset".to_string(),
+            }),
+        );
+        let mut agent = AgentCore::new(Arc::new(MockProvider), registry);
+        agent.active_mcp_tools = vec![McpToolDescriptor {
+            public_name: public_name.to_string(),
+            server_id: Uuid::new_v4(),
+            tool_name: "run".to_string(),
+            description: Some("Process a supplied asset".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "image": { "type": "object" },
+                    "focus": { "type": "string" }
+                }
+            }),
+            annotations: json!({ "readOnlyHint": true }),
+            meta: json!({
+                "com.opentopia/capabilities": ["media.image.inspect/v1"]
+            }),
+            permission_labels: vec!["read".to_string()],
+        }];
+
+        let exposed = agent
+            .provider_tool_catalog()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+        assert!(exposed.contains("view_attachment"));
+        assert!(!exposed.contains(public_name));
+        assert!(agent
+            .search_deferred_tools("asset image", 10)
+            .iter()
+            .all(|tool| tool.name != public_name));
     }
 
     #[tokio::test]
@@ -5040,6 +5591,127 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parallel_batch_selection_requires_independent_approval_free_core_reads() {
+        let workspace = test_workspace("parallel-batch-selection");
+        let agent = AgentCore::new(Arc::new(MockProvider), ToolRegistry::with_core_tools());
+        let read = |id: &str, path: &str| ProviderToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": path }),
+        };
+
+        assert_eq!(
+            agent.parallel_read_only_batch_len(
+                &[read("a", "a.txt"), read("b", "b.txt")],
+                &workspace,
+                PermissionMode::Approve,
+            ),
+            2
+        );
+        assert_eq!(
+            agent.parallel_read_only_batch_len(
+                &[read("a", "same.txt"), read("b", "same.txt")],
+                &workspace,
+                PermissionMode::Approve,
+            ),
+            1
+        );
+        assert_eq!(
+            agent.parallel_read_only_batch_len(
+                &[read("outside", "../outside.txt"), read("b", "b.txt")],
+                &workspace,
+                PermissionMode::Approve,
+            ),
+            0
+        );
+        assert_eq!(
+            agent.parallel_read_only_batch_len(
+                &[ProviderToolCall {
+                    id: "write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "a.txt", "content": "changed" }),
+                }],
+                &workspace,
+                PermissionMode::FullAccess,
+            ),
+            0
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn independent_read_only_provider_calls_execute_concurrently_in_order() {
+        let workspace = test_workspace("parallel-provider-calls");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![
+                    ProviderToolCall {
+                        id: "read-a".to_string(),
+                        name: "parallel_observation_test".to_string(),
+                        arguments: json!({ "resource": "a" }),
+                    },
+                    ProviderToolCall {
+                        id: "read-b".to_string(),
+                        name: "parallel_observation_test".to_string(),
+                        arguments: json!({ "resource": "b" }),
+                    },
+                ],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            },
+            ModelResponse::text("done"),
+        ]));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::with_core_tools();
+        registry.insert(
+            "parallel_observation_test".to_string(),
+            Arc::new(ParallelObservationTestTool {
+                active,
+                max_active: Arc::clone(&max_active),
+            }),
+        );
+        let agent = AgentCore::new(provider.clone(), registry);
+
+        let result = agent
+            .run_turn_detailed_streaming(
+                AgentTurnInput {
+                    thread_id: Uuid::new_v4(),
+                    user_message_id: Uuid::new_v4(),
+                    workspace_root: workspace.clone(),
+                    content: "inspect both resources".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    provider_cursor: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .await
+            .expect("parallel read-only turn succeeds");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        let requests = provider.requests();
+        let result_ids = requests[1]
+            .tool_results
+            .iter()
+            .map(|result| result.call_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids, vec!["read-a", "read-b"]);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
     #[tokio::test]
     async fn plan_mode_suspends_for_structured_input_and_resumes_with_the_answer() {
         let thread_id = Uuid::new_v4();
@@ -5091,10 +5763,16 @@ mod tests {
                         "goal_id": goal_id,
                         "expected_revision": 0,
                         "change_reason": "Use the selected SQLite strategy",
+                        "requirements": [{
+                            "id": "sqlite-persistence",
+                            "statement": "Use SQLite persistence that survives restart",
+                            "source_refs": ["user answer: storage=sqlite"]
+                        }],
                         "steps": [{
                             "id": "implement",
                             "title": "Implement SQLite persistence",
                             "dependencies": [],
+                            "covers_requirement_ids": ["sqlite-persistence"],
                             "acceptance_criteria": ["Persistence survives restart"]
                         }]
                     }),
@@ -5740,6 +6418,106 @@ mod tests {
     }
 
     #[test]
+    fn failed_tool_attempt_is_recorded_but_a_later_success_can_satisfy_coverage() {
+        let agent = AgentCore::new(Arc::new(MockProvider), ToolRegistry::with_builtins());
+        let mut events = TurnEvents::new(None);
+        events.push(AgentEventPayload::ToolCallFinished {
+            result: ToolResult::text(
+                Uuid::new_v4(),
+                "first read failed",
+                json!({
+                    "toolName": "read_file",
+                    "providerToolCallId": "failed_read",
+                    "success": false,
+                    "error": "file was temporarily unavailable"
+                }),
+            ),
+        });
+        events.push(AgentEventPayload::ToolCallFinished {
+            result: ToolResult::text(
+                Uuid::new_v4(),
+                "verified content",
+                json!({
+                    "toolName": "read_file",
+                    "providerToolCallId": "successful_read",
+                    "success": true
+                }),
+            ),
+        });
+        let plan: TaskPlan = serde_json::from_value(json!({
+            "planRevision": 2,
+            "goalId": "recover-after-tool-error",
+            "coverage": {
+                "requirementsRevision": 1,
+                "requirements": [{
+                    "id": "inspect-result",
+                    "statement": "Inspect and verify the requested result",
+                    "sourceRefs": ["user request"]
+                }],
+                "stepRequirements": { "inspect": ["inspect-result"] },
+                "evidenceRefs": [
+                    {
+                        "stepId": "inspect",
+                        "requirementId": "inspect-result",
+                        "kind": "observation",
+                        "toolCallId": "successful_read",
+                        "summary": "The later read observed the result",
+                        "requirementsRevision": 1
+                    },
+                    {
+                        "stepId": "inspect",
+                        "requirementId": "inspect-result",
+                        "kind": "verification",
+                        "toolCallId": "successful_read",
+                        "summary": "The later read verified the result",
+                        "requirementsRevision": 1
+                    }
+                ]
+            },
+            "steps": [{
+                "id": "inspect",
+                "title": "Inspect the result",
+                "status": "completed",
+                "dependencies": [],
+                "acceptanceCriteria": ["The requested result is verified"],
+                "evidence": ["successful_read returned the expected content"]
+            }]
+        }))
+        .unwrap();
+        events.push(AgentEventPayload::PlanUpdated { plan });
+
+        let intervention = agent
+            .apply_finalization_guard(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                None,
+                &[],
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut events,
+            )
+            .unwrap();
+
+        assert!(intervention.is_none());
+        let failed = events.items.iter().find_map(|event| match event {
+            AgentEventPayload::ToolCallFinished { result }
+                if result.metadata["providerToolCallId"] == "failed_read" =>
+            {
+                Some(result)
+            }
+            _ => None,
+        });
+        let failed = failed.expect("failed attempt remains in the event history");
+        assert_eq!(failed.metadata["errorRecord"]["recorded"], true);
+        assert_eq!(
+            failed.metadata["errorRecord"]["message"],
+            "file was temporarily unavailable"
+        );
+        assert_eq!(failed.metadata["errorRecord"]["executed"], true);
+    }
+
+    #[test]
     fn finalization_guard_blocks_a_pending_plan_restored_from_the_store() {
         let workspace = test_workspace("persisted-pending-finalization-guard");
         let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
@@ -5900,24 +6678,38 @@ mod tests {
         let provider = Arc::new(ScriptedProvider::new(vec![
             ModelResponse {
                 text: String::new(),
-                tool_calls: vec![ProviderToolCall {
-                    id: "call_plan_open".to_string(),
-                    name: "update_plan".to_string(),
-                    arguments: json!({
+                tool_calls: vec![
+                    ProviderToolCall {
+                        id: "call_plan_open".to_string(),
+                        name: "update_plan".to_string(),
+                        arguments: json!({
                         "operation": "append_step",
                         "goal_id": "finalization-guard",
                         "expected_revision": 0,
                         "change_reason": "Track implementation before finalizing",
+                        "requirements": [{
+                            "id": "implement-change",
+                            "statement": "Implement and verify the requested change",
+                            "source_refs": ["user request"]
+                        }],
                         "step": {
                             "id": "implement-change",
                             "title": "Implement the change",
                             "status": "in_progress",
                             "dependencies": [],
+                            "covers_requirement_ids": ["implement-change"],
                             "acceptance_criteria": ["The requested change is implemented"],
-                            "evidence": []
+                            "evidence": [],
+                            "evidence_refs": []
                         }
-                    }),
-                }],
+                        }),
+                    },
+                    ProviderToolCall {
+                        id: "call_observe_change".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: json!({ "path": "." }),
+                    },
+                ],
                 usage: None,
                 response_id: None,
                 provider_items: Vec::new(),
@@ -5937,7 +6729,21 @@ mod tests {
                         "step_id": "implement-change",
                         "updates": {
                             "status": "completed",
-                            "evidence": ["Implementation completed in the test fixture"]
+                            "evidence": ["Implementation completed in the test fixture"],
+                            "evidence_refs": [
+                                {
+                                    "requirement_id": "implement-change",
+                                    "kind": "observation",
+                                    "tool_call_id": "call_observe_change",
+                                    "summary": "Observed the implemented fixture"
+                                },
+                                {
+                                    "requirement_id": "implement-change",
+                                    "kind": "verification",
+                                    "tool_call_id": "call_observe_change",
+                                    "summary": "Verified the fixture is accessible"
+                                }
+                            ]
                         }
                     }),
                 }],
@@ -6173,6 +6979,13 @@ mod tests {
         let result = &requests[1].tool_results[0];
         assert!(result.is_error);
         assert_eq!(result.metadata["invalidToolArguments"], true);
+        assert_eq!(result.metadata["errorRecord"]["recorded"], true);
+        assert_eq!(
+            result.metadata["errorRecord"]["code"],
+            "invalid_tool_arguments"
+        );
+        assert_eq!(result.metadata["errorRecord"]["phase"], "validation");
+        assert_eq!(result.metadata["errorRecord"]["executed"], false);
         assert!(result.output.contains("arguments.path is required"));
         assert!(result.output.contains("Do not retry this call unchanged"));
 
@@ -7272,8 +8085,8 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_test".to_string(),
-                    name: "shell".to_string(),
-                    arguments: json!({ "command": "node test/check.js" }),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "test/check.js" }),
                 }],
                 usage: None,
                 response_id: None,
@@ -7291,13 +8104,33 @@ mod tests {
                             "goal_id": "complete-current-phase",
                             "expected_revision": 0,
                             "change_reason": "Record the completed current scope",
+                            "requirements": [{
+                                "id": "current-phase",
+                                "statement": "Complete and verify the current phase while explicitly deferring later work",
+                                "source_refs": ["user request"]
+                            }],
                             "step": {
                                 "id": "implement-current-scope",
                                 "title": "Implement current scope",
                                 "status": "completed",
                                 "dependencies": [],
+                                "covers_requirement_ids": ["current-phase"],
                                 "acceptance_criteria": ["Current scope is implemented"],
-                                "evidence": ["node test/check.js passed"]
+                                "evidence": ["test/check.js was read successfully"],
+                                "evidence_refs": [
+                                    {
+                                        "requirement_id": "current-phase",
+                                        "kind": "implementation",
+                                        "tool_call_id": "call_test",
+                                        "summary": "Current fixture represents the implemented phase"
+                                    },
+                                    {
+                                        "requirement_id": "current-phase",
+                                        "kind": "verification",
+                                        "tool_call_id": "call_test",
+                                        "summary": "test/check.js was read successfully"
+                                    }
+                                ]
                             }
                         }),
                     },
@@ -7316,8 +8149,10 @@ mod tests {
                                 "status": "deferred",
                                 "status_reason": "The user requested this work in a later session",
                                 "dependencies": ["implement-current-scope"],
+                                "covers_requirement_ids": ["current-phase"],
                                 "acceptance_criteria": ["Later session work is completed"],
-                                "evidence": []
+                                "evidence": [],
+                                "evidence_refs": []
                             }
                         }),
                     },
@@ -7383,13 +8218,20 @@ mod tests {
                             "goal_id": "implement-and-verify",
                             "expected_revision": 0,
                             "change_reason": "Start implementation",
+                            "requirements": [{
+                                "id": "current-phase",
+                                "statement": "Implement and verify the current phase while deferring the CLI phase",
+                                "source_refs": ["user request"]
+                            }],
                             "step": {
                                 "id": "implement-current-scope",
                                 "title": "Implement current scope",
                                 "status": "in_progress",
                                 "dependencies": [],
+                                "covers_requirement_ids": ["current-phase"],
                                 "acceptance_criteria": ["Current scope is implemented"],
-                                "evidence": []
+                                "evidence": [],
+                                "evidence_refs": []
                             }
                         }),
                     },
@@ -7406,8 +8248,10 @@ mod tests {
                                 "title": "Run tests and verify",
                                 "status": "pending",
                                 "dependencies": ["implement-current-scope"],
+                                "covers_requirement_ids": ["current-phase"],
                                 "acceptance_criteria": ["Focused tests pass"],
-                                "evidence": []
+                                "evidence": [],
+                                "evidence_refs": []
                             }
                         }),
                     },
@@ -7424,8 +8268,10 @@ mod tests {
                                 "title": "Session 2: implement CLI",
                                 "status": "pending",
                                 "dependencies": ["run-tests"],
+                                "covers_requirement_ids": ["current-phase"],
                                 "acceptance_criteria": ["CLI phase is implemented"],
-                                "evidence": []
+                                "evidence": [],
+                                "evidence_refs": []
                             }
                         }),
                     },
@@ -7451,8 +8297,8 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_test".to_string(),
-                    name: "shell".to_string(),
-                    arguments: json!({ "command": "node test/check.js" }),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "test/check.js" }),
                 }],
                 usage: None,
                 response_id: None,
@@ -7485,7 +8331,13 @@ mod tests {
                             "step_id": "implement-current-scope",
                             "updates": {
                                 "status": "completed",
-                                "evidence": ["result.txt contains the requested output"]
+                                "evidence": ["result.txt contains the requested output"],
+                                "evidence_refs": [{
+                                    "requirement_id": "current-phase",
+                                    "kind": "implementation",
+                                    "tool_call_id": "call_write",
+                                    "summary": "result.txt was written successfully"
+                                }]
                             }
                         }),
                     },
@@ -7500,7 +8352,13 @@ mod tests {
                             "step_id": "run-tests",
                             "updates": {
                                 "status": "completed",
-                                "evidence": ["node test/check.js passed"]
+                                "evidence": ["test/check.js was read successfully"],
+                                "evidence_refs": [{
+                                    "requirement_id": "current-phase",
+                                    "kind": "verification",
+                                    "tool_call_id": "call_test",
+                                    "summary": "test/check.js was read successfully"
+                                }]
                             }
                         }),
                     },
@@ -7605,13 +8463,20 @@ mod tests {
                             "goal_id": "cli-contract",
                             "expected_revision": 0,
                             "change_reason": "Start CLI contract implementation",
+                            "requirements": [{
+                                "id": "cli-contract",
+                                "statement": "Implement the CLI contract after inspecting the task context",
+                                "source_refs": ["user request"]
+                            }],
                             "step": {
                                 "id": "implement-cli-contract",
                                 "title": "Implement CLI contract",
                                 "status": "in_progress",
                                 "dependencies": [],
+                                "covers_requirement_ids": ["cli-contract"],
                                 "acceptance_criteria": ["CLI contract is implemented"],
-                                "evidence": []
+                                "evidence": [],
+                                "evidence_refs": []
                             }
                         }),
                     },
@@ -7628,8 +8493,10 @@ mod tests {
                                 "title": "Run tests and verify",
                                 "status": "pending",
                                 "dependencies": ["implement-cli-contract"],
+                                "covers_requirement_ids": ["cli-contract"],
                                 "acceptance_criteria": ["Tests pass"],
-                                "evidence": []
+                                "evidence": [],
+                                "evidence_refs": []
                             }
                         }),
                     },
@@ -7691,7 +8558,13 @@ mod tests {
                             "step_id": "implement-cli-contract",
                             "updates": {
                                 "status": "completed",
-                                "evidence": ["src/cli.js contains the implementation"]
+                                "evidence": ["src/cli.js contains the implementation"],
+                                "evidence_refs": [{
+                                    "requirement_id": "cli-contract",
+                                    "kind": "implementation",
+                                    "tool_call_id": "call_write",
+                                    "summary": "src/cli.js was written successfully"
+                                }]
                             }
                         }),
                     },
@@ -7706,7 +8579,13 @@ mod tests {
                             "step_id": "run-tests",
                             "updates": {
                                 "status": "completed",
-                                "evidence": ["Eleven distinct context files were read successfully"]
+                                "evidence": ["Eleven distinct context files were read successfully"],
+                                "evidence_refs": [{
+                                    "requirement_id": "cli-contract",
+                                    "kind": "verification",
+                                    "tool_call_id": "call_read_0",
+                                    "summary": "Context verification read completed successfully"
+                                }]
                             }
                         }),
                     },
@@ -7776,13 +8655,20 @@ mod tests {
                     "goal_id": "resolve-problem",
                     "expected_revision": 0,
                     "change_reason": "Track the active problem-solving step",
+                    "requirements": [{
+                        "id": "resolve-problem",
+                        "statement": "Resolve and verify the current problem",
+                        "source_refs": ["user request"]
+                    }],
                     "step": {
                         "id": "resolve-current-problem",
                         "title": "Resolve the current problem",
                         "status": "in_progress",
                         "dependencies": [],
+                        "covers_requirement_ids": ["resolve-problem"],
                         "acceptance_criteria": ["The current problem is resolved"],
-                        "evidence": []
+                        "evidence": [],
+                        "evidence_refs": []
                     }
                 }),
             }],
@@ -7816,7 +8702,21 @@ mod tests {
                     "step_id": "resolve-current-problem",
                     "updates": {
                         "status": "completed",
-                        "evidence": ["Eight alternating reads completed"]
+                        "evidence": ["Eight alternating reads completed"],
+                        "evidence_refs": [
+                            {
+                                "requirement_id": "resolve-problem",
+                                "kind": "observation",
+                                "tool_call_id": "call_cycle_7",
+                                "summary": "The final problem observation completed"
+                            },
+                            {
+                                "requirement_id": "resolve-problem",
+                                "kind": "verification",
+                                "tool_call_id": "call_cycle_7",
+                                "summary": "The alternating read cycle completed"
+                            }
+                        ]
                     }
                 }),
             }],
@@ -9217,6 +10117,28 @@ mod tests {
         assert_eq!(agent.tool_calls_used(), 1);
 
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn flow_transcript_keeps_tool_activity_without_hidden_reasoning() {
+        let call = ToolCall::new("list_files", json!({"path": "."}));
+        let events = vec![
+            AgentEventPayload::ReasoningDelta {
+                text: "private reasoning must not be persisted".to_string(),
+            },
+            AgentEventPayload::ToolCallStarted { call: call.clone() },
+            AgentEventPayload::ToolCallFinished {
+                result: ToolResult::text(call.id, "[]", json!({"isError": false})),
+            },
+        ];
+
+        let transcript = flow_transcript_from_events(&events);
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].kind, FlowTranscriptEntryKindV1::ToolCall);
+        assert_eq!(transcript[1].kind, FlowTranscriptEntryKindV1::ToolResult);
+        assert!(!serde_json::to_string(&transcript)
+            .expect("serialize transcript")
+            .contains("private reasoning"));
     }
 
     fn test_workspace(name: &str) -> PathBuf {
