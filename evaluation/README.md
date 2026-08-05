@@ -29,6 +29,19 @@ node evaluation/src/cli.mjs run `
   --output evaluation/.runs
 ```
 
+评测结果不进入 OpenTopia 产品数据库或桌面 UI。生成本地结果索引：
+
+```powershell
+pnpm eval:catalog
+```
+
+命令会扫描 `.opentopia/evaluations/*/summary.json` 并生成
+`.opentopia/evaluations/index.md`。每次评测的原始 `summary.json` 和已有的
+`report.md` 都会保留链接。
+
+产品代码不能依赖评测模块。`pnpm boundary:check` 会检查产品目录中没有
+评测 UI、API、存储或运行时描述符，并确认桌面安装包不包含评测文件。
+
 OpenTopia application suites are model-neutral. Select and freeze the provider,
 model, reasoning settings, and context limits in the external run profile; the
 result manifest records that run configuration without changing fixture IDs.

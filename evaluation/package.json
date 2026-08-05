@@ -9,6 +9,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "catalog": "node src/cli.mjs catalog --root ../.opentopia/evaluations",
     "validate:example": "node src/cli.mjs validate --suite examples/smoke/suite.json --target examples/smoke/target.json",
     "run:example": "node src/cli.mjs run --suite examples/smoke/suite.json --target examples/smoke/target.json --output .runs"
   },

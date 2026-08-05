@@ -2,6 +2,7 @@
 
 import process from "node:process";
 import path from "node:path";
+import { writeEvaluationCatalog } from "./catalog.mjs";
 import { compareSummaries, writeComparison } from "./compare.mjs";
 import { runSuite, validateDefinitions } from "./runner.mjs";
 import { loadJson } from "./validation.mjs";
@@ -13,6 +14,7 @@ Usage:
   agent-eval validate --suite <suite.json> --target <target.json>
   agent-eval run --suite <suite.json> --target <target.json> [--output <dir>] [--repetitions <n>]
   agent-eval compare --baseline <summary.json> --candidate <summary.json> [--output <dir>]
+  agent-eval catalog [--root <evaluations-dir>] [--output <catalog.md>]
 
 The target is a black-box process adapter. The harness passes the prompt through
 stdin or a file, exposes trial paths through AGENT_EVAL_* environment variables,
@@ -39,6 +41,19 @@ async function main() {
   const { command, options } = parseArguments(process.argv.slice(2));
   if (!command || command === "help" || command === "--help") {
     process.stdout.write(help());
+    return;
+  }
+  if (command === "catalog") {
+    const rootDirectory = path.resolve(
+      options.root ?? path.join(process.cwd(), ".opentopia", "evaluations")
+    );
+    const outputPath = path.resolve(options.output ?? path.join(rootDirectory, "index.md"));
+    const catalog = await writeEvaluationCatalog(rootDirectory, outputPath);
+    process.stdout.write(`${JSON.stringify({
+      runs: catalog.runs.length,
+      skipped: catalog.warnings.length,
+      catalog: catalog.outputPath
+    }, null, 2)}\n`);
     return;
   }
   if (command === "compare") {
