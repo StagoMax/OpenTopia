@@ -1,6 +1,9 @@
 use crate::flow::{
     simulate_flow, validate_flow_spec, FlowDraftStatusV1, FlowDraftV1, FlowSourceV1, FlowSpecV1,
 };
+use crate::flow_runtime::{
+    prepare_flow_resume, resolve_flow_approval, spawn_flow_run, FlowRunStatusV1, FlowRunV1,
+};
 use crate::model::{ExperienceMode, ToolCall, ToolResult, TurnStatus};
 use crate::tools::{Tool, ToolContext, ToolExecutionPolicy, ToolSideEffect};
 use async_trait::async_trait;
@@ -19,6 +22,11 @@ enum FlowToolAction {
     Validate,
     Simulate,
     Publish,
+    Run,
+    Status,
+    Pause,
+    Resume,
+    Cancel,
 }
 
 pub fn flow_tools() -> Vec<(String, Arc<dyn Tool>)> {
@@ -30,6 +38,11 @@ pub fn flow_tools() -> Vec<(String, Arc<dyn Tool>)> {
         FlowToolAction::Validate,
         FlowToolAction::Simulate,
         FlowToolAction::Publish,
+        FlowToolAction::Run,
+        FlowToolAction::Status,
+        FlowToolAction::Pause,
+        FlowToolAction::Resume,
+        FlowToolAction::Cancel,
     ]
     .into_iter()
     .map(|action| {
@@ -131,6 +144,41 @@ struct PublishInput {
     published_by: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunInput {
+    flow_id: String,
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default)]
+    input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunIdInput {
+    run_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StatusInput {
+    #[serde(default)]
+    run_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResumeInput {
+    run_id: Uuid,
+    #[serde(default)]
+    approved: Option<bool>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    retry_interrupted_node: bool,
+}
+
 fn flow_spec_schema() -> Value {
     json!({
         "type": "object",
@@ -174,6 +222,11 @@ impl Tool for FlowTool {
             FlowToolAction::Validate => "flow.validate",
             FlowToolAction::Simulate => "flow.simulate",
             FlowToolAction::Publish => "flow.publish",
+            FlowToolAction::Run => "flow.run",
+            FlowToolAction::Status => "flow.status",
+            FlowToolAction::Pause => "flow.pause",
+            FlowToolAction::Resume => "flow.resume",
+            FlowToolAction::Cancel => "flow.cancel",
         }
     }
 
@@ -186,6 +239,11 @@ impl Tool for FlowTool {
             FlowToolAction::Validate => "Statically validate graph topology, schemas, references, capability boundaries, risk gates, budgets, and bounded termination without calling another model.",
             FlowToolAction::Simulate => "Compile and dry-run a valid FlowDraft against the existing Agent Harness, showing which AgentCore, SubagentScheduler, SkillRuntime, ToolRegistry, and runtime-control primitives each node will use. No business side effects are executed.",
             FlowToolAction::Publish => "Publish an immutable Flow version after current-revision validation and simulation pass. High-risk Flows require an independent approver.",
+            FlowToolAction::Run => "Start an immutable published Flow in the durable Flow Runtime. The runtime schedules graph dependencies and control nodes, while Agent, Skill, and Tool nodes execute through the currently restricted Agent Harness.",
+            FlowToolAction::Status => "Inspect one durable Flow run or list recent runs for the current Flow session, including node attempts, outputs, budgets, and pending control state.",
+            FlowToolAction::Pause => "Request a Flow run pause. The request takes effect at the next node boundary so an in-flight side effect is not interrupted into an unknown state.",
+            FlowToolAction::Resume => "Resume a paused Flow run, or resolve its explicit approval node with approved=true/false. Execution continues from the persisted node boundary.",
+            FlowToolAction::Cancel => "Request cancellation of a Flow run at the next node boundary.",
         }
     }
 
@@ -233,6 +291,33 @@ impl Tool for FlowTool {
                     "publishedBy": {"type": "string", "minLength": 1}
                 }
             }),
+            FlowToolAction::Run => json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["flowId"],
+                "properties": {
+                    "flowId": {"type": "string"},
+                    "version": {"type": "integer", "minimum": 1},
+                    "input": {}
+                }
+            }),
+            FlowToolAction::Status => json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"runId": {"type": "string", "format": "uuid"}}
+            }),
+            FlowToolAction::Pause | FlowToolAction::Cancel => run_id_schema(),
+            FlowToolAction::Resume => json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["runId"],
+                "properties": {
+                    "runId": {"type": "string", "format": "uuid"},
+                    "approved": {"type": "boolean"},
+                    "note": {"type": "string"},
+                    "retryInterruptedNode": {
+                        "type": "boolean",
+                        "description": "After a process restart, explicitly retry a node that may have stopped mid-side-effect. Inspect external state first."
+                    }
+                }
+            }),
         }
     }
 
@@ -243,7 +328,7 @@ impl Tool for FlowTool {
             .and_then(Value::as_str)
             .unwrap_or("current");
         match self.action {
-            FlowToolAction::Search | FlowToolAction::Inspect => {
+            FlowToolAction::Search | FlowToolAction::Inspect | FlowToolAction::Status => {
                 ToolExecutionPolicy::read_only(vec![format!("flow:{draft_key}")])
             }
             FlowToolAction::Validate | FlowToolAction::Simulate => ToolExecutionPolicy {
@@ -253,15 +338,19 @@ impl Tool for FlowTool {
                 side_effect: ToolSideEffect::SessionMutation,
                 resource_keys: vec![format!("flow:{draft_key}")],
             },
-            FlowToolAction::Create | FlowToolAction::Update | FlowToolAction::Publish => {
-                ToolExecutionPolicy {
-                    read_only: false,
-                    idempotent: false,
-                    parallel_safe: false,
-                    side_effect: ToolSideEffect::ControlPlane,
-                    resource_keys: vec![format!("flow:{draft_key}")],
-                }
-            }
+            FlowToolAction::Create
+            | FlowToolAction::Update
+            | FlowToolAction::Publish
+            | FlowToolAction::Run
+            | FlowToolAction::Pause
+            | FlowToolAction::Resume
+            | FlowToolAction::Cancel => ToolExecutionPolicy {
+                read_only: false,
+                idempotent: false,
+                parallel_safe: false,
+                side_effect: ToolSideEffect::ControlPlane,
+                resource_keys: vec![format!("flow:{draft_key}")],
+            },
         }
     }
 
@@ -384,6 +473,124 @@ impl Tool for FlowTool {
                     store.publish_flow_draft(input.draft_id, input.published_by.trim())?;
                 Self::result(call.id, json!({"definition": definition}))
             }
+            FlowToolAction::Run => {
+                let thread_id = self.require_flow_thread(&ctx)?;
+                let input: RunInput = serde_json::from_value(call.input)?;
+                let definition = store
+                    .get_flow_definition(input.flow_id.trim(), input.version)?
+                    .ok_or_else(|| anyhow::anyhow!("published Flow not found"))?;
+                let run = FlowRunV1::new(
+                    thread_id,
+                    &definition,
+                    input.input,
+                    &ctx.capability_projection,
+                )?;
+                let run = store.insert_flow_run(&run)?;
+                spawn_flow_run(run.id, ctx.clone())?;
+                Self::result(call.id, json!({"run": run}))
+            }
+            FlowToolAction::Status => {
+                let thread_id = self.require_flow_thread(&ctx)?;
+                let input: StatusInput = serde_json::from_value(call.input)?;
+                if let Some(run_id) = input.run_id {
+                    let run = store
+                        .get_flow_run(run_id)?
+                        .ok_or_else(|| anyhow::anyhow!("Flow run not found"))?;
+                    anyhow::ensure!(
+                        run.thread_id == thread_id,
+                        "Flow run belongs to another session"
+                    );
+                    return Self::result(call.id, json!({"run": run}));
+                }
+                Self::result(call.id, json!({"runs": store.list_flow_runs(thread_id)?}))
+            }
+            FlowToolAction::Pause => {
+                let thread_id = self.require_flow_thread(&ctx)?;
+                let input: RunIdInput = serde_json::from_value(call.input)?;
+                let mut run = store
+                    .get_flow_run(input.run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Flow run not found"))?;
+                anyhow::ensure!(
+                    run.thread_id == thread_id,
+                    "Flow run belongs to another session"
+                );
+                anyhow::ensure!(
+                    matches!(
+                        run.status,
+                        FlowRunStatusV1::Queued | FlowRunStatusV1::Running
+                    ),
+                    "only a queued or running Flow can be paused"
+                );
+                let expected = run.revision;
+                run.status = FlowRunStatusV1::PauseRequested;
+                run.touch();
+                let run = store.update_flow_run(&run, expected)?;
+                Self::result(call.id, json!({"run": run}))
+            }
+            FlowToolAction::Resume => {
+                let thread_id = self.require_flow_thread(&ctx)?;
+                let input: ResumeInput = serde_json::from_value(call.input)?;
+                let mut run = store
+                    .get_flow_run(input.run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Flow run not found"))?;
+                anyhow::ensure!(
+                    run.thread_id == thread_id,
+                    "Flow run belongs to another session"
+                );
+                let expected = run.revision;
+                match run.status {
+                    FlowRunStatusV1::Paused => {
+                        anyhow::ensure!(
+                            input.approved.is_none(),
+                            "approved is only valid while a Flow is waiting for approval"
+                        );
+                        prepare_flow_resume(&mut run, input.retry_interrupted_node)?;
+                        run.status = FlowRunStatusV1::Running;
+                        run.error = None;
+                        run.touch();
+                    }
+                    FlowRunStatusV1::WaitingApproval => {
+                        resolve_flow_approval(
+                            &mut run,
+                            input.approved.ok_or_else(|| {
+                                anyhow::anyhow!("approved is required for an approval node")
+                            })?,
+                            input.note.as_deref(),
+                        )?;
+                    }
+                    _ => anyhow::bail!("Flow run is not paused or waiting for approval"),
+                }
+                let run = store.update_flow_run(&run, expected)?;
+                if !run.status.is_terminal() {
+                    spawn_flow_run(run.id, ctx.clone())?;
+                }
+                Self::result(call.id, json!({"run": run}))
+            }
+            FlowToolAction::Cancel => {
+                let thread_id = self.require_flow_thread(&ctx)?;
+                let input: RunIdInput = serde_json::from_value(call.input)?;
+                let mut run = store
+                    .get_flow_run(input.run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Flow run not found"))?;
+                anyhow::ensure!(
+                    run.thread_id == thread_id,
+                    "Flow run belongs to another session"
+                );
+                anyhow::ensure!(!run.status.is_terminal(), "Flow run is already terminal");
+                let expected = run.revision;
+                if matches!(
+                    run.status,
+                    FlowRunStatusV1::Paused | FlowRunStatusV1::WaitingApproval
+                ) {
+                    run.status = FlowRunStatusV1::Cancelled;
+                    run.completed_at = Some(Utc::now());
+                } else {
+                    run.status = FlowRunStatusV1::CancelRequested;
+                }
+                run.touch();
+                let run = store.update_flow_run(&run, expected)?;
+                Self::result(call.id, json!({"run": run}))
+            }
         }
     }
 }
@@ -393,5 +600,13 @@ fn draft_schema() -> Value {
         "type": "object", "additionalProperties": false,
         "required": ["draftId"],
         "properties": {"draftId": {"type": "string", "format": "uuid"}}
+    })
+}
+
+fn run_id_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["runId"],
+        "properties": {"runId": {"type": "string", "format": "uuid"}}
     })
 }

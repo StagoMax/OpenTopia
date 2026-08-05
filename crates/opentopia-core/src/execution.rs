@@ -598,7 +598,11 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
                 environment_keys: environment_keys(&runtime),
                 additional_denied_read_paths: request.requirements.deny_read_paths.clone(),
                 additional_protected_paths: request.requirements.deny_write_paths.clone(),
-                timeout_ms: Some(context.timeout.as_millis().min(u64::MAX as u128) as u64),
+                // A stdio session is a long-lived transport (for example an MCP
+                // server), so the caller's timeout applies to startup/handshake
+                // work, not to the lifetime of the spawned process. The session
+                // owner closes or kills it explicitly.
+                timeout_ms: None,
                 termination_timeout_ms: Some(
                     context
                         .termination_timeout
@@ -877,7 +881,10 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
                 environment_keys: environment_keys(&runtime),
                 additional_denied_read_paths: request.requirements.deny_read_paths.clone(),
                 additional_protected_paths: request.requirements.deny_write_paths.clone(),
-                timeout_ms: Some(context.timeout.as_millis().min(u64::MAX as u128) as u64),
+                // A stdio session is a long-lived transport (for example an MCP
+                // server). Its configured timeout bounds startup/handshake work,
+                // not the lifetime of the process; the owner closes it explicitly.
+                timeout_ms: None,
                 termination_timeout_ms: Some(
                     context
                         .termination_timeout

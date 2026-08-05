@@ -7,9 +7,9 @@ use crate::enterprise::{
     AgentTemplateSpecV1, AgentTemplateStatusV1, AgentTemplateVersionV1,
 };
 use crate::flow::{
-    definition_from_draft, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1,
-    FlowTrialV1,
+    definition_from_draft, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1, FlowTrialV1,
 };
+use crate::flow_runtime::FlowRunV1;
 use crate::mcp::{McpServerConfig, McpToolDescriptor, ThreadMcpServer};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
@@ -283,6 +283,11 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         thread_id: Uuid,
         response: &UserInputResponse,
     ) -> anyhow::Result<Option<UserInputRecord>>;
+    fn get_published_agent_template_version(
+        &self,
+        template_id: &str,
+        version: u32,
+    ) -> anyhow::Result<Option<AgentTemplateVersionV1>>;
     fn create_flow_draft(&self, draft: &FlowDraftV1) -> anyhow::Result<FlowDraftV1>;
     fn get_flow_draft(&self, draft_id: Uuid) -> anyhow::Result<Option<FlowDraftV1>>;
     fn list_flow_drafts(&self, thread_id: Option<Uuid>) -> anyhow::Result<Vec<FlowDraftV1>>;
@@ -306,6 +311,11 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         flow_id: &str,
         version: Option<u32>,
     ) -> anyhow::Result<Option<FlowDefinitionV1>>;
+    fn insert_flow_run(&self, run: &FlowRunV1) -> anyhow::Result<FlowRunV1>;
+    fn get_flow_run(&self, run_id: Uuid) -> anyhow::Result<Option<FlowRunV1>>;
+    fn list_flow_runs(&self, thread_id: Uuid) -> anyhow::Result<Vec<FlowRunV1>>;
+    fn update_flow_run(&self, run: &FlowRunV1, expected_revision: u32)
+        -> anyhow::Result<FlowRunV1>;
 
     fn insert_large_tool_output_artifact(
         &self,
@@ -433,6 +443,10 @@ pub enum FlowStoreError {
     PassedTrialRequired,
     #[error("high-risk Flow publication requires an independent approver")]
     IndependentApproverRequired,
+    #[error("Flow run not found: {0}")]
+    RunNotFound(Uuid),
+    #[error("Flow run revision conflict; current revision is {0}")]
+    RunRevisionConflict(u32),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1315,6 +1329,51 @@ impl SqliteSessionStore {
                 "#,
             )?;
         }
+        if schema_version < 14 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS flow_runs (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    flow_id TEXT NOT NULL,
+                    flow_version INTEGER NOT NULL CHECK(flow_version > 0),
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    status TEXT NOT NULL CHECK(status IN (
+                        'queued', 'running', 'pause_requested', 'paused',
+                        'waiting_approval', 'succeeded', 'failed',
+                        'cancel_requested', 'cancelled'
+                    )),
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_flow_runs_thread_updated
+                    ON flow_runs(thread_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_flow_runs_definition_updated
+                    ON flow_runs(flow_id, flow_version, updated_at DESC);
+                PRAGMA user_version = 14;
+                "#,
+            )?;
+        }
+        conn.execute(
+            r#"
+            UPDATE flow_runs
+            SET status = 'paused',
+                revision = revision + 1,
+                document_json = json_set(
+                    document_json,
+                    '$.status', 'paused',
+                    '$.error', 'server restarted at a node boundary; resume after inspection',
+                    '$.revision', revision + 1,
+                    '$.updatedAt', ?1
+                ),
+                updated_at = ?1
+            WHERE status IN ('queued', 'running', 'pause_requested')
+            "#,
+            params![Utc::now().to_rfc3339()],
+        )?;
         let recovered_at = Utc::now().to_rfc3339();
         conn.execute(
             r#"
@@ -1800,6 +1859,34 @@ impl SqliteSessionStore {
         collect_rows(rows)
     }
 
+    /// Loads projected tool results for one turn without deserializing the
+    /// complete (and potentially very large) conversation history.
+    pub fn list_turn_tool_result_events(
+        &self,
+        thread_id: Uuid,
+        turn_id: Uuid,
+    ) -> anyhow::Result<Vec<AgentEvent>> {
+        let conn = self.read_connection();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT conversation_events.id, conversation_events.thread_id,
+                   conversation_events.turn_id, conversation_events.seq,
+                   conversation_events.payload_json, conversation_events.created_at
+            FROM conversation_events
+            INNER JOIN events ON events.id = conversation_events.id
+            WHERE conversation_events.thread_id = ?1
+              AND conversation_events.turn_id = ?2
+              AND events.kind = 'tool_call_finished'
+            ORDER BY conversation_events.seq ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![thread_id.to_string(), turn_id.to_string()],
+            map_event,
+        )?;
+        collect_rows(rows)
+    }
+
     /// Loads only event kinds used to calculate the context status panel.
     pub fn list_context_events(&self, thread_id: Uuid) -> anyhow::Result<Vec<AgentEvent>> {
         let conn = self.read_connection();
@@ -2248,6 +2335,15 @@ impl SqliteSessionStore {
 }
 
 impl SessionStore for SqliteSessionStore {
+    fn get_published_agent_template_version(
+        &self,
+        template_id: &str,
+        version: u32,
+    ) -> anyhow::Result<Option<AgentTemplateVersionV1>> {
+        let template = SqliteSessionStore::get_agent_template_version(self, template_id, version)?;
+        Ok(template.filter(|template| template.status == AgentTemplateStatusV1::Published))
+    }
+
     fn create_flow_draft(&self, draft: &FlowDraftV1) -> anyhow::Result<FlowDraftV1> {
         let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
         let tx = conn.transaction()?;
@@ -2436,8 +2532,8 @@ impl SessionStore for SqliteSessionStore {
     ) -> anyhow::Result<FlowDefinitionV1> {
         let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
         let tx = conn.transaction()?;
-        let mut draft = query_flow_draft(&tx, draft_id)?
-            .ok_or(FlowStoreError::DraftNotFound(draft_id))?;
+        let mut draft =
+            query_flow_draft(&tx, draft_id)?.ok_or(FlowStoreError::DraftNotFound(draft_id))?;
         if !draft
             .last_validation
             .as_ref()
@@ -2553,6 +2649,99 @@ impl SessionStore for SqliteSessionStore {
         document
             .map(|document| serde_json::from_str(&document).map_err(Into::into))
             .transpose()
+    }
+
+    fn insert_flow_run(&self, run: &FlowRunV1) -> anyhow::Result<FlowRunV1> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO flow_runs (
+                id, thread_id, flow_id, flow_version, revision, status,
+                document_json, created_at, updated_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                run.id.to_string(),
+                run.thread_id.to_string(),
+                &run.flow_id,
+                i64::from(run.flow_version),
+                i64::from(run.revision),
+                run.status.as_str(),
+                serde_json::to_string(run)?,
+                run.created_at.to_rfc3339(),
+                run.updated_at.to_rfc3339(),
+                run.completed_at.map(|value| value.to_rfc3339()),
+            ],
+        )?;
+        Ok(run.clone())
+    }
+
+    fn get_flow_run(&self, run_id: Uuid) -> anyhow::Result<Option<FlowRunV1>> {
+        let conn = self.read_connection();
+        let document: Option<String> = conn
+            .query_row(
+                "SELECT document_json FROM flow_runs WHERE id = ?1",
+                params![run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        document
+            .map(|document| serde_json::from_str(&document).map_err(Into::into))
+            .transpose()
+    }
+
+    fn list_flow_runs(&self, thread_id: Uuid) -> anyhow::Result<Vec<FlowRunV1>> {
+        let conn = self.read_connection();
+        let mut stmt = conn.prepare(
+            "SELECT document_json FROM flow_runs WHERE thread_id = ?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(
+            params![thread_id.to_string()],
+            deserialize_json_column::<FlowRunV1>,
+        )?;
+        collect_rows(rows)
+    }
+
+    fn update_flow_run(
+        &self,
+        run: &FlowRunV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<FlowRunV1> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let changed = conn.execute(
+            r#"
+            UPDATE flow_runs
+            SET revision = ?2, status = ?3, document_json = ?4,
+                updated_at = ?5, completed_at = ?6
+            WHERE id = ?1 AND revision = ?7
+            "#,
+            params![
+                run.id.to_string(),
+                i64::from(run.revision),
+                run.status.as_str(),
+                serde_json::to_string(run)?,
+                run.updated_at.to_rfc3339(),
+                run.completed_at.map(|value| value.to_rfc3339()),
+                i64::from(expected_revision),
+            ],
+        )?;
+        if changed != 1 {
+            let current: Option<i64> = conn
+                .query_row(
+                    "SELECT revision FROM flow_runs WHERE id = ?1",
+                    params![run.id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return match current {
+                Some(revision) => Err(FlowStoreError::RunRevisionConflict(
+                    u32::try_from(revision).unwrap_or(u32::MAX),
+                )
+                .into()),
+                None => Err(FlowStoreError::RunNotFound(run.id).into()),
+            };
+        }
+        Ok(run.clone())
     }
 
     fn create_project(
@@ -4973,9 +5162,8 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let document: String = row.get(0)?;
-    serde_json::from_str(&document).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-    })
+    serde_json::from_str(&document)
+        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
 }
 
 fn collect_rows<T, F>(rows: rusqlite::MappedRows<'_, F>) -> anyhow::Result<Vec<T>>
@@ -6452,6 +6640,16 @@ mod tests {
             .iter()
             .all(|event| !matches!(event.payload, AgentEventPayload::ReasoningDelta { .. })));
 
+        let turn_tool_results = store
+            .list_turn_tool_result_events(thread.id, turn_id)
+            .expect("list one turn's tool results");
+        assert_eq!(turn_tool_results.len(), 1);
+        assert!(matches!(
+            &turn_tool_results[0].payload,
+            AgentEventPayload::ToolCallFinished { result }
+                if result.content.is_empty() && result.output.len() == 11_000
+        ));
+
         let context = store
             .list_context_events(thread.id)
             .expect("list context events");
@@ -7595,7 +7793,10 @@ mod tests {
         let mut draft = FlowDraftV1::new(thread.id, spec, &capabilities);
         store.create_flow_draft(&draft).expect("persist draft");
         assert!(matches!(
-            store.publish_flow_draft(draft.id, "reviewer").unwrap_err().downcast_ref::<FlowStoreError>(),
+            store
+                .publish_flow_draft(draft.id, "reviewer")
+                .unwrap_err()
+                .downcast_ref::<FlowStoreError>(),
             Some(FlowStoreError::ValidationRequired)
         ));
 

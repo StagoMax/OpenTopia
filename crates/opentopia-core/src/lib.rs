@@ -14,6 +14,7 @@ pub mod execution;
 mod execution_runtime;
 pub mod execution_spec;
 pub mod flow;
+pub mod flow_runtime;
 mod flow_tools;
 pub mod git_workflow;
 pub mod guardian;
@@ -82,8 +83,8 @@ pub use computer::{
     MAX_COMPUTER_IMAGE_EDGE, MAX_COMPUTER_SCREENSHOT_BYTES, MAX_COMPUTER_WINDOWS,
 };
 pub use context_sources::{
-    load_context_sources, ContextSourceError, ContextSourceKind, ContextSourcePolicy,
-    LoadedContextSource,
+    load_context_source_metadata, load_context_sources, ContextSourceError, ContextSourceKind,
+    ContextSourcePolicy, LoadedContextSource,
 };
 pub use contribution_hosts::{
     AppViewDescriptor, AppViewHost, AppViewMessage, AppViewSandbox, AppViewSession,
@@ -106,22 +107,26 @@ pub use enterprise::{
     CapabilityChangeKindV1, CapabilityChangeV1, CapabilityProjection, DataClassification,
     EnterpriseExecutionContextV1, EvidenceRecordV1, ExecutionBoundaryError, ExecutionIdentityRoute,
     ExecutionIdentityRouter, ExecutionResourceGrantV1, ExperienceSurfaceProfile, ResourceKind,
-    ENTERPRISE_SCHEMA_VERSION_V1,
-    MAX_AGENT_DELEGATION_DEPTH,
+    ENTERPRISE_SCHEMA_VERSION_V1, MAX_AGENT_DELEGATION_DEPTH,
+};
+pub use execution::{
+    ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
+    FileReadResult, FileWriteRequest, LocalExecutionEnvironment, PatchResult, ResourceLimit,
+    StdioSession, WriteResult,
 };
 pub use flow::{
     compile_flow, definition_from_draft, flow_content_hash, normalize_flow_spec, simulate_flow,
     validate_flow_spec, CompiledFlowNodeV1, CompiledFlowPlanV1, FlowBudgetV1, FlowDefinitionV1,
     FlowDraftStatusV1, FlowDraftV1, FlowSimulationStepV1, FlowSourceV1, FlowSpecV1,
     FlowTrialStatusV1, FlowTrialV1, FlowValidationIssueV1, FlowValidationReportV1,
-    FlowValidationSeverityV1, GraphDefinitionV1, GraphEdgeV1, GraphLoopPolicyV1,
-    GraphNodeKindV1, GraphNodeV1, HarnessNodeTargetV1, LoopExhaustionActionV1,
-    MAX_FLOW_DURATION_SECONDS, MAX_FLOW_LOOP_ITERATIONS, MAX_FLOW_NODES,
+    FlowValidationSeverityV1, GraphDefinitionV1, GraphEdgeV1, GraphLoopPolicyV1, GraphNodeKindV1,
+    GraphNodeV1, HarnessNodeTargetV1, LoopExhaustionActionV1, MAX_FLOW_DURATION_SECONDS,
+    MAX_FLOW_LOOP_ITERATIONS, MAX_FLOW_NODES,
 };
-pub use execution::{
-    ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
-    FileReadResult, FileWriteRequest, LocalExecutionEnvironment, PatchResult, ResourceLimit,
-    StdioSession, WriteResult,
+pub use flow_runtime::{
+    evaluate_condition as evaluate_flow_condition, prepare_flow_resume, resolve_flow_approval,
+    spawn_flow_run, FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness,
+    FlowNodeRunStatusV1, FlowNodeRunV1, FlowRunStatusV1, FlowRunV1,
 };
 pub use git_workflow::{
     execute_git_workflow, isolated_subagent_compare_request, isolated_subagent_worktree_request,

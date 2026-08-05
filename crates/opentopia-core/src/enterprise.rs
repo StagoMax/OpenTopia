@@ -195,6 +195,11 @@ impl ExperienceSurfaceProfile {
                     "flow.validate",
                     "flow.simulate",
                     "flow.publish",
+                    "flow.run",
+                    "flow.status",
+                    "flow.pause",
+                    "flow.resume",
+                    "flow.cancel",
                     "complete_task",
                 ]);
                 // Flow design is control-plane work. External plugins and MCP
@@ -1566,6 +1571,8 @@ mod tests {
         let profile = ExperienceSurfaceProfile::for_mode(ExperienceMode::Flow);
         assert!(profile.enterprise_only);
         assert!(profile.capabilities.allows_tool("read_file"));
+        assert!(profile.capabilities.allows_tool("flow.run"));
+        assert!(profile.capabilities.allows_tool("flow.status"));
         assert!(!profile.capabilities.allows_tool("shell"));
         assert!(!profile.capabilities.allows_plugin("browser-automation"));
         assert!(!profile.capabilities.allows_mcp_server("server-1"));
