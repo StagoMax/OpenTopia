@@ -185,12 +185,45 @@ impl TurnChangeManager {
         Ok(change_set)
     }
 
+    #[cfg(test)]
     pub async fn finalize_capture(&self, turn_id: Uuid) -> anyhow::Result<TurnChangeSet> {
+        self.finalize_capture_scoped(turn_id, None).await
+    }
+
+    /// Finalize a capture using only file paths explicitly reported by
+    /// successful workspace-write tools in this turn. An empty slice is a
+    /// confident "no turn-owned writes" result; it must not absorb unrelated
+    /// edits that happened elsewhere in the workspace while the turn ran.
+    pub async fn finalize_capture_for_paths(
+        &self,
+        turn_id: Uuid,
+        changed_paths: &[PathBuf],
+    ) -> anyhow::Result<TurnChangeSet> {
+        self.finalize_capture_scoped(turn_id, Some(changed_paths))
+            .await
+    }
+
+    async fn finalize_capture_scoped(
+        &self,
+        turn_id: Uuid,
+        changed_paths: Option<&[PathBuf]>,
+    ) -> anyhow::Result<TurnChangeSet> {
         let mut change_set = self
             .store
             .get_turn_change_set(turn_id)?
             .context("turn change set was not started")?;
         if change_set.status != TurnChangeSetStatus::Capturing {
+            return Ok(change_set);
+        }
+        if changed_paths.is_some_and(|paths| paths.is_empty()) {
+            change_set.after_tree = change_set.before_tree.clone();
+            change_set.status = TurnChangeSetStatus::Empty;
+            change_set.files.clear();
+            change_set.additions = 0;
+            change_set.deletions = 0;
+            change_set.error = None;
+            change_set.finalized_at = Some(Utc::now());
+            self.store.upsert_turn_change_set(&change_set)?;
             return Ok(change_set);
         }
         let result = async {
@@ -201,7 +234,23 @@ impl TurnChangeManager {
                 .context("before tree is unavailable")?;
             let reference = turn_snapshot_ref(turn_id, "after");
             let after_tree = capture_tree(&repo, Some(&reference)).await?;
-            let files = diff_trees(&repo, before_tree, &after_tree).await?;
+            let mut files = diff_trees(&repo, before_tree, &after_tree).await?;
+            if let Some(changed_paths) = changed_paths {
+                let allowed = changed_paths
+                    .iter()
+                    .filter_map(|path| normalize_reported_change_path(&change_set, path))
+                    .collect::<Vec<_>>();
+                files.retain(|file| {
+                    file.old_path
+                        .iter()
+                        .chain(file.new_path.iter())
+                        .any(|path| {
+                            allowed
+                                .iter()
+                                .any(|allowed| same_change_path(path, allowed))
+                        })
+                });
+            }
             anyhow::Ok((after_tree, files))
         }
         .await;
@@ -733,6 +782,48 @@ fn repo_from_change_set(change_set: &TurnChangeSet) -> anyhow::Result<RepoContex
     })
 }
 
+fn normalize_reported_change_path(change_set: &TurnChangeSet, reported: &Path) -> Option<PathBuf> {
+    if reported.as_os_str().is_empty() {
+        return None;
+    }
+    if reported.is_relative() {
+        return Some(reported.to_path_buf());
+    }
+
+    let reported = normalized_path_text(reported);
+    let workspace = normalized_path_text(&change_set.workspace_root);
+    let reported_cmp = comparable_path_text(&reported);
+    let workspace_cmp = comparable_path_text(&workspace);
+    if reported_cmp == workspace_cmp {
+        return Some(PathBuf::from("."));
+    }
+    let prefix = format!("{workspace_cmp}/");
+    reported_cmp
+        .strip_prefix(&prefix)
+        .map(|relative| PathBuf::from(&reported[reported.len() - relative.len()..]))
+}
+
+fn same_change_path(left: &Path, right: &Path) -> bool {
+    comparable_path_text(&normalized_path_text(left))
+        == comparable_path_text(&normalized_path_text(right))
+}
+
+fn normalized_path_text(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn comparable_path_text(path: &str) -> String {
+    if cfg!(windows) {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
 async fn capture_tree(repo: &RepoContext, reference: Option<&str>) -> anyhow::Result<String> {
     let temp_index = std::env::temp_dir().join(format!("opentopia-index-{}", Uuid::new_v4()));
     let verify = git_output(
@@ -749,11 +840,12 @@ async fn capture_tree(repo: &RepoContext, reference: Option<&str>) -> anyhow::Re
 
     let result = async {
         run_git_strings(&repo.repo_root, &read_args, Some(&temp_index)).await?;
-        run_git_strings(
+        let _add = git_output_strings(
             &repo.repo_root,
             &[
                 "add".to_string(),
                 "-A".to_string(),
+                "--ignore-errors".to_string(),
                 "--".to_string(),
                 git_path(&repo.workspace_prefix),
             ],
@@ -1412,6 +1504,57 @@ mod tests {
         assert!(detail.contains("fatal: adding files failed"));
         assert!(!detail.contains("LF will be replaced"));
         assert!(detail.chars().count() <= GIT_FAILURE_DETAIL_CHARS + 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_finalize_ignores_unreported_concurrent_workspace_edits() {
+        let repo = TestRepo::new();
+        repo.write("owned.txt", "before\n");
+        repo.write("unrelated.txt", "before\n");
+        repo.commit_all();
+        let (manager, store, thread_id) = manager(&repo);
+        let turn_id = insert_turn(&store, thread_id);
+
+        manager
+            .begin_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        repo.write("owned.txt", "after\n");
+        repo.write("unrelated.txt", "changed elsewhere\n");
+
+        let changes = manager
+            .finalize_capture_for_paths(turn_id, &[PathBuf::from("owned.txt")])
+            .await
+            .unwrap();
+        assert_eq!(changes.status, TurnChangeSetStatus::Ready);
+        assert_eq!(changes.files.len(), 1);
+        assert_eq!(
+            changes.files[0].new_path.as_deref(),
+            Some(Path::new("owned.txt"))
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_finalize_is_empty_without_successful_reported_writes() {
+        let repo = TestRepo::new();
+        repo.write("unrelated.txt", "before\n");
+        repo.commit_all();
+        let (manager, store, thread_id) = manager(&repo);
+        let turn_id = insert_turn(&store, thread_id);
+
+        manager
+            .begin_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        repo.write("unrelated.txt", "changed elsewhere\n");
+
+        let changes = manager
+            .finalize_capture_for_paths(turn_id, &[])
+            .await
+            .unwrap();
+        assert_eq!(changes.status, TurnChangeSetStatus::Empty);
+        assert!(changes.files.is_empty());
+        assert_eq!(changes.before_tree, changes.after_tree);
     }
 
     #[tokio::test]

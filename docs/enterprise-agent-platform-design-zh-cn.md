@@ -1356,11 +1356,11 @@ Flow 图默认是审阅模型生成结果的视图。可以允许用户选择节
 
 ### Phase 2：Flow Design 与编排
 
-- 在 Flow 模式默认投影 `flow.search/create/update/inspect/validate/simulate/publish` 工具，并通过工具名称、说明和 schema 引导主 Agent 自然选择；
+- 在 Flow 模式默认投影 `flow.search/create/update/inspect/validate/simulate/publish/run/status/pause/resume/cancel` 工具，并通过工具名称、说明和 schema 引导主 Agent 自然选择；
 - 让同一个 `flow.create` 同时支持从成功 Run/Trace 提炼流程和从自然语言直接设计流程；
 - 实现 Flow Registry、FlowDraft、`flow.*` 高层工具、内部 Graph API、schema 编译器和静态校验；
 - 把 Agent、Skill、Tool、Approval、Join 和受控 Loop 节点编译到现有 Harness；
-- 复用现有运行事件、检查点、审批、暂停和恢复；
+- 复用现有 Agent Harness，并由 Flow Runtime 持久化 `FlowRun/NodeRun`、图快照、预算和节点边界检查点；审批、暂停、恢复和取消均在节点边界生效，进程中断的节点必须人工核对外部状态后显式重试；
 - 增加 Flow 模式三栏界面、右侧审阅窗口、Flow 库和完整 Trace。
 
 验收标准：用户能从一次正确执行或自然语言描述生成可审阅 FlowDraft；开发—测试—返工等闭环受到次数和预算限制；所有节点仍由现有 Harness 执行。
