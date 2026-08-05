@@ -100,6 +100,67 @@ function cloneComposerSnapshot(
   };
 }
 
+/**
+ * Chromium can replace a deleted `contenteditable=false` inline node with one
+ * or more line breaks. Those breaks are browser caret scaffolding, not user
+ * input, and become an apparently undeletable blank line once the composer is
+ * read back. Remove them only when the same mutation actually deleted an image
+ * reference and inserted nothing except line breaks.
+ */
+export function normalizeComposerImageDeletionSnapshot(
+  before: ComposerHistorySnapshot,
+  after: ComposerHistorySnapshot,
+): ComposerHistorySnapshot {
+  const beforeTokens = composerContentTokens(before.parts);
+  const afterTokens = composerContentTokens(after.parts);
+  let prefixLength = 0;
+  while (
+    prefixLength < beforeTokens.length &&
+    prefixLength < afterTokens.length &&
+    composerTokensEqual(beforeTokens[prefixLength], afterTokens[prefixLength])
+  ) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < beforeTokens.length - prefixLength &&
+    suffixLength < afterTokens.length - prefixLength &&
+    composerTokensEqual(
+      beforeTokens[beforeTokens.length - 1 - suffixLength],
+      afterTokens[afterTokens.length - 1 - suffixLength],
+    )
+  ) {
+    suffixLength += 1;
+  }
+
+  const removedTokens = beforeTokens.slice(
+    prefixLength,
+    beforeTokens.length - suffixLength,
+  );
+  const insertedTokens = afterTokens.slice(
+    prefixLength,
+    afterTokens.length - suffixLength,
+  );
+  const deletedImage = removedTokens.some(
+    (token) => token.type === "image_ref",
+  );
+  const insertedOnlyLineBreaks =
+    insertedTokens.length > 0 &&
+    insertedTokens.every(
+      (token) => token.type === "text" && /^\r?\n$/.test(token.text),
+    );
+  if (!deletedImage || !insertedOnlyLineBreaks) return after;
+
+  return {
+    parts: composerPartsFromTokens([
+      ...afterTokens.slice(0, prefixLength),
+      ...afterTokens.slice(afterTokens.length - suffixLength),
+    ]),
+    caretOffset: prefixLength,
+  };
+}
+
 export function composerUndoEntries(
   before: ComposerHistorySnapshot,
   after: ComposerHistorySnapshot,

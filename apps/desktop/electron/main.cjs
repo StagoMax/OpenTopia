@@ -2,9 +2,11 @@ const {
   app,
   BrowserWindow,
   WebContentsView,
+  clipboard,
   dialog,
   ipcMain,
   Notification,
+  nativeImage,
   safeStorage,
   shell,
 } = require("electron");
@@ -1987,6 +1989,28 @@ function registerIpc() {
       logConsole("warn", "notification.show.failed", { error });
     });
     notification.show();
+    return true;
+  });
+
+  ipcMain.handle("platform:write-clipboard-image", (event, bytes) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) {
+      throw new Error(
+        "Clipboard image writes are available only to the main window",
+      );
+    }
+    if (!ArrayBuffer.isView(bytes) || bytes.byteLength === 0) {
+      throw new TypeError(
+        "Clipboard image bytes must be a non-empty typed array",
+      );
+    }
+    const buffer = Buffer.from(
+      bytes.buffer,
+      bytes.byteOffset,
+      bytes.byteLength,
+    );
+    const image = nativeImage.createFromBuffer(buffer);
+    if (image.isEmpty()) throw new Error("Clipboard image data is invalid");
+    clipboard.writeImage(image);
     return true;
   });
 

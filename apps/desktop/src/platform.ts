@@ -109,6 +109,20 @@ export async function showSystemNotification(
   return true;
 }
 
+export async function writeClipboardImage(pngBlob: Blob): Promise<void> {
+  if (window.opentopia?.writeClipboardImage) {
+    const bytes = new Uint8Array(await pngBlob.arrayBuffer());
+    await window.opentopia.writeClipboardImage(bytes);
+    return;
+  }
+  if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+    throw new Error("当前环境不支持复制图片");
+  }
+  await navigator.clipboard.write([
+    new ClipboardItem({ [pngBlob.type]: pngBlob }),
+  ]);
+}
+
 export async function getRecentWorkspaces(): Promise<RecentWorkspace[]> {
   if (window.opentopia) return window.opentopia.getRecentWorkspaces();
   return readBrowserRecentWorkspaces();

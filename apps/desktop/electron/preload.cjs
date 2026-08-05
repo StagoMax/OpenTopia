@@ -52,13 +52,17 @@ contextBridge.exposeInMainWorld("opentopia", {
     ipcRenderer.invoke("platform:open-path", targetPath),
   showSystemNotification: (options) =>
     ipcRenderer.invoke("platform:show-system-notification", options),
+  writeClipboardImage: (bytes) =>
+    ipcRenderer.invoke("platform:write-clipboard-image", bytes),
   selectWorkspace: (options) => ipcRenderer.invoke("workspace:select", options),
   selectContextFiles: (options) =>
     ipcRenderer.invoke("context:select-files", options),
   getDroppedContextFiles: (files) =>
     ipcRenderer.invoke(
       "context:add-dropped-files",
-      Array.from(files, (file) => webUtils.getPathForFile(file)).filter(Boolean),
+      Array.from(files, (file) => webUtils.getPathForFile(file)).filter(
+        Boolean,
+      ),
     ),
   selectPluginDirectory: (options) =>
     ipcRenderer.invoke("plugins:select-directory", options),

@@ -5,6 +5,7 @@ import {
   composerUndoEntries,
   composerVisibleText,
   normalizeComposerContentParts,
+  normalizeComposerImageDeletionSnapshot,
   referencedImageIds,
 } from "./composerContent.ts";
 
@@ -78,6 +79,46 @@ test("keeps a pasted phrase as one undo operation", () => {
   assert.deepEqual(entries, [
     { parts: [{ type: "text", text: "前" }], caretOffset: 1 },
   ]);
+});
+
+test("removes a line break Chromium inserts when an inline image is deleted", () => {
+  const snapshot = normalizeComposerImageDeletionSnapshot(
+    {
+      parts: [
+        { type: "text", text: "before" },
+        { type: "image_ref", imageId },
+        { type: "text", text: "after" },
+      ],
+      caretOffset: 7,
+    },
+    {
+      parts: [{ type: "text", text: "before\nafter" }],
+      caretOffset: 7,
+    },
+  );
+
+  assert.deepEqual(snapshot, {
+    parts: [{ type: "text", text: "beforeafter" }],
+    caretOffset: 6,
+  });
+});
+
+test("preserves intentional line breaks when no image was deleted", () => {
+  const after = {
+    parts: [{ type: "text" as const, text: "before\nafter" }],
+    caretOffset: 7,
+  };
+
+  assert.equal(
+    normalizeComposerImageDeletionSnapshot(
+      {
+        parts: [{ type: "text", text: "beforeafter" }],
+        caretOffset: 6,
+      },
+      after,
+    ),
+    after,
+  );
 });
 
 test("records inline image insertion in the custom undo history", () => {
