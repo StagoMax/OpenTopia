@@ -255,6 +255,7 @@ export type AppSettings = {
   enterprise: {
     enabled: boolean;
   };
+  parallelToolCallsMigrated: boolean;
   updatedAt: string;
 };
 
@@ -1761,8 +1762,20 @@ export type FlowNodeRun = {
   output: unknown | null;
   error: string | null;
   toolCalls: number;
+  transcript: FlowTranscriptEntry[];
   startedAt: string;
   completedAt: string | null;
+};
+
+export type FlowTranscriptEntry = {
+  id: string;
+  kind: "input" | "tool_call" | "tool_result" | "output" | "approval" | "error";
+  title: string;
+  content: unknown;
+  toolName?: string | null;
+  callId?: string | null;
+  isError: boolean;
+  createdAt: string;
 };
 
 export type FlowRun = {
@@ -1938,11 +1951,36 @@ export type TaskPlanStep = {
   evidence: string[];
 };
 
+export type TaskEvidenceKind =
+  | "observation"
+  | "implementation"
+  | "verification"
+  | "global_check";
+
+export type TaskPlanCoverage = {
+  requirementsRevision: number;
+  requirements: Array<{
+    id: string;
+    statement: string;
+    sourceRefs: string[];
+  }>;
+  stepRequirements: Record<string, string[]>;
+  evidenceRefs: Array<{
+    stepId: string;
+    requirementId: string;
+    kind: TaskEvidenceKind;
+    toolCallId: string;
+    summary: string;
+    requirementsRevision: number;
+  }>;
+};
+
 export type TaskPlan = {
   planRevision: number;
   goalId: string;
   changeReason?: string | null;
   explanation?: string | null;
+  coverage?: TaskPlanCoverage | null;
   steps: TaskPlanStep[];
 };
 
@@ -2365,6 +2403,7 @@ declare global {
       showSystemNotification(
         options: SystemNotificationOptions,
       ): Promise<boolean>;
+      writeClipboardImage(bytes: Uint8Array): Promise<boolean>;
       selectWorkspace(options?: {
         defaultPath?: string;
       }): Promise<WorkspacePickResult>;
