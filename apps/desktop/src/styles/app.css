@@ -2597,6 +2597,10 @@ button:disabled {
   background: var(--app-bg);
 }
 
+.workspace.is-settings-hidden {
+  display: none;
+}
+
 .workspace-resizer {
   position: relative;
   z-index: 40;
@@ -3114,7 +3118,6 @@ button:disabled {
 }
 
 .message.user .message-body {
-  border: 1px solid var(--border);
   background: var(--surface-subtle);
 }
 
@@ -5547,7 +5550,6 @@ button:disabled {
 }
 
 .message.user .message-body {
-  border: 1px solid var(--border);
   background: var(--surface-subtle);
 }
 
@@ -12540,6 +12542,24 @@ button:disabled {
   z-index: var(--z-popover);
 }
 
+.image-copy-context-menu {
+  position: fixed;
+  z-index: var(--z-toast);
+}
+
+.image-copy-context-menu button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: var(--space-1);
+}
+
+.image-copy-context-menu[data-status="copied"] button {
+  color: var(--success);
+}
+
+.image-copy-context-menu[data-status="error"] button {
+  color: var(--danger);
+}
+
 .message-inline-image.is-reference {
   display: inline-flex;
   width: calc(var(--space-12) * 2);
@@ -12828,8 +12848,13 @@ button:disabled {
   background: var(--surface-active);
 }
 
-.thread-row-wrap:hover .thread-row-status,
-.thread-row-wrap.menu-open .thread-row-status {
+.thread-row-wrap:hover .thread-row-status:not(.is-processing),
+.thread-row-wrap.menu-open .thread-row-status:not(.is-processing) {
+  visibility: hidden;
+}
+
+.thread-row-wrap.is-processing:hover .thread-row-menu-wrap,
+.thread-row-wrap.is-processing.menu-open .thread-row-menu-wrap {
   visibility: hidden;
 }
 

@@ -36,6 +36,7 @@ import {
   Cloud,
   Clock3,
   Code2,
+  Copy,
   Download,
   ExternalLink,
   File,
@@ -109,6 +110,7 @@ import { FlowWorkspacePanel } from "./components/FlowWorkspacePanel";
 import { RightContextRail } from "./components/RightContextRail";
 import { SettingsPanel as RedesignedSettingsPanel } from "./components/SettingsPanel";
 import { TaskSearchDialog } from "./components/TaskSearchDialog";
+import { UsageLogDashboard } from "./components/UsageLogDashboard";
 import {
   PendingTurnStatus,
   TurnActivityTimeline,
@@ -130,10 +132,16 @@ import {
   composerUndoEntries,
   composerVisibleText,
   normalizeComposerContentParts,
+  normalizeComposerImageDeletionSnapshot,
   referencedImageIds,
   splitComposerText,
   type ComposerHistorySnapshot,
 } from "./composerContent";
+import {
+  newTaskComposerDraftKey,
+  threadComposerDraftKey,
+} from "./composerDrafts";
+import { useComposerDraft } from "./useComposerDraft";
 import { isConversationScrollNearEnd } from "./conversationScroll";
 import {
   cacheConversation,
@@ -156,10 +164,6 @@ import {
   WorkspacePathIndexContext,
 } from "./components/WorkspacePathProvider";
 import {
-  reconcileReasoningEffort,
-  resolveDefaultModelId,
-} from "./modelCatalog";
-import {
   deleteProviderApiKey,
   getDroppedContextFiles,
   getRecentWorkspaces,
@@ -173,6 +177,7 @@ import {
   selectWorkspace,
   setProviderApiKey,
   showSystemNotification,
+  writeClipboardImage,
 } from "./platform";
 import {
   playCompletionChime,
@@ -187,6 +192,11 @@ import {
   type ThreadActivityReadAt,
 } from "./threadActivityRead";
 import {
+  isThreadActivityProcessing,
+  threadActivityStatusLabel,
+  type ThreadActivityStatus,
+} from "./threadActivityStatus";
+import {
   applyAppearance,
   readAppearanceSettings,
   resolveTheme,
@@ -198,12 +208,20 @@ import {
   readPersonalizationSettings,
   writePersonalizationSettings,
 } from "./personalization";
-import type { ActiveTurnPhase } from "./turnActivityStatus";
+import { hasPendingProviderRequest } from "./turnActivityStatus";
 import {
   readEditorPreferences,
   writeEditorPreferences,
 } from "./editorPreferences";
-import type { TaskSearchActivityStatus } from "./taskSearch";
+import {
+  readDraftModelSelection,
+  readLastActiveThreadId,
+  readSidebarNavigationState,
+  resolveDraftModelSelection,
+  updateSidebarNavigationState,
+  writeDraftModelSelection,
+  writeLastActiveThreadId,
+} from "./workbenchPreferences";
 import type {
   AgentEvent,
   AppSettings,
@@ -263,8 +281,6 @@ import type {
 
 type ServerStatus = "checking" | "online" | "offline";
 
-type ThreadActivityStatus = TaskSearchActivityStatus;
-
 type LoadedThreadActivityStatus = {
   status: ThreadActivityStatus;
   updatedAt: string | null;
@@ -279,7 +295,6 @@ type ConversationLoadState = {
 type PendingTurnFeedback = {
   threadId: string;
   turnId: string | null;
-  phase: ActiveTurnPhase;
   startedAt: string;
 };
 
@@ -324,7 +339,10 @@ async function loadThreadActivityStatuses(
         if (!status) return null;
 
         const updatedAt = turnStatus?.updatedAt ?? null;
-        if (!isThreadActivityUnread(activityReadAt, thread.id, updatedAt)) {
+        if (
+          !isThreadActivityProcessing(status) &&
+          !isThreadActivityUnread(activityReadAt, thread.id, updatedAt)
+        ) {
           return null;
         }
         return [thread.id, { status, updatedAt }] as const;
@@ -343,7 +361,13 @@ async function loadThreadActivityStatuses(
 }
 
 type ToolTabKind =
-  WorkbenchTab | "browser" | "computer" | "preview" | "side-task";
+  | WorkbenchTab
+  | "flow"
+  | "browser"
+  | "computer"
+  | "preview"
+  | "side-task"
+  | "usage";
 
 type ToolTab = {
   id: string;
@@ -614,10 +638,11 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
   // Model picked on the new-task screen, before a thread exists to pin it to.
   // Carried into the thread the draft creates.
   const [draftModelSelection, setDraftModelSelection] =
-    useState<ThreadModelSelection | null>(null);
+    useState<ThreadModelSelection | null>(readDraftModelSelection);
   const [experienceMode, setExperienceMode] =
     useState<ExperienceMode>(readExperienceMode);
   const [collaborationMode, setCollaborationMode] = useState<CollaborationMode>(
@@ -647,12 +672,20 @@ export function App() {
   const [terminalEvents, setTerminalEvents] = useState<TerminalEvent[]>([]);
   const [terminalSession, setTerminalSession] =
     useState<TerminalSession | null>(null);
-  const [composer, setComposer] = useState("");
+  const composerDraftKey = activeThreadId
+    ? threadComposerDraftKey(activeThreadId)
+    : newTaskComposerDraftKey(experienceMode, draftProjectId);
+  const {
+    text: composer,
+    contextSources,
+    selectedSkillIds,
+    setText: setComposer,
+    setContextSources,
+    setSelectedSkillIds,
+  } = useComposerDraft(composerDraftKey);
   const [newTaskLaunchMode, setNewTaskLaunchMode] =
     useState<NewTaskLaunchMode>("local");
-  const [contextSources, setContextSources] = useState<ContextSourceFile[]>([]);
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
-  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [skillsRevision, setSkillsRevision] = useState(0);
   const [isCreatingThread, setIsCreatingThread] = useState(false);
   const [sendingThreadIds, setSendingThreadIds] = useState<ReadonlySet<string>>(
@@ -770,11 +803,12 @@ export function App() {
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
   const [contextRailOpen, setContextRailOpen] = useState(false);
   const [contextRailCollapsed, setContextRailCollapsed] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => readSidebarNavigationState().collapsed,
+  );
   const [taskSearchOpen, setTaskSearchOpen] = useState(false);
   const [keyboardShortcutsOpen, setKeyboardShortcutsOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
-  const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [turnUndoDialog, setTurnUndoDialog] =
     useState<TurnUndoDialogState | null>(null);
@@ -837,12 +871,81 @@ export function App() {
     threadActivityReadAtRef.current = nextReadAt;
     writeThreadActivityReadAt(nextReadAt);
     setThreadActivityStatuses((current) => {
-      if (!(threadId in current)) return current;
+      if (
+        !(threadId in current) ||
+        isThreadActivityProcessing(current[threadId])
+      ) {
+        return current;
+      }
       const next = { ...current };
       delete next[threadId];
       return next;
     });
   }, []);
+
+  const processingThreadIds = useMemo(
+    () =>
+      Object.keys(threadActivityStatuses).filter((threadId) =>
+        isThreadActivityProcessing(threadActivityStatuses[threadId]),
+      ),
+    [threadActivityStatuses],
+  );
+
+  useEffect(() => {
+    if (!client || processingThreadIds.length === 0) return;
+
+    const controller = new AbortController();
+    const refreshProcessingStatuses = () => {
+      void Promise.all(
+        processingThreadIds.map(async (threadId) => {
+          try {
+            const turnStatus = await client.getTurnStatus(
+              threadId,
+              controller.signal,
+            );
+            return turnStatus
+              ? {
+                  threadId,
+                  status: resolveThreadActivityStatus(turnStatus),
+                  updatedAt: turnStatus.updatedAt,
+                }
+              : null;
+          } catch {
+            return null;
+          }
+        }),
+      ).then((statusUpdates) => {
+        if (controller.signal.aborted) return;
+        setThreadActivityStatuses((current) => {
+          let next = current;
+          for (const update of statusUpdates) {
+            if (!update || isThreadActivityProcessing(update.status)) continue;
+            const nextStatus =
+              update.status &&
+              isThreadActivityUnread(
+                threadActivityReadAtRef.current,
+                update.threadId,
+                update.updatedAt,
+              )
+                ? update.status
+                : null;
+            if (next[update.threadId] === nextStatus) continue;
+            if (next === current) next = { ...current };
+            if (nextStatus) next[update.threadId] = nextStatus;
+            else delete next[update.threadId];
+          }
+          return next;
+        });
+      });
+    };
+
+    refreshProcessingStatuses();
+    const timer = window.setInterval(refreshProcessingStatuses, 2_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [client, processingThreadIds]);
 
   const setThreadSending = useCallback((threadId: string, sending: boolean) => {
     setSendingThreadIds((current) => {
@@ -897,6 +1000,10 @@ export function App() {
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
     [threads, activeThreadId],
   );
+  useEffect(() => {
+    if (!activeThread) return;
+    writeLastActiveThreadId(activeThread.experienceMode, activeThread.id);
+  }, [activeThread]);
   const isSending = activeThreadId
     ? sendingThreadIds.has(activeThreadId)
     : isCreatingThread;
@@ -1113,6 +1220,10 @@ export function App() {
   }, [experienceMode]);
 
   useEffect(() => {
+    updateSidebarNavigationState({ collapsed: sidebarCollapsed });
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
     if (settings && !settings.enterprise.enabled && experienceMode === "flow") {
       setExperienceMode("code");
     }
@@ -1317,6 +1428,7 @@ export function App() {
 
       if (event.payload.type === "approval_requested") {
         const approvalId = event.payload.approval_id;
+        setThreadActivityStatus(event.threadId, "approval");
         markThreadActivityRead(event.threadId);
         setApprovalDecisionError(null);
         setConversationCollapsed(false);
@@ -1326,12 +1438,14 @@ export function App() {
       }
 
       if (event.payload.type === "browser_handoff_required") {
+        setThreadActivityStatus(event.threadId, "user_action");
         markThreadActivityRead(event.threadId);
         setConversationCollapsed(false);
       }
 
       if (event.payload.type === "user_input_requested") {
         const request = event.payload.request;
+        setThreadActivityStatus(event.threadId, "user_action");
         setUserInputError(null);
         setConversationCollapsed(false);
         setPendingUserInput((current) =>
@@ -1354,6 +1468,7 @@ export function App() {
       }
 
       if (event.payload.type === "error") {
+        setThreadActivityStatus(event.threadId, "failed");
         markThreadActivityRead(event.threadId);
         setActionError(
           `Agent 请求失败：${friendlyProviderError(event.payload.message)}`,
@@ -1361,12 +1476,14 @@ export function App() {
       }
 
       if (event.payload.type === "turn_started" && event.turnId) {
+        setThreadActivityStatus(event.threadId, "processing");
         markThreadActivityRead(event.threadId);
         setActiveTurnId(event.turnId);
         setCancellingTurnId(null);
         setQueuedMessageCount((current) => Math.max(0, current - 1));
       } else if (event.payload.type === "turn_finished") {
         // This task is already open, so its completion has been seen.
+        setThreadActivityStatus(event.threadId, "succeeded");
         markThreadActivityRead(event.threadId);
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
@@ -1375,6 +1492,7 @@ export function App() {
           !event.turnId || current === event.turnId ? null : current,
         );
       } else if (event.payload.type === "turn_suspended") {
+        setThreadActivityStatus(event.threadId, "approval");
         markThreadActivityRead(event.threadId);
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
@@ -1401,6 +1519,9 @@ export function App() {
         event.payload.type === "turn_awaiting_input" ||
         event.payload.type === "error"
       ) {
+        if (event.payload.type === "turn_awaiting_input") {
+          setThreadActivityStatus(event.threadId, "user_action");
+        }
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
@@ -1635,21 +1756,24 @@ export function App() {
           );
           const latestStatuses = Object.fromEntries(
             Object.entries(statuses)
-              .filter(([threadId, activity]) =>
-                isThreadActivityUnread(
-                  threadActivityReadAtRef.current,
-                  threadId,
-                  activity.updatedAt,
-                ),
+              .filter(
+                ([threadId, activity]) =>
+                  isThreadActivityProcessing(activity.status) ||
+                  isThreadActivityUnread(
+                    threadActivityReadAtRef.current,
+                    threadId,
+                    activity.updatedAt,
+                  ),
               )
               .map(([threadId, activity]) => [threadId, activity.status]),
           );
           setThreadActivityStatuses((current) => {
             const currentStatuses = Object.fromEntries(
               Object.entries(current).filter(
-                ([threadId]) =>
+                ([threadId, status]) =>
                   loadedThreadIds.has(threadId) &&
-                  !threadActivityReadAtRef.current[threadId],
+                  (isThreadActivityProcessing(status) ||
+                    !threadActivityReadAtRef.current[threadId]),
               ),
             );
             return { ...latestStatuses, ...currentStatuses };
@@ -1659,6 +1783,13 @@ export function App() {
         setProviderHealth(loadedHealth);
         setMcpServers(loadedMcp);
         const projectIds = new Set(loadedProjects.map((project) => project.id));
+        const lastActiveThreadId = readLastActiveThreadId(experienceMode);
+        const restoredThread = loadedThreads.find(
+          (thread) =>
+            thread.id === lastActiveThreadId &&
+            !thread.archivedAt &&
+            thread.experienceMode === experienceMode,
+        );
         const firstVisibleThread = loadedThreads.find(
           (thread) =>
             !thread.archivedAt &&
@@ -1667,16 +1798,15 @@ export function App() {
             projectIds.has(thread.projectId),
         );
         const firstProject = sortProjects(loadedProjects)[0] ?? null;
-        setActiveThreadId(
-          (current) => current ?? firstVisibleThread?.id ?? null,
-        );
-        if (!firstVisibleThread) {
+        const initialThread = restoredThread ?? firstVisibleThread ?? null;
+        setActiveThreadId((current) => current ?? initialThread?.id ?? null);
+        if (!initialThread) {
           setDraftProjectId((current) => current ?? firstProject?.id ?? null);
         }
         setSelectedWorkspaceRoot(
           (current) =>
             current ??
-            firstVisibleThread?.workspaceRoot ??
+            initialThread?.workspaceRoot ??
             firstProject?.workspaceRoot ??
             null,
         );
@@ -1744,31 +1874,18 @@ export function App() {
   // model is the default, and the composer is where you deviate from it.
   useEffect(() => {
     if (!settings) return;
-    const active =
-      settings.providers.find(
-        (provider) => provider.id === settings.activeProviderId,
-      ) ?? settings.providers[0];
-    if (!active) return;
-    setDraftModelSelection((current) => {
-      if (current && current.connectionId === active.id) return current;
-      const modelIds =
-        active.syncedModels.length > 0 ? active.syncedModels : [active.model];
-      const modelId = resolveDefaultModelId(
-        modelIds,
-        active.enabledFamilies,
-        active.model,
-      );
-      return {
-        connectionId: active.id,
-        modelId,
-        reasoningEffort: reconcileReasoningEffort(
-          active.kind,
-          modelId,
-          active.reasoningEffort ?? null,
-        ),
-      };
-    });
+    setDraftModelSelection((current) =>
+      resolveDraftModelSelection(
+        settings.providers,
+        settings.activeProviderId,
+        current,
+      ),
+    );
   }, [settings]);
+
+  useEffect(() => {
+    writeDraftModelSelection(draftModelSelection);
+  }, [draftModelSelection]);
 
   useEffect(() => {
     setPendingApprovalIds([]);
@@ -1874,6 +1991,9 @@ export function App() {
             pendingApprovals.length > 0
               ? "approval"
               : resolveThreadActivityStatus(turnStatus);
+          if (activityStatus) {
+            setThreadActivityStatus(threadId, activityStatus);
+          }
           if (activityStatus) markThreadActivityRead(threadId);
           setPendingApprovalIds(
             pendingApprovals.map((approval) => approval.approvalId),
@@ -2047,9 +2167,6 @@ export function App() {
     setActiveThreadId(threadId);
     if (thread) setExperienceMode(thread.experienceMode);
     setDraftProjectId(null);
-    setComposer("");
-    setContextSources([]);
-    setSelectedSkillIds([]);
     if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
   }
 
@@ -2071,9 +2188,6 @@ export function App() {
         setActiveThreadId(thread.id);
         setExperienceMode(thread.experienceMode);
         setDraftProjectId(null);
-        setComposer("");
-        setContextSources([]);
-        setSelectedSkillIds([]);
         setSelectedWorkspaceRoot(thread.workspaceRoot);
       } catch (error) {
         console.warn("OpenTopia could not open the requested task", error);
@@ -2107,10 +2221,7 @@ export function App() {
     setActiveThreadId(null);
     setMessages([]);
     setEvents([]);
-    setComposer("");
     setNewTaskLaunchMode("local");
-    setContextSources([]);
-    setSelectedSkillIds([]);
     setActiveTurnId(null);
     setPendingApprovalIds([]);
     setToolTabs([]);
@@ -2990,9 +3101,9 @@ export function App() {
         updatePendingTurnFeedback(thread.id, {
           threadId: thread.id,
           turnId: null,
-          phase: "thinking",
           startedAt: pendingFeedbackStartedAt,
         });
+        setThreadActivityStatus(thread.id, "processing");
         const { message, turnId } = await client.sendMessage(
           thread.id,
           initialPrompt?.trim() ?? "",
@@ -3021,6 +3132,7 @@ export function App() {
       }
       return activeThreadIdRef.current === thread.id;
     } catch (error) {
+      if (createdThreadId) setThreadActivityStatus(createdThreadId, null);
       if (pendingFeedbackStartedAt && createdThreadId) {
         updatePendingTurnFeedback(createdThreadId, (current) =>
           current?.startedAt === pendingFeedbackStartedAt ? null : current,
@@ -3153,9 +3265,9 @@ export function App() {
       updatePendingTurnFeedback(threadId, {
         threadId,
         turnId: null,
-        phase: "thinking",
         startedAt: pendingFeedbackStartedAt,
       });
+      setThreadActivityStatus(threadId, "processing");
       const { message, turnId, queued } = await client.sendMessage(
         threadId,
         messageText,
@@ -3176,7 +3288,6 @@ export function App() {
           ? {
               ...current,
               turnId,
-              phase: queued ? "processing" : current.phase,
             }
           : current,
       );
@@ -3201,6 +3312,7 @@ export function App() {
       }
       return activeThreadIdRef.current === threadId;
     } catch (error) {
+      setThreadActivityStatus(threadId, null);
       if (pendingFeedbackStartedAt) {
         updatePendingTurnFeedback(threadId, (current) =>
           current?.startedAt === pendingFeedbackStartedAt ? null : current,
@@ -4096,456 +4208,442 @@ export function App() {
             </button>
           </div>
         )}
-        {!settingsOpen ? (
-          <main
-            ref={workspaceRef}
-            className={`workspace ${toolStageOpen ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
-            style={workspaceStyle}
+        <main
+          ref={workspaceRef}
+          className={`workspace ${settingsOpen ? "is-settings-hidden" : ""} ${toolStageOpen ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
+          style={workspaceStyle}
+        >
+          <Sidebar
+            projects={projects}
+            threads={threads}
+            threadActivityStatuses={threadActivityStatuses}
+            activeThreadId={activeThreadId}
+            activeProjectId={activeThread?.projectId ?? draftProjectId}
+            activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
+            workspaceError={workspaceError}
+            isPickingWorkspace={isPickingWorkspace}
+            experienceMode={experienceMode}
+            flowModeEnabled={settings?.enterprise.enabled ?? false}
+            onExperienceModeChange={changeExperienceMode}
+            onSelect={selectThread}
+            onNew={beginNewThread}
+            onPickWorkspace={() => void chooseWorkspace()}
+            onCreateProject={createBlankProject}
+            onRemoveProject={(project) => void removeProject(project)}
+            onRenameProject={(project) =>
+              setRenameTarget({
+                kind: "project",
+                id: project.id,
+                name: project.name,
+              })
+            }
+            onToggleProjectPinned={(project) =>
+              void toggleProjectPinned(project)
+            }
+            onSelectProject={beginProjectDraft}
+            onNewThreadForProject={handleNewThreadForProject}
+            onRenameThread={(thread) =>
+              setRenameTarget({
+                kind: "thread",
+                id: thread.id,
+                name: thread.title,
+              })
+            }
+            onOpenThreadUsage={(thread) => {
+              selectThread(thread.id);
+              openToolTab("usage");
+            }}
+            onRestoreThread={(thread) => void restoreThread(thread)}
+            onOpenThreadWorkspace={(workspaceRoot) =>
+              void openWorkspaceRoot(workspaceRoot)
+            }
+            onOpenExtensions={() => openToolTab("extensions")}
+            onOpenTaskSearch={() => setTaskSearchOpen(true)}
+            onSettings={() => setSettingsOpen(true)}
+          />
+          {!settingsOpen && !sidebarCollapsed ? (
+            <div
+              className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
+              role="separator"
+              tabIndex={0}
+              aria-label="调整左侧栏宽度"
+              aria-controls="workspace-sidebar"
+              aria-orientation="vertical"
+              aria-valuemin={workspaceLayout.leftMin}
+              aria-valuemax={workspaceLayout.leftMax}
+              aria-valuenow={workspaceLayout.left}
+              aria-valuetext={`${workspaceLayout.left} 像素`}
+              onPointerDown={(event) => beginWorkspaceResize("left", event)}
+              onPointerMove={(event) => continueWorkspaceResize("left", event)}
+              onPointerUp={(event) => finishWorkspaceResize("left", event)}
+              onPointerCancel={(event) => finishWorkspaceResize("left", event)}
+              onLostPointerCapture={(event) =>
+                finishWorkspaceResize("left", event)
+              }
+              onDoubleClick={() => resetWorkspacePanelSize("left")}
+              onKeyDown={(event) => resizeWorkspaceWithKeyboard("left", event)}
+            />
+          ) : null}
+          <section
+            className={`center-pane ${
+              activeApproval
+                ? "has-approval"
+                : activeUserInput
+                  ? "has-plan-choice"
+                  : ""
+            }`}
+            id="workspace-center-pane"
           >
-            <Sidebar
-              projects={projects}
-              threads={threads}
-              threadActivityStatuses={threadActivityStatuses}
-              activeThreadId={activeThreadId}
-              activeProjectId={activeThread?.projectId ?? draftProjectId}
-              activeWorkspaceRemoteUrl={workspaceDiff?.remoteUrl ?? null}
-              workspaceError={workspaceError}
-              isPickingWorkspace={isPickingWorkspace}
-              experienceMode={experienceMode}
-              flowModeEnabled={settings?.enterprise.enabled ?? false}
-              onExperienceModeChange={changeExperienceMode}
-              onSelect={selectThread}
-              onNew={beginNewThread}
-              onPickWorkspace={() => void chooseWorkspace()}
-              onCreateProject={createBlankProject}
-              onRemoveProject={(project) => void removeProject(project)}
-              onRenameProject={(project) =>
-                setRenameTarget({
-                  kind: "project",
-                  id: project.id,
-                  name: project.name,
-                })
+            <ThreadHeader
+              thread={activeThread}
+              toolStageOpen={toolStageOpen}
+              contextRailOpen={contextRailVisible}
+              onOpenLocation={() =>
+                activeThread &&
+                void openWorkspaceRoot(activeThread.workspaceRoot)
               }
-              onToggleProjectPinned={(project) =>
-                void toggleProjectPinned(project)
-              }
-              onSelectProject={beginProjectDraft}
-              onNewThreadForProject={handleNewThreadForProject}
-              onRenameThread={(thread) =>
+              onOpenTool={openToolTab}
+              onToggleContextRail={() => {
+                if (toolStageOpen) {
+                  setToolStageOpen(false);
+                  setContextRailCollapsed(false);
+                  setContextRailOpen(true);
+                  return;
+                }
+                if (contextRailAutoVisible) {
+                  setContextRailOpen(false);
+                  setContextRailCollapsed((current) => !current);
+                  return;
+                }
+                setContextRailCollapsed(false);
+                setContextRailOpen((current) => !current);
+              }}
+              onToggleToolStage={() => {
+                setConversationCollapsed(false);
+                if (!toolStageOpen && activeThread?.experienceMode === "flow") {
+                  openToolTab("flow");
+                  return;
+                }
+                setToolStageOpen((current) => !current);
+              }}
+              onRename={() =>
+                activeThread &&
                 setRenameTarget({
                   kind: "thread",
-                  id: thread.id,
-                  name: thread.title,
+                  id: activeThread.id,
+                  name: activeThread.title,
                 })
               }
-              onRestoreThread={(thread) => void restoreThread(thread)}
-              onOpenThreadWorkspace={(workspaceRoot) =>
-                void openWorkspaceRoot(workspaceRoot)
-              }
-              onOpenExtensions={() => openToolTab("extensions")}
-              onOpenTaskSearch={() => setTaskSearchOpen(true)}
-              onSettings={() => setSettingsOpen(true)}
+              onArchive={() => activeThread && void archiveThread(activeThread)}
             />
-            {!settingsOpen && !sidebarCollapsed ? (
-              <div
-                className={`workspace-resizer workspace-resizer-left ${workspaceResizeSide === "left" ? "active" : ""}`}
-                role="separator"
-                tabIndex={0}
-                aria-label="调整左侧栏宽度"
-                aria-controls="workspace-sidebar"
-                aria-orientation="vertical"
-                aria-valuemin={workspaceLayout.leftMin}
-                aria-valuemax={workspaceLayout.leftMax}
-                aria-valuenow={workspaceLayout.left}
-                aria-valuetext={`${workspaceLayout.left} 像素`}
-                onPointerDown={(event) => beginWorkspaceResize("left", event)}
-                onPointerMove={(event) =>
-                  continueWorkspaceResize("left", event)
-                }
-                onPointerUp={(event) => finishWorkspaceResize("left", event)}
-                onPointerCancel={(event) =>
-                  finishWorkspaceResize("left", event)
-                }
-                onLostPointerCapture={(event) =>
-                  finishWorkspaceResize("left", event)
-                }
-                onDoubleClick={() => resetWorkspacePanelSize("left")}
-                onKeyDown={(event) =>
-                  resizeWorkspaceWithKeyboard("left", event)
-                }
+            {serverStatus === "offline" ? (
+              <OfflineState
+                backendUrl={platform?.backendUrl}
+                error={serverError}
+                attempt={bootstrapAttempt}
+                isProbing={serverProbing}
+                onRetry={() => setBootstrapAttempt((attempt) => attempt + 1)}
               />
-            ) : null}
-            <section
-              className={`center-pane ${
-                activeApproval
-                  ? "has-approval"
-                  : activeUserInput
-                    ? "has-plan-choice"
-                    : ""
-              }`}
-              id="workspace-center-pane"
-            >
-              <ThreadHeader
-                thread={activeThread}
-                toolStageOpen={toolStageOpen}
-                contextRailOpen={contextRailVisible}
-                onOpenLocation={() =>
-                  activeThread &&
-                  void openWorkspaceRoot(activeThread.workspaceRoot)
-                }
-                onOpenTool={openToolTab}
-                onToggleContextRail={() => {
-                  if (toolStageOpen) {
-                    setToolStageOpen(false);
-                    setContextRailCollapsed(false);
-                    setContextRailOpen(true);
-                    return;
-                  }
-                  if (contextRailAutoVisible) {
-                    setContextRailOpen(false);
-                    setContextRailCollapsed((current) => !current);
-                    return;
-                  }
-                  setContextRailCollapsed(false);
-                  setContextRailOpen((current) => !current);
-                }}
-                onToggleToolStage={() => {
-                  setConversationCollapsed(false);
-                  setToolStageOpen((current) => !current);
-                }}
-                onRename={() =>
-                  activeThread &&
-                  setRenameTarget({
-                    kind: "thread",
-                    id: activeThread.id,
-                    name: activeThread.title,
-                  })
-                }
-                onArchive={() =>
-                  activeThread && void archiveThread(activeThread)
-                }
+            ) : activeThread ? (
+              <>
+                {conversationGoalSnapshot ? (
+                  <GoalStrip
+                    snapshot={conversationGoalSnapshot}
+                    isRunning={Boolean(conversationActiveTurnId)}
+                    action={goalAction}
+                    onRun={() => void runGoal()}
+                    onPause={() => void changeGoalStatus("paused")}
+                    onCancel={() => void changeGoalStatus("cancelled")}
+                  />
+                ) : null}
+                {conversationLoadError ? (
+                  <ConversationLoadErrorState
+                    error={conversationLoadError}
+                    onRetry={() =>
+                      setConversationLoadAttempt((attempt) => attempt + 1)
+                    }
+                  />
+                ) : isConversationLoading ? (
+                  <ConversationLoadingState />
+                ) : (
+                  <MessageList
+                    key={activeThread.id}
+                    messages={conversationMessages}
+                    events={conversationEvents}
+                    activeTurnId={conversationActiveTurnId}
+                    pendingTurnFeedback={conversationPendingTurnFeedback}
+                    undoingTurnId={
+                      turnUndoDialog?.loading || turnUndoDialog?.applying
+                        ? turnUndoDialog.turnId
+                        : null
+                    }
+                    threadId={activeThread.id}
+                    artifacts={artifacts}
+                    onOpenArtifact={(artifactId) =>
+                      void openArtifact(activeThread.id, artifactId)
+                    }
+                    onOpenMarkdownLink={openMarkdownLink}
+                    onUndoTurn={(turnId) => void openTurnUndo(turnId)}
+                    onReviewChanges={() => {
+                      openToolTab("diff");
+                      void refreshWorkbench();
+                    }}
+                    onOpenFileReview={openFileReview}
+                    onLoadTurnFilePreview={(turnId, path, offset) => {
+                      if (!client) {
+                        return Promise.reject(new Error("服务尚未连接"));
+                      }
+                      return client.getTurnFileDiffPreview(
+                        activeThread.id,
+                        turnId,
+                        path,
+                        offset,
+                      );
+                    }}
+                  />
+                )}
+                {activeApproval ? (
+                  <ApprovalDialog
+                    key={activeApproval.approval_id}
+                    request={activeApproval}
+                    queuePosition={1}
+                    queueLength={pendingApprovalQueue.length}
+                    isSubmitting={
+                      decidingApprovalId === activeApproval.approval_id
+                    }
+                    error={approvalDecisionError}
+                    onDecision={(approved) =>
+                      void decideApproval(activeApproval.approval_id, approved)
+                    }
+                  />
+                ) : activeUserInput ? (
+                  <PlanChoiceCard
+                    key={activeUserInput.request.requestId}
+                    request={activeUserInput.request}
+                    isSubmitting={
+                      submittingUserInputId ===
+                      activeUserInput.request.requestId
+                    }
+                    error={userInputError}
+                    onSubmit={(response) =>
+                      void submitUserInput(
+                        activeUserInput.request.requestId,
+                        response,
+                      )
+                    }
+                  />
+                ) : (
+                  <Composer
+                    value={composer}
+                    taskPlan={composerTaskPlan}
+                    isSending={isSending}
+                    isRunning={Boolean(conversationActiveTurnId)}
+                    isCancelling={
+                      Boolean(conversationActiveTurnId) &&
+                      cancellingTurnId === conversationActiveTurnId
+                    }
+                    queuedMessageCount={
+                      isConversationReady ? queuedMessageCount : 0
+                    }
+                    modelSelection={activeThread?.modelSelection ?? null}
+                    providers={settings?.providers ?? []}
+                    activeProviderId={settings?.activeProviderId ?? ""}
+                    permissionMode={settings?.permissionMode ?? "auto"}
+                    collaborationMode={collaborationMode}
+                    sandboxMode={
+                      settings?.sandbox.sandboxMode ?? "workspace-write"
+                    }
+                    contextSources={contextSources}
+                    skills={skills}
+                    selectedSkillIds={selectedSkillIds}
+                    workspaceRoot={null}
+                    projectName={null}
+                    projects={projects}
+                    onChange={setComposer}
+                    onSubmit={submitMessage}
+                    onCancel={() => void cancelTurn()}
+                    onPickWorkspace={() => void chooseWorkspace()}
+                    onSelectProject={selectProject}
+                    onChangePermissionMode={changeExecutionPreset}
+                    onChangeCollaborationMode={setCollaborationMode}
+                    onChangeSandboxMode={changeSandboxMode}
+                    onChangeModelSelection={changeModelSelection}
+                    onOpenSettings={() => setSettingsOpen(true)}
+                    onAddContextSources={addContextSources}
+                    onRemoveContextSource={removeContextSource}
+                    onToggleSkill={toggleSkill}
+                  />
+                )}
+              </>
+            ) : (
+              <NewTaskState
+                value={composer}
+                workspaceRoot={currentWorkspaceRoot}
+                projectName={draftProject?.name ?? null}
+                projects={projects}
+                modelSelection={draftModelSelection}
+                providers={settings?.providers ?? []}
+                activeProviderId={settings?.activeProviderId ?? ""}
+                permissionMode={settings?.permissionMode ?? "auto"}
+                collaborationMode={collaborationMode}
+                sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
+                contextSources={contextSources}
+                skills={skills}
+                selectedSkillIds={selectedSkillIds}
+                isSending={isSending}
+                launchMode={newTaskLaunchMode}
+                experienceMode={experienceMode}
+                onChange={setComposer}
+                onChangeLaunchMode={setNewTaskLaunchMode}
+                onPickWorkspace={() => void chooseWorkspace(true)}
+                onSelectProject={selectProject}
+                onChangePermissionMode={changeExecutionPreset}
+                onChangeCollaborationMode={setCollaborationMode}
+                onChangeSandboxMode={changeSandboxMode}
+                onChangeModelSelection={changeModelSelection}
+                onOpenSettings={() => setSettingsOpen(true)}
+                onAddContextSources={addContextSources}
+                onRemoveContextSource={removeContextSource}
+                onToggleSkill={toggleSkill}
+                onSubmit={createThread}
               />
-              {serverStatus === "offline" ? (
-                <OfflineState
-                  backendUrl={platform?.backendUrl}
-                  error={serverError}
-                  attempt={bootstrapAttempt}
-                  isProbing={serverProbing}
-                  onRetry={() => setBootstrapAttempt((attempt) => attempt + 1)}
-                />
-              ) : activeThread ? (
-                <>
-                  {conversationGoalSnapshot ? (
-                    <GoalStrip
-                      snapshot={conversationGoalSnapshot}
-                      isRunning={Boolean(conversationActiveTurnId)}
-                      action={goalAction}
-                      onRun={() => void runGoal()}
-                      onPause={() => void changeGoalStatus("paused")}
-                      onCancel={() => void changeGoalStatus("cancelled")}
-                    />
-                  ) : null}
-                  {conversationLoadError ? (
-                    <ConversationLoadErrorState
-                      error={conversationLoadError}
-                      onRetry={() =>
-                        setConversationLoadAttempt((attempt) => attempt + 1)
-                      }
-                    />
-                  ) : isConversationLoading ? (
-                    <ConversationLoadingState />
-                  ) : (
-                    <MessageList
-                      key={activeThread.id}
-                      messages={conversationMessages}
-                      events={conversationEvents}
-                      activeTurnId={conversationActiveTurnId}
-                      pendingTurnFeedback={conversationPendingTurnFeedback}
-                      undoingTurnId={
-                        turnUndoDialog?.loading || turnUndoDialog?.applying
-                          ? turnUndoDialog.turnId
-                          : null
-                      }
-                      threadId={activeThread.id}
-                      artifacts={artifacts}
-                      onOpenArtifact={(artifactId) =>
-                        void openArtifact(activeThread.id, artifactId)
-                      }
-                      onOpenMarkdownLink={openMarkdownLink}
-                      onUndoTurn={(turnId) => void openTurnUndo(turnId)}
-                      onReviewChanges={() => {
-                        openToolTab("diff");
-                        void refreshWorkbench();
-                      }}
-                      onOpenFileReview={openFileReview}
-                      onLoadTurnFilePreview={(turnId, path, offset) => {
-                        if (!client) {
-                          return Promise.reject(new Error("服务尚未连接"));
-                        }
-                        return client.getTurnFileDiffPreview(
-                          activeThread.id,
-                          turnId,
-                          path,
-                          offset,
-                        );
-                      }}
-                    />
-                  )}
-                  {activeApproval ? (
-                    <ApprovalDialog
-                      key={activeApproval.approval_id}
-                      request={activeApproval}
-                      queuePosition={1}
-                      queueLength={pendingApprovalQueue.length}
-                      isSubmitting={
-                        decidingApprovalId === activeApproval.approval_id
-                      }
-                      error={approvalDecisionError}
-                      onDecision={(approved) =>
-                        void decideApproval(
-                          activeApproval.approval_id,
-                          approved,
-                        )
-                      }
-                    />
-                  ) : activeUserInput ? (
-                    <PlanChoiceCard
-                      key={activeUserInput.request.requestId}
-                      request={activeUserInput.request}
-                      isSubmitting={
-                        submittingUserInputId ===
-                        activeUserInput.request.requestId
-                      }
-                      error={userInputError}
-                      onSubmit={(response) =>
-                        void submitUserInput(
-                          activeUserInput.request.requestId,
-                          response,
-                        )
-                      }
-                    />
-                  ) : (
-                    <Composer
-                      value={composer}
-                      taskPlan={composerTaskPlan}
-                      isSending={isSending}
-                      isRunning={Boolean(conversationActiveTurnId)}
-                      isCancelling={
-                        Boolean(conversationActiveTurnId) &&
-                        cancellingTurnId === conversationActiveTurnId
-                      }
-                      queuedMessageCount={
-                        isConversationReady ? queuedMessageCount : 0
-                      }
-                      modelSelection={activeThread?.modelSelection ?? null}
-                      providers={settings?.providers ?? []}
-                      activeProviderId={settings?.activeProviderId ?? ""}
-                      permissionMode={settings?.permissionMode ?? "auto"}
-                      collaborationMode={collaborationMode}
-                      sandboxMode={
-                        settings?.sandbox.sandboxMode ?? "workspace-write"
-                      }
-                      contextSources={contextSources}
-                      skills={skills}
-                      selectedSkillIds={selectedSkillIds}
-                      workspaceRoot={null}
-                      projectName={null}
-                      projects={projects}
-                      onChange={setComposer}
-                      onSubmit={submitMessage}
-                      onCancel={() => void cancelTurn()}
-                      onPickWorkspace={() => void chooseWorkspace()}
-                      onSelectProject={selectProject}
-                      onChangePermissionMode={changeExecutionPreset}
-                      onChangeCollaborationMode={setCollaborationMode}
-                      onChangeSandboxMode={changeSandboxMode}
-                      onChangeModelSelection={changeModelSelection}
-                      onOpenSettings={() => setSettingsOpen(true)}
-                      onAddContextSources={addContextSources}
-                      onRemoveContextSource={removeContextSource}
-                      onToggleSkill={toggleSkill}
-                    />
-                  )}
-                </>
-              ) : (
-                <NewTaskState
-                  value={composer}
-                  workspaceRoot={currentWorkspaceRoot}
-                  projectName={draftProject?.name ?? null}
-                  projects={projects}
-                  modelSelection={draftModelSelection}
-                  providers={settings?.providers ?? []}
-                  activeProviderId={settings?.activeProviderId ?? ""}
-                  permissionMode={settings?.permissionMode ?? "auto"}
-                  collaborationMode={collaborationMode}
-                  sandboxMode={
-                    settings?.sandbox.sandboxMode ?? "workspace-write"
-                  }
-                  contextSources={contextSources}
-                  skills={skills}
-                  selectedSkillIds={selectedSkillIds}
-                  isSending={isSending}
-                  launchMode={newTaskLaunchMode}
-                  experienceMode={experienceMode}
-                  onChange={setComposer}
-                  onChangeLaunchMode={setNewTaskLaunchMode}
-                  onPickWorkspace={() => void chooseWorkspace(true)}
-                  onSelectProject={selectProject}
-                  onChangePermissionMode={changeExecutionPreset}
-                  onChangeCollaborationMode={setCollaborationMode}
-                  onChangeSandboxMode={changeSandboxMode}
-                  onChangeModelSelection={changeModelSelection}
-                  onOpenSettings={() => setSettingsOpen(true)}
-                  onAddContextSources={addContextSources}
-                  onRemoveContextSource={removeContextSource}
-                  onToggleSkill={toggleSkill}
-                  onSubmit={createThread}
-                />
-              )}
-            </section>
-            {toolStageOpen && !settingsOpen ? (
-              <div
-                className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
-                role="separator"
-                tabIndex={0}
-                aria-label="调整右侧栏宽度"
-                aria-controls="workspace-right-panel"
-                aria-orientation="vertical"
-                aria-valuemin={workspaceLayout.rightMin}
-                aria-valuemax={workspaceLayout.rightMax}
-                aria-valuenow={workspaceLayout.right}
-                aria-valuetext={`${workspaceLayout.right} 像素`}
-                onPointerDown={(event) => beginWorkspaceResize("right", event)}
-                onPointerMove={(event) =>
-                  continueWorkspaceResize("right", event)
-                }
-                onPointerUp={(event) => finishWorkspaceResize("right", event)}
-                onPointerCancel={(event) =>
-                  finishWorkspaceResize("right", event)
-                }
-                onLostPointerCapture={(event) =>
-                  finishWorkspaceResize("right", event)
-                }
-                onDoubleClick={() => resetWorkspacePanelSize("right")}
-                onKeyDown={(event) =>
-                  resizeWorkspaceWithKeyboard("right", event)
-                }
-              />
-            ) : null}
-            <RightPanel
-              client={client}
-              threads={threads}
-              toolTabs={toolTabs}
-              activeToolTab={activeToolTab}
-              toolStageOpen={toolStageOpen}
-              conversationCollapsed={conversationCollapsed}
-              contextRailOpen={contextRailVisible}
-              contextRailAutoVisible={contextRailAutoVisible}
-              thread={activeThread}
-              settings={settings}
-              projects={projects}
-              skills={skills}
-              collaborationMode={collaborationMode}
-              workspaceRoot={currentWorkspaceRoot}
-              messages={conversationMessages}
-              events={conversationEvents.filter(
-                (event) =>
-                  event.payload.type !== "approval_requested" ||
-                  pendingApprovalIds.includes(event.payload.approval_id),
-              )}
-              subagentRuns={isConversationReady ? subagentRuns : []}
-              terminalEvents={terminalEvents}
-              terminalSession={terminalSession}
-              workspaceTree={workspaceTree}
-              filePreview={filePreview}
-              workspaceDiff={workspaceDiff}
-              sandbox={sandbox}
-              plugins={plugins}
-              selectedSkillIds={selectedSkillIds}
-              mcpServers={mcpServers}
-              threadMcpServers={threadMcpServers}
-              workbenchError={workbenchError}
-              isRefreshingWorkbench={isRefreshingWorkbench}
-              pendingApprovalIds={pendingApprovalIds}
-              decidingApprovalId={decidingApprovalId}
-              artifacts={artifacts}
-              contextStatus={contextStatus}
-              isCompactingContext={isCompactingContext}
-              revertingDiffPath={revertingDiffPath}
-              hunkActionKey={hunkActionKey}
-              reviewFileRequest={reviewFileRequest}
-              onDecideApproval={decideApproval}
-              onRefreshWorkbench={() => void refreshWorkbench()}
-              onOpenWorkspacePath={(path) => void openWorkspacePath(path)}
-              onOpenWorkspaceEntry={(entry) => void openWorkspaceEntry(entry)}
-              onToggleThreadMcp={(serverId, enabled) =>
-                void toggleThreadMcp(serverId, enabled)
+            )}
+          </section>
+          {toolStageOpen && !settingsOpen ? (
+            <div
+              className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
+              role="separator"
+              tabIndex={0}
+              aria-label="调整右侧栏宽度"
+              aria-controls="workspace-right-panel"
+              aria-orientation="vertical"
+              aria-valuemin={workspaceLayout.rightMin}
+              aria-valuemax={workspaceLayout.rightMax}
+              aria-valuenow={workspaceLayout.right}
+              aria-valuetext={`${workspaceLayout.right} 像素`}
+              onPointerDown={(event) => beginWorkspaceResize("right", event)}
+              onPointerMove={(event) => continueWorkspaceResize("right", event)}
+              onPointerUp={(event) => finishWorkspaceResize("right", event)}
+              onPointerCancel={(event) => finishWorkspaceResize("right", event)}
+              onLostPointerCapture={(event) =>
+                finishWorkspaceResize("right", event)
               }
-              onCreateMcpServer={createMcpServer}
-              onUpdateMcpServer={updateMcpServer}
-              onRestartMcpServer={restartMcpServer}
-              onDeleteMcpServer={deleteMcpServer}
-              onInstallPlugin={installLocalPlugin}
-              onUninstallPlugin={uninstallLocalPlugin}
-              onToggleThreadPlugin={toggleThreadPlugin}
-              onUsePluginSkills={usePluginSkills}
-              onOpenWorkspace={(workspaceRoot) =>
-                void openWorkspaceRoot(workspaceRoot)
-              }
-              onEnsureTerminalSession={ensureTerminalSession}
-              onWriteTerminalSession={(threadId, sessionId, data) =>
-                void writeTerminalSession(threadId, sessionId, data)
-              }
-              onResizeTerminalSession={(threadId, sessionId, cols, rows) =>
-                void resizeTerminalSession(threadId, sessionId, cols, rows)
-              }
-              onCloseTerminalSession={(threadId, sessionId) =>
-                void closeTerminalSession(threadId, sessionId)
-              }
-              onCompactContext={() => void compactContext()}
-              onOpenArtifact={(threadId, artifactId) =>
-                void openArtifact(threadId, artifactId)
-              }
-              onOpenMarkdownLink={openMarkdownLink}
-              onRevertDiffFile={(path) => void revertDiffFile(path)}
-              onApplyDiffHunk={(hunk, action) =>
-                void applyDiffHunk(hunk, action)
-              }
-              onOpenFileTab={openReviewFileTab}
-              onLoadFileContent={loadReviewFileContent}
-              onLoadTurnFileDiff={loadReviewTurnFileDiff}
-              onGitAction={runReviewGitAction}
-              onGetArtifact={(threadId, artifactId) =>
-                getArtifact(threadId, artifactId)
-              }
-              onOpenToolTab={openToolTab}
-              onOpenSideTask={() => void openSideTask()}
-              onThreadUpdated={(updatedThread) =>
-                setThreads((current) =>
-                  current.map((thread) =>
-                    thread.id === updatedThread.id ? updatedThread : thread,
-                  ),
-                )
-              }
-              onSetThreadActivity={setThreadActivityStatus}
-              onMarkThreadActivityRead={markThreadActivityRead}
-              onChangePermissionMode={changeExecutionPreset}
-              onChangeSandboxMode={changeSandboxMode}
-              onOpenSettings={() => setSettingsOpen(true)}
-              onActivateToolTab={setActiveToolTabId}
-              onCloseToolTab={closeToolTab}
-              onToggleConversation={() =>
-                setConversationCollapsed((current) => !current)
-              }
-              onHideToolStage={() => {
-                setToolStageOpen(false);
-                setConversationCollapsed(false);
-              }}
-              onAddContextSources={() => void addContextSources()}
-              onCancelSubagent={(runId) => void cancelSubagent(runId)}
+              onDoubleClick={() => resetWorkspacePanelSize("right")}
+              onKeyDown={(event) => resizeWorkspaceWithKeyboard("right", event)}
             />
-          </main>
-        ) : null}
+          ) : null}
+          <RightPanel
+            client={client}
+            threads={threads}
+            toolTabs={toolTabs}
+            activeToolTab={activeToolTab}
+            toolStageOpen={toolStageOpen}
+            conversationCollapsed={conversationCollapsed}
+            contextRailOpen={contextRailVisible}
+            contextRailAutoVisible={contextRailAutoVisible}
+            thread={activeThread}
+            settings={settings}
+            projects={projects}
+            skills={skills}
+            collaborationMode={collaborationMode}
+            workspaceRoot={currentWorkspaceRoot}
+            messages={conversationMessages}
+            events={conversationEvents.filter(
+              (event) =>
+                event.payload.type !== "approval_requested" ||
+                pendingApprovalIds.includes(event.payload.approval_id),
+            )}
+            conversationLoading={isConversationLoading}
+            subagentRuns={isConversationReady ? subagentRuns : []}
+            terminalEvents={terminalEvents}
+            terminalSession={terminalSession}
+            workspaceTree={workspaceTree}
+            filePreview={filePreview}
+            workspaceDiff={workspaceDiff}
+            sandbox={sandbox}
+            plugins={plugins}
+            selectedSkillIds={selectedSkillIds}
+            mcpServers={mcpServers}
+            threadMcpServers={threadMcpServers}
+            workbenchError={workbenchError}
+            isRefreshingWorkbench={isRefreshingWorkbench}
+            pendingApprovalIds={pendingApprovalIds}
+            decidingApprovalId={decidingApprovalId}
+            artifacts={artifacts}
+            contextStatus={contextStatus}
+            isCompactingContext={isCompactingContext}
+            revertingDiffPath={revertingDiffPath}
+            hunkActionKey={hunkActionKey}
+            reviewFileRequest={reviewFileRequest}
+            onDecideApproval={decideApproval}
+            onRefreshWorkbench={() => void refreshWorkbench()}
+            onOpenWorkspacePath={(path) => void openWorkspacePath(path)}
+            onOpenWorkspaceEntry={(entry) => void openWorkspaceEntry(entry)}
+            onToggleThreadMcp={(serverId, enabled) =>
+              void toggleThreadMcp(serverId, enabled)
+            }
+            onCreateMcpServer={createMcpServer}
+            onUpdateMcpServer={updateMcpServer}
+            onRestartMcpServer={restartMcpServer}
+            onDeleteMcpServer={deleteMcpServer}
+            onInstallPlugin={installLocalPlugin}
+            onUninstallPlugin={uninstallLocalPlugin}
+            onToggleThreadPlugin={toggleThreadPlugin}
+            onUsePluginSkills={usePluginSkills}
+            onOpenWorkspace={(workspaceRoot) =>
+              void openWorkspaceRoot(workspaceRoot)
+            }
+            onEnsureTerminalSession={ensureTerminalSession}
+            onWriteTerminalSession={(threadId, sessionId, data) =>
+              void writeTerminalSession(threadId, sessionId, data)
+            }
+            onResizeTerminalSession={(threadId, sessionId, cols, rows) =>
+              void resizeTerminalSession(threadId, sessionId, cols, rows)
+            }
+            onCloseTerminalSession={(threadId, sessionId) =>
+              void closeTerminalSession(threadId, sessionId)
+            }
+            onCompactContext={() => void compactContext()}
+            onOpenArtifact={(threadId, artifactId) =>
+              void openArtifact(threadId, artifactId)
+            }
+            onOpenMarkdownLink={openMarkdownLink}
+            onRevertDiffFile={(path) => void revertDiffFile(path)}
+            onApplyDiffHunk={(hunk, action) => void applyDiffHunk(hunk, action)}
+            onOpenFileTab={openReviewFileTab}
+            onLoadFileContent={loadReviewFileContent}
+            onLoadTurnFileDiff={loadReviewTurnFileDiff}
+            onGitAction={runReviewGitAction}
+            onGetArtifact={(threadId, artifactId) =>
+              getArtifact(threadId, artifactId)
+            }
+            onOpenToolTab={openToolTab}
+            onOpenSideTask={() => void openSideTask()}
+            onThreadUpdated={(updatedThread) =>
+              setThreads((current) =>
+                current.map((thread) =>
+                  thread.id === updatedThread.id ? updatedThread : thread,
+                ),
+              )
+            }
+            onSetThreadActivity={setThreadActivityStatus}
+            onMarkThreadActivityRead={markThreadActivityRead}
+            onChangePermissionMode={changeExecutionPreset}
+            onChangeSandboxMode={changeSandboxMode}
+            onOpenSettings={() => setSettingsOpen(true)}
+            onActivateToolTab={setActiveToolTabId}
+            onCloseToolTab={closeToolTab}
+            onToggleConversation={() =>
+              setConversationCollapsed((current) => !current)
+            }
+            onHideToolStage={() => {
+              setToolStageOpen(false);
+              setConversationCollapsed(false);
+            }}
+            onAddContextSources={() => void addContextSources()}
+            onCancelSubagent={(runId) => void cancelSubagent(runId)}
+          />
+        </main>
         {settingsOpen && (
           <RedesignedSettingsPanel
             platform={platform}
@@ -5528,7 +5626,7 @@ function SettingsPanel({
         contextWindowTokens: null,
         reasoningEffort: null,
         storeResponses: false,
-        parallelToolCalls: false,
+        parallelToolCalls: true,
         promptCacheKey: null,
         promptCachePolicy: null,
         responsesCompactionThresholdTokens: null,
@@ -6315,6 +6413,7 @@ function Sidebar({
   onOpenThreadWorkspace,
   onNewThreadForProject,
   onRenameThread,
+  onOpenThreadUsage,
   onRestoreThread,
   onOpenExtensions,
   onOpenTaskSearch,
@@ -6342,24 +6441,30 @@ function Sidebar({
   onOpenThreadWorkspace(workspaceRoot: string): void;
   onNewThreadForProject?(project: Project): void;
   onRenameThread(thread: Thread): void;
+  onOpenThreadUsage(thread: Thread): void;
   onRestoreThread(thread: Thread): void;
   onOpenExtensions(): void;
   onOpenTaskSearch(): void;
   onSettings(): void;
 }) {
+  const initialNavigationState = useMemo(readSidebarNavigationState, []);
   const [experienceMenuOpen, setExperienceMenuOpen] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("New project");
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
-    () => new Set(),
+    () => new Set(initialNavigationState.expandedProjectIds),
   );
   const [moreMenuProjectId, setMoreMenuProjectId] = useState<string | null>(
     null,
   );
-  const [unassignedExpanded, setUnassignedExpanded] = useState(false);
-  const [archivedExpanded, setArchivedExpanded] = useState(false);
+  const [unassignedExpanded, setUnassignedExpanded] = useState(
+    initialNavigationState.unassignedExpanded,
+  );
+  const [archivedExpanded, setArchivedExpanded] = useState(
+    initialNavigationState.archivedExpanded,
+  );
   const [hoveredProject, setHoveredProject] =
     useState<ProjectHoverState | null>(null);
   const moreMenuRef = useDismissiblePopover(moreMenuProjectId !== null, () =>
@@ -6389,6 +6494,8 @@ function Sidebar({
     experienceModeOptions.find((option) => option.id === experienceMode) ??
     experienceModeOptions.find((option) => option.id === "code")!;
   const ActiveExperienceModeIcon = activeExperienceMode.icon;
+  const activityStatusForThread = (threadId: string) =>
+    threadActivityStatuses[threadId];
 
   function toggleExpandedProject(projectId: string) {
     setExpandedProjects((prev) => {
@@ -6401,6 +6508,14 @@ function Sidebar({
       return next;
     });
   }
+
+  useEffect(() => {
+    updateSidebarNavigationState({
+      expandedProjectIds: [...expandedProjects],
+      unassignedExpanded,
+      archivedExpanded,
+    });
+  }, [archivedExpanded, expandedProjects, unassignedExpanded]);
 
   useEffect(() => {
     if (!newProjectOpen) return;
@@ -6517,7 +6632,7 @@ function Sidebar({
               {isPickingWorkspace ? (
                 <Loader2 size={14} className="spin" />
               ) : (
-                <SquarePen size={14} />
+                <Plus size={14} />
               )}
             </button>
             {projectMenuOpen && (
@@ -6685,12 +6800,13 @@ function Sidebar({
                     {projectThreads.map((thread) => (
                       <SidebarThreadRow
                         active={thread.id === activeThreadId}
-                        activityStatus={threadActivityStatuses[thread.id]}
+                        activityStatus={activityStatusForThread(thread.id)}
                         key={thread.id}
                         project={project}
                         thread={thread}
                         onSelect={() => onSelect(thread.id)}
                         onRename={() => onRenameThread(thread)}
+                        onOpenUsage={() => onOpenThreadUsage(thread)}
                         onRemoveProject={onRemoveProject}
                         onToggleProjectPinned={onToggleProjectPinned}
                       />
@@ -6724,12 +6840,13 @@ function Sidebar({
                   {unassignedThreads.map((thread) => (
                     <SidebarThreadRow
                       active={thread.id === activeThreadId}
-                      activityStatus={threadActivityStatuses[thread.id]}
+                      activityStatus={activityStatusForThread(thread.id)}
                       key={thread.id}
                       project={null}
                       thread={thread}
                       onSelect={() => onSelect(thread.id)}
                       onRename={() => onRenameThread(thread)}
+                      onOpenUsage={() => onOpenThreadUsage(thread)}
                       onRemoveProject={onRemoveProject}
                       onToggleProjectPinned={onToggleProjectPinned}
                     />
@@ -6756,7 +6873,7 @@ function Sidebar({
                     <SidebarThreadRow
                       archived
                       active={false}
-                      activityStatus={threadActivityStatuses[thread.id]}
+                      activityStatus={activityStatusForThread(thread.id)}
                       key={thread.id}
                       project={
                         projects.find(
@@ -6766,6 +6883,7 @@ function Sidebar({
                       thread={thread}
                       onSelect={() => onRestoreThread(thread)}
                       onRename={() => onRenameThread(thread)}
+                      onOpenUsage={() => onOpenThreadUsage(thread)}
                       onRemoveProject={onRemoveProject}
                       onToggleProjectPinned={onToggleProjectPinned}
                       onRestore={() => onRestoreThread(thread)}
@@ -6914,16 +7032,7 @@ function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
     return <span className="thread-row-status" aria-hidden="true" />;
   }
 
-  const label =
-    status === "processing"
-      ? "处理中"
-      : status === "succeeded"
-        ? "已完成"
-        : status === "failed"
-          ? "失败"
-          : status === "user_action"
-            ? "需要手动操作"
-            : "需要审批";
+  const label = threadActivityStatusLabel(status);
 
   return (
     <span
@@ -6951,6 +7060,7 @@ function SidebarThreadRow({
   archived = false,
   onSelect,
   onRename,
+  onOpenUsage,
   onRemoveProject,
   onToggleProjectPinned,
   onRestore,
@@ -6962,6 +7072,7 @@ function SidebarThreadRow({
   archived?: boolean;
   onSelect(): void;
   onRename(): void;
+  onOpenUsage(): void;
   onRemoveProject(project: Project): void;
   onToggleProjectPinned(project: Project): void;
   onRestore?(): void;
@@ -7014,8 +7125,8 @@ function SidebarThreadRow({
   return (
     <div
       className={`thread-row-wrap ${active ? "active" : ""} ${
-        menuOpen ? "menu-open" : ""
-      }`}
+        isThreadActivityProcessing(activityStatus) ? "is-processing" : ""
+      } ${menuOpen ? "menu-open" : ""}`}
     >
       <button
         className={`thread-row ${active ? "active" : ""}`}
@@ -7065,6 +7176,16 @@ function SidebarThreadRow({
             >
               <Pencil size={14} />
               <span>重命名</span>
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                onOpenUsage();
+                setMenuOpen(false);
+              }}
+            >
+              <Activity size={14} />
+              <span>使用日志看板</span>
             </button>
             {project ? (
               <>
@@ -7640,6 +7761,11 @@ function MessageList({
     : false;
   const showPendingTurnStatus =
     pendingTurnFeedback !== null && !pendingTurnIsAnchored;
+  const showModelThinkingStatus =
+    activeTurnId !== null &&
+    hasPendingProviderRequest(eventsByTurn.get(activeTurnId) ?? []);
+  const showTrailingTurnStatus =
+    showPendingTurnStatus || showModelThinkingStatus;
 
   useEffect(() => {
     if (!hasPendingMessages) return;
@@ -7737,18 +7863,18 @@ function MessageList({
       <div
         className="message-list"
         ref={messageListRef}
-        aria-busy={hasPendingMessages || showPendingTurnStatus}
+        aria-busy={hasPendingMessages || showTrailingTurnStatus}
         onCopy={trimCopiedSelection}
       >
         <div
           className={`message-list-content ${
-            visibleMessages.length === 0 && !showPendingTurnStatus
+            visibleMessages.length === 0 && !showTrailingTurnStatus
               ? "is-empty"
               : ""
           }`.trim()}
           ref={messageListContentRef}
         >
-          {visibleMessages.length === 0 && !showPendingTurnStatus ? (
+          {visibleMessages.length === 0 && !showTrailingTurnStatus ? (
             <div className="empty-thread">
               <Bot size={42} />
               <h2>等待第一个任务指令</h2>
@@ -7805,10 +7931,17 @@ function MessageList({
               </div>
             </article>
           ))}
-          {showPendingTurnStatus && pendingTurnFeedback ? (
+          {showModelThinkingStatus && activeTurnId ? (
+            <PendingTurnStatus
+              key={`model-thinking-${activeTurnId}`}
+              phase="thinking"
+              threadId={threadId}
+              turnId={activeTurnId}
+            />
+          ) : showPendingTurnStatus && pendingTurnFeedback ? (
             <PendingTurnStatus
               key={pendingTurnFeedback.startedAt}
-              phase={pendingTurnFeedback.phase}
+              phase="processing"
               threadId={pendingTurnFeedback.threadId}
               turnId={pendingTurnFeedback.turnId}
             />
@@ -7892,40 +8025,41 @@ const MessageBubble = memo(function MessageBubble({
         return { part, referencedImage, previewImage, previewIndex };
       });
   }, [message.parts]);
-  const imagePreviews = useMemo<ImageLightboxAttachment[]>(
-    () =>
-      renderedParts.flatMap(({ previewImage }) => {
-        if (!previewImage) return [];
-        const contentType =
-          previewImage.contentType ||
-          (previewImage as typeof previewImage & { content_type?: string })
-            .content_type ||
-          "application/octet-stream";
-        return [
-          {
-            name: previewImage.name || "图片",
-            previewUrl: URL.createObjectURL(
-              new Blob([new Uint8Array(previewImage.data)], {
-                type: contentType,
-              }),
-            ),
-          },
-        ];
-      }),
-    [renderedParts],
+  const [imagePreviews, setImagePreviews] = useState<ImageLightboxAttachment[]>(
+    [],
   );
   const [activeImagePreviewIndex, setActiveImagePreviewIndex] = useState<
     number | null
   >(null);
 
-  useEffect(
-    () => () => {
-      imagePreviews.forEach(({ previewUrl }) =>
+  useLayoutEffect(() => {
+    // Create and revoke object URLs in the same lifecycle. React StrictMode
+    // re-runs effects, so each setup must produce fresh, usable URLs.
+    const nextImagePreviews = renderedParts.flatMap(({ previewImage }) => {
+      if (!previewImage) return [];
+      const contentType =
+        previewImage.contentType ||
+        (previewImage as typeof previewImage & { content_type?: string })
+          .content_type ||
+        "application/octet-stream";
+      return [
+        {
+          name: previewImage.name || "图片",
+          previewUrl: URL.createObjectURL(
+            new Blob([new Uint8Array(previewImage.data)], {
+              type: contentType,
+            }),
+          ),
+        },
+      ];
+    });
+    setImagePreviews(nextImagePreviews);
+    return () => {
+      nextImagePreviews.forEach(({ previewUrl }) =>
         URL.revokeObjectURL(previewUrl),
       );
-    },
-    [imagePreviews],
-  );
+    };
+  }, [renderedParts]);
 
   useEffect(() => {
     if (
@@ -8098,21 +8232,180 @@ function InlineImageMessagePart({
   onPreview?(): void;
   compact?: boolean;
 }) {
+  const [copyContextMenu, setCopyContextMenu] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+
   if (!previewUrl) return null;
   const name = part.name || "图片";
 
   return (
-    <button
-      className={`message-inline-image ${compact ? "is-reference" : ""}`}
-      type="button"
-      aria-haspopup="dialog"
-      aria-label={`预览 ${name}`}
-      title={`预览 ${name}`}
-      onClick={onPreview}
-    >
-      <img src={previewUrl} alt={name} decoding="async" loading="lazy" />
-    </button>
+    <>
+      <button
+        className={`message-inline-image ${compact ? "is-reference" : ""}`}
+        type="button"
+        aria-haspopup="dialog"
+        aria-label={`预览 ${name}`}
+        title={`预览 ${name}`}
+        onClick={onPreview}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          setCopyContextMenu({ x: event.clientX, y: event.clientY });
+        }}
+      >
+        <img src={previewUrl} alt={name} decoding="async" loading="lazy" />
+      </button>
+      {copyContextMenu ? (
+        <ImageCopyContextMenu
+          name={name}
+          position={copyContextMenu}
+          previewUrl={previewUrl}
+          onClose={() => setCopyContextMenu(null)}
+        />
+      ) : null}
+    </>
   );
+}
+
+type ImageCopyContextMenuPosition = {
+  x: number;
+  y: number;
+};
+
+type ImageCopyStatus = "idle" | "copying" | "copied" | "error";
+
+function ImageCopyContextMenu({
+  name,
+  position,
+  previewUrl,
+  onClose,
+}: {
+  name: string;
+  position: ImageCopyContextMenuPosition;
+  previewUrl: string;
+  onClose(): void;
+}) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [resolvedPosition, setResolvedPosition] = useState(position);
+  const [status, setStatus] = useState<ImageCopyStatus>("idle");
+
+  useEffect(() => {
+    setResolvedPosition(position);
+    setStatus("idle");
+  }, [position, previewUrl]);
+
+  useEffect(() => {
+    const closeOnPointerDown = () => onClose();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("pointerdown", closeOnPointerDown);
+    window.addEventListener("blur", onClose);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnPointerDown);
+      window.removeEventListener("blur", onClose);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [onClose]);
+
+  useEffect(() => {
+    if (status !== "copied") return;
+    const timer = window.setTimeout(onClose, 800);
+    return () => window.clearTimeout(timer);
+  }, [onClose, status]);
+
+  useLayoutEffect(() => {
+    const menu = menuRef.current;
+    if (!menu) return;
+    const bounds = menu.getBoundingClientRect();
+    const nextPosition = {
+      x: Math.max(
+        0,
+        resolvedPosition.x - Math.max(0, bounds.right - window.innerWidth),
+      ),
+      y: Math.max(
+        0,
+        resolvedPosition.y - Math.max(0, bounds.bottom - window.innerHeight),
+      ),
+    };
+    if (
+      nextPosition.x !== resolvedPosition.x ||
+      nextPosition.y !== resolvedPosition.y
+    ) {
+      setResolvedPosition(nextPosition);
+      return;
+    }
+    menu.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [resolvedPosition]);
+
+  const label =
+    status === "copying"
+      ? "正在复制…"
+      : status === "copied"
+        ? "已复制图片"
+        : status === "error"
+          ? "复制失败，请重试"
+          : "复制图片";
+
+  return createPortal(
+    <div
+      ref={menuRef}
+      className="tool-popover image-copy-context-menu"
+      role="menu"
+      aria-label={`${name} 操作`}
+      data-status={status}
+      style={{ left: resolvedPosition.x, top: resolvedPosition.y }}
+      onContextMenu={(event) => event.preventDefault()}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      <button
+        role="menuitem"
+        type="button"
+        disabled={status === "copying" || status === "copied"}
+        onClick={() => {
+          setStatus("copying");
+          void copyImageToClipboard(previewUrl)
+            .then(() => setStatus("copied"))
+            .catch(() => setStatus("error"));
+        }}
+      >
+        {status === "copying" ? (
+          <Loader2 className="spin" size={14} aria-hidden="true" />
+        ) : status === "copied" ? (
+          <Check size={14} aria-hidden="true" />
+        ) : (
+          <Copy size={14} aria-hidden="true" />
+        )}
+        <span aria-live="polite">{label}</span>
+      </button>
+    </div>,
+    document.body,
+  );
+}
+
+async function copyImageToClipboard(previewUrl: string): Promise<void> {
+  const pngBlob = await imagePreviewToPngBlob(previewUrl);
+  await writeClipboardImage(pngBlob);
+}
+
+async function imagePreviewToPngBlob(previewUrl: string): Promise<Blob> {
+  const image = new Image();
+  image.src = previewUrl;
+  await image.decode();
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("无法创建图片复制画布");
+  context.drawImage(image, 0, 0);
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("无法转换待复制图片"));
+    }, "image/png");
+  });
 }
 
 function MessageArtifactLinks({
@@ -8258,6 +8551,22 @@ function ComposerPlanStepIcon({
 const MAX_COMPOSER_IMAGES = 10;
 const MAX_COMPOSER_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_COMPOSER_HISTORY_ENTRIES = 200;
+const COMPOSER_IMAGE_EXTENSIONS = new Set([
+  "bmp",
+  "gif",
+  "jpeg",
+  "jpg",
+  "png",
+  "svg",
+  "webp",
+]);
+
+function isComposerImageFile(file: File): boolean {
+  return (
+    file.type.startsWith("image/") ||
+    COMPOSER_IMAGE_EXTENSIONS.has(fileExtension(file.name).toLowerCase())
+  );
+}
 
 type ComposerImageAttachment = InlineImageAttachment & {
   previewUrl: string;
@@ -8694,9 +9003,11 @@ function Composer({
     y: number;
   } | null>(null);
   const dragDepthRef = useRef(0);
+  const preDragComposerRangeRef = useRef<Range | null>(null);
   const imageAttachmentsRef = useRef(imageAttachments);
   const editorRef = useRef<HTMLDivElement>(null);
   const imageFileInputRef = useRef<HTMLInputElement>(null);
+  const contextFileInputRef = useRef<HTMLInputElement>(null);
   const savedComposerRangeRef = useRef<Range | null>(null);
   const contextMenuInsertionRangeRef = useRef<Range | null>(null);
   const contextMenuReferenceRef = useRef<HTMLElement | null>(null);
@@ -8853,6 +9164,7 @@ function Composer({
   function commitComposerMutation(
     splitInsertedContent: boolean,
     requestedBefore?: ComposerHistorySnapshot | null,
+    normalizeImageDeletionArtifacts = false,
   ) {
     const editor = editorRef.current;
     if (!editor) return;
@@ -8862,9 +9174,27 @@ function Composer({
     ) {
       editor.replaceChildren();
     }
-    const after = composerSnapshotAtSelection(editor);
+    let after = composerSnapshotAtSelection(editor);
     const before =
       requestedBefore ?? currentComposerSnapshotRef.current ?? after;
+    if (normalizeImageDeletionArtifacts) {
+      const normalizedAfter = normalizeComposerImageDeletionSnapshot(
+        before,
+        after,
+      );
+      if (normalizedAfter !== after) {
+        const range = renderComposerSnapshot(
+          editor,
+          normalizedAfter,
+          imageAttachmentsRef.current,
+        );
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+        savedComposerRangeRef.current = range.cloneRange();
+        after = normalizedAfter;
+      }
+    }
     const entries = composerUndoEntries(before, after, splitInsertedContent);
     if (entries.length > 0) {
       composerUndoHistoryRef.current.push(...entries);
@@ -8946,7 +9276,7 @@ function Composer({
     requestedRange: Range | null = savedComposerRangeRef.current,
   ) {
     const acceptedFiles = files
-      .filter((file) => file.type.startsWith("image/"))
+      .filter(isComposerImageFile)
       .filter((file) => file.size <= MAX_COMPOSER_IMAGE_BYTES);
     if (acceptedFiles.length === 0) return;
 
@@ -9006,7 +9336,7 @@ function Composer({
     const editor = editorRef.current;
     const before = editor ? composerSnapshotAtSelection(editor) : null;
     reference.remove();
-    commitComposerMutation(false, before);
+    commitComposerMutation(false, before, true);
   }
 
   const submitDraft = async () => {
@@ -9070,9 +9400,29 @@ function Composer({
     await addImageFiles(files, range);
   }
 
+  function addSelectedFiles(
+    files: File[],
+    requestedRange: Range | null = savedComposerRangeRef.current,
+  ) {
+    const images = files.filter(isComposerImageFile);
+    const otherFiles = files.filter((file) => !isComposerImageFile(file));
+    if (images.length > 0) {
+      void addImageFiles(images, requestedRange?.cloneRange() ?? null);
+    }
+    if (otherFiles.length > 0) void onAddContextSources(otherFiles);
+  }
+
   function handleDragEnter(event: ReactDragEvent<HTMLDivElement>) {
     if (!Array.from(event.dataTransfer.types).includes("Files")) return;
     event.preventDefault();
+    if (dragDepthRef.current === 0) {
+      const editor = editorRef.current;
+      const savedRange = savedComposerRangeRef.current;
+      preDragComposerRangeRef.current =
+        editor && rangeBelongsToEditor(editor, savedRange)
+          ? savedRange!.cloneRange()
+          : null;
+    }
     dragDepthRef.current += 1;
     setIsDraggingFiles(true);
   }
@@ -9085,7 +9435,10 @@ function Composer({
 
   function handleDragLeave() {
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
-    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+    if (dragDepthRef.current === 0) {
+      preDragComposerRangeRef.current = null;
+      setIsDraggingFiles(false);
+    }
   }
 
   function handleDrop(event: ReactDragEvent<HTMLDivElement>) {
@@ -9094,13 +9447,11 @@ function Composer({
     dragDepthRef.current = 0;
     setIsDraggingFiles(false);
     const files = Array.from(event.dataTransfer.files);
-    const images = files.filter((file) => file.type.startsWith("image/"));
-    const otherFiles = files.filter((file) => !file.type.startsWith("image/"));
-    if (images.length > 0) {
-      const range = composerRangeAtPoint(event.clientX, event.clientY);
-      void addImageFiles(images, range);
-    }
-    if (otherFiles.length > 0) void onAddContextSources(otherFiles);
+    const range =
+      preDragComposerRangeRef.current?.cloneRange() ??
+      composerRangeAtPoint(event.clientX, event.clientY);
+    preDragComposerRangeRef.current = null;
+    addSelectedFiles(files, range);
   }
 
   const hasSendableContent = Boolean(
@@ -9452,6 +9803,7 @@ function Composer({
                 nativeEvent.inputType === "insertCompositionText" ||
                 nativeEvent.inputType === "insertFromComposition",
               before,
+              nativeEvent.inputType.startsWith("delete"),
             );
           }}
           onClick={(event) => {
@@ -9528,6 +9880,20 @@ function Composer({
             const files = Array.from(event.target.files ?? []);
             event.target.value = "";
             void addImageFiles(files);
+          }}
+        />
+        <input
+          ref={contextFileInputRef}
+          hidden
+          type="file"
+          multiple
+          onChange={(event) => {
+            const files = Array.from(event.target.files ?? []);
+            event.target.value = "";
+            addSelectedFiles(
+              files,
+              savedComposerRangeRef.current?.cloneRange() ?? null,
+            );
           }}
         />
         <div className="composer-toolbar">
@@ -9665,7 +10031,7 @@ function Composer({
             <button
               role="menuitem"
               onClick={() => {
-                void onAddContextSources();
+                contextFileInputRef.current?.click();
                 setOpenMenu(null);
               }}
             >
@@ -9815,14 +10181,18 @@ function ImageLightbox({
   const [zoomPercent, setZoomPercent] = useState(
     IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT,
   );
+  const [copyContextMenu, setCopyContextMenu] =
+    useState<ImageCopyContextMenuPosition | null>(null);
   const active = attachments[activeIndex];
 
   useEffect(() => {
     setZoomPercent(IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT);
+    setCopyContextMenu(null);
   }, [activeIndex]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (copyContextMenu) return;
       if (event.key === "Escape") onClose();
       if (event.key === "ArrowLeft" && activeIndex > 0) {
         onChangeIndex(activeIndex - 1);
@@ -9833,7 +10203,13 @@ function ImageLightbox({
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [activeIndex, attachments.length, onChangeIndex, onClose]);
+  }, [
+    activeIndex,
+    attachments.length,
+    copyContextMenu,
+    onChangeIndex,
+    onClose,
+  ]);
 
   if (!active) return null;
   const activeName = active.name || "图片";
@@ -9873,6 +10249,10 @@ function ImageLightbox({
               alt={activeName}
               draggable={false}
               style={{ transform: `scale(${zoomPercent / 100})` }}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                setCopyContextMenu({ x: event.clientX, y: event.clientY });
+              }}
             />
           </div>
           <IconButton
@@ -9937,6 +10317,14 @@ function ImageLightbox({
           </a>
         </footer>
       </div>
+      {copyContextMenu ? (
+        <ImageCopyContextMenu
+          name={activeName}
+          position={copyContextMenu}
+          previewUrl={active.previewUrl}
+          onClose={() => setCopyContextMenu(null)}
+        />
+      ) : null}
     </div>,
     document.body,
   );
@@ -10066,6 +10454,14 @@ function SideTaskConversation({
   onOpenFileReview(path: string): void;
 }) {
   const threadId = thread?.id ?? null;
+  const {
+    text: composer,
+    contextSources,
+    selectedSkillIds,
+    setText: setComposer,
+    setContextSources,
+    setSelectedSkillIds,
+  } = useComposerDraft(threadComposerDraftKey(threadId ?? "unavailable"));
   const [messages, setMessages] = useState<Message[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [loadState, setLoadState] = useState<ConversationLoadState>({
@@ -10074,15 +10470,12 @@ function SideTaskConversation({
     error: null,
   });
   const [loadAttempt, setLoadAttempt] = useState(0);
-  const [composer, setComposer] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const [cancellingTurnId, setCancellingTurnId] = useState<string | null>(null);
   const [pendingTurnFeedback, setPendingTurnFeedback] =
     useState<PendingTurnFeedback | null>(null);
   const [queuedMessageCount, setQueuedMessageCount] = useState(0);
-  const [contextSources, setContextSources] = useState<ContextSourceFile[]>([]);
-  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [collaborationMode, setCollaborationMode] = useState(
     initialCollaborationMode,
   );
@@ -10127,16 +10520,19 @@ function SideTaskConversation({
       }
       if (event.payload.type === "approval_requested") {
         const approvalId = event.payload.approval_id;
+        onSetThreadActivity(threadId, "approval");
         setPendingApprovalIds((current) =>
           current.includes(approvalId) ? current : [...current, approvalId],
         );
         onMarkThreadActivityRead(threadId);
       }
       if (event.payload.type === "browser_handoff_required") {
+        onSetThreadActivity(threadId, "user_action");
         onMarkThreadActivityRead(threadId);
       }
       if (event.payload.type === "user_input_requested") {
         const request = event.payload.request;
+        onSetThreadActivity(threadId, "user_action");
         setPendingUserInput((current) =>
           current.some(
             (record) => record.request.requestId === request.requestId,
@@ -10157,11 +10553,13 @@ function SideTaskConversation({
       }
 
       if (event.payload.type === "turn_started" && event.turnId) {
+        onSetThreadActivity(threadId, "processing");
         setActiveTurnId(event.turnId);
         setCancellingTurnId(null);
         setQueuedMessageCount((current) => Math.max(0, current - 1));
         onMarkThreadActivityRead(threadId);
       } else if (event.payload.type === "turn_finished") {
+        onSetThreadActivity(threadId, "succeeded");
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
@@ -10169,6 +10567,7 @@ function SideTaskConversation({
         setPendingTurnFeedback(null);
         onMarkThreadActivityRead(threadId);
       } else if (event.payload.type === "turn_suspended") {
+        onSetThreadActivity(threadId, "approval");
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
@@ -10191,6 +10590,9 @@ function SideTaskConversation({
         event.payload.type === "turn_awaiting_input" ||
         event.payload.type === "error"
       ) {
+        if (event.payload.type === "turn_awaiting_input") {
+          onSetThreadActivity(threadId, "user_action");
+        }
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
@@ -10198,6 +10600,7 @@ function SideTaskConversation({
       }
 
       if (event.payload.type === "error") {
+        onSetThreadActivity(threadId, "failed");
         setPendingTurnFeedback(null);
         setActionError(friendlyProviderError(event.payload.message));
         onMarkThreadActivityRead(threadId);
@@ -10255,6 +10658,7 @@ function SideTaskConversation({
             pendingApprovals.length > 0
               ? "approval"
               : resolveThreadActivityStatus(turnStatus);
+          if (activityStatus) onSetThreadActivity(threadId, activityStatus);
           if (activityStatus) onMarkThreadActivityRead(threadId);
           setLoadState({ threadId, status: "ready", error: null });
           source = client.openEventStream(
@@ -10355,9 +10759,9 @@ function SideTaskConversation({
     setPendingTurnFeedback({
       threadId: thread.id,
       turnId: null,
-      phase: "thinking",
       startedAt,
     });
+    onSetThreadActivity(thread.id, "processing");
     try {
       const { message, turnId, queued } = await client.sendMessage(
         thread.id,
@@ -10376,7 +10780,6 @@ function SideTaskConversation({
           ? {
               ...current,
               turnId,
-              phase: queued ? "processing" : current.phase,
             }
           : current,
       );
@@ -10388,6 +10791,7 @@ function SideTaskConversation({
       if (isFirstPrompt && messageText) void updateThreadTitle(messageText);
       return true;
     } catch (error) {
+      onSetThreadActivity(thread.id, "failed");
       setPendingTurnFeedback((current) =>
         current?.startedAt === startedAt ? null : current,
       );
@@ -10650,6 +11054,7 @@ function RightPanel({
   subagentRuns,
   messages,
   events,
+  conversationLoading,
   terminalEvents,
   terminalSession,
   workspaceTree,
@@ -10730,6 +11135,7 @@ function RightPanel({
   messages: Message[];
   subagentRuns: SubagentRun[];
   events: AgentEvent[];
+  conversationLoading: boolean;
   terminalEvents: TerminalEvent[];
   terminalSession: TerminalSession | null;
   workspaceTree: WorkspaceTree | null;
@@ -10874,6 +11280,7 @@ function RightPanel({
         <ToolTabStrip
           tabs={toolTabs}
           activeTabId={activeToolTab?.id ?? null}
+          canOpenFlow={thread?.experienceMode === "flow"}
           terminalTitle={
             terminalSession ? terminalShellName(terminalSession.shell) : null
           }
@@ -10888,7 +11295,25 @@ function RightPanel({
         />
         <div className="tool-stage-body">
           {!activeToolTab ? (
-            <ToolStageLauncher onOpen={onOpenToolTab} />
+            <ToolStageLauncher
+              canOpenFlow={thread?.experienceMode === "flow"}
+              onOpen={onOpenToolTab}
+            />
+          ) : activeToolTab.kind === "flow" ? (
+            thread?.experienceMode === "flow" ? (
+              <FlowWorkspacePanel
+                client={client}
+                threadId={thread.id}
+                workspaceRoot={workspaceRoot}
+                settings={settings}
+              />
+            ) : (
+              <div className="unavailable-tool-state">
+                <GitFork aria-hidden="true" size={20} />
+                <h2>Flow View 仅用于 Flow 模式</h2>
+                <p>切换到 Flow 任务后，可在这里设计、运行和审阅 Flow。</p>
+              </div>
+            )
           ) : activeToolTab.kind === "side-task" ? (
             activeToolTab.sideTaskThreadId ? (
               <SideTaskConversation
@@ -10926,6 +11351,16 @@ function RightPanel({
             />
           ) : activeToolTab.kind === "computer" ? (
             <ComputerPanel client={client} threadId={thread?.id ?? null} />
+          ) : activeToolTab.kind === "usage" ? (
+            thread ? (
+              <UsageLogDashboard
+                thread={thread}
+                events={events}
+                isLoading={conversationLoading}
+              />
+            ) : (
+              <ConversationLoadingState />
+            )
           ) : activeToolTab.kind === "preview" &&
             activeToolTab.previewTarget ? (
             <PreviewHost
@@ -10953,60 +11388,55 @@ function RightPanel({
       aria-label="右侧上下文摘要"
       aria-hidden={!contextRailOpen}
     >
-      {thread?.experienceMode === "flow" ? (
-        <FlowWorkspacePanel
-          client={client}
-          threadId={thread.id}
-          workspaceRoot={workspaceRoot}
-          settings={settings}
-        />
-      ) : (
-        <RightContextRail
-          client={client}
-          threadId={thread?.id ?? null}
-          workspaceRoot={workspaceRoot}
-          workspaceDiff={workspaceDiff}
-          terminalEvents={terminalEvents}
-          terminalSession={terminalSession}
-          agentEvents={events}
-          subagentRuns={subagentRuns}
-          artifacts={artifacts}
-          messages={messages}
-          onOpenDiff={() => onOpenToolTab("diff")}
-          onOpenTerminal={() => onOpenToolTab("terminal")}
-          onOpenFiles={() => onOpenToolTab("files")}
-          onOpenEnvironment={() => onOpenToolTab("sandbox")}
-          onAddSource={onAddContextSources}
-          onCancelSubagent={onCancelSubagent}
-          onGitChanged={onRefreshWorkbench}
-        />
-      )}
+      <RightContextRail
+        client={client}
+        threadId={thread?.id ?? null}
+        workspaceRoot={workspaceRoot}
+        workspaceDiff={workspaceDiff}
+        terminalEvents={terminalEvents}
+        terminalSession={terminalSession}
+        agentEvents={events}
+        subagentRuns={subagentRuns}
+        artifacts={artifacts}
+        messages={messages}
+        onOpenDiff={() => onOpenToolTab("diff")}
+        onOpenTerminal={() => onOpenToolTab("terminal")}
+        onOpenFiles={() => onOpenToolTab("files")}
+        onOpenEnvironment={() => onOpenToolTab("sandbox")}
+        onAddSource={onAddContextSources}
+        onCancelSubagent={onCancelSubagent}
+        onGitChanged={onRefreshWorkbench}
+      />
     </aside>
   );
 }
 
 function ToolStageLauncher({
+  canOpenFlow,
   onOpen,
 }: {
+  canOpenFlow: boolean;
   onOpen(kind: Exclude<ToolTabKind, "preview" | "side-task">): void;
 }) {
   return (
     <div className="tool-stage-empty">
       <nav className="tool-stage-launcher" aria-label="打开工具">
-        {toolStageLauncherKinds.map(({ kind, label }) => {
-          const Icon = toolTabIcon(kind);
-          return (
-            <Button
-              className="tool-stage-launcher-button"
-              key={kind}
-              variant="quiet"
-              onClick={() => onOpen(kind)}
-            >
-              <Icon size={16} aria-hidden="true" />
-              <span>{label}</span>
-            </Button>
-          );
-        })}
+        {toolStageLauncherKinds
+          .filter(({ kind }) => kind !== "flow" || canOpenFlow)
+          .map(({ kind, label }) => {
+            const Icon = toolTabIcon(kind);
+            return (
+              <Button
+                className="tool-stage-launcher-button"
+                key={kind}
+                variant="quiet"
+                onClick={() => onOpen(kind)}
+              >
+                <Icon size={16} aria-hidden="true" />
+                <span>{label}</span>
+              </Button>
+            );
+          })}
       </nav>
     </div>
   );
@@ -11015,6 +11445,7 @@ function ToolStageLauncher({
 function ToolTabStrip({
   tabs,
   activeTabId,
+  canOpenFlow,
   terminalTitle,
   onActivate,
   onClose,
@@ -11027,6 +11458,7 @@ function ToolTabStrip({
 }: {
   tabs: ToolTab[];
   activeTabId: string | null;
+  canOpenFlow: boolean;
   terminalTitle: string | null;
   onActivate(tabId: string): void;
   onClose(tabId: string): void;
@@ -11102,20 +11534,22 @@ function ToolTabStrip({
         >
           {({ close }) => (
             <div className="tool-popover tool-tab-add-popover" role="menu">
-              {toolTabMenuItems.map(({ kind, shortcut }) => {
-                const Icon = toolTabIcon(kind);
-                return (
-                  <button
-                    key={kind}
-                    role="menuitem"
-                    onClick={() => open(kind, close)}
-                  >
-                    <Icon size={14} aria-hidden="true" />
-                    <span>{toolTabTitle(kind)}</span>
-                    {shortcut ? <kbd>{shortcut}</kbd> : null}
-                  </button>
-                );
-              })}
+              {toolTabMenuItems
+                .filter(({ kind }) => kind !== "flow" || canOpenFlow)
+                .map(({ kind, shortcut }) => {
+                  const Icon = toolTabIcon(kind);
+                  return (
+                    <button
+                      key={kind}
+                      role="menuitem"
+                      onClick={() => open(kind, close)}
+                    >
+                      <Icon size={14} aria-hidden="true" />
+                      <span>{toolTabTitle(kind)}</span>
+                      {shortcut ? <kbd>{shortcut}</kbd> : null}
+                    </button>
+                  );
+                })}
               <button
                 type="button"
                 role="menuitem"
@@ -11784,9 +12218,10 @@ function formatBytes(value: number): string {
 }
 
 const toolTabMenuItems: Array<{
-  kind: "terminal" | "browser" | "files";
+  kind: "flow" | "terminal" | "browser" | "files";
   shortcut: string | null;
 }> = [
+  { kind: "flow", shortcut: null },
   { kind: "terminal", shortcut: null },
   { kind: "browser", shortcut: "Ctrl+T" },
   { kind: "files", shortcut: "Ctrl+P" },
@@ -11796,6 +12231,7 @@ const toolStageLauncherKinds: Array<{
   kind: Exclude<ToolTabKind, "preview" | "side-task">;
   label: string;
 }> = [
+  { kind: "flow", label: "Flow" },
   { kind: "diff", label: "代码审阅" },
   { kind: "terminal", label: "终端" },
   { kind: "browser", label: "浏览器" },
@@ -11805,6 +12241,8 @@ const toolStageLauncherKinds: Array<{
 
 function toolTabTitle(kind: ToolTabKind): string {
   switch (kind) {
+    case "flow":
+      return "Flow";
     case "files":
       return "文件";
     case "terminal":
@@ -11821,6 +12259,8 @@ function toolTabTitle(kind: ToolTabKind): string {
       return "浏览器";
     case "computer":
       return "电脑";
+    case "usage":
+      return "使用日志";
     case "side-task":
       return "侧边任务";
     case "preview":
@@ -11830,6 +12270,8 @@ function toolTabTitle(kind: ToolTabKind): string {
 
 function toolTabIcon(kind: ToolTabKind): typeof Folder {
   switch (kind) {
+    case "flow":
+      return GitFork;
     case "files":
       return Folder;
     case "terminal":
@@ -11846,6 +12288,8 @@ function toolTabIcon(kind: ToolTabKind): typeof Folder {
       return Globe2;
     case "computer":
       return Monitor;
+    case "usage":
+      return Activity;
     case "side-task":
       return CirclePlus;
     case "preview":
