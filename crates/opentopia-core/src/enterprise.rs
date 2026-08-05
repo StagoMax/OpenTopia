@@ -188,18 +188,18 @@ impl ExperienceSurfaceProfile {
                     "git_diff",
                     "list_skills",
                     "read_skill",
-                    "flow.search",
-                    "flow.create",
-                    "flow.update",
-                    "flow.inspect",
-                    "flow.validate",
-                    "flow.simulate",
-                    "flow.publish",
-                    "flow.run",
-                    "flow.status",
-                    "flow.pause",
-                    "flow.resume",
-                    "flow.cancel",
+                    "flow_search",
+                    "flow_create",
+                    "flow_update",
+                    "flow_inspect",
+                    "flow_validate",
+                    "flow_simulate",
+                    "flow_publish",
+                    "flow_run",
+                    "flow_status",
+                    "flow_pause",
+                    "flow_resume",
+                    "flow_cancel",
                     "complete_task",
                 ]);
                 // Flow design is control-plane work. External plugins and MCP
@@ -1571,8 +1571,8 @@ mod tests {
         let profile = ExperienceSurfaceProfile::for_mode(ExperienceMode::Flow);
         assert!(profile.enterprise_only);
         assert!(profile.capabilities.allows_tool("read_file"));
-        assert!(profile.capabilities.allows_tool("flow.run"));
-        assert!(profile.capabilities.allows_tool("flow.status"));
+        assert!(profile.capabilities.allows_tool("flow_run"));
+        assert!(profile.capabilities.allows_tool("flow_status"));
         assert!(!profile.capabilities.allows_tool("shell"));
         assert!(!profile.capabilities.allows_plugin("browser-automation"));
         assert!(!profile.capabilities.allows_mcp_server("server-1"));

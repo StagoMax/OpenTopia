@@ -215,18 +215,18 @@ fn flow_spec_schema() -> Value {
 impl Tool for FlowTool {
     fn name(&self) -> &str {
         match self.action {
-            FlowToolAction::Search => "flow.search",
-            FlowToolAction::Create => "flow.create",
-            FlowToolAction::Update => "flow.update",
-            FlowToolAction::Inspect => "flow.inspect",
-            FlowToolAction::Validate => "flow.validate",
-            FlowToolAction::Simulate => "flow.simulate",
-            FlowToolAction::Publish => "flow.publish",
-            FlowToolAction::Run => "flow.run",
-            FlowToolAction::Status => "flow.status",
-            FlowToolAction::Pause => "flow.pause",
-            FlowToolAction::Resume => "flow.resume",
-            FlowToolAction::Cancel => "flow.cancel",
+            FlowToolAction::Search => "flow_search",
+            FlowToolAction::Create => "flow_create",
+            FlowToolAction::Update => "flow_update",
+            FlowToolAction::Inspect => "flow_inspect",
+            FlowToolAction::Validate => "flow_validate",
+            FlowToolAction::Simulate => "flow_simulate",
+            FlowToolAction::Publish => "flow_publish",
+            FlowToolAction::Run => "flow_run",
+            FlowToolAction::Status => "flow_status",
+            FlowToolAction::Pause => "flow_pause",
+            FlowToolAction::Resume => "flow_resume",
+            FlowToolAction::Cancel => "flow_cancel",
         }
     }
 
@@ -319,6 +319,14 @@ impl Tool for FlowTool {
                 }
             }),
         }
+    }
+
+    fn has_derived_input_schema(&self) -> bool {
+        // Flow tools are one host-owned, action-generated static family. Their
+        // action match owns both the inline schema above and the matching typed
+        // serde input used by execute, so they satisfy the same static-tool
+        // contract without twelve otherwise identical wrapper structs.
+        true
     }
 
     fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {

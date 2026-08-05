@@ -459,11 +459,11 @@ Flow 不是冻结所有运行路径。它可以包含由 Agent 决定的局部�
 
 ### 10.3 Flow Design：从工作经验或自然语言形成 Flow
 
-Flow 模式的核心不是手动画节点，也不是启动一个额外的 Flow Designer 模型。当前主 Agent 在 Flow 模式下看到 `flow.create` 等工具及其说明，自然判断何时创建、修改、验证和发布 Flow。所谓 Flow Designer，只是主 Agent 在该 ExperienceMode 下承担的角色。
+Flow 模式的核心不是手动画节点，也不是启动一个额外的 Flow Designer 模型。当前主 Agent 在 Flow 模式下看到 `flow_create` 等工具及其说明，自然判断何时创建、修改、验证和发布 Flow。所谓 Flow Designer，只是主 Agent 在该 ExperienceMode 下承担的角色。
 
-两条主要入口使用同一个 `flow.create` 工具，只是创建依据不同：一次已完成 Run 的 Trace，或用户当前的自然语言描述。
+两条主要入口使用同一个 `flow_create` 工具，只是创建依据不同：一次已完成 Run 的 Trace，或用户当前的自然语言描述。
 
-从 Runtime 角度看，Flow Design 只增加两件事：向模型上下文投影描述清晰的 `flow.create` schema，以及在工具执行侧对提交的 FlowDraft 做确定性校验和持久化。设计过程就是主 Agent 调用工具前已有的规划与推理，不需要再编排一段独立的“设计工作流”。
+从 Runtime 角度看，Flow Design 只增加两件事：向模型上下文投影描述清晰的 `flow_create` schema，以及在工具执行侧对提交的 FlowDraft 做确定性校验和持久化。设计过程就是主 Agent 调用工具前已有的规划与推理，不需要再编排一段独立的“设计工作流”。
 
 #### 10.3.1 从一次正确执行中提炼
 
@@ -497,7 +497,7 @@ FlowDraft 至少经过一次独立样例或沙箱回放后才能发布；高风�
 
 > 主 Agent 接收开发需求，交给开发 Agent；开发完成后交给测试 Agent；测试通过则把结果返回主 Agent，测试失败则把问题返回开发 Agent；最多返工三次，仍失败则升级给人工。
 
-主 Agent 将自然语言转换为结构化 FlowDraft，并调用 `flow.create`：
+主 Agent 将自然语言转换为结构化 FlowDraft，并调用 `flow_create`：
 
 1. 识别入口、终态、Agent 角色和职责；
 2. 识别前后依赖、并行关系、条件、重试和人工升级；
@@ -508,7 +508,7 @@ FlowDraft 至少经过一次独立样例或沙箱回放后才能发布；高风�
 7. 在右侧审阅窗口展示 Graph、节点配置、条件、能力和版本差异；
 8. 通过 Dry Run、样例数据或真实受控任务验证后发布。
 
-用户可以在对话中继续修改，例如“测试失败两次就换高级开发 Agent”“生产发布必须由经理批准”。当前主 Agent 调用 `flow.update`，把这些语义修改转换为 FlowDraft diff，而不是要求用户手动重新连图。
+用户可以在对话中继续修改，例如“测试失败两次就换高级开发 Agent”“生产发布必须由经理批准”。当前主 Agent 调用 `flow_update`，把这些语义修改转换为 FlowDraft diff，而不是要求用户手动重新连图。
 
 #### 10.3.3 受控闭环
 
@@ -620,16 +620,16 @@ Flow 模式默认只需要向主 Agent 暴露少量高层工具：
 
 | 工具 | 作用 |
 | --- | --- |
-| `flow.search` | 按任务分类、输入输出和适用条件检索已发布 Flow |
-| `flow.create` | 从模型提交的完整结构创建 FlowDraft；可引用 Run Trace，也可直接来自当前描述 |
-| `flow.update` | 使用结构化 patch 修改已有 FlowDraft |
-| `flow.inspect` | 返回 Graph、节点配置、能力、条件、待决策和版本 diff |
-| `flow.validate` / `flow.simulate` | 执行静态检查、样例回放或沙箱 Dry Run |
-| `flow.run` | 将已发布 Flow 或可试运行 Draft 实例化为 GraphRun |
-| `flow.publish` | 在评测和审批通过后发布不可变 Flow 版本 |
-| `flow.pause` / `flow.cancel` | 暂停或取消 FlowRun |
+| `flow_search` | 按任务分类、输入输出和适用条件检索已发布 Flow |
+| `flow_create` | 从模型提交的完整结构创建 FlowDraft；可引用 Run Trace，也可直接来自当前描述 |
+| `flow_update` | 使用结构化 patch 修改已有 FlowDraft |
+| `flow_inspect` | 返回 Graph、节点配置、能力、条件、待决策和版本 diff |
+| `flow_validate` / `flow_simulate` | 执行静态检查、样例回放或沙箱 Dry Run |
+| `flow_run` | 将已发布 Flow 或可试运行 Draft 实例化为 GraphRun |
+| `flow_publish` | 在评测和审批通过后发布不可变 Flow 版本 |
+| `flow_pause` / `flow_cancel` | 暂停或取消 FlowRun |
 
-`flow.create` 的工具说明本身应该告诉模型何时使用，例如：
+`flow_create` 的工具说明本身应该告诉模型何时使用，例如：
 
 > 当用户要求把一个工作过程沉淀为可复用流程、要求从刚完成的 Run 总结流程，或直接定义了 Agent、步骤、条件和闭环时，创建 FlowDraft。一次性短任务不要创建 Flow。
 
@@ -641,7 +641,7 @@ Flow 模式默认只需要向主 Agent 暴露少量高层工具：
 
 ```json
 {
-  "tool": "flow.create",
+  "tool": "flow_create",
   "arguments": {
     "name": "development-validation-loop",
     "description": "开发、测试验证并将结果返回主 Agent 的闭环",
@@ -687,7 +687,7 @@ Flow 模式默认只需要向主 Agent 暴露少量高层工具：
 }
 ```
 
-`requestedCapabilities` 只是 Flow 希望使用的能力声明。Runtime 通过现有 Harness 的 Tool、Skill、MCP 和环境投影返回实际收窄后的 `effectiveCapabilities`；`flow.create` 只保存和校验设计，不能赋权，也不创建新的 Agent 执行框架。
+`requestedCapabilities` 只是 Flow 希望使用的能力声明。Runtime 通过现有 Harness 的 Tool、Skill、MCP 和环境投影返回实际收窄后的 `effectiveCapabilities`；`flow_create` 只保存和校验设计，不能赋权，也不创建新的 Agent 执行框架。
 
 ### 10.8 运行中修改
 
@@ -1082,7 +1082,7 @@ flowchart LR
 /api/enterprise/evaluations
 ```
 
-`flow.*` 工具、内部 Graph API 和 HTTP API 复用同一领域服务与现有 Harness 能力投影，不能形成一套给模型、一套给 UI 的不同执行逻辑。所有写 API 支持幂等键和乐观并发版本；列表和事件 API 必须按租户及其环境身份过滤。
+`flow_*` 工具、内部 Graph API 和 HTTP API 复用同一领域服务与现有 Harness 能力投影，不能形成一套给模型、一套给 UI 的不同执行逻辑。所有写 API 支持幂等键和乐观并发版本；列表和事件 API 必须按租户及其环境身份过滤。
 
 ## 19. 与 OpenTopia 当前架构的映射
 
@@ -1110,7 +1110,7 @@ flowchart TD
 | 当前模块 | 企业侧增量职责 |
 | --- | --- |
 | `AgentCore` / `prompt_runtime` / `model_context` | 继续负责模型循环、提示词组装，以及 Skill、工具和环境能力投影 |
-| `ToolRegistry` | 继续作为工具发现、schema 暴露和执行入口；增加 `flow.*` 高层工具，底层 Graph 原语保留为内部领域 API |
+| `ToolRegistry` | 继续作为工具发现、schema 暴露和执行入口；增加 `flow_*` 高层工具，底层 Graph 原语保留为内部领域 API |
 | `skills.rs` / Skill 工具 | 继续负责垂直任务方法的发现、选择和按需加载 |
 | `SubagentScheduler` / mailbox | 继续执行 Flow 中的 Agent 节点、通信、等待和生命周期 |
 | Store / events / approval | 复用现有持久化、SSE、审批中断和续跑，增加 Flow/Graph 事件字段 |
@@ -1144,11 +1144,11 @@ Graph 的 `agent` 节点编译成一次现有 Agent Thread 或 `spawn_agent`/`fo
 
 1. `ExperienceMode::Flow` 与 `FlowSurfaceAdapter`：提供模式提示词、默认能力、会话和 UI ViewModel；
 2. `FlowDraftStore` 与 `FlowRegistry`：保存草案、可复用 Flow 的分类、版本、参数和评测状态；
-3. `flow.*` 工具处理器：注册到现有 `ToolRegistry`，接收主 Agent 生成的结构化 FlowDraft，并完成持久化、校验、试运行和发布；
+3. `flow_*` 工具处理器：注册到现有 `ToolRegistry`，接收主 Agent 生成的结构化 FlowDraft，并完成持久化、校验、试运行和发布；
 4. `GraphCompiler`：把 Graph/Flow Node 编译为现有 Harness 调用；
 5. `GraphRunCoordinator`：只维护节点依赖、受控循环、就绪状态和检查点。
 
-这里不新增 `TaskRouter` 或 `FlowDesignerService`。直接执行、Skill、已有 Flow 与 `flow.create` 的选择，复用模型已有的工具调用能力；自然语言设计和从 Run Trace 总结只是同一个 `flow.create` 工具的两种输入来源。
+这里不新增 `TaskRouter` 或 `FlowDesignerService`。直接执行、Skill、已有 Flow 与 `flow_create` 的选择，复用模型已有的工具调用能力；自然语言设计和从 Run Trace 总结只是同一个 `flow_create` 工具的两种输入来源。
 
 它们都调用现有 Agent Harness，不拥有第二套模型客户端、工具注册表、权限系统、沙箱、Agent 生命周期或消息总线。
 
@@ -1211,7 +1211,7 @@ effective_capabilities =
 | Work | 业务目标、资料、协作、文档和可交付成果 | 文档、表格、浏览器、Computer、业务 Connector 与 Work Skill |
 | Flow | 需求澄清、流程提炼、Agent/条件设计、试运行、审阅和发布 | Flow Design 工具、Agent/Skill/Tool/Plugin catalog、Trace、Eval、模拟、审批和 Connector schema |
 
-Flow Design 阶段默认不直接暴露高风险生产写工具。需要试运行时，由 `flow.simulate` 或受控 Trial 创建独立执行环境；运行已发布 Flow 时，每个 Node 再按自己的 Agent Profile 和数据绑定获得能力投影。
+Flow Design 阶段默认不直接暴露高风险生产写工具。需要试运行时，由 `flow_simulate` 或受控 Trial 创建独立执行环境；运行已发布 Flow 时，每个 Node 再按自己的 Agent Profile 和数据绑定获得能力投影。
 
 这要求修改当前 ExperienceMode 只影响“collaboration and presentation”的语义：模式仍不能扩大权限，但可以改变默认注入的提示词模块、Skill、插件和工具集合。
 
@@ -1315,7 +1315,7 @@ Flow 图默认是审阅模型生成结果的视图。可以允许用户选择节
 ```text
 新建 Flow Design 会话
   -> 自然语言描述 Agent、顺序、条件和闭环
-  -> 主 Agent 提问并调用 flow.create 生成 FlowDraft
+  -> 主 Agent 提问并调用 flow_create 生成 FlowDraft
   -> 右侧检查 Graph 与配置
   -> Dry Run / Eval
   -> 修改并发布
@@ -1356,12 +1356,12 @@ Flow 图默认是审阅模型生成结果的视图。可以允许用户选择节
 
 ### Phase 2：Flow Design 与编排
 
-- 在 Flow 模式默认投影 `flow.search/create/update/inspect/validate/simulate/publish/run/status/pause/resume/cancel` 工具，并通过工具名称、说明和 schema 引导主 Agent 自然选择；
-- 让同一个 `flow.create` 同时支持从成功 Run/Trace 提炼流程和从自然语言直接设计流程；
-- 实现 Flow Registry、FlowDraft、`flow.*` 高层工具、内部 Graph API、schema 编译器和静态校验；
+- 在 Flow 模式默认投影 `flow_search/flow_create/flow_update/flow_inspect/flow_validate/flow_simulate/flow_publish/flow_run/flow_status/flow_pause/flow_resume/flow_cancel` 工具，并通过工具名称、说明和 schema 引导主 Agent 自然选择；
+- 让同一个 `flow_create` 同时支持从成功 Run/Trace 提炼流程和从自然语言直接设计流程；
+- 实现 Flow Registry、FlowDraft、`flow_*` 高层工具、内部 Graph API、schema 编译器和静态校验；
 - 把 Agent、Skill、Tool、Approval、Join 和受控 Loop 节点编译到现有 Harness；
 - 复用现有 Agent Harness，并由 Flow Runtime 持久化 `FlowRun/NodeRun`、图快照、预算和节点边界检查点；审批、暂停、恢复和取消均在节点边界生效，进程中断的节点必须人工核对外部状态后显式重试；
-- 增加 Flow 模式三栏界面、右侧审阅窗口、Flow 库和完整 Trace。
+- 增加 Flow 模式三栏界面、右侧审阅窗口、Flow 库和完整 Trace；每个 `NodeRun` 持久化审计型 Transcript，展示节点输入、工具调用、工具结果、Agent 输出、审批和错误，但不保存或展示模型隐藏推理。
 
 验收标准：用户能从一次正确执行或自然语言描述生成可审阅 FlowDraft；开发—测试—返工等闭环受到次数和预算限制；所有节点仍由现有 Harness 执行。
 
@@ -1488,7 +1488,7 @@ MVP 暂不包含：
 
 ## 25. 与 OpenAI Frontier 及官方 Agent 文档的关系
 
-本设计借鉴 Frontier 所强调的企业 Agent、目标驱动工作和治理方向，但不是 OpenAI Frontier 接口或内部实现的复刻。OpenTopia 的 Agent 身份、能力投影、`flow.*` 工具与 Graph 执行 IR、企业 Connector 和 Evidence Ledger 都是本项目的架构提案。
+本设计借鉴 Frontier 所强调的企业 Agent、目标驱动工作和治理方向，但不是 OpenAI Frontier 接口或内部实现的复刻。OpenTopia 的 Agent 身份、能力投影、`flow_*` 工具与 Graph 执行 IR、企业 Connector 和 Evidence Ledger 都是本项目的架构提案。
 
 需要特别校正一个表述：不能笼统声称 OpenAI 从未提供工作流画布。OpenAI 官方文档将 Agent Builder 描述为可拖拽节点的可视化画布；截至本文日期，官方同时宣布 Agent Builder 已进入弃用流程，并计划于 2026-11-30 关闭。OpenTopia 不以人工画布为核心，是本项目对企业任务适应性和控制面的主动选择，而不是建立在“可视化工作流不存在”这一事实上。
 
