@@ -1,0 +1,365 @@
+import { useMemo } from "react";
+import { Activity } from "lucide-react";
+
+import {
+  aggregateUsageEvents,
+  type UsageCall,
+  type UsageSummary,
+} from "../usageLogs";
+import type { AgentEvent, Thread } from "../types";
+import { Badge, Panel, type BadgeVariant } from "./ui";
+import "./UsageLogDashboard.css";
+
+type UsageLogDashboardProps = {
+  thread: Thread;
+  events: AgentEvent[];
+  isLoading: boolean;
+};
+
+export function UsageLogDashboard({
+  thread,
+  events,
+  isLoading,
+}: UsageLogDashboardProps) {
+  const data = useMemo(
+    () =>
+      aggregateUsageEvents(events, {
+        fallbackModelSelection: thread.modelSelection,
+      }),
+    [events, thread.modelSelection],
+  );
+  return (
+    <div className="usage-log-dashboard">
+      <header className="usage-log-header">
+        <div className="usage-log-heading">
+          <div>
+            <div className="usage-log-title-row">
+              <Activity size={16} aria-hidden="true" />
+              <h2>使用日志</h2>
+              <Badge variant="info">API 可观测</Badge>
+            </div>
+            <p>{thread.title}</p>
+          </div>
+        </div>
+      </header>
+
+      <div className="usage-log-scroll">
+        <section className="usage-kpi-grid" aria-label="Token 使用概览">
+          <MetricCard
+            label="总 Tokens"
+            value={formatInteger(data.summary.totalTokens)}
+            detail={`${formatInteger(data.summary.averageTokensPerRequest)} / 请求`}
+          />
+          <MetricCard
+            label="输入 Tokens"
+            value={formatInteger(data.summary.inputTokens)}
+            detail={cacheReadDetail(data.summary)}
+          />
+          <MetricCard
+            label="输出 Tokens"
+            value={formatInteger(data.summary.outputTokens)}
+            detail={`${formatInteger(data.summary.reasoningTokens)} 推理`}
+          />
+          <MetricCard
+            label="Prompt Cache 读取率"
+            value={formatPercent(data.summary.cacheReadRatio)}
+            detail={cacheWriteDetail(data.summary)}
+          />
+          <MetricCard
+            label="API 请求"
+            value={formatInteger(data.summary.requestCount)}
+            detail={`${formatInteger(data.summary.turnCount)} 个回合`}
+          />
+          <MetricCard
+            label="平均端到端延迟"
+            value={formatDuration(data.summary.averageLatencyMs)}
+            detail={`P95 ${formatDuration(data.summary.p95LatencyMs)}`}
+          />
+        </section>
+
+        <div className="usage-detail-grid">
+          <Panel className="usage-detail-panel" title="API 与推理链路">
+            <MetricList
+              items={[
+                ["平均 TTFT", formatDuration(data.summary.averageTtftMs)],
+                [
+                  "端到端输出速率",
+                  formatRate(data.summary.outputTokensPerSecond),
+                ],
+                ["重试次数", formatInteger(data.summary.retryCount)],
+                ["重试率", formatPercent(data.summary.retryRate)],
+                ["错误事件", formatInteger(data.summary.errorEventCount)],
+                ["失败请求", formatInteger(data.summary.failedRequestCount)],
+              ]}
+            />
+          </Panel>
+          <Panel className="usage-detail-panel" title="缓存与 Token 构成">
+            <MetricList
+              items={[
+                [
+                  "未缓存输入（已报告）",
+                  formatInteger(uncachedInput(data.summary)),
+                ],
+                [
+                  "缓存读取 Tokens",
+                  formatInteger(data.summary.cachedInputTokens),
+                ],
+                [
+                  "缓存写入 Tokens",
+                  formatInteger(data.summary.cacheWriteTokens),
+                ],
+                ["推理 Tokens", formatInteger(data.summary.reasoningTokens)],
+                ["可见输出 Tokens", formatInteger(visibleOutput(data.summary))],
+                ["缓存字段覆盖", cacheCoverageLabel(data.calls)],
+              ]}
+            />
+          </Panel>
+          <Panel className="usage-detail-panel" title="Harness 与工具">
+            <MetricList
+              items={[
+                ["工具调用", formatInteger(data.summary.toolCallCount)],
+                ["工具错误", formatInteger(data.summary.toolErrorCount)],
+                [
+                  "平均工具耗时",
+                  formatDuration(data.summary.averageToolDurationMs),
+                ],
+                [
+                  "成功请求",
+                  formatInteger(data.summary.successfulRequestCount),
+                ],
+                ["运行中请求", formatInteger(data.summary.runningRequestCount)],
+                ["模型", distinctModels(data.calls)],
+              ]}
+            />
+          </Panel>
+        </div>
+
+        <Panel
+          className="usage-call-panel"
+          title="API 调用明细"
+          actions={<Badge variant="neutral">{data.calls.length} 次请求</Badge>}
+        >
+          {isLoading && data.calls.length === 0 ? (
+            <div className="usage-table-state" role="status">
+              正在加载使用日志…
+            </div>
+          ) : data.calls.length === 0 ? (
+            <div className="usage-table-state">
+              <Activity size={20} aria-hidden="true" />
+              <p>这个会话还没有可用的 API 使用记录。</p>
+              <span>
+                完成一次模型调用后，这里会显示 API 返回的 usage
+                和本地观测到的链路指标。
+              </span>
+            </div>
+          ) : (
+            <div className="usage-table-wrap">
+              <table className="usage-call-table">
+                <thead>
+                  <tr>
+                    <th scope="col">时间</th>
+                    <th scope="col">模型 / 轮次</th>
+                    <th scope="col" className="usage-number-cell">
+                      总 Tokens
+                    </th>
+                    <th scope="col" className="usage-number-cell">
+                      输入 / 输出
+                    </th>
+                    <th scope="col" className="usage-number-cell">
+                      缓存读取
+                    </th>
+                    <th scope="col" className="usage-number-cell">
+                      推理
+                    </th>
+                    <th scope="col" className="usage-number-cell">
+                      TTFT
+                    </th>
+                    <th scope="col" className="usage-number-cell">
+                      延迟
+                    </th>
+                    <th scope="col">状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.calls.map((call) => (
+                    <UsageCallRow call={call} key={call.id} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
+
+        <p className="usage-log-footnote">
+          Token 与缓存字段来自模型 API 的
+          usage；TTFT、端到端延迟、工具耗时和重试由 OpenTopia
+          事件时间计算。Prompt Cache 读取率 = cached input tokens / input
+          tokens。托管 API 不提供 GPU 利用率、KV block
+          占用/逐出或服务端真实排队时间，因此不会在此伪造这些指标。
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({
+  label,
+  value,
+  detail,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+}) {
+  return (
+    <article className="usage-metric-card">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </article>
+  );
+}
+
+function MetricList({ items }: { items: Array<[string, string]> }) {
+  return (
+    <dl className="usage-metric-list">
+      {items.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function UsageCallRow({ call }: { call: UsageCall }) {
+  const cacheRatio =
+    call.inputTokens > 0 ? call.cachedInputTokens / call.inputTokens : null;
+  return (
+    <tr>
+      <td>
+        <time dateTime={call.startedAt}>{formatDateTime(call.startedAt)}</time>
+      </td>
+      <td>
+        <span className="usage-call-model" title={call.endpoint}>
+          {call.model ?? call.adapter}
+        </span>
+        <small>
+          Round {call.round}
+          {call.providerId ? ` · ${call.providerId}` : ""}
+        </small>
+      </td>
+      <td className="usage-number-cell">{formatInteger(call.totalTokens)}</td>
+      <td className="usage-number-cell">
+        {formatInteger(call.inputTokens)} / {formatInteger(call.outputTokens)}
+      </td>
+      <td className="usage-number-cell">
+        {call.cacheReadTokensReported
+          ? formatInteger(call.cachedInputTokens)
+          : "—"}
+        {call.cacheReadTokensReported ? (
+          <small>{formatPercent(cacheRatio)}</small>
+        ) : null}
+      </td>
+      <td className="usage-number-cell">
+        {formatInteger(call.reasoningTokens)}
+      </td>
+      <td className="usage-number-cell">{formatDuration(call.ttftMs)}</td>
+      <td className="usage-number-cell">{formatDuration(call.durationMs)}</td>
+      <td>
+        <Badge variant={statusBadgeVariant(call)}>{statusLabel(call)}</Badge>
+        {call.retryCount > 0 ? <small>重试 {call.retryCount}</small> : null}
+      </td>
+    </tr>
+  );
+}
+
+function statusBadgeVariant(call: UsageCall): BadgeVariant {
+  if (call.status === "failed") return "danger";
+  if (call.status === "running") return "info";
+  return "success";
+}
+
+function statusLabel(call: UsageCall): string {
+  if (call.status === "failed") {
+    return call.statusCode ? `失败 ${call.statusCode}` : "失败";
+  }
+  if (call.status === "running") return "进行中";
+  return call.statusCode ? `成功 ${call.statusCode}` : "成功";
+}
+
+function uncachedInput(summary: UsageSummary): number | null {
+  if (summary.cacheReadReportedRequestCount === 0) return null;
+  return Math.max(0, summary.cacheReadInputTokens - summary.cachedInputTokens);
+}
+
+function visibleOutput(summary: UsageSummary): number {
+  return Math.max(0, summary.outputTokens - summary.reasoningTokens);
+}
+
+function cacheCoverageLabel(calls: UsageCall[]): string {
+  if (calls.length === 0) return "—";
+  const reported = calls.filter(
+    (call) => call.cacheReadTokensReported || call.cacheWriteTokensReported,
+  ).length;
+  return `${formatInteger(reported)} / ${formatInteger(calls.length)} 请求`;
+}
+
+function cacheReadDetail(summary: UsageSummary): string {
+  return summary.cacheReadReportedRequestCount > 0
+    ? `${formatInteger(summary.cachedInputTokens)} 命中缓存`
+    : "缓存读取字段未返回";
+}
+
+function cacheWriteDetail(summary: UsageSummary): string {
+  return summary.cacheWriteReportedRequestCount > 0
+    ? `${formatInteger(summary.cacheWriteTokens)} 写入缓存`
+    : "缓存写入字段未返回";
+}
+
+function distinctModels(calls: UsageCall[]): string {
+  const models = new Set(calls.map((call) => call.model).filter(Boolean));
+  if (models.size === 0) return "—";
+  if (models.size === 1) return [...models][0] ?? "—";
+  return `${models.size} 个模型`;
+}
+
+function formatInteger(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "—";
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(
+    value,
+  );
+}
+
+function formatPercent(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "—";
+  return new Intl.NumberFormat("zh-CN", {
+    style: "percent",
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
+function formatDuration(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "—";
+  if (value < 1_000) return `${Math.round(value)} ms`;
+  return `${(value / 1_000).toFixed(value < 10_000 ? 2 : 1)} s`;
+}
+
+function formatRate(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "—";
+  return `${value.toFixed(1)} tok/s`;
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
