@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Check,
   ChevronDown,
@@ -44,6 +51,7 @@ type ModelOption = {
 };
 
 type OpenSubmenu = "model" | "effort" | null;
+type SubmenuSide = "left" | "right";
 
 /** Grace period that covers the gap between the panel and an open submenu. */
 const CLOSE_DELAY_MS = 200;
@@ -71,8 +79,11 @@ export function ModelSelector({
 
   const [open, setOpen] = useState(false);
   const [submenu, setSubmenu] = useState<OpenSubmenu>(null);
+  const [submenuSide, setSubmenuSide] = useState<SubmenuSide>("right");
+  const [submenuTopOffset, setSubmenuTopOffset] = useState(0);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const submenuRef = useRef<HTMLDivElement | null>(null);
   const closeTimer = useRef<number | null>(null);
 
   const cancelClose = useCallback(() => {
@@ -86,6 +97,68 @@ export function ModelSelector({
     setOpen(false);
     setSubmenu(null);
   }, [cancelClose]);
+
+  const showSubmenu = useCallback((nextSubmenu: Exclude<OpenSubmenu, null>) => {
+    // Prefer the conventional lower-right cascade before measuring overflow.
+    setSubmenuSide("right");
+    setSubmenuTopOffset(0);
+    setSubmenu(nextSubmenu);
+  }, []);
+
+  const toggleSubmenu = useCallback(
+    (nextSubmenu: Exclude<OpenSubmenu, null>) => {
+      if (submenu === nextSubmenu) {
+        setSubmenu(null);
+        return;
+      }
+      showSubmenu(nextSubmenu);
+    },
+    [showSubmenu, submenu],
+  );
+
+  useLayoutEffect(() => {
+    if (!open || !submenu) return undefined;
+
+    const updateSubmenuPlacement = () => {
+      const submenuElement = submenuRef.current;
+      const ownerElement = submenuElement?.parentElement;
+      if (!submenuElement || !ownerElement) return;
+
+      const submenuRect = submenuElement.getBoundingClientRect();
+      const ownerRect = ownerElement.getBoundingClientRect();
+      const gap =
+        submenuSide === "right"
+          ? submenuRect.left - ownerRect.right
+          : ownerRect.left - submenuRect.right;
+      const visualViewport = window.visualViewport;
+      const viewportRight =
+        (visualViewport?.offsetLeft ?? 0) +
+        (visualViewport?.width ?? window.innerWidth);
+      const viewportBottom =
+        (visualViewport?.offsetTop ?? 0) +
+        (visualViewport?.height ?? window.innerHeight);
+      const fitsOnRight =
+        viewportRight - ownerRect.right >= submenuRect.width + Math.max(gap, 0);
+      const topOffset = Math.min(
+        0,
+        viewportBottom - ownerRect.top - submenuRect.height,
+      );
+
+      setSubmenuSide(fitsOnRight ? "right" : "left");
+      setSubmenuTopOffset(topOffset);
+    };
+
+    updateSubmenuPlacement();
+    window.addEventListener("resize", updateSubmenuPlacement);
+    window.visualViewport?.addEventListener("resize", updateSubmenuPlacement);
+    return () => {
+      window.removeEventListener("resize", updateSubmenuPlacement);
+      window.visualViewport?.removeEventListener(
+        "resize",
+        updateSubmenuPlacement,
+      );
+    };
+  }, [open, submenu, submenuSide]);
 
   // Pointer exits are forgiving: a keyboard user typing in the model search
   // must not lose the panel just because the pointer drifted off it.
@@ -188,10 +261,8 @@ export function ModelSelector({
               aria-expanded={submenu === "model"}
               aria-haspopup="menu"
               className="model-selector-row"
-              onClick={() =>
-                setSubmenu((current) => (current === "model" ? null : "model"))
-              }
-              onMouseEnter={() => setSubmenu("model")}
+              onClick={() => toggleSubmenu("model")}
+              onMouseEnter={() => showSubmenu("model")}
               role="menuitem"
               type="button"
             >
@@ -200,7 +271,13 @@ export function ModelSelector({
               <ChevronRight aria-hidden="true" size={14} />
             </button>
             {submenu === "model" ? (
-              <div className="model-selector-submenu">
+              <div
+                className={`model-selector-submenu${
+                  submenuSide === "left" ? " model-selector-submenu--left" : ""
+                }`}
+                ref={submenuRef}
+                style={{ top: submenuTopOffset }}
+              >
                 <ModelMenu
                   connections={connections}
                   onOpenSettings={() => {
@@ -232,12 +309,8 @@ export function ModelSelector({
                 aria-expanded={submenu === "effort"}
                 aria-haspopup="menu"
                 className="model-selector-row"
-                onClick={() =>
-                  setSubmenu((current) =>
-                    current === "effort" ? null : "effort",
-                  )
-                }
-                onMouseEnter={() => setSubmenu("effort")}
+                onClick={() => toggleSubmenu("effort")}
+                onMouseEnter={() => showSubmenu("effort")}
                 role="menuitem"
                 type="button"
               >
@@ -248,7 +321,15 @@ export function ModelSelector({
                 <ChevronRight aria-hidden="true" size={14} />
               </button>
               {submenu === "effort" ? (
-                <div className="model-selector-submenu model-selector-submenu--effort">
+                <div
+                  className={`model-selector-submenu model-selector-submenu--effort${
+                    submenuSide === "left"
+                      ? " model-selector-submenu--left"
+                      : ""
+                  }`}
+                  ref={submenuRef}
+                  style={{ top: submenuTopOffset }}
+                >
                   <ul className="model-menu-list" role="listbox">
                     {capability.supportedEfforts.map((effort) => (
                       <li key={effort}>

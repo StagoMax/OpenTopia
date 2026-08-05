@@ -3305,7 +3305,7 @@ function createProviderSettings(
     contextWindowTokens: null,
     reasoningEffort: null,
     storeResponses: false,
-    parallelToolCalls: false,
+    parallelToolCalls: true,
     promptCacheKey: null,
     promptCachePolicy: null,
     responsesCompactionThresholdTokens: null,

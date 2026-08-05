@@ -123,20 +123,22 @@
   border-top: 1px solid var(--border-subtle);
 }
 
-/*
- * Submenus open leftward and grow upward: the composer lives at the bottom
- * right of the window, so this is the only direction with room.
- */
+/* Submenus cascade rightward; runtime placement keeps their bottoms in view. */
 .model-selector-submenu {
   position: absolute;
-  right: calc(100% + var(--space-2));
-  bottom: 0;
+  left: calc(100% + var(--space-2));
+  top: 0;
   z-index: var(--z-popover);
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--shadow-float);
+}
+
+.model-selector-submenu--left {
+  right: calc(100% + var(--space-2));
+  left: auto;
 }
 
 .model-selector-submenu--effort {
