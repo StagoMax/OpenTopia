@@ -457,6 +457,33 @@ impl SqliteSessionStore {
         })
     }
 
+    /// Resolves plugin configuration using the same global -> workspace -> thread precedence as
+    /// activation. Object keys in a narrower scope replace the corresponding broader value.
+    pub fn effective_plugin_settings(
+        &self,
+        plugin_id: &str,
+        workspace_root: &Path,
+        thread_id: Uuid,
+    ) -> anyhow::Result<Value> {
+        let scopes = [
+            PluginControlScope::global(),
+            PluginControlScope::workspace(workspace_root)?,
+            PluginControlScope::thread(thread_id),
+        ];
+        let mut effective = Map::new();
+        for scope in scopes {
+            let Some(record) = self.get_plugin_settings(plugin_id, &scope)? else {
+                continue;
+            };
+            let values = record
+                .settings
+                .as_object()
+                .context("stored plugin settings are not an object")?;
+            effective.extend(values.clone());
+        }
+        Ok(Value::Object(effective))
+    }
+
     pub fn put_plugin_settings(
         &self,
         plugin_id: &str,
@@ -1111,6 +1138,47 @@ mod tests {
         assert!(store
             .plugin_effectively_enabled("plugin", false, None, None)
             .unwrap());
+    }
+
+    #[test]
+    fn effective_settings_follow_global_workspace_thread_precedence() {
+        let store = SqliteSessionStore::open(":memory:").unwrap();
+        let workspace = Path::new("C:/work/browser-settings");
+        let thread_id = Uuid::new_v4();
+        store
+            .put_plugin_settings(
+                "browser-automation",
+                &PluginControlScope::global(),
+                &serde_json::json!({
+                    "allowedDomains": ["global.example"],
+                    "downloadDirectory": "global-downloads"
+                }),
+            )
+            .unwrap();
+        store
+            .put_plugin_settings(
+                "browser-automation",
+                &PluginControlScope::workspace(workspace).unwrap(),
+                &serde_json::json!({ "downloadDirectory": "workspace-downloads" }),
+            )
+            .unwrap();
+        store
+            .put_plugin_settings(
+                "browser-automation",
+                &PluginControlScope::thread(thread_id),
+                &serde_json::json!({ "allowedDomains": ["thread.example"] }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .effective_plugin_settings("browser-automation", workspace, thread_id)
+                .unwrap(),
+            serde_json::json!({
+                "allowedDomains": ["thread.example"],
+                "downloadDirectory": "workspace-downloads"
+            })
+        );
     }
 
     #[test]

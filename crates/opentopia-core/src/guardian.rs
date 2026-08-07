@@ -95,6 +95,13 @@ pub enum GuardianApprovalAction {
         target: String,
         host: Option<String>,
     },
+    BrowserAction {
+        action: String,
+        target: Option<String>,
+        host: Option<String>,
+        observation_id: Option<String>,
+        node_ref: Option<String>,
+    },
     FileOperation {
         tool: String,
         path: Option<PathBuf>,
@@ -134,12 +141,33 @@ impl GuardianApprovalAction {
                     .arguments
                     .get("url")
                     .and_then(Value::as_str)
-                    .unwrap_or("browser-interaction")
-                    .to_string();
-                let host = reqwest::Url::parse(&target)
-                    .ok()
+                    .map(str::to_string);
+                let host = target
+                    .as_deref()
+                    .and_then(|target| reqwest::Url::parse(target).ok())
                     .and_then(|url| url.host_str().map(str::to_string));
-                Self::NetworkAccess { target, host }
+                Self::BrowserAction {
+                    action: call
+                        .arguments
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    target,
+                    host,
+                    observation_id: call
+                        .arguments
+                        .get("observation_id")
+                        .or_else(|| call.arguments.get("observationId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    node_ref: call
+                        .arguments
+                        .get("node_ref")
+                        .or_else(|| call.arguments.get("nodeRef"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }
             }
             "list_files" | "read_file" | "write_file" | "search" | "spreadsheet" => {
                 let path = call
@@ -175,6 +203,20 @@ impl GuardianApprovalAction {
             Self::NetworkAccess { target, host } => {
                 json!({ "type": "network_access", "target": target, "host": host })
             }
+            Self::BrowserAction {
+                action,
+                target,
+                host,
+                observation_id,
+                node_ref,
+            } => json!({
+                "type": "browser_action",
+                "action": action,
+                "target": target,
+                "host": host,
+                "observationId": observation_id,
+                "nodeRef": node_ref,
+            }),
             Self::FileOperation { tool, path, .. } => {
                 json!({ "type": "file_operation", "tool": tool, "path": path })
             }
@@ -1317,6 +1359,29 @@ mod tests {
         let assessment = parse_guardian_assessment(r#"{"outcome":"allow"}"#).unwrap();
         assert_eq!(assessment.risk_level, GuardianRiskLevel::Low);
         assert_eq!(assessment.outcome, GuardianAssessmentOutcome::Allow);
+    }
+
+    #[test]
+    fn browser_approval_actions_do_not_invent_network_hosts() {
+        let call = ProviderToolCall {
+            id: "browser-click".to_string(),
+            name: "browser".to_string(),
+            arguments: json!({
+                "action": "click",
+                "observation_id": "observation-1",
+                "node_ref": "node-1"
+            }),
+        };
+        let action = GuardianApprovalAction::from_provider_call(&call, Path::new("C:/workspace"));
+        assert!(matches!(
+            action,
+            GuardianApprovalAction::BrowserAction {
+                ref action,
+                target: None,
+                host: None,
+                ..
+            } if action == "click"
+        ));
     }
 
     #[test]

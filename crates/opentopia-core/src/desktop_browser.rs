@@ -6,9 +6,9 @@
 
 use crate::{
     BrowserAction, BrowserActionReceipt, BrowserDownloadRequest, BrowserError,
-    BrowserNavigateRequest, BrowserNode, BrowserNodeRef, BrowserObservation, BrowserObservationId,
-    BrowserObserveOptions, BrowserOutput, BrowserRuntime, BrowserSessionId, BrowserWaitCondition,
-    BrowserWaitRequest,
+    BrowserNavigateRequest, BrowserNetworkGrant, BrowserNode, BrowserNodeRef, BrowserObservation,
+    BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserRuntime, BrowserSessionId,
+    BrowserTargetRef, BrowserWaitCondition, BrowserWaitRequest,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -131,7 +131,7 @@ impl DesktopBrowserRuntime {
 
     async fn execute<T: DeserializeOwned>(
         &self,
-        request: BrokerRequest,
+        request: impl Serialize,
     ) -> Result<T, BrowserError> {
         let endpoint = self.endpoint("v1/browser")?;
         let request = self
@@ -177,6 +177,9 @@ impl DesktopBrowserRuntime {
         if let Some(reason) = stale_observation_reason(&body, &self.token) {
             return BrowserError::StaleObservation { reason };
         }
+        if let Some(host) = network_blocked_host(&body) {
+            return BrowserError::NetworkBlocked { host };
+        }
         let message = sanitize_error_message(&body, &self.token);
         BrowserError::BrokerRejected { status, message }
     }
@@ -190,6 +193,20 @@ impl DesktopBrowserRuntime {
 
 #[async_trait]
 impl BrowserRuntime for DesktopBrowserRuntime {
+    async fn grant_network_access(
+        &self,
+        session: BrowserSessionId,
+        grant: BrowserNetworkGrant,
+    ) -> Result<(), BrowserError> {
+        self.execute::<BrowserOutput>(BrokerNetworkGrantRequest {
+            session_id: session,
+            action: "grant_network_access",
+            allowed_hosts: grant.allowed_hosts,
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn navigate(
         &self,
         session: BrowserSessionId,
@@ -202,12 +219,16 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             url: Some(request.url),
             selector,
             text,
+            value: None,
             wait,
             observation_id: None,
             node_ref: None,
             operation: None,
             clear_first: None,
+            delta_x: None,
+            delta_y: None,
             include_screenshot: None,
+            target_ref: None,
         })
         .await
     }
@@ -223,14 +244,28 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             url: None,
             selector: None,
             text: None,
+            value: None,
             wait: None,
             observation_id: None,
             node_ref: None,
             operation: None,
             clear_first: None,
+            delta_x: None,
+            delta_y: None,
             include_screenshot: Some(options.include_screenshot),
+            target_ref: None,
         })
         .await
+    }
+
+    async fn switch_target(
+        &self,
+        session: BrowserSessionId,
+        target: BrowserTargetRef,
+    ) -> Result<BrowserOutput, BrowserError> {
+        let mut request = BrokerRequest::new(session, BrokerAction::SwitchTarget);
+        request.target_ref = Some(target);
+        self.execute(request).await
     }
 
     async fn observation_node(
@@ -245,12 +280,16 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             url: None,
             selector: None,
             text: None,
+            value: None,
             wait: None,
             observation_id: Some(observation_id),
             node_ref: Some(node_ref),
             operation: None,
             clear_first: None,
+            delta_x: None,
+            delta_y: None,
             include_screenshot: None,
+            target_ref: None,
         })
         .await
     }
@@ -262,11 +301,28 @@ impl BrowserRuntime for DesktopBrowserRuntime {
         node_ref: BrowserNodeRef,
         action: BrowserAction,
     ) -> Result<BrowserActionReceipt, BrowserError> {
-        let (operation, text, clear_first) = match action {
-            BrowserAction::Click => (BrokerOperation::Click, None, None),
-            BrowserAction::Type { text, clear_first } => {
-                (BrokerOperation::Type, Some(text), Some(clear_first))
+        let (operation, text, value, clear_first, delta_x, delta_y) = match action {
+            BrowserAction::Click => (BrokerOperation::Click, None, None, None, None, None),
+            BrowserAction::Type { text, clear_first } => (
+                BrokerOperation::Type,
+                Some(text),
+                None,
+                Some(clear_first),
+                None,
+                None,
+            ),
+            BrowserAction::Select { value } => {
+                (BrokerOperation::Select, None, Some(value), None, None, None)
             }
+            BrowserAction::Hover => (BrokerOperation::Hover, None, None, None, None, None),
+            BrowserAction::Scroll { delta_x, delta_y } => (
+                BrokerOperation::Scroll,
+                None,
+                None,
+                None,
+                Some(delta_x),
+                Some(delta_y),
+            ),
         };
         self.execute(BrokerRequest {
             session_id: session,
@@ -274,12 +330,16 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             url: None,
             selector: None,
             text,
+            value,
             wait: None,
             observation_id: Some(observation_id),
             node_ref: Some(node_ref),
             operation: Some(operation),
             clear_first,
+            delta_x,
+            delta_y,
             include_screenshot: None,
+            target_ref: None,
         })
         .await
     }
@@ -301,12 +361,16 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             url: None,
             selector,
             text,
+            value: None,
             wait,
             observation_id: None,
             node_ref: None,
             operation: None,
             clear_first: None,
+            delta_x: None,
+            delta_y: None,
             include_screenshot: None,
+            target_ref: None,
         })
         .await
     }
@@ -322,6 +386,7 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             url: Some(request.url),
             selector: None,
             text: None,
+            value: None,
             wait: request.timeout.map(|timeout| BrokerWait {
                 condition: None,
                 timeout_ms: Some(duration_millis(timeout)),
@@ -331,7 +396,10 @@ impl BrowserRuntime for DesktopBrowserRuntime {
             node_ref: None,
             operation: None,
             clear_first: None,
+            delta_x: None,
+            delta_y: None,
             include_screenshot: None,
+            target_ref: None,
         })
         .await
     }
@@ -349,6 +417,7 @@ enum BrokerAction {
     Navigate,
     Observe,
     ObservationNode,
+    SwitchTarget,
     Screenshot,
     Perform,
     Wait,
@@ -361,6 +430,9 @@ enum BrokerAction {
 enum BrokerOperation {
     Click,
     Type,
+    Select,
+    Hover,
+    Scroll,
 }
 
 #[derive(Serialize)]
@@ -375,6 +447,8 @@ struct BrokerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     wait: Option<BrokerWait>,
     #[serde(skip_serializing_if = "Option::is_none")]
     observation_id: Option<BrowserObservationId>,
@@ -385,7 +459,13 @@ struct BrokerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     clear_first: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    delta_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta_y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     include_screenshot: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_ref: Option<BrowserTargetRef>,
 }
 
 impl BrokerRequest {
@@ -396,12 +476,16 @@ impl BrokerRequest {
             url: None,
             selector: None,
             text: None,
+            value: None,
             wait: None,
             observation_id: None,
             node_ref: None,
             operation: None,
             clear_first: None,
+            delta_x: None,
+            delta_y: None,
             include_screenshot: None,
+            target_ref: None,
         }
     }
 }
@@ -554,6 +638,14 @@ fn sanitize_error_message(body: &[u8], token: &str) -> String {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerNetworkGrantRequest {
+    session_id: BrowserSessionId,
+    action: &'static str,
+    allowed_hosts: Vec<String>,
+}
+
 fn stale_observation_reason(body: &[u8], token: &str) -> Option<String> {
     let value = serde_json::from_slice::<Value>(body).ok()?;
     let code = value.pointer("/error/code").and_then(Value::as_str)?;
@@ -561,6 +653,19 @@ fn stale_observation_reason(body: &[u8], token: &str) -> Option<String> {
         return None;
     }
     Some(sanitize_error_message(body, token))
+}
+
+fn network_blocked_host(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    if value.pointer("/error/code").and_then(Value::as_str)? != "network_host_blocked" {
+        return None;
+    }
+    let host = value.pointer("/error/host").and_then(Value::as_str)?;
+    BrowserNetworkGrant::new([host])
+        .ok()?
+        .allowed_hosts
+        .into_iter()
+        .next()
 }
 
 #[cfg(test)]
@@ -707,6 +812,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_actions_serialize_without_exposing_internal_locators() {
+        let observation_id = BrowserObservationId::new();
+        let node_ref: BrowserNodeRef =
+            serde_json::from_value(json!(BrowserObservationId::new().to_string())).unwrap();
+        let body = serde_json::to_vec(&json!({
+            "observationId": observation_id,
+            "nodeRef": node_ref,
+            "action": "scroll",
+            "target": {
+                "nodeRef": node_ref,
+                "role": "button",
+                "name": "More",
+                "tagName": "button",
+                "bounds": { "x": 0, "y": 0, "width": 10, "height": 10 },
+                "href": null,
+                "formAction": null,
+                "editable": false
+            },
+            "url": "https://example.com/",
+            "title": "Example"
+        }))
+        .unwrap();
+        let (base_url, captured) = spawn_broker(200, body, Duration::ZERO).await;
+        let runtime = DesktopBrowserRuntime::new(&base_url, "test-token").unwrap();
+
+        runtime
+            .perform(
+                BrowserSessionId::new(),
+                observation_id,
+                node_ref,
+                BrowserAction::Scroll {
+                    delta_x: 12.0,
+                    delta_y: 640.0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let payload: Value = serde_json::from_slice(&captured.await.unwrap().body).unwrap();
+        assert_eq!(payload["action"], "perform");
+        assert_eq!(payload["operation"], "scroll");
+        assert_eq!(payload["deltaX"], 12.0);
+        assert_eq!(payload["deltaY"], 640.0);
+        assert!(payload.get("selector").is_none());
+    }
+
+    #[tokio::test]
+    async fn target_switching_uses_an_opaque_target_reference() {
+        let (base_url, captured) = spawn_broker(200, output_body(), Duration::ZERO).await;
+        let runtime = DesktopBrowserRuntime::new(&base_url, "test-token").unwrap();
+        let target: BrowserTargetRef = serde_json::from_value(json!("owned-target")).unwrap();
+
+        runtime
+            .switch_target(BrowserSessionId::new(), target)
+            .await
+            .unwrap();
+
+        let payload: Value = serde_json::from_slice(&captured.await.unwrap().body).unwrap();
+        assert_eq!(payload["action"], "switch_target");
+        assert_eq!(payload["targetRef"], "owned-target");
+    }
+
+    #[tokio::test]
     async fn health_check_uses_the_health_endpoint_and_authentication() {
         let (base_url, captured) = spawn_broker(200, b"{}".to_vec(), Duration::ZERO).await;
         let runtime =
@@ -745,6 +913,53 @@ mod tests {
                 if message.contains("[redacted]") && !message.contains(token)
         ));
         assert!(!error.to_string().contains(token));
+    }
+
+    #[tokio::test]
+    async fn network_policy_rejections_preserve_the_blocked_host() {
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "code": "network_host_blocked",
+                "message": "The browser blocked an unauthorized network request.",
+                "host": "STATIC.Example.COM."
+            }
+        }))
+        .unwrap();
+        let (base_url, _) = spawn_broker(403, body, Duration::ZERO).await;
+        let runtime = DesktopBrowserRuntime::new(&base_url, "test-token").unwrap();
+
+        let error = runtime
+            .observe(BrowserSessionId::new(), BrowserObserveOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BrowserError::NetworkBlocked { ref host } if host == "static.example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn network_grants_use_the_same_authenticated_broker_contract() {
+        let (base_url, captured) = spawn_broker(200, output_body(), Duration::ZERO).await;
+        let runtime = DesktopBrowserRuntime::new(&base_url, "test-broker-token").unwrap();
+        let session = BrowserSessionId::new();
+
+        runtime
+            .grant_network_access(
+                session,
+                BrowserNetworkGrant::new(["example.com", "static.example.com"]).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let captured = captured.await.unwrap();
+        let payload: Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(payload["sessionId"], session.to_string());
+        assert_eq!(payload["action"], "grant_network_access");
+        assert_eq!(
+            payload["allowedHosts"],
+            json!(["example.com", "static.example.com"])
+        );
     }
 
     #[tokio::test]

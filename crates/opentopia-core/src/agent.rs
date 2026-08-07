@@ -5,7 +5,7 @@ use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime};
 use crate::effect_journal::{EffectIntent, EffectKind, EffectSideEffectClass, EffectStatus};
 use crate::enterprise::CapabilityProjection;
-use crate::execution_authorization::{ExecutionGrant, NetworkAccess};
+use crate::execution_authorization::ExecutionGrant;
 use crate::flow::GraphNodeKindV1;
 use crate::flow_runtime::{
     FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness,
@@ -2077,7 +2077,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             // the tools are known to be approval-free. An outside-workspace read
             // therefore stays on the existing sequential approval path.
             let intent = tool.execution_intent(&call, workspace_root);
-            if intent.network != NetworkAccess::Deny
+            if !intent.network.does_not_require_network()
                 || !intent.requested_write_paths.is_empty()
                 || intent.requested_read_paths.iter().any(|path| {
                     if path
@@ -2876,6 +2876,9 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         self.tools
             .list()
             .into_iter()
+            // Keep the legacy tool executable for persisted or replayed calls,
+            // but expose one canonical model-facing file editor: apply_patch.
+            .filter(|name| name != "write_file")
             .filter(|name| subagents_available || !is_subagent_tool(name))
             .filter(|name| structured_input_available || name.as_str() != "request_user_input")
             .filter(|name| self.tool_is_allowed(name))
@@ -3333,26 +3336,27 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             Err(err) if approval_required(&err).is_some() => Err(err),
             Err(err) if err.to_string().contains("cancelled") => Err(err),
             Err(err) => {
+                let error_message = format!("{err:#}");
                 let mut metadata = json!({
                     "toolName": &provider_call.name,
                     "providerToolCallId": &provider_call.id,
                     "success": false,
-                    "error": err.to_string()
+                    "error": &error_message
                 });
-                insert_tool_error_record(
+                insert_anyhow_error_record(
                     &mut metadata,
                     "tool_execution_failed",
                     "execution",
                     true,
                     false,
-                    &err.to_string(),
+                    &err,
                 );
                 self.insert_tool_source_metadata(&provider_call.name, &mut metadata);
                 Ok(ProviderToolResult {
                     call_id: provider_call.id.clone(),
                     name: provider_call.name.clone(),
-                    output: err.to_string(),
-                    content: vec![ModelContentPart::text(err.to_string())],
+                    output: error_message.clone(),
+                    content: vec![ModelContentPart::text(error_message)],
                     is_error: true,
                     metadata,
                 })
@@ -3361,6 +3365,36 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
 
         if let Some((store, effect_id, policy)) = journal {
             match &provider_result {
+                Ok(result) if result.is_error => {
+                    let executed = result
+                        .metadata
+                        .get("errorRecord")
+                        .and_then(|record| record.get("executed"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let status = if !executed
+                        || policy.side_effect == ToolSideEffect::None
+                        || policy.idempotent
+                    {
+                        EffectStatus::Failed
+                    } else {
+                        EffectStatus::Indeterminate
+                    };
+                    let error = result
+                        .metadata
+                        .get("errorRecord")
+                        .and_then(|record| record.get("message"))
+                        .or_else(|| result.metadata.get("error"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&result.output)
+                        .to_string();
+                    store.finish_effect(
+                        effect_id,
+                        status,
+                        Some(serde_json::to_value(result)?),
+                        Some(error),
+                    )?;
+                }
                 Ok(result) => {
                     store.finish_effect(
                         effect_id,
@@ -3596,11 +3630,20 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         let mut result = match tool.execute(call.clone(), ctx).await {
             Ok(result) => result,
             Err(err) => {
+                let error_message = format!("{err:#}");
                 let mut metadata = json!({
                     "toolName": &name,
                     "success": false,
-                    "error": err.to_string()
+                    "error": &error_message
                 });
+                insert_anyhow_error_record(
+                    &mut metadata,
+                    "tool_execution_failed",
+                    "execution",
+                    true,
+                    false,
+                    &err,
+                );
                 self.insert_tool_source_metadata(&name, &mut metadata);
                 insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&err));
                 merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
@@ -3608,8 +3651,8 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 events.push(AgentEventPayload::ToolCallFinished {
                     result: ToolResult {
                         call_id: call.id,
-                        output: err.to_string(),
-                        content: vec![ModelContentPart::text(err.to_string())],
+                        output: error_message.clone(),
+                        content: vec![ModelContentPart::text(error_message)],
                         metadata,
                     },
                 });
@@ -4876,6 +4919,26 @@ fn insert_tool_error_record(
     );
 }
 
+fn insert_anyhow_error_record(
+    metadata: &mut Value,
+    code: &str,
+    phase: &str,
+    executed: bool,
+    retryable: bool,
+    error: &anyhow::Error,
+) {
+    let message = format!("{error:#}");
+    insert_tool_error_record(metadata, code, phase, executed, retryable, &message);
+    let chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object.insert("errorChain".to_string(), json!(&chain));
+    if let Some(record) = object.get_mut("errorRecord").and_then(Value::as_object_mut) {
+        record.insert("causes".to_string(), json!(chain));
+    }
+}
+
 fn ensure_tool_error_record(result: &mut ToolResult) {
     if !tool_result_is_error(result) || result.metadata.get("errorRecord").is_some() {
         return;
@@ -5018,6 +5081,8 @@ mod tests {
         requires_approval: bool,
     }
 
+    struct JournalChainedFailureTool;
+
     struct ParallelObservationTestTool {
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
@@ -5057,6 +5122,30 @@ mod tests {
                 "executed",
                 json!({ "success": true }),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl Tool for JournalChainedFailureTool {
+        fn name(&self) -> &str {
+            "journal_chained_failure"
+        }
+
+        fn description(&self) -> &str {
+            "Return a chained read-only execution error for journal tests."
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+
+        fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::read_only(vec!["git:index-and-worktree".to_string()])
+        }
+
+        async fn execute(&self, _call: ToolCall, _ctx: ToolContext) -> anyhow::Result<ToolResult> {
+            Err(anyhow::anyhow!("sandbox process creation was denied")
+                .context("git diff execution failed"))
         }
     }
 
@@ -5277,6 +5366,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_provider_tool_result_preserves_error_chain_and_fails_effect() {
+        let workspace = test_workspace("journal-error-result");
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
+        let thread = store.create_thread(None, workspace.clone()).unwrap();
+        let user_message_id = Uuid::new_v4();
+        let turn = store
+            .insert_turn(TurnRecord::running(thread.id, user_message_id))
+            .unwrap();
+        let mut registry = ToolRegistry::with_core_tools();
+        registry.insert(
+            "journal_chained_failure".to_string(),
+            Arc::new(JournalChainedFailureTool),
+        );
+        let agent = AgentCore::new(Arc::new(MockProvider), registry);
+
+        let result = agent
+            .execute_provider_tool_call(
+                &ProviderToolCall {
+                    id: "chained-failure-call".to_string(),
+                    name: "journal_chained_failure".to_string(),
+                    arguments: json!({}),
+                },
+                user_message_id,
+                journal_test_context(Arc::clone(&store), thread.id, workspace.clone(), false),
+                &mut TurnEvents::new(None),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(result.output.contains("git diff execution failed"));
+        assert!(result
+            .output
+            .contains("sandbox process creation was denied"));
+        assert_eq!(
+            result.metadata["errorChain"],
+            json!([
+                "git diff execution failed",
+                "sandbox process creation was denied"
+            ])
+        );
+        let effects = store.list_turn_effects(turn.turn_id).unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].status, EffectStatus::Failed);
+        assert!(effects[0].result.is_some());
+        assert!(effects[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("sandbox process creation was denied")));
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn approved_retry_restarts_the_same_failed_effect_record() {
         let workspace = test_workspace("journal-approved-retry");
         let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
@@ -5332,6 +5474,20 @@ mod tests {
         assert_eq!(effects[0].status, EffectStatus::Succeeded);
         assert_eq!(effects[0].attempt, 2);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn provider_exposes_apply_patch_as_the_single_general_file_editor() {
+        let agent = AgentCore::default();
+        let tools = agent
+            .provider_tool_catalog()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+
+        assert!(tools.contains("apply_patch"));
+        assert!(!tools.contains("write_file"));
+        assert!(agent.tools.get("write_file").is_some());
     }
 
     #[test]

@@ -1,4 +1,6 @@
-use crate::sandbox::{LocalSandboxConfig, NetworkPolicy, SandboxMode};
+use crate::sandbox::{
+    LocalSandboxConfig, NetworkPolicy, OsSandboxPlatform, SandboxBackendCapabilities, SandboxMode,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -17,9 +19,21 @@ pub enum FilesystemAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccess {
+    /// The operation does not need network access. Enforce offline execution
+    /// when the selected backend can do so authoritatively; otherwise retain
+    /// the session's network boundary instead of rejecting a local process.
+    PreferDeny,
+    /// The operation requires authoritative offline execution. Unsupported
+    /// backends must reject it rather than falling back to the session policy.
     Deny,
     InheritSession,
     Required,
+}
+
+impl NetworkAccess {
+    pub fn does_not_require_network(self) -> bool {
+        matches!(self, Self::PreferDeny | Self::Deny)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +70,7 @@ impl ToolExecutionIntent {
     pub fn observation(read_paths: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
             filesystem: FilesystemAccess::ReadWorkspace,
-            network: NetworkAccess::Deny,
+            network: NetworkAccess::PreferDeny,
             process_lifetime: ProcessLifetime::None,
             approval_escalation: ApprovalEscalation::ExactPaths,
             requested_read_paths: read_paths.into_iter().collect(),
@@ -67,7 +81,7 @@ impl ToolExecutionIntent {
     pub fn workspace_mutation(write_paths: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
             filesystem: FilesystemAccess::WriteWorkspace,
-            network: NetworkAccess::Deny,
+            network: NetworkAccess::PreferDeny,
             process_lifetime: ProcessLifetime::None,
             approval_escalation: ApprovalEscalation::ExactPaths,
             requested_read_paths: Vec::new(),
@@ -141,6 +155,26 @@ impl ExecutionGrant {
         intent: &ToolExecutionIntent,
         approval_granted: bool,
     ) -> anyhow::Result<Self> {
+        let capabilities = SandboxBackendCapabilities::for_platform(
+            OsSandboxPlatform::current(),
+            base.windows_backend,
+        );
+        Self::resolve_with_capabilities(
+            base,
+            workspace_root,
+            intent,
+            approval_granted,
+            &capabilities,
+        )
+    }
+
+    fn resolve_with_capabilities(
+        base: &LocalSandboxConfig,
+        workspace_root: &Path,
+        intent: &ToolExecutionIntent,
+        approval_granted: bool,
+        capabilities: &SandboxBackendCapabilities,
+    ) -> anyhow::Result<Self> {
         let mut sandbox = base.clone();
 
         sandbox = match intent.filesystem {
@@ -157,6 +191,8 @@ impl ExecutionGrant {
         };
 
         sandbox.network = match intent.network {
+            NetworkAccess::PreferDeny if capabilities.network_offline => NetworkPolicy::Deny,
+            NetworkAccess::PreferDeny => base.network,
             NetworkAccess::Deny => NetworkPolicy::Deny,
             NetworkAccess::InheritSession => base.network,
             NetworkAccess::Required if approval_granted => NetworkPolicy::Allow,
@@ -221,19 +257,80 @@ fn resolve_requested_path(workspace_root: &Path, path: &Path) -> anyhow::Result<
 mod tests {
     use super::*;
 
+    fn capabilities_with_offline(network_offline: bool) -> SandboxBackendCapabilities {
+        let mut capabilities = SandboxBackendCapabilities::for_platform(
+            OsSandboxPlatform::Linux,
+            crate::sandbox::WindowsSandboxBackend::Auto,
+        );
+        capabilities.network_offline = network_offline;
+        capabilities
+    }
+
     #[test]
-    fn observation_narrows_workspace_write_and_network() {
+    fn observation_enforces_offline_when_the_backend_supports_it() {
         let mut base = LocalSandboxConfig::enforce();
         base.network = NetworkPolicy::Allow;
-        let grant = ExecutionGrant::resolve(
+        let grant = ExecutionGrant::resolve_with_capabilities(
             &base,
             Path::new("C:/workspace"),
             &ToolExecutionIntent::observation([]),
             false,
+            &capabilities_with_offline(true),
         )
         .unwrap();
 
         assert_eq!(grant.sandbox.sandbox_mode, SandboxMode::ReadOnly);
+        assert_eq!(grant.sandbox.network, NetworkPolicy::Deny);
+    }
+
+    #[test]
+    fn observation_retains_session_network_when_offline_is_unsupported() {
+        let mut base = LocalSandboxConfig::enforce();
+        base.network = NetworkPolicy::Allow;
+        let grant = ExecutionGrant::resolve_with_capabilities(
+            &base,
+            Path::new("C:/workspace"),
+            &ToolExecutionIntent::observation([]),
+            false,
+            &capabilities_with_offline(false),
+        )
+        .unwrap();
+
+        assert_eq!(grant.sandbox.sandbox_mode, SandboxMode::ReadOnly);
+        assert_eq!(grant.sandbox.network, NetworkPolicy::Allow);
+    }
+
+    #[test]
+    fn strict_offline_intent_is_never_downgraded() {
+        let mut base = LocalSandboxConfig::enforce();
+        base.network = NetworkPolicy::Allow;
+        let mut intent = ToolExecutionIntent::observation([]);
+        intent.network = NetworkAccess::Deny;
+        let grant = ExecutionGrant::resolve_with_capabilities(
+            &base,
+            Path::new("C:/workspace"),
+            &intent,
+            false,
+            &capabilities_with_offline(false),
+        )
+        .unwrap();
+
+        assert_eq!(grant.sandbox.network, NetworkPolicy::Deny);
+    }
+
+    #[test]
+    fn preferred_offline_does_not_widen_an_offline_session() {
+        let mut base = LocalSandboxConfig::enforce();
+        base.network = NetworkPolicy::Deny;
+        let grant = ExecutionGrant::resolve_with_capabilities(
+            &base,
+            Path::new("C:/workspace"),
+            &ToolExecutionIntent::workspace_mutation([]),
+            false,
+            &capabilities_with_offline(false),
+        )
+        .unwrap();
+
         assert_eq!(grant.sandbox.network, NetworkPolicy::Deny);
     }
 

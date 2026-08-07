@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hmac
+import ipaddress
 import json
 import secrets
 import signal
@@ -33,6 +34,7 @@ MAX_REQUEST_BYTES = 1024 * 1024
 MAX_TEXT_BYTES = 1024 * 1024
 MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
 MAX_WAIT_MS = 30_000
+MAX_NETWORK_HOSTS = 256
 OBSERVATION_TTL_SECONDS = 120
 MAX_NODE_POSITION_DRIFT = 24
 
@@ -57,6 +59,42 @@ def browser_output(page: Page, action: str, contents: list[dict[str, Any]] | Non
         "contents": contents or [],
         "metadata": {"action": action, **metadata},
     }
+
+
+def normalize_network_host(value: str) -> str:
+    raw = value.strip().rstrip(".").lower()
+    if not raw or any(character.isspace() for character in raw) or "/" in raw or "@" in raw:
+        raise ValueError("network host must be a host name or IP address without a port")
+
+    candidates = [raw]
+    if ":" in raw and not (raw.startswith("[") and raw.endswith("]")):
+        candidates.append(f"[{raw}]")
+    for candidate in candidates:
+        try:
+            parsed = urlparse(f"http://{candidate}/")
+            host = (parsed.hostname or "").rstrip(".").lower()
+            port = parsed.port
+        except ValueError:
+            continue
+        if (
+            not host
+            or port is not None
+            or parsed.username
+            or parsed.password
+            or parsed.path != "/"
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            continue
+        try:
+            return ipaddress.ip_address(host).compressed.lower()
+        except ValueError:
+            try:
+                return host.encode("idna").decode("ascii").lower()
+            except UnicodeError:
+                continue
+    raise ValueError("invalid network host")
 
 
 class StaticSiteHandler(SimpleHTTPRequestHandler):
@@ -111,9 +149,16 @@ class MiniwobBroker:
         self.browser = None
         self.context = None
         self.page: Page | None = None
+        self.task_page: Page | None = None
+        self.page_refs: dict[Page, str] = {}
+        self.page_openers: dict[Page, Page | None] = {}
+        self.frame_refs: dict[Any, str] = {}
+        self.dialogs: list[dict[str, Any]] = []
         self.task = None
         self.goal = ""
         self.observations: dict[str, dict[str, Any]] = {}
+        self.network_policy_enforced = False
+        self.allowed_hosts: set[str] = set()
 
     @staticmethod
     def _normalize_task_id(task_id: str) -> str:
@@ -135,8 +180,91 @@ class MiniwobBroker:
             launch_options["executable_path"] = str(self.browser_executable)
         self.browser = self.playwright.chromium.launch(**launch_options)
         self.context = self.browser.new_context(viewport=self.task.viewport)
+        self.context.route("**/*", self._route_request)
+        self.context.on("page", self._register_page)
         self.page = self.context.new_page()
+        self.task_page = self.page
+        self._register_page(self.page)
         self.goal, _setup_info = self.task.setup(self.page)
+
+    def _register_page(self, page: Page) -> None:
+        if page in self.page_refs:
+            if page.opener:
+                self.page_openers[page] = page.opener
+            self.page = page
+            return
+        self.page_refs[page] = str(uuid.uuid4())
+        self.page_openers[page] = page.opener
+        page.on("dialog", lambda dialog, owner=page: self._handle_dialog(owner, dialog))
+        page.on("popup", self._register_page)
+        page.on("close", lambda owner=page: self._handle_page_close(owner))
+        self.page = page
+
+    def _handle_page_close(self, page: Page) -> None:
+        if self.page != page:
+            return
+        opener = self.page_openers.get(page)
+        fallback = opener if opener and not opener.is_closed() else next(
+            (candidate for candidate in self.page_refs if candidate != page and not candidate.is_closed()),
+            None,
+        )
+        self.page = fallback
+        self.observations.clear()
+
+    def _handle_dialog(self, page: Page, dialog: Any) -> None:
+        self.dialogs.append(
+            {
+                "dialogType": str(dialog.type),
+                "message": str(dialog.message),
+                "defaultPrompt": str(dialog.default_value) if dialog.default_value else None,
+                "handled": True,
+                "targetRef": self.page_refs.get(page, ""),
+            }
+        )
+        self.dialogs = self.dialogs[-32:]
+        dialog.dismiss()
+
+    def _route_request(self, route: Any) -> None:
+        parsed = urlparse(route.request.url)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        if (
+            self.network_policy_enforced
+            and parsed.scheme in {"http", "https"}
+            and host not in self.allowed_hosts
+        ):
+            route.abort("blockedbyclient")
+            return
+        route.continue_()
+
+    def grant_network_access(self, request: dict[str, Any]) -> dict[str, Any]:
+        hosts = request.get("allowedHosts")
+        if not isinstance(hosts, list) or len(hosts) > MAX_NETWORK_HOSTS:
+            raise BrokerError(
+                "invalid_network_grant",
+                f"allowedHosts must contain at most {MAX_NETWORK_HOSTS} hosts.",
+            )
+        normalized: set[str] = set()
+        for value in hosts:
+            if not isinstance(value, str) or not value.strip():
+                raise BrokerError("invalid_network_host", "allowedHosts entries must be non-empty strings.")
+            try:
+                host = normalize_network_host(value)
+            except ValueError:
+                raise BrokerError("invalid_network_host", f"Invalid network host '{value}'.")
+            normalized.add(host)
+        if len(self.allowed_hosts | normalized) > MAX_NETWORK_HOSTS:
+            raise BrokerError(
+                "invalid_network_grant",
+                f"A browser session may authorize at most {MAX_NETWORK_HOSTS} hosts.",
+            )
+        self.network_policy_enforced = True
+        self.allowed_hosts.update(normalized)
+        return browser_output(
+            self._page(),
+            "grant_network_access",
+            [],
+            allowedHosts=sorted(self.allowed_hosts),
+        )
 
     def close(self) -> None:
         try:
@@ -156,7 +284,168 @@ class MiniwobBroker:
             raise BrokerError("browser_unavailable", "BrowserGym page is unavailable.", HTTPStatus.SERVICE_UNAVAILABLE)
         return self.page
 
+    @staticmethod
+    def _frame_snapshot(frame: Any) -> dict[str, Any]:
+        return frame.evaluate(
+            """() => {
+              const max = 200;
+              const identities = globalThis.__opentopiaBrowserNodeIdentities ||
+                (globalThis.__opentopiaBrowserNodeIdentities = { nodes: new WeakMap(), next: 0 });
+              const nodeKey = (element) => {
+                let key = identities.nodes.get(element);
+                if (!key) {
+                  key = String(++identities.next);
+                  identities.nodes.set(element, key);
+                }
+                return key;
+              };
+              const selector = 'a[href],button,input,textarea,select,[role=button],[role=link],[contenteditable=true],[tabindex],[data-color]';
+              const escape = (value) => window.CSS && CSS.escape
+                ? CSS.escape(String(value))
+                : String(value).replace(/[^a-zA-Z0-9_-]/g, (char) => "\\\\" + char);
+              const selectorFor = (element, root) => {
+                if (element.id) return "#" + escape(element.id);
+                const parts = [];
+                for (let current = element; current && current.nodeType === Node.ELEMENT_NODE; current = current.parentElement) {
+                  let part = current.localName || "*";
+                  const siblings = current.parentElement
+                    ? Array.from(current.parentElement.children).filter((item) => item.localName === current.localName)
+                    : [];
+                  if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(current) + 1) + ")";
+                  parts.unshift(part);
+                  if (current.parentNode === root || current === document.body) break;
+                }
+                return parts.join(" > ");
+              };
+              const roleFor = (element) => element.getAttribute("role") || ({
+                a: "link", button: "button", textarea: "textbox", select: "combobox",
+                input: element.type === "checkbox" ? "checkbox" : element.type === "radio" ? "radio" : "textbox"
+              })[element.localName] || element.localName;
+              const nodes = [];
+              const walk = (root, shadowPath) => {
+                for (const element of root.querySelectorAll(selector)) {
+                  if (nodes.length >= max) break;
+                  if (element.disabled || !element.getClientRects().length) continue;
+                  const rect = element.getBoundingClientRect();
+                  nodes.push({
+                    selectorPath: [...shadowPath, selectorFor(element, root)],
+                    nodeKey: nodeKey(element),
+                    tagName: element.localName,
+                    role: roleFor(element),
+                    name: String(element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("placeholder") || element.getAttribute("data-color") || "").slice(0, 2048),
+                    href: element.href || null,
+                    formAction: element.getAttribute("formaction") || element.form?.getAttribute("action") || null,
+                    formMethod: (element.getAttribute("formmethod") || element.form?.getAttribute("method") || "get").toLowerCase(),
+                    inputType: element.getAttribute("type")?.toLowerCase() || null,
+                    editable: Boolean(element.isContentEditable || (["input", "textarea", "select"].includes(element.localName) && !element.readOnly)),
+                    bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+                  });
+                }
+                for (const host of root.querySelectorAll("*")) {
+                  if (nodes.length >= max) break;
+                  if (host.shadowRoot) walk(host.shadowRoot, [...shadowPath, selectorFor(host, root)]);
+                }
+              };
+              walk(document, []);
+              return { text: document.body ? document.body.innerText : "", nodes };
+            }"""
+        )
+
     def _snapshot(self) -> dict[str, Any]:
+        page = self._page()
+        target_ref = self.page_refs.setdefault(page, str(uuid.uuid4()))
+        raw_nodes: list[dict[str, Any]] = []
+        frames: list[dict[str, Any]] = []
+        texts: list[str] = []
+        for frame in page.frames:
+            frame_ref = self.frame_refs.setdefault(frame, str(uuid.uuid4()))
+            parent_ref = self.frame_refs.setdefault(frame.parent_frame, str(uuid.uuid4())) if frame.parent_frame else None
+            try:
+                result = self._frame_snapshot(frame)
+            except PlaywrightError:
+                if frame == page.main_frame:
+                    raise
+                continue
+            frames.append(
+                {
+                    "frameRef": frame_ref,
+                    "targetRef": target_ref,
+                    "parentFrameRef": parent_ref,
+                    "url": frame.url,
+                    "name": frame.name,
+                }
+            )
+            if result.get("text"):
+                texts.append(str(result["text"]))
+            for node in result.get("nodes") or []:
+                if len(raw_nodes) >= 200:
+                    break
+                raw_nodes.append(
+                    {
+                        **node,
+                        "targetRef": target_ref,
+                        "frameRef": frame_ref,
+                        "_frame": frame,
+                    }
+                )
+
+        targets = []
+        for candidate, candidate_ref in list(self.page_refs.items()):
+            if candidate.is_closed():
+                continue
+            opener = self.page_openers.get(candidate)
+            targets.append(
+                {
+                    "targetRef": candidate_ref,
+                    "url": candidate.url,
+                    "title": candidate.title(),
+                    "active": candidate == page,
+                    "opener": self.page_refs.get(opener) if opener else None,
+                }
+            )
+
+        accessibility_tree: list[dict[str, Any]] = []
+        cdp = None
+        try:
+            if self.context:
+                cdp = self.context.new_cdp_session(page)
+                result = cdp.send("Accessibility.getFullAXTree", {"depth": 32})
+                root_frame_ref = self.frame_refs.get(page.main_frame)
+                for node in (result.get("nodes") or [])[:1000]:
+                    value_of = lambda field: str((field or {}).get("value", ""))
+                    accessibility_tree.append(
+                        {
+                            "axNodeId": str(node.get("nodeId", "")),
+                            "parentAxNodeId": str(node["parentId"]) if node.get("parentId") else None,
+                            "role": value_of(node.get("role")),
+                            "name": value_of(node.get("name")),
+                            "value": value_of(node.get("value")) or None,
+                            "description": value_of(node.get("description")) or None,
+                            "ignored": bool(node.get("ignored")),
+                            "targetRef": target_ref,
+                            "frameRef": root_frame_ref,
+                            "nodeRef": None,
+                        }
+                    )
+        except PlaywrightError:
+            accessibility_tree = []
+        finally:
+            if cdp:
+                cdp.detach()
+
+        text, text_truncated = truncate_text("\n".join(texts))
+        return {
+            "url": page.url,
+            "title": page.title(),
+            "text": text,
+            "textTruncated": text_truncated,
+            "nodes": raw_nodes,
+            "targets": targets,
+            "frames": frames,
+            "accessibilityTree": accessibility_tree,
+        }
+
+    def _legacy_snapshot(self) -> dict[str, Any]:
         page = self._page()
         result = page.evaluate(
             """() => {
@@ -236,6 +525,8 @@ class MiniwobBroker:
             "name": str(raw.get("name") or ""),
             "tagName": str(raw.get("tagName") or ""),
             "bounds": raw.get("bounds") or {"x": 0, "y": 0, "width": 0, "height": 0},
+            "targetRef": raw.get("targetRef"),
+            "frameRef": raw.get("frameRef"),
             "href": raw.get("href"),
             "formAction": raw.get("formAction"),
             "formMethod": raw.get("formMethod"),
@@ -247,7 +538,7 @@ class MiniwobBroker:
 
     @staticmethod
     def _matches(expected: dict[str, Any], current: dict[str, Any]) -> bool:
-        fields = ("role", "name", "tagName", "href", "formAction", "formMethod", "inputType", "editable")
+        fields = ("role", "name", "tagName", "targetRef", "frameRef", "href", "formAction", "formMethod", "inputType", "editable")
         if any(expected.get(field) != current.get(field) for field in fields):
             return False
         expected_bounds = expected.get("bounds") or {}
@@ -274,10 +565,18 @@ class MiniwobBroker:
             node_ref = str(uuid.uuid4())
             node = self._node(raw, node_ref)
             nodes.append(node)
-            bindings[node_ref] = {"node": node, "selector": raw["selector"]}
+            bindings[node_ref] = {
+                "node": node,
+                "targetRef": raw["targetRef"],
+                "frameRef": raw["frameRef"],
+                "frame": raw["_frame"],
+                "selectorPath": raw["selectorPath"],
+                "nodeKey": raw["nodeKey"],
+            }
         self.observations[observation_id] = {
             "captured": time.monotonic(),
             "url": snapshot["url"],
+            "targetRef": self.page_refs.get(self._page()),
             "nodes": bindings,
         }
         self._prune_observations()
@@ -294,8 +593,17 @@ class MiniwobBroker:
             "text": snapshot["text"],
             "textTruncated": snapshot["textTruncated"],
             "nodes": nodes,
+            "targets": snapshot.get("targets") or [],
+            "frames": snapshot.get("frames") or [],
+            "accessibilityTree": snapshot.get("accessibilityTree") or [],
+            "dialogs": self._drain_dialogs(),
             "screenshot": screenshot,
         }
+
+    def _drain_dialogs(self) -> list[dict[str, Any]]:
+        dialogs = self.dialogs
+        self.dialogs = []
+        return dialogs
 
     def _observed_node(self, request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         observation_id = request.get("observationId")
@@ -314,10 +622,23 @@ class MiniwobBroker:
     def perform(self, request: dict[str, Any]) -> dict[str, Any]:
         observation, binding = self._observed_node(request)
         page = self._page()
+        if self.page_refs.get(page) != observation.get("targetRef"):
+            raise BrokerError("stale_observation", "The active browser target changed after the observation.", HTTPStatus.CONFLICT)
         if page.url != observation["url"]:
             raise BrokerError("stale_observation", "The page URL changed after the observation.", HTTPStatus.CONFLICT)
-        snapshot = self._snapshot()
-        current_raw = next((node for node in snapshot["nodes"] if node.get("selector") == binding["selector"]), None)
+        before = self._snapshot()
+        current_raw = next(
+            (
+                node
+                for node in before["nodes"]
+                if node.get("targetRef") == binding["targetRef"]
+                and node.get("frameRef") == binding["frameRef"]
+                and node.get("_frame") == binding["frame"]
+                and node.get("selectorPath") == binding["selectorPath"]
+                and node.get("nodeKey") == binding["nodeKey"]
+            ),
+            None,
+        )
         if current_raw is None:
             raise BrokerError("stale_observation", "The observed element no longer exists.", HTTPStatus.CONFLICT)
         current = self._node(current_raw, binding["node"]["nodeRef"])
@@ -325,7 +646,13 @@ class MiniwobBroker:
             raise BrokerError("stale_observation", "The observed element changed or moved.", HTTPStatus.CONFLICT)
 
         operation = request.get("operation")
-        locator = page.locator(binding["selector"]).first
+        frame = binding["frame"]
+        selector_path = binding["selectorPath"]
+        if not selector_path:
+            raise BrokerError("stale_observation", "The observed element has no locator.", HTTPStatus.CONFLICT)
+        locator = frame.locator(selector_path[0]).first
+        for selector in selector_path[1:]:
+            locator = locator.locator(selector).first
         try:
             if operation == "click":
                 locator.click(timeout=MAX_WAIT_MS)
@@ -340,20 +667,49 @@ class MiniwobBroker:
                 else:
                     locator.click(timeout=MAX_WAIT_MS)
                     locator.press_sequentially(text, timeout=MAX_WAIT_MS)
+            elif operation == "select":
+                value = request.get("value")
+                if not isinstance(value, str) or not value:
+                    raise BrokerError("invalid_value", "value must be a non-empty string.")
+                try:
+                    locator.select_option(value=value, timeout=MAX_WAIT_MS)
+                except PlaywrightError:
+                    locator.select_option(label=value, timeout=MAX_WAIT_MS)
+            elif operation == "hover":
+                locator.hover(timeout=MAX_WAIT_MS)
+            elif operation == "scroll":
+                delta_x = float(request.get("deltaX", 0))
+                delta_y = float(request.get("deltaY", 0))
+                if not (-10_000 <= delta_x <= 10_000 and -10_000 <= delta_y <= 10_000):
+                    raise BrokerError("invalid_scroll", "Scroll deltas must be between -10000 and 10000.")
+                locator.scroll_into_view_if_needed(timeout=MAX_WAIT_MS)
+                locator.hover(timeout=MAX_WAIT_MS)
+                page.mouse.wheel(delta_x, delta_y)
             else:
-                raise BrokerError("invalid_action", "operation must be click or type.")
+                raise BrokerError("invalid_action", "operation must be click, type, select, hover, or scroll.")
         except BrokerError:
             raise
         except PlaywrightError as error:
             raise BrokerError("browser_action_failed", str(error), HTTPStatus.CONFLICT) from error
+
+        after = self._snapshot()
+        url_changed = before["url"] != after["url"]
+        title_changed = before["title"] != after["title"]
+        text_changed = before["text"] != after["text"]
 
         return {
             "observationId": request["observationId"],
             "nodeRef": request["nodeRef"],
             "action": operation,
             "target": current,
-            "url": page.url,
-            "title": page.title(),
+            "url": self._page().url,
+            "title": self._page().title(),
+            "verification": {
+                "pageChanged": url_changed or title_changed or text_changed,
+                "urlChanged": url_changed,
+                "titleChanged": title_changed,
+                "textChanged": text_changed,
+            },
         }
 
     def navigate(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -404,10 +760,31 @@ class MiniwobBroker:
             raise BrokerError("screenshot_too_large", "Screenshot exceeds the 8 MiB limit.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         return browser_output(self._page(), "screenshot", [{"type": "image", "mime_type": "image/png", "bytes": list(image)}])
 
+    def switch_target(self, request: dict[str, Any]) -> dict[str, Any]:
+        target_ref = request.get("targetRef")
+        if not isinstance(target_ref, str) or not target_ref:
+            raise BrokerError("invalid_target", "targetRef is required.")
+        target = next(
+            (page for page, reference in self.page_refs.items() if reference == target_ref and not page.is_closed()),
+            None,
+        )
+        if target is None:
+            raise BrokerError("target_not_found", "The browser target is no longer available.", HTTPStatus.NOT_FOUND)
+        self.page = target
+        target.bring_to_front()
+        self.observations.clear()
+        return browser_output(
+            target,
+            "switch_target",
+            [{"type": "json", "value": {"url": target.url, "title": target.title()}}],
+            targetRef=target_ref,
+        )
+
     def result(self) -> dict[str, Any]:
         if self.task is None:
             return {"status": "not_started"}
-        reward, done, _message, info = self.task.validate(self._page(), [])
+        validation_page = self.task_page or self._page()
+        reward, done, _message, info = self.task.validate(validation_page, [])
         return {
             "benchmark": "BrowserGym MiniWoB++",
             "browsergymTask": self.task_id,
@@ -425,9 +802,13 @@ class MiniwobBroker:
             raise BrokerError("invalid_action", "action must be a string.")
         if action == "observe":
             return self.observe(bool(request.get("includeScreenshot")))
+        if action == "grant_network_access":
+            return self.grant_network_access(request)
         if action == "observation_node":
             _observation, binding = self._observed_node(request)
             return binding["node"]
+        if action == "switch_target":
+            return self.switch_target(request)
         if action == "perform":
             return self.perform(request)
         if action == "navigate":

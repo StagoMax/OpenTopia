@@ -587,10 +587,6 @@ impl PolicyEngine for BasicPolicyEngine {
                 reason: "Network host cannot be empty.".to_string(),
             };
         }
-        if host.eq_ignore_ascii_case("browser-interaction") && self.mode != PermissionMode::Chat {
-            return PolicyDecision::Allow;
-        }
-
         if self
             .config
             .network
@@ -679,6 +675,10 @@ mod tests {
         ));
         assert!(matches!(
             user.inspect_network("example.com"),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            auto.inspect_network("browser-interaction"),
             PolicyDecision::Ask { .. }
         ));
     }

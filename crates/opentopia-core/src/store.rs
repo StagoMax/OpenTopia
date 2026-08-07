@@ -84,6 +84,12 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         experience_mode: ExperienceMode,
     ) -> anyhow::Result<Thread>;
     fn get_thread(&self, id: Uuid) -> anyhow::Result<Option<Thread>>;
+    fn effective_plugin_settings(
+        &self,
+        plugin_id: &str,
+        workspace_root: &Path,
+        thread_id: Uuid,
+    ) -> anyhow::Result<Value>;
     fn list_threads(&self) -> anyhow::Result<Vec<Thread>>;
     fn list_threads_including_archived(
         &self,
@@ -2272,6 +2278,15 @@ impl SqliteSessionStore {
 }
 
 impl SessionStore for SqliteSessionStore {
+    fn effective_plugin_settings(
+        &self,
+        plugin_id: &str,
+        workspace_root: &Path,
+        thread_id: Uuid,
+    ) -> anyhow::Result<Value> {
+        SqliteSessionStore::effective_plugin_settings(self, plugin_id, workspace_root, thread_id)
+    }
+
     fn get_published_agent_template_version(
         &self,
         template_id: &str,

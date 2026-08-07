@@ -10,6 +10,7 @@
         "type": "string",
         "minLength": 1
       },
+      "maxItems": 256,
       "uniqueItems": true,
       "default": [],
       "description": "Domains the user has chosen to make available to browser automation. Host policy remains authoritative."

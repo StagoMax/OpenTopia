@@ -5,9 +5,9 @@ use crate::background::{
 };
 use crate::browser::{
     BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
-    BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
-    BrowserObserveOptions, BrowserRuntime, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
-    BrowserWaitRequest,
+    BrowserNavigateRequest, BrowserNetworkGrant, BrowserNodeRef, BrowserObservation,
+    BrowserObservationId, BrowserObserveOptions, BrowserRuntime, BrowserSelector, BrowserSessionId,
+    BrowserWaitCondition, BrowserWaitRequest,
 };
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{
@@ -2808,6 +2808,10 @@ enum BrowserActionInput {
     Screenshot,
     Click,
     Type,
+    Select,
+    Hover,
+    Scroll,
+    SwitchTarget,
     Wait,
     Download,
     Close,
@@ -2821,6 +2825,10 @@ impl BrowserActionInput {
             Self::Screenshot => "screenshot",
             Self::Click => "click",
             Self::Type => "type",
+            Self::Select => "select",
+            Self::Hover => "hover",
+            Self::Scroll => "scroll",
+            Self::SwitchTarget => "switch_target",
             Self::Wait => "wait",
             Self::Download => "download",
             Self::Close => "close",
@@ -2852,10 +2860,10 @@ struct BrowserInput {
     /// CSS selector for a non-mutating wait condition only.
     #[serde(default)]
     selector: Option<String>,
-    /// Required for click and type; returned by observe.
+    /// Required for click, type, select, hover, and scroll; returned by observe.
     #[serde(default)]
     observation_id: Option<String>,
-    /// Required for click and type; returned by observe.
+    /// Required for click, type, select, hover, and scroll; returned by observe.
     #[serde(default)]
     node_ref: Option<String>,
     /// Include a screenshot in observe; defaults to false.
@@ -2864,9 +2872,23 @@ struct BrowserInput {
     /// Text for type or a wait text condition.
     #[serde(default)]
     text: Option<String>,
+    /// Option value or visible label for select.
+    #[serde(default)]
+    value: Option<String>,
     /// Clear an input before typing; defaults to true.
     #[serde(default = "default_true")]
     clear_first: bool,
+    /// Horizontal scroll delta, bounded to one practical interaction.
+    #[serde(default)]
+    #[schemars(range(min = -10000.0, max = 10000.0))]
+    delta_x: f64,
+    /// Vertical scroll delta, bounded to one practical interaction.
+    #[serde(default)]
+    #[schemars(range(min = -10000.0, max = 10000.0))]
+    delta_y: f64,
+    /// Target reference returned by observe; required for switch_target.
+    #[serde(default)]
+    target_ref: Option<String>,
     /// Wait condition; defaults to document_complete.
     #[serde(default)]
     condition: BrowserWaitConditionInput,
@@ -2921,7 +2943,7 @@ impl TypedTool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Use the shared local browser. Observe before every click or type, then use the returned observationId and nodeRef. The runtime rejects stale observations; if it reports stale_observation, discard the old node reference and call observe again before retrying. Navigate and follow ordinary links normally. When a page requires a login, verification, upload, payment, publication, or irreversible submission, stop controlling the page and tell the user to complete it in the visible browser. After the user says to continue, observe the page again before interacting."
+        "Use the shared local browser. Observe before every click, type, select, hover, or scroll, then use the returned observationId and nodeRef. Observations include owned tabs/popups, frames, and a bounded accessibility tree. Use switch_target with a returned targetRef to change tabs. The runtime rejects stale observations; if it reports stale_observation, discard the old node reference and observe again. When a page requires a login, verification, upload, payment, publication, or irreversible submission, stop controlling the page and tell the user to complete it in the visible browser."
     }
 
     async fn execute_typed(
@@ -2944,6 +2966,8 @@ impl TypedTool for BrowserTool {
         let output = match input.action {
             BrowserActionInput::Navigate => {
                 let url = required_typed_string(input.url.as_deref(), "url")?;
+                let host = inspect_browser_destination(&ctx, &url)?;
+                grant_browser_network_access(&ctx, &runtime, session, [host]).await?;
                 let mut request = BrowserNavigateRequest::new(url);
                 if let Some(wait) = request.wait.as_mut() {
                     wait.timeout = timeout;
@@ -2951,6 +2975,8 @@ impl TypedTool for BrowserTool {
                 runtime.navigate(session, request).await?
             }
             BrowserActionInput::Observe => {
+                grant_browser_network_access(&ctx, &runtime, session, std::iter::empty::<String>())
+                    .await?;
                 let observation = runtime
                     .observe(
                         session,
@@ -2966,9 +2992,12 @@ impl TypedTool for BrowserTool {
                     None,
                 ));
             }
-            BrowserActionInput::Screenshot => runtime.screenshot(session).await?,
+            BrowserActionInput::Screenshot => {
+                grant_browser_network_access(&ctx, &runtime, session, std::iter::empty::<String>())
+                    .await?;
+                runtime.screenshot(session).await?
+            }
             BrowserActionInput::Click => {
-                inspect_browser_interaction(&ctx)?;
                 let observation_id = browser_observation_id(input.observation_id.as_deref())?;
                 let node_ref = browser_node_ref(input.node_ref.as_deref())?;
                 let target = runtime
@@ -2979,6 +3008,8 @@ impl TypedTool for BrowserTool {
                 {
                     return Err(handoff.into());
                 }
+                let hosts = inspect_browser_node_destinations(&ctx, &target)?;
+                grant_browser_network_access(&ctx, &runtime, session, hosts).await?;
                 let receipt = runtime
                     .perform(session, observation_id, node_ref, BrowserAction::Click)
                     .await?;
@@ -2993,7 +3024,6 @@ impl TypedTool for BrowserTool {
                 ));
             }
             BrowserActionInput::Type => {
-                inspect_browser_interaction(&ctx)?;
                 let observation_id = browser_observation_id(input.observation_id.as_deref())?;
                 let node_ref = browser_node_ref(input.node_ref.as_deref())?;
                 let target = runtime
@@ -3002,6 +3032,8 @@ impl TypedTool for BrowserTool {
                 if let Some(handoff) = browser_handoff_for_node(&action, &target, None) {
                     return Err(handoff.into());
                 }
+                grant_browser_network_access(&ctx, &runtime, session, std::iter::empty::<String>())
+                    .await?;
                 let receipt = runtime
                     .perform(
                         session,
@@ -3023,7 +3055,92 @@ impl TypedTool for BrowserTool {
                     Some(receipt),
                 ));
             }
+            BrowserActionInput::Select => {
+                let observation_id = browser_observation_id(input.observation_id.as_deref())?;
+                let node_ref = browser_node_ref(input.node_ref.as_deref())?;
+                let target = runtime
+                    .observation_node(session, observation_id, node_ref)
+                    .await?;
+                if let Some(handoff) = browser_handoff_for_node(&action, &target, None) {
+                    return Err(handoff.into());
+                }
+                grant_browser_network_access(&ctx, &runtime, session, std::iter::empty::<String>())
+                    .await?;
+                let receipt = runtime
+                    .perform(
+                        session,
+                        observation_id,
+                        node_ref,
+                        BrowserAction::Select {
+                            value: required_typed_string(input.value.as_deref(), "value")?,
+                        },
+                    )
+                    .await?;
+                let observation = runtime
+                    .observe(session, BrowserObserveOptions::default())
+                    .await?;
+                return Ok(browser_observation_to_tool_result(
+                    call_id,
+                    action,
+                    observation,
+                    Some(receipt),
+                ));
+            }
+            BrowserActionInput::Hover | BrowserActionInput::Scroll => {
+                let observation_id = browser_observation_id(input.observation_id.as_deref())?;
+                let node_ref = browser_node_ref(input.node_ref.as_deref())?;
+                grant_browser_network_access(&ctx, &runtime, session, std::iter::empty::<String>())
+                    .await?;
+                if !input.delta_x.is_finite()
+                    || !input.delta_y.is_finite()
+                    || input.delta_x.abs() > 10_000.0
+                    || input.delta_y.abs() > 10_000.0
+                {
+                    anyhow::bail!("scroll deltas must be finite values between -10000 and 10000");
+                }
+                let browser_action = if matches!(input.action, BrowserActionInput::Hover) {
+                    BrowserAction::Hover
+                } else {
+                    BrowserAction::Scroll {
+                        delta_x: input.delta_x,
+                        delta_y: input.delta_y,
+                    }
+                };
+                let receipt = runtime
+                    .perform(session, observation_id, node_ref, browser_action)
+                    .await?;
+                let observation = runtime
+                    .observe(session, BrowserObserveOptions::default())
+                    .await?;
+                return Ok(browser_observation_to_tool_result(
+                    call_id,
+                    action,
+                    observation,
+                    Some(receipt),
+                ));
+            }
+            BrowserActionInput::SwitchTarget => {
+                let target_ref = serde_json::from_value(Value::String(required_typed_string(
+                    input.target_ref.as_deref(),
+                    "targetRef",
+                )?))
+                .context("targetRef must be a browser target reference")?;
+                grant_browser_network_access(&ctx, &runtime, session, std::iter::empty::<String>())
+                    .await?;
+                runtime.switch_target(session, target_ref).await?;
+                let observation = runtime
+                    .observe(session, BrowserObserveOptions::default())
+                    .await?;
+                return Ok(browser_observation_to_tool_result(
+                    call_id,
+                    action,
+                    observation,
+                    None,
+                ));
+            }
             BrowserActionInput::Wait => {
+                grant_browser_network_access(&ctx, &runtime, session, std::iter::empty::<String>())
+                    .await?;
                 let condition = match input.condition {
                     BrowserWaitConditionInput::DocumentComplete => {
                         BrowserWaitCondition::DocumentComplete
@@ -3050,6 +3167,8 @@ impl TypedTool for BrowserTool {
             }
             BrowserActionInput::Download => {
                 let url = required_typed_string(input.url.as_deref(), "url")?;
+                let host = inspect_browser_destination(&ctx, &url)?;
+                grant_browser_network_access(&ctx, &runtime, session, [host]).await?;
                 runtime
                     .download(
                         session,
@@ -3062,7 +3181,6 @@ impl TypedTool for BrowserTool {
                     .await?
             }
             BrowserActionInput::Close => {
-                inspect_browser_interaction(&ctx)?;
                 runtime.close_session(session).await?;
                 return Ok(ToolResult::text(
                     call_id,
@@ -3421,11 +3539,93 @@ fn computer_tool_result(
     }
 }
 
-fn inspect_browser_interaction(ctx: &ToolContext) -> anyhow::Result<()> {
-    enforce_policy_decision(
-        ctx.policy.inspect_network("browser-interaction"),
-        ctx.approval_granted,
-    )
+fn inspect_browser_destination(ctx: &ToolContext, raw_url: &str) -> anyhow::Result<String> {
+    let host = browser_destination_host(raw_url)?;
+    enforce_policy_decision(ctx.policy.inspect_network(&host), ctx.approval_granted)?;
+    Ok(host)
+}
+
+fn inspect_browser_node_destinations(
+    ctx: &ToolContext,
+    node: &crate::browser::BrowserNode,
+) -> anyhow::Result<Vec<String>> {
+    let mut inspected = HashSet::new();
+    for destination in [node.href.as_deref(), node.form_action.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let host = browser_destination_host(destination)?;
+        if inspected.insert(host.clone()) {
+            enforce_policy_decision(ctx.policy.inspect_network(&host), ctx.approval_granted)?;
+        }
+    }
+    Ok(inspected.into_iter().collect())
+}
+
+async fn grant_browser_network_access<I>(
+    ctx: &ToolContext,
+    runtime: &Arc<dyn BrowserRuntime>,
+    session: BrowserSessionId,
+    explicit_hosts: I,
+) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut hosts = configured_browser_hosts(ctx)?;
+    hosts.extend(explicit_hosts);
+    runtime
+        .grant_network_access(session, BrowserNetworkGrant::new(hosts)?)
+        .await?;
+    Ok(())
+}
+
+fn configured_browser_hosts(ctx: &ToolContext) -> anyhow::Result<HashSet<String>> {
+    let (Some(store), Some(thread_id)) = (ctx.store.as_ref(), ctx.thread_id) else {
+        return Ok(HashSet::new());
+    };
+    let settings =
+        store.effective_plugin_settings("browser-automation", &ctx.workspace_root, thread_id)?;
+    let Some(domains) = settings.get("allowedDomains") else {
+        return Ok(HashSet::new());
+    };
+    let domains = domains
+        .as_array()
+        .context("browser-automation allowedDomains must be an array")?;
+    let mut hosts = HashSet::new();
+    for domain in domains {
+        let domain = domain
+            .as_str()
+            .context("browser-automation allowedDomains entries must be strings")?;
+        let grant = BrowserNetworkGrant::new([domain]).with_context(|| {
+            format!("invalid browser-automation allowedDomains entry `{domain}`")
+        })?;
+        for host in grant.allowed_hosts {
+            if !matches!(
+                ctx.policy.inspect_network(&host),
+                PolicyDecision::Deny { .. }
+            ) {
+                hosts.insert(host);
+            }
+        }
+    }
+    Ok(hosts)
+}
+
+fn browser_destination_host(raw_url: &str) -> anyhow::Result<String> {
+    let url =
+        reqwest::Url::parse(raw_url).context("browser destination must be an absolute URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "browser destination uses a blocked URL scheme: {}",
+            url.scheme()
+        );
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("browser destination must not contain embedded credentials");
+    }
+    url.host_str()
+        .map(str::to_ascii_lowercase)
+        .context("browser destination must contain a host")
 }
 
 fn browser_output_to_tool_result(
@@ -6237,14 +6437,32 @@ impl TypedTool for GitDiffTool {
         _input: Self::Input,
         ctx: ToolContext,
     ) -> anyhow::Result<ToolResult> {
+        let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let output = ctx
             .environment
             .exec(
-                ExecRequest::new("git").args(["diff", "--"]),
+                ExecRequest::new("git")
+                    .args([
+                        "--no-pager".to_string(),
+                        "-c".to_string(),
+                        format!("core.hooksPath={null_device}"),
+                        "-c".to_string(),
+                        "core.fsmonitor=false".to_string(),
+                        "diff".to_string(),
+                        "--no-ext-diff".to_string(),
+                        "--no-color".to_string(),
+                        "--".to_string(),
+                    ])
+                    .envs([
+                        ("GIT_OPTIONAL_LOCKS", "0"),
+                        ("GIT_TERMINAL_PROMPT", "0"),
+                        ("GCM_INTERACTIVE", "Never"),
+                        ("GIT_PAGER", "cat"),
+                    ]),
                 ctx.execution_context(Duration::from_secs(20)),
             )
             .await
-            .context("git diff failed")?;
+            .map_err(|error| anyhow::anyhow!("git diff execution failed: {error:#}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let text = if stdout.trim().is_empty() {
@@ -8790,6 +9008,44 @@ mod tests {
     }
 
     #[test]
+    fn browser_destinations_are_reduced_to_canonical_policy_hosts() {
+        assert_eq!(
+            browser_destination_host("https://EXAMPLE.com:8443/path?q=1#section").unwrap(),
+            "example.com"
+        );
+        assert!(browser_destination_host("javascript:alert(1)").is_err());
+        assert!(browser_destination_host("https://user:secret@example.com/").is_err());
+        assert!(browser_destination_host("/relative/path").is_err());
+    }
+
+    #[test]
+    fn browser_allowed_domains_feed_the_session_network_grant() {
+        let workspace =
+            std::env::temp_dir().join(format!("opentopia-browser-grant-{}", Uuid::new_v4()));
+        let thread_id = Uuid::new_v4();
+        let store = Arc::new(crate::store::SqliteSessionStore::open(":memory:").unwrap());
+        store
+            .put_plugin_settings(
+                "browser-automation",
+                &crate::plugin_control::PluginControlScope::thread(thread_id),
+                &json!({ "allowedDomains": ["STATIC.Example.COM."] }),
+            )
+            .unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace.clone(),
+            PermissionMode::Auto,
+        ));
+        let mut context = ToolContext::local(workspace, policy);
+        context.store = Some(store);
+        context.thread_id = Some(thread_id);
+
+        assert_eq!(
+            configured_browser_hosts(&context).unwrap(),
+            HashSet::from(["static.example.com".to_string()])
+        );
+    }
+
+    #[test]
     fn preserves_typed_mcp_content_and_structured_content() {
         let parts = mcp_content_parts(
             &[
@@ -9624,6 +9880,91 @@ mod tests {
         assert!(!policy.read_only);
         assert!(!policy.parallel_safe);
         assert_eq!(policy.side_effect, ToolSideEffect::Process);
+    }
+
+    #[tokio::test]
+    async fn git_diff_returns_worktree_changes_through_the_execution_environment() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-git-diff-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace_root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        fs::write(workspace_root.join("sample.txt"), "before\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "--", "sample.txt"])
+            .current_dir(&workspace_root)
+            .status()
+            .unwrap();
+        assert!(add.success());
+        fs::write(workspace_root.join("sample.txt"), "after\n").unwrap();
+
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+        let result = GitDiffTool
+            .execute(ToolCall::new("git_diff", json!({})), context)
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["success"], true);
+        assert!(result.output.contains("-before"));
+        assert!(result.output.contains("+after"));
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_patch_process_uses_backend_compatible_workspace_intent() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-git-apply-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace_root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        fs::write(workspace_root.join("sample.txt"), "before\n").unwrap();
+
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+        let result = ApplyPatchTool
+            .execute(
+                ToolCall::new(
+                    "apply_patch",
+                    json!({
+                        "patch": "--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-before\n+after\n"
+                    }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["success"], true);
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("sample.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "after\n"
+        );
+        fs::remove_dir_all(workspace_root).unwrap();
     }
 
     #[test]

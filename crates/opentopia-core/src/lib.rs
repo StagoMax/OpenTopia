@@ -57,12 +57,13 @@ pub use background::{
     BackgroundRegistryConfig, BackgroundScope, BackgroundSpawnRequest,
 };
 pub use browser::{
-    BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownload, BrowserDownloadRequest,
-    BrowserError, BrowserNavigateRequest, BrowserNavigation, BrowserNode, BrowserNodeRef,
-    BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserRect,
-    BrowserRuntime, BrowserRuntimeConfig, BrowserScreenshot, BrowserSelector, BrowserSessionId,
-    BrowserSnapshot, BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest,
-    LocalBrowserRuntime,
+    BrowserAccessibilityNode, BrowserAction, BrowserActionReceipt, BrowserActionVerification,
+    BrowserContent, BrowserDialog, BrowserDownload, BrowserDownloadRequest, BrowserError,
+    BrowserFrame, BrowserFrameRef, BrowserNavigateRequest, BrowserNavigation, BrowserNetworkGrant,
+    BrowserNode, BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions,
+    BrowserOutput, BrowserRect, BrowserRuntime, BrowserRuntimeConfig, BrowserScreenshot,
+    BrowserSelector, BrowserSessionId, BrowserSnapshot, BrowserTarget, BrowserTargetRef,
+    BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, LocalBrowserRuntime,
 };
 pub use bundled_plugins::{
     bundled_plugin_catalog, bundled_plugin_metadata, ensure_bundled_plugins_installed,

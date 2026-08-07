@@ -25,28 +25,28 @@ use opentopia_core::{
     ArtifactMetadata, BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction,
     BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
     BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
-    BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserWaitCondition,
-    BrowserWaitRequest, ChangedFile, CodexAccountManager, CodexAccountStatus, CodexLoginStart,
-    CollaborationMode, CompiledModelContext, ComputerRuntime, ComputerRuntimeConfig,
-    ComputerSessionId, ContextCacheScope, ContextCheckpoint, ContextCheckpointArtifact,
-    ContextCheckpointCommand, ContextCheckpointCoverage, ContextCheckpointFact,
-    ContextCheckpointInteraction, ContextCheckpointMode, ContextCheckpointStep,
-    ContextCheckpointWorkspace, ContextCompactionDetails, ContextCompactionMetrics,
-    ContextFactStatus, ContextItemKind, ContextProjection, ContextRole, ContextSensitivity,
-    ContextSourcePolicy, ContextSourceRef, ContextSummary, ContributionKind, DesktopBrowserRuntime,
-    ExecutionContext, ExperienceMode, ExperienceSurfaceProfile, GitWorkflowAction,
-    GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill, LocalBrowserRuntime,
-    LocalComputerRuntime, LocalExecutionEnvironment, LocalSandboxConfig, McpCallResult,
-    McpServerConfig, McpServerStatus, McpToolDescriptor, MediaHandlerSelection, Message,
-    MessagePart, MessageRole, ModelContentPart, ModelContextItem, ModelConversationMessage,
-    ModelConversationRole, ModelRequest, ObserveOptions, OpenAiCompatibleProvider, OpenAiProtocol,
-    PermissionMode, PluginControlScope, PluginDescriptor, PluginError, PolicyDecision,
-    PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest,
-    PreviewTarget, PreviewWorkbook, ProviderConversationCursor, ProviderConversationState,
-    ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck,
-    ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview, ResourceLimit,
-    RuntimeSurface, SandboxDescriptor, SandboxMode, SandboxSettings, SearchTool, SessionStore,
-    SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
+    BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserTargetRef,
+    BrowserWaitCondition, BrowserWaitRequest, ChangedFile, CodexAccountManager, CodexAccountStatus,
+    CodexLoginStart, CollaborationMode, CompiledModelContext, ComputerRuntime,
+    ComputerRuntimeConfig, ComputerSessionId, ContextCacheScope, ContextCheckpoint,
+    ContextCheckpointArtifact, ContextCheckpointCommand, ContextCheckpointCoverage,
+    ContextCheckpointFact, ContextCheckpointInteraction, ContextCheckpointMode,
+    ContextCheckpointStep, ContextCheckpointWorkspace, ContextCompactionDetails,
+    ContextCompactionMetrics, ContextFactStatus, ContextItemKind, ContextProjection, ContextRole,
+    ContextSensitivity, ContextSourcePolicy, ContextSourceRef, ContextSummary, ContributionKind,
+    DesktopBrowserRuntime, ExecutionContext, ExperienceMode, ExperienceSurfaceProfile,
+    GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill,
+    LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment, LocalSandboxConfig,
+    McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor, MediaHandlerSelection,
+    Message, MessagePart, MessageRole, ModelContentPart, ModelContextItem,
+    ModelConversationMessage, ModelConversationRole, ModelRequest, ObserveOptions,
+    OpenAiCompatibleProvider, OpenAiProtocol, PermissionMode, PluginControlScope, PluginDescriptor,
+    PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind,
+    PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderConversationCursor,
+    ProviderConversationState, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth,
+    ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview,
+    ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxMode, SandboxSettings, SearchTool,
+    SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
     SubagentExecutionContract, SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler,
     SubagentSchedulerConfig, SubagentScope, SubagentWorkspaceMode, TaskPlan,
     TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer,
@@ -4463,6 +4463,83 @@ async fn run_browser_command(
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
             return Ok(Json(browser_observation_output(observation, Some(receipt))));
         }
+        "select" => {
+            let observation_id = browser_observation_required(request.observation_id)?;
+            let node_ref = browser_node_required(request.node_ref)?;
+            let target = state
+                .browser
+                .observation_node(session, observation_id, node_ref)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            if let Some(handoff) = browser_handoff_for_node("select", &target, None) {
+                return Err(ApiError::conflict(handoff.reason));
+            }
+            let receipt = state
+                .browser
+                .perform(
+                    session,
+                    observation_id,
+                    node_ref,
+                    BrowserAction::Select {
+                        value: browser_required(&request.value, "value")?.to_string(),
+                    },
+                )
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            let observation = state
+                .browser
+                .observe(session, BrowserObserveOptions::default())
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            return Ok(Json(browser_observation_output(observation, Some(receipt))));
+        }
+        "hover" | "scroll" => {
+            let observation_id = browser_observation_required(request.observation_id)?;
+            let node_ref = browser_node_required(request.node_ref)?;
+            let delta_x = request.delta_x.unwrap_or(0.0);
+            let delta_y = request.delta_y.unwrap_or(0.0);
+            if !delta_x.is_finite()
+                || !delta_y.is_finite()
+                || delta_x.abs() > 10_000.0
+                || delta_y.abs() > 10_000.0
+            {
+                return Err(ApiError::bad_request(
+                    "browser scroll deltas must be finite values between -10000 and 10000",
+                ));
+            }
+            let action = if request.action == "hover" {
+                BrowserAction::Hover
+            } else {
+                BrowserAction::Scroll { delta_x, delta_y }
+            };
+            let receipt = state
+                .browser
+                .perform(session, observation_id, node_ref, action)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            let observation = state
+                .browser
+                .observe(session, BrowserObserveOptions::default())
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            return Ok(Json(browser_observation_output(observation, Some(receipt))));
+        }
+        "switch_target" => {
+            let target_ref = request
+                .target_ref
+                .ok_or_else(|| ApiError::bad_request("browser targetRef is required"))?;
+            state
+                .browser
+                .switch_target(session, target_ref)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            let observation = state
+                .browser
+                .observe(session, BrowserObserveOptions::default())
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            return Ok(Json(browser_observation_output(observation, None)));
+        }
         "wait" => {
             let condition = match request.condition.as_deref().unwrap_or("document_complete") {
                 "document_complete" => BrowserWaitCondition::DocumentComplete,
@@ -6315,9 +6392,6 @@ fn turn_reported_changed_paths(state: &AppState, thread_id: Uuid, turn_id: Uuid)
         let AgentEventPayload::ToolCallFinished { result } = event.payload else {
             continue;
         };
-        if result.metadata.get("success").and_then(Value::as_bool) == Some(false) {
-            continue;
-        }
         let reported = result
             .metadata
             .get("changedPath")
@@ -6485,7 +6559,10 @@ async fn run_new_agent_turn(
         }
     }
     let workspace_root = thread.workspace_root.clone();
-    let _workspace_guard = state.turn_changes.lock_workspace(&workspace_root).await;
+    let _workspace_guard = state
+        .turn_changes
+        .lock_workspace_shared(&workspace_root)
+        .await;
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
     // The thread's pinned model wins over the globally active connection, so a
@@ -6855,7 +6932,10 @@ async fn run_resumed_agent_turn(
     let workspace_root = continuation.workspace_root.clone();
     let collaboration_mode = continuation.collaboration_mode;
     let goal = continuation.goal.clone();
-    let _workspace_guard = state.turn_changes.lock_workspace(&workspace_root).await;
+    let _workspace_guard = state
+        .turn_changes
+        .lock_workspace_shared(&workspace_root)
+        .await;
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
     // Continuations must stay on the model the conversation started with.
@@ -11013,7 +11093,11 @@ struct BrowserCommandRequest {
     observation_id: Option<BrowserObservationId>,
     node_ref: Option<BrowserNodeRef>,
     text: Option<String>,
+    value: Option<String>,
     clear_first: Option<bool>,
+    delta_x: Option<f64>,
+    delta_y: Option<f64>,
+    target_ref: Option<BrowserTargetRef>,
     include_screenshot: Option<bool>,
     condition: Option<String>,
     timeout_ms: Option<u64>,

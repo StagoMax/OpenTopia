@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::process::Command;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 use uuid::Uuid;
 
 const MAX_MERGE_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -20,7 +20,7 @@ const GIT_FAILURE_DETAIL_CHARS: usize = 600;
 #[derive(Clone)]
 pub struct TurnChangeManager {
     store: Arc<SqliteSessionStore>,
-    workspace_locks: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+    workspace_locks: Arc<Mutex<HashMap<String, Weak<AsyncRwLock<()>>>>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -135,22 +135,31 @@ impl TurnChangeManager {
         }
     }
 
-    pub async fn lock_workspace(&self, workspace_root: &Path) -> OwnedMutexGuard<()> {
+    fn workspace_lock(&self, workspace_root: &Path) -> Arc<AsyncRwLock<()>> {
         let key = normalize_workspace_key(workspace_root);
-        let lock = {
-            let mut locks = self
-                .workspace_locks
-                .lock()
-                .expect("workspace change lock registry poisoned");
-            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-                lock
-            } else {
-                let lock = Arc::new(AsyncMutex::new(()));
-                locks.insert(key, Arc::downgrade(&lock));
-                lock
-            }
-        };
-        lock.lock_owned().await
+        let mut locks = self
+            .workspace_locks
+            .lock()
+            .expect("workspace change lock registry poisoned");
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(AsyncRwLock::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    }
+
+    /// Keeps destructive workspace operations out while allowing independent
+    /// threads in the same workspace to execute concurrently.
+    pub async fn lock_workspace_shared(&self, workspace_root: &Path) -> OwnedRwLockReadGuard<()> {
+        self.workspace_lock(workspace_root).read_owned().await
+    }
+
+    /// Exclusively coordinates undo operations with all active turns in a
+    /// workspace so an undo never races a model-owned file mutation.
+    pub async fn lock_workspace(&self, workspace_root: &Path) -> OwnedRwLockWriteGuard<()> {
+        self.workspace_lock(workspace_root).write_owned().await
     }
 
     pub async fn begin_capture(
@@ -190,10 +199,10 @@ impl TurnChangeManager {
         self.finalize_capture_scoped(turn_id, None).await
     }
 
-    /// Finalize a capture using only file paths explicitly reported by
-    /// successful workspace-write tools in this turn. An empty slice is a
-    /// confident "no turn-owned writes" result; it must not absorb unrelated
-    /// edits that happened elsewhere in the workspace while the turn ran.
+    /// Finalize a capture using only file paths attributed to workspace-write
+    /// tools in this turn. An empty slice is a confident "no turn-owned writes"
+    /// result; it must not absorb unrelated edits that happened elsewhere in
+    /// the workspace while the turn ran.
     pub async fn finalize_capture_for_paths(
         &self,
         turn_id: Uuid,
@@ -1504,6 +1513,35 @@ mod tests {
         assert!(detail.contains("fatal: adding files failed"));
         assert!(!detail.contains("LF will be replaced"));
         assert!(detail.chars().count() <= GIT_FAILURE_DETAIL_CHARS + 1);
+    }
+
+    #[tokio::test]
+    async fn active_turns_share_a_workspace_while_undo_remains_exclusive() {
+        let store = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
+        let manager = TurnChangeManager::new(store);
+        let workspace = PathBuf::from("C:/workspace/shared-project");
+
+        let first_turn = manager.lock_workspace_shared(&workspace).await;
+        let second_turn = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            manager.lock_workspace_shared(&workspace),
+        )
+        .await
+        .expect("a second thread in the same workspace must not be serialized");
+
+        let mut undo = Box::pin(manager.lock_workspace(&workspace));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut undo)
+                .await
+                .is_err(),
+            "undo must wait until every active workspace turn finishes"
+        );
+
+        drop(first_turn);
+        drop(second_turn);
+        tokio::time::timeout(std::time::Duration::from_secs(1), undo)
+            .await
+            .expect("undo should proceed after active turns release the workspace");
     }
 
     #[tokio::test]
