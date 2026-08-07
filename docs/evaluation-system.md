@@ -379,6 +379,8 @@ metrics:
 | 指标 | 定义 |
 | --- | --- |
 | `wall_time_ms` | 从提交用户消息到终态的单调时钟耗时 |
+| `phase1_time_ms` / `phase2_time_ms` / `restart_time_ms` | 长程任务阶段 1、重启窗口和阶段 2 的耗时；运行级 JSON 对应 `timing.phase1Ms`、`timing.restartMs`、`timing.phase2Ms` |
+| `timing_stats` | 套件级报告对总耗时和各阶段耗时提供 measured runs、sum、mean、median、min、max；同时记录 suite wall-clock 和未测量运行数 |
 | `time_to_first_delta_ms` | 到首个可见模型文本增量的时间 |
 | `time_to_first_tool_ms` | 到首个工具开始事件的时间 |
 | `input_tokens` / `output_tokens` | Provider usage 原始值 |

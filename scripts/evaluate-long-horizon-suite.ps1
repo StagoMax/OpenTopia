@@ -40,7 +40,8 @@ foreach ($manifest in $TaskManifests) {
     $port = $StartPort + $runIndex - 1
     $taskId = [string]$task.id
     $safeTaskId = ($taskId.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
-    $childSummary = Join-Path $suiteRoot "$safeTaskId-$repetition.json"
+    $runLabel = "{0:D3}-{1}-{2}" -f $runIndex, $safeTaskId, $repetition
+    $childSummary = Join-Path $suiteRoot "$runLabel.json"
     $arguments = @(
       "-NoProfile",
       "-ExecutionPolicy", "Bypass",
@@ -56,8 +57,8 @@ foreach ($manifest in $TaskManifests) {
       $arguments += "-SkipBuild"
     }
 
-    $childStdout = Join-Path $suiteRoot "$safeTaskId-$repetition.stdout.log"
-    $childStderr = Join-Path $suiteRoot "$safeTaskId-$repetition.stderr.log"
+    $childStdout = Join-Path $suiteRoot "$runLabel.stdout.log"
+    $childStderr = Join-Path $suiteRoot "$runLabel.stderr.log"
     $process = Start-Process `
       -FilePath "powershell.exe" `
       -ArgumentList $arguments `
@@ -110,6 +111,64 @@ $scoredRuns = @($validRuns | Where-Object {
   $_.result.failureCategory -notmatch '^provider_.*_unavailable$'
 })
 $passedRuns = @($scoredRuns | Where-Object { $_.result.status -eq "passed" })
+
+function Get-TimingStats {
+  param(
+    [Parameter(Mandatory = $true)][object[]]$Runs,
+    [Parameter(Mandatory = $true)][string]$Field
+  )
+
+  $values = @(
+    $Runs | ForEach-Object {
+      if ($null -ne $_.result -and $null -ne $_.result.timing) {
+        $value = $_.result.timing.$Field
+        if ($null -ne $value) {
+          [double]$value
+        }
+      }
+    } | Sort-Object
+  )
+
+  if ($values.Count -eq 0) {
+    return [ordered]@{
+      measuredRuns = 0
+      sumMs = $null
+      meanMs = $null
+      medianMs = $null
+      minMs = $null
+      maxMs = $null
+    }
+  }
+
+  $sum = [double](($values | Measure-Object -Sum).Sum)
+  $middle = [int][Math]::Floor($values.Count / 2)
+  $median = if (($values.Count % 2) -eq 1) {
+    $values[$middle]
+  } else {
+    ($values[$middle - 1] + $values[$middle]) / 2
+  }
+
+  [ordered]@{
+    measuredRuns = $values.Count
+    sumMs = [int64]$sum
+    meanMs = [double]($sum / $values.Count)
+    medianMs = [double]$median
+    minMs = [int64]$values[0]
+    maxMs = [int64]$values[$values.Count - 1]
+  }
+}
+
+function Get-TimingSummary {
+  param([Parameter(Mandatory = $true)][object[]]$Runs)
+
+  [ordered]@{
+    total = Get-TimingStats -Runs $Runs -Field "totalMs"
+    phase1 = Get-TimingStats -Runs $Runs -Field "phase1Ms"
+    restart = Get-TimingStats -Runs $Runs -Field "restartMs"
+    phase2 = Get-TimingStats -Runs $Runs -Field "phase2Ms"
+  }
+}
+
 $taskSummaries = @($validRuns | Group-Object taskId | ForEach-Object {
   $taskRuns = @($_.Group)
   $taskInconclusive = @($taskRuns | Where-Object {
@@ -128,12 +187,16 @@ $taskSummaries = @($validRuns | Group-Object taskId | ForEach-Object {
     passRate = if ($taskScored.Count -gt 0) {
       [double]$taskPassed.Count / [double]$taskScored.Count
     } else { $null }
+    timing = Get-TimingSummary -Runs $taskRuns
     runs = @($taskRuns | ForEach-Object {
       [ordered]@{
         repetition = $_.repetition
         runId = $_.result.runId
         status = $_.result.status
         totalMs = $_.result.timing.totalMs
+        phase1Ms = $_.result.timing.phase1Ms
+        restartMs = $_.result.timing.restartMs
+        phase2Ms = $_.result.timing.phase2Ms
         totalTokens = $_.result.trajectoryMetrics.totalTokens
         completionToolCalls = $_.result.trajectoryMetrics.completionToolCalls
         verifiedPlanCompletionCalls = $_.result.trajectoryMetrics.verifiedPlanCompletionCalls
@@ -162,11 +225,22 @@ $suiteStatus = if ($allSucceeded) {
 } else {
   "failed"
 }
+$completedAt = Get-Date
+$timingSummary = Get-TimingSummary -Runs $runs
+$timingSummary = [ordered]@{
+  wallClockMs = [int64](($completedAt - $startedAt).TotalMilliseconds)
+  measuredRuns = $timingSummary.total.measuredRuns
+  unmeasuredRuns = $runs.Count - $timingSummary.total.measuredRuns
+  total = $timingSummary.total
+  phase1 = $timingSummary.phase1
+  restart = $timingSummary.restart
+  phase2 = $timingSummary.phase2
+}
 $summary = [ordered]@{
   schemaVersion = 1
   suiteId = $suiteId
   startedAt = $startedAt.ToUniversalTime().ToString("o")
-  completedAt = (Get-Date).ToUniversalTime().ToString("o")
+  completedAt = $completedAt.ToUniversalTime().ToString("o")
   status = $suiteStatus
   provider = [ordered]@{
     profile = $Profile
@@ -187,6 +261,7 @@ $summary = [ordered]@{
       [double]$passedRuns.Count / [double]$scoredRuns.Count
     } else { $null }
   }
+  timing = $timingSummary
   tasks = $taskSummaries
   infrastructureFailures = @(
     $runs | Where-Object { $null -eq $_.result } | ForEach-Object {
