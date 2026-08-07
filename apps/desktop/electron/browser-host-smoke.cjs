@@ -206,8 +206,11 @@ async function main() {
         "visible browser actions did not produce expected output",
       );
     }
+    if (!Array.isArray(structuredSnapshot?.interactiveElements)) {
+      throw new Error("public browser snapshot omitted structured elements");
+    }
     if (
-      structuredSnapshot?.interactiveElements?.some(
+      structuredSnapshot.interactiveElements.some(
         (node) =>
           Object.hasOwn(node, "locator") ||
           Object.hasOwn(node, "selectorPath") ||
