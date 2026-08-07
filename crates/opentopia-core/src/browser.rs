@@ -552,17 +552,6 @@ pub struct BrowserNavigation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BrowserSnapshot {
-    pub url: String,
-    pub title: String,
-    pub text: String,
-    pub text_truncated: bool,
-    /// A compact, model-oriented description of interactive elements and their CSS selectors.
-    pub interactive_elements: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BrowserDownload {
     pub path: PathBuf,
     pub filename: String,

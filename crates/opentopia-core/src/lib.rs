@@ -62,8 +62,8 @@ pub use browser::{
     BrowserFrame, BrowserFrameRef, BrowserNavigateRequest, BrowserNavigation, BrowserNetworkGrant,
     BrowserNode, BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions,
     BrowserOutput, BrowserRect, BrowserRuntime, BrowserRuntimeConfig, BrowserScreenshot,
-    BrowserSelector, BrowserSessionId, BrowserSnapshot, BrowserTarget, BrowserTargetRef,
-    BrowserTypeRequest, BrowserWaitCondition, BrowserWaitRequest, LocalBrowserRuntime,
+    BrowserSelector, BrowserSessionId, BrowserTarget, BrowserTargetRef, BrowserTypeRequest,
+    BrowserWaitCondition, BrowserWaitRequest, LocalBrowserRuntime,
 };
 pub use bundled_plugins::{
     bundled_plugin_catalog, bundled_plugin_metadata, ensure_bundled_plugins_installed,
