@@ -1058,154 +1058,32 @@ function createDesktopBrowserHost(options) {
   }
 
   async function snapshot(entry, includeInternalLocators = false) {
-    {
-      const webContents = entry.view.webContents;
-      const value = await collectStructuredSnapshot(entry);
-      const outputValue = includeInternalLocators
-        ? value
-        : {
-            ...value,
-            interactiveElements: value.interactiveElements.map(
-              ({
-                locator: _locator,
-                selectorPath: _selectorPath,
-                nodeKey: _nodeKey,
-                ...node
-              }) => node,
-            ),
-          };
-      return browserOutput(
-        webContents,
-        "snapshot",
-        [
-          { type: "text", text: value.text, truncated: value.textTruncated },
-          jsonContent(outputValue),
-        ],
-        {
-          title: value.title,
-          interactive_elements_truncated:
-            value.interactiveElements.length >= MAX_INTERACTIVE_ELEMENTS,
-        },
-      );
-    }
     const webContents = entry.view.webContents;
-    const result = await webContents.executeJavaScript(
-      `(() => {
-        const byteLimit = ${MAX_SNAPSHOT_BYTES};
-        const elementLimit = ${MAX_INTERACTIVE_ELEMENTS};
-        const encoder = new TextEncoder();
-        const truncate = (value, limit) => {
-          const text = String(value || "");
-          if (encoder.encode(text).length <= limit) return { value: text, truncated: false };
-          let low = 0;
-          let high = text.length;
-          while (low < high) {
-            const middle = Math.ceil((low + high) / 2);
-            if (encoder.encode(text.slice(0, middle)).length <= limit) low = middle;
-            else high = middle - 1;
-          }
-          return { value: text.slice(0, low), truncated: true };
+    const value = await collectStructuredSnapshot(entry);
+    const outputValue = includeInternalLocators
+      ? value
+      : {
+          ...value,
+          interactiveElements: value.interactiveElements.map(
+            ({
+              locator: _locator,
+              selectorPath: _selectorPath,
+              nodeKey: _nodeKey,
+              ...node
+            }) => node,
+          ),
         };
-        const escape = (value) => window.CSS && CSS.escape
-          ? CSS.escape(String(value))
-          : String(value).replace(/[^a-zA-Z0-9_-]/g, (char) => "\\\\" + char);
-        const selectorFor = (element) => {
-          if (element.id) return "#" + escape(element.id);
-          const parts = [];
-          let current = element;
-          while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 8) {
-            let part = current.localName || "*";
-            const siblings = current.parentElement
-              ? Array.from(current.parentElement.children).filter((item) => item.localName === current.localName)
-              : [];
-            if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(current) + 1) + ")";
-            parts.unshift(part);
-            current = current.parentElement;
-          }
-          return parts.join(" > ");
-        };
-        const candidates = Array.from(document.querySelectorAll(
-          "a[href],button,input,textarea,select,[role=button],[role=link],[contenteditable=true],[tabindex]"
-        )).slice(0, elementLimit);
-        const roleFor = (element) => element.getAttribute("role") || ({
-          a: "link", button: "button", textarea: "textbox", select: "combobox",
-          input: element.type === "checkbox" ? "checkbox" : element.type === "radio" ? "radio" : "textbox"
-        })[element.localName] || element.localName;
-        const handoffReason = (element, name, inputType, formMethod) => {
-          const normalized = [
-            name,
-            element.getAttribute("aria-label") || "",
-            element.getAttribute("title") || "",
-          ].join(" ").toLowerCase();
-          if (inputType === "file") return "Please choose and upload the file yourself in the visible browser, then tell me to continue.";
-          if (inputType === "password" || /sign[ -]?in|log[ -]?in|password|passkey|verification|verify|captcha|one[ -]?time code|security code/.test(normalized)) {
-            return "Please complete the sign-in or verification step yourself in the visible browser, then tell me to continue.";
-          }
-          if (/pay|payment|checkout|purchase|buy now|place order|subscribe/.test(normalized)) {
-            return "Please review and complete the payment or purchase yourself in the visible browser, then tell me to continue.";
-          }
-          if (/send|publish|post|share|upload|delete|remove|submit|save changes|confirm/.test(normalized) && formMethod !== "get") {
-            return "Please review and complete this external action yourself in the visible browser, then tell me to continue.";
-          }
-          return null;
-        };
-        const interactiveElements = candidates
-          .filter((element) => !element.disabled && element.getClientRects().length)
-          .map((element) => {
-            const rect = element.getBoundingClientRect();
-            const name = truncate(element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("placeholder") || "", 2048).value;
-            const inputType = (element.getAttribute("type") || "").toLowerCase() || null;
-            const formMethod = (element.getAttribute("formmethod") || element.form?.getAttribute("method") || "get").toLowerCase();
-            const userActionReason = handoffReason(element, name, inputType, formMethod);
-            return {
-              selector: selectorFor(element),
-              tagName: element.localName,
-              role: roleFor(element),
-              name,
-              href: element.href || null,
-              formAction: element.formAction || (element.form && element.form.action) || null,
-              formMethod,
-              inputType,
-              editable: Boolean(element.isContentEditable || (["input", "textarea", "select"].includes(element.localName) && !element.readOnly)),
-              requiresUserAction: Boolean(userActionReason),
-              userActionReason,
-              bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-            };
-          });
-        const body = truncate(document.body ? document.body.innerText : "", byteLimit);
-        return {
-          url: document.location.href,
-          title: document.title,
-          text: body.value,
-          text_truncated: body.truncated,
-          interactive_elements: interactiveElements,
-          interactive_elements_truncated: candidates.length >= elementLimit
-        };
-      })()`,
-      false,
-    );
-    const text = truncateUtf8(result?.text || "", MAX_SNAPSHOT_BYTES);
-    const value = {
-      url: result?.url || webContents.getURL(),
-      title: result?.title || webContents.getTitle(),
-      text: text.value,
-      textTruncated: Boolean(result?.text_truncated || text.truncated),
-      interactiveElements: Array.isArray(result?.interactive_elements)
-        ? result.interactive_elements.slice(0, MAX_INTERACTIVE_ELEMENTS)
-        : [],
-    };
     return browserOutput(
       webContents,
       "snapshot",
       [
         { type: "text", text: value.text, truncated: value.textTruncated },
-        jsonContent(value),
+        jsonContent(outputValue),
       ],
       {
         title: value.title,
-        interactive_elements_truncated: Boolean(
-          result?.interactive_elements_truncated,
-        ),
+        interactive_elements_truncated:
+          value.interactiveElements.length >= MAX_INTERACTIVE_ELEMENTS,
       },
     );
   }
