@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type * as UsageLogsModule from "./usageLogs";
-import type { AgentEvent } from "./types";
+import type {
+  AgentEvent,
+  ModelContextItem,
+  ModelRequestSnapshot,
+} from "./types";
 
 const { aggregateUsageEvents } = (await import(
   "./usageLogs" + ".ts"
@@ -21,6 +25,40 @@ function event(
     seq,
     createdAt,
     payload,
+  };
+}
+
+function contextItem(
+  source: string,
+  contentHash: string,
+  tokenEstimate: number,
+  kind: ModelContextItem["kind"] = "developer_instructions",
+): ModelContextItem {
+  return {
+    id: `${kind}:${contentHash}`,
+    kind,
+    role: "developer",
+    source,
+    content: [{ type: "text", text: source }],
+    contentHash,
+    tokenEstimate,
+    cacheScope: "stable",
+    sensitivity: "workspace",
+  };
+}
+
+function modelRequest(
+  promptCacheKey = "thread-cache",
+  systemPrompt = "stable system prompt",
+): ModelRequestSnapshot {
+  return {
+    systemPrompt,
+    conversation: [],
+    userMessage: "question",
+    toolCandidates: [],
+    previousToolCalls: [],
+    toolResults: [],
+    promptCacheKey,
   };
 }
 
@@ -158,4 +196,211 @@ test("marks an unfinished provider request as failed when its turn errors", () =
   assert.equal(result.calls[0]?.durationMs, 400);
   assert.equal(result.summary.failedRequestCount, 1);
   assert.equal(result.summary.errorEventCount, 1);
+});
+
+test("locates the first changed context item when cache reuse breaks", () => {
+  const firstItems = [
+    contextItem("opentopia:base", "base-v1", 400, "base_instructions"),
+    contextItem("repo:AGENTS.md", "repo-v1", 500, "repository_instructions"),
+    contextItem("current_user_message", "question-1", 300, "user"),
+  ];
+  const secondItems = [
+    contextItem("opentopia:base", "base-v1", 400, "base_instructions"),
+    contextItem("repo:AGENTS.md", "repo-v2", 520, "repository_instructions"),
+    contextItem("current_user_message", "question-2", 330, "user"),
+  ];
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "model_context_built",
+      request_id: "request-1",
+      round: 1,
+      context_hash: "context-1",
+      token_estimate: 1_200,
+      items: firstItems,
+    }),
+    event(2, "2026-08-05T00:00:00.010Z", {
+      type: "model_request",
+      request_id: "request-1",
+      round: 1,
+      request: modelRequest(),
+    }),
+    event(3, "2026-08-05T00:00:00.020Z", {
+      type: "provider_request_sent",
+      request_id: "request-1",
+      round: 1,
+      attempt: 1,
+      adapter: "openai_responses",
+      method: "POST",
+      endpoint: "/responses",
+    }),
+    event(4, "2026-08-05T00:00:00.100Z", {
+      type: "token_usage",
+      input_tokens: 1_200,
+      cached_input_tokens: 800,
+      output_tokens: 100,
+      total_tokens: 1_300,
+    }),
+    event(
+      5,
+      "2026-08-05T00:01:00.000Z",
+      {
+        type: "model_context_built",
+        request_id: "request-2",
+        round: 1,
+        context_hash: "context-2",
+        token_estimate: 1_250,
+        items: secondItems,
+      },
+      "turn-2",
+    ),
+    event(
+      6,
+      "2026-08-05T00:01:00.010Z",
+      {
+        type: "model_request",
+        request_id: "request-2",
+        round: 1,
+        request: modelRequest("thread-cache", "changed repository prompt"),
+      },
+      "turn-2",
+    ),
+    event(
+      7,
+      "2026-08-05T00:01:00.020Z",
+      {
+        type: "provider_request_sent",
+        request_id: "request-2",
+        round: 1,
+        attempt: 1,
+        adapter: "openai_responses",
+        method: "POST",
+        endpoint: "/responses",
+      },
+      "turn-2",
+    ),
+    event(
+      8,
+      "2026-08-05T00:01:00.100Z",
+      {
+        type: "token_usage",
+        input_tokens: 1_250,
+        cached_input_tokens: 0,
+        output_tokens: 100,
+        total_tokens: 1_350,
+      },
+      "turn-2",
+    ),
+  ]);
+
+  assert.equal(result.cacheBreaks.length, 1);
+  assert.equal(result.cacheBreaks[0]?.id, "request-2");
+  assert.equal(result.cacheBreaks[0]?.cacheReuse.state, "broken");
+  assert.equal(result.cacheBreaks[0]?.cacheReuse.reason, "content_changed");
+  assert.equal(result.cacheBreaks[0]?.cacheReuse.lostCachedTokens, 800);
+  assert.deepEqual(result.cacheBreaks[0]?.cacheReuse.breakpoint, {
+    kind: "repository_instructions",
+    source: "repo:AGENTS.md",
+    cacheScope: "stable",
+    change: "changed",
+    tokenOffsetEstimate: 400,
+    previousTokenEstimate: 500,
+    currentTokenEstimate: 520,
+  });
+  assert.equal(result.summary.cacheBreakCount, 1);
+});
+
+test("does not blame an appended suffix for an operational cache miss", () => {
+  const sharedItems = [
+    contextItem("opentopia:base", "base-v1", 700, "base_instructions"),
+    contextItem("conversation:0", "question-1", 400, "conversation"),
+  ];
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "model_context_built",
+      request_id: "request-1",
+      round: 1,
+      context_hash: "context-1",
+      token_estimate: 1_100,
+      items: sharedItems,
+    }),
+    event(2, "2026-08-05T00:00:00.010Z", {
+      type: "model_request",
+      request_id: "request-1",
+      round: 1,
+      request: modelRequest(),
+    }),
+    event(3, "2026-08-05T00:00:00.020Z", {
+      type: "provider_request_sent",
+      request_id: "request-1",
+      round: 1,
+      attempt: 1,
+      adapter: "openai_responses",
+      method: "POST",
+      endpoint: "/responses",
+    }),
+    event(4, "2026-08-05T00:00:00.100Z", {
+      type: "token_usage",
+      input_tokens: 1_100,
+      cached_input_tokens: 1_000,
+      output_tokens: 100,
+      total_tokens: 1_200,
+    }),
+    event(
+      5,
+      "2026-08-05T00:01:00.000Z",
+      {
+        type: "model_context_built",
+        request_id: "request-2",
+        round: 1,
+        context_hash: "context-2",
+        token_estimate: 1_300,
+        items: [
+          ...sharedItems,
+          contextItem("current_user_message", "question-2", 200, "user"),
+        ],
+      },
+      "turn-2",
+    ),
+    event(
+      6,
+      "2026-08-05T00:01:00.010Z",
+      {
+        type: "model_request",
+        request_id: "request-2",
+        round: 1,
+        request: modelRequest(),
+      },
+      "turn-2",
+    ),
+    event(
+      7,
+      "2026-08-05T00:01:00.020Z",
+      {
+        type: "provider_request_sent",
+        request_id: "request-2",
+        round: 1,
+        attempt: 1,
+        adapter: "openai_responses",
+        method: "POST",
+        endpoint: "/responses",
+      },
+      "turn-2",
+    ),
+    event(
+      8,
+      "2026-08-05T00:01:00.100Z",
+      {
+        type: "token_usage",
+        input_tokens: 1_300,
+        cached_input_tokens: 0,
+        output_tokens: 100,
+        total_tokens: 1_400,
+      },
+      "turn-2",
+    ),
+  ]);
+
+  assert.equal(result.cacheBreaks[0]?.cacheReuse.reason, "operational_miss");
+  assert.equal(result.cacheBreaks[0]?.cacheReuse.confidence, "low");
+  assert.equal(result.cacheBreaks[0]?.cacheReuse.breakpoint, null);
 });

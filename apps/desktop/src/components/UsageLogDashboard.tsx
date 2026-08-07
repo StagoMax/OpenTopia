@@ -1,8 +1,9 @@
 import { useMemo } from "react";
-import { Activity } from "lucide-react";
+import { Activity, CircleCheck, TriangleAlert } from "lucide-react";
 
 import {
   aggregateUsageEvents,
+  type CacheReuseDiagnostic,
   type UsageCall,
   type UsageSummary,
 } from "../usageLogs";
@@ -108,6 +109,11 @@ export function UsageLogDashboard({
                   "缓存写入 Tokens",
                   formatInteger(data.summary.cacheWriteTokens),
                 ],
+                ["完整复用中断", formatInteger(data.summary.cacheBreakCount)],
+                [
+                  "部分命中下降",
+                  formatInteger(data.summary.cacheDegradationCount),
+                ],
                 ["推理 Tokens", formatInteger(data.summary.reasoningTokens)],
                 ["可见输出 Tokens", formatInteger(visibleOutput(data.summary))],
                 ["缓存字段覆盖", cacheCoverageLabel(data.calls)],
@@ -133,6 +139,39 @@ export function UsageLogDashboard({
             />
           </Panel>
         </div>
+
+        <Panel
+          className="usage-cache-break-panel"
+          title="缓存复用断点"
+          actions={
+            <Badge
+              variant={data.cacheBreaks.length > 0 ? "warning" : "neutral"}
+            >
+              {data.cacheBreaks.length} 个事件
+            </Badge>
+          }
+        >
+          <p className="usage-cache-break-help">
+            API 只报告命中的缓存
+            Token；下列位置由相邻请求的缓存结果、配置与上下文 hash
+            推断，并标注置信度。
+          </p>
+          {data.cacheBreaks.length === 0 ? (
+            <div className="usage-table-state">
+              <CircleCheck size={20} aria-hidden="true" />
+              <p>目前没有检测到缓存复用下降。</p>
+              <span>
+                至少需要两次返回缓存 usage 的可比较请求，才能定位复用断点。
+              </span>
+            </div>
+          ) : (
+            <div className="usage-cache-break-list">
+              {data.cacheBreaks.map((call) => (
+                <CacheBreakRecord call={call} key={call.id} />
+              ))}
+            </div>
+          )}
+        </Panel>
 
         <Panel
           className="usage-call-panel"
@@ -195,11 +234,172 @@ export function UsageLogDashboard({
           usage；TTFT、端到端延迟、工具耗时和重试由 OpenTopia
           事件时间计算。Prompt Cache 读取率 = cached input tokens / input
           tokens。托管 API 不提供 GPU 利用率、KV block
-          占用/逐出或服务端真实排队时间，因此不会在此伪造这些指标。
+          占用/逐出或服务端真实排队时间。缓存断点位置是 harness
+          根据相邻请求前缀推断的；无法区分缓存过期、服务端逐出或路由漂移时会明确标为低置信。
         </p>
       </div>
     </div>
   );
+}
+
+function CacheBreakRecord({ call }: { call: UsageCall }) {
+  const diagnostic = call.cacheReuse;
+  return (
+    <article className="usage-cache-break-item" data-state={diagnostic.state}>
+      <div className="usage-cache-break-heading">
+        <div>
+          <TriangleAlert size={16} aria-hidden="true" />
+          <strong>{cacheBreakTitle(diagnostic)}</strong>
+        </div>
+        <div>
+          <Badge variant={cacheBreakBadgeVariant(diagnostic)}>
+            {diagnostic.state === "broken" ? "复用中断" : "命中下降"}
+          </Badge>
+          <time dateTime={call.startedAt}>
+            {formatDateTime(call.startedAt)}
+          </time>
+        </div>
+      </div>
+      <p>{cacheBreakExplanation(diagnostic)}</p>
+      <dl className="usage-cache-break-meta">
+        <div>
+          <dt>缓存读取</dt>
+          <dd>
+            {formatInteger(diagnostic.previousCachedInputTokens)} →{" "}
+            {formatInteger(diagnostic.currentCachedInputTokens)}
+          </dd>
+        </div>
+        <div>
+          <dt>估算损失</dt>
+          <dd>{formatInteger(diagnostic.lostCachedTokens)} Tokens</dd>
+        </div>
+        <div>
+          <dt>前缀位置</dt>
+          <dd>{cacheBreakOffset(diagnostic)}</dd>
+        </div>
+        <div>
+          <dt>置信度</dt>
+          <dd>{cacheConfidenceLabel(diagnostic.confidence)}</dd>
+        </div>
+      </dl>
+    </article>
+  );
+}
+
+function cacheBreakBadgeVariant(
+  diagnostic: CacheReuseDiagnostic,
+): BadgeVariant {
+  return diagnostic.state === "broken" ? "danger" : "warning";
+}
+
+function cacheBreakTitle(diagnostic: CacheReuseDiagnostic): string {
+  const point = diagnostic.breakpoint;
+  switch (diagnostic.reason) {
+    case "content_changed":
+      return point
+        ? `最早变化：${contextKindLabel(point.kind)} · ${point.source}`
+        : "输入前缀内容发生变化";
+    case "tool_catalog_changed":
+      return "工具定义或顺序发生变化";
+    case "system_prompt_changed":
+      return "系统提示发生变化";
+    case "cache_key_changed":
+      return "Prompt Cache Key 发生变化";
+    case "model_changed":
+      return "模型发生切换";
+    case "provider_changed":
+      return "API Provider 发生切换";
+    case "input_below_minimum":
+      return "输入低于 OpenAI 缓存最低长度";
+    case "stateful_context":
+      return "状态游标请求无法直接比较完整前缀";
+    case "operational_miss":
+      return "未发现提前变化的输入前缀";
+    default:
+      return "缓存读取下降";
+  }
+}
+
+function cacheBreakExplanation(diagnostic: CacheReuseDiagnostic): string {
+  const point = diagnostic.breakpoint;
+  switch (diagnostic.reason) {
+    case "content_changed":
+      return point
+        ? `${contextChangeLabel(point.change)}；缓存范围为${cacheScopeLabel(point.cacheScope)}。该位置是 token_estimate 推断，不是 API 返回的逐 Token 断点。`
+        : "相邻请求的上下文 hash 不一致，但没有足够的上下文项用于精确定位。";
+    case "tool_catalog_changed":
+      return "工具名称、描述、输入 Schema 或排列顺序的变化都可能使缓存前缀失配。";
+    case "system_prompt_changed":
+      return "系统或开发者指令位于提示词前部，变化通常会影响其后的整段缓存复用。";
+    case "cache_key_changed":
+      return "相邻请求没有使用相同的 prompt_cache_key，缓存路由与匹配不再可直接复用。";
+    case "model_changed":
+      return "不同模型的 KV Cache 不能作为同一条可比较缓存链处理。";
+    case "provider_changed":
+      return "请求切换了 Provider，服务端缓存不共享。";
+    case "input_below_minimum":
+      return "该请求少于 1,024 个输入 Token，OpenAI 的 Prompt Cache 不会产生读取命中。";
+    case "stateful_context":
+      return "请求使用 previous_response_id 复用服务端状态；若已记录内容没有变化，缓存下降也可能来自状态游标的计量差异。";
+    case "operational_miss":
+      return "已记录的公共前缀未提前变化，更可能是缓存过期、服务端逐出、路由漂移或负载分片造成。";
+    default:
+      return "现有事件不足以确定具体内容位置。";
+  }
+}
+
+function cacheBreakOffset(diagnostic: CacheReuseDiagnostic): string {
+  const offset = diagnostic.breakpoint?.tokenOffsetEstimate;
+  return offset === null || offset === undefined
+    ? "无法定位"
+    : `约 ${formatInteger(offset)} Tokens 后`;
+}
+
+function contextKindLabel(kind: string): string {
+  const labels: Record<string, string> = {
+    base_instructions: "基础指令",
+    developer_instructions: "开发者指令",
+    repository_instructions: "仓库指令",
+    environment: "环境上下文",
+    world_state: "世界状态",
+    skill: "Skill",
+    summary: "上下文摘要",
+    checkpoint: "上下文检查点",
+    conversation: "会话历史",
+    user: "用户输入",
+    tool_call: "工具调用",
+    tool_result: "工具结果",
+  };
+  return labels[kind] ?? kind;
+}
+
+function contextChangeLabel(
+  change: NonNullable<CacheReuseDiagnostic["breakpoint"]>["change"],
+): string {
+  if (change === "inserted") return "该上下文项被插入到公共前缀中";
+  if (change === "removed") return "该上下文项从公共前缀中移除";
+  return "该上下文项的内容 hash 发生变化";
+}
+
+function cacheScopeLabel(
+  scope: NonNullable<CacheReuseDiagnostic["breakpoint"]>["cacheScope"],
+): string {
+  const labels = {
+    stable: "稳定级",
+    thread: "会话级",
+    turn: "回合级",
+    round: "推理轮次级",
+    none: "未缓存级",
+  } as const;
+  return scope ? labels[scope] : "未知级";
+}
+
+function cacheConfidenceLabel(
+  confidence: CacheReuseDiagnostic["confidence"],
+): string {
+  if (confidence === "high") return "高 · 配置/API 证据";
+  if (confidence === "medium") return "中 · 上下文 hash 推断";
+  return "低 · 服务端状态不可见";
 }
 
 function MetricCard({

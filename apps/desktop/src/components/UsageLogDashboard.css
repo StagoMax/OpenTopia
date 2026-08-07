@@ -145,6 +145,112 @@
 .usage-call-panel {
   margin-top: var(--space-4);
 }
+
+.usage-cache-break-panel {
+  margin-top: var(--space-4);
+}
+
+.usage-cache-break-panel .ot-panel__body {
+  padding: 0;
+}
+
+.usage-cache-break-help {
+  margin: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+  padding: var(--space-3) var(--space-4);
+}
+
+.usage-cache-break-list {
+  display: grid;
+}
+
+.usage-cache-break-item {
+  display: grid;
+  gap: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  border-inline-start: var(--space-1) solid var(--warning);
+  padding: var(--space-4);
+}
+
+.usage-cache-break-item[data-state="broken"] {
+  border-inline-start-color: var(--danger);
+}
+
+.usage-cache-break-item:last-child {
+  border-bottom: 0;
+}
+
+.usage-cache-break-heading,
+.usage-cache-break-heading > div {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.usage-cache-break-heading {
+  justify-content: space-between;
+}
+
+.usage-cache-break-heading > div:first-child {
+  min-width: 0;
+}
+
+.usage-cache-break-heading strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-cache-break-heading time {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.usage-cache-break-item > p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+}
+
+.usage-cache-break-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.usage-cache-break-meta > div {
+  min-width: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  padding: var(--space-3);
+}
+
+.usage-cache-break-meta dt {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.usage-cache-break-meta dd {
+  overflow: hidden;
+  margin: var(--space-1) 0 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .usage-table-state {
   display: grid;
   justify-items: center;
@@ -246,5 +352,9 @@
 
   .usage-detail-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .usage-cache-break-meta {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
