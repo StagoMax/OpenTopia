@@ -76,6 +76,14 @@ function NativeWebPreview({
   const hasUrlRef = useRef(false);
   const handledNavigationIdRef = useRef<string | null>(null);
 
+  useEffect(() => {
+    if (!handoff || !sessionId) return;
+    void api
+      .createSession({ sessionId })
+      .then(() => api.beginUserControl(sessionId))
+      .catch((cause) => setError(errorMessage(cause)));
+  }, [api, handoff, sessionId]);
+
   const reportBounds = useCallback(() => {
     const element = containerRef.current;
     if (!element) return;

@@ -10,6 +10,7 @@ const IPC_CHANNELS = Object.freeze({
   getState: "browser-host:get-state",
   navigate: "browser-host:navigate",
   navigateFromAddressBar: "browser-host:navigate-from-address-bar",
+  beginUserControl: "browser-host:begin-user-control",
   back: "browser-host:back",
   forward: "browser-host:forward",
   reload: "browser-host:reload",
@@ -31,7 +32,10 @@ const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_WAIT_MS = 30_000;
 const DEFAULT_WAIT_MS = 10_000;
+const MAX_OPERATION_MS = 34_000;
+const SCREENSHOT_CAPTURE_MS = 8_000;
 const MAX_INTERACTIVE_ELEMENTS = 500;
+const MAX_NETWORK_HOSTS = 256;
 const MAX_OBSERVATIONS_PER_SESSION = 12;
 const OBSERVATION_TTL_MS = 120_000;
 const MAX_NODE_POSITION_DRIFT = 24;
@@ -45,11 +49,12 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 
 class BrowserHostError extends Error {
-  constructor(code, message, statusCode = 400) {
+  constructor(code, message, statusCode = 400, details = null) {
     super(message);
     this.name = "BrowserHostError";
     this.code = code;
     this.statusCode = statusCode;
+    this.details = details;
   }
 }
 
@@ -102,6 +107,57 @@ function normalizeUrl(value) {
     );
   }
   return parsed.toString();
+}
+
+function normalizeNetworkHost(value) {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    /[\s/@]/.test(value)
+  ) {
+    throw new BrowserHostError(
+      "invalid_network_host",
+      "allowedHosts entries must be host names or IP addresses without ports.",
+    );
+  }
+  const raw = value.trim().replace(/\.$/, "").toLowerCase();
+  let parsed;
+  try {
+    parsed = new URL(`http://${raw}/`);
+  } catch {
+    try {
+      parsed = new URL(`http://[${raw}]/`);
+    } catch {
+      throw new BrowserHostError(
+        "invalid_network_host",
+        `Invalid network host '${value}'.`,
+      );
+    }
+  }
+  if (
+    parsed.username ||
+    parsed.password ||
+    parsed.port ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new BrowserHostError(
+      "invalid_network_host",
+      `Invalid network host '${value}'.`,
+    );
+  }
+  return parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+}
+
+function normalizeAllowedHosts(value) {
+  if (!Array.isArray(value) || value.length > MAX_NETWORK_HOSTS) {
+    throw new BrowserHostError(
+      "invalid_network_grant",
+      `allowedHosts must be an array containing at most ${MAX_NETWORK_HOSTS} hosts.`,
+    );
+  }
+  return new Set(value.map(normalizeNetworkHost));
 }
 
 function normalizeSelector(value, required = true) {
@@ -176,19 +232,52 @@ function truncateUtf8(value, maximumBytes) {
   return { value: buffer.subarray(0, end).toString("utf8"), truncated: true };
 }
 
-function timeoutAfter(milliseconds, label) {
-  return new Promise((_, reject) => {
-    const timer = setTimeout(() => {
-      reject(
-        new BrowserHostError(
-          "timeout",
-          `${label} timed out after ${milliseconds} ms.`,
-          504,
-        ),
+function imageLooksBlank(image) {
+  if (!image || image.isEmpty()) return true;
+  const size = image.getSize();
+  const bitmap = image.toBitmap();
+  const pixelCount = size.width * size.height;
+  if (!pixelCount || bitmap.length < pixelCount * 4) return true;
+  const stride = Math.max(1, Math.floor(pixelCount / 4096));
+  let sampled = 0;
+  let blank = 0;
+  for (let pixel = 0; pixel < pixelCount; pixel += stride) {
+    const offset = pixel * 4;
+    const blue = bitmap[offset];
+    const green = bitmap[offset + 1];
+    const red = bitmap[offset + 2];
+    const alpha = bitmap[offset + 3];
+    sampled += 1;
+    if (alpha <= 2 || (red <= 3 && green <= 3 && blue <= 3)) blank += 1;
+  }
+  return sampled > 0 && blank / sampled >= 0.995;
+}
+
+async function withTimeout(
+  operation,
+  milliseconds,
+  label,
+  { code = "timeout", abandonedOperation = false } = {},
+) {
+  let timer;
+  const task = Promise.resolve().then(operation);
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new BrowserHostError(
+        code,
+        `${label} timed out after ${milliseconds} ms.`,
+        504,
       );
+      error.abandonedOperation = abandonedOperation;
+      reject(error);
     }, milliseconds);
     timer.unref?.();
   });
+  try {
+    return await Promise.race([task, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function sleep(milliseconds) {
@@ -275,6 +364,7 @@ function serializeError(error) {
       code: error.code,
       message: error.message,
       statusCode: error.statusCode,
+      details: error.details,
     };
   }
   return {
@@ -285,14 +375,22 @@ function serializeError(error) {
 }
 
 function createDesktopBrowserHost(options) {
-  const { app, WebContentsView, getMainWindow, logger = () => {} } = options;
+  const {
+    app,
+    WebContentsView,
+    nativeImage,
+    getMainWindow,
+    logger = () => {},
+  } = options;
   const sessions = new Map();
+  const sessionsByWebContentsId = new Map();
   const bearerToken = crypto.randomBytes(32).toString("base64url");
   let brokerServer = null;
   let brokerUrl = null;
   let attachedWindow = null;
   let windowSuspended = false;
   let windowListeners = [];
+  let networkInterceptorInstalled = false;
 
   function log(level, event, metadata = {}) {
     try {
@@ -392,12 +490,181 @@ function createDesktopBrowserHost(options) {
     entry.attached = false;
   }
 
-  function configureRemoteContents(entry) {
-    const webContents = entry.view.webContents;
+  function activeTarget(entry) {
+    const target = entry.targets.get(entry.activeTargetRef);
+    if (!target || target.view.webContents.isDestroyed()) {
+      throw new BrowserHostError(
+        "target_not_found",
+        "The active browser target is no longer available.",
+        404,
+      );
+    }
+    return target;
+  }
+
+  function switchActiveTarget(entry, targetRef) {
+    const target = entry.targets.get(targetRef);
+    if (!target || target.view.webContents.isDestroyed()) {
+      throw new BrowserHostError(
+        "target_not_found",
+        `Browser target was not found: ${targetRef}`,
+        404,
+      );
+    }
+    if (entry.activeTargetRef === targetRef) return target;
+    const wasAttached = entry.attached;
+    if (wasAttached) detachEntry(entry);
+    entry.activeTargetRef = targetRef;
+    entry.view = target.view;
+    entry.observations.clear();
+    if (wasAttached) attachEntry(entry);
+    emitState(entry);
+    return target;
+  }
+
+  function registerTarget(entry, view, openerTargetRef = null) {
+    const target = {
+      targetRef: crypto.randomUUID(),
+      openerTargetRef,
+      view,
+      frameRefs: new Map(),
+    };
+    entry.targets.set(target.targetRef, target);
+    sessionsByWebContentsId.set(view.webContents.id, entry);
+    configureRemoteContents(entry, target);
+    return target;
+  }
+
+  function recordDialog(entry, target, type, message, defaultPrompt = null) {
+    entry.dialogs.push({
+      dialogType: String(type || "dialog"),
+      message: String(message || ""),
+      defaultPrompt: typeof defaultPrompt === "string" ? defaultPrompt : null,
+      handled: true,
+      targetRef: target.targetRef,
+    });
+    if (entry.dialogs.length > 32) entry.dialogs.shift();
+  }
+
+  function configureRemoteContents(entry, target) {
+    const webContents = target.view.webContents;
     const browserSession = webContents.session;
 
-    webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    if (!networkInterceptorInstalled) {
+      browserSession.webRequest.onBeforeRequest(
+        { urls: ["http://*/*", "https://*/*"] },
+        (details, callback) => {
+          const target = sessionsByWebContentsId.get(details.webContentsId);
+          if (!target || !target.networkPolicyEnforced) {
+            callback({});
+            return;
+          }
+          let host = "";
+          try {
+            host = normalizeNetworkHost(new URL(details.url).hostname);
+          } catch {
+            callback({ cancel: true });
+            return;
+          }
+          if (target.allowedHosts.has(host)) {
+            callback({});
+            return;
+          }
+          target.lastError = {
+            code: "network_host_blocked",
+            message: `Browser network request to '${host}' was blocked.`,
+            host,
+          };
+          log("warn", "browser.network-request.blocked", {
+            sessionId: target.sessionId,
+            host,
+            url: details.url,
+            resourceType: details.resourceType,
+          });
+          callback({ cancel: true });
+        },
+      );
+      networkInterceptorInstalled = true;
+    }
+
+    webContents.setWindowOpenHandler((details) => {
+      setImmediate(async () => {
+        if (entry.destroyed || !entry.targets.has(target.targetRef)) return;
+        const popupView = new WebContentsView({
+          webPreferences: {
+            partition: "persist:opentopia-browser",
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+            webSecurity: true,
+            allowRunningInsecureContent: false,
+            spellcheck: false,
+            backgroundThrottling: false,
+          },
+        });
+        popupView.setBounds(DEFAULT_BACKGROUND_BOUNDS);
+        const popup = registerTarget(entry, popupView, target.targetRef);
+        switchActiveTarget(entry, popup.targetRef);
+        log("info", "browser.target.created", {
+          sessionId: entry.sessionId,
+          targetRef: popup.targetRef,
+          openerTargetRef: target.targetRef,
+        });
+        try {
+          await popupView.webContents.loadURL(normalizeUrl(details.url));
+        } catch (error) {
+          if (entry.lastError?.code !== "network_host_blocked") {
+            log("warn", "browser.target.navigation-failed", {
+              sessionId: entry.sessionId,
+              targetRef: popup.targetRef,
+              error: serializeError(error),
+            });
+          }
+        }
+      });
+      return { action: "deny" };
+    });
     webContents.on("will-attach-webview", (event) => event.preventDefault());
+    webContents.on("will-prevent-unload", (event) => {
+      recordDialog(
+        entry,
+        target,
+        "beforeunload",
+        "The page requested confirmation before unloading.",
+      );
+      event.preventDefault();
+    });
+
+    try {
+      const browserDebugger = webContents.debugger;
+      if (!browserDebugger.isAttached()) browserDebugger.attach("1.3");
+      void browserDebugger.sendCommand("Page.enable").catch((error) => {
+        if (!webContents.isDestroyed()) {
+          log("warn", "browser.dialog-handler.enable-failed", {
+            sessionId: entry.sessionId,
+            error: serializeError(error),
+          });
+        }
+      });
+      browserDebugger.on("message", (_event, method, params) => {
+        if (method !== "Page.javascriptDialogOpening") return;
+        recordDialog(
+          entry,
+          target,
+          params?.type,
+          params?.message,
+          params?.defaultPrompt,
+        );
+        void browserDebugger
+          .sendCommand("Page.handleJavaScriptDialog", { accept: false })
+          .catch(() => {});
+      });
+    } catch (error) {
+      log("warn", "browser.dialog-handler.unavailable", {
+        sessionId: entry.sessionId,
+        error: serializeError(error),
+      });
+    }
 
     const updateEvents = [
       "did-start-loading",
@@ -415,6 +682,26 @@ function createDesktopBrowserHost(options) {
         details,
       });
       emitState(entry);
+    });
+    webContents.on("destroyed", () => {
+      sessionsByWebContentsId.delete(webContents.id);
+      entry.targets.delete(target.targetRef);
+      if (entry.destroyed || entry.activeTargetRef !== target.targetRef) return;
+      const fallback =
+        entry.targets.get(target.openerTargetRef) ||
+        entry.targets.values().next().value;
+      if (fallback) {
+        try {
+          getMainWindow()?.contentView?.removeChildView(target.view);
+        } catch {
+          // The owning window may already be tearing down.
+        }
+        entry.activeTargetRef = fallback.targetRef;
+        entry.view = fallback.view;
+        entry.attached = false;
+        attachEntry(entry);
+        emitState(entry);
+      }
     });
 
     browserSession.on("will-download", (_event, item, sourceContents) => {
@@ -446,12 +733,16 @@ function createDesktopBrowserHost(options) {
         webSecurity: true,
         allowRunningInsecureContent: false,
         spellcheck: false,
+        backgroundThrottling: false,
       },
     });
     view.setBounds(DEFAULT_BACKGROUND_BOUNDS);
     const entry = {
       sessionId: normalized,
       view,
+      targets: new Map(),
+      activeTargetRef: null,
+      dialogs: [],
       bounds: { ...DEFAULT_BACKGROUND_BOUNDS },
       requestedVisible: false,
       attached: false,
@@ -460,10 +751,13 @@ function createDesktopBrowserHost(options) {
       activeDownloadItem: null,
       lastError: null,
       observations: new Map(),
+      networkPolicyEnforced: false,
+      allowedHosts: new Set(),
       queue: Promise.resolve(),
     };
     sessions.set(normalized, entry);
-    configureRemoteContents(entry);
+    const target = registerTarget(entry, view);
+    entry.activeTargetRef = target.targetRef;
     attachEntry(entry);
     emitState(entry);
     log("info", "browser.session.created", { sessionId: normalized });
@@ -499,7 +793,24 @@ function createDesktopBrowserHost(options) {
       );
     }
     try {
-      return await operation();
+      return await withTimeout(
+        operation,
+        MAX_OPERATION_MS,
+        "Browser operation",
+        {
+          code: "operation_timeout",
+          abandonedOperation: true,
+        },
+      );
+    } catch (error) {
+      if (error?.abandonedOperation && !entry.destroyed) {
+        log("error", "browser.session.operation-abandoned", {
+          sessionId: entry.sessionId,
+          error: serializeError(error),
+        });
+        destroySession(entry.sessionId);
+      }
+      throw error;
     } finally {
       release();
     }
@@ -509,8 +820,24 @@ function createDesktopBrowserHost(options) {
     const targetUrl = normalizeUrl(rawUrl);
     entry.lastError = null;
     const webContents = entry.view.webContents;
-    const load = webContents.loadURL(targetUrl);
-    await Promise.race([load, timeoutAfter(MAX_WAIT_MS, "Navigation")]);
+    try {
+      await withTimeout(
+        () => webContents.loadURL(targetUrl),
+        MAX_WAIT_MS,
+        "Navigation",
+        { code: "navigation_timeout", abandonedOperation: true },
+      );
+    } catch (error) {
+      if (entry.lastError?.code === "network_host_blocked") {
+        throw new BrowserHostError(
+          entry.lastError.code,
+          entry.lastError.message,
+          403,
+          { host: entry.lastError.host },
+        );
+      }
+      throw error;
+    }
     if (waitOptions) await waitFor(entry, {}, waitOptions);
     return browserOutput(
       webContents,
@@ -527,10 +854,240 @@ function createDesktopBrowserHost(options) {
 
   function navigateFromAddressBar(sessionId, url) {
     const entry = requireSession(sessionId);
-    return runExclusive(entry, () => navigate(entry, url, null));
+    return runExclusive(entry, () => {
+      beginUserControl(entry);
+      return navigate(entry, url, null);
+    });
   }
 
-  async function snapshot(entry) {
+  function beginUserControl(entry) {
+    entry.networkPolicyEnforced = false;
+    entry.lastError = null;
+    log("info", "browser.session.control-mode-changed", {
+      sessionId: entry.sessionId,
+      mode: "user",
+    });
+    return sessionState(entry);
+  }
+
+  function frameSnapshotScript(limit) {
+    return `(() => {
+      const max = ${limit};
+      const identities = globalThis.__opentopiaBrowserNodeIdentities ||
+        (globalThis.__opentopiaBrowserNodeIdentities = { nodes: new WeakMap(), next: 0 });
+      const nodeKey = (element) => {
+        let key = identities.nodes.get(element);
+        if (!key) {
+          key = String(++identities.next);
+          identities.nodes.set(element, key);
+        }
+        return key;
+      };
+      const selector = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"],[tabindex]';
+      const escape = (value) => window.CSS && CSS.escape ? CSS.escape(String(value)) : String(value).replace(/[^a-zA-Z0-9_-]/g, (char) => "\\\\" + char);
+      const selectorFor = (element, root) => {
+        if (element.id) return "#" + escape(element.id);
+        const parts = [];
+        for (let current = element; current && current.nodeType === Node.ELEMENT_NODE; current = current.parentElement) {
+          let part = current.localName || "*";
+          const siblings = current.parentElement ? Array.from(current.parentElement.children).filter((item) => item.localName === current.localName) : [];
+          if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(current) + 1) + ")";
+          parts.unshift(part);
+          if (current.parentNode === root || current === document.body) break;
+        }
+        return parts.join(" > ");
+      };
+      const roleFor = (element) => element.getAttribute("role") || ({
+        a: "link", button: "button", textarea: "textbox", select: "combobox",
+        input: element.type === "checkbox" ? "checkbox" : element.type === "radio" ? "radio" : "textbox"
+      })[element.localName] || element.localName;
+      const handoffReason = (element, name, inputType, formMethod) => {
+        const normalized = [name, element.getAttribute("aria-label") || "", element.getAttribute("title") || ""].join(" ").toLowerCase();
+        if (inputType === "file") return "Please choose and upload the file yourself in the visible browser, then tell me to continue.";
+        if (inputType === "password" || /sign[ -]?in|log[ -]?in|password|passkey|verification|verify|captcha|one[ -]?time code|security code/.test(normalized)) return "Please complete the sign-in or verification step yourself in the visible browser, then tell me to continue.";
+        if (/pay|payment|checkout|purchase|buy now|place order|subscribe/.test(normalized)) return "Please review and complete the payment or purchase yourself in the visible browser, then tell me to continue.";
+        if (/send|publish|post|share|upload|delete|remove|submit|save changes|confirm/.test(normalized) && formMethod !== "get") return "Please review and complete this external action yourself in the visible browser, then tell me to continue.";
+        return null;
+      };
+      const nodes = [];
+      const walk = (root, shadowPath) => {
+        for (const element of root.querySelectorAll(selector)) {
+          if (nodes.length >= max) break;
+          if (element.disabled || !element.getClientRects().length) continue;
+          const rect = element.getBoundingClientRect();
+          const name = String(element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("placeholder") || "").slice(0, 2048);
+          const inputType = (element.getAttribute("type") || "").toLowerCase() || null;
+          const formMethod = (element.getAttribute("formmethod") || element.form?.getAttribute("method") || "get").toLowerCase();
+          const userActionReason = handoffReason(element, name, inputType, formMethod);
+          nodes.push({
+            selectorPath: [...shadowPath, selectorFor(element, root)],
+            nodeKey: nodeKey(element),
+            tagName: element.localName,
+            role: roleFor(element),
+            name,
+            href: element.href || null,
+            formAction: element.formAction || element.form?.action || null,
+            formMethod,
+            inputType,
+            editable: Boolean(element.isContentEditable || (["input", "textarea", "select"].includes(element.localName) && !element.readOnly)),
+            requiresUserAction: Boolean(userActionReason),
+            userActionReason,
+            bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          });
+        }
+        for (const host of root.querySelectorAll("*")) {
+          if (nodes.length >= max) break;
+          if (host.shadowRoot) walk(host.shadowRoot, [...shadowPath, selectorFor(host, root)]);
+        }
+      };
+      walk(document, []);
+      return { url: document.location.href, name: window.name || "", text: document.body ? document.body.innerText : "", nodes };
+    })()`;
+  }
+
+  async function collectStructuredSnapshot(entry) {
+    const target = activeTarget(entry);
+    const webContents = target.view.webContents;
+    const frameList = webContents.mainFrame?.framesInSubtree || [
+      webContents.mainFrame,
+    ];
+    const frames = [];
+    const interactiveElements = [];
+    const texts = [];
+    for (const frame of frameList) {
+      if (!frame || interactiveElements.length >= MAX_INTERACTIVE_ELEMENTS)
+        break;
+      const key = `${frame.processId}:${frame.routingId}`;
+      if (!target.frameRefs.has(key))
+        target.frameRefs.set(key, crypto.randomUUID());
+      const frameRef = target.frameRefs.get(key);
+      const parentKey = frame.parent
+        ? `${frame.parent.processId}:${frame.parent.routingId}`
+        : null;
+      if (parentKey && !target.frameRefs.has(parentKey))
+        target.frameRefs.set(parentKey, crypto.randomUUID());
+      try {
+        const result = await frame.executeJavaScript(
+          frameSnapshotScript(
+            MAX_INTERACTIVE_ELEMENTS - interactiveElements.length,
+          ),
+          false,
+        );
+        frames.push({
+          frameRef,
+          targetRef: target.targetRef,
+          parentFrameRef: parentKey ? target.frameRefs.get(parentKey) : null,
+          url: String(result?.url || frame.url || ""),
+          name: String(result?.name || ""),
+        });
+        if (result?.text) texts.push(String(result.text));
+        for (const node of result?.nodes || []) {
+          interactiveElements.push({
+            ...node,
+            targetRef: target.targetRef,
+            frameRef,
+            locator: {
+              targetRef: target.targetRef,
+              frameRef,
+              processId: frame.processId,
+              routingId: frame.routingId,
+              selectorPath: node.selectorPath,
+              nodeKey: node.nodeKey,
+            },
+          });
+        }
+      } catch (error) {
+        if (frame === webContents.mainFrame) throw error;
+      }
+    }
+    const text = truncateUtf8(texts.join("\n"), MAX_SNAPSHOT_BYTES);
+    let accessibilityTree = [];
+    try {
+      const ax = await withDebugger(webContents, (browserDebugger) =>
+        browserDebugger.sendCommand("Accessibility.getFullAXTree", {
+          depth: 32,
+        }),
+      );
+      const rootFrameRef =
+        frames.find((frame) => !frame.parentFrameRef)?.frameRef || null;
+      accessibilityTree = (ax?.nodes || []).slice(0, 1000).map((node) => {
+        const axValue = (field) => {
+          const value = field?.value;
+          return value == null ? "" : String(value);
+        };
+        return {
+          axNodeId: String(node.nodeId || ""),
+          parentAxNodeId: node.parentId ? String(node.parentId) : null,
+          role: axValue(node.role),
+          name: axValue(node.name),
+          value: axValue(node.value) || null,
+          description: axValue(node.description) || null,
+          ignored: Boolean(node.ignored),
+          targetRef: target.targetRef,
+          frameRef: rootFrameRef,
+          nodeRef: null,
+        };
+      });
+    } catch (error) {
+      log("warn", "browser.accessibility-tree.failed", {
+        sessionId: entry.sessionId,
+        error: serializeError(error),
+      });
+    }
+    const targets = [...entry.targets.values()].map((item) => ({
+      targetRef: item.targetRef,
+      url: item.view.webContents.isDestroyed()
+        ? ""
+        : item.view.webContents.getURL(),
+      title: item.view.webContents.isDestroyed()
+        ? ""
+        : item.view.webContents.getTitle(),
+      active: item.targetRef === entry.activeTargetRef,
+      opener: item.openerTargetRef,
+    }));
+    return {
+      url: webContents.getURL(),
+      title: webContents.getTitle(),
+      text: text.value,
+      textTruncated: text.truncated,
+      interactiveElements,
+      targets,
+      frames,
+      accessibilityTree,
+    };
+  }
+
+  async function snapshot(entry, includeInternalLocators = false) {
+    {
+      const webContents = entry.view.webContents;
+      const value = await collectStructuredSnapshot(entry);
+      const outputValue = includeInternalLocators
+        ? value
+        : {
+            ...value,
+            interactiveElements: value.interactiveElements.map(
+              ({
+                locator: _locator,
+                selectorPath: _selectorPath,
+                nodeKey: _nodeKey,
+                ...node
+              }) => node,
+            ),
+          };
+      return browserOutput(
+        webContents,
+        "snapshot",
+        [
+          { type: "text", text: value.text, truncated: value.textTruncated },
+          jsonContent(outputValue),
+        ],
+        {
+          title: value.title,
+          interactive_elements_truncated:
+            value.interactiveElements.length >= MAX_INTERACTIVE_ELEMENTS,
+        },
+      );
+    }
     const webContents = entry.view.webContents;
     const result = await webContents.executeJavaScript(
       `(() => {
@@ -606,7 +1163,7 @@ function createDesktopBrowserHost(options) {
               role: roleFor(element),
               name,
               href: element.href || null,
-              formAction: element.getAttribute("formaction") || (element.form && element.form.getAttribute("action")) || null,
+              formAction: element.formAction || (element.form && element.form.action) || null,
               formMethod,
               inputType,
               editable: Boolean(element.isContentEditable || (["input", "textarea", "select"].includes(element.localName) && !element.readOnly)),
@@ -674,7 +1231,7 @@ function createDesktopBrowserHost(options) {
   }
 
   async function observe(entry, includeScreenshot) {
-    const output = await snapshot(entry);
+    const output = await snapshot(entry, true);
     const snapshotValueResult = snapshotValue(output);
     if (!snapshotValueResult || typeof snapshotValueResult !== "object") {
       throw new BrowserHostError(
@@ -687,7 +1244,8 @@ function createDesktopBrowserHost(options) {
     const nodes = [];
     const bindings = new Map();
     for (const raw of snapshotValueResult.interactiveElements || []) {
-      if (!raw || typeof raw.selector !== "string") continue;
+      if (!raw || !raw.locator || !Array.isArray(raw.locator.selectorPath))
+        continue;
       const nodeRef = crypto.randomUUID();
       const node = {
         nodeRef,
@@ -695,20 +1253,26 @@ function createDesktopBrowserHost(options) {
         name: String(raw.name || ""),
         tagName: String(raw.tagName || ""),
         bounds: raw.bounds || { x: 0, y: 0, width: 0, height: 0 },
+        targetRef: typeof raw.targetRef === "string" ? raw.targetRef : null,
+        frameRef: typeof raw.frameRef === "string" ? raw.frameRef : null,
         href: typeof raw.href === "string" ? raw.href : null,
         formAction: typeof raw.formAction === "string" ? raw.formAction : null,
         formMethod: typeof raw.formMethod === "string" ? raw.formMethod : null,
         inputType: typeof raw.inputType === "string" ? raw.inputType : null,
         editable: Boolean(raw.editable),
         requiresUserAction: Boolean(raw.requiresUserAction),
-        userActionReason: typeof raw.userActionReason === "string" ? raw.userActionReason : null,
+        userActionReason:
+          typeof raw.userActionReason === "string"
+            ? raw.userActionReason
+            : null,
       };
       nodes.push(node);
-      bindings.set(nodeRef, { node, selector: raw.selector });
+      bindings.set(nodeRef, { node, locator: raw.locator });
     }
     entry.observations.set(observationId, {
       capturedAt: Date.now(),
       url: String(snapshotValueResult.url || entry.view.webContents.getURL()),
+      targetRef: entry.activeTargetRef,
       nodes: bindings,
     });
     pruneObservations(entry);
@@ -728,16 +1292,25 @@ function createDesktopBrowserHost(options) {
     return {
       observationId,
       url: String(snapshotValueResult.url || entry.view.webContents.getURL()),
-      title: String(snapshotValueResult.title || entry.view.webContents.getTitle()),
+      title: String(
+        snapshotValueResult.title || entry.view.webContents.getTitle(),
+      ),
       text: String(snapshotValueResult.text || ""),
       textTruncated: Boolean(snapshotValueResult.textTruncated),
       nodes,
+      targets: snapshotValueResult.targets || [],
+      frames: snapshotValueResult.frames || [],
+      accessibilityTree: snapshotValueResult.accessibilityTree || [],
+      dialogs: entry.dialogs.splice(0),
       screenshot: screenshotValue,
     };
   }
 
   function observedNode(entry, rawObservationId, rawNodeRef) {
-    if (typeof rawObservationId !== "string" || typeof rawNodeRef !== "string") {
+    if (
+      typeof rawObservationId !== "string" ||
+      typeof rawNodeRef !== "string"
+    ) {
       throw new BrowserHostError(
         "invalid_observation",
         "observationId and nodeRef are required.",
@@ -762,6 +1335,8 @@ function createDesktopBrowserHost(options) {
       expected.role === current.role &&
       expected.name === current.name &&
       expected.tagName === current.tagName &&
+      expected.targetRef === current.targetRef &&
+      expected.frameRef === current.frameRef &&
       expected.href === current.href &&
       expected.formAction === current.formAction &&
       expected.formMethod === current.formMethod &&
@@ -769,11 +1344,125 @@ function createDesktopBrowserHost(options) {
       expected.editable === current.editable &&
       expected.requiresUserAction === current.requiresUserAction &&
       expected.userActionReason === current.userActionReason &&
-      Math.abs(Number(bounds.x) - Number(currentBounds.x)) <= MAX_NODE_POSITION_DRIFT &&
-      Math.abs(Number(bounds.y) - Number(currentBounds.y)) <= MAX_NODE_POSITION_DRIFT &&
-      Math.abs(Number(bounds.width) - Number(currentBounds.width)) <= MAX_NODE_POSITION_DRIFT &&
-      Math.abs(Number(bounds.height) - Number(currentBounds.height)) <= MAX_NODE_POSITION_DRIFT
+      Math.abs(Number(bounds.x) - Number(currentBounds.x)) <=
+        MAX_NODE_POSITION_DRIFT &&
+      Math.abs(Number(bounds.y) - Number(currentBounds.y)) <=
+        MAX_NODE_POSITION_DRIFT &&
+      Math.abs(Number(bounds.width) - Number(currentBounds.width)) <=
+        MAX_NODE_POSITION_DRIFT &&
+      Math.abs(Number(bounds.height) - Number(currentBounds.height)) <=
+        MAX_NODE_POSITION_DRIFT
     );
+  }
+
+  function locatorsMatch(left, right) {
+    return Boolean(
+      left &&
+      right &&
+      left.targetRef === right.targetRef &&
+      left.frameRef === right.frameRef &&
+      left.processId === right.processId &&
+      left.routingId === right.routingId &&
+      left.nodeKey === right.nodeKey &&
+      Array.isArray(left.selectorPath) &&
+      Array.isArray(right.selectorPath) &&
+      left.selectorPath.length === right.selectorPath.length &&
+      left.selectorPath.every(
+        (part, index) => part === right.selectorPath[index],
+      ),
+    );
+  }
+
+  function frameForLocator(entry, locator) {
+    const target = activeTarget(entry);
+    if (target.targetRef !== locator?.targetRef) {
+      throw staleObservation(
+        "The active browser target changed after the observation.",
+      );
+    }
+    const frames = target.view.webContents.mainFrame?.framesInSubtree || [
+      target.view.webContents.mainFrame,
+    ];
+    const frame = frames.find(
+      (candidate) =>
+        candidate.processId === locator.processId &&
+        candidate.routingId === locator.routingId,
+    );
+    if (!frame)
+      throw staleObservation(
+        "The observed frame navigated or no longer exists.",
+      );
+    return frame;
+  }
+
+  async function performLocator(entry, locator, request) {
+    const frame = frameForLocator(entry, locator);
+    const result = await frame.executeJavaScript(
+      `(() => {
+        const path = ${JSON.stringify(locator.selectorPath)};
+        let root = document;
+        let element = null;
+        for (let index = 0; index < path.length; index += 1) {
+          element = root.querySelector(path[index]);
+          if (!element) return { found: false };
+          if (index + 1 < path.length) {
+            root = element.shadowRoot;
+            if (!root) return { found: false };
+          }
+        }
+        element.scrollIntoView({ block: "center", inline: "center" });
+        const operation = ${JSON.stringify(request.operation)};
+        const value = ${JSON.stringify(typeof request.value === "string" ? request.value : typeof request.text === "string" ? request.text : "")};
+        if (operation === "click") {
+          element.click();
+        } else if (operation === "type") {
+          element.focus();
+          const next = ${request.clearFirst !== false} ? value : String(element.value ?? element.textContent ?? "") + value;
+          if (element.isContentEditable) element.textContent = next;
+          else if ("value" in element) {
+            const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value");
+            if (descriptor?.set) descriptor.set.call(element, next); else element.value = next;
+          } else return { found: true, supported: false };
+          element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: value }));
+          element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        } else if (operation === "select") {
+          if (!(element instanceof HTMLSelectElement)) return { found: true, supported: false };
+          const option = Array.from(element.options).find((candidate) => candidate.value === value || candidate.label === value);
+          if (!option) return { found: true, optionFound: false };
+          element.value = option.value;
+          element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+          element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        } else if (operation === "hover") {
+          const rect = element.getBoundingClientRect();
+          const init = { bubbles: true, composed: true, clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2 };
+          if (typeof PointerEvent === "function") element.dispatchEvent(new PointerEvent("pointerover", init));
+          element.dispatchEvent(new MouseEvent("mouseover", init));
+          element.dispatchEvent(new MouseEvent("mouseenter", { ...init, bubbles: false }));
+          element.dispatchEvent(new MouseEvent("mousemove", init));
+        } else if (operation === "scroll") {
+          const scroller = element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth ? element : window;
+          scroller.scrollBy({ left: ${Number(request.deltaX) || 0}, top: ${Number(request.deltaY) || 0}, behavior: "instant" });
+        } else return { found: true, supported: false };
+        return { found: true, supported: true, optionFound: true };
+      })()`,
+      true,
+    );
+    if (!result?.found)
+      throw staleObservation("The observed element no longer exists.");
+    if (result.supported === false) {
+      throw new BrowserHostError(
+        "unsupported_element_action",
+        `The observed element does not support ${request.operation}.`,
+        409,
+      );
+    }
+    if (result.optionFound === false) {
+      throw new BrowserHostError(
+        "select_option_not_found",
+        "The requested select option does not exist.",
+        409,
+      );
+    }
   }
 
   async function perform(entry, request) {
@@ -783,12 +1472,18 @@ function createDesktopBrowserHost(options) {
       request.nodeRef,
     );
     const webContents = entry.view.webContents;
+    if (entry.activeTargetRef !== observation.targetRef) {
+      throw staleObservation(
+        "The active browser target changed after the observation.",
+      );
+    }
     if (webContents.getURL() !== observation.url) {
       throw staleObservation("The page URL changed after the observation.");
     }
-    const output = await snapshot(entry);
-    const current = snapshotValue(output)?.interactiveElements?.find(
-      (node) => node?.selector === binding.selector,
+    const output = await snapshot(entry, true);
+    const before = snapshotValue(output);
+    const current = before?.interactiveElements?.find((node) =>
+      locatorsMatch(node?.locator, binding.locator),
     );
     if (!current) {
       throw staleObservation("The observed element no longer exists.");
@@ -796,38 +1491,66 @@ function createDesktopBrowserHost(options) {
     const currentNode = {
       ...current,
       nodeRef: binding.node.nodeRef,
+      targetRef:
+        typeof current.targetRef === "string" ? current.targetRef : null,
+      frameRef: typeof current.frameRef === "string" ? current.frameRef : null,
       href: typeof current.href === "string" ? current.href : null,
-      formAction: typeof current.formAction === "string" ? current.formAction : null,
-      formMethod: typeof current.formMethod === "string" ? current.formMethod : null,
-      inputType: typeof current.inputType === "string" ? current.inputType : null,
+      formAction:
+        typeof current.formAction === "string" ? current.formAction : null,
+      formMethod:
+        typeof current.formMethod === "string" ? current.formMethod : null,
+      inputType:
+        typeof current.inputType === "string" ? current.inputType : null,
       editable: Boolean(current.editable),
       requiresUserAction: Boolean(current.requiresUserAction),
-      userActionReason: typeof current.userActionReason === "string" ? current.userActionReason : null,
+      userActionReason:
+        typeof current.userActionReason === "string"
+          ? current.userActionReason
+          : null,
     };
     if (!nodesMatch(binding.node, currentNode)) {
       throw staleObservation("The observed element changed or moved.");
     }
-    if (request.operation === "click") {
-      await click(entry, binding.selector);
-    } else if (request.operation === "type") {
-      if (!currentNode.editable) {
-        throw staleObservation("The observed element is no longer editable.");
-      }
-      await typeText(entry, binding.selector, request.text);
-    } else {
-      throw new BrowserHostError("invalid_action", "operation must be click or type.");
+    if (request.operation === "type" && !currentNode.editable) {
+      throw staleObservation("The observed element is no longer editable.");
     }
+    if (request.operation === "click")
+      validateElementNavigation(currentNode, webContents.getURL());
+    if (
+      !new Set(["click", "type", "select", "hover", "scroll"]).has(
+        request.operation,
+      )
+    ) {
+      throw new BrowserHostError(
+        "invalid_action",
+        "operation must be click, type, select, hover, or scroll.",
+      );
+    }
+    await performLocator(entry, binding.locator, request);
+    await sleep(50);
+    const after = snapshotValue(await snapshot(entry, true));
+    const urlChanged = String(before?.url || "") !== String(after?.url || "");
+    const titleChanged =
+      String(before?.title || "") !== String(after?.title || "");
+    const textChanged =
+      String(before?.text || "") !== String(after?.text || "");
     return {
       observationId: request.observationId,
       nodeRef: request.nodeRef,
       action: request.operation,
       target: currentNode,
-      url: webContents.getURL(),
-      title: webContents.getTitle(),
+      url: entry.view.webContents.getURL(),
+      title: entry.view.webContents.getTitle(),
+      verification: {
+        pageChanged: urlChanged || titleChanged || textChanged,
+        urlChanged,
+        titleChanged,
+        textChanged,
+      },
     };
   }
 
-  async function withDebugger(webContents, operation) {
+  async function withDebugger(webContents, operation, timeoutOptions = null) {
     const browserDebugger = webContents.debugger;
     let attachedHere = false;
     if (!browserDebugger.isAttached()) {
@@ -835,7 +1558,13 @@ function createDesktopBrowserHost(options) {
       attachedHere = true;
     }
     try {
-      return await operation(browserDebugger);
+      if (!timeoutOptions) return await operation(browserDebugger);
+      return await withTimeout(
+        () => operation(browserDebugger),
+        timeoutOptions.milliseconds,
+        timeoutOptions.label,
+        { code: timeoutOptions.code },
+      );
     } finally {
       if (attachedHere && browserDebugger.isAttached())
         browserDebugger.detach();
@@ -844,21 +1573,80 @@ function createDesktopBrowserHost(options) {
 
   async function screenshot(entry) {
     const webContents = entry.view.webContents;
-    const result = await withDebugger(webContents, (browserDebugger) =>
-      browserDebugger.sendCommand("Page.captureScreenshot", {
-        format: "png",
-        fromSurface: true,
-        captureBeyondViewport: false,
-      }),
-    );
-    if (!result?.data) {
-      throw new BrowserHostError(
-        "screenshot_failed",
-        "Page.captureScreenshot returned no image data.",
-        500,
+    const surfaceWasVisible = sessionState(entry).visible;
+    let bytes;
+    let captureBackend = "capture_page";
+    let fallbackReason = null;
+    try {
+      if (!surfaceWasVisible) {
+        entry.view.setBounds({
+          ...entry.bounds,
+          x: -entry.bounds.width - 1,
+        });
+        entry.view.setVisible(true);
+        await sleep(50);
+      }
+      const image = await withTimeout(
+        () =>
+          webContents.capturePage(undefined, {
+            stayHidden: false,
+            stayAwake: true,
+          }),
+        SCREENSHOT_CAPTURE_MS,
+        "Electron screenshot capture",
+        { code: "screenshot_capture_timeout" },
       );
+      if (imageLooksBlank(image)) {
+        throw new BrowserHostError(
+          "screenshot_capture_blank",
+          "Electron screenshot capture returned an empty or blank image.",
+          500,
+        );
+      }
+      bytes = image.toPNG();
+    } catch (primaryError) {
+      captureBackend = "devtools";
+      fallbackReason = serializeError(primaryError).code;
+      log("warn", "browser.screenshot.capture-page-failed", {
+        sessionId: entry.sessionId,
+        error: serializeError(primaryError),
+      });
+      const result = await withDebugger(
+        webContents,
+        (browserDebugger) =>
+          browserDebugger.sendCommand("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          }),
+        {
+          milliseconds: SCREENSHOT_CAPTURE_MS,
+          label: "DevTools screenshot capture",
+          code: "screenshot_fallback_timeout",
+        },
+      );
+      if (!result?.data) {
+        throw new BrowserHostError(
+          "screenshot_failed",
+          "Screenshot capture returned no image data.",
+          500,
+        );
+      }
+      bytes = Buffer.from(result.data, "base64");
+      if (nativeImage && imageLooksBlank(nativeImage.createFromBuffer(bytes))) {
+        throw new BrowserHostError(
+          "screenshot_blank",
+          "Both screenshot backends returned an empty or blank image.",
+          500,
+        );
+      }
+    } finally {
+      if (!surfaceWasVisible && !entry.destroyed) {
+        entry.view.setVisible(false);
+        entry.view.setBounds(entry.bounds);
+        setActualVisibility(entry);
+      }
     }
-    const bytes = Buffer.from(result.data, "base64");
     if (bytes.length > MAX_SCREENSHOT_BYTES) {
       throw new BrowserHostError(
         "screenshot_too_large",
@@ -866,9 +1654,21 @@ function createDesktopBrowserHost(options) {
         413,
       );
     }
-    return browserOutput(webContents, "screenshot", [
-      { type: "image", mime_type: "image/png", bytes: Array.from(bytes) },
-    ]);
+    return browserOutput(
+      webContents,
+      "screenshot",
+      [
+        {
+          type: "image",
+          mime_type: "image/png",
+          bytes: bytes.toString("base64"),
+        },
+      ],
+      {
+        captureBackend,
+        fallbackReason,
+      },
+    );
   }
 
   async function locateElement(entry, rawSelector) {
@@ -1088,10 +1888,7 @@ function createDesktopBrowserHost(options) {
         409,
       );
     }
-    const downloadDirectory = path.join(
-      app.getPath("downloads"),
-      "OpenTopia",
-    );
+    const downloadDirectory = path.join(app.getPath("downloads"), "OpenTopia");
     fs.mkdirSync(downloadDirectory, { recursive: true });
 
     let downloadTimeout;
@@ -1204,7 +2001,12 @@ function createDesktopBrowserHost(options) {
     entry.activeDownloadItem = null;
     detachEntry(entry);
     entry.destroyed = true;
-    if (!entry.view.webContents.isDestroyed()) entry.view.webContents.close();
+    for (const target of [...entry.targets.values()]) {
+      sessionsByWebContentsId.delete(target.view.webContents.id);
+      if (!target.view.webContents.isDestroyed())
+        target.view.webContents.close();
+    }
+    entry.targets.clear();
     sessions.delete(entry.sessionId);
     log("info", "browser.session.destroyed", { sessionId: entry.sessionId });
     return { sessionId: entry.sessionId, destroyed: true };
@@ -1237,10 +2039,12 @@ function createDesktopBrowserHost(options) {
       "snapshot",
       "observe",
       "observation_node",
+      "switch_target",
       "screenshot",
       "perform",
       "wait",
       "download",
+      "grant_network_access",
       "close",
     ]);
     if (!supported.has(action)) {
@@ -1264,6 +2068,27 @@ function createDesktopBrowserHost(options) {
     const entry = createSession(sessionId);
     return runExclusive(entry, async () => {
       switch (action) {
+        case "grant_network_access": {
+          const allowedHosts = normalizeAllowedHosts(request.allowedHosts);
+          if (
+            new Set([...entry.allowedHosts, ...allowedHosts]).size >
+            MAX_NETWORK_HOSTS
+          ) {
+            throw new BrowserHostError(
+              "invalid_network_grant",
+              `A browser session may authorize at most ${MAX_NETWORK_HOSTS} hosts.`,
+            );
+          }
+          entry.networkPolicyEnforced = true;
+          for (const host of allowedHosts) entry.allowedHosts.add(host);
+          log("info", "browser.session.control-mode-changed", {
+            sessionId: entry.sessionId,
+            mode: "automation",
+          });
+          return browserOutput(entry.view.webContents, action, [], {
+            allowedHosts: [...entry.allowedHosts].sort(),
+          });
+        }
         case "navigate":
           return navigate(entry, request.url, parseWaitOptions(request));
         case "snapshot":
@@ -1273,6 +2098,26 @@ function createDesktopBrowserHost(options) {
         case "observation_node":
           return observedNode(entry, request.observationId, request.nodeRef)
             .binding.node;
+        case "switch_target": {
+          if (typeof request.targetRef !== "string" || !request.targetRef) {
+            throw new BrowserHostError(
+              "invalid_target",
+              "targetRef is required.",
+            );
+          }
+          const target = switchActiveTarget(entry, request.targetRef);
+          return browserOutput(
+            target.view.webContents,
+            action,
+            [
+              jsonContent({
+                url: target.view.webContents.getURL(),
+                title: target.view.webContents.getTitle(),
+              }),
+            ],
+            { targetRef: target.targetRef },
+          );
+        }
         case "screenshot":
           return screenshot(entry);
         case "perform":
@@ -1407,7 +2252,11 @@ function createDesktopBrowserHost(options) {
         },
       );
       sendJson(response, serialized.statusCode, {
-        error: { code: serialized.code, message: serialized.message },
+        error: {
+          code: serialized.code,
+          message: serialized.message,
+          ...(serialized.details || {}),
+        },
       });
     }
   }
@@ -1463,14 +2312,22 @@ function createDesktopBrowserHost(options) {
     );
     handle(IPC_CHANNELS.navigate, (sessionId, url) => {
       const entry = requireSession(sessionId);
-      return runExclusive(entry, () => navigate(entry, url, null));
+      return runExclusive(entry, () => {
+        beginUserControl(entry);
+        return navigate(entry, url, null);
+      });
     });
     handle(IPC_CHANNELS.navigateFromAddressBar, (sessionId, url) =>
       navigateFromAddressBar(sessionId, url),
     );
+    handle(IPC_CHANNELS.beginUserControl, (sessionId) => {
+      const entry = requireSession(sessionId);
+      return runExclusive(entry, () => beginUserControl(entry));
+    });
     handle(IPC_CHANNELS.back, async (sessionId) => {
       const entry = requireSession(sessionId);
       return runExclusive(entry, async () => {
+        beginUserControl(entry);
         const history = navigationHistory(entry.view.webContents);
         if (history.canGoBack()) history.goBack();
         return sessionState(entry);
@@ -1479,6 +2336,7 @@ function createDesktopBrowserHost(options) {
     handle(IPC_CHANNELS.forward, async (sessionId) => {
       const entry = requireSession(sessionId);
       return runExclusive(entry, async () => {
+        beginUserControl(entry);
         const history = navigationHistory(entry.view.webContents);
         if (history.canGoForward()) history.goForward();
         return sessionState(entry);
@@ -1487,6 +2345,7 @@ function createDesktopBrowserHost(options) {
     handle(IPC_CHANNELS.reload, async (sessionId) => {
       const entry = requireSession(sessionId);
       return runExclusive(entry, async () => {
+        beginUserControl(entry);
         entry.view.webContents.reload();
         return sessionState(entry);
       });

@@ -15,6 +15,8 @@ const browserHost = Object.freeze({
       sessionId,
       url,
     ),
+  beginUserControl: (sessionId) =>
+    ipcRenderer.invoke("browser-host:begin-user-control", sessionId),
   back: (sessionId) => ipcRenderer.invoke("browser-host:back", sessionId),
   forward: (sessionId) => ipcRenderer.invoke("browser-host:forward", sessionId),
   reload: (sessionId) => ipcRenderer.invoke("browser-host:reload", sessionId),

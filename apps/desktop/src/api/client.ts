@@ -861,6 +861,10 @@ export class ApiClient {
         | "screenshot"
         | "click"
         | "type"
+        | "select"
+        | "hover"
+        | "scroll"
+        | "switch_target"
         | "wait"
         | "download"
         | "close";
@@ -869,7 +873,11 @@ export class ApiClient {
       observationId?: string;
       nodeRef?: string;
       text?: string;
+      value?: string;
       clearFirst?: boolean;
+      deltaX?: number;
+      deltaY?: number;
+      targetRef?: string;
       includeScreenshot?: boolean;
       condition?: "document_complete" | "selector" | "text";
       timeoutMs?: number;

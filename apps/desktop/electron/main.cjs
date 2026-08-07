@@ -2354,6 +2354,7 @@ if (!singleInstance) {
     desktopBrowserHost = createDesktopBrowserHost({
       app,
       WebContentsView,
+      nativeImage,
       getMainWindow: () => mainWindow,
       logger: (level, event, metadata) => logConsole(level, event, metadata),
     });

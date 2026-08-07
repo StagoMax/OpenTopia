@@ -93,9 +93,48 @@ export type BrowserNode = {
   name: string;
   tagName: string;
   bounds: BrowserRect;
+  targetRef?: string | null;
+  frameRef?: string | null;
   href?: string | null;
   formAction?: string | null;
   editable: boolean;
+};
+
+export type BrowserTarget = {
+  targetRef: string;
+  url: string;
+  title: string;
+  active: boolean;
+  opener?: string | null;
+};
+
+export type BrowserFrame = {
+  frameRef: string;
+  targetRef: string;
+  parentFrameRef?: string | null;
+  url: string;
+  name: string;
+};
+
+export type BrowserAccessibilityNode = {
+  axNodeId: string;
+  parentAxNodeId?: string | null;
+  role: string;
+  name: string;
+  value?: string | null;
+  description?: string | null;
+  ignored: boolean;
+  targetRef: string;
+  frameRef?: string | null;
+  nodeRef?: string | null;
+};
+
+export type BrowserDialog = {
+  dialogType: string;
+  message: string;
+  defaultPrompt?: string | null;
+  handled: boolean;
+  targetRef: string;
 };
 
 export type BrowserObservation = {
@@ -105,6 +144,10 @@ export type BrowserObservation = {
   text: string;
   textTruncated: boolean;
   nodes: BrowserNode[];
+  targets: BrowserTarget[];
+  frames: BrowserFrame[];
+  accessibilityTree: BrowserAccessibilityNode[];
+  dialogs: BrowserDialog[];
 };
 
 export type ScreenRect = {
@@ -1923,10 +1966,7 @@ export type TaskPlanStep = {
 };
 
 export type TaskEvidenceKind =
-  | "observation"
-  | "implementation"
-  | "verification"
-  | "global_check";
+  "observation" | "implementation" | "verification" | "global_check";
 
 export type TaskPlanCoverage = {
   requirementsRevision: number;
@@ -2066,6 +2106,7 @@ export type ModelRequestSnapshot = {
   }>;
   contextItems?: ModelContextItem[];
   previousResponseItems?: unknown[];
+  previousResponseId?: string | null;
   promptCacheKey?: string | null;
   finalOutputJsonSchema?: unknown | null;
 };
@@ -2080,6 +2121,7 @@ export type ModelContextItem = {
     | "world_state"
     | "skill"
     | "summary"
+    | "checkpoint"
     | "conversation"
     | "user"
     | "tool_call"
@@ -2438,6 +2480,7 @@ declare global {
           sessionId: string,
           url: string,
         ): Promise<unknown>;
+        beginUserControl(sessionId: string): Promise<unknown>;
         back(sessionId: string): Promise<unknown>;
         forward(sessionId: string): Promise<unknown>;
         reload(sessionId: string): Promise<unknown>;

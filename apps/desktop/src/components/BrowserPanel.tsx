@@ -1,9 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowDown,
   Camera,
   Download,
   Keyboard,
+  ListChecks,
   Loader2,
+  Move,
   MousePointer2,
   RefreshCw,
   Square,
@@ -27,6 +30,10 @@ type BrowserAction =
   | "screenshot"
   | "click"
   | "type"
+  | "select"
+  | "hover"
+  | "scroll"
+  | "switch_target"
   | "download"
   | "close";
 
@@ -43,6 +50,7 @@ export function BrowserPanel({
 }) {
   const [url, setUrl] = useState("");
   const [selectedNodeRef, setSelectedNodeRef] = useState("");
+  const [selectedTargetRef, setSelectedTargetRef] = useState("");
   const [text, setText] = useState("");
   const [output, setOutput] = useState<BrowserOutput | null>(null);
   const [isRunning, setIsRunning] = useState(false);
@@ -181,12 +189,21 @@ export function BrowserPanel({
         : (observation?.nodes[0]?.nodeRef ?? ""),
     );
   }, [observation]);
+  useEffect(() => {
+    setSelectedTargetRef(
+      observation?.targets.find((target) => target.active)?.targetRef ?? "",
+    );
+  }, [observation]);
   const handoff = useMemo(
     () => activeBrowserHandoff(events, threadId),
     [events, threadId],
   );
 
-  async function run(action: BrowserAction, requestedUrl = url) {
+  async function run(
+    action: BrowserAction,
+    requestedUrl = url,
+    requestedTargetRef = selectedTargetRef,
+  ) {
     if (!client || !threadId || isRunning) return;
     const requestVersion = ++requestVersionRef.current;
     const requestThreadId = threadId;
@@ -201,14 +218,18 @@ export function BrowserPanel({
             ? requestedUrl
             : undefined,
         observationId:
-          action === "click" || action === "type"
+          ["click", "type", "select", "hover", "scroll"].includes(action)
             ? observation?.observationId
             : undefined,
         nodeRef:
-          action === "click" || action === "type"
+          ["click", "type", "select", "hover", "scroll"].includes(action)
             ? selectedNode?.nodeRef
             : undefined,
         text: action === "type" ? text : undefined,
+        value: action === "select" ? text : undefined,
+        deltaY: action === "scroll" ? 600 : undefined,
+        targetRef:
+          action === "switch_target" ? requestedTargetRef : undefined,
       });
       if (
         requestVersionRef.current !== requestVersion ||
@@ -317,6 +338,27 @@ export function BrowserPanel({
         </button>
       </div>
 
+      {observation && observation.targets.length > 1 && (
+        <div className="browser-selector-row">
+          <select
+            aria-label="Active browser target"
+            disabled={disabled}
+            value={selectedTargetRef}
+            onChange={(event) => {
+              const targetRef = event.target.value;
+              setSelectedTargetRef(targetRef);
+              void run("switch_target", url, targetRef);
+            }}
+          >
+            {observation.targets.map((target) => (
+              <option key={target.targetRef} value={target.targetRef}>
+                {target.title || target.url}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
       <div className="browser-selector-row">
         <select
           aria-label="Observed browser element"
@@ -344,6 +386,26 @@ export function BrowserPanel({
         >
           <MousePointer2 size={14} />
         </button>
+        <button
+          aria-label="Hover observed element"
+          className="icon-button small"
+          disabled={disabled || !selectedNode}
+          onClick={() => void run("hover")}
+          title="Hover observed element"
+          type="button"
+        >
+          <Move size={14} />
+        </button>
+        <button
+          aria-label="Scroll observed element"
+          className="icon-button small"
+          disabled={disabled || !selectedNode}
+          onClick={() => void run("scroll")}
+          title="Scroll observed element"
+          type="button"
+        >
+          <ArrowDown size={14} />
+        </button>
       </div>
       <div className="browser-selector-row">
         <input
@@ -361,6 +423,16 @@ export function BrowserPanel({
           type="button"
         >
           <Keyboard size={14} />
+        </button>
+        <button
+          aria-label="Select observed option"
+          className="icon-button small"
+          disabled={disabled || selectedNode?.tagName !== "select" || !text.length}
+          onClick={() => void run("select")}
+          title="Select observed option"
+          type="button"
+        >
+          <ListChecks size={14} />
         </button>
       </div>
 
@@ -507,6 +579,27 @@ function browserObservationFromOutput(
       text: typeof value.text === "string" ? value.text : "",
       textTruncated: value.textTruncated === true,
       nodes,
+      targets: Array.isArray(value.targets)
+        ? value.targets.flatMap((candidate) => {
+            const target = asRecord(candidate);
+            return typeof target?.targetRef === "string"
+              ? [{
+                  targetRef: target.targetRef,
+                  url: typeof target.url === "string" ? target.url : "",
+                  title: typeof target.title === "string" ? target.title : "",
+                  active: target.active === true,
+                  opener: typeof target.opener === "string" ? target.opener : null,
+                }]
+              : [];
+          })
+        : [],
+      frames: Array.isArray(value.frames) ? (value.frames as BrowserObservation["frames"]) : [],
+      accessibilityTree: Array.isArray(value.accessibilityTree)
+        ? (value.accessibilityTree as BrowserObservation["accessibilityTree"])
+        : [],
+      dialogs: Array.isArray(value.dialogs)
+        ? (value.dialogs as BrowserObservation["dialogs"])
+        : [],
     };
   }
   return null;
@@ -539,6 +632,8 @@ function browserNodeFromValue(value: unknown): BrowserNode | null {
       width: bounds.width,
       height: bounds.height,
     },
+    targetRef: typeof node.targetRef === "string" ? node.targetRef : null,
+    frameRef: typeof node.frameRef === "string" ? node.frameRef : null,
     href: typeof node.href === "string" ? node.href : null,
     formAction: typeof node.formAction === "string" ? node.formAction : null,
     editable: node.editable,
