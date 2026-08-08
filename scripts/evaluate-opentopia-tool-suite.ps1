@@ -2,6 +2,8 @@ param(
   [Parameter(Mandatory = $true)][string]$EnvFile,
   [string]$Profile = "AUDIT_COPILOT_LLM",
   [string]$ExpectedModel = "",
+  [string]$ModelOverride = "",
+  [string]$ReasoningEffort = "",
   [ValidateRange(1024, 65535)][int]$Port = 8812,
   [ValidateRange(1, 100)][int]$Repetitions = 1,
   [string]$SuitePath = "evaluation\examples\opentopia-tool-suite\suite.json",
@@ -49,8 +51,13 @@ function ConvertFrom-DotEnvFile {
 
 function New-EvaluationToken {
   $bytes = [byte[]]::new(32)
-  [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-  return [Convert]::ToHexString($bytes).ToLowerInvariant()
+  $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $generator.GetBytes($bytes)
+  } finally {
+    $generator.Dispose()
+  }
+  return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
 }
 
 function Protect-Text {
@@ -334,19 +341,63 @@ function New-RuntimeTarget {
   [IO.File]::WriteAllText($DestinationPath, "$targetJson`n", [Text.UTF8Encoding]::new($false))
 }
 
+function Set-EvaluationProviderSettings {
+  param(
+    [Parameter(Mandatory = $true)][string]$Model,
+    [AllowEmptyString()][string]$ReasoningEffort = ""
+  )
+
+  $settings = Invoke-EvalApi "Get" "/api/settings"
+  $activeProviderId = [string]$settings.activeProviderId
+  $providers = @($settings.providers | ForEach-Object {
+    if ([string]$_.id -eq $activeProviderId) {
+      $_.model = $Model
+      if ($ReasoningEffort) {
+        $_.reasoningEffort = $ReasoningEffort
+      }
+    }
+    $_
+  })
+  if (-not $providers -or -not ($providers | Where-Object { [string]$_.id -eq $activeProviderId })) {
+    throw "OpenTopia active provider was not found"
+  }
+
+  Invoke-EvalApi "Patch" "/api/settings" @{
+    providers = $providers
+    activeProviderId = $activeProviderId
+  } | Out-Null
+  return Invoke-EvalApi "Get" "/api/settings"
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . "$PSScriptRoot\dev-env.ps1"
 
 $envFilePath = (Resolve-Path -LiteralPath $EnvFile).Path
 $values = ConvertFrom-DotEnvFile $envFilePath
-$apiKey = [string]$values["${Profile}_API_KEY"]
-$baseUrl = ([string]$values["${Profile}_BASE_URL"]).TrimEnd("/")
-$model = [string]$values["${Profile}_MODEL"]
+$apiKey = @(
+  [string]$values["${Profile}_API_KEY"]
+  [string]$values["${Profile}_KEY"]
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
+$baseUrl = @(
+  [string]$values["${Profile}_BASE_URL"]
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
+$configuredModel = @(
+  [string]$values["${Profile}_MODEL"]
+  [string]$values["${Profile}MODEL"]
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
+$apiKey = [string]$apiKey
+$baseUrl = ([string]$baseUrl).TrimEnd("/")
+$configuredModel = [string]$configuredModel
+$model = if ($ModelOverride) { $ModelOverride.Trim() } else { $configuredModel }
 if (-not $apiKey -or -not $baseUrl -or -not $model) {
   throw "The selected provider profile is incomplete"
 }
 if ($ExpectedModel -and $model -ne $ExpectedModel) {
   throw "Selected model does not match the expected model"
+}
+$supportedReasoningEfforts = @("none", "minimal", "low", "medium", "high", "xhigh", "max")
+if ($ReasoningEffort -and $supportedReasoningEfforts -notcontains $ReasoningEffort) {
+  throw "ReasoningEffort must be one of: $($supportedReasoningEfforts -join ', ')"
 }
 
 $suitePath = if ([IO.Path]::IsPathRooted($SuitePath)) {
@@ -487,6 +538,7 @@ try {
 
   New-RuntimeTarget $targetPath $runtimeTargetPath $adapterPath
   $script:ServerProcess = Start-EvalServer "initial" $serverPath $databasePath $runRoot
+  $settings = Set-EvaluationProviderSettings $model $ReasoningEffort
   $providerHealth = Invoke-EvalApi "Post" "/api/provider/test" @{}
   if (-not $providerHealth.reachable -or -not $providerHealth.modelAvailable) {
     throw "OpenTopia provider health check failed"
@@ -501,9 +553,10 @@ try {
   if (
     -not $activeProvider -or
     $activeProvider.model -ne $model -or
-    $activeProvider.baseUrl.TrimEnd("/") -ne $baseUrl
+    $activeProvider.baseUrl.TrimEnd("/") -ne $baseUrl -or
+    ($ReasoningEffort -and $activeProvider.reasoningEffort -ne $ReasoningEffort)
   ) {
-    throw "OpenTopia active provider settings do not match the selected profile"
+    throw "OpenTopia active provider settings do not match the selected evaluation configuration"
   }
 
   $nodePath = (Get-Command node -ErrorAction Stop).Source
@@ -583,6 +636,8 @@ $result = [ordered]@{
     profile = $Profile
     expectedModel = if ($ExpectedModel) { $ExpectedModel } else { $null }
     model = $model
+    configuredModel = $configuredModel
+    reasoningEffort = if ($ReasoningEffort) { $ReasoningEffort } else { $null }
     baseUrl = $baseUrl
     credentials = "redacted:set"
     reachable = if ($providerHealth) { $providerHealth.reachable } else { $false }
