@@ -3,8 +3,9 @@ use crate::execution_runtime::{
     configure_command_environment, configure_stdio, environment_keys, resolve_runtime,
 };
 pub use crate::execution_spec::{
-    EnvironmentPolicy, ExecRequest, ExecutionFailure, ExecutionRequirements, ExecutionSpec,
-    ExecutionStage, LifecyclePolicy, RuntimeRequirements, StdioPolicy,
+    shell_command_compatibility_error, EnvironmentPolicy, ExecRequest, ExecutionFailure,
+    ExecutionRequirements, ExecutionSpec, ExecutionStage, LifecyclePolicy, RuntimeRequirements,
+    ShellCompatibilityError, ShellDialect, StdioPolicy,
 };
 use crate::policy::ApprovalRequired;
 use crate::process_quota::ProcessQuota;
@@ -17,7 +18,7 @@ use crate::sandbox::{
 };
 use anyhow::Context;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -147,7 +148,7 @@ pub struct ExecResult {
     pub sandbox: Option<ExecutionSandboxMetadata>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionSandboxMetadata {
     pub status: SandboxCommandStatus,
@@ -1424,6 +1425,29 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
                 .status,
             SandboxCommandStatus::Disabled
         ));
+
+        std::fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_powershell_diagnostics_are_utf8() {
+        let root = std::env::temp_dir().join(format!("opentopia-shell-utf8-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        let env = LocalExecutionEnvironment::new(root.clone());
+        let diagnostic = format!("{}{}{}{}", '\u{8bca}', '\u{65ad}', '\u{9519}', '\u{8bef}');
+        let command = format!("Write-Error '{diagnostic}'");
+
+        let exec = env
+            .exec(
+                ExecRequest::shell(command),
+                ExecutionContext::with_timeout(Duration::from_secs(10)),
+            )
+            .await
+            .expect("PowerShell returns a process result");
+        assert!(!exec.success);
+        let stderr = std::str::from_utf8(&exec.stderr).expect("stderr is UTF-8");
+        assert!(stderr.contains(&diagnostic));
 
         std::fs::remove_dir_all(root).expect("remove temp workspace");
     }

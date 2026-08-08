@@ -1930,6 +1930,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdio_client_correlates_concurrent_tool_calls_that_finish_out_of_order() {
+        let (client_stdin, server_stdin) = duplex(16 * 1024);
+        let (server_stdout, client_stdout) = duplex(16 * 1024);
+        let server = tokio::spawn(run_out_of_order_mcp_server(server_stdin, server_stdout));
+
+        let mut config = McpServerConfig::new("Concurrent Server".to_string(), "mock".to_string());
+        config.timeout_ms = 5_000;
+        let client = McpStdioClient::from_io_for_test(config, client_stdout, client_stdin);
+
+        let (first, second) = tokio::join!(
+            client.call_tool("echo", json!({ "text": "first" })),
+            client.call_tool("echo", json!({ "text": "second" })),
+        );
+        assert_eq!(
+            mcp_content_to_text(&first.expect("first call should succeed").content, None),
+            "echo: first"
+        );
+        assert_eq!(
+            mcp_content_to_text(&second.expect("second call should succeed").content, None),
+            "echo: second"
+        );
+
+        client.shutdown().await.expect("shutdown should succeed");
+        server.await.expect("mock server task should finish");
+    }
+
+    #[tokio::test]
     async fn stdio_client_rejects_server_capability_request_without_losing_tool_response() {
         let (client_stdin, server_stdin) = duplex(16 * 1024);
         let (server_stdout, client_stdout) = duplex(16 * 1024);
@@ -2335,6 +2362,54 @@ mod tests {
             )
             .await;
         }
+    }
+
+    async fn run_out_of_order_mcp_server(
+        stdin: tokio::io::DuplexStream,
+        mut stdout: tokio::io::DuplexStream,
+    ) {
+        let mut lines = BufReader::new(stdin).lines();
+        let mut calls = Vec::new();
+        while calls.len() < 2 {
+            let line = lines
+                .next_line()
+                .await
+                .expect("mock read should succeed")
+                .expect("client should send both calls");
+            let value: Value = serde_json::from_str(&line).expect("client message should be JSON");
+            if value.get("method").and_then(Value::as_str) == Some("tools/call") {
+                calls.push((
+                    value.get("id").cloned().unwrap_or(Value::Null),
+                    value
+                        .pointer("/params/arguments/text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                ));
+            }
+        }
+
+        for (id, text) in calls.into_iter().rev() {
+            write_json_line(
+                &mut stdout,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{ "type": "text", "text": format!("echo: {text}") }],
+                        "isError": false
+                    }
+                }),
+            )
+            .await;
+        }
+
+        while lines
+            .next_line()
+            .await
+            .expect("mock read should succeed")
+            .is_some()
+        {}
     }
 
     async fn run_changing_tool_server(

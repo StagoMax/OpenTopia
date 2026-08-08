@@ -1,4 +1,5 @@
 use crate::execution_spec::{EnvironmentPolicy, ExecutionSpec};
+use crate::git_workflow::GIT_NONINTERACTIVE_ENVIRONMENT;
 use crate::sandbox::NetworkPolicy;
 use std::path::Path;
 
@@ -22,12 +23,8 @@ pub(crate) fn adapt(mut spec: ExecutionSpec, cwd: &Path) -> ExecutionSpec {
 fn adapt_git(spec: &mut ExecutionSpec, cwd: &Path) {
     spec.environment = EnvironmentPolicy::Isolated;
     spec.clear_env = true;
-    spec.env.extend([
-        ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
-        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-        ("GCM_INTERACTIVE".into(), "Never".into()),
-        ("GIT_PAGER".into(), "cat".into()),
-    ]);
+    spec.env
+        .extend(GIT_NONINTERACTIVE_ENVIRONMENT.map(|(key, value)| (key.into(), value.into())));
 
     let command = git_subcommand(&spec.args).map(str::to_string);
     let safe_directory = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());

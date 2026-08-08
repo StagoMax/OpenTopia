@@ -5,6 +5,191 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellDialect {
+    WindowsPowerShell51,
+    PosixSh,
+}
+
+impl ShellDialect {
+    pub fn current() -> Self {
+        if cfg!(windows) {
+            Self::WindowsPowerShell51
+        } else {
+            Self::PosixSh
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::WindowsPowerShell51 => "windows_powershell_5_1",
+            Self::PosixSh => "posix_sh",
+        }
+    }
+
+    pub fn model_guidance(self) -> &'static str {
+        match self {
+            Self::WindowsPowerShell51 => {
+                "Shell commands use Windows PowerShell 5.1, not Bash or PowerShell 7. Use `;` or explicit `$LASTEXITCODE` checks instead of `&&`/`||`, `Select-Object -First/-Last` instead of `head`/`tail`, and `$null` for discarded output."
+            }
+            Self::PosixSh => {
+                "Shell commands use POSIX `sh`; do not use PowerShell cmdlets or `$env:` syntax."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellCompatibilityError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+pub fn shell_command_compatibility_error(command: &str) -> Option<ShellCompatibilityError> {
+    if ShellDialect::current() != ShellDialect::WindowsPowerShell51 {
+        return None;
+    }
+    let operator = unsupported_windows_powershell_operator(command)?;
+    Some(ShellCompatibilityError {
+        code: "shell_dialect_mismatch",
+        message: format!(
+            "The active shell is Windows PowerShell 5.1, where unquoted `{operator}` is invalid. Use separate shell calls, `;`, or an explicit `$LASTEXITCODE` check. Use `Select-Object -First/-Last` instead of `head`/`tail`, and redirect discarded output to `$null`."
+        ),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellLexState {
+    Code,
+    SingleQuoted,
+    DoubleQuoted,
+    SingleQuotedHereString,
+    DoubleQuotedHereString,
+    LineComment,
+    BlockComment,
+}
+
+fn unsupported_windows_powershell_operator(command: &str) -> Option<&'static str> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut state = PowerShellLexState::Code;
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        let next = chars.get(index + 1).copied();
+        match state {
+            PowerShellLexState::Code => {
+                if current == '-' && next == Some('-') && chars.get(index + 2) == Some(&'%') {
+                    return None;
+                }
+                if current == '<' && next == Some('#') {
+                    state = PowerShellLexState::BlockComment;
+                    index += 2;
+                    continue;
+                }
+                if current == '#' {
+                    state = PowerShellLexState::LineComment;
+                    index += 1;
+                    continue;
+                }
+                if current == '@' && next == Some('\'') {
+                    state = PowerShellLexState::SingleQuotedHereString;
+                    index += 2;
+                    continue;
+                }
+                if current == '@' && next == Some('"') {
+                    state = PowerShellLexState::DoubleQuotedHereString;
+                    index += 2;
+                    continue;
+                }
+                if current == '\'' {
+                    state = PowerShellLexState::SingleQuoted;
+                    index += 1;
+                    continue;
+                }
+                if current == '"' {
+                    state = PowerShellLexState::DoubleQuoted;
+                    index += 1;
+                    continue;
+                }
+                if current == '`' {
+                    index += 2;
+                    continue;
+                }
+                if current == '&' && next == Some('&') {
+                    return Some("&&");
+                }
+                if current == '|' && next == Some('|') {
+                    return Some("||");
+                }
+            }
+            PowerShellLexState::SingleQuoted => {
+                if current == '\'' {
+                    if next == Some('\'') {
+                        index += 2;
+                        continue;
+                    }
+                    state = PowerShellLexState::Code;
+                }
+            }
+            PowerShellLexState::DoubleQuoted => {
+                if current == '`' {
+                    index += 2;
+                    continue;
+                }
+                if current == '"' {
+                    state = PowerShellLexState::Code;
+                }
+            }
+            PowerShellLexState::SingleQuotedHereString => {
+                if is_here_string_terminator(&chars, index, '\'') {
+                    state = PowerShellLexState::Code;
+                    index += 2;
+                    continue;
+                }
+            }
+            PowerShellLexState::DoubleQuotedHereString => {
+                if is_here_string_terminator(&chars, index, '"') {
+                    state = PowerShellLexState::Code;
+                    index += 2;
+                    continue;
+                }
+            }
+            PowerShellLexState::LineComment => {
+                if current == '\n' {
+                    state = PowerShellLexState::Code;
+                }
+            }
+            PowerShellLexState::BlockComment => {
+                if current == '#' && next == Some('>') {
+                    state = PowerShellLexState::Code;
+                    index += 2;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_here_string_terminator(chars: &[char], index: usize, quote: char) -> bool {
+    chars.get(index) == Some(&quote)
+        && chars.get(index + 1) == Some(&'@')
+        && (index == 0 || chars.get(index.wrapping_sub(1)) == Some(&'\n'))
+}
+
+fn windows_powershell_wrapper(command: &str) -> String {
+    format!(
+        "$__otUtf8 = New-Object System.Text.UTF8Encoding($false); \
+         [Console]::InputEncoding = $__otUtf8; \
+         [Console]::OutputEncoding = $__otUtf8; \
+         $OutputEncoding = $__otUtf8; \
+         $ErrorActionPreference = 'Stop'; \
+         {command}"
+    )
+}
+
 /// Standard-input behavior for a launched process.
 ///
 /// Non-interactive execution defaults to `Null`; callers must opt in to a pipe
@@ -97,10 +282,11 @@ impl ExecutionSpec {
         if cfg!(windows) {
             Self::new("powershell.exe")
                 .arg("-NoProfile")
+                .arg("-NonInteractive")
                 .arg("-ExecutionPolicy")
                 .arg("Bypass")
                 .arg("-Command")
-                .arg(command)
+                .arg(windows_powershell_wrapper(&command))
         } else {
             Self::new("sh").arg("-lc").arg(command)
         }
@@ -251,5 +437,59 @@ impl ExecutionFailure {
             message: message.into(),
             os_error: error.raw_os_error(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_dialect_matches_the_platform() {
+        let expected = if cfg!(windows) {
+            ShellDialect::WindowsPowerShell51
+        } else {
+            ShellDialect::PosixSh
+        };
+        assert_eq!(ShellDialect::current(), expected);
+        assert!(!expected.model_guidance().is_empty());
+    }
+
+    #[test]
+    fn windows_powershell_operator_scan_ignores_literals_comments_and_here_strings() {
+        assert_eq!(
+            unsupported_windows_powershell_operator("git status && git log"),
+            Some("&&")
+        );
+        assert_eq!(
+            unsupported_windows_powershell_operator("git status || git log"),
+            Some("||")
+        );
+        assert_eq!(
+            unsupported_windows_powershell_operator("Write-Output 'a && b'"),
+            None
+        );
+        assert_eq!(
+            unsupported_windows_powershell_operator("Write-Output \"a || b\" # && ignored"),
+            None
+        );
+        assert_eq!(
+            unsupported_windows_powershell_operator("@'\na && b\n'@\nWrite-Output ok"),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_initializes_utf8_before_user_input() {
+        let command = format!("Write-Output '{}{}'", '\u{4e2d}', '\u{6587}');
+        let request = ExecutionSpec::shell(&command);
+        assert_eq!(request.program, "powershell.exe");
+        let wrapper = request.args.last().expect("PowerShell wrapper");
+        assert!(wrapper.contains("[Console]::OutputEncoding = $__otUtf8"));
+        assert!(wrapper.ends_with(&command));
+        assert!(
+            wrapper.find("[Console]::OutputEncoding").unwrap() < wrapper.find(&command).unwrap()
+        );
     }
 }

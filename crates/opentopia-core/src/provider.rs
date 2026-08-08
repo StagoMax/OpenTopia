@@ -1156,12 +1156,13 @@ impl OpenAiCompatibleProvider {
         if compatibility_messages {
             self.compatibility_messages.store(true, Ordering::Release);
         }
+        let replay_chat_reasoning = model_requires_reasoning_content_for_tool_calls(&self.model);
         let messages = if compatibility_messages
             && chat_request_needs_message_compatibility_fallback(&request)
         {
-            openai_compatibility_messages(&request)
+            openai_compatibility_messages_with_reasoning(&request, replay_chat_reasoning)
         } else {
-            openai_messages(&request)
+            openai_messages_with_reasoning(&request, replay_chat_reasoning)
         };
         let stream = request.tool_candidates.is_empty()
             || !openai_chat_nonstream_tools_cached(&self.base_url, &self.model);
@@ -1175,7 +1176,12 @@ impl OpenAiCompatibleProvider {
         }
         // Reasoning models reject any explicit temperature with a 400, so the
         // field is omitted rather than clamped.
-        if model_accepts_temperature(&self.model) {
+        let deepseek_thinking_enabled = model_uses_deepseek_thinking_control(&self.model)
+            && self
+                .reasoning_effort
+                .as_deref()
+                .is_none_or(|effort| effort != "none");
+        if model_accepts_temperature(&self.model) && !deepseek_thinking_enabled {
             if let Some(temperature) = self.temperature {
                 payload["temperature"] = json!(temperature);
             }
@@ -1188,17 +1194,32 @@ impl OpenAiCompatibleProvider {
             .as_deref()
             .filter(|value| !value.is_empty())
         {
-            if model_uses_glm_thinking_control(&self.model)
-                && matches!(reasoning_effort, "none" | "minimal")
-            {
-                payload["thinking"] = json!({ "type": "disabled" });
+            if model_uses_deepseek_thinking_control(&self.model) {
+                if reasoning_effort == "none" {
+                    payload["thinking"] = json!({ "type": "disabled" });
+                } else {
+                    payload["thinking"] = json!({ "type": "enabled" });
+                    payload["reasoning_effort"] =
+                        json!(deepseek_reasoning_effort(reasoning_effort));
+                }
+            } else if model_uses_glm_thinking_control(&self.model) {
+                if matches!(reasoning_effort, "none" | "minimal") {
+                    payload["thinking"] = json!({ "type": "disabled" });
+                } else {
+                    payload["thinking"] = json!({ "type": "enabled" });
+                    payload["reasoning_effort"] = json!(reasoning_effort);
+                }
             } else {
                 payload["reasoning_effort"] = json!(reasoning_effort);
             }
         }
         if !request.tool_candidates.is_empty() {
             payload["tools"] = json!(openai_tools(&request.tool_candidates));
-            payload["tool_choice"] = json!("auto");
+            // DeepSeek V4 thinking mode rejects tool_choice and treats an
+            // omitted value as auto. Non-thinking mode accepts the field.
+            if !deepseek_thinking_enabled {
+                payload["tool_choice"] = json!("auto");
+            }
             if !openai_chat_parallel_tools_unsupported_cached(&self.base_url, &self.model) {
                 payload["parallel_tool_calls"] = json!(self.parallel_tool_calls);
             }
@@ -1299,8 +1320,10 @@ impl OpenAiCompatibleProvider {
             }
             let mut used_message_compatibility = false;
             if chat_request_needs_message_compatibility_fallback(&prepared.logical_request) {
-                prepared.body["messages"] =
-                    json!(openai_compatibility_messages(&prepared.logical_request));
+                prepared.body["messages"] = json!(openai_compatibility_messages_with_reasoning(
+                    &prepared.logical_request,
+                    model_requires_reasoning_content_for_tool_calls(&self.model),
+                ));
                 changes.push("native developer messages or structured tool history");
                 used_message_compatibility = true;
             }
@@ -1487,6 +1510,15 @@ async fn decode_openai_chat_response(
         let body: Value = response.json().await?;
         let response = parse_model_response_body(&body)?;
         if emit_nonstream_deltas {
+            for reasoning in response.provider_items.iter().filter_map(|item| {
+                (item.get("type").and_then(Value::as_str) == Some(OPENAI_CHAT_ASSISTANT_STATE_TYPE))
+                    .then(|| item.get("reasoning_content").and_then(Value::as_str))
+                    .flatten()
+            }) {
+                on_delta(ModelStreamDelta::Reasoning {
+                    text: reasoning.to_string(),
+                })?;
+            }
             if !response.text.is_empty() {
                 on_delta(ModelStreamDelta::Text {
                     text: response.text.clone(),
@@ -2375,6 +2407,7 @@ struct StreamingToolCall {
 #[derive(Debug, Default)]
 struct OpenAiStreamAccumulator {
     text: String,
+    reasoning: String,
     tool_calls: BTreeMap<usize, StreamingToolCall>,
     usage: Option<ModelUsage>,
     finish_reason: Option<ModelFinishReason>,
@@ -2520,6 +2553,7 @@ impl OpenAiStreamAccumulator {
         if let Some(delta) = event.pointer("/choices/0/delta") {
             let reasoning = extract_stream_reasoning(delta);
             if !reasoning.is_empty() {
+                self.reasoning.push_str(&reasoning);
                 on_delta(ModelStreamDelta::Reasoning { text: reasoning })?;
             }
             let text = extract_stream_text(delta.get("content"));
@@ -2577,12 +2611,16 @@ impl OpenAiStreamAccumulator {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let provider_items =
+            openai_chat_assistant_state_item(&self.text, &self.reasoning, &tool_calls)
+                .into_iter()
+                .collect();
         Ok(ModelResponse {
             text: self.text,
             tool_calls,
             usage: self.usage,
             response_id: None,
-            provider_items: Vec::new(),
+            provider_items,
             finish_reason: self
                 .finish_reason
                 .unwrap_or(ModelFinishReason::StreamInterrupted),
@@ -2913,6 +2951,22 @@ fn extract_stream_reasoning(delta: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn openai_chat_assistant_state_item(
+    content: &str,
+    reasoning: &str,
+    tool_calls: &[ProviderToolCall],
+) -> Option<Value> {
+    if reasoning.is_empty() || tool_calls.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": OPENAI_CHAT_ASSISTANT_STATE_TYPE,
+        "content": content,
+        "reasoning_content": reasoning,
+        "tool_call_ids": tool_calls.iter().map(|call| &call.id).collect::<Vec<_>>(),
+    }))
+}
+
 fn extract_reasoning_value(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -3070,6 +3124,28 @@ fn model_uses_glm_thinking_control(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
     let model = model.rsplit('/').next().unwrap_or(&model);
     model.starts_with("glm") || model.starts_with("chatglm")
+}
+
+fn model_uses_deepseek_thinking_control(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    let model = model.split(':').next().unwrap_or(model);
+    model.starts_with("deepseek-v4-flash")
+        || model.starts_with("deepseek-v4-pro")
+        || model.starts_with("deepseek-reasoner")
+}
+
+fn model_requires_reasoning_content_for_tool_calls(model: &str) -> bool {
+    model_uses_deepseek_thinking_control(model)
+}
+
+fn deepseek_reasoning_effort(value: &str) -> &str {
+    match value {
+        "xhigh" | "max" => "max",
+        // DeepSeek documents low/medium as compatibility aliases for high.
+        // Treat a stale minimal value conservatively as high as well.
+        _ => "high",
+    }
 }
 
 fn model_supports_anthropic_adaptive_thinking(model: &str) -> bool {
@@ -3434,7 +3510,15 @@ fn chat_request_has_compatibility_fallback(request: &ModelRequest) -> bool {
         || chat_request_needs_message_compatibility_fallback(request)
 }
 
+#[cfg(test)]
 fn openai_messages(request: &ModelRequest) -> Vec<Value> {
+    openai_messages_with_reasoning(request, false)
+}
+
+fn openai_messages_with_reasoning(
+    request: &ModelRequest,
+    replay_chat_reasoning: bool,
+) -> Vec<Value> {
     let mut messages = openai_instruction_messages(request);
 
     messages.extend(request.conversation.iter().map(|message| {
@@ -3458,36 +3542,20 @@ fn openai_messages(request: &ModelRequest) -> Vec<Value> {
         "content": openai_message_content(&request.user_message, &request.user_content)
     }));
 
-    // AgentCore keeps completed calls as a flat durable history. Rebuild a valid
-    // Chat Completions sequence instead of collapsing calls from several model
-    // rounds into one synthetic assistant message.
-    let mut emitted_results = vec![false; request.tool_results.len()];
-    for call in &request.previous_tool_calls {
-        messages.push(json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [openai_tool_call_message(call)]
-        }));
-        for (index, result) in request.tool_results.iter().enumerate() {
-            if result.call_id == call.id {
-                messages.push(openai_tool_result_message(result));
-                emitted_results[index] = true;
-            }
-        }
-    }
-    for (index, result) in request.tool_results.iter().enumerate() {
-        if !emitted_results[index] {
-            messages.push(openai_tool_result_message(result));
-        }
-    }
-    if let Some(companion) = openai_tool_image_companion(&request.tool_results) {
-        messages.push(companion);
-    }
+    append_openai_tool_history(&mut messages, request, replay_chat_reasoning);
 
     messages
 }
 
+#[cfg(test)]
 fn openai_compatibility_messages(request: &ModelRequest) -> Vec<Value> {
+    openai_compatibility_messages_with_reasoning(request, false)
+}
+
+fn openai_compatibility_messages_with_reasoning(
+    request: &ModelRequest,
+    replay_chat_reasoning: bool,
+) -> Vec<Value> {
     let mut messages = vec![json!({
         "role": "system",
         "content": &request.system_prompt
@@ -3512,6 +3580,11 @@ fn openai_compatibility_messages(request: &ModelRequest) -> Vec<Value> {
         "role": "user",
         "content": openai_message_content(&request.user_message, &request.user_content)
     }));
+
+    if replay_chat_reasoning {
+        append_openai_tool_history(&mut messages, request, true);
+        return messages;
+    }
 
     let history = request
         .previous_tool_calls
@@ -3549,6 +3622,98 @@ fn openai_compatibility_messages(request: &ModelRequest) -> Vec<Value> {
     messages
 }
 
+const OPENAI_CHAT_ASSISTANT_STATE_TYPE: &str = "openai_chat_assistant_state";
+
+fn append_openai_tool_history(
+    messages: &mut Vec<Value>,
+    request: &ModelRequest,
+    replay_chat_reasoning: bool,
+) {
+    // AgentCore keeps completed calls as a flat durable history. Rebuild a
+    // valid Chat Completions sequence, grouping calls that came from the same
+    // assistant response when provider-owned reasoning state is available.
+    let mut emitted_call_ids = HashSet::new();
+    let mut emitted_results = vec![false; request.tool_results.len()];
+
+    if replay_chat_reasoning {
+        for item in request.previous_response_items.iter().filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some(OPENAI_CHAT_ASSISTANT_STATE_TYPE)
+        }) {
+            let call_ids = item
+                .get("tool_call_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            let calls = call_ids
+                .iter()
+                .filter_map(|call_id| {
+                    request
+                        .previous_tool_calls
+                        .iter()
+                        .find(|call| call.id == *call_id)
+                })
+                .collect::<Vec<_>>();
+            if calls.is_empty() {
+                continue;
+            }
+
+            let mut assistant = json!({
+                "role": "assistant",
+                "content": item.get("content").and_then(Value::as_str).unwrap_or(""),
+                "tool_calls": calls
+                    .iter()
+                    .map(|call| openai_tool_call_message(call))
+                    .collect::<Vec<_>>(),
+            });
+            if let Some(reasoning) = item
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                assistant["reasoning_content"] = json!(reasoning);
+            }
+            messages.push(assistant);
+
+            for call in calls {
+                emitted_call_ids.insert(call.id.clone());
+                for (index, result) in request.tool_results.iter().enumerate() {
+                    if result.call_id == call.id {
+                        messages.push(openai_tool_result_message(result));
+                        emitted_results[index] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    for call in &request.previous_tool_calls {
+        if emitted_call_ids.contains(&call.id) {
+            continue;
+        }
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [openai_tool_call_message(call)]
+        }));
+        for (index, result) in request.tool_results.iter().enumerate() {
+            if result.call_id == call.id {
+                messages.push(openai_tool_result_message(result));
+                emitted_results[index] = true;
+            }
+        }
+    }
+    for (index, result) in request.tool_results.iter().enumerate() {
+        if !emitted_results[index] {
+            messages.push(openai_tool_result_message(result));
+        }
+    }
+    if let Some(companion) = openai_tool_image_companion(&request.tool_results) {
+        messages.push(companion);
+    }
+}
+
 fn openai_conversation_role(role: ModelConversationRole) -> &'static str {
     match role {
         ModelConversationRole::System => "system",
@@ -3557,16 +3722,40 @@ fn openai_conversation_role(role: ModelConversationRole) -> &'static str {
     }
 }
 
+const PORTABLE_APPLY_PATCH_DESCRIPTION: &str = "Apply workspace edits by passing exactly one JSON field named `patch`. The value must be a `*** Begin Patch` envelope ending with `*** End Patch`. For updates, use `*** Update File: relative/path` followed by one or more unified `@@` hunks. Do not send `path`, `diff`, or `operation` as separate fields, and do not use bare `SEARCH:`/`REPLACE:` labels.";
+
+fn portable_function_tool_candidate(candidate: &ProviderToolCandidate) -> ProviderToolCandidate {
+    if candidate.name != "apply_patch" {
+        return candidate.clone();
+    }
+    ProviderToolCandidate {
+        name: candidate.name.clone(),
+        description: PORTABLE_APPLY_PATCH_DESCRIPTION.to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "A complete *** Begin Patch ... *** End Patch envelope."
+                }
+            },
+            "required": ["patch"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 fn openai_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
     candidates
         .iter()
         .map(|candidate| {
+            let candidate = portable_function_tool_candidate(candidate);
             json!({
             "type": "function",
             "function": {
-                    "name": &candidate.name,
-                    "description": &candidate.description,
-                    "parameters": &candidate.input_schema
+                    "name": candidate.name,
+                    "description": candidate.description,
+                    "parameters": candidate.input_schema
                 }
             })
         })
@@ -3613,10 +3802,11 @@ fn responses_tool_definitions(
                     ),
                 }
             } else {
+                let candidate = portable_function_tool_candidate(candidate);
                 ProviderToolDefinition::Function {
-                    name: candidate.name.clone(),
-                    description: candidate.description.clone(),
-                    input_schema: candidate.input_schema.clone(),
+                    name: candidate.name,
+                    description: candidate.description,
+                    input_schema: candidate.input_schema,
                 }
             }
         })
@@ -4153,16 +4343,30 @@ fn model_response_observation(response: &ModelResponse) -> Value {
 }
 
 fn parse_model_response_body(body: &Value) -> anyhow::Result<ModelResponse> {
+    let tool_calls = extract_provider_tool_calls(body)?;
+    let mut provider_items = body
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if provider_items.is_empty() {
+        let reasoning = body
+            .pointer("/choices/0/message/reasoning_content")
+            .or_else(|| body.pointer("/choices/0/message/reasoning"))
+            .map(extract_reasoning_value)
+            .unwrap_or_default();
+        if let Some(item) =
+            openai_chat_assistant_state_item(&extract_response_text(body), &reasoning, &tool_calls)
+        {
+            provider_items.push(item);
+        }
+    }
     Ok(ModelResponse {
         text: extract_response_text(body),
-        tool_calls: extract_provider_tool_calls(body)?,
+        tool_calls,
         usage: parse_model_usage(body.get("usage")),
         response_id: body.get("id").and_then(Value::as_str).map(str::to_string),
-        provider_items: body
-            .get("output")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
+        provider_items,
         finish_reason: body
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
@@ -4617,20 +4821,47 @@ pub(crate) fn tool_input_schema_error(schema: &Value, value: &Value, path: &str)
         }
     }
     if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
-        if !branches
+        let branch_errors = branches
             .iter()
-            .any(|branch| tool_input_schema_error(branch, value, path).is_none())
-        {
-            return Some(format!("{path} does not match any allowed input shape"));
+            .map(|branch| tool_input_schema_error(branch, value, path))
+            .collect::<Vec<_>>();
+        if branch_errors.iter().all(Option::is_some) {
+            let reasons = branch_errors
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, error)| {
+                    error.map(|error| format!("option {}: {error}", index + 1))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Some(format!(
+                "{path} does not match any allowed input shape ({reasons})"
+            ));
         }
     }
     if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
-        let matches = branches
+        let branch_errors = branches
             .iter()
-            .filter(|branch| tool_input_schema_error(branch, value, path).is_none())
-            .count();
+            .map(|branch| tool_input_schema_error(branch, value, path))
+            .collect::<Vec<_>>();
+        let matches = branch_errors.iter().filter(|error| error.is_none()).count();
         if matches != 1 {
-            return Some(format!("{path} must match exactly one allowed input shape"));
+            if matches == 0 {
+                let reasons = branch_errors
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, error)| {
+                        error.map(|error| format!("option {}: {error}", index + 1))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Some(format!(
+                    "{path} must match exactly one allowed input shape ({reasons})"
+                ));
+            }
+            return Some(format!(
+                "{path} must match exactly one allowed input shape ({matches} shapes matched)"
+            ));
         }
     }
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
@@ -6887,6 +7118,135 @@ mod tests {
     }
 
     #[test]
+    fn glm_enables_thinking_with_native_control() {
+        let mut provider =
+            OpenAiCompatibleProvider::new("https://api.example.test/v1", "test-key", "glm-5.2");
+        provider.reasoning_effort = Some("high".to_string());
+
+        let prepared = provider.prepare(Uuid::nil(), model_request()).unwrap();
+
+        assert_eq!(prepared.body["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(prepared.body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn deepseek_v4_maps_thinking_effort_and_omits_incompatible_tool_choice() {
+        let mut provider = OpenAiCompatibleProvider::new(
+            "https://api.deepseek.com/v1",
+            "test-key",
+            "deepseek-v4-flash",
+        );
+        provider.temperature = Some(0.7);
+        provider.reasoning_effort = Some("xhigh".to_string());
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        }];
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+
+        assert_eq!(prepared.body["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(prepared.body["reasoning_effort"], "max");
+        assert!(prepared.body.get("temperature").is_none());
+        assert!(prepared.body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn deepseek_v4_can_disable_thinking() {
+        let mut provider = OpenAiCompatibleProvider::new(
+            "https://api.deepseek.com/v1",
+            "test-key",
+            "deepseek-v4-pro",
+        );
+        provider.temperature = Some(0.7);
+        provider.reasoning_effort = Some("none".to_string());
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        }];
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+
+        assert_eq!(prepared.body["thinking"], json!({ "type": "disabled" }));
+        assert!(prepared.body.get("reasoning_effort").is_none());
+        assert_eq!(prepared.body["temperature"], 0.7);
+        assert_eq!(prepared.body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn deepseek_tool_history_replays_reasoning_content() {
+        let mut request = model_request();
+        request.previous_tool_calls = vec![ProviderToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "Cargo.toml" }),
+        }];
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            output: "workspace".to_string(),
+            content: Vec::new(),
+            is_error: false,
+            metadata: json!({}),
+        }];
+        request.previous_response_items = vec![json!({
+            "type": OPENAI_CHAT_ASSISTANT_STATE_TYPE,
+            "content": "I will inspect the file.",
+            "reasoning_content": "The file is needed for the next step.",
+            "tool_call_ids": ["call_1"],
+        })];
+
+        let messages = openai_messages_with_reasoning(&request, true);
+        let assistant = messages
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .expect("assistant tool-call message");
+
+        assert_eq!(assistant["content"], "I will inspect the file.");
+        assert_eq!(
+            assistant["reasoning_content"],
+            "The file is needed for the next step."
+        );
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn chat_response_preserves_reasoning_for_tool_replay() {
+        let response = parse_model_response_body(&json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_content": "I need the file.",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(response.provider_items.len(), 1);
+        assert_eq!(
+            response.provider_items[0]["type"],
+            OPENAI_CHAT_ASSISTANT_STATE_TYPE
+        );
+        assert_eq!(
+            response.provider_items[0]["reasoning_content"],
+            "I need the file."
+        );
+    }
+
+    #[test]
     fn compatibility_retry_diagnostics_report_actual_image_count() {
         let request = model_request();
         assert_eq!(request_image_part_count(&request), 0);
@@ -8421,6 +8781,91 @@ mod tests {
         assert!(transport
             .iter()
             .any(|event| matches!(event, ProviderTransportEvent::Retry { attempt: 2, .. })));
+    }
+
+    #[test]
+    fn function_apply_patch_uses_one_portable_shape_across_openai_transports() {
+        let candidate = ProviderToolCandidate {
+            name: "apply_patch".to_string(),
+            description: "Legacy multi-shape patch tool.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": { "patch": { "type": "string" } },
+                        "required": ["patch"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "operation": { "type": "object" } },
+                        "required": ["operation"],
+                        "additionalProperties": false
+                    }
+                ]
+            }),
+        };
+
+        let chat_tools = openai_tools(std::slice::from_ref(&candidate));
+        let chat_function = &chat_tools[0]["function"];
+        assert_eq!(chat_function["parameters"]["required"], json!(["patch"]));
+        assert_eq!(
+            chat_function["parameters"]["additionalProperties"],
+            json!(false)
+        );
+        assert!(chat_function["parameters"].get("anyOf").is_none());
+        assert!(chat_function["parameters"]["properties"]
+            .get("operation")
+            .is_none());
+        assert!(chat_function["description"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch"));
+        assert!(chat_function["description"]
+            .as_str()
+            .unwrap()
+            .contains("Do not send `path`, `diff`, or `operation`"));
+
+        let responses_tools = responses_tools(
+            std::slice::from_ref(&candidate),
+            ProviderToolProtocolCapabilities::default(),
+        );
+        assert_eq!(responses_tools[0]["type"], "function");
+        assert_eq!(
+            responses_tools[0]["parameters"]["required"],
+            json!(["patch"])
+        );
+        assert!(responses_tools[0]["parameters"].get("anyOf").is_none());
+    }
+
+    #[test]
+    fn schema_union_errors_report_each_rejected_shape() {
+        let schema = json!({
+            "type": "object",
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": { "patch": { "type": "string" } },
+                    "required": ["patch"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": { "operation": { "type": "object" } },
+                    "required": ["operation"],
+                    "additionalProperties": false
+                }
+            ]
+        });
+
+        assert_eq!(
+            tool_input_schema_error(&schema, &json!({ "diff": "@@" }), "arguments")
+                .as_deref(),
+            Some(
+                "arguments does not match any allowed input shape (option 1: arguments.patch is required; option 2: arguments.operation is required)"
+            )
+        );
     }
 
     #[test]

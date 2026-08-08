@@ -37,6 +37,7 @@ pub mod provider;
 pub mod sandbox;
 pub mod scm_connector;
 pub mod settings;
+pub mod shell_analysis;
 mod skill_authoring;
 pub mod skills;
 pub mod spreadsheet;
@@ -115,7 +116,7 @@ pub use enterprise::{
 pub use execution::{
     ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
     FileReadResult, FileWriteRequest, LocalExecutionEnvironment, PatchResult, ResourceLimit,
-    StdioSession, WriteResult,
+    ShellDialect, StdioSession, WriteResult,
 };
 pub use execution_authorization::{
     ApprovalEscalation, ExecutionGrant, FilesystemAccess, NetworkAccess, ProcessLifetime,
@@ -145,11 +146,12 @@ pub use git_workflow::{
     CreateWorktreeRequest, FetchRequest, GitBranchInfo, GitPathsRequest, GitRemoteInfo,
     GitStatusRequest, GitWorkflowAction, GitWorkflowActionKind, GitWorkflowError,
     GitWorkflowRequest, GitWorkflowResult, ListBranchesRequest, PullRequest, PushRequest,
-    RemoveWorktreeRequest, SwitchBranchRequest, WorktreeTarget,
+    RemoveWorktreeRequest, SwitchBranchRequest, WorktreeTarget, GIT_NONINTERACTIVE_ENVIRONMENT,
 };
 pub use guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianAssessment, GuardianAssessmentOutcome,
-    GuardianReviewResult, GuardianReviewSessionManager, GuardianReviewStatus, GuardianRiskLevel,
+    GuardianDecisionSource, GuardianReviewFailureKind, GuardianReviewResult,
+    GuardianReviewSessionManager, GuardianReviewStatus, GuardianRiskLevel,
     GuardianUserAuthorization,
 };
 pub use instructions::{
@@ -207,9 +209,9 @@ pub use policy::{
 };
 pub use preview::{
     decode_preview_id, encode_preview_id, preview_spreadsheet_range, preview_workbook,
-    read_preview_content, resolve_artifact_preview, resolve_workspace_preview,
-    PreviewContentSource, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange,
-    PreviewRangeRequest, PreviewSheet, PreviewSource, PreviewTarget, PreviewWorkbook,
+    read_preview_content, resolve_artifact_preview, resolve_attachment_preview,
+    resolve_workspace_preview, PreviewContentSource, PreviewDescriptor, PreviewError, PreviewKind,
+    PreviewRange, PreviewRangeRequest, PreviewSheet, PreviewSource, PreviewTarget, PreviewWorkbook,
     ResolvedPreview, MAX_PREVIEW_CONTENT_BYTES,
 };
 pub use prompt_runtime::{
@@ -248,6 +250,9 @@ pub use settings::{
     ProviderHealthCheck, ProviderKind, ProviderModelCapabilities, ProviderModelSettings,
     ProviderSettings, RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
     MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
+};
+pub use shell_analysis::{
+    analyze_shell_command, ShellAnalysisConfidence, ShellCapability, ShellCommandAnalysis,
 };
 pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,

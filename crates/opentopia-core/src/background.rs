@@ -1,24 +1,25 @@
-//! Long-running commands that outlive the tool call that started them.
+//! Long-running work that outlives the tool call that started it.
 //!
 //! A blocking `shell` call ties a command's runtime to a model round: the model
 //! can do nothing else while it waits, the output only appears at the end, and a
 //! cancelled turn throws the work away. That is acceptable for a `git status` and
 //! wrong for an install, a build, or a download.
 //!
-//! This registry lets the same execution path run detached. The command keeps the
-//! ordinary sandbox, quota, and cancellation semantics of [`ExecutionEnvironment`];
-//! what changes is who waits for it. Output accumulates as it arrives, the model can
-//! pull it at any time, and completion is pushed into the next model round rather
-//! than polled for.
+//! This registry lets commands and bounded non-process tasks run detached without
+//! creating separate lifecycle managers. Commands keep the ordinary sandbox, quota,
+//! and cancellation semantics of [`ExecutionEnvironment`]; what changes is who waits.
+//! Output accumulates as it arrives, the model can pull it at any time, and completion
+//! is pushed into the next model round rather than polled for.
 
 use crate::execution::{
-    BackgroundOutputSink, ExecRequest, ExecutionContext, ExecutionEnvironment, OutputStream,
-    StdioSession,
+    BackgroundOutputSink, ExecRequest, ExecutionContext, ExecutionEnvironment,
+    ExecutionSandboxMetadata, OutputStream, StdioSession,
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -80,6 +81,10 @@ pub struct BackgroundJobSnapshot {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// True when the execution backend had to truncate process output.
+    pub truncated: bool,
+    /// Sandbox details captured when the process exits.
+    pub sandbox: Option<ExecutionSandboxMetadata>,
     /// Bytes produced in total, including any the buffer had to drop.
     pub stdout_bytes: usize,
     pub stderr_bytes: usize,
@@ -174,6 +179,8 @@ struct JobState {
     success: bool,
     finished_at: Option<DateTime<Utc>>,
     error: Option<String>,
+    truncated: bool,
+    sandbox: Option<ExecutionSandboxMetadata>,
     stdout: StreamBuffer,
     stderr: StreamBuffer,
     /// Set once the model has been told this job reached a terminal state.
@@ -187,6 +194,7 @@ struct Job {
     command: String,
     started_at: DateTime<Utc>,
     cancel: CancellationToken,
+    finished: CancellationToken,
     max_buffered_bytes: usize,
     session: Option<InteractiveSession>,
     state: Mutex<JobState>,
@@ -212,6 +220,8 @@ impl Job {
             started_at: self.started_at,
             finished_at: state.finished_at,
             error: state.error.clone(),
+            truncated: state.truncated,
+            sandbox: state.sandbox.clone(),
             stdout_bytes: state.stdout.total_bytes,
             stderr_bytes: state.stderr.total_bytes,
             dropped_bytes: state.stdout.dropped_bytes + state.stderr.dropped_bytes,
@@ -297,6 +307,66 @@ impl BackgroundProcessRegistry {
         Ok(job)
     }
 
+    fn register_detached_job(
+        &self,
+        scope: BackgroundScope,
+        label: String,
+    ) -> anyhow::Result<(Arc<Job>, CancellationToken, CancellationToken)> {
+        let running = self
+            .jobs()
+            .values()
+            .filter(|job| job.scope == scope && !job.lock().status.is_terminal())
+            .count();
+        if running >= self.inner.config.max_jobs_per_agent {
+            anyhow::bail!(
+                "this agent already has {running} background jobs running (maximum {}); wait for one to finish or stop it first",
+                self.inner.config.max_jobs_per_agent
+            );
+        }
+
+        let cancel = CancellationToken::new();
+        let finished = CancellationToken::new();
+        let job = Arc::new(Job {
+            id: Uuid::new_v4(),
+            scope,
+            command: label,
+            started_at: Utc::now(),
+            cancel: cancel.clone(),
+            finished: finished.clone(),
+            max_buffered_bytes: self.inner.config.max_buffered_bytes,
+            session: None,
+            state: Mutex::new(JobState {
+                status: BackgroundJobStatus::Running,
+                exit_code: None,
+                success: false,
+                finished_at: None,
+                error: None,
+                truncated: false,
+                sandbox: None,
+                stdout: StreamBuffer::default(),
+                stderr: StreamBuffer::default(),
+                completion_reported: false,
+            }),
+        });
+        self.jobs().insert(job.id, job.clone());
+        Ok((job, cancel, finished))
+    }
+
+    fn link_turn_cancellation(
+        turn_cancel: Option<CancellationToken>,
+        job_cancel: CancellationToken,
+        job_finished: CancellationToken,
+    ) {
+        if let Some(turn_cancel) = turn_cancel {
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = turn_cancel.cancelled() => job_cancel.cancel(),
+                    _ = job_finished.cancelled() => {}
+                }
+            });
+        }
+    }
+
     /// Starts a command and returns as soon as it is running.
     ///
     /// The command runs through the caller's [`ExecutionEnvironment`], so sandbox,
@@ -313,57 +383,16 @@ impl BackgroundProcessRegistry {
             mut context,
         } = spawn;
 
-        let running = self
-            .jobs()
-            .values()
-            .filter(|job| job.scope == scope && !job.lock().status.is_terminal())
-            .count();
-        if running >= self.inner.config.max_jobs_per_agent {
-            anyhow::bail!(
-                "this agent already has {running} background jobs running (maximum {}); wait for one to finish or stop it first",
-                self.inner.config.max_jobs_per_agent
-            );
-        }
-
-        let cancel = CancellationToken::new();
-        let job = Arc::new(Job {
-            id: Uuid::new_v4(),
-            scope,
-            command: command.clone(),
-            started_at: Utc::now(),
-            cancel: cancel.clone(),
-            max_buffered_bytes: self.inner.config.max_buffered_bytes,
-            session: None,
-            state: Mutex::new(JobState {
-                status: BackgroundJobStatus::Running,
-                exit_code: None,
-                success: false,
-                finished_at: None,
-                error: None,
-                stdout: StreamBuffer::default(),
-                stderr: StreamBuffer::default(),
-                completion_reported: false,
-            }),
-        });
+        let (job, cancel, finished) = self.register_detached_job(scope, command)?;
 
         // The job's own token stops just this command. A turn token, when the caller
         // supplied one, still stops everything at once: a user pressing stop should not
         // leave a download running with nobody left to read it.
-        if let Some(turn_cancel) = context.cancel.take() {
-            let job_cancel = cancel.clone();
-            let job_finished = cancel.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = turn_cancel.cancelled() => job_cancel.cancel(),
-                    _ = job_finished.cancelled() => {}
-                }
-            });
-        }
+        Self::link_turn_cancellation(context.cancel.take(), cancel.clone(), finished.clone());
         context.cancel = Some(cancel.clone());
         context.output_sink = Some(Arc::new(JobSink { job: job.clone() }));
 
         let snapshot = job.snapshot();
-        self.jobs().insert(job.id, job.clone());
 
         tokio::spawn(async move {
             let outcome = environment.exec(request, context).await;
@@ -376,6 +405,8 @@ impl BackgroundProcessRegistry {
                     state.status = BackgroundJobStatus::Exited;
                     state.exit_code = result.exit_code;
                     state.success = result.success;
+                    state.truncated = result.truncated;
+                    state.sandbox = result.sandbox;
                     if result.truncated {
                         state.error = Some(
                             "output exceeded the resource limit and was truncated".to_string(),
@@ -396,8 +427,56 @@ impl BackgroundProcessRegistry {
                     state.error = Some(message);
                 }
             }
+            drop(state);
+            finished.cancel();
         });
 
+        Ok(snapshot)
+    }
+
+    /// Runs a non-process operation through the same bounded job lifecycle used
+    /// by commands. This keeps downloads and opt-in remote work from requiring a
+    /// second scheduler or a second set of read/stop/completion tools.
+    pub fn spawn_task<F>(
+        &self,
+        scope: BackgroundScope,
+        label: String,
+        turn_cancel: Option<CancellationToken>,
+        task: F,
+    ) -> anyhow::Result<BackgroundJobSnapshot>
+    where
+        F: Future<Output = anyhow::Result<String>> + Send + 'static,
+    {
+        let (job, cancel, finished) = self.register_detached_job(scope, label)?;
+        Self::link_turn_cancellation(turn_cancel, cancel.clone(), finished.clone());
+
+        let snapshot = job.snapshot();
+        tokio::spawn(async move {
+            let outcome = tokio::select! {
+                outcome = task => Some(outcome),
+                _ = cancel.cancelled() => None,
+            };
+            let mut state = job.lock();
+            state.finished_at = Some(Utc::now());
+            match outcome {
+                Some(Ok(output)) => {
+                    let max = job.max_buffered_bytes;
+                    state.stdout.push(output.as_bytes(), max);
+                    state.status = BackgroundJobStatus::Exited;
+                    state.success = true;
+                }
+                Some(Err(error)) => {
+                    state.status = BackgroundJobStatus::Failed;
+                    state.error = Some(error.to_string());
+                }
+                None => {
+                    state.status = BackgroundJobStatus::Cancelled;
+                    state.error = Some("background task was cancelled".to_string());
+                }
+            }
+            drop(state);
+            finished.cancel();
+        });
         Ok(snapshot)
     }
 
@@ -436,6 +515,7 @@ impl BackgroundProcessRegistry {
 
         let cancel = CancellationToken::new();
         let session_done = CancellationToken::new();
+        let finished = CancellationToken::new();
         if let Some(turn_cancel) = context.cancel.take() {
             let session_cancel = cancel.clone();
             let session_finished = session_done.clone();
@@ -460,6 +540,7 @@ impl BackgroundProcessRegistry {
             command,
             started_at: Utc::now(),
             cancel: cancel.clone(),
+            finished: finished.clone(),
             max_buffered_bytes: self.inner.config.max_buffered_bytes,
             session: Some(InteractiveSession {
                 inner: session.clone(),
@@ -470,6 +551,8 @@ impl BackgroundProcessRegistry {
                 success: false,
                 finished_at: None,
                 error: None,
+                truncated: false,
+                sandbox: None,
                 stdout: StreamBuffer::default(),
                 stderr: StreamBuffer::default(),
                 completion_reported: false,
@@ -553,6 +636,8 @@ impl BackgroundProcessRegistry {
                     state.status = BackgroundJobStatus::Exited;
                     state.exit_code = result.exit_code;
                     state.success = result.success;
+                    state.truncated = result.truncated;
+                    state.sandbox = result.sandbox;
                 }
                 Err(error) => {
                     let message = error.to_string();
@@ -568,6 +653,8 @@ impl BackgroundProcessRegistry {
                     }
                 }
             }
+            drop(state);
+            finished.cancel();
         });
 
         Ok(snapshot)
@@ -617,6 +704,30 @@ impl BackgroundProcessRegistry {
             stderr,
             dropped_bytes: dropped,
         })
+    }
+
+    /// Waits briefly for a job to finish without turning a long command back into
+    /// a blocking tool call. A completed job is consumed exactly like an explicit
+    /// `background_output read`; `None` means it is still running.
+    pub async fn wait_for_output(
+        &self,
+        scope: &BackgroundScope,
+        job_id: Uuid,
+        wait: Duration,
+    ) -> anyhow::Result<Option<BackgroundOutputChunk>> {
+        let job = self.visible(scope, job_id)?;
+        if !job.lock().status.is_terminal() {
+            let finished = job.finished.clone();
+            // Register the waiter before checking again so a completion between
+            // the first check and the select cannot be missed.
+            let notified = finished.cancelled();
+            if !job.lock().status.is_terminal()
+                && tokio::time::timeout(wait, notified).await.is_err()
+            {
+                return Ok(None);
+            }
+        }
+        self.read_output(scope, job_id).map(Some)
     }
 
     pub fn list(&self, scope: &BackgroundScope) -> Vec<BackgroundJobSnapshot> {
@@ -784,6 +895,102 @@ mod tests {
         assert!(registry.pending_completions(&scope).is_empty());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_short_wait_consumes_a_finished_job_without_polling() {
+        let root = workspace("wait-finished");
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let command = if cfg!(windows) {
+            "Write-Output ready"
+        } else {
+            "echo ready"
+        };
+        let snapshot = registry
+            .spawn(
+                environment(&root),
+                BackgroundSpawnRequest {
+                    scope: scope.clone(),
+                    command: command.to_string(),
+                    request: ExecRequest::shell(command).cwd(&root),
+                    context: ExecutionContext::with_timeout(Duration::from_secs(30)),
+                },
+            )
+            .expect("spawn succeeds");
+
+        let output = registry
+            .wait_for_output(&scope, snapshot.job_id, Duration::from_secs(10))
+            .await
+            .expect("wait succeeds")
+            .expect("quick command finishes inline");
+        assert!(output.job.success);
+        assert!(output.stdout.contains("ready"));
+        assert!(registry.pending_completions(&scope).is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_short_wait_yields_a_job_that_is_still_running() {
+        let root = workspace("wait-yields");
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let snapshot = registry
+            .spawn(
+                environment(&root),
+                BackgroundSpawnRequest {
+                    scope: scope.clone(),
+                    command: command.to_string(),
+                    request: ExecRequest::shell(command).cwd(&root),
+                    context: ExecutionContext::with_timeout(Duration::from_secs(60)),
+                },
+            )
+            .expect("spawn succeeds");
+
+        let output = registry
+            .wait_for_output(&scope, snapshot.job_id, Duration::from_millis(10))
+            .await
+            .expect("wait succeeds");
+        assert!(
+            output.is_none(),
+            "a slow job must yield instead of blocking"
+        );
+        assert_eq!(
+            registry.list(&scope)[0].status,
+            BackgroundJobStatus::Running
+        );
+
+        registry
+            .stop(&scope, snapshot.job_id)
+            .expect("stop succeeds");
+        wait_until_terminal(&registry, &scope, snapshot.job_id).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_non_process_task_reuses_the_same_wait_and_completion_path() {
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let snapshot = registry
+            .spawn_task(scope.clone(), "download fixture".to_string(), None, async {
+                Ok(r#"{"path":"fixture.zip","bytes":42}"#.to_string())
+            })
+            .expect("task starts");
+
+        let output = registry
+            .wait_for_output(&scope, snapshot.job_id, Duration::from_secs(1))
+            .await
+            .expect("wait succeeds")
+            .expect("task finishes inline");
+        assert!(output.job.success);
+        assert!(output.stdout.contains("fixture.zip"));
+        assert!(registry.pending_completions(&scope).is_empty());
     }
 
     #[tokio::test]

@@ -4,6 +4,16 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Environment shared by every non-interactive Git entry point, including
+/// callers that use the structured execution environment and internal Git
+/// plumbing that launches `git` directly.
+pub const GIT_NONINTERACTIVE_ENVIRONMENT: [(&str, &str); 4] = [
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GCM_INTERACTIVE", "Never"),
+    ("GIT_PAGER", "cat"),
+];
+
 pub const MAX_COMMIT_MESSAGE_BYTES: usize = 32 * 1024;
 const MAX_REF_BYTES: usize = 1_024;
 const MAX_REMOTE_BYTES: usize = 255;
@@ -893,11 +903,14 @@ fn option_string(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::execution::{
-        FileReadRequest, FileReadResult, FileWriteRequest, StdioSession, WriteResult,
+        FileReadRequest, FileReadResult, FileWriteRequest, LocalExecutionEnvironment, StdioSession,
+        WriteResult,
     };
-    use crate::sandbox::ExecutionEnvironmentKind;
+    use crate::sandbox::{ExecutionEnvironmentKind, LocalSandboxConfig};
     use async_trait::async_trait;
+    use std::fs;
     use std::sync::Mutex;
+    use uuid::Uuid;
 
     fn workflow(action: GitWorkflowAction) -> GitWorkflowRequest {
         GitWorkflowRequest {
@@ -1505,6 +1518,80 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].program, "git");
         assert_eq!(requests[0].cwd, Some(request.repository));
+    }
+
+    #[tokio::test]
+    async fn structured_git_read_matrix_executes_in_a_real_environment() {
+        let repository =
+            std::env::temp_dir().join(format!("opentopia-git-workflow-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repository).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(repository.join("sample.txt"), "fixture\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "--", "sample.txt"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=OpenTopia Test",
+                "-c",
+                "user.email=opentopia@example.invalid",
+                "commit",
+                "--quiet",
+                "--message",
+                "fixture commit",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+
+        let environment = LocalExecutionEnvironment::with_sandbox_config(
+            repository.clone(),
+            LocalSandboxConfig::danger_full_access(),
+        );
+        let actions = [
+            GitWorkflowAction::Status(GitStatusRequest::default()),
+            GitWorkflowAction::ListBranches(ListBranchesRequest {
+                include_remote: false,
+            }),
+            GitWorkflowAction::ListRemotes,
+            GitWorkflowAction::Compare(CompareRequest {
+                base: "HEAD".to_string(),
+                head: "HEAD".to_string(),
+                mode: CompareMode::Direct,
+            }),
+            GitWorkflowAction::ListWorktrees,
+        ];
+        for action in actions {
+            let request = GitWorkflowRequest {
+                repository: repository.clone(),
+                action,
+            };
+            let result = execute_git_workflow(
+                &environment,
+                &request,
+                ExecutionContext::with_timeout(std::time::Duration::from_secs(20)),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.success,
+                "{:?}: {}",
+                result.action,
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[tokio::test]

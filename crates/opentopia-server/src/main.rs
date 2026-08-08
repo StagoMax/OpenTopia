@@ -55,7 +55,7 @@ use opentopia_core::{
     UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff,
     WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
-    CONTEXT_CHECKPOINT_SCHEMA_VERSION, MAX_PREVIEW_CONTENT_BYTES,
+    CONTEXT_CHECKPOINT_SCHEMA_VERSION, GIT_NONINTERACTIVE_ENVIRONMENT, MAX_PREVIEW_CONTENT_BYTES,
     MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -3798,6 +3798,22 @@ fn resolve_preview_target(
                 .ok_or_else(|| ApiError::not_found(format!("artifact not found: {artifact_id}")))?;
             opentopia_core::resolve_artifact_preview(thread.id, &thread.workspace_root, &artifact)
                 .map_err(preview_api_error)
+        }
+        PreviewTarget::Attachment { attachment_id } => {
+            let attachment = store
+                .list_messages(thread.id)?
+                .into_iter()
+                .flat_map(|message| message.parts)
+                .find_map(|part| match part {
+                    MessagePart::SourceRef { source } if source.id == *attachment_id => {
+                        Some(source)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("attachment not found: {attachment_id}"))
+                })?;
+            opentopia_core::resolve_attachment_preview(&attachment).map_err(preview_api_error)
         }
     }
 }
@@ -10521,6 +10537,7 @@ async fn run_git<const N: usize>(
     let output = timeout(
         Duration::from_secs(20),
         Command::new("git")
+            .envs(GIT_NONINTERACTIVE_ENVIRONMENT)
             .args(args)
             .current_dir(workspace_root)
             .stdout(Stdio::piped())
@@ -10544,6 +10561,7 @@ async fn run_git_with_input(
     input: &str,
 ) -> Result<String, ApiError> {
     let mut child = Command::new("git")
+        .envs(GIT_NONINTERACTIVE_ENVIRONMENT)
         .args(args)
         .current_dir(workspace_root)
         .stdin(Stdio::piped())
@@ -12686,6 +12704,51 @@ mod tests {
     }
 
     #[test]
+    fn preview_attachment_resolution_is_scoped_to_the_route_thread() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let workspace = std::env::current_dir().expect("current directory");
+        let owner = store
+            .create_thread(Some("owner".to_string()), workspace.clone())
+            .expect("create owner thread");
+        let other = store
+            .create_thread(Some("other".to_string()), workspace)
+            .expect("create other thread");
+        let attachment_id = Uuid::new_v4();
+        let attachment_path =
+            std::env::temp_dir().join(format!("opentopia-preview-attachment-{attachment_id}.pdf"));
+        std::fs::write(&attachment_path, b"%PDF-1.7").expect("write attachment");
+        store
+            .append_message(Message {
+                id: Uuid::new_v4(),
+                thread_id: owner.id,
+                role: MessageRole::User,
+                parts: vec![MessagePart::SourceRef {
+                    source: ContextSourceRef {
+                        id: attachment_id,
+                        path: attachment_path.clone(),
+                        name: "brief.pdf".to_string(),
+                        kind: opentopia_core::ContextSourceKind::Document,
+                        content_type: "application/pdf".to_string(),
+                        bytes: 8,
+                        truncated: false,
+                    },
+                }],
+                created_at: Utc::now(),
+            })
+            .expect("store attachment reference");
+        let target = PreviewTarget::Attachment { attachment_id };
+
+        let owner_preview =
+            resolve_preview_target(&store, &owner, &target).expect("owner resolves attachment");
+        assert_eq!(owner_preview.descriptor.kind, PreviewKind::Pdf);
+
+        let error = resolve_preview_target(&store, &other, &target)
+            .expect_err("other thread must not resolve attachment");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        std::fs::remove_file(attachment_path).expect("remove attachment");
+    }
+
+    #[test]
     fn preview_target_contract_uses_tagged_camel_case_artifact_id() {
         let artifact_id = Uuid::new_v4();
         let target: PreviewTarget = serde_json::from_value(json!({
@@ -12694,6 +12757,17 @@ mod tests {
         }))
         .expect("deserialize preview target");
         assert_eq!(target, PreviewTarget::Artifact { artifact_id });
+    }
+
+    #[test]
+    fn preview_target_contract_uses_tagged_camel_case_attachment_id() {
+        let attachment_id = Uuid::new_v4();
+        let target: PreviewTarget = serde_json::from_value(json!({
+            "source": "attachment",
+            "attachmentId": attachment_id,
+        }))
+        .expect("deserialize preview target");
+        assert_eq!(target, PreviewTarget::Attachment { attachment_id });
     }
 
     #[test]

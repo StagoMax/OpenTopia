@@ -2,7 +2,7 @@ use anyhow::Context;
 use chrono::Utc;
 use opentopia_core::{
     normalize_workspace_key, SessionStore, SqliteSessionStore, TurnChangeSet, TurnChangeSetStatus,
-    TurnFileChange, TurnFileChangeKind,
+    TurnFileChange, TurnFileChangeKind, GIT_NONINTERACTIVE_ENVIRONMENT,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -1094,6 +1094,7 @@ async fn merge_contents(
     tokio::fs::write(&after_path, after).await?;
     tokio::fs::write(&before_path, before).await?;
     let output = Command::new("git")
+        .envs(GIT_NONINTERACTIVE_ENVIRONMENT)
         .arg("merge-file")
         .arg("-p")
         .arg("--diff3")
@@ -1306,7 +1307,11 @@ async fn git_output_strings(
     index: Option<&Path>,
 ) -> anyhow::Result<Output> {
     let mut command = Command::new("git");
-    command.current_dir(repo_root).args(args).kill_on_drop(true);
+    command
+        .envs(GIT_NONINTERACTIVE_ENVIRONMENT)
+        .current_dir(repo_root)
+        .args(args)
+        .kill_on_drop(true);
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }

@@ -2,9 +2,10 @@ use crate::model::TaskPlan;
 use crate::policy::{BasicPolicyEngine, PermissionMode, PolicyDecision, PolicyEngine};
 use crate::provider::{
     ModelConversationMessage, ModelConversationRole, ModelDecision, ModelProvider, ModelRequest,
-    ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
+    ModelUsage, ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
 };
 use crate::sandbox::LocalSandboxConfig;
+use crate::shell_analysis::analyze_shell_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -12,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -57,7 +58,9 @@ pub enum GuardianUserAuthorization {
 #[serde(rename_all = "snake_case")]
 pub enum GuardianAssessmentOutcome {
     Allow,
-    Deny,
+    NeedsUserApproval,
+    #[serde(alias = "deny")]
+    DenyByPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,14 +77,41 @@ pub struct GuardianAssessment {
 pub enum GuardianReviewStatus {
     InProgress,
     Approved,
-    Denied,
-    TimedOut,
+    NeedsUserApproval,
+    #[serde(alias = "denied")]
+    DeniedByPolicy,
+    #[serde(alias = "timed_out")]
+    ReviewerUnavailable,
+    InvalidReviewerResponse,
     Aborted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianReviewFailureKind {
+    ReviewerUnavailable,
+    InvalidReviewerResponse,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianDecisionSource {
+    Guardian,
+    Runtime,
+}
+
+impl Default for GuardianDecisionSource {
+    fn default() -> Self {
+        Self::Guardian
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuardianApprovalAction {
+    Batch {
+        actions: Vec<GuardianApprovalAction>,
+    },
     Command {
         tool: String,
         command: String,
@@ -192,6 +222,11 @@ impl GuardianApprovalAction {
 
     pub fn event_summary(&self) -> Value {
         match self {
+            Self::Batch { actions } => json!({
+                "type": "batch",
+                "count": actions.len(),
+                "actions": actions.iter().map(Self::event_summary).collect::<Vec<_>>(),
+            }),
             Self::Command { tool, command, cwd } => {
                 json!({ "type": "command", "tool": tool, "command": command, "cwd": cwd })
             }
@@ -223,6 +258,25 @@ impl GuardianApprovalAction {
             Self::ToolCall { tool, cwd, .. } => {
                 json!({ "type": "tool_call", "tool": tool, "cwd": cwd })
             }
+        }
+    }
+
+    /// Returns a reason when a dangerous shell action cannot be reviewed as a
+    /// concrete operation. The Guardian only judges fully specified actions; it
+    /// must never guess what a shell variable or command substitution will
+    /// resolve to at execution time.
+    pub fn reviewability_error(&self) -> Option<String> {
+        match self {
+            Self::Batch { actions } => actions.iter().find_map(Self::reviewability_error),
+            Self::Command { command, .. }
+                if analyze_shell_command(command).is_unreviewable_destructive_action() =>
+            {
+                Some(
+                    "Dangerous shell action contains an unresolved variable or command expansion. Resolve it to a concrete target before requesting approval."
+                        .to_string(),
+                )
+            }
+            _ => None,
         }
     }
 }
@@ -260,12 +314,36 @@ pub struct GuardianReviewResult {
     pub assessment: Option<GuardianAssessment>,
     pub rationale: String,
     pub interrupt_turn: Option<String>,
+    pub failure_kind: Option<GuardianReviewFailureKind>,
+    pub usage: ModelUsage,
+    pub attempts: usize,
+    pub tool_rounds: usize,
+    pub decision_source: GuardianDecisionSource,
 }
 
 impl GuardianReviewResult {
     pub fn approved(&self) -> bool {
         self.status == GuardianReviewStatus::Approved
     }
+
+    pub fn needs_user_approval(&self) -> bool {
+        self.status == GuardianReviewStatus::NeedsUserApproval
+    }
+
+    pub fn denied_by_policy(&self) -> bool {
+        self.status == GuardianReviewStatus::DeniedByPolicy
+    }
+
+    pub fn technical_failure(&self) -> bool {
+        self.failure_kind.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GuardianModelReviewOutput {
+    text: String,
+    usage: ModelUsage,
+    tool_rounds: usize,
 }
 
 pub(crate) struct GuardianReviewContext<'a> {
@@ -431,6 +509,9 @@ impl GuardianReviewSessionManager {
         let prompt = build_guardian_prompt(request, prompt_entries, can_use_delta, &context);
         let deadline = Instant::now() + self.timeout;
         let mut last_error = String::new();
+        let mut last_failure_kind = GuardianReviewFailureKind::ReviewerUnavailable;
+        let mut usage = ModelUsage::default();
+        let mut tool_rounds = 0usize;
 
         for attempt in 1..=self.max_attempts {
             let retry_prompt = if attempt == 1 {
@@ -448,6 +529,11 @@ impl GuardianReviewSessionManager {
                 context.sandbox_config,
                 request.thread_id,
             );
+            let attempts_remaining = self.max_attempts.saturating_sub(attempt).saturating_add(1);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt_timeout = remaining
+                .checked_div(u32::try_from(attempts_remaining).unwrap_or(u32::MAX))
+                .unwrap_or(remaining);
             let outcome = if let Some(cancel) = cancellation {
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -457,36 +543,44 @@ impl GuardianReviewSessionManager {
                             assessment: None,
                             rationale: "Automatic approval review was cancelled.".to_string(),
                             interrupt_turn: None,
+                            failure_kind: None,
+                            usage,
+                            attempts: attempt,
+                            tool_rounds,
+                            decision_source: GuardianDecisionSource::Runtime,
                         };
                     }
-                    outcome = timeout_at(deadline, review) => outcome,
+                    outcome = timeout(attempt_timeout, review) => outcome,
                 }
             } else {
-                timeout_at(deadline, review).await
+                timeout(attempt_timeout, review).await
             };
 
             let response = match outcome {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
                     last_error = error.to_string();
+                    last_failure_kind = GuardianReviewFailureKind::ReviewerUnavailable;
                     continue;
                 }
                 Err(_) => {
-                    record_review_result(&mut state, request.turn_id, false);
-                    return GuardianReviewResult {
-                        status: GuardianReviewStatus::TimedOut,
-                        assessment: None,
-                        rationale: "Automatic approval review timed out while evaluating the requested approval."
-                            .to_string(),
-                        interrupt_turn: None,
-                    };
+                    last_error = format!(
+                        "reviewer attempt {attempt} timed out after {} ms",
+                        attempt_timeout.as_millis()
+                    );
+                    last_failure_kind = GuardianReviewFailureKind::ReviewerUnavailable;
+                    continue;
                 }
             };
 
-            let assessment = match parse_guardian_assessment(&response) {
+            accumulate_model_usage(&mut usage, &response.usage);
+            tool_rounds = tool_rounds.saturating_add(response.tool_rounds);
+
+            let assessment = match parse_guardian_assessment(&response.text) {
                 Ok(assessment) => assessment,
                 Err(error) => {
                     last_error = error.to_string();
+                    last_failure_kind = GuardianReviewFailureKind::InvalidReviewerResponse;
                     continue;
                 }
             };
@@ -497,32 +591,55 @@ impl GuardianReviewSessionManager {
             });
             state.reviewer_conversation.push(ModelConversationMessage {
                 role: ModelConversationRole::Assistant,
-                content: response,
+                content: response.text,
                 content_parts: Vec::new(),
             });
             state.prior_review_count += 1;
             state.last_parent_transcript = transcript;
-            let denied = assessment.outcome == GuardianAssessmentOutcome::Deny;
-            let interrupt_turn = record_review_result(&mut state, request.turn_id, denied);
-            let status = if denied {
-                GuardianReviewStatus::Denied
-            } else {
-                GuardianReviewStatus::Approved
+            let denied_by_policy = assessment.outcome == GuardianAssessmentOutcome::DenyByPolicy;
+            let interrupt_turn =
+                record_review_result(&mut state, request.turn_id, denied_by_policy);
+            let status = match assessment.outcome {
+                GuardianAssessmentOutcome::Allow => GuardianReviewStatus::Approved,
+                GuardianAssessmentOutcome::NeedsUserApproval => {
+                    GuardianReviewStatus::NeedsUserApproval
+                }
+                GuardianAssessmentOutcome::DenyByPolicy => GuardianReviewStatus::DeniedByPolicy,
             };
             return GuardianReviewResult {
                 status,
                 rationale: assessment.rationale.clone(),
                 assessment: Some(assessment),
                 interrupt_turn,
+                failure_kind: None,
+                usage,
+                attempts: attempt,
+                tool_rounds,
+                decision_source: GuardianDecisionSource::Guardian,
             };
         }
 
         record_review_result(&mut state, request.turn_id, false);
         GuardianReviewResult {
-            status: GuardianReviewStatus::Denied,
+            status: match last_failure_kind {
+                GuardianReviewFailureKind::ReviewerUnavailable => {
+                    GuardianReviewStatus::ReviewerUnavailable
+                }
+                GuardianReviewFailureKind::InvalidReviewerResponse => {
+                    GuardianReviewStatus::InvalidReviewerResponse
+                }
+            },
             assessment: None,
-            rationale: format!("Automatic approval review failed closed: {last_error}"),
+            rationale: format!(
+                "Automatic approval review could not produce a decision after {} attempt(s): {last_error}",
+                self.max_attempts
+            ),
             interrupt_turn: None,
+            failure_kind: Some(last_failure_kind),
+            usage,
+            attempts: self.max_attempts,
+            tool_rounds,
+            decision_source: GuardianDecisionSource::Runtime,
         }
     }
 
@@ -670,10 +787,12 @@ async fn run_review_model(
     workspace_root: &Path,
     sandbox_config: &LocalSandboxConfig,
     thread_id: Uuid,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<GuardianModelReviewOutput> {
     let mut previous_tool_calls = Vec::new();
     let mut tool_results = Vec::new();
     let mut previous_response_items = Vec::new();
+    let mut usage = ModelUsage::default();
+    let mut tool_rounds = 0usize;
     for _ in 0..=GUARDIAN_MAX_TOOL_ROUNDS {
         let response = provider
             .complete(ModelRequest {
@@ -692,9 +811,17 @@ async fn run_review_model(
                 final_output_json_schema: Some(guardian_output_schema()),
             })
             .await?;
-        if response.tool_calls.is_empty() {
-            return Ok(response.text);
+        if let Some(response_usage) = response.usage.as_ref() {
+            accumulate_model_usage(&mut usage, response_usage);
         }
+        if response.tool_calls.is_empty() {
+            return Ok(GuardianModelReviewOutput {
+                text: response.text,
+                usage,
+                tool_rounds,
+            });
+        }
+        tool_rounds = tool_rounds.saturating_add(1);
         previous_response_items.extend(response.provider_items);
         for call in response.tool_calls {
             let result =
@@ -704,6 +831,21 @@ async fn run_review_model(
         }
     }
     anyhow::bail!("guardian exceeded its read-only tool-call budget")
+}
+
+fn accumulate_model_usage(total: &mut ModelUsage, next: &ModelUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
+    accumulate_optional_usage(&mut total.cached_input_tokens, next.cached_input_tokens);
+    accumulate_optional_usage(&mut total.cache_write_tokens, next.cache_write_tokens);
+    accumulate_optional_usage(&mut total.reasoning_tokens, next.reasoning_tokens);
+}
+
+fn accumulate_optional_usage(total: &mut Option<u64>, next: Option<u64>) {
+    if let Some(next) = next {
+        *total = Some(total.unwrap_or_default().saturating_add(next));
+    }
 }
 
 async fn run_rollout_review_model(
@@ -815,7 +957,7 @@ fn guardian_policy_prompt() -> String {
     let prompt = BUNDLED_GUARDIAN_POLICY_TEMPLATE
         .replace("{{ tenant_policy_config }}", BUNDLED_GUARDIAN_POLICY.trim());
     format!(
-        "{prompt}\n\nYou may use read-only tool checks to gather additional context. Your final message must be strict JSON. For low-risk actions {{\"outcome\":\"allow\"}} is sufficient when the provider permits omitted properties; if its schema requires every property, use null for the other values. Otherwise return risk_level, user_authorization, outcome, and rationale."
+        "{prompt}\n\nYou may use read-only tool checks to gather additional context. Your final message must be strict JSON. The only business outcomes are allow, needs_user_approval, and deny_by_policy. For low-risk actions {{\"outcome\":\"allow\"}} is sufficient when the provider permits omitted properties; if its schema requires every property, use null for the other values. Otherwise return risk_level, user_authorization, outcome, and rationale."
     )
 }
 
@@ -834,7 +976,7 @@ fn guardian_output_schema() -> Value {
             },
             "outcome": {
                 "type": "string",
-                "enum": ["allow", "deny"]
+                "enum": ["allow", "needs_user_approval", "deny_by_policy"]
             },
             "rationale": { "type": ["string", "null"] }
         },
@@ -863,7 +1005,8 @@ fn parse_guardian_assessment(text: &str) -> anyhow::Result<GuardianAssessment> {
     };
     let risk_level = payload.risk_level.unwrap_or(match payload.outcome {
         GuardianAssessmentOutcome::Allow => GuardianRiskLevel::Low,
-        GuardianAssessmentOutcome::Deny => GuardianRiskLevel::High,
+        GuardianAssessmentOutcome::NeedsUserApproval => GuardianRiskLevel::High,
+        GuardianAssessmentOutcome::DenyByPolicy => GuardianRiskLevel::Critical,
     });
     let rationale = payload
         .rationale
@@ -872,8 +1015,11 @@ fn parse_guardian_assessment(text: &str) -> anyhow::Result<GuardianAssessment> {
             GuardianAssessmentOutcome::Allow => {
                 "Auto-review returned a low-risk allow decision.".to_string()
             }
-            GuardianAssessmentOutcome::Deny => {
-                "Auto-review returned a deny decision without a rationale.".to_string()
+            GuardianAssessmentOutcome::NeedsUserApproval => {
+                "Auto-review requires the user to approve this concrete action.".to_string()
+            }
+            GuardianAssessmentOutcome::DenyByPolicy => {
+                "Auto-review found that the action violates a non-overridable policy.".to_string()
             }
         });
     Ok(GuardianAssessment {
@@ -1237,12 +1383,14 @@ async fn guardian_read_file(
 
 async fn guardian_git_context(workspace_root: &Path) -> anyhow::Result<String> {
     let status = tokio::process::Command::new("git")
+        .envs(crate::git_workflow::GIT_NONINTERACTIVE_ENVIRONMENT)
         .arg("-C")
         .arg(workspace_root)
         .args(["status", "--short", "--branch"])
         .output()
         .await?;
     let remotes = tokio::process::Command::new("git")
+        .envs(crate::git_workflow::GIT_NONINTERACTIVE_ENVIRONMENT)
         .arg("-C")
         .arg(workspace_root)
         .args(["remote", "-v"])
@@ -1362,6 +1510,23 @@ mod tests {
     }
 
     #[test]
+    fn dangerous_dynamic_shell_action_is_not_reviewable() {
+        let dynamic = GuardianApprovalAction::Command {
+            tool: "shell".to_string(),
+            command: "Remove-Item -Recurse -Force $target".to_string(),
+            cwd: PathBuf::from("C:/workspace"),
+        };
+        assert!(dynamic.reviewability_error().is_some());
+
+        let concrete = GuardianApprovalAction::Command {
+            tool: "shell".to_string(),
+            command: "Remove-Item -Recurse -Force -LiteralPath 'build'".to_string(),
+            cwd: PathBuf::from("C:/workspace"),
+        };
+        assert!(concrete.reviewability_error().is_none());
+    }
+
+    #[test]
     fn browser_approval_actions_do_not_invent_network_hosts() {
         let call = ProviderToolCall {
             id: "browser-click".to_string(),
@@ -1436,11 +1601,14 @@ mod tests {
     #[test]
     fn parses_json_wrapped_in_prose() {
         let assessment = parse_guardian_assessment(
-            r#"Decision: {"risk_level":"high","user_authorization":"unknown","outcome":"deny","rationale":"not authorized"}"#,
+            r#"Decision: {"risk_level":"high","user_authorization":"unknown","outcome":"needs_user_approval","rationale":"not authorized"}"#,
         )
         .unwrap();
         assert_eq!(assessment.risk_level, GuardianRiskLevel::High);
-        assert_eq!(assessment.outcome, GuardianAssessmentOutcome::Deny);
+        assert_eq!(
+            assessment.outcome,
+            GuardianAssessmentOutcome::NeedsUserApproval
+        );
     }
 
     #[tokio::test]
@@ -1550,7 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_output_fails_closed_after_retry_budget() {
+    async fn malformed_output_reports_invalid_response_after_retry_budget() {
         let reviewer = Arc::new(ScriptedReviewer::new(vec![
             Ok(ModelResponse::text("not json")),
             Ok(ModelResponse::text("still not json")),
@@ -1566,12 +1734,17 @@ mod tests {
                 None,
             )
             .await;
-        assert_eq!(result.status, GuardianReviewStatus::Denied);
-        assert!(result.rationale.contains("failed closed"));
+        assert_eq!(result.status, GuardianReviewStatus::InvalidReviewerResponse);
+        assert_eq!(
+            result.failure_kind,
+            Some(GuardianReviewFailureKind::InvalidReviewerResponse)
+        );
+        assert_eq!(result.attempts, 3);
+        assert!(result.rationale.contains("could not produce a decision"));
     }
 
     #[tokio::test]
-    async fn reviewer_timeout_fails_closed_without_an_assessment() {
+    async fn reviewer_timeout_reports_unavailable_without_an_assessment() {
         let manager = GuardianReviewSessionManager::with_limits(
             Arc::new(SlowReviewer),
             Duration::from_millis(10),
@@ -1585,8 +1758,38 @@ mod tests {
                 None,
             )
             .await;
-        assert_eq!(result.status, GuardianReviewStatus::TimedOut);
+        assert_eq!(result.status, GuardianReviewStatus::ReviewerUnavailable);
+        assert_eq!(
+            result.failure_kind,
+            Some(GuardianReviewFailureKind::ReviewerUnavailable)
+        );
         assert!(result.assessment.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_failures_report_reviewer_unavailable_after_retry_budget() {
+        let reviewer = Arc::new(ScriptedReviewer::new(vec![
+            Err(anyhow::anyhow!("provider 504")),
+            Err(anyhow::anyhow!("provider 504")),
+            Err(anyhow::anyhow!("provider 504")),
+        ]));
+        let manager =
+            GuardianReviewSessionManager::with_limits(reviewer, Duration::from_secs(1), 3);
+        let sandbox = LocalSandboxConfig::default();
+        let result = manager
+            .review(
+                &request(Uuid::new_v4()),
+                review_context(&[], &[], &sandbox),
+                None,
+            )
+            .await;
+        assert_eq!(result.status, GuardianReviewStatus::ReviewerUnavailable);
+        assert_eq!(
+            result.failure_kind,
+            Some(GuardianReviewFailureKind::ReviewerUnavailable)
+        );
+        assert_eq!(result.attempts, 3);
+        assert!(result.rationale.contains("provider 504"));
     }
 
     #[tokio::test]
@@ -1602,12 +1805,29 @@ mod tests {
                     name: "guardian_read_file".to_string(),
                     arguments: json!({ "path": "target.txt" }),
                 }],
-                usage: None,
+                usage: Some(ModelUsage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    total_tokens: 12,
+                    cached_input_tokens: Some(4),
+                    cache_write_tokens: None,
+                    reasoning_tokens: Some(1),
+                }),
                 response_id: None,
                 provider_items: Vec::new(),
                 finish_reason: crate::provider::ModelFinishReason::ToolCalls,
             }),
-            Ok(ModelResponse::text(r#"{"outcome":"allow"}"#)),
+            Ok(ModelResponse {
+                usage: Some(ModelUsage {
+                    input_tokens: 6,
+                    output_tokens: 3,
+                    total_tokens: 9,
+                    cached_input_tokens: Some(2),
+                    cache_write_tokens: Some(1),
+                    reasoning_tokens: None,
+                }),
+                ..ModelResponse::text(r#"{"outcome":"allow"}"#)
+            }),
         ]));
         let manager = GuardianReviewSessionManager::new(reviewer.clone());
         let sandbox = LocalSandboxConfig::default();
@@ -1631,6 +1851,13 @@ mod tests {
         );
         let result = manager.review(&request, context, None).await;
         assert_eq!(result.status, GuardianReviewStatus::Approved);
+        assert_eq!(result.tool_rounds, 1);
+        assert_eq!(result.usage.input_tokens, 16);
+        assert_eq!(result.usage.output_tokens, 5);
+        assert_eq!(result.usage.total_tokens, 21);
+        assert_eq!(result.usage.cached_input_tokens, Some(6));
+        assert_eq!(result.usage.cache_write_tokens, Some(1));
+        assert_eq!(result.usage.reasoning_tokens, Some(1));
         let requests = reviewer.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].tool_results.len(), 1);
@@ -1644,7 +1871,7 @@ mod tests {
     async fn three_consecutive_denials_interrupt_the_turn() {
         let denial = || {
             Ok(ModelResponse::text(
-                r#"{"risk_level":"high","user_authorization":"unknown","outcome":"deny","rationale":"not authorized"}"#,
+                r#"{"risk_level":"critical","user_authorization":"unknown","outcome":"deny_by_policy","rationale":"absolute tenant prohibition"}"#,
             ))
         };
         let reviewer = Arc::new(ScriptedReviewer::new(vec![denial(), denial(), denial()]));

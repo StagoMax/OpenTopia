@@ -1,6 +1,10 @@
 use crate::context_sources::{ContextSourceKind, LoadedContextSource};
-use crate::guardian::{GuardianReviewStatus, GuardianRiskLevel, GuardianUserAuthorization};
+use crate::guardian::{
+    GuardianDecisionSource, GuardianReviewFailureKind, GuardianReviewStatus, GuardianRiskLevel,
+    GuardianUserAuthorization,
+};
 use crate::model_context::{ModelContextItem, ThreadContextSnapshot, TurnContextSnapshot};
+use crate::provider::ModelUsage;
 use crate::skills::LoadedSkill;
 use crate::subagents::SubagentRun;
 use chrono::{DateTime, Utc};
@@ -1779,6 +1783,16 @@ pub enum AgentEventPayload {
         user_authorization: Option<GuardianUserAuthorization>,
         rationale: String,
         action: Value,
+        #[serde(default)]
+        usage: ModelUsage,
+        #[serde(default)]
+        attempts: usize,
+        #[serde(default)]
+        tool_rounds: usize,
+        #[serde(default)]
+        decision_source: GuardianDecisionSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_kind: Option<GuardianReviewFailureKind>,
     },
     AutoReviewInterruptionWarning {
         message: String,
@@ -1912,6 +1926,45 @@ mod tests {
         assert!(matches!(
             parsed,
             AgentEventPayload::ContextCompacted { details: None, .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_automatic_review_events_deserialize_with_new_defaults() {
+        let current = AgentEventPayload::AutomaticApprovalReviewCompleted {
+            review_id: Uuid::new_v4(),
+            target_item_id: "call-1".to_string(),
+            status: GuardianReviewStatus::DeniedByPolicy,
+            risk_level: Some(GuardianRiskLevel::High),
+            user_authorization: Some(GuardianUserAuthorization::Unknown),
+            rationale: "legacy denial".to_string(),
+            action: json!({ "type": "command" }),
+            usage: ModelUsage::default(),
+            attempts: 0,
+            tool_rounds: 0,
+            decision_source: GuardianDecisionSource::Guardian,
+            failure_kind: None,
+        };
+        let mut payload = serde_json::to_value(current).expect("serialize");
+        let object = payload.as_object_mut().expect("event object");
+        object.insert("status".to_string(), json!("denied"));
+        object.remove("usage");
+        object.remove("attempts");
+        object.remove("tool_rounds");
+        object.remove("decision_source");
+        object.remove("failure_kind");
+
+        let parsed: AgentEventPayload = serde_json::from_value(payload).expect("deserialize");
+        assert!(matches!(
+            parsed,
+            AgentEventPayload::AutomaticApprovalReviewCompleted {
+                status: GuardianReviewStatus::DeniedByPolicy,
+                attempts: 0,
+                tool_rounds: 0,
+                decision_source: GuardianDecisionSource::Guardian,
+                failure_kind: None,
+                ..
+            }
         ));
     }
 

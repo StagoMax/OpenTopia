@@ -1,5 +1,6 @@
 use crate::computer::{ComputerAction, ComputerPolicyContext, WindowTarget};
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
+use crate::shell_analysis::analyze_shell_command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
@@ -32,8 +33,9 @@ pub enum ApprovalsReviewer {
 impl PermissionMode {
     pub fn approval_policy(self) -> ApprovalPolicy {
         match self {
-            Self::FullAccess => ApprovalPolicy::Never,
-            Self::Chat | Self::ReadOnly | Self::Auto | Self::Approve => ApprovalPolicy::OnRequest,
+            Self::Chat | Self::ReadOnly | Self::Auto | Self::Approve | Self::FullAccess => {
+                ApprovalPolicy::OnRequest
+            }
         }
     }
 
@@ -525,16 +527,32 @@ impl PolicyEngine for BasicPolicyEngine {
     }
 
     fn inspect_command(&self, command: &str) -> PolicyDecision {
+        let analysis = analyze_shell_command(command);
         for rule in &self.config.command_rules {
             if rule.matches(command) {
                 let decision = rule.decision(command);
-                if matches!(decision, PolicyDecision::Ask { .. })
-                    && self.mode == PermissionMode::FullAccess
-                {
-                    return PolicyDecision::Allow;
-                }
-                return decision;
+                return match (analysis.destructive, decision) {
+                    // A broad configured allow rule must not silently bypass the
+                    // invariant that destructive shell actions are reviewable in
+                    // every mode, including FullAccess. Explicit policy denials
+                    // remain stronger than an approval boundary.
+                    (true, PolicyDecision::Allow) => PolicyDecision::Ask {
+                        reason: format!("Potentially destructive shell action: {command}"),
+                    },
+                    (_, decision) => decision,
+                };
             }
+        }
+
+        // The configured rules remain the authoritative place for explicit
+        // allow/ask/deny overrides, while the structural analyzer closes the
+        // obvious alias/subcommand gaps in the small default string list. This
+        // signal may require approval, but it never grants authority or marks
+        // an unknown command safe.
+        if analysis.destructive {
+            return PolicyDecision::Ask {
+                reason: format!("Potentially destructive shell action: {command}"),
+            };
         }
 
         match self.mode {
@@ -576,6 +594,9 @@ impl PolicyEngine for BasicPolicyEngine {
                     }
                 }
             }
+            PermissionMode::FullAccess if risk == McpToolRisk::Destructive => PolicyDecision::Ask {
+                reason: self.mcp_approval_reason(descriptor, risk),
+            },
             PermissionMode::FullAccess => PolicyDecision::Allow,
         }
     }
@@ -660,7 +681,11 @@ mod tests {
         );
         assert_eq!(
             PermissionMode::FullAccess.approval_policy(),
-            ApprovalPolicy::Never
+            ApprovalPolicy::OnRequest
+        );
+        assert_eq!(
+            PermissionMode::FullAccess.approvals_reviewer(),
+            ApprovalsReviewer::User
         );
     }
 
@@ -720,6 +745,81 @@ mod tests {
     }
 
     #[test]
+    fn mcp_policy_matrix_keeps_destructive_operations_behind_approval() {
+        let cases = [
+            (
+                descriptor(&["read"], json!({ "readOnlyHint": true })),
+                ["deny", "allow", "allow", "allow", "allow"],
+            ),
+            (
+                descriptor(&["write"], json!({})),
+                ["deny", "deny", "ask", "ask", "allow"],
+            ),
+            (
+                descriptor(&["network"], json!({ "openWorldHint": true })),
+                ["deny", "deny", "ask", "ask", "allow"],
+            ),
+            (
+                descriptor(&["unknown"], json!({})),
+                ["deny", "deny", "ask", "ask", "allow"],
+            ),
+            (
+                descriptor(&["destructive"], json!({ "destructiveHint": true })),
+                ["deny", "deny", "ask", "ask", "ask"],
+            ),
+        ];
+        let modes = [
+            PermissionMode::Chat,
+            PermissionMode::ReadOnly,
+            PermissionMode::Auto,
+            PermissionMode::Approve,
+            PermissionMode::FullAccess,
+        ];
+
+        for (descriptor, expected) in cases {
+            for (mode, expected) in modes.into_iter().zip(expected) {
+                let decision = policy(mode).inspect_mcp_tool_call(&descriptor);
+                let actual = match decision {
+                    PolicyDecision::Allow => "allow",
+                    PolicyDecision::Ask { .. } => "ask",
+                    PolicyDecision::Deny { .. } => "deny",
+                };
+                assert_eq!(
+                    actual, expected,
+                    "unexpected decision for mode {mode:?}, labels {:?}, annotations {}",
+                    descriptor.permission_labels, descriptor.annotations
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn destructive_mcp_signal_overrides_conflicting_read_only_signal() {
+        let cases = [
+            descriptor(
+                &["read"],
+                json!({ "readOnlyHint": true, "destructiveHint": true }),
+            ),
+            descriptor(&["read", "destructive"], json!({ "readOnlyHint": true })),
+            descriptor(&["read", "delete"], json!({ "readOnlyHint": true })),
+            descriptor(&["read", "dangerous"], json!({ "readOnlyHint": true })),
+        ];
+
+        for descriptor in cases {
+            let decision = policy(PermissionMode::FullAccess).inspect_mcp_tool_call(&descriptor);
+            match decision {
+                PolicyDecision::Ask { reason } => {
+                    assert!(
+                        reason.contains("destructive"),
+                        "unexpected reason: {reason}"
+                    );
+                }
+                other => panic!("destructive MCP tool must require approval: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn approve_mode_allows_workspace_work_but_still_asks_for_external_risks() {
         let id = Uuid::new_v4();
         let workspace = std::env::temp_dir().join(format!("opentopia-policy-workspace-{id}"));
@@ -751,6 +851,80 @@ mod tests {
 
         std::fs::remove_dir_all(workspace).expect("remove workspace fixture");
         std::fs::remove_dir_all(outside).expect("remove outside fixture");
+    }
+
+    #[test]
+    fn full_access_still_asks_for_destructive_command_rules() {
+        let policy = policy(PermissionMode::FullAccess);
+        for command in [
+            "rm -rf build",
+            "Remove-Item -Recurse -LiteralPath build",
+            "del /s generated",
+            "rmdir /s /q generated",
+            "format C:",
+            "git reset --hard HEAD~1",
+            "git clean -fdx",
+            "sudo apt remove package",
+        ] {
+            assert!(
+                matches!(policy.inspect_command(command), PolicyDecision::Ask { .. }),
+                "destructive command must require approval in full access: {command}"
+            );
+        }
+        assert!(matches!(
+            policy.inspect_command("cargo test -p opentopia-core"),
+            PolicyDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn full_access_honors_configured_ask_command_rules() {
+        let mut config = PolicyConfig::default();
+        config.command_rules.insert(
+            0,
+            CommandPolicyRule::prefix(
+                "Remove-Item",
+                PolicyRuleEffect::Ask,
+                "Configured destructive PowerShell command: {command}",
+            ),
+        );
+        let policy = BasicPolicyEngine::new_with_config(
+            PathBuf::from("."),
+            PermissionMode::FullAccess,
+            config,
+        );
+
+        assert!(matches!(
+            policy.inspect_command("Remove-Item -Recurse build"),
+            PolicyDecision::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn configured_allow_rule_cannot_bypass_destructive_review() {
+        let mut config = PolicyConfig::default();
+        config.command_rules.insert(
+            0,
+            CommandPolicyRule::prefix(
+                "git",
+                PolicyRuleEffect::Allow,
+                "Configured git allow rule: {command}",
+            ),
+        );
+        let policy = BasicPolicyEngine::new_with_config(
+            PathBuf::from("."),
+            PermissionMode::FullAccess,
+            config,
+        );
+
+        assert!(matches!(
+            policy.inspect_command("git clean -fdx"),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            policy.inspect_command("git status --short"),
+            PolicyDecision::Allow
+        ));
     }
 
     #[test]

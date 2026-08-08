@@ -1,4 +1,4 @@
-use crate::model::{Artifact, ArtifactStorage};
+use crate::model::{Artifact, ArtifactStorage, ContextSourceRef};
 use crate::spreadsheet::{
     inspect_workbook, read_range, CellAddress, CellRange, InspectWorkbookRequest, ReadRangeRequest,
     SheetKind, SheetVisibility, SpreadsheetCell, SpreadsheetError, EXCEL_MAX_COLUMNS,
@@ -29,6 +29,7 @@ pub enum PreviewKind {
 pub enum PreviewSource {
     Workspace,
     Artifact,
+    Attachment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +41,7 @@ pub enum PreviewSource {
 pub enum PreviewTarget {
     Workspace { path: PathBuf },
     Artifact { artifact_id: Uuid },
+    Attachment { attachment_id: Uuid },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +150,9 @@ pub fn encode_preview_id(target: &PreviewTarget) -> String {
             format!("workspace.{}", URL_SAFE_NO_PAD.encode(path.as_bytes()))
         }
         PreviewTarget::Artifact { artifact_id } => format!("artifact.{artifact_id}"),
+        PreviewTarget::Attachment { attachment_id } => {
+            format!("attachment.{attachment_id}")
+        }
     }
 }
 
@@ -169,6 +174,11 @@ pub fn decode_preview_id(id: &str) -> Result<PreviewTarget, PreviewError> {
         let artifact_id =
             Uuid::parse_str(raw_id).map_err(|_| PreviewError::InvalidPreviewId(id.to_string()))?;
         return Ok(PreviewTarget::Artifact { artifact_id });
+    }
+    if let Some(raw_id) = id.strip_prefix("attachment.") {
+        let attachment_id =
+            Uuid::parse_str(raw_id).map_err(|_| PreviewError::InvalidPreviewId(id.to_string()))?;
+        return Ok(PreviewTarget::Attachment { attachment_id });
     }
     Err(PreviewError::InvalidPreviewId(id.to_string()))
 }
@@ -297,6 +307,42 @@ pub fn resolve_artifact_preview(
     Ok(ResolvedPreview {
         descriptor,
         content,
+    })
+}
+
+/// Resolves a user-selected context source that was persisted on a message.
+///
+/// Unlike workspace previews, attachments may intentionally live outside the
+/// workspace. Callers must first look up the opaque attachment ID inside the
+/// route thread; accepting a path directly here would bypass that ownership
+/// check.
+pub fn resolve_attachment_preview(
+    attachment: &ContextSourceRef,
+) -> Result<ResolvedPreview, PreviewError> {
+    let resolved = attachment
+        .path
+        .canonicalize()
+        .map_err(|_| PreviewError::PathNotFound(attachment.path.clone()))?;
+    let metadata = file_metadata(&resolved)?;
+    let content_type = infer_content_type(&resolved, Some(&attachment.content_type));
+    let target = PreviewTarget::Attachment {
+        attachment_id: attachment.id,
+    };
+    let descriptor = PreviewDescriptor {
+        id: encode_preview_id(&target),
+        source: PreviewSource::Attachment,
+        path: Some(resolved.clone()),
+        name: attachment.name.clone(),
+        kind: classify_preview(&content_type, &resolved),
+        content_type,
+        bytes: metadata.len(),
+        readonly: true,
+        revision: file_revision(&format!("u-{}", attachment.id), &metadata),
+        handler_id: None,
+    };
+    Ok(ResolvedPreview {
+        descriptor,
+        content: PreviewContentSource::Path(resolved),
     })
 }
 
@@ -575,6 +621,7 @@ fn is_source_extension(extension: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_sources::ContextSourceKind;
     use crate::spreadsheet::{
         write_workbook, CellUpdate, SheetWriteRequest, SpreadsheetCellInput, WriteWorkbookRequest,
     };
@@ -650,6 +697,37 @@ mod tests {
             error,
             PreviewError::ArtifactThreadMismatch { thread_id, .. } if thread_id == other_thread
         ));
+    }
+
+    #[test]
+    fn attachment_preview_round_trips_opaque_id_outside_workspace() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("brief.pdf");
+        std::fs::write(&path, b"%PDF-1.7").expect("write attachment");
+        let attachment = ContextSourceRef {
+            id: Uuid::new_v4(),
+            path: path.clone(),
+            name: "brief.pdf".to_string(),
+            kind: ContextSourceKind::Document,
+            content_type: "application/pdf".to_string(),
+            bytes: 0,
+            truncated: false,
+        };
+
+        let preview = resolve_attachment_preview(&attachment).expect("resolve attachment preview");
+        assert_eq!(preview.descriptor.kind, PreviewKind::Pdf);
+        assert_eq!(preview.descriptor.source, PreviewSource::Attachment);
+        assert_eq!(
+            preview.descriptor.path,
+            Some(path.canonicalize().expect("canonical attachment path"))
+        );
+        assert_eq!(preview.descriptor.bytes, 8);
+        assert_eq!(
+            decode_preview_id(&preview.descriptor.id).expect("decode attachment preview id"),
+            PreviewTarget::Attachment {
+                attachment_id: attachment.id,
+            }
+        );
     }
 
     #[test]

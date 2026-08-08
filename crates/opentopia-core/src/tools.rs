@@ -19,8 +19,8 @@ use crate::context_sources::{
 };
 use crate::enterprise::{CapabilityProjection, DataClassification};
 use crate::execution::{
-    ExecRequest, ExecutionContext, ExecutionEnvironment, FileReadRequest, FileWriteRequest,
-    LocalExecutionEnvironment,
+    shell_command_compatibility_error, ExecRequest, ExecutionContext, ExecutionEnvironment,
+    FileReadRequest, FileWriteRequest, LocalExecutionEnvironment, ShellDialect,
 };
 use crate::execution_authorization::{ExecutionGrant, ProcessLifetime, ToolExecutionIntent};
 use crate::file_mutation::{read_optional, FileMutationBatch, PreparedFileMutation};
@@ -39,6 +39,7 @@ use crate::policy::{
 };
 use crate::provider::{ModelConversationMessage, ModelConversationRole};
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
+use crate::shell_analysis::analyze_shell_command;
 use crate::skill_authoring::{
     create_skill_from_draft, preview_skill_draft, skill_target_path, SkillDraft, SkillResourceDraft,
 };
@@ -262,6 +263,18 @@ pub trait Tool: Send + Sync {
     fn execution_intent(&self, call: &ToolCall, _workspace_root: &Path) -> ToolExecutionIntent {
         self.execution_policy(call).execution_intent()
     }
+    /// Pure authorization preview used only to group calls that are already
+    /// known to cross an approval boundary. `None` means the tool cannot make
+    /// that decision without its ordinary execution-time validation. The
+    /// dispatcher must then keep the existing sequential path; it must never
+    /// execute a tool merely to discover whether approval is required.
+    fn authorization_preflight(
+        &self,
+        _call: &ToolCall,
+        _ctx: &ToolContext,
+    ) -> Option<PolicyDecision> {
+        None
+    }
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult>;
 }
 
@@ -284,6 +297,13 @@ trait TypedTool: Send + Sync {
     }
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
         self.execution_policy(input).execution_intent()
+    }
+    fn authorization_preflight(
+        &self,
+        _input: &Self::Input,
+        _ctx: &ToolContext,
+    ) -> Option<PolicyDecision> {
+        None
     }
     async fn execute_typed(
         &self,
@@ -381,6 +401,19 @@ macro_rules! impl_typed_tool {
                 )
                 .map(|input| <Self as TypedTool>::execution_intent(self, &input, workspace_root))
                 .unwrap_or_default()
+            }
+
+            fn authorization_preflight(
+                &self,
+                call: &ToolCall,
+                ctx: &ToolContext,
+            ) -> Option<PolicyDecision> {
+                decode_typed_tool_input::<<Self as TypedTool>::Input>(
+                    <Self as TypedTool>::name(self),
+                    call.input.clone(),
+                )
+                .ok()
+                .and_then(|input| <Self as TypedTool>::authorization_preflight(self, &input, ctx))
             }
 
             async fn execute(
@@ -2893,8 +2926,13 @@ struct BrowserInput {
     #[serde(default)]
     condition: BrowserWaitConditionInput,
     #[serde(default)]
-    #[schemars(range(min = 1, max = 120000))]
+    #[schemars(range(min = 1, max = 21600000))]
     timeout_ms: Option<u64>,
+    /// How long a download may stay inline before it automatically returns a
+    /// background job id. Other browser actions ignore this field.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 60000))]
+    yield_time_ms: Option<u64>,
     /// Optional expected filename for a download.
     #[serde(default)]
     expected_filename: Option<String>,
@@ -2960,9 +2998,14 @@ impl TypedTool for BrowserTool {
         let thread_id = ctx.thread_id.context("browser requires a thread context")?;
         let session = BrowserSessionId::from_thread(thread_id);
         let action = input.action.as_str().to_string();
-        let timeout = input
-            .timeout_ms
-            .map(|milliseconds| Duration::from_millis(milliseconds.clamp(1, 120_000)));
+        let timeout = input.timeout_ms.map(|milliseconds| {
+            let maximum = if matches!(input.action, BrowserActionInput::Download) {
+                MAX_BACKGROUND_TIMEOUT_SECONDS * 1_000
+            } else {
+                120_000
+            };
+            Duration::from_millis(milliseconds.clamp(1, maximum))
+        });
         let output = match input.action {
             BrowserActionInput::Navigate => {
                 let url = required_typed_string(input.url.as_deref(), "url")?;
@@ -3169,16 +3212,73 @@ impl TypedTool for BrowserTool {
                 let url = required_typed_string(input.url.as_deref(), "url")?;
                 let host = inspect_browser_destination(&ctx, &url)?;
                 grant_browser_network_access(&ctx, &runtime, session, [host]).await?;
-                runtime
-                    .download(
-                        session,
-                        BrowserDownloadRequest {
-                            url,
-                            expected_filename: input.expected_filename,
-                            timeout,
+                let request = BrowserDownloadRequest {
+                    url: url.clone(),
+                    expected_filename: input.expected_filename,
+                    timeout,
+                };
+                if let (Some(registry), Some(_)) = (ctx.background.as_ref(), ctx.thread_id) {
+                    let scope = background_scope(&ctx)?;
+                    let task_runtime = runtime.clone();
+                    let job = registry.spawn_task(
+                        scope.clone(),
+                        format!("browser download {url}"),
+                        ctx.cancel.clone(),
+                        async move {
+                            let output = task_runtime.download(session, request).await?;
+                            serde_json::to_string(&output)
+                                .context("failed to serialize browser download result")
                         },
-                    )
-                    .await?
+                    )?;
+                    let yield_time_ms = input
+                        .yield_time_ms
+                        .unwrap_or(DEFAULT_FOREGROUND_YIELD_MILLISECONDS)
+                        .clamp(1, MAX_FOREGROUND_YIELD_MILLISECONDS);
+                    if let Some(chunk) = registry
+                        .wait_for_output(&scope, job.job_id, Duration::from_millis(yield_time_ms))
+                        .await?
+                    {
+                        anyhow::ensure!(
+                            chunk.job.success,
+                            "browser download failed: {}",
+                            chunk
+                                .job
+                                .error
+                                .as_deref()
+                                .unwrap_or("unknown background error")
+                        );
+                        serde_json::from_str(&chunk.stdout)
+                            .context("invalid browser download result from background registry")?
+                    } else {
+                        let value = json!({
+                            "jobId": job.job_id,
+                            "status": job.status.as_str(),
+                            "action": action,
+                            "url": url,
+                            "startedAt": job.started_at,
+                            "autoDetached": true,
+                            "yieldTimeMs": yield_time_ms,
+                            "note": "The download is still running. Completion is delivered automatically; background_output reads progress or stops it."
+                        });
+                        return Ok(ToolResult {
+                            call_id,
+                            output: serde_json::to_string_pretty(&value)?,
+                            content: vec![ModelContentPart::json(value)],
+                            metadata: json!({
+                                "toolName": "browser",
+                                "action": action,
+                                "background": true,
+                                "autoDetached": true,
+                                "yieldTimeMs": yield_time_ms,
+                                "jobId": job.job_id,
+                                "url": url,
+                                "success": true
+                            }),
+                        });
+                    }
+                } else {
+                    runtime.download(session, request).await?
+                }
             }
             BrowserActionInput::Close => {
                 runtime.close_session(session).await?;
@@ -5765,7 +5865,7 @@ impl TypedTool for WriteFileTool {
         ToolExecutionPolicy {
             read_only: false,
             idempotent: true,
-            parallel_safe: false,
+            parallel_safe: true,
             side_effect: ToolSideEffect::WorkspaceWrite,
             resource_keys: vec![tool_resource_key("file", &input.path)],
         }
@@ -6001,6 +6101,10 @@ const ARTIFACT_THRESHOLD: usize = 16_000;
 const MAX_FOREGROUND_TIMEOUT_SECONDS: u64 = 1_800;
 const MAX_BACKGROUND_TIMEOUT_SECONDS: u64 = 21_600;
 const DEFAULT_BACKGROUND_TIMEOUT_SECONDS: u64 = 3_600;
+/// Keep ordinary commands feeling synchronous, then yield the model instead of
+/// letting one slow process hold an entire parallel tool batch hostage.
+const DEFAULT_FOREGROUND_YIELD_MILLISECONDS: u64 = 10_000;
+const MAX_FOREGROUND_YIELD_MILLISECONDS: u64 = 60_000;
 
 fn background_scope(ctx: &ToolContext) -> anyhow::Result<BackgroundScope> {
     Ok(BackgroundScope {
@@ -6049,7 +6153,7 @@ impl TypedTool for BackgroundOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Control commands and persistent stdio sessions you started: list them, read new output, write input to an interactive session, or stop one. You do not need to poll for completion; a finished command reports itself."
+        "Control background jobs and persistent stdio sessions you started: list them, read new output, write input to an interactive session, or stop one. You do not need to poll for completion; a finished job reports itself."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -6178,6 +6282,11 @@ struct ShellInput {
     /// Run detached and return a job id immediately.
     #[serde(default)]
     background: bool,
+    /// How long an ordinary command may stay in the foreground before it
+    /// automatically continues as a background job.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 60000))]
+    yield_time_ms: Option<u64>,
     /// Keep stdin open as a persistent stdio session.
     #[serde(default)]
     interactive: bool,
@@ -6192,25 +6301,47 @@ impl TypedTool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in a workspace directory with timeout and output caps. Set background for slow commands, or interactive for a persistent stdio session that accepts input through background_output. Both return a job id immediately and report completion automatically."
-    }
-
-    fn execution_policy(&self, _input: &Self::Input) -> ToolExecutionPolicy {
-        ToolExecutionPolicy {
-            read_only: false,
-            idempotent: false,
-            parallel_safe: false,
-            side_effect: ToolSideEffect::Process,
-            resource_keys: vec!["process:self".to_string(), "workspace:*".to_string()],
+        if cfg!(windows) {
+            "Run a Windows PowerShell 5.1 command in a workspace directory with timeout and output caps. This is not Bash or PowerShell 7: use `;` or explicit `$LASTEXITCODE` checks instead of `&&`/`||`, `Select-Object -First/-Last` instead of `head`/`tail`, and `$null` for discarded output. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
+        } else {
+            "Run a POSIX `sh` command in a workspace directory with timeout and output caps; do not use PowerShell cmdlets or `$env:` syntax. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
         }
     }
 
-    fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        let lifetime = if input.interactive || input.background {
-            ProcessLifetime::Background
-        } else {
-            ProcessLifetime::OneShot
-        };
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        let analysis = analyze_shell_command(&input.command);
+        if !input.background && !input.interactive && analysis.is_strictly_read_only() {
+            return ToolExecutionPolicy::read_only(Vec::new());
+        }
+        ToolExecutionPolicy {
+            read_only: false,
+            idempotent: false,
+            parallel_safe: true,
+            side_effect: ToolSideEffect::Process,
+            // Shell calls are intentionally not serialized by guessed resource
+            // conflicts. A model-issued tool batch has no intra-batch result
+            // dependency; command failures remain structured observations for
+            // the next model round to inspect and repair.
+            resource_keys: Vec::new(),
+        }
+    }
+
+    fn authorization_preflight(
+        &self,
+        input: &Self::Input,
+        ctx: &ToolContext,
+    ) -> Option<PolicyDecision> {
+        Some(ctx.policy.inspect_command(&input.command))
+    }
+
+    fn execution_intent(
+        &self,
+        _input: &Self::Input,
+        _workspace_root: &Path,
+    ) -> ToolExecutionIntent {
+        // A nominally foreground call may yield into the shared background
+        // registry, so its authority must describe the process's real lifetime.
+        let lifetime = ProcessLifetime::Background;
         ToolExecutionIntent::session_process(lifetime)
     }
 
@@ -6222,6 +6353,13 @@ impl TypedTool for ShellTool {
     ) -> anyhow::Result<ToolResult> {
         let command = input.command.trim();
         anyhow::ensure!(!command.is_empty(), "shell requires a command");
+        if let Some(error) = shell_command_compatibility_error(command) {
+            return Ok(shell_compatibility_error_result(call_id, error));
+        }
+        let analysis = analyze_shell_command(command);
+        if analysis.is_unreviewable_destructive_action() {
+            return Ok(unreviewable_shell_action_result(call_id, command));
+        }
         enforce_policy_decision(ctx.policy.inspect_command(command), ctx.approval_granted)?;
 
         let interactive = input.interactive;
@@ -6233,14 +6371,16 @@ impl TypedTool for ShellTool {
         if !workdir.is_dir() {
             anyhow::bail!("shell workdir is not a directory: {}", workdir.display());
         }
+        let can_auto_yield = !background && ctx.background.is_some() && ctx.thread_id.is_some();
+        let long_lived = background || can_auto_yield;
         let timeout_seconds = input
             .timeout_seconds
-            .unwrap_or(if background {
+            .unwrap_or(if long_lived {
                 DEFAULT_BACKGROUND_TIMEOUT_SECONDS
             } else {
                 30
             })
-            .min(if background {
+            .min(if long_lived {
                 MAX_BACKGROUND_TIMEOUT_SECONDS
             } else {
                 MAX_FOREGROUND_TIMEOUT_SECONDS
@@ -6257,7 +6397,7 @@ impl TypedTool for ShellTool {
                     BackgroundSessionSpawnRequest {
                         scope: background_scope(&ctx)?,
                         command: command.to_string(),
-                        request: ExecRequest::shell(command).cwd(&workdir),
+                        request: model_shell_request(command, true).cwd(&workdir),
                         context: ctx.execution_context(Duration::from_secs(timeout_seconds)),
                     },
                 )
@@ -6281,6 +6421,7 @@ impl TypedTool for ShellTool {
                     "background": true,
                     "interactive": true,
                     "transport": "stdio",
+                    "shellDialect": ShellDialect::current().id(),
                     "jobId": job.job_id,
                     "workdir": workdir.display().to_string(),
                     "success": true
@@ -6288,53 +6429,85 @@ impl TypedTool for ShellTool {
             });
         }
 
-        if background {
+        if background || can_auto_yield {
             let registry = ctx
                 .background
                 .as_ref()
                 .context("background commands are unavailable in this runtime")?;
+            let scope = background_scope(&ctx)?;
+            let started_at = Instant::now();
             let job = registry.spawn(
                 ctx.environment.clone(),
                 BackgroundSpawnRequest {
-                    scope: background_scope(&ctx)?,
+                    scope: scope.clone(),
                     command: command.to_string(),
-                    request: ExecRequest::shell(command).cwd(&workdir),
+                    request: model_shell_request(command, false).cwd(&workdir),
                     context: ctx.execution_context(Duration::from_secs(timeout_seconds)),
                 },
             )?;
-            let value = json!({
-                "jobId": job.job_id,
-                "status": job.status.as_str(),
-                "command": job.command,
-                "workdir": workdir.display().to_string(),
-                "startedAt": job.started_at,
-                "note": "The command is running detached. Carry on with other work: its output and exit status are delivered to you when it finishes, and background_output reads progress or stops it in the meantime."
-            });
-            return Ok(ToolResult {
-                call_id,
-                output: serde_json::to_string_pretty(&value)?,
-                content: vec![ModelContentPart::json(value)],
-                metadata: json!({
-                    "toolName": "shell",
-                    "background": true,
-                    "jobId": job.job_id,
-                    "workdir": workdir.display().to_string(),
-                    "success": true
-                }),
-            });
+            if background {
+                return shell_background_result(call_id, &job, &workdir, false, None);
+            }
+
+            let yield_time_ms = input
+                .yield_time_ms
+                .unwrap_or(DEFAULT_FOREGROUND_YIELD_MILLISECONDS)
+                .clamp(1, MAX_FOREGROUND_YIELD_MILLISECONDS);
+            if let Some(chunk) = registry
+                .wait_for_output(&scope, job.job_id, Duration::from_millis(yield_time_ms))
+                .await?
+            {
+                if chunk.job.status == crate::background::BackgroundJobStatus::Cancelled {
+                    anyhow::bail!(
+                        "{}",
+                        chunk
+                            .job
+                            .error
+                            .as_deref()
+                            .unwrap_or("shell execution cancelled")
+                    );
+                }
+                let stderr = if chunk.stderr.trim().is_empty() {
+                    chunk.job.error.clone().unwrap_or_default()
+                } else {
+                    chunk.stderr
+                };
+                if !chunk.job.success && looks_like_sandbox_denial(&stderr) {
+                    return Err(ApprovalRequired::new(format!(
+                        "Command was blocked by the sandbox: {}",
+                        truncate(&stderr, 2_000)
+                    ))
+                    .into());
+                }
+                return shell_completed_result(
+                    call_id,
+                    command,
+                    &workdir,
+                    started_at.elapsed().as_millis() as u64,
+                    chunk.stdout,
+                    stderr,
+                    chunk.job.exit_code,
+                    chunk.job.success,
+                    chunk.job.truncated,
+                    chunk.job.sandbox,
+                    &ctx,
+                );
+            }
+
+            return shell_background_result(call_id, &job, &workdir, true, Some(yield_time_ms));
         }
 
         let started_at = Instant::now();
         let output = ctx
             .environment
             .exec(
-                ExecRequest::shell(command).cwd(&workdir),
+                model_shell_request(command, false).cwd(&workdir),
                 ctx.execution_context(Duration::from_secs(timeout_seconds)),
             )
             .await?;
         let duration_ms = started_at.elapsed().as_millis() as u64;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.success && looks_like_sandbox_denial(&stderr) {
             return Err(ApprovalRequired::new(format!(
                 "Command was blocked by the sandbox: {}",
@@ -6342,76 +6515,212 @@ impl TypedTool for ShellTool {
             ))
             .into());
         }
-        let full_combined = format!(
-            "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
-            command, stdout, stderr
-        );
-        let combined = format!(
-            "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
-            command,
-            truncate(&stdout, 24_000),
-            truncate(&stderr, 12_000)
-        );
-
-        // `output` above is the model-facing envelope. The UI renders the call
-        // from these structured fields instead of re-parsing that text, so a
-        // terminal view can separate the command, stdout and stderr reliably.
-        let mut result = ToolResult {
+        shell_completed_result(
             call_id,
-            output: combined,
-            content: Vec::new(),
-            metadata: json!({
-                "command": command,
-                "workdir": workdir.display().to_string(),
-                "exitCode": output.exit_code,
-                "success": output.success,
-                "truncated": output.truncated,
-                "durationMs": duration_ms,
-                "stdout": truncate(&stdout, SHELL_DISPLAY_STDOUT_LIMIT),
-                "stderr": truncate(&stderr, SHELL_DISPLAY_STDERR_LIMIT),
-                "sandbox": output.sandbox
-            }),
-        };
-
-        if let Some(ref store) = ctx.store {
-            if let Some(thread_id) = ctx.thread_id {
-                if full_combined.len() > ARTIFACT_THRESHOLD {
-                    let artifact_result = ToolResult {
-                        call_id: result.call_id,
-                        output: full_combined,
-                        content: Vec::new(),
-                        metadata: result.metadata.clone(),
-                    };
-                    if let Ok(Some(artifact)) = store.insert_large_tool_output_artifact(
-                        thread_id,
-                        &artifact_result,
-                        ARTIFACT_THRESHOLD,
-                    ) {
-                        if let Some(obj) = result.metadata.as_object_mut() {
-                            obj.insert("artifactId".to_string(), json!(artifact.id));
-                            obj.insert("artifactKind".to_string(), json!("tool_output"));
-                            obj.insert(
-                                "artifact".to_string(),
-                                json!({
-                                    "id": artifact.id,
-                                    "kind": "tool_output",
-                                    "bytes": artifact_result.output.len()
-                                }),
-                            );
-                        }
-                        result
-                            .output
-                            .push_str(&format!("\n\n[Artifact: {}]", artifact.id));
-                    }
-                }
-            }
-        }
-
-        Ok(result)
+            command,
+            &workdir,
+            duration_ms,
+            stdout,
+            stderr,
+            output.exit_code,
+            output.success,
+            output.truncated,
+            output.sandbox,
+            &ctx,
+        )
     }
 }
 
+fn shell_background_result(
+    call_id: Uuid,
+    job: &crate::background::BackgroundJobSnapshot,
+    workdir: &Path,
+    auto_detached: bool,
+    yield_time_ms: Option<u64>,
+) -> anyhow::Result<ToolResult> {
+    let note = if auto_detached {
+        "The command exceeded the foreground wait and is still running. Carry on with independent work: completion is delivered automatically, and background_output reads progress or stops it."
+    } else {
+        "The command is running detached. Carry on with other work: completion is delivered automatically, and background_output reads progress or stops it."
+    };
+    let value = json!({
+        "jobId": job.job_id,
+        "status": job.status.as_str(),
+        "command": job.command,
+        "workdir": workdir.display().to_string(),
+        "startedAt": job.started_at,
+        "autoDetached": auto_detached,
+        "yieldTimeMs": yield_time_ms,
+        "note": note
+    });
+    Ok(ToolResult {
+        call_id,
+        output: serde_json::to_string_pretty(&value)?,
+        content: vec![ModelContentPart::json(value)],
+        metadata: json!({
+            "toolName": "shell",
+            "background": true,
+            "autoDetached": auto_detached,
+            "yieldTimeMs": yield_time_ms,
+            "shellDialect": ShellDialect::current().id(),
+            "jobId": job.job_id,
+            "workdir": workdir.display().to_string(),
+            "success": true
+        }),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shell_completed_result(
+    call_id: Uuid,
+    command: &str,
+    workdir: &Path,
+    duration_ms: u64,
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    success: bool,
+    truncated: bool,
+    sandbox: Option<crate::execution::ExecutionSandboxMetadata>,
+    ctx: &ToolContext,
+) -> anyhow::Result<ToolResult> {
+    let full_combined = format!(
+        "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
+        command, stdout, stderr
+    );
+    let combined = format!(
+        "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
+        command,
+        truncate(&stdout, 24_000),
+        truncate(&stderr, 12_000)
+    );
+
+    // `output` above is the model-facing envelope. The UI renders the call
+    // from these structured fields instead of re-parsing that text, so a
+    // terminal view can separate the command, stdout and stderr reliably.
+    let mut result = ToolResult {
+        call_id,
+        output: combined,
+        content: Vec::new(),
+        metadata: json!({
+            "command": command,
+            "shellDialect": ShellDialect::current().id(),
+            "workdir": workdir.display().to_string(),
+            "exitCode": exit_code,
+            "success": success,
+            "truncated": truncated,
+            "durationMs": duration_ms,
+            "stdout": truncate(&stdout, SHELL_DISPLAY_STDOUT_LIMIT),
+            "stderr": truncate(&stderr, SHELL_DISPLAY_STDERR_LIMIT),
+            "sandbox": sandbox
+        }),
+    };
+
+    if let Some(ref store) = ctx.store {
+        if let Some(thread_id) = ctx.thread_id {
+            if full_combined.len() > ARTIFACT_THRESHOLD {
+                let artifact_result = ToolResult {
+                    call_id: result.call_id,
+                    output: full_combined,
+                    content: Vec::new(),
+                    metadata: result.metadata.clone(),
+                };
+                if let Ok(Some(artifact)) = store.insert_large_tool_output_artifact(
+                    thread_id,
+                    &artifact_result,
+                    ARTIFACT_THRESHOLD,
+                ) {
+                    if let Some(obj) = result.metadata.as_object_mut() {
+                        obj.insert("artifactId".to_string(), json!(artifact.id));
+                        obj.insert("artifactKind".to_string(), json!("tool_output"));
+                        obj.insert(
+                            "artifact".to_string(),
+                            json!({
+                                "id": artifact.id,
+                                "kind": "tool_output",
+                                "bytes": artifact_result.output.len()
+                            }),
+                        );
+                    }
+                    result
+                        .output
+                        .push_str(&format!("\n\n[Artifact: {}]", artifact.id));
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 impl_typed_tool!(ShellTool);
+
+fn model_shell_request(command: &str, interactive: bool) -> ExecRequest {
+    let request = ExecRequest::shell(command);
+    if interactive {
+        request
+    } else {
+        request.envs([
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GCM_INTERACTIVE", "Never"),
+            ("GIT_PAGER", "cat"),
+            ("GH_PAGER", "cat"),
+            ("PAGER", "cat"),
+        ])
+    }
+}
+
+fn shell_compatibility_error_result(
+    call_id: Uuid,
+    error: crate::execution::ShellCompatibilityError,
+) -> ToolResult {
+    let dialect = ShellDialect::current().id();
+    ToolResult {
+        call_id,
+        output: error.message.clone(),
+        content: vec![ModelContentPart::text(error.message.clone())],
+        metadata: json!({
+            "toolName": "shell",
+            "shellDialect": dialect,
+            "success": false,
+            "error": error.message,
+            "errorRecord": {
+                "recorded": true,
+                "code": error.code,
+                "phase": "validation",
+                "executed": false,
+                "retryable": true,
+                "message": error.message,
+            }
+        }),
+    }
+}
+
+fn unreviewable_shell_action_result(call_id: Uuid, command: &str) -> ToolResult {
+    let message = format!(
+        "UnreviewableAction: destructive shell command contains an unresolved variable, wildcard, command substitution, or no concrete target. Resolve the target and submit a new tool call. Command: {command}"
+    );
+    ToolResult {
+        call_id,
+        output: message.clone(),
+        content: vec![ModelContentPart::text(message.clone())],
+        metadata: json!({
+            "toolName": "shell",
+            "shellDialect": ShellDialect::current().id(),
+            "success": false,
+            "reviewability": "unreviewable_action",
+            "error": message,
+            "errorRecord": {
+                "recorded": true,
+                "code": "unreviewable_action",
+                "phase": "validation",
+                "executed": false,
+                "retryable": true,
+                "message": message,
+            }
+        }),
+    }
+}
 
 pub struct GitDiffTool;
 
@@ -6437,28 +6746,10 @@ impl TypedTool for GitDiffTool {
         _input: Self::Input,
         ctx: ToolContext,
     ) -> anyhow::Result<ToolResult> {
-        let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let output = ctx
             .environment
             .exec(
-                ExecRequest::new("git")
-                    .args([
-                        "--no-pager".to_string(),
-                        "-c".to_string(),
-                        format!("core.hooksPath={null_device}"),
-                        "-c".to_string(),
-                        "core.fsmonitor=false".to_string(),
-                        "diff".to_string(),
-                        "--no-ext-diff".to_string(),
-                        "--no-color".to_string(),
-                        "--".to_string(),
-                    ])
-                    .envs([
-                        ("GIT_OPTIONAL_LOCKS", "0"),
-                        ("GIT_TERMINAL_PROMPT", "0"),
-                        ("GCM_INTERACTIVE", "Never"),
-                        ("GIT_PAGER", "cat"),
-                    ]),
+                ExecRequest::new("git").args(["diff", "--no-ext-diff", "--no-color", "--"]),
                 ctx.execution_context(Duration::from_secs(20)),
             )
             .await
@@ -6541,7 +6832,7 @@ impl TypedTool for ApplyPatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a unified diff, a *** Begin Patch envelope, or one structured create_file/update_file/delete_file operation. Structured updates also accept SEARCH/REPLACE blocks and use context when hunk line numbers are stale."
+        "Apply workspace edits. Portable callers pass exactly one `patch` string using a `*** Begin Patch` ... `*** End Patch` envelope; update sections use `*** Update File: relative/path` plus unified `@@` hunks. Native providers may instead pass one structured create_file/update_file/delete_file operation. Structured SEARCH/REPLACE updates must use the exact `<<<<<<< SEARCH`, `=======`, and `>>>>>>> REPLACE` markers."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -6552,7 +6843,7 @@ impl TypedTool for ApplyPatchTool {
         ToolExecutionPolicy {
             read_only: false,
             idempotent: false,
-            parallel_safe: false,
+            parallel_safe: true,
             side_effect: ToolSideEffect::WorkspaceWrite,
             resource_keys: vec![key],
         }
@@ -6580,6 +6871,32 @@ impl TypedTool for ApplyPatchTool {
                 }),
         };
         ToolExecutionIntent::workspace_mutation(paths)
+    }
+
+    fn authorization_preflight(
+        &self,
+        input: &Self::Input,
+        _ctx: &ToolContext,
+    ) -> Option<PolicyDecision> {
+        let deletes_file = match input {
+            ApplyPatchInput::Structured(input) => {
+                matches!(&input.operation, NativePatchOperation::DeleteFile { .. })
+            }
+            ApplyPatchInput::Portable(input) => {
+                parse_apply_patch_envelope(&input.patch)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|operations| {
+                        operations.iter().any(|operation| {
+                            matches!(operation, NativePatchOperation::DeleteFile { .. })
+                        })
+                    })
+                    || unified_diff_deletes_file(&input.patch)
+            }
+        };
+        deletes_file.then(|| PolicyDecision::Ask {
+            reason: "Deleting a file through apply_patch requires approval.".to_string(),
+        })
     }
 
     async fn execute_typed(
@@ -6618,6 +6935,15 @@ async fn execute_portable_patch(
                 "format": "apply_patch_envelope"
             }),
         });
+    }
+
+    if unified_diff_deletes_file(patch) {
+        enforce_policy_decision(
+            PolicyDecision::Ask {
+                reason: "Deleting a file through apply_patch requires approval.".to_string(),
+            },
+            ctx.approval_granted,
+        )?;
     }
 
     enforce_policy_decision(
@@ -6725,6 +7051,17 @@ async fn execute_native_patch_batch(
         let relative = validate_native_patch_path(operation.path())?;
         let target = normalize_workspace_path(&ctx.workspace_root, &relative)?;
         enforce_policy_decision(ctx.policy.inspect_write(&target), ctx.approval_granted)?;
+        if matches!(&operation, NativePatchOperation::DeleteFile { .. }) {
+            enforce_policy_decision(
+                PolicyDecision::Ask {
+                    reason: format!(
+                        "Deleting workspace file {} requires approval.",
+                        target.display()
+                    ),
+                },
+                ctx.approval_granted,
+            )?;
+        }
         let original = read_optional(ctx.environment.as_ref(), &target).await?;
 
         match operation {
@@ -6795,6 +7132,15 @@ async fn execute_native_patch_batch(
                     .to_string()
             })
             .collect(),
+    })
+}
+
+fn unified_diff_deletes_file(patch: &str) -> bool {
+    patch.lines().any(|line| {
+        line.trim_end_matches('\r') == "+++ /dev/null"
+            || line
+                .trim_end_matches('\r')
+                .starts_with("deleted file mode ")
     })
 }
 
@@ -7806,6 +8152,22 @@ impl McpToolWrapper {
     pub fn descriptor(&self) -> &McpToolDescriptor {
         &self.descriptor
     }
+
+    fn annotation(&self, key: &str) -> bool {
+        self.descriptor
+            .annotations
+            .get(key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn has_permission_label(&self, candidates: &[&str]) -> bool {
+        self.descriptor.permission_labels.iter().any(|label| {
+            candidates
+                .iter()
+                .any(|candidate| label.eq_ignore_ascii_case(candidate))
+        })
+    }
 }
 
 #[async_trait]
@@ -7820,6 +8182,45 @@ impl Tool for McpToolWrapper {
 
     fn schema(&self) -> Value {
         self.descriptor.input_schema.clone()
+    }
+
+    fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+        let declares_read_only = self.annotation("readOnlyHint")
+            || self.has_permission_label(&["read", "readonly", "read_only"]);
+        let declares_write = self.has_permission_label(&["write", "modify", "mutation"]);
+        let declares_destructive = self.annotation("destructiveHint")
+            || self.has_permission_label(&["destructive", "delete", "dangerous"]);
+        let read_only = declares_read_only && !declares_write && !declares_destructive;
+
+        ToolExecutionPolicy {
+            read_only,
+            idempotent: read_only || self.annotation("idempotentHint"),
+            // MCP uses request ids and the host keeps independent pending responses, so calls do
+            // not need to be serialized merely because they share a transport or server.
+            parallel_safe: true,
+            side_effect: if read_only {
+                ToolSideEffect::None
+            } else {
+                ToolSideEffect::External
+            },
+            // Read-only calls carry no exclusive resource claim. Mutating/unknown calls from the
+            // same server stay ordered because MCP annotations do not identify the external
+            // resource they affect; calls to different servers may still run concurrently.
+            resource_keys: if read_only {
+                Vec::new()
+            } else {
+                vec![format!("mcp:server:{}", self.descriptor.server_id)]
+            },
+        }
+    }
+
+    fn authorization_preflight(
+        &self,
+        _call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> Option<PolicyDecision> {
+        let permission = ToolPermissionDescriptor::from(&self.descriptor);
+        Some(ctx.policy.inspect_mcp_tool_call(&permission))
     }
 
     async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
@@ -7966,6 +8367,67 @@ mod tests {
         NoopSubagentObserver, SubagentExecutor, SubagentRun, SubagentSchedulerConfig,
     };
     use tokio::sync::mpsc;
+
+    fn mcp_policy_fixture(annotations: Value, permission_labels: Vec<&str>) -> McpToolWrapper {
+        McpToolWrapper::new(
+            McpExtensionHost::new(),
+            McpToolDescriptor {
+                public_name: "fixture__operation".to_string(),
+                server_id: Uuid::nil(),
+                tool_name: "operation".to_string(),
+                description: Some("fixture MCP operation".to_string()),
+                input_schema: json!({ "type": "object" }),
+                annotations,
+                meta: json!({}),
+                permission_labels: permission_labels.into_iter().map(str::to_string).collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn mcp_read_only_calls_are_parallel_without_a_server_wide_conflict() {
+        let tool = mcp_policy_fixture(json!({ "readOnlyHint": true }), vec!["read"]);
+        let policy = tool.execution_policy(&ToolCall::new(tool.name(), json!({})));
+
+        assert!(policy.read_only);
+        assert!(policy.idempotent);
+        assert!(policy.parallel_safe);
+        assert_eq!(policy.side_effect, ToolSideEffect::None);
+        assert!(policy.resource_keys.is_empty());
+    }
+
+    #[test]
+    fn mcp_mutations_are_parallel_across_servers_but_ordered_per_server() {
+        let tool = mcp_policy_fixture(json!({ "idempotentHint": true }), vec!["write"]);
+        let policy = tool.execution_policy(&ToolCall::new(tool.name(), json!({})));
+
+        assert!(!policy.read_only);
+        assert!(policy.idempotent);
+        assert!(policy.parallel_safe);
+        assert_eq!(policy.side_effect, ToolSideEffect::External);
+        assert_eq!(
+            policy.resource_keys,
+            vec![format!("mcp:server:{}", Uuid::nil())]
+        );
+    }
+
+    #[test]
+    fn mcp_destructive_hint_overrides_an_inconsistent_read_only_hint() {
+        let tool = mcp_policy_fixture(
+            json!({ "readOnlyHint": true, "destructiveHint": true }),
+            vec!["read"],
+        );
+        let policy = tool.execution_policy(&ToolCall::new(tool.name(), json!({})));
+
+        assert!(!policy.read_only);
+        assert!(!policy.idempotent);
+        assert!(policy.parallel_safe);
+        assert_eq!(policy.side_effect, ToolSideEffect::External);
+        assert_eq!(
+            policy.resource_keys,
+            vec![format!("mcp:server:{}", Uuid::nil())]
+        );
+    }
 
     #[test]
     fn bundled_native_tools_are_not_core_tools_and_keep_their_plugin_source() {
@@ -9864,6 +10326,171 @@ mod tests {
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
+    #[tokio::test]
+    async fn shell_automatically_yields_a_slow_command_to_the_existing_registry() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-shell-yield-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+        context.thread_id = Some(Uuid::new_v4());
+        context.background = Some(BackgroundProcessRegistry::default());
+        let scope = background_scope(&context).unwrap();
+        let registry = context.background.clone().unwrap();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+
+        let result = ShellTool
+            .execute(
+                ToolCall::new("shell", json!({ "command": command, "yieldTimeMs": 10 })),
+                context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["background"], true);
+        assert_eq!(result.metadata["autoDetached"], true);
+        assert_eq!(result.metadata["yieldTimeMs"], 10);
+        let job_id = Uuid::parse_str(result.metadata["jobId"].as_str().unwrap()).unwrap();
+        assert_eq!(registry.list(&scope).len(), 1);
+        registry.stop(&scope, job_id).unwrap();
+        for _ in 0..100 {
+            if registry
+                .list(&scope)
+                .iter()
+                .all(|job| job.status.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_keeps_a_quick_registered_command_in_the_foreground() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-shell-inline-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+        context.thread_id = Some(Uuid::new_v4());
+        context.background = Some(BackgroundProcessRegistry::default());
+        let command = if cfg!(windows) {
+            "Write-Output inline-ready"
+        } else {
+            "echo inline-ready"
+        };
+
+        let result = ShellTool
+            .execute(
+                ToolCall::new("shell", json!({ "command": command, "yieldTimeMs": 10000 })),
+                context,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.output.contains("inline-ready"));
+        assert_eq!(result.metadata["success"], true);
+        assert!(result.metadata.get("background").is_none());
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_rejects_unreviewable_destructive_target_before_execution() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-shell-reviewability-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+
+        let result = ShellTool
+            .execute(
+                ToolCall::new("shell", json!({ "command": "rm -rf $target" })),
+                context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["success"], false);
+        assert_eq!(result.metadata["reviewability"], "unreviewable_action");
+        assert_eq!(
+            result.metadata["errorRecord"]["code"],
+            "unreviewable_action"
+        );
+        assert_eq!(result.metadata["errorRecord"]["executed"], false);
+        assert_eq!(result.metadata["errorRecord"]["retryable"], true);
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_rejects_posix_connectors_before_execution() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-shell-dialect-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+
+        let result = ShellTool
+            .execute(
+                ToolCall::new(
+                    "shell",
+                    json!({
+                        "command": "git status && git log -1 | head -20"
+                    }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["success"], false);
+        assert_eq!(
+            result.metadata["shellDialect"],
+            ShellDialect::WindowsPowerShell51.id()
+        );
+        assert_eq!(
+            result.metadata["errorRecord"]["code"],
+            "shell_dialect_mismatch"
+        );
+        assert_eq!(result.metadata["errorRecord"]["executed"], false);
+        assert_eq!(result.metadata["errorRecord"]["retryable"], true);
+        assert!(result.output.contains("Select-Object -First/-Last"));
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
     #[test]
     fn tool_execution_policy_marks_observations_as_parallel_safe() {
         let registry = ToolRegistry::with_core_tools();
@@ -9877,8 +10504,26 @@ mod tests {
 
         let shell = ToolCall::new("shell", json!({ "command": "git status" }));
         let policy = registry.execution_policy("shell", &shell).unwrap();
+        assert!(policy.read_only);
+        assert!(policy.idempotent);
+        assert!(policy.parallel_safe);
+        assert_eq!(policy.side_effect, ToolSideEffect::None);
+        assert!(policy.resource_keys.is_empty());
+
+        let dynamic_shell = ToolCall::new("shell", json!({ "command": "cargo test" }));
+        let policy = registry.execution_policy("shell", &dynamic_shell).unwrap();
         assert!(!policy.read_only);
-        assert!(!policy.parallel_safe);
+        assert!(!policy.idempotent);
+        assert_eq!(policy.side_effect, ToolSideEffect::Process);
+
+        let background_read = ToolCall::new(
+            "shell",
+            json!({ "command": "git status", "background": true }),
+        );
+        let policy = registry
+            .execution_policy("shell", &background_read)
+            .unwrap();
+        assert!(!policy.read_only);
         assert_eq!(policy.side_effect, ToolSideEffect::Process);
     }
 
@@ -9964,6 +10609,86 @@ mod tests {
                 .replace("\r\n", "\n"),
             "after\n"
         );
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn common_git_read_commands_execute_through_the_model_shell() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-git-read-matrix-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace_root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        fs::write(workspace_root.join("sample.txt"), "fixture\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "--", "sample.txt"])
+            .current_dir(&workspace_root)
+            .status()
+            .unwrap();
+        assert!(add.success());
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=OpenTopia Test",
+                "-c",
+                "user.email=opentopia@example.invalid",
+                "commit",
+                "--quiet",
+                "--message",
+                "fixture commit",
+            ])
+            .current_dir(&workspace_root)
+            .status()
+            .unwrap();
+        assert!(commit.success());
+
+        let commands = [
+            "git status --short --branch",
+            "git log --oneline -1",
+            "git log -L 1,1:sample.txt --oneline -1",
+            "git show --stat --oneline HEAD",
+            "git rev-parse --show-toplevel",
+            "git branch --list",
+            "git worktree list --porcelain",
+            "git blame -L 1,1 -- sample.txt",
+            "git ls-files -- sample.txt",
+            "git diff --no-ext-diff --no-color --",
+        ];
+        let command = if cfg!(windows) {
+            commands
+                .iter()
+                .map(|command| {
+                    format!("{command}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            format!("set -e; {}", commands.join("; "))
+        };
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+        let result = ShellTool
+            .execute(
+                ToolCall::new("shell", json!({ "command": command })),
+                context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["success"], true, "{}", result.output);
+        assert!(result.output.contains("fixture commit"));
+        assert!(result.output.contains("sample.txt"));
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
@@ -10084,16 +10809,61 @@ mod tests {
             "hello\nearth\n"
         );
 
+        let mut approved_delete_context = context;
+        approved_delete_context.approval_granted = true;
         execute_native_patch_operation(
             Uuid::new_v4(),
             NativePatchOperation::DeleteFile {
                 path: "notes.txt".to_string(),
             },
-            context,
+            approved_delete_context,
         )
         .await
         .unwrap();
         assert!(!workspace_root.join("notes.txt").exists());
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_patch_delete_requires_approval_even_in_full_access() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-delete-approval-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("delete-me.txt"), "fixture\n").unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+
+        let error = execute_native_patch_operation(
+            Uuid::new_v4(),
+            NativePatchOperation::DeleteFile {
+                path: "delete-me.txt".to_string(),
+            },
+            context.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(crate::policy::approval_required(&error).is_some());
+        assert!(workspace_root.join("delete-me.txt").exists());
+
+        let mut approved = context;
+        approved.approval_granted = true;
+        execute_native_patch_operation(
+            Uuid::new_v4(),
+            NativePatchOperation::DeleteFile {
+                path: "delete-me.txt".to_string(),
+            },
+            approved,
+        )
+        .await
+        .unwrap();
+        assert!(!workspace_root.join("delete-me.txt").exists());
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
