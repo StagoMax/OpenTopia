@@ -4,12 +4,9 @@ import {
   ExternalLink,
   FileQuestion,
   Loader2,
-  Maximize2,
   Minus,
   Plus,
   RefreshCw,
-  RotateCcw,
-  Scan,
   Sheet,
   ZoomIn,
   ZoomOut,
@@ -18,6 +15,7 @@ import type { PDFDocumentProxy } from "pdfjs-dist";
 import type { ApiClient } from "../api/client";
 import { openPath } from "../platform";
 import type {
+  InlineImageAttachment,
   PreviewDescriptor,
   PreviewTarget,
   SpreadsheetPreview,
@@ -31,6 +29,13 @@ type LoadState<T> =
   | { status: "loading" }
   | { status: "ready"; value: T }
   | { status: "error"; message: string };
+
+export type ImagePreviewSource = Pick<
+  InlineImageAttachment,
+  "contentType" | "data" | "name"
+> & {
+  content_type?: string;
+};
 
 export function PreviewHost({
   client,
@@ -238,6 +243,7 @@ function TextPreview({
       descriptor.target.type === "workspace" ? descriptor.target.path : null;
     return (
       <MarkdownContent
+        baseWorkspacePath={baseWorkspacePath}
         className="preview-markdown"
         onOpenLink={(href) => onOpenMarkdownLink?.(href, baseWorkspacePath)}
         text={text.value}
@@ -271,9 +277,6 @@ function ImagePreview({
   descriptor: PreviewDescriptor;
 }) {
   const state = usePreviewBlob(client, descriptor);
-  const [mode, setMode] = useState<"fit" | "actual">("fit");
-  const [zoom, setZoom] = useState(1);
-  const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
   const objectUrl = useObjectUrl(state.status === "ready" ? state.value : null);
 
   if (state.status === "loading")
@@ -288,73 +291,64 @@ function ImagePreview({
     );
   }
 
+  return <ImagePreviewSurface title={descriptor.title} objectUrl={objectUrl} />;
+}
+
+export function InlineImagePreview({ image }: { image: ImagePreviewSource }) {
+  const blob = useMemo(
+    () =>
+      new Blob([new Uint8Array(image.data)], {
+        type:
+          image.contentType || image.content_type || "application/octet-stream",
+      }),
+    [image],
+  );
+  const objectUrl = useObjectUrl(blob);
+
+  return (
+    <ImagePreviewSurface
+      title={image.name?.trim() || "图片"}
+      objectUrl={objectUrl}
+    />
+  );
+}
+
+function ImagePreviewSurface({
+  title,
+  objectUrl,
+}: {
+  title: string;
+  objectUrl: string | null;
+}) {
+  const [zoom, setZoom] = useState<number | "fit">("fit");
+  const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
+  const isFit = zoom === "fit";
+
   return (
     <div className="image-preview">
-      <div
-        className="preview-renderer-toolbar"
-        role="toolbar"
-        aria-label="Image controls"
-      >
-        <button
-          className={`icon-button small ${mode === "fit" ? "active" : ""}`}
-          type="button"
-          title="Fit to view"
-          aria-label="Fit image to view"
-          aria-pressed={mode === "fit"}
-          onClick={() => setMode("fit")}
+      <div className="image-preview-toolbar">
+        <select
+          className="image-preview-zoom-select"
+          aria-label="图片缩放"
+          value={zoom}
+          onChange={(event) =>
+            setZoom(
+              event.target.value === "fit" ? "fit" : Number(event.target.value),
+            )
+          }
         >
-          <Maximize2 size={14} />
-        </button>
-        <button
-          className={`icon-button small ${mode === "actual" ? "active" : ""}`}
-          type="button"
-          title="Actual size"
-          aria-label="Show image at actual size"
-          aria-pressed={mode === "actual"}
-          onClick={() => {
-            setMode("actual");
-            setZoom(1);
-          }}
-        >
-          <Scan size={14} />
-        </button>
-        <span className="preview-toolbar-divider" />
-        <button
-          className="icon-button small"
-          type="button"
-          title="Zoom out"
-          aria-label="Zoom out"
-          disabled={mode === "fit" || zoom <= 0.25}
-          onClick={() => setZoom((current) => Math.max(0.25, current - 0.25))}
-        >
-          <ZoomOut size={14} />
-        </button>
-        <span className="preview-zoom-value">{Math.round(zoom * 100)}%</span>
-        <button
-          className="icon-button small"
-          type="button"
-          title="Zoom in"
-          aria-label="Zoom in"
-          disabled={mode === "fit" || zoom >= 4}
-          onClick={() => setZoom((current) => Math.min(4, current + 0.25))}
-        >
-          <ZoomIn size={14} />
-        </button>
-        <button
-          className="icon-button small"
-          type="button"
-          title="Reset zoom"
-          aria-label="Reset zoom"
-          disabled={mode === "fit" || zoom === 1}
-          onClick={() => setZoom(1)}
-        >
-          <RotateCcw size={14} />
-        </button>
+          <option value={0.25}>25%</option>
+          <option value={0.5}>50%</option>
+          <option value={1}>100%</option>
+          <option value={1.5}>150%</option>
+          <option value={2}>200%</option>
+          <option value="fit">适应窗口</option>
+        </select>
       </div>
-      <div className={`image-preview-canvas ${mode}`}>
+      <div className={`image-preview-canvas ${isFit ? "fit" : "actual"}`}>
         {objectUrl && (
           <img
-            alt={descriptor.title}
+            alt={title}
             src={objectUrl}
             onLoad={(event) =>
               setNaturalSize({
@@ -363,7 +357,7 @@ function ImagePreview({
               })
             }
             style={
-              mode === "actual" && naturalSize.width
+              !isFit && naturalSize.width
                 ? {
                     width: `${naturalSize.width * zoom}px`,
                     height: `${naturalSize.height * zoom}px`,

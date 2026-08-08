@@ -13,13 +13,18 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronUp,
+  CircleSlash,
+  CloudOff,
   Clock3,
   Code2,
+  FileWarning,
   FileDiff,
   FileSearch,
   FileText,
   Loader2,
   RotateCcw,
+  ShieldCheck,
+  ShieldX,
   X,
 } from "lucide-react";
 import type {
@@ -47,6 +52,12 @@ import {
   rendererTraceTime,
   type ConversationRenderTrace,
 } from "../conversationRenderTrace";
+import {
+  guardianActivityPresentation,
+  type GuardianActivityIcon,
+  type GuardianActivityMetric,
+  type GuardianReviewCompletedPayload,
+} from "../guardianActivity";
 import { recordConversationRenderTrace } from "../platform";
 import { shouldShowRecordedTurnChanges } from "../turnChangeOwnership";
 import type { ActiveTurnPhase } from "../turnActivityStatus";
@@ -117,6 +128,15 @@ type PrimitiveActivity =
       reason: string;
       action: string;
       createdAt: string;
+    }
+  | {
+      kind: "guardian-review";
+      seq: number;
+      reviewId: string;
+      targetItemId: string;
+      startedAt: string;
+      finishedAt?: string;
+      completed?: GuardianReviewCompletedPayload;
     }
   | {
       kind: "browser-handoff";
@@ -1055,6 +1075,9 @@ function ActivityEntryView({
       />
     );
   }
+  if (entry.kind === "guardian-review") {
+    return <GuardianReviewActivity entry={entry} now={now} />;
+  }
   if (entry.kind === "browser-handoff") {
     const details = [entry.reason, entry.url, "完成后在对话中告诉我继续。"]
       .filter((value): value is string => Boolean(value))
@@ -1517,12 +1540,14 @@ function ActivityNotice({
   icon,
   title,
   detail,
+  metrics = [],
   tone = "neutral",
 }: {
   icon: ReactNode;
   title: string;
   detail: string;
-  tone?: "neutral" | "waiting" | "error";
+  metrics?: GuardianActivityMetric[];
+  tone?: "neutral" | "waiting" | "success" | "error";
 }) {
   return (
     <div className="activity-notice" data-tone={tone}>
@@ -1530,9 +1555,75 @@ function ActivityNotice({
       <div>
         <strong>{title}</strong>
         <p>{detail}</p>
+        {metrics.length > 0 && (
+          <dl className="activity-notice-metrics">
+            {metrics.map((metric) => (
+              <div key={metric.label}>
+                <dt>{metric.label}</dt>
+                <dd>{metric.value}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
       </div>
     </div>
   );
+}
+
+function GuardianReviewActivity({
+  entry,
+  now,
+}: {
+  entry: Extract<ActivityEntry, { kind: "guardian-review" }>;
+  now: number;
+}) {
+  const timing = formatActivityTiming(
+    entry.startedAt,
+    entry.finishedAt,
+    !entry.completed,
+    now,
+  );
+  if (!entry.completed) {
+    return (
+      <ActivityNotice
+        icon={<Loader2 className="spin" size={13} />}
+        tone="waiting"
+        title="正在自动审批"
+        detail={timing ? `已用时 ${timing}` : "正在评估待执行操作。"}
+      />
+    );
+  }
+
+  const presentation = guardianActivityPresentation(entry.completed);
+  const detail = [presentation.rationale, timing ? `耗时 ${timing}` : null]
+    .filter((value): value is string => Boolean(value))
+    .join("\n");
+  return (
+    <ActivityNotice
+      icon={guardianActivityIcon(presentation.icon)}
+      tone={presentation.tone}
+      title={presentation.title}
+      detail={detail}
+      metrics={presentation.metrics}
+    />
+  );
+}
+
+function guardianActivityIcon(kind: GuardianActivityIcon): ReactNode {
+  switch (kind) {
+    case "approved":
+      return <ShieldCheck size={13} />;
+    case "waiting":
+      return <Clock3 size={13} />;
+    case "denied":
+      return <ShieldX size={13} />;
+    case "unavailable":
+      return <CloudOff size={13} />;
+    case "invalid":
+      return <FileWarning size={13} />;
+    case "aborted":
+      return <CircleSlash size={13} />;
+  }
 }
 
 function ActivityResultIcon({
@@ -1608,6 +1699,10 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
   const subagents = new Map<
     string,
     Extract<PrimitiveActivity, { kind: "subagent" }>
+  >();
+  const guardianReviews = new Map<
+    string,
+    Extract<PrimitiveActivity, { kind: "guardian-review" }>
   >();
   const primitives: PrimitiveActivity[] = [];
   const planEvents = sorted.filter(
@@ -1715,6 +1810,34 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         action: payload.action,
         createdAt: event.createdAt,
       });
+    } else if (payload.type === "automatic_approval_review_started") {
+      const entry: Extract<PrimitiveActivity, { kind: "guardian-review" }> = {
+        kind: "guardian-review",
+        seq: event.seq,
+        reviewId: payload.review_id,
+        targetItemId: payload.target_item_id,
+        startedAt: event.createdAt,
+      };
+      guardianReviews.set(payload.review_id, entry);
+      primitives.push(entry);
+    } else if (payload.type === "automatic_approval_review_completed") {
+      const current = guardianReviews.get(payload.review_id);
+      if (current) {
+        current.completed = payload;
+        current.finishedAt = event.createdAt;
+      } else {
+        const entry: Extract<PrimitiveActivity, { kind: "guardian-review" }> = {
+          kind: "guardian-review",
+          seq: event.seq,
+          reviewId: payload.review_id,
+          targetItemId: payload.target_item_id,
+          startedAt: event.createdAt,
+          finishedAt: event.createdAt,
+          completed: payload,
+        };
+        guardianReviews.set(payload.review_id, entry);
+        primitives.push(entry);
+      }
     } else if (payload.type === "browser_handoff_required") {
       primitives.push({
         kind: "browser-handoff",
@@ -1939,6 +2062,7 @@ function activityEntryIsRunning(entry: ActivityEntry) {
   if (entry.kind === "subagent") {
     return entry.run.status === "queued" || entry.run.status === "running";
   }
+  if (entry.kind === "guardian-review") return !entry.completed;
   return false;
 }
 
@@ -1966,6 +2090,9 @@ function activityEntryKey(entry: ActivityEntry) {
   if (entry.kind === "tool-group" || entry.kind === "file-group")
     return entry.id;
   if (entry.kind === "subagent") return `subagent-${entry.run.id}`;
+  if (entry.kind === "guardian-review") {
+    return `guardian-review-${entry.reviewId}`;
+  }
   return `${entry.kind}-${entry.seq}`;
 }
 

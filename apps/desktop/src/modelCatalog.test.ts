@@ -143,6 +143,16 @@ test("Kimi K3 uses its documented compatibility effort mapping", () => {
   ]);
 });
 
+test("DeepSeek V4 exposes its thinking switch and distinct effort levels", () => {
+  const capability = resolveReasoningOptions(
+    "openai_compatible",
+    "deepseek-v4-flash",
+  );
+  assert.equal(capability.official, true);
+  assert.equal(capability.thinkingToggle, true);
+  assert.deepEqual(capability.supportedEfforts, ["none", "high", "max"]);
+});
+
 test("non-reasoning members of a reasoning family offer no efforts", () => {
   assert.deepEqual(
     resolveReasoningOptions("openai_compatible", "deepseek-chat")

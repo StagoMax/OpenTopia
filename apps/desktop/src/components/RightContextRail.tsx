@@ -31,6 +31,7 @@ import type {
   GitWorkflowAction,
   GitWorkflowResponse,
   Message,
+  PreviewTarget,
   TerminalEvent,
   TerminalSession,
   WorkspaceDiff,
@@ -53,6 +54,7 @@ export type RightContextRailProps = {
   onOpenTerminal(): void;
   onOpenFiles(): void;
   onOpenEnvironment(): void;
+  onOpenPreview(target: PreviewTarget, title: string): void;
   onAddSource(): void;
   onCancelSubagent(runId: string): void;
   onGitChanged(): void;
@@ -90,6 +92,7 @@ type SourceItem = {
   createdAt: string;
   icon: LucideIcon;
   dedupeKey: string;
+  previewTarget?: PreviewTarget;
 };
 
 const SOURCE_LIMIT = 4;
@@ -109,6 +112,7 @@ export function RightContextRail({
   onOpenTerminal,
   onOpenFiles,
   onOpenEnvironment,
+  onOpenPreview,
   onAddSource,
   onCancelSubagent,
   onGitChanged,
@@ -397,7 +401,11 @@ export function RightContextRail({
               icon={source.icon}
               label={source.label}
               title={source.title}
-              onClick={onOpenFiles}
+              onClick={
+                source.previewTarget
+                  ? () => onOpenPreview(source.previewTarget!, source.label)
+                  : onOpenFiles
+              }
               className="is-source"
             />
           ))}
@@ -859,6 +867,10 @@ function collectSources(
           createdAt: message.createdAt,
           icon: sourceIcon(source.name, source.contentType),
           dedupeKey: `path:${normalizePath(source.path)}`,
+          previewTarget: {
+            type: "attachment",
+            attachmentId: source.id,
+          },
         });
       } else if (part.type === "skill_ref") {
         candidates.push({
@@ -884,6 +896,7 @@ function collectSources(
       createdAt: event.createdAt,
       icon: sourceIcon(path, ""),
       dedupeKey: `path:${normalizePath(path)}`,
+      previewTarget: { type: "workspace", path },
     });
   }
 
@@ -902,6 +915,7 @@ function collectSources(
       dedupeKey: path
         ? `path:${normalizePath(path)}`
         : `artifact:${artifact.id}`,
+      previewTarget: { type: "artifact", artifactId: artifact.id },
     });
   }
 

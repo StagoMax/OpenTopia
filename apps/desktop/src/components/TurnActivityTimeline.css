@@ -14,6 +14,34 @@
   color: var(--danger);
 }
 
+.activity-notice[data-tone="success"] {
+  color: var(--success);
+}
+
+.activity-notice-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-6);
+  margin: var(--space-2) 0 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.activity-notice-metrics > div {
+  display: inline-flex;
+  gap: var(--space-2);
+}
+
+.activity-notice-metrics dt,
+.activity-notice-metrics dd {
+  margin: 0;
+}
+
+.activity-notice-metrics dd {
+  color: var(--text-secondary);
+}
+
 .turn-change-card {
   width: 100%;
   max-width: 700px;

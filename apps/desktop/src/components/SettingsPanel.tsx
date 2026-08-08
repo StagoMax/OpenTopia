@@ -2084,7 +2084,7 @@ function ProviderSettingsView({
                       className="settings-field-wide settings-reasoning-unavailable"
                       role="status"
                     >
-                      <span>推理强度</span>
+                      <span>思考模式 / 推理强度</span>
                       <strong>
                         {reasoningCapability.official
                           ? "当前模型不提供推理强度"
@@ -2093,7 +2093,7 @@ function ProviderSettingsView({
                     </div>
                   ) : (
                     <label className="settings-field-wide settings-reasoning-field">
-                      <span>默认推理强度</span>
+                      <span>默认思考模式 / 推理强度</span>
                       <select
                         value={selectedReasoningEffort ?? ""}
                         onChange={(event) =>
@@ -2119,7 +2119,9 @@ function ProviderSettingsView({
                       </select>
                       <small>
                         {reasoningCapability?.official
-                          ? `已按官方能力显示 ${reasoningCapability.supportedEfforts.length} 个可用档位。`
+                          ? reasoningCapability.thinkingToggle
+                            ? `已按官方能力显示 ${reasoningCapability.supportedEfforts.length} 个可用档位；None 会关闭 thinking。`
+                            : `已按官方能力显示 ${reasoningCapability.supportedEfforts.length} 个可用档位。`
                           : "模型能力未知，保留兼容供应商支持的全部档位。"}
                       </small>
                     </label>
@@ -2987,7 +2989,7 @@ function ModelConfigurationSection({
             className="settings-field-wide settings-reasoning-unavailable"
             role="status"
           >
-            <span>推理强度</span>
+            <span>思考模式 / 推理强度</span>
             <strong>当前模型不提供推理强度参数。</strong>
           </div>
         ) : (
@@ -3013,7 +3015,9 @@ function ModelConfigurationSection({
             </select>
             <small>
               {reasoningCapability.official
-                ? `已识别 ${reasoningCapability.supportedEfforts.length} 个可用推理档位。`
+                ? reasoningCapability.thinkingToggle
+                  ? `已识别 thinking 开关及 ${reasoningCapability.supportedEfforts.length - 1} 个推理档位；None 会关闭 thinking。`
+                  : `已识别 ${reasoningCapability.supportedEfforts.length} 个可用推理档位。`
                 : "模型能力未知，保留兼容 Provider 支持的推理档位。"}
             </small>
           </label>

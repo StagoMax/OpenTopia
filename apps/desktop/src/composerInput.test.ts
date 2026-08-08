@@ -43,6 +43,19 @@ test("does not feed a locally published value back into the editor", () => {
   );
 });
 
+test("keeps the browser's live edit when a queued draft publish rerenders", () => {
+  assert.equal(
+    composerExternalValueSyncAction({
+      value: "before delete",
+      lastLocallyPublishedValue: "before delet",
+      compositionPending: false,
+      pendingLocalPublish: true,
+      lastExternalValue: "before delete",
+    }),
+    "ignore",
+  );
+});
+
 test("defers a real external value until IME composition has settled", () => {
   assert.equal(
     composerExternalValueSyncAction({

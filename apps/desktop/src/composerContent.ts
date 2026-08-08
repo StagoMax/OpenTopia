@@ -13,12 +13,22 @@ export function composerExternalValueSyncAction({
   value,
   lastLocallyPublishedValue,
   compositionPending,
+  pendingLocalPublish = false,
+  lastExternalValue,
 }: {
   value: string;
   lastLocallyPublishedValue: string | null;
   compositionPending: boolean;
+  /**
+   * The composer publishes its local text on the next animation frame. While
+   * that work is queued, React can re-render with the last prop value; that is
+   * not an external reset and must not overwrite the browser's live edit.
+   */
+  pendingLocalPublish?: boolean;
+  lastExternalValue?: string;
 }): ComposerExternalValueSyncAction {
   if (value === lastLocallyPublishedValue) return "ignore";
+  if (pendingLocalPublish && value === lastExternalValue) return "ignore";
   return compositionPending ? "defer" : "apply";
 }
 

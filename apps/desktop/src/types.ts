@@ -1085,6 +1085,7 @@ export type PreviewRenderer =
 export type PreviewTarget =
   | { type: "workspace"; path: string }
   | { type: "artifact"; artifactId: string }
+  | { type: "attachment"; attachmentId: string }
   | { type: "url"; url: string };
 
 export type PreviewDescriptor = {
@@ -2299,11 +2300,31 @@ export type AgentEventPayload =
       type: "automatic_approval_review_completed";
       review_id: string;
       target_item_id: string;
-      status: "in_progress" | "approved" | "denied" | "timed_out" | "aborted";
+      status:
+        | "in_progress"
+        | "approved"
+        | "needs_user_approval"
+        | "denied_by_policy"
+        | "reviewer_unavailable"
+        | "invalid_reviewer_response"
+        | "aborted";
       risk_level?: "low" | "medium" | "high" | "critical" | null;
       user_authorization?: "unknown" | "low" | "medium" | "high" | null;
       rationale: string;
       action: unknown;
+      usage: {
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        cachedInputTokens?: number | null;
+        cacheWriteTokens?: number | null;
+        reasoningTokens?: number | null;
+      };
+      attempts: number;
+      tool_rounds: number;
+      decision_source: "guardian" | "runtime";
+      failure_kind?:
+        "reviewer_unavailable" | "invalid_reviewer_response" | null;
     }
   | { type: "auto_review_interruption_warning"; message: string }
   | {

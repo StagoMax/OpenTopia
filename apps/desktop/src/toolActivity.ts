@@ -263,7 +263,7 @@ function buildToolActivityView(
           ? [{ label: formatBytes(numberField(metadata, "bytes") ?? 0) }]
           : [],
       body: content
-        ? { type: "file", path, text: clampText(content) }
+        ? { type: "file", path: displayPath(path), text: clampText(content) }
         : result
           ? { type: "text", text: output }
           : { type: "pending" },
@@ -278,7 +278,7 @@ function buildToolActivityView(
       title: `读取 ${displayPath(path) || "文件"}`,
       chips: bytesChip(numberField(metadata, "bytes")),
       body: result
-        ? { type: "file", path, text: clampText(output) }
+        ? { type: "file", path: displayPath(path), text: clampText(output) }
         : { type: "pending" },
       failed,
     };
@@ -738,7 +738,12 @@ export function formatBytes(bytes: number) {
 }
 
 export function displayPath(value: string) {
-  return value.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  return value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/\/\?\/UNC\//i, "//")
+    .replace(/^\/\/\?\//, "")
+    .replace(/^\.\//, "");
 }
 
 export function asRecord(value: unknown): Record<string, unknown> | null {

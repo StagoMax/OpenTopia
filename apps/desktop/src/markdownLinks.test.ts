@@ -7,7 +7,8 @@ const markdownLinks: typeof MarkdownLinksModule = await import(
   "./markdownLinks" + ".ts"
 );
 
-const { markdownStreamInterval, resolveMarkdownLink } = markdownLinks;
+const { markdownStreamInterval, resolveMarkdownFileLink, resolveMarkdownLink } =
+  markdownLinks;
 
 test("routes HTTP and HTTPS links to the internal browser", () => {
   assert.deepEqual(resolveMarkdownLink("https://example.com/docs?q=1"), {
@@ -72,6 +73,23 @@ test("keeps Windows drive paths absolute", () => {
     path: "J:/Project/OpenTopia/README.md",
     fragment: null,
   });
+});
+
+test("derives a filename label from explicit local file links", () => {
+  assert.deepEqual(resolveMarkdownFileLink("apps/desktop/src/styles/app.css"), {
+    path: "apps/desktop/src/styles/app.css",
+    fragment: null,
+    fileName: "app.css",
+  });
+  assert.deepEqual(
+    resolveMarkdownFileLink("J:/Project/OpenTopia/apps/desktop/src/App.tsx:42"),
+    {
+      path: "J:/Project/OpenTopia/apps/desktop/src/App.tsx",
+      fragment: "L42",
+      fileName: "App.tsx",
+    },
+  );
+  assert.equal(resolveMarkdownFileLink("https://example.com/app.css"), null);
 });
 
 test("blocks unsafe protocols and workspace traversal", () => {

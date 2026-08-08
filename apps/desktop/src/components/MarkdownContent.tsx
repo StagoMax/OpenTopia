@@ -1,4 +1,3 @@
-import { FileText } from "lucide-react";
 import {
   createContext,
   memo,
@@ -29,7 +28,10 @@ import {
   isWindowsDrivePath,
   remarkFilePathLinks,
 } from "../filePathLinks";
-import { markdownStreamInterval } from "../markdownLinks";
+import {
+  markdownStreamInterval,
+  resolveMarkdownFileLink,
+} from "../markdownLinks";
 import { recordConversationRenderTrace } from "../platform";
 import { useWorkspacePathStatus } from "./WorkspacePathProvider";
 import "./MarkdownContent.css";
@@ -38,6 +40,7 @@ export type MarkdownContentProps = {
   text: string;
   className?: string;
   streaming?: boolean;
+  baseWorkspacePath?: string | null;
   onOpenLink?(href: string): void;
   renderTrace?: ConversationMarkdownTraceContext;
 };
@@ -47,8 +50,12 @@ type RemarkPlugins = Options["remarkPlugins"];
 const basePlugins: RemarkPlugins = [remarkGfm];
 const pathLinkPlugins: RemarkPlugins = [remarkGfm, remarkFilePathLinks];
 
-const MarkdownLinkHandlerContext =
-  createContext<MarkdownContentProps["onOpenLink"]>(undefined);
+type MarkdownLinkContextValue = Pick<
+  MarkdownContentProps,
+  "baseWorkspacePath" | "onOpenLink"
+>;
+
+const MarkdownLinkContext = createContext<MarkdownLinkContextValue>({});
 
 const markdownComponents: Components = {
   a: MarkdownAnchor,
@@ -59,6 +66,7 @@ export function MarkdownContent({
   text,
   className = "",
   streaming = false,
+  baseWorkspacePath,
   onOpenLink,
   renderTrace,
 }: MarkdownContentProps) {
@@ -66,14 +74,14 @@ export function MarkdownContent({
   useConversationMarkdownTrace(renderedText, renderTrace);
   const instanceId = useId().replaceAll(":", "");
   return (
-    <MarkdownLinkHandlerContext.Provider value={onOpenLink}>
+    <MarkdownLinkContext.Provider value={{ baseWorkspacePath, onOpenLink }}>
       <MemoizedMarkdown
         className={`markdown-content ${className}`.trim()}
         clobberPrefix={`opentopia-${instanceId}-`}
         linkifyPaths={Boolean(onOpenLink)}
         text={renderedText}
       />
-    </MarkdownLinkHandlerContext.Provider>
+    </MarkdownLinkContext.Provider>
   );
 }
 
@@ -115,26 +123,25 @@ function MarkdownAnchor({
   children,
   ...props
 }: AnchorHTMLAttributes<HTMLAnchorElement>) {
-  const onOpenLink = useContext(MarkdownLinkHandlerContext);
-  const linkInfo = href ? decodeFilePathHref(href) : null;
+  const { baseWorkspacePath, onOpenLink } = useContext(MarkdownLinkContext);
+  const detectedLinkInfo = href ? decodeFilePathHref(href) : null;
+  const linkInfo = href
+    ? resolveMarkdownFileLink(href, baseWorkspacePath)
+    : null;
   const pathStatus = useWorkspacePathStatus(linkInfo?.path ?? null);
 
-  // File-detected link (opentopia-file: scheme): render as a compact chip once
-  // the file is confirmed to exist, otherwise show plain text.
-  if (linkInfo) {
-    if (pathStatus !== "known") return <>{children}</>;
-
-    const segments = linkInfo.path.split("/").filter(Boolean);
-    const fileName = segments.at(-1) ?? linkInfo.path;
-    const lineLabel = linkInfo.fragment
-      ? `(line ${linkInfo.fragment.replace(/^L+/, "")})`
-      : null;
+  // Both automatically detected paths and explicit Markdown file links use a
+  // filename-only label after the target is confirmed in the workspace.
+  if (linkInfo && pathStatus === "known") {
+    const targetTitle = linkInfo.fragment
+      ? `${linkInfo.path}#${linkInfo.fragment}`
+      : linkInfo.path;
 
     return (
       <a
         href={href}
-        title={linkInfo.path}
-        className="markdown-path-chip"
+        title={targetTitle}
+        className="markdown-file-link"
         onClick={(event) => {
           if (event.defaultPrevented || !href) return;
           if (!onOpenLink) return;
@@ -142,14 +149,14 @@ function MarkdownAnchor({
           onOpenLink(href);
         }}
       >
-        <FileText size={12} strokeWidth={2} aria-hidden />
-        <span>{fileName}</span>
-        {lineLabel && (
-          <span className="markdown-path-chip-line">{lineLabel}</span>
-        )}
+        {linkInfo.fileName}
       </a>
     );
   }
+
+  // Automatically detected prose should not become a broken link when its
+  // path is missing. Explicit Markdown links retain their original behavior.
+  if (detectedLinkInfo) return <>{children}</>;
 
   // Normal markdown link
   return (
@@ -295,10 +302,7 @@ function useConversationMarkdownTrace(
 function traceBase(
   context: ConversationMarkdownTraceContext,
   stage: ConversationRenderTrace["stage"],
-): Omit<
-  ConversationRenderTrace,
-  "change" | "text" | "textLength" | "visible"
-> {
+): Omit<ConversationRenderTrace, "change" | "text" | "textLength" | "visible"> {
   return {
     stage,
     channel: context.channel,

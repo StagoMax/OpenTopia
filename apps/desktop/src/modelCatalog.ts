@@ -336,8 +336,8 @@ const FAMILY_REASONING: Partial<
     nonReasoningPattern: /moonshot-v1/,
   },
   deepseek: {
-    efforts: ["none", "low", "medium", "high"],
-    defaultEffort: "medium",
+    efforts: ["none", "high", "max"],
+    defaultEffort: "high",
     nonReasoningPattern: /deepseek-(?:chat|coder)(?:$|-)/,
   },
   qwen: {

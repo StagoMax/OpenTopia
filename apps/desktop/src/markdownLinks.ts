@@ -7,6 +7,12 @@ export type MarkdownLinkTarget =
   | { kind: "workspace"; path: string; fragment: string | null }
   | { kind: "blocked"; reason: string };
 
+export type MarkdownFileLinkTarget = {
+  path: string;
+  fragment: string | null;
+  fileName: string;
+};
+
 const explicitSchemePattern = /^[a-z][a-z0-9+.-]*:/i;
 
 export function resolveMarkdownLink(
@@ -65,6 +71,22 @@ export function resolveMarkdownLink(
   }
 
   return { kind: "workspace", path: resolved, fragment };
+}
+
+/** Returns the display information shared by detected and explicit file links. */
+export function resolveMarkdownFileLink(
+  href: string,
+  baseWorkspacePath?: string | null,
+): MarkdownFileLinkTarget | null {
+  const target = resolveMarkdownLink(href, baseWorkspacePath);
+  if (target.kind !== "workspace") return null;
+
+  const segments = target.path.replaceAll("\\", "/").split("/").filter(Boolean);
+  return {
+    path: target.path,
+    fragment: target.fragment,
+    fileName: segments.at(-1) ?? target.path,
+  };
 }
 
 /**
@@ -129,11 +151,23 @@ function splitRelativeReference(value: string): {
 } {
   const hashIndex = value.indexOf("#");
   const withoutFragment = hashIndex >= 0 ? value.slice(0, hashIndex) : value;
-  const fragment = hashIndex >= 0 ? value.slice(hashIndex + 1) || null : null;
+  let fragment = hashIndex >= 0 ? value.slice(hashIndex + 1) || null : null;
   const queryIndex = withoutFragment.indexOf("?");
+  let path =
+    queryIndex >= 0 ? withoutFragment.slice(0, queryIndex) : withoutFragment;
+
+  // Codex file links may encode a source line as `/path/file.ts:42`.
+  // Convert that suffix to the same fragment shape used by detected paths.
+  if (!fragment) {
+    const lineReference = /^(.*):(\d+)(?::\d+)?$/.exec(path);
+    if (lineReference?.[1]) {
+      path = lineReference[1];
+      fragment = `L${lineReference[2]}`;
+    }
+  }
+
   return {
-    path:
-      queryIndex >= 0 ? withoutFragment.slice(0, queryIndex) : withoutFragment,
+    path,
     fragment,
   };
 }

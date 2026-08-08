@@ -117,7 +117,7 @@ export class ApiResponseError extends Error {
 
 type PreviewDescriptorResponse = {
   id: string;
-  source: "workspace" | "artifact";
+  source: "workspace" | "artifact" | "attachment";
   path?: string | null;
   name: string;
   kind: "text" | "image" | "pdf" | "spreadsheet" | "unsupported";
@@ -1292,7 +1292,9 @@ export class ApiClient {
         `/api/threads/${threadId}/previews/resolve`,
         target.type === "workspace"
           ? { source: "workspace", path: target.path }
-          : { source: "artifact", artifactId: target.artifactId },
+          : target.type === "artifact"
+            ? { source: "artifact", artifactId: target.artifactId }
+            : { source: "attachment", attachmentId: target.attachmentId },
       );
       return {
         id: response.id,
@@ -1308,10 +1310,16 @@ export class ApiClient {
         revision: response.revision,
         readonly: response.readonly,
         externalPath:
-          response.source === "artifact" ? response.path : undefined,
+          response.source === "artifact" || response.source === "attachment"
+            ? response.path
+            : undefined,
       };
     } catch (cause) {
-      if (cause instanceof ApiResponseError && cause.status === 404) {
+      if (
+        cause instanceof ApiResponseError &&
+        cause.status === 404 &&
+        target.type !== "attachment"
+      ) {
         return this.resolveLegacyPreview(threadId, target);
       }
       throw cause;
@@ -1494,7 +1502,7 @@ export class ApiClient {
 
   private async resolveLegacyPreview(
     threadId: string,
-    target: Exclude<PreviewTarget, { type: "url" }>,
+    target: Exclude<PreviewTarget, { type: "url" } | { type: "attachment" }>,
   ): Promise<PreviewDescriptor> {
     if (target.type === "workspace") {
       const file = await this.readWorkspaceFile(threadId, target.path);

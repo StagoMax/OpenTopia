@@ -2912,24 +2912,24 @@ button:disabled {
 }
 
 .thread-row {
-  display: block;
+  display: flex;
+  align-items: center;
   width: 100%;
-  min-height: 27px;
+  min-height: var(--control-height-sm);
   border: 0;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-secondary);
-  padding: 5px 7px;
-  /* CJK glyph ink sits optically low in this compact line box. */
-  padding-block: var(--space-2) var(--space-3);
+  padding: var(--space-0) var(--space-3);
   text-align: left;
-  font-size: 12px;
-  font-weight: 400;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
   line-height: 17px;
 }
 
 .thread-title-viewport {
   display: block;
+  flex: 1;
   min-width: 0;
 }
 
@@ -2937,6 +2937,8 @@ button:disabled {
   display: inline-block;
   min-width: max-content;
   letter-spacing: 0;
+  position: relative;
+  top: var(--space-1);
 }
 
 .thread-title-viewport.is-overflowing {
@@ -8742,20 +8744,20 @@ button:disabled {
 }
 
 .preview-renderer-toolbar {
-  gap: 3px;
-  height: 35px;
-  padding: 0 8px;
+  gap: var(--space-2);
+  height: var(--control-height-md);
+  padding: 0 var(--space-4);
 }
 
 .preview-renderer-toolbar .icon-button.active {
-  background: var(--surface-active);
-  color: var(--success);
+  background: var(--accent-subtle);
+  color: var(--accent);
 }
 
 .preview-toolbar-divider {
   width: 1px;
-  height: 16px;
-  margin: 0 3px;
+  height: var(--icon-size-sm);
+  margin: 0 var(--space-2);
   background: var(--border);
 }
 
@@ -8766,7 +8768,7 @@ button:disabled {
 .image-preview,
 .pdf-preview {
   display: grid;
-  grid-template-rows: 35px minmax(0, 1fr);
+  grid-template-rows: var(--control-height-md) minmax(0, 1fr);
 }
 
 .image-preview-canvas,
@@ -8774,24 +8776,67 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   overflow: auto;
+}
+
+.image-preview {
+  grid-template-rows: calc(var(--control-height-lg) + var(--space-4)) minmax(
+      0,
+      1fr
+    );
+  background: var(--surface-subtle);
+}
+
+.image-preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: var(--space-2) var(--space-4);
+}
+
+.image-preview-zoom-select {
+  height: var(--control-height-md);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--font-size-base);
+  padding: 0 var(--space-3);
+}
+
+.image-preview-zoom-select:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.image-preview-zoom-select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.image-preview-canvas {
+  background: var(--surface-subtle);
+  padding: var(--space-8);
+}
+
+.pdf-preview-canvas {
   background-color: var(--surface-subtle);
   background-image:
-    linear-gradient(45deg, #e5e8e3 25%, transparent 25%),
-    linear-gradient(-45deg, #e5e8e3 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #e5e8e3 75%),
-    linear-gradient(-45deg, transparent 75%, #e5e8e3 75%);
+    linear-gradient(45deg, var(--surface-active) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--surface-active) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--surface-active) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--surface-active) 75%);
   background-position:
     0 0,
-    0 6px,
-    6px -6px,
-    -6px 0;
-  background-size: 12px 12px;
+    0 var(--space-3),
+    var(--space-3) calc(var(--space-3) * -1),
+    calc(var(--space-3) * -1) 0;
+  background-size: var(--space-6) var(--space-6);
 }
 
 .image-preview-canvas.fit {
   display: grid;
   place-items: center;
-  padding: 16px;
 }
 
 .image-preview-canvas.fit img {

@@ -12,6 +12,8 @@ export const KIMI_K3_MODEL_GUIDE_URL =
   "https://www.kimi.com/code/docs/en/kimi-code/models.html";
 export const GLM_THINKING_GUIDE_URL =
   "https://docs.bigmodel.cn/cn/guide/capabilities/thinking";
+export const DEEPSEEK_THINKING_GUIDE_URL =
+  "https://api-docs.deepseek.com/guides/thinking_mode";
 export const OPENAI_MODEL_CATALOG_VERIFIED_AT = "2026-08-02";
 
 export type OfficialModelPreset = {
@@ -28,6 +30,8 @@ export type ModelReasoningCapability = {
   defaultEffort: ReasoningEffort | null;
   sourceUrl: string | null;
   official: boolean;
+  /** The model has an explicit thinking on/off transport control. */
+  thinkingToggle?: boolean;
 };
 
 export const REASONING_EFFORT_DETAILS: Readonly<
@@ -118,6 +122,15 @@ const CLAUDE_XHIGH_EFFORTS = [
   "xhigh",
   "max",
 ] as const satisfies readonly ReasoningEffort[];
+const DEEPSEEK_V4_EFFORTS = [
+  "none",
+  "high",
+  "max",
+] as const satisfies readonly ReasoningEffort[];
+const DEEPSEEK_REASONER_EFFORTS = [
+  "high",
+  "max",
+] as const satisfies readonly ReasoningEffort[];
 
 export const OFFICIAL_OPENAI_MODEL_PRESETS: readonly OfficialModelPreset[] = [
   {
@@ -204,6 +217,25 @@ const modelCapabilityRules: ReadonlyArray<{
   capability: ModelReasoningCapability;
 }> = [
   {
+    pattern: /(?:^|[/\.])deepseek-v4-(?:flash|pro)(?:$|[-:\[])/,
+    capability: officialCapability(
+      DEEPSEEK_V4_EFFORTS,
+      "high",
+      DEEPSEEK_THINKING_GUIDE_URL,
+      true,
+    ),
+  },
+  {
+    // The legacy reasoner alias is thinking-only. It accepts effort control,
+    // but cannot be switched to non-thinking mode through this model id.
+    pattern: /(?:^|[/\.])deepseek-reasoner(?:$|[-:\[])/,
+    capability: officialCapability(
+      DEEPSEEK_REASONER_EFFORTS,
+      "high",
+      DEEPSEEK_THINKING_GUIDE_URL,
+    ),
+  },
+  {
     // Kimi maps `medium` to high and `xhigh` to max. `none` is its explicit
     // thinking-off control; `minimal` is not an accepted K3 effort value.
     pattern: /(?:^|[/\.])(?:kimi-)?k3(?:-256k)?(?:$|[-\[])/,
@@ -219,6 +251,7 @@ const modelCapabilityRules: ReadonlyArray<{
       ALL_REASONING_EFFORTS,
       "max",
       GLM_THINKING_GUIDE_URL,
+      true,
     ),
   },
   {
@@ -362,6 +395,7 @@ function officialCapability(
   supportedEfforts: readonly ReasoningEffort[],
   defaultEffort: ReasoningEffort | null,
   sourceUrl: string,
+  thinkingToggle = false,
 ): ModelReasoningCapability {
   return {
     status: "supported",
@@ -369,6 +403,7 @@ function officialCapability(
     defaultEffort,
     sourceUrl,
     official: true,
+    thinkingToggle,
   };
 }
 

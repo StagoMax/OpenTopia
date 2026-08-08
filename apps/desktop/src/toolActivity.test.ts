@@ -9,6 +9,7 @@ const toolActivity: typeof ToolActivityModule = await import(
 
 const {
   buildToolActivity,
+  displayPath,
   groupSearchHits,
   parsePatchLines,
   parseSearchHits,
@@ -106,6 +107,21 @@ test("parses ripgrep hits including windows drive paths", () => {
   const groups = groupSearchHits(hits);
   assert.equal(groups.length, 2);
   assert.equal(groups[0].hits.length, 2);
+});
+
+test("hides Windows extended-length prefixes in displayed paths", () => {
+  assert.equal(
+    displayPath(String.raw`\\?\J:\Project\OpenTopia\inspect.mjs`),
+    "J:/Project/OpenTopia/inspect.mjs",
+  );
+  assert.equal(
+    displayPath("//?/J:/Project/OpenTopia/inspect.mjs"),
+    "J:/Project/OpenTopia/inspect.mjs",
+  );
+  assert.equal(
+    displayPath(String.raw`\\?\UNC\server\share\file.txt`),
+    "//server/share/file.txt",
+  );
 });
 
 test("parses git and apply_patch diffs into numbered lines", () => {
@@ -222,6 +238,20 @@ test("uses per-tool bodies for reads, listings and searches", () => {
   );
   assert.equal(search.body.type, "matches");
   assert.equal(search.title, "搜索 tool_call");
+});
+
+test("renders read paths without the Windows device prefix", () => {
+  const rawPath = String.raw`\\?\J:\Project\OpenTopia\inspect.mjs`;
+  const read = buildToolActivity(
+    call("read_file", { path: rawPath }),
+    result("export {};", { path: rawPath, bytes: 10 }),
+  );
+
+  assert.equal(read.title, "读取 J:/Project/OpenTopia/inspect.mjs");
+  assert.equal(read.body.type, "file");
+  if (read.body.type === "file") {
+    assert.equal(read.body.path, "J:/Project/OpenTopia/inspect.mjs");
+  }
 });
 
 test("labels MCP tools by server and tool name", () => {

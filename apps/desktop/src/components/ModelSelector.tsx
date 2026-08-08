@@ -81,6 +81,7 @@ export function ModelSelector({
   const [submenu, setSubmenu] = useState<OpenSubmenu>(null);
   const [submenuSide, setSubmenuSide] = useState<SubmenuSide>("right");
   const [submenuTopOffset, setSubmenuTopOffset] = useState(0);
+  const [submenuMaxHeight, setSubmenuMaxHeight] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const submenuRef = useRef<HTMLDivElement | null>(null);
@@ -102,6 +103,7 @@ export function ModelSelector({
     // Prefer the conventional lower-right cascade before measuring overflow.
     setSubmenuSide("right");
     setSubmenuTopOffset(0);
+    setSubmenuMaxHeight(null);
     setSubmenu(nextSubmenu);
   }, []);
 
@@ -119,39 +121,53 @@ export function ModelSelector({
   useLayoutEffect(() => {
     if (!open || !submenu) return undefined;
 
-    const updateSubmenuPlacement = () => {
-      const submenuElement = submenuRef.current;
-      const ownerElement = submenuElement?.parentElement;
-      if (!submenuElement || !ownerElement) return;
+    const submenuElement = submenuRef.current;
+    const ownerElement = submenuElement?.parentElement;
+    if (!submenuElement || !ownerElement) return undefined;
+    const menuElement = ownerElement.closest(".model-selector-menu");
 
+    const updateSubmenuPlacement = () => {
       const submenuRect = submenuElement.getBoundingClientRect();
       const ownerRect = ownerElement.getBoundingClientRect();
+      const menuRect = menuElement?.getBoundingClientRect();
       const gap =
         submenuSide === "right"
           ? submenuRect.left - ownerRect.right
           : ownerRect.left - submenuRect.right;
       const visualViewport = window.visualViewport;
+      const viewportTop = visualViewport?.offsetTop ?? 0;
       const viewportRight =
         (visualViewport?.offsetLeft ?? 0) +
         (visualViewport?.width ?? window.innerWidth);
       const viewportBottom =
         (visualViewport?.offsetTop ?? 0) +
         (visualViewport?.height ?? window.innerHeight);
+      // The parent settings menu sits directly above the composer. Keeping the
+      // cascade within its lower edge prevents the composer from covering it.
+      const bottomBoundary = Math.min(
+        viewportBottom,
+        menuRect?.bottom ?? viewportBottom,
+      );
       const fitsOnRight =
         viewportRight - ownerRect.right >= submenuRect.width + Math.max(gap, 0);
-      const topOffset = Math.min(
-        0,
-        viewportBottom - ownerRect.top - submenuRect.height,
+      const topOffset = Math.max(
+        viewportTop - ownerRect.top,
+        Math.min(0, bottomBoundary - ownerRect.top - submenuRect.height),
       );
 
       setSubmenuSide(fitsOnRight ? "right" : "left");
       setSubmenuTopOffset(topOffset);
+      setSubmenuMaxHeight(Math.max(0, bottomBoundary - viewportTop));
     };
 
     updateSubmenuPlacement();
+    const resizeObserver = new ResizeObserver(updateSubmenuPlacement);
+    resizeObserver.observe(submenuElement);
+    resizeObserver.observe(ownerElement);
     window.addEventListener("resize", updateSubmenuPlacement);
     window.visualViewport?.addEventListener("resize", updateSubmenuPlacement);
     return () => {
+      resizeObserver.disconnect();
       window.removeEventListener("resize", updateSubmenuPlacement);
       window.visualViewport?.removeEventListener(
         "resize",
@@ -262,7 +278,9 @@ export function ModelSelector({
               aria-haspopup="menu"
               className="model-selector-row"
               onClick={() => toggleSubmenu("model")}
-              onMouseEnter={() => showSubmenu("model")}
+              onMouseEnter={() => {
+                if (submenu !== "model") showSubmenu("model");
+              }}
               role="menuitem"
               type="button"
             >
@@ -276,7 +294,10 @@ export function ModelSelector({
                   submenuSide === "left" ? " model-selector-submenu--left" : ""
                 }`}
                 ref={submenuRef}
-                style={{ top: submenuTopOffset }}
+                style={{
+                  maxHeight: submenuMaxHeight ?? undefined,
+                  top: submenuTopOffset,
+                }}
               >
                 <ModelMenu
                   connections={connections}
@@ -310,7 +331,9 @@ export function ModelSelector({
                 aria-haspopup="menu"
                 className="model-selector-row"
                 onClick={() => toggleSubmenu("effort")}
-                onMouseEnter={() => showSubmenu("effort")}
+                onMouseEnter={() => {
+                  if (submenu !== "effort") showSubmenu("effort");
+                }}
                 role="menuitem"
                 type="button"
               >
@@ -328,7 +351,10 @@ export function ModelSelector({
                       : ""
                   }`}
                   ref={submenuRef}
-                  style={{ top: submenuTopOffset }}
+                  style={{
+                    maxHeight: submenuMaxHeight ?? undefined,
+                    top: submenuTopOffset,
+                  }}
                 >
                   <ul className="model-menu-list" role="listbox">
                     {capability.supportedEfforts.map((effort) => (
@@ -400,9 +426,15 @@ function ModelMenu({
   selectedModelId: string;
 }) {
   const [query, setQuery] = useState("");
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
-
   const sections = useMemo(() => buildSections(connections), [connections]);
+  const [collapsedNodes, setCollapsedNodes] = useState<ReadonlySet<string>>(
+    () =>
+      buildInitialCollapsedNodes(
+        sections,
+        selectedConnectionId,
+        selectedModelId,
+      ),
+  );
 
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const filtered = useMemo(() => {
@@ -426,9 +458,6 @@ function ModelMenu({
       .filter((section) => section.groups.length > 0);
   }, [normalizedQuery, sections]);
 
-  // Only one connection means the connection heading is noise.
-  const showConnectionHeadings = sections.length > 1;
-
   return (
     <div className="model-menu">
       <div className="model-menu-search">
@@ -449,91 +478,111 @@ function ModelMenu({
         </p>
       ) : (
         <div className="model-menu-scroll">
-          {filtered.map((section) => (
-            <section key={section.connection.id}>
-              {showConnectionHeadings ? (
-                <h3 className="model-menu-connection">
-                  {providerDisplayName(section.connection)}
-                </h3>
-              ) : null}
-              {section.groups.map((group) => {
-                const key = `${section.connection.id}:${group.familyLabel}`;
-                // Searching should never hide results behind a collapsed group.
-                const isCollapsed = !normalizedQuery && collapsed.has(key);
-                return (
-                  <div className="model-menu-family" key={key}>
-                    <button
-                      aria-expanded={!isCollapsed}
-                      className="model-menu-family-toggle"
-                      onClick={() =>
-                        setCollapsed((current) => {
-                          const next = new Set(current);
-                          if (next.has(key)) next.delete(key);
-                          else next.add(key);
-                          return next;
-                        })
-                      }
-                      type="button"
-                    >
-                      {isCollapsed ? (
-                        <ChevronRight aria-hidden="true" size={14} />
-                      ) : (
-                        <ChevronDown aria-hidden="true" size={14} />
-                      )}
-                      <span>{group.familyLabel}</span>
-                      <span className="model-menu-family-count">
-                        {group.options.length}
-                      </span>
-                    </button>
-                    {isCollapsed ? null : (
-                      <ul className="model-menu-list" role="listbox">
-                        {group.options.map((option) => {
-                          const selected =
-                            option.modelId === selectedModelId &&
-                            option.connection.id === selectedConnectionId;
-                          return (
-                            <li
-                              key={`${option.connection.id}:${option.modelId}`}
-                            >
-                              <button
-                                aria-selected={selected}
-                                className="model-menu-option"
-                                onClick={() => onSelect(option)}
-                                role="option"
-                                type="button"
-                              >
-                                <span className="model-menu-option-main">
-                                  <span className="model-menu-option-name">
-                                    {option.displayName}
-                                    {option.latest ? (
-                                      <span className="model-menu-tag">
-                                        最新
+          {filtered.map((section) => {
+            const providerKey = providerNodeKey(section.connection);
+            // Searching should never hide results behind a collapsed branch.
+            const providerCollapsed =
+              !normalizedQuery && collapsedNodes.has(providerKey);
+
+            return (
+              <section key={section.connection.id}>
+                <button
+                  aria-expanded={!providerCollapsed}
+                  className="model-menu-provider-toggle"
+                  onClick={() =>
+                    setCollapsedNodes((current) =>
+                      toggleCollapsedNode(current, providerKey),
+                    )
+                  }
+                  type="button"
+                >
+                  {providerCollapsed ? (
+                    <ChevronRight aria-hidden="true" size={14} />
+                  ) : (
+                    <ChevronDown aria-hidden="true" size={14} />
+                  )}
+                  <span className="model-menu-provider-name">
+                    {providerDisplayName(section.connection)}
+                  </span>
+                </button>
+
+                {providerCollapsed ? null : (
+                  <div className="model-menu-provider-groups">
+                    {section.groups.map((group) => {
+                      const familyKey = familyNodeKey(
+                        section.connection,
+                        group.familyLabel,
+                      );
+                      const familyCollapsed =
+                        !normalizedQuery && collapsedNodes.has(familyKey);
+                      return (
+                        <div className="model-menu-family" key={familyKey}>
+                          <button
+                            aria-expanded={!familyCollapsed}
+                            className="model-menu-family-toggle"
+                            onClick={() =>
+                              setCollapsedNodes((current) =>
+                                toggleCollapsedNode(current, familyKey),
+                              )
+                            }
+                            type="button"
+                          >
+                            {familyCollapsed ? (
+                              <ChevronRight aria-hidden="true" size={14} />
+                            ) : (
+                              <ChevronDown aria-hidden="true" size={14} />
+                            )}
+                            <span>{group.familyLabel}</span>
+                          </button>
+                          {familyCollapsed ? null : (
+                            <ul className="model-menu-list" role="listbox">
+                              {group.options.map((option) => {
+                                const selected =
+                                  option.modelId === selectedModelId &&
+                                  option.connection.id === selectedConnectionId;
+                                return (
+                                  <li
+                                    key={`${option.connection.id}:${option.modelId}`}
+                                  >
+                                    <button
+                                      aria-selected={selected}
+                                      className="model-menu-option"
+                                      onClick={() => onSelect(option)}
+                                      role="option"
+                                      type="button"
+                                    >
+                                      <span className="model-menu-option-main">
+                                        <span className="model-menu-option-name">
+                                          {option.modelId}
+                                          {option.latest ? (
+                                            <span className="model-menu-tag">
+                                              最新
+                                            </span>
+                                          ) : null}
+                                          {option.preview ? (
+                                            <span className="model-menu-tag">
+                                              预览
+                                            </span>
+                                          ) : null}
+                                        </span>
                                       </span>
-                                    ) : null}
-                                    {option.preview ? (
-                                      <span className="model-menu-tag">
-                                        预览
-                                      </span>
-                                    ) : null}
-                                  </span>
-                                  <span className="model-menu-option-meta">
-                                    {option.modelId}
-                                  </span>
-                                </span>
-                                {selected ? (
-                                  <Check aria-hidden="true" size={14} />
-                                ) : null}
-                              </button>
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    )}
+                                      {selected ? (
+                                        <Check aria-hidden="true" size={14} />
+                                      ) : null}
+                                    </button>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
-                );
-              })}
-            </section>
-          ))}
+                )}
+              </section>
+            );
+          })}
         </div>
       )}
 
@@ -551,8 +600,55 @@ function ModelMenu({
 
 type MenuSection = {
   connection: ProviderSettings;
-  groups: { familyLabel: string; options: ModelOption[] }[];
+  groups: MenuFamily[];
 };
+
+type MenuFamily = { familyLabel: string; options: ModelOption[] };
+
+function providerNodeKey(connection: ProviderSettings): string {
+  return `provider:${connection.id}`;
+}
+
+function familyNodeKey(
+  connection: ProviderSettings,
+  familyLabel: string,
+): string {
+  return `family:${connection.id}:${familyLabel}`;
+}
+
+function toggleCollapsedNode(
+  current: ReadonlySet<string>,
+  key: string,
+): ReadonlySet<string> {
+  const next = new Set(current);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next;
+}
+
+function buildInitialCollapsedNodes(
+  sections: MenuSection[],
+  selectedConnectionId: string,
+  selectedModelId: string,
+): ReadonlySet<string> {
+  const collapsed = new Set<string>();
+
+  for (const section of sections) {
+    const selectedConnection = section.connection.id === selectedConnectionId;
+    if (!selectedConnection) collapsed.add(providerNodeKey(section.connection));
+
+    for (const group of section.groups) {
+      const containsSelectedModel =
+        selectedConnection &&
+        group.options.some((option) => option.modelId === selectedModelId);
+      if (!containsSelectedModel) {
+        collapsed.add(familyNodeKey(section.connection, group.familyLabel));
+      }
+    }
+  }
+
+  return collapsed;
+}
 
 function buildSections(connections: ProviderSettings[]): MenuSection[] {
   return connections

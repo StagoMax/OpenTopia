@@ -51,7 +51,6 @@ import {
   GitFork,
   Globe2,
   Hand,
-  ImagePlus,
   Laptop,
   ListTodo,
   Loader2,
@@ -105,7 +104,11 @@ import {
   type ApprovalRequest,
 } from "./components/ApprovalDialog";
 import { PlanChoiceCard } from "./components/PlanChoiceCard";
-import { PreviewHost } from "./components/PreviewHost";
+import {
+  InlineImagePreview,
+  type ImagePreviewSource,
+  PreviewHost,
+} from "./components/PreviewHost";
 import { FlowWorkspacePanel } from "./components/FlowWorkspacePanel";
 import { RightContextRail } from "./components/RightContextRail";
 import { SettingsPanel as RedesignedSettingsPanel } from "./components/SettingsPanel";
@@ -237,6 +240,7 @@ import type {
   CodexLoginStart,
   ContextStatus,
   ContextSourceFile,
+  ContextSourceRef,
   ExperienceMode,
   GoalSnapshot,
   GoalStatus,
@@ -369,6 +373,7 @@ type ToolTabKind =
   | "flow"
   | "browser"
   | "computer"
+  | "image"
   | "preview"
   | "side-task"
   | "usage";
@@ -377,6 +382,7 @@ type ToolTab = {
   id: string;
   kind: ToolTabKind;
   title: string;
+  imagePreview?: ImagePreviewSource;
   sideTaskThreadId?: string;
   previewTarget?: PreviewTarget;
   browserNavigation?: BrowserNavigationRequest;
@@ -2373,7 +2379,7 @@ export function App() {
   }
 
   function openToolTab(kind: ToolTabKind) {
-    if (kind === "preview" || kind === "side-task") return;
+    if (kind === "image" || kind === "preview" || kind === "side-task") return;
     const id = `tool-${kind}`;
     setToolTabs((current) =>
       current.some((tab) => tab.id === id)
@@ -2454,7 +2460,7 @@ export function App() {
     void refreshWorkbench();
   }
 
-  function toggleToolPanel(kind: Exclude<ToolTabKind, "preview">) {
+  function toggleToolPanel(kind: Exclude<ToolTabKind, "image" | "preview">) {
     const tabId = `tool-${kind}`;
     if (toolStageOpen && activeToolTabId === tabId) {
       setToolStageOpen(false);
@@ -2474,12 +2480,31 @@ export function App() {
         ? `workspace:${target.path}`
         : target.type === "artifact"
           ? `artifact:${target.artifactId}`
-          : `url:${target.url}`;
+          : target.type === "attachment"
+            ? `attachment:${target.attachmentId}`
+            : `url:${target.url}`;
     const id = `preview:${threadId}:${targetKey}`;
     setToolTabs((current) =>
       current.some((tab) => tab.id === id)
         ? current
         : [...current, { id, kind: "preview", title, previewTarget: target }],
+    );
+    setActiveToolTabId(id);
+    setToolStageOpen(true);
+    setConversationCollapsed(false);
+  }, []);
+
+  const openInlineImagePreview = useCallback(function openInlineImagePreview(
+    threadId: string,
+    sourceId: string,
+    image: ImagePreviewSource,
+  ) {
+    const id = `image-preview:${threadId}:${sourceId}`;
+    const title = image.name?.trim() || "图片";
+    setToolTabs((current) =>
+      current.some((tab) => tab.id === id)
+        ? current
+        : [...current, { id, kind: "image", title, imagePreview: image }],
     );
     setActiveToolTabId(id);
     setToolStageOpen(true);
@@ -4399,6 +4424,16 @@ export function App() {
                     onOpenArtifact={(artifactId) =>
                       void openArtifact(activeThread.id, artifactId)
                     }
+                    onOpenImagePreview={(sourceId, image) =>
+                      openInlineImagePreview(activeThread.id, sourceId, image)
+                    }
+                    onOpenAttachmentPreview={(source) =>
+                      openPreviewTab(
+                        activeThread.id,
+                        { type: "attachment", attachmentId: source.id },
+                        source.name,
+                      )
+                    }
                     onOpenMarkdownLink={openMarkdownLink}
                     onUndoTurn={(turnId) => void openTurnUndo(turnId)}
                     onReviewChanges={() => {
@@ -4624,6 +4659,7 @@ export function App() {
             onOpenArtifact={(threadId, artifactId) =>
               void openArtifact(threadId, artifactId)
             }
+            onOpenPreview={openPreviewTab}
             onOpenMarkdownLink={openMarkdownLink}
             onRevertDiffFile={(path) => void revertDiffFile(path)}
             onApplyDiffHunk={(hunk, action) => void applyDiffHunk(hunk, action)}
@@ -4634,6 +4670,7 @@ export function App() {
             onGetArtifact={(threadId, artifactId) =>
               getArtifact(threadId, artifactId)
             }
+            onOpenImagePreview={openInlineImagePreview}
             onOpenToolTab={openToolTab}
             onOpenSideTask={() => void openSideTask()}
             onThreadUpdated={(updatedThread) =>
@@ -7619,6 +7656,8 @@ function MessageList({
   threadId,
   artifacts,
   onOpenArtifact,
+  onOpenImagePreview,
+  onOpenAttachmentPreview,
   onOpenMarkdownLink,
   onUndoTurn,
   onReviewChanges,
@@ -7633,6 +7672,8 @@ function MessageList({
   threadId: string;
   artifacts: ArtifactDescriptor[];
   onOpenArtifact(artifactId: string): void;
+  onOpenImagePreview(sourceId: string, image: ImagePreviewSource): void;
+  onOpenAttachmentPreview(source: ContextSourceRef): void;
   onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
   onUndoTurn(turnId: string): void;
   onReviewChanges(): void;
@@ -7874,6 +7915,8 @@ function MessageList({
                     threadId={threadId}
                     artifacts={artifacts}
                     onOpenArtifact={onOpenArtifact}
+                    onOpenImagePreview={onOpenImagePreview}
+                    onOpenAttachmentPreview={onOpenAttachmentPreview}
                     onOpenMarkdownLink={onOpenMarkdownLink}
                   />
                   {turnIds.map((turnId) => (
@@ -7961,12 +8004,16 @@ const MessageBubble = memo(function MessageBubble({
   threadId,
   artifacts,
   onOpenArtifact,
+  onOpenImagePreview,
+  onOpenAttachmentPreview,
   onOpenMarkdownLink,
 }: {
   message: Message;
   threadId: string;
   artifacts: ArtifactDescriptor[];
   onOpenArtifact(artifactId: string): void;
+  onOpenImagePreview(sourceId: string, image: ImagePreviewSource): void;
+  onOpenAttachmentPreview(source: ContextSourceRef): void;
   onOpenMarkdownLink(href: string): void;
 }) {
   const renderedParts = useMemo(() => {
@@ -8005,9 +8052,6 @@ const MessageBubble = memo(function MessageBubble({
   const [imagePreviews, setImagePreviews] = useState<ImageLightboxAttachment[]>(
     [],
   );
-  const [activeImagePreviewIndex, setActiveImagePreviewIndex] = useState<
-    number | null
-  >(null);
 
   useLayoutEffect(() => {
     // Create and revoke object URLs in the same lifecycle. React StrictMode
@@ -8038,15 +8082,6 @@ const MessageBubble = memo(function MessageBubble({
     };
   }, [renderedParts]);
 
-  useEffect(() => {
-    if (
-      activeImagePreviewIndex !== null &&
-      activeImagePreviewIndex >= imagePreviews.length
-    ) {
-      setActiveImagePreviewIndex(null);
-    }
-  }, [activeImagePreviewIndex, imagePreviews.length]);
-
   if (renderedParts.length === 0) return null;
 
   return (
@@ -8054,7 +8089,7 @@ const MessageBubble = memo(function MessageBubble({
       <article className={`message ${message.role}`}>
         <div className="message-body">
           {renderedParts.map(
-            ({ part, referencedImage, previewIndex }, index) => (
+            ({ part, referencedImage, previewImage, previewIndex }, index) => (
               <MessagePartView
                 key={index}
                 messageId={message.id}
@@ -8066,29 +8101,25 @@ const MessageBubble = memo(function MessageBubble({
                     : imagePreviews[previewIndex]?.previewUrl
                 }
                 onPreviewImage={
-                  previewIndex === null
+                  previewIndex === null || !previewImage
                     ? undefined
-                    : () => setActiveImagePreviewIndex(previewIndex)
+                    : () =>
+                        onOpenImagePreview(
+                          `${message.id}:${previewIndex}`,
+                          previewImage,
+                        )
                 }
                 role={message.role}
                 threadId={threadId}
                 artifacts={artifacts}
                 onOpenArtifact={onOpenArtifact}
+                onOpenAttachmentPreview={onOpenAttachmentPreview}
                 onOpenMarkdownLink={onOpenMarkdownLink}
               />
             ),
           )}
         </div>
       </article>
-      {activeImagePreviewIndex !== null &&
-      imagePreviews[activeImagePreviewIndex] ? (
-        <ImageLightbox
-          attachments={imagePreviews}
-          activeIndex={activeImagePreviewIndex}
-          onChangeIndex={setActiveImagePreviewIndex}
-          onClose={() => setActiveImagePreviewIndex(null)}
-        />
-      ) : null}
     </>
   );
 });
@@ -8103,6 +8134,7 @@ function MessagePartView({
   threadId,
   artifacts,
   onOpenArtifact,
+  onOpenAttachmentPreview,
   onOpenMarkdownLink,
 }: {
   messageId: string;
@@ -8114,6 +8146,7 @@ function MessagePartView({
   threadId: string;
   artifacts: ArtifactDescriptor[];
   onOpenArtifact(artifactId: string): void;
+  onOpenAttachmentPreview(source: ContextSourceRef): void;
   onOpenMarkdownLink(href: string): void;
 }) {
   if (part.type === "image") {
@@ -8172,8 +8205,8 @@ function MessagePartView({
       <button
         className="message-source-reference"
         type="button"
-        title={part.source.path}
-        onClick={() => void openPath(part.source.path)}
+        title={`在右侧预览 ${part.source.name}`}
+        onClick={() => onOpenAttachmentPreview(part.source)}
       >
         <ContextSourceIcon extension={fileExtension(part.source.name)} />
         <span>{part.source.name}</span>
@@ -8222,9 +8255,9 @@ function InlineImageMessagePart({
       <button
         className={`message-inline-image ${compact ? "is-reference" : ""}`}
         type="button"
-        aria-haspopup="dialog"
-        aria-label={`预览 ${name}`}
-        title={`预览 ${name}`}
+        aria-controls="workspace-right-panel"
+        aria-label={`在右侧预览 ${name}`}
+        title={`在右侧预览 ${name}`}
         onClick={onPreview}
         onContextMenu={(event) => {
           event.preventDefault();
@@ -8983,7 +9016,6 @@ function Composer({
   const preDragComposerRangeRef = useRef<Range | null>(null);
   const imageAttachmentsRef = useRef(imageAttachments);
   const editorRef = useRef<HTMLDivElement>(null);
-  const imageFileInputRef = useRef<HTMLInputElement>(null);
   const contextFileInputRef = useRef<HTMLInputElement>(null);
   const savedComposerRangeRef = useRef<Range | null>(null);
   const contextMenuInsertionRangeRef = useRef<Range | null>(null);
@@ -9003,10 +9035,46 @@ function Composer({
   const isComposingRef = useRef(false);
   const lastLocallyPublishedValueRef = useRef<string | null>(null);
   const deferredExternalValueRef = useRef<{ value: string } | null>(null);
+  const pendingComposerPublishRef = useRef<string | null>(null);
+  const composerPublishFrameRef = useRef<number | null>(null);
+  const lastExternalComposerValueRef = useRef(value);
 
   useEffect(() => {
     imageAttachmentsRef.current = imageAttachments;
   }, [imageAttachments]);
+
+  function cancelPendingComposerPublish() {
+    if (composerPublishFrameRef.current !== null) {
+      window.cancelAnimationFrame(composerPublishFrameRef.current);
+      composerPublishFrameRef.current = null;
+    }
+    pendingComposerPublishRef.current = null;
+  }
+
+  function flushPendingComposerPublish() {
+    const nextText = pendingComposerPublishRef.current;
+    cancelPendingComposerPublish();
+    if (nextText !== null) onChange(nextText);
+  }
+
+  function scheduleComposerPublish(text: string) {
+    pendingComposerPublishRef.current = text;
+    if (composerPublishFrameRef.current !== null) return;
+    composerPublishFrameRef.current = window.requestAnimationFrame(() => {
+      composerPublishFrameRef.current = null;
+      const nextText = pendingComposerPublishRef.current;
+      pendingComposerPublishRef.current = null;
+      if (nextText === null) return;
+      onChange(nextText);
+    });
+  }
+
+  useEffect(
+    () => () => {
+      cancelPendingComposerPublish();
+    },
+    [],
+  );
 
   useEffect(
     () => () => {
@@ -9020,6 +9088,7 @@ function Composer({
   function applyExternalComposerValue(nextValue: string) {
     const editor = editorRef.current;
     if (!editor) return;
+    cancelPendingComposerPublish();
     deferredExternalValueRef.current = null;
     lastLocallyPublishedValueRef.current = null;
     const current = composerSnapshotAtSelection(editor);
@@ -9048,10 +9117,17 @@ function Composer({
   useLayoutEffect(() => {
     const compositionPending =
       isComposingRef.current || Boolean(compositionStartSnapshotRef.current);
+    const valueChangedSinceLastSync =
+      value !== lastExternalComposerValueRef.current;
+    lastExternalComposerValueRef.current = value;
     const action = composerExternalValueSyncAction({
       value,
       lastLocallyPublishedValue: lastLocallyPublishedValueRef.current,
       compositionPending,
+      pendingLocalPublish: pendingComposerPublishRef.current !== null,
+      lastExternalValue: valueChangedSinceLastSync
+        ? undefined
+        : lastExternalComposerValueRef.current,
     });
     if (action === "ignore") {
       deferredExternalValueRef.current = null;
@@ -9135,7 +9211,7 @@ function Composer({
     });
     setDraft(text);
     lastLocallyPublishedValueRef.current = text;
-    onChange(text);
+    scheduleComposerPublish(text);
   }
 
   function commitComposerMutation(
@@ -9318,6 +9394,7 @@ function Composer({
 
   const submitDraft = async () => {
     if (isSending) return;
+    flushPendingComposerPublish();
     const editor = editorRef.current;
     const parts = editor ? readComposerContentParts(editor) : [];
     const usedIds = referencedImageIds(parts);
@@ -9852,18 +9929,6 @@ function Composer({
           }}
         />
         <input
-          ref={imageFileInputRef}
-          hidden
-          type="file"
-          accept="image/*"
-          multiple
-          onChange={(event) => {
-            const files = Array.from(event.target.files ?? []);
-            event.target.value = "";
-            void addImageFiles(files);
-          }}
-        />
-        <input
           ref={contextFileInputRef}
           hidden
           type="file"
@@ -9998,16 +10063,6 @@ function Composer({
         </button>
         {openMenu === "actions" && (
           <div className="tool-popover composer-actions-popover" role="menu">
-            <button
-              role="menuitem"
-              onClick={() => {
-                imageFileInputRef.current?.click();
-                setOpenMenu(null);
-              }}
-            >
-              <ImagePlus size={14} aria-hidden="true" />
-              <span>图片</span>
-            </button>
             <div className="composer-actions-section-label">添加</div>
             <button
               role="menuitem"
@@ -10410,6 +10465,8 @@ function SideTaskConversation({
   onChangeSandboxMode,
   onOpenSettings,
   onOpenArtifact,
+  onOpenImagePreview,
+  onOpenPreview,
   onOpenMarkdownLink,
   onOpenToolTab,
   onOpenFileReview,
@@ -10430,6 +10487,12 @@ function SideTaskConversation({
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onOpenSettings(): void;
   onOpenArtifact(threadId: string, artifactId: string): void;
+  onOpenImagePreview(
+    threadId: string,
+    sourceId: string,
+    image: ImagePreviewSource,
+  ): void;
+  onOpenPreview(threadId: string, target: PreviewTarget, title: string): void;
   onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
   onOpenToolTab(kind: ToolTabKind): void;
   onOpenFileReview(path: string): void;
@@ -10916,6 +10979,16 @@ function SideTaskConversation({
           threadId={thread.id}
           artifacts={[]}
           onOpenArtifact={(artifactId) => onOpenArtifact(thread.id, artifactId)}
+          onOpenImagePreview={(sourceId, image) =>
+            onOpenImagePreview(thread.id, sourceId, image)
+          }
+          onOpenAttachmentPreview={(source) =>
+            onOpenPreview(
+              thread.id,
+              { type: "attachment", attachmentId: source.id },
+              source.name,
+            )
+          }
           onOpenMarkdownLink={onOpenMarkdownLink}
           onUndoTurn={(turnId) => void undoSideTaskTurn(turnId)}
           onReviewChanges={() => onOpenToolTab("diff")}
@@ -11076,6 +11149,8 @@ function RightPanel({
   onCloseTerminalSession,
   onCompactContext,
   onOpenArtifact,
+  onOpenImagePreview,
+  onOpenPreview,
   onOpenMarkdownLink,
   onRevertDiffFile,
   onApplyDiffHunk,
@@ -11166,6 +11241,12 @@ function RightPanel({
   onCloseTerminalSession(threadId: string, sessionId: string): void;
   onCompactContext(): void;
   onOpenArtifact(threadId: string, artifactId: string): void;
+  onOpenImagePreview(
+    threadId: string,
+    sourceId: string,
+    image: ImagePreviewSource,
+  ): void;
+  onOpenPreview(threadId: string, target: PreviewTarget, title: string): void;
   onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
   onRevertDiffFile(path: string): void;
   onApplyDiffHunk(
@@ -11316,6 +11397,8 @@ function RightPanel({
                 onChangeSandboxMode={onChangeSandboxMode}
                 onOpenSettings={onOpenSettings}
                 onOpenArtifact={onOpenArtifact}
+                onOpenImagePreview={onOpenImagePreview}
+                onOpenPreview={onOpenPreview}
                 onOpenMarkdownLink={onOpenMarkdownLink}
                 onOpenToolTab={onOpenToolTab}
                 onOpenFileReview={onOpenFileTab}
@@ -11342,6 +11425,8 @@ function RightPanel({
             ) : (
               <ConversationLoadingState />
             )
+          ) : activeToolTab.kind === "image" && activeToolTab.imagePreview ? (
+            <InlineImagePreview image={activeToolTab.imagePreview} />
           ) : activeToolTab.kind === "preview" &&
             activeToolTab.previewTarget ? (
             <PreviewHost
@@ -11352,6 +11437,7 @@ function RightPanel({
               onOpenMarkdownLink={onOpenMarkdownLink}
             />
           ) : (
+            activeToolTab.kind !== "image" &&
             activeToolTab.kind !== "preview" &&
             renderWorkbench("stage", activeToolTab.kind)
           )}
@@ -11384,6 +11470,9 @@ function RightPanel({
         onOpenTerminal={() => onOpenToolTab("terminal")}
         onOpenFiles={() => onOpenToolTab("files")}
         onOpenEnvironment={() => onOpenToolTab("sandbox")}
+        onOpenPreview={(target, title) => {
+          if (thread) onOpenPreview(thread.id, target, title);
+        }}
         onAddSource={onAddContextSources}
         onCancelSubagent={onCancelSubagent}
         onGitChanged={onRefreshWorkbench}
@@ -11397,7 +11486,7 @@ function ToolStageLauncher({
   onOpen,
 }: {
   canOpenFlow: boolean;
-  onOpen(kind: Exclude<ToolTabKind, "preview" | "side-task">): void;
+  onOpen(kind: Exclude<ToolTabKind, "image" | "preview" | "side-task">): void;
 }) {
   return (
     <div className="tool-stage-empty">
@@ -12208,7 +12297,7 @@ const toolTabMenuItems: Array<{
 ];
 
 const toolStageLauncherKinds: Array<{
-  kind: Exclude<ToolTabKind, "preview" | "side-task">;
+  kind: Exclude<ToolTabKind, "image" | "preview" | "side-task">;
   label: string;
 }> = [
   { kind: "flow", label: "Flow" },
@@ -12240,6 +12329,8 @@ function toolTabTitle(kind: ToolTabKind): string {
       return "使用日志";
     case "side-task":
       return "侧边任务";
+    case "image":
+      return "图片";
     case "preview":
       return "预览";
   }
@@ -12267,6 +12358,8 @@ function toolTabIcon(kind: ToolTabKind): typeof Folder {
       return Activity;
     case "side-task":
       return CirclePlus;
+    case "image":
+      return FileImage;
     case "preview":
       return FileCode2;
   }

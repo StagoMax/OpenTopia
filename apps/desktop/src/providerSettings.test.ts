@@ -70,10 +70,7 @@ test("exposes current OpenAI presets with official source links", () => {
     findOfficialModelPreset(" GPT-5.6-TERRA ")?.label,
     "GPT-5.6 Terra",
   );
-  assert.equal(
-    findOfficialModelPreset("gpt-5.4-pro")?.label,
-    "GPT-5.4 Pro",
-  );
+  assert.equal(findOfficialModelPreset("gpt-5.4-pro")?.label, "GPT-5.4 Pro");
   assert.equal(
     findOfficialModelPreset("gpt-5.3-codex")?.label,
     "GPT-5.3-Codex",
@@ -182,4 +179,28 @@ test("keeps Claude effort when its model supports Anthropic's effort parameter",
     resolveModelReasoningCapability("openai_responses", "gpt-4.1-mini").status,
     "unsupported",
   );
+});
+
+test("recognizes DeepSeek V4 dual-mode thinking controls", () => {
+  const flash = resolveModelReasoningCapability(
+    "openai_compatible",
+    "deepseek-v4-flash",
+  );
+  assert.equal(flash.status, "supported");
+  assert.equal(flash.thinkingToggle, true);
+  assert.equal(flash.defaultEffort, "high");
+  assert.deepEqual(flash.supportedEfforts, ["none", "high", "max"]);
+
+  const prefixed = resolveModelReasoningCapability(
+    "openai_compatible",
+    "deepseek/deepseek-v4-pro-20260801",
+  );
+  assert.equal(prefixed.thinkingToggle, true);
+  assert.deepEqual(prefixed.supportedEfforts, ["none", "high", "max"]);
+
+  const reasoner = resolveModelReasoningCapability(
+    "openai_compatible",
+    "deepseek-reasoner",
+  );
+  assert.deepEqual(reasoner.supportedEfforts, ["high", "max"]);
 });
