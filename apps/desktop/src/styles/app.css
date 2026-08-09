@@ -8880,7 +8880,16 @@ button:disabled {
 
 .spreadsheet-preview {
   display: grid;
-  grid-template-rows: 35px minmax(0, 1fr);
+  grid-template-rows: var(--control-height-lg) minmax(0, 1fr);
+}
+
+.spreadsheet-glide-grid {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--surface);
 }
 
 .spreadsheet-sheet-tabs {
@@ -8895,15 +8904,15 @@ button:disabled {
 .spreadsheet-sheet-tabs button {
   display: flex;
   align-items: center;
-  gap: 5px;
-  min-width: 72px;
-  max-width: 180px;
+  gap: var(--space-2);
+  min-width: calc(var(--space-12) * 3);
+  max-width: calc(var(--space-16) * 5);
   border: 0;
   border-right: 1px solid var(--border);
   background: transparent;
   color: var(--text-secondary);
-  padding: 0 10px;
-  font-size: 11px;
+  padding: 0 var(--space-5);
+  font-size: var(--font-size-xs);
 }
 
 .spreadsheet-sheet-tabs button span {
@@ -8913,105 +8922,28 @@ button:disabled {
 }
 
 .spreadsheet-sheet-tabs button.active {
-  border-bottom: 2px solid var(--border);
+  border-bottom: var(--space-1) solid var(--border);
   background: var(--surface);
   color: var(--text);
 }
 
-.spreadsheet-viewport {
-  position: relative;
-  min-width: 0;
-  min-height: 0;
-  overflow: auto;
-  outline: none;
-  background: var(--surface);
-}
-
-.spreadsheet-viewport:focus-visible {
-  box-shadow: inset 0 0 0 2px var(--ring, #2563eb);
-}
-
-.spreadsheet-canvas {
-  position: relative;
-  min-width: 100%;
-  min-height: 100%;
-}
-
-.spreadsheet-corner,
-.spreadsheet-column-header,
-.spreadsheet-row-header,
-.spreadsheet-cell {
-  position: absolute;
-  box-sizing: border-box;
-  border-right: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  font-size: 11px;
-}
-
-.spreadsheet-corner {
-  z-index: 4;
-  top: 0;
-  left: 0;
-  width: 48px;
-  height: 27px;
-  background: var(--surface-subtle);
-}
-
-.spreadsheet-column-header {
-  z-index: 3;
-  top: 0;
-  width: 120px;
-  height: 27px;
-  background: var(--surface-subtle);
-  color: var(--text-secondary);
-  line-height: 27px;
-  text-align: center;
-}
-
-.spreadsheet-row-header {
-  z-index: 2;
-  left: 0;
-  width: 48px;
-  height: 25px;
-  background: var(--surface-subtle);
-  color: var(--text-secondary);
-  line-height: 25px;
-  text-align: center;
-}
-
-.spreadsheet-cell {
-  width: 120px;
-  height: 25px;
-  overflow: hidden;
-  background: var(--surface);
-  color: var(--text);
-  padding: 4px 6px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.spreadsheet-loading,
 .spreadsheet-error {
-  position: sticky;
-  z-index: 5;
-  left: 12px;
-  bottom: 12px;
+  position: absolute;
+  z-index: var(--z-sticky);
+  left: var(--space-6);
+  bottom: var(--space-6);
   display: flex;
   width: max-content;
-  max-width: calc(100% - 24px);
+  max-width: calc(100% - var(--space-12));
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   border: 1px solid var(--border-strong);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--surface);
-  box-shadow: 0 2px 8px rgb(31 39 31 / 12%);
-  color: var(--text-secondary);
-  padding: 6px 8px;
-  font-size: 11px;
-}
-
-.spreadsheet-error {
+  box-shadow: var(--shadow-float);
   color: var(--danger);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--font-size-sm);
 }
 
 .web-preview-toolbar {

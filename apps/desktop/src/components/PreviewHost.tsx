@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ExternalLink,
@@ -7,7 +7,6 @@ import {
   Minus,
   Plus,
   RefreshCw,
-  Sheet,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -18,12 +17,15 @@ import type {
   InlineImageAttachment,
   PreviewDescriptor,
   PreviewTarget,
-  SpreadsheetPreview,
-  SpreadsheetPreviewCell,
-  SpreadsheetPreviewRange,
 } from "../types";
 import { detectLanguage, MonacoEditor } from "./MonacoEditor";
 import { MarkdownContent } from "./MarkdownContent";
+
+const GlideSpreadsheetGrid = lazy(() =>
+  import("./SpreadsheetGrid").then(({ SpreadsheetGrid }) => ({
+    default: SpreadsheetGrid,
+  })),
+);
 
 type LoadState<T> =
   | { status: "loading" }
@@ -185,7 +187,13 @@ function PreviewRenderer({
     case "pdf":
       return <PdfPreview client={client} descriptor={descriptor} />;
     case "spreadsheet":
-      return <SpreadsheetGrid client={client} descriptor={descriptor} />;
+      return (
+        <Suspense
+          fallback={<PreviewStatus icon="loading" title="Loading workbook" />}
+        >
+          <GlideSpreadsheetGrid client={client} descriptor={descriptor} />
+        </Suspense>
+      );
     case "unsupported":
       return <UnsupportedPreview descriptor={descriptor} />;
     case "web":
@@ -556,308 +564,6 @@ function PdfPreview({
   );
 }
 
-const sheetRowHeight = 25;
-const sheetColumnWidth = 120;
-const sheetRowHeaderWidth = 48;
-const sheetColumnHeaderHeight = 27;
-const sheetChunkRows = 100;
-const sheetChunkColumns = 20;
-
-function SpreadsheetGrid({
-  client,
-  descriptor,
-}: {
-  client: ApiClient;
-  descriptor: PreviewDescriptor;
-}) {
-  const viewportRef = useRef<HTMLDivElement>(null);
-  const [book, setBook] = useState<LoadState<SpreadsheetPreview>>({
-    status: "loading",
-  });
-  const [activeSheetId, setActiveSheetId] = useState<string | null>(null);
-  const [range, setRange] = useState<LoadState<SpreadsheetPreviewRange>>({
-    status: "loading",
-  });
-  const [windowStart, setWindowStart] = useState({ row: 0, column: 0 });
-
-  useEffect(() => {
-    let disposed = false;
-    setBook({ status: "loading" });
-    void client
-      .getSpreadsheetPreview(descriptor.threadId, descriptor.id)
-      .then((value) => {
-        if (disposed) return;
-        setBook({ status: "ready", value });
-        setActiveSheetId(value.sheets[0]?.id ?? null);
-      })
-      .catch((cause) => {
-        if (!disposed)
-          setBook({ status: "error", message: errorMessage(cause) });
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [client, descriptor.id]);
-
-  useEffect(() => {
-    let disposed = false;
-    if (!activeSheetId) return;
-    setRange({ status: "loading" });
-    void client
-      .getSpreadsheetPreviewRange(
-        descriptor.threadId,
-        descriptor.id,
-        activeSheetId,
-        {
-          rowStart: windowStart.row,
-          rowCount: sheetChunkRows,
-          columnStart: windowStart.column,
-          columnCount: sheetChunkColumns,
-        },
-      )
-      .then((value) => {
-        if (!disposed) setRange({ status: "ready", value });
-      })
-      .catch((cause) => {
-        if (!disposed)
-          setRange({ status: "error", message: errorMessage(cause) });
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [
-    activeSheetId,
-    client,
-    descriptor.id,
-    windowStart.column,
-    windowStart.row,
-  ]);
-
-  const activeSheet =
-    book.status === "ready"
-      ? (book.value.sheets.find((sheet) => sheet.id === activeSheetId) ?? null)
-      : null;
-  const cells = useMemo(() => {
-    const next = new Map<string, SpreadsheetPreviewCell>();
-    if (range.status === "ready") {
-      for (const cell of range.value.cells)
-        next.set(`${cell.row}:${cell.column}`, cell);
-    }
-    return next;
-  }, [range]);
-
-  const updateVisibleWindow = useCallback((element: HTMLDivElement) => {
-    const row = Math.max(
-      0,
-      Math.floor(
-        (element.scrollTop - sheetColumnHeaderHeight) / sheetRowHeight,
-      ),
-    );
-    const column = Math.max(
-      0,
-      Math.floor((element.scrollLeft - sheetRowHeaderWidth) / sheetColumnWidth),
-    );
-    const nextRow = Math.floor(row / sheetChunkRows) * sheetChunkRows;
-    const nextColumn =
-      Math.floor(column / sheetChunkColumns) * sheetChunkColumns;
-    setWindowStart((current) => {
-      if (current.row === nextRow && current.column === nextColumn)
-        return current;
-      return { row: nextRow, column: nextColumn };
-    });
-  }, []);
-
-  if (book.status === "loading")
-    return <PreviewStatus icon="loading" title="Loading workbook" />;
-  if (book.status === "error") {
-    return (
-      <PreviewStatus
-        icon="error"
-        title="Could not read workbook"
-        detail={book.message}
-      />
-    );
-  }
-  if (!book.value.sheets.length || !activeSheet) {
-    return (
-      <PreviewStatus
-        icon="empty"
-        title="This workbook has no visible sheets."
-      />
-    );
-  }
-
-  const firstRow =
-    range.status === "ready" ? range.value.rowStart : windowStart.row;
-  const firstColumn =
-    range.status === "ready" ? range.value.columnStart : windowStart.column;
-  const rowCount = Math.min(
-    sheetChunkRows,
-    Math.max(0, activeSheet.rowCount - firstRow),
-  );
-  const columnCount = Math.min(
-    sheetChunkColumns,
-    Math.max(0, activeSheet.columnCount - firstColumn),
-  );
-
-  return (
-    <div className="spreadsheet-preview">
-      <div
-        className="spreadsheet-sheet-tabs"
-        role="tablist"
-        aria-label="Workbook sheets"
-      >
-        {book.value.sheets.map((sheet) => (
-          <button
-            key={sheet.id}
-            className={sheet.id === activeSheet.id ? "active" : ""}
-            type="button"
-            role="tab"
-            aria-selected={sheet.id === activeSheet.id}
-            title={sheet.name}
-            onClick={() => {
-              setActiveSheetId(sheet.id);
-              setWindowStart({ row: 0, column: 0 });
-              viewportRef.current?.scrollTo(0, 0);
-            }}
-          >
-            <Sheet size={13} />
-            <span>{sheet.name}</span>
-          </button>
-        ))}
-      </div>
-      <div
-        ref={viewportRef}
-        className="spreadsheet-viewport"
-        role="grid"
-        aria-label={`${descriptor.title}, ${activeSheet.name}`}
-        aria-rowcount={activeSheet.rowCount}
-        aria-colcount={activeSheet.columnCount}
-        tabIndex={0}
-        onScroll={(event) => updateVisibleWindow(event.currentTarget)}
-        onKeyDown={(event) => {
-          const step = event.shiftKey ? 5 : 1;
-          if (event.key === "ArrowDown")
-            event.currentTarget.scrollBy(0, sheetRowHeight * step);
-          else if (event.key === "ArrowUp")
-            event.currentTarget.scrollBy(0, -sheetRowHeight * step);
-          else if (event.key === "ArrowRight")
-            event.currentTarget.scrollBy(sheetColumnWidth * step, 0);
-          else if (event.key === "ArrowLeft")
-            event.currentTarget.scrollBy(-sheetColumnWidth * step, 0);
-          else return;
-          event.preventDefault();
-        }}
-      >
-        <div
-          className="spreadsheet-canvas"
-          style={{
-            width: `${sheetRowHeaderWidth + Math.max(1, activeSheet.columnCount) * sheetColumnWidth}px`,
-            height: `${sheetColumnHeaderHeight + Math.max(1, activeSheet.rowCount) * sheetRowHeight}px`,
-          }}
-        >
-          <div
-            role="presentation"
-            style={{
-              position: "sticky",
-              zIndex: 3,
-              top: 0,
-              width: "100%",
-              height: `${sheetColumnHeaderHeight}px`,
-            }}
-          >
-            <div
-              className="spreadsheet-corner"
-              role="presentation"
-              style={{
-                position: "sticky",
-                left: 0,
-              }}
-            />
-            {Array.from(
-              { length: columnCount },
-              (_, offset) => firstColumn + offset,
-            ).map((column) => (
-              <div
-                className="spreadsheet-column-header"
-                key={`column-${column}`}
-                role="columnheader"
-                style={{
-                  left: `${sheetRowHeaderWidth + column * sheetColumnWidth}px`,
-                }}
-              >
-                {columnLabel(column)}
-              </div>
-            ))}
-          </div>
-          <div
-            role="presentation"
-            style={{
-              position: "sticky",
-              zIndex: 2,
-              left: 0,
-              width: `${sheetRowHeaderWidth}px`,
-              height: `${Math.max(1, activeSheet.rowCount) * sheetRowHeight}px`,
-            }}
-          >
-            {Array.from(
-              { length: rowCount },
-              (_, offset) => firstRow + offset,
-            ).map((row) => (
-              <div
-                className="spreadsheet-row-header"
-                key={`row-${row}`}
-                role="rowheader"
-                style={{ top: `${row * sheetRowHeight}px` }}
-              >
-                {row + 1}
-              </div>
-            ))}
-          </div>
-          {Array.from(
-            { length: rowCount },
-            (_, rowOffset) => firstRow + rowOffset,
-          ).flatMap((row) =>
-            Array.from(
-              { length: columnCount },
-              (_, columnOffset) => firstColumn + columnOffset,
-            ).map((column) => {
-              const cell = cells.get(`${row}:${column}`);
-              const text = formatCell(cell);
-              return (
-                <div
-                  className="spreadsheet-cell"
-                  key={`${row}:${column}`}
-                  role="gridcell"
-                  aria-rowindex={row + 1}
-                  aria-colindex={column + 1}
-                  title={cell?.formula ? `${cell.formula}\n${text}` : text}
-                  style={{
-                    left: `${sheetRowHeaderWidth + column * sheetColumnWidth}px`,
-                    top: `${sheetColumnHeaderHeight + row * sheetRowHeight}px`,
-                  }}
-                >
-                  {text}
-                </div>
-              );
-            }),
-          )}
-        </div>
-        {range.status === "loading" && (
-          <div className="spreadsheet-loading" aria-live="polite">
-            <Loader2 className="spin" size={14} /> Loading cells
-          </div>
-        )}
-        {range.status === "error" && (
-          <div className="spreadsheet-error" role="alert">
-            {range.message}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function UnsupportedPreview({ descriptor }: { descriptor: PreviewDescriptor }) {
   return (
     <div className="unsupported-preview">
@@ -954,24 +660,6 @@ function useObjectUrl(blob: Blob | null): string | null {
     return () => URL.revokeObjectURL(next);
   }, [blob]);
   return url;
-}
-
-function formatCell(cell: SpreadsheetPreviewCell | undefined): string {
-  if (!cell) return "";
-  if (cell.formatted != null) return cell.formatted;
-  if (cell.value == null) return "";
-  return String(cell.value);
-}
-
-function columnLabel(index: number): string {
-  let value = index + 1;
-  let label = "";
-  while (value > 0) {
-    value -= 1;
-    label = String.fromCharCode(65 + (value % 26)) + label;
-    value = Math.floor(value / 26);
-  }
-  return label;
 }
 
 function formatBytes(bytes: number): string {

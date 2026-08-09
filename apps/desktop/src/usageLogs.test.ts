@@ -171,8 +171,164 @@ test("aggregates API token, prompt cache, latency, retry, and tool metrics", () 
   assert.equal(result.summary.cacheReadRatio, 0.6);
   assert.equal(result.summary.averageLatencyMs, 1_000);
   assert.equal(result.summary.retryRate, 1);
+  assert.equal(result.summary.estimatedRetryInputTokens, 900);
+  assert.equal(result.summary.estimateErrorP95, 0.1);
+  assert.equal(result.summary.providerUsageCoverage, 1);
+  assert.equal(result.summary.tokensPerSuccessfulTask, 1_250);
   assert.equal(result.summary.toolCallCount, 1);
   assert.equal(result.summary.averageToolDurationMs, 300);
+});
+
+test("correlates usage by request id and attributes token modules and waste signals", () => {
+  const breakdown = {
+    baseInstructions: 40,
+    developerInstructions: 0,
+    repositoryInstructions: 0,
+    runtimeContext: 0,
+    skillInstructions: 0,
+    summaries: 0,
+    checkpoints: 0,
+    conversation: 0,
+    currentUser: 10,
+    toolCalls: 0,
+    toolResults: 0,
+    toolSchemas: 50,
+    providerState: 0,
+    other: 0,
+    total: 100,
+  };
+  const plan = {
+    planRevision: 1,
+    goalId: "goal-1",
+    steps: [
+      {
+        id: "step-1",
+        title: "Inspect",
+        status: "in_progress" as const,
+        dependencies: [],
+        acceptanceCriteria: [],
+        evidence: [],
+      },
+    ],
+  };
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "model_context_built",
+      request_id: "agent-request",
+      round: 1,
+      purpose: "agent_round",
+      context_hash: "agent-context",
+      token_estimate: 100,
+      token_breakdown: breakdown,
+    }),
+    event(2, "2026-08-05T00:00:00.010Z", {
+      type: "provider_request_sent",
+      request_id: "agent-request",
+      round: 1,
+      attempt: 1,
+      adapter: "responses",
+      method: "POST",
+      endpoint: "/responses",
+    }),
+    event(3, "2026-08-05T00:00:00.020Z", {
+      type: "model_context_built",
+      request_id: "compaction-request",
+      round: 0,
+      purpose: "context_compaction",
+      context_hash: "compaction-context",
+      token_estimate: 200,
+      token_breakdown: {
+        ...breakdown,
+        baseInstructions: 0,
+        currentUser: 200,
+        toolSchemas: 0,
+        total: 200,
+      },
+    }),
+    event(4, "2026-08-05T00:00:00.030Z", {
+      type: "provider_request_sent",
+      request_id: "compaction-request",
+      round: 0,
+      attempt: 1,
+      adapter: "responses",
+      method: "POST",
+      endpoint: "/responses",
+    }),
+    event(5, "2026-08-05T00:00:00.040Z", {
+      type: "token_usage",
+      request_id: "agent-request",
+      round: 1,
+      purpose: "agent_round",
+      input_tokens: 110,
+      output_tokens: 10,
+      total_tokens: 120,
+      local_input_estimate: 100,
+      input_breakdown: breakdown,
+    }),
+    event(6, "2026-08-05T00:00:00.050Z", {
+      type: "token_usage",
+      request_id: "compaction-request",
+      round: 0,
+      purpose: "context_compaction",
+      input_tokens: 220,
+      output_tokens: 10,
+      total_tokens: 230,
+      local_input_estimate: 200,
+    }),
+    event(7, "2026-08-05T00:00:00.060Z", {
+      type: "provider_request_retried",
+      request_id: "agent-request",
+      round: 1,
+      attempt: 2,
+      reason: "stored response cursor unavailable; replay fallback",
+    }),
+    event(8, "2026-08-05T00:00:00.070Z", {
+      type: "context_warning",
+      stage: "invalid_tool_call_circuit_breaker",
+      message: "stopped",
+    }),
+    event(9, "2026-08-05T00:00:00.080Z", {
+      type: "context_warning",
+      stage: "finalization_guard",
+      message: "deferred",
+    }),
+    event(10, "2026-08-05T00:00:00.090Z", {
+      type: "context_warning",
+      stage: "step_reminder.repeated_tool_calls",
+      message: "stalled",
+    }),
+    event(11, "2026-08-05T00:00:00.100Z", {
+      type: "plan_updated",
+      plan,
+    }),
+    event(12, "2026-08-05T00:00:00.110Z", {
+      type: "plan_updated",
+      plan,
+    }),
+    event(13, "2026-08-05T00:00:00.120Z", {
+      type: "turn_finished",
+      summary: "done",
+    }),
+  ]);
+
+  assert.equal(
+    result.calls.find((call) => call.id === "agent-request")?.inputTokens,
+    110,
+  );
+  assert.equal(
+    result.calls.find((call) => call.id === "compaction-request")?.inputTokens,
+    220,
+  );
+  assert.equal(result.summary.tokenBreakdown.total, 300);
+  assert.equal(result.summary.compactionTokens, 230);
+  assert.equal(result.summary.estimatedRetryInputTokens, 100);
+  assert.equal(result.summary.compatibilityRetryCount, 1);
+  assert.equal(result.summary.invalidToolLoopCount, 1);
+  assert.equal(result.summary.finalizationGuardRejectCount, 1);
+  assert.equal(result.summary.noProgressSignalCount, 1);
+  assert.equal(result.summary.duplicatePlanCount, 1);
+  assert.equal(result.summary.tokensPerSuccessfulTask, 350);
+  assert.equal(result.summary.providerUsageCoverage, 1);
 });
 
 test("marks an unfinished provider request as failed when its turn errors", () => {

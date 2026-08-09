@@ -1041,10 +1041,25 @@ export type ContextStatus = {
   latestSummary?: ContextSummary | null;
   usage: {
     modelRequests: number;
+    agentModelRequests: number;
+    compactionModelRequests: number;
+    auxiliaryModelRequests: number;
+    providerResponses: number;
+    providerUsageCoverage?: number | null;
     inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    uncachedInputTokens: number;
     cachedInputTokens: number;
     cacheWriteTokens: number;
     reasoningTokens: number;
+    localInputEstimate: number;
+    rawInputEstimate: number;
+    estimateCalibrationFactor?: number | null;
+    estimateErrorMean?: number | null;
+    estimateErrorP95?: number | null;
+    rawEstimateErrorMean?: number | null;
+    rawEstimateErrorP95?: number | null;
     compactions: number;
     nativeCompactions: number;
     providerFallbacks: number;
@@ -2137,6 +2152,31 @@ export type ModelContextItem = {
   metadata?: unknown;
 };
 
+export type ModelCallPurpose =
+  | "agent_round"
+  | "context_compaction"
+  | "guardian_review"
+  | "title_generation"
+  | "other";
+
+export type TokenEstimateBreakdown = {
+  baseInstructions: number;
+  developerInstructions: number;
+  repositoryInstructions: number;
+  runtimeContext: number;
+  skillInstructions: number;
+  summaries: number;
+  checkpoints: number;
+  conversation: number;
+  currentUser: number;
+  toolCalls: number;
+  toolResults: number;
+  toolSchemas: number;
+  providerState: number;
+  other: number;
+  total: number;
+};
+
 export type ThreadContextSnapshot = {
   capturedAt: string;
   providerId: string;
@@ -2226,6 +2266,8 @@ export type AgentEventPayload =
       round: number;
       context_hash: string;
       token_estimate: number;
+      purpose?: ModelCallPurpose;
+      token_breakdown?: TokenEstimateBreakdown | null;
       items?: ModelContextItem[];
     }
   | {
@@ -2350,12 +2392,17 @@ export type AgentEventPayload =
   | { type: "context_warning"; stage: string; message: string }
   | {
       type: "token_usage";
+      request_id?: string | null;
+      round?: number | null;
+      purpose?: ModelCallPurpose;
       input_tokens: number;
       output_tokens: number;
       total_tokens: number;
       cached_input_tokens?: number | null;
       cache_write_tokens?: number | null;
       reasoning_tokens?: number | null;
+      local_input_estimate?: number | null;
+      input_breakdown?: TokenEstimateBreakdown | null;
     }
   | { type: "turn_finished"; summary: string }
   | { type: "turn_suspended"; approval_id: string; reason: string }

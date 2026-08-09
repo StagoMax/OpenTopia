@@ -1373,6 +1373,7 @@ export class ApiClient {
       columnStart: number;
       columnCount: number;
     },
+    signal?: AbortSignal,
   ): Promise<SpreadsheetPreviewRange> {
     const response = await this.get<SpreadsheetRangeResponse>(
       `/api/threads/${threadId}/previews/${encodeURIComponent(previewId)}/range${queryString(
@@ -1384,6 +1385,7 @@ export class ApiClient {
           columnCount: input.columnCount,
         },
       )}`,
+      signal,
     );
     const cells = response.rows.flatMap((row, rowOffset) =>
       row.map((cell, columnOffset) => ({

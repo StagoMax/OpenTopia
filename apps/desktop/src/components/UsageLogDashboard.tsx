@@ -49,12 +49,12 @@ export function UsageLogDashboard({
           <MetricCard
             label="总 Tokens"
             value={formatInteger(data.summary.totalTokens)}
-            detail={`${formatInteger(data.summary.averageTokensPerRequest)} / 请求`}
+            detail={`${formatInteger(data.summary.tokensPerSuccessfulTask)} / 成功任务`}
           />
           <MetricCard
             label="输入 Tokens"
             value={formatInteger(data.summary.inputTokens)}
-            detail={cacheReadDetail(data.summary)}
+            detail={`${formatInteger(data.summary.uncachedInputTokens)} 未缓存`}
           />
           <MetricCard
             label="输出 Tokens"
@@ -69,7 +69,7 @@ export function UsageLogDashboard({
           <MetricCard
             label="API 请求"
             value={formatInteger(data.summary.requestCount)}
-            detail={`${formatInteger(data.summary.turnCount)} 个回合`}
+            detail={`${formatPercent(data.summary.providerUsageCoverage)} usage 覆盖`}
           />
           <MetricCard
             label="平均端到端延迟"
@@ -89,6 +89,22 @@ export function UsageLogDashboard({
                 ],
                 ["重试次数", formatInteger(data.summary.retryCount)],
                 ["重试率", formatPercent(data.summary.retryRate)],
+                [
+                  "供应商 usage 覆盖",
+                  `${formatInteger(data.summary.providerUsageReportedRequestCount)} / ${formatInteger(data.summary.successfulRequestCount)} 成功请求`,
+                ],
+                [
+                  "校准后估算误差 P95",
+                  formatPercent(data.summary.estimateErrorP95),
+                ],
+                [
+                  "原始估算误差 P95",
+                  formatPercent(data.summary.rawEstimateErrorP95),
+                ],
+                [
+                  "当前校准系数",
+                  formatFactor(data.summary.estimateCalibrationFactor),
+                ],
                 ["错误事件", formatInteger(data.summary.errorEventCount)],
                 ["失败请求", formatInteger(data.summary.failedRequestCount)],
               ]}
@@ -117,6 +133,10 @@ export function UsageLogDashboard({
                 ["推理 Tokens", formatInteger(data.summary.reasoningTokens)],
                 ["可见输出 Tokens", formatInteger(visibleOutput(data.summary))],
                 ["缓存字段覆盖", cacheCoverageLabel(data.calls)],
+                [
+                  "未缓存 Tokens / 成功任务",
+                  formatInteger(data.summary.uncachedTokensPerSuccessfulTask),
+                ],
               ]}
             />
           </Panel>
@@ -134,11 +154,63 @@ export function UsageLogDashboard({
                   formatInteger(data.summary.successfulRequestCount),
                 ],
                 ["运行中请求", formatInteger(data.summary.runningRequestCount)],
+                ["成功任务", formatInteger(data.summary.successfulTurnCount)],
+                ["失败任务", formatInteger(data.summary.failedTurnCount)],
                 ["模型", distinctModels(data.calls)],
               ]}
             />
           </Panel>
         </div>
+
+        <Panel
+          className="usage-token-breakdown-panel"
+          title="输入 Token 瀑布（本地估算）"
+          actions={
+            <Badge variant="neutral">
+              {formatInteger(data.summary.tokenBreakdown.total)} Tokens
+            </Badge>
+          }
+        >
+          <p className="usage-token-breakdown-help">
+            按请求实际组装的上下文模块归因；模块合计是原始估算，后续轮次会用同一任务中
+            Provider 已返回 usage 的中位数校准调用前预算。两者都不替代实际
+            usage。
+          </p>
+          <TokenBreakdownTable summary={data.summary} />
+        </Panel>
+
+        <Panel className="usage-waste-panel" title="可归因浪费与附加成本">
+          <MetricList
+            items={[
+              [
+                "重试输入风险（估算）",
+                `${formatInteger(data.summary.estimatedRetryInputTokens)} Tokens`,
+              ],
+              [
+                "Provider 兼容回退",
+                formatInteger(data.summary.compatibilityRetryCount),
+              ],
+              [
+                "无效工具循环中止",
+                formatInteger(data.summary.invalidToolLoopCount),
+              ],
+              [
+                "终态守卫驳回",
+                formatInteger(data.summary.finalizationGuardRejectCount),
+              ],
+              [
+                "无进展重复调用信号",
+                formatInteger(data.summary.noProgressSignalCount),
+              ],
+              ["完全重复计划", formatInteger(data.summary.duplicatePlanCount)],
+              [
+                "上下文压缩调用",
+                `${formatInteger(data.summary.compactionRequestCount)} 次 · ${formatInteger(data.summary.compactionTokens)} Tokens`,
+              ],
+              ["成本 / 成功任务", "—（需 Provider 账单）"],
+            ]}
+          />
+        </Panel>
 
         <Panel
           className="usage-cache-break-panel"
@@ -205,6 +277,9 @@ export function UsageLogDashboard({
                       输入 / 输出
                     </th>
                     <th scope="col" className="usage-number-cell">
+                      本地估算 / 误差
+                    </th>
+                    <th scope="col" className="usage-number-cell">
                       缓存读取
                     </th>
                     <th scope="col" className="usage-number-cell">
@@ -233,7 +308,9 @@ export function UsageLogDashboard({
           Token 与缓存字段来自模型 API 的
           usage；TTFT、端到端延迟、工具耗时和重试由 OpenTopia
           事件时间计算。Prompt Cache 读取率 = cached input tokens / input
-          tokens。托管 API 不提供 GPU 利用率、KV block
+          tokens。缓存读取没有从逻辑 Token
+          中扣除；重试输入风险和模块瀑布均为本地估算。 成本字段在没有 Provider
+          账单或带版本价格表时保持为空。托管 API 不提供 GPU 利用率、KV block
           占用/逐出或服务端真实排队时间。缓存断点位置是 harness
           根据相邻请求前缀推断的；无法区分缓存过期、服务端逐出或路由漂移时会明确标为低置信。
         </p>
@@ -433,6 +510,75 @@ function MetricList({ items }: { items: Array<[string, string]> }) {
   );
 }
 
+function TokenBreakdownTable({ summary }: { summary: UsageSummary }) {
+  const breakdown = summary.tokenBreakdown;
+  const allRows: Array<[string, number]> = [
+    ["基础指令", breakdown.baseInstructions],
+    ["开发者指令", breakdown.developerInstructions],
+    ["仓库指令", breakdown.repositoryInstructions],
+    ["运行时环境", breakdown.runtimeContext],
+    ["Skills", breakdown.skillInstructions],
+    ["上下文摘要", breakdown.summaries],
+    ["检查点", breakdown.checkpoints],
+    ["会话历史", breakdown.conversation],
+    ["当前用户输入", breakdown.currentUser],
+    ["工具调用", breakdown.toolCalls],
+    ["工具结果", breakdown.toolResults],
+    ["工具 / 输出 Schema", breakdown.toolSchemas],
+    ["Provider 状态对象", breakdown.providerState],
+    ["其他", breakdown.other],
+  ];
+  const rows = allRows.filter(([, tokens]) => tokens > 0);
+
+  if (rows.length === 0) {
+    return (
+      <div className="usage-table-state">
+        <span>新请求完成后会记录可审计的模块级 Token 构成。</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="usage-table-wrap">
+      <table className="usage-token-breakdown-table">
+        <thead>
+          <tr>
+            <th scope="col">输入模块</th>
+            <th scope="col" className="usage-number-cell">
+              估算 Tokens
+            </th>
+            <th scope="col" className="usage-number-cell">
+              占比
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([label, tokens]) => (
+            <tr key={label}>
+              <th scope="row">{label}</th>
+              <td className="usage-number-cell">{formatInteger(tokens)}</td>
+              <td className="usage-number-cell">
+                {formatPercent(
+                  breakdown.total > 0 ? tokens / breakdown.total : null,
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr>
+            <th scope="row">合计</th>
+            <td className="usage-number-cell">
+              {formatInteger(breakdown.total)}
+            </td>
+            <td className="usage-number-cell">100%</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  );
+}
+
 function UsageCallRow({ call }: { call: UsageCall }) {
   const cacheRatio =
     call.inputTokens > 0 ? call.cachedInputTokens / call.inputTokens : null;
@@ -446,13 +592,17 @@ function UsageCallRow({ call }: { call: UsageCall }) {
           {call.model ?? call.adapter}
         </span>
         <small>
-          Round {call.round}
+          {callPurposeLabel(call.purpose)} · Round {call.round}
           {call.providerId ? ` · ${call.providerId}` : ""}
         </small>
       </td>
       <td className="usage-number-cell">{formatInteger(call.totalTokens)}</td>
       <td className="usage-number-cell">
         {formatInteger(call.inputTokens)} / {formatInteger(call.outputTokens)}
+      </td>
+      <td className="usage-number-cell">
+        {formatInteger(call.contextTokenEstimate)}
+        <small>{formatPercent(call.estimateErrorRatio)}</small>
       </td>
       <td className="usage-number-cell">
         {call.cacheReadTokensReported
@@ -473,6 +623,17 @@ function UsageCallRow({ call }: { call: UsageCall }) {
       </td>
     </tr>
   );
+}
+
+function callPurposeLabel(purpose: UsageCall["purpose"]): string {
+  const labels: Record<UsageCall["purpose"], string> = {
+    agent_round: "Agent",
+    context_compaction: "上下文压缩",
+    guardian_review: "Guardian",
+    title_generation: "标题生成",
+    other: "其他",
+  };
+  return labels[purpose];
 }
 
 function statusBadgeVariant(call: UsageCall): BadgeVariant {
@@ -504,12 +665,6 @@ function cacheCoverageLabel(calls: UsageCall[]): string {
     (call) => call.cacheReadTokensReported || call.cacheWriteTokensReported,
   ).length;
   return `${formatInteger(reported)} / ${formatInteger(calls.length)} 请求`;
-}
-
-function cacheReadDetail(summary: UsageSummary): string {
-  return summary.cacheReadReportedRequestCount > 0
-    ? `${formatInteger(summary.cachedInputTokens)} 命中缓存`
-    : "缓存读取字段未返回";
 }
 
 function cacheWriteDetail(summary: UsageSummary): string {
@@ -549,6 +704,11 @@ function formatDuration(value: number | null): string {
 function formatRate(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return "—";
   return `${value.toFixed(1)} tok/s`;
+}
+
+function formatFactor(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "—";
+  return `×${value.toFixed(2)}`;
 }
 
 function formatDateTime(value: string): string {

@@ -146,6 +146,61 @@
   margin-top: var(--space-4);
 }
 
+.usage-token-breakdown-panel,
+.usage-waste-panel {
+  margin-top: var(--space-4);
+}
+
+.usage-token-breakdown-panel .ot-panel__body {
+  padding: 0;
+}
+
+.usage-token-breakdown-help {
+  margin: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+  padding: var(--space-3) var(--space-4);
+}
+
+.usage-token-breakdown-table {
+  width: 100%;
+  min-width: calc(var(--space-16) * 6);
+  border-collapse: collapse;
+  font-size: var(--font-size-xs);
+}
+
+.usage-token-breakdown-table th,
+.usage-token-breakdown-table td {
+  border-bottom: 1px solid var(--border-subtle);
+  padding: var(--space-3) var(--space-4);
+  text-align: left;
+}
+
+.usage-token-breakdown-table thead th {
+  background: var(--surface-chrome);
+  color: var(--text-muted);
+  font-weight: var(--font-weight-medium);
+}
+
+.usage-token-breakdown-table tbody th {
+  color: var(--text-secondary);
+  font-weight: var(--font-weight-normal);
+}
+
+.usage-token-breakdown-table tfoot th,
+.usage-token-breakdown-table tfoot td {
+  border-bottom: 0;
+  color: var(--text);
+  font-weight: var(--font-weight-semibold);
+}
+
+.usage-token-breakdown-table .usage-number-cell {
+  font-family: var(--font-mono);
+  text-align: right;
+}
+
 .usage-cache-break-panel {
   margin-top: var(--space-4);
 }

@@ -1,8 +1,10 @@
 import type {
   AgentEvent,
+  ModelCallPurpose,
   ModelContextItem,
   ModelRequestSnapshot,
   ThreadModelSelection,
+  TokenEstimateBreakdown,
 } from "./types";
 
 export type UsageCallStatus = "running" | "succeeded" | "failed";
@@ -55,6 +57,7 @@ export type UsageCall = {
   id: string;
   turnId: string | null;
   round: number;
+  purpose: ModelCallPurpose;
   providerId: string | null;
   model: string | null;
   adapter: string;
@@ -67,7 +70,13 @@ export type UsageCall = {
   status: UsageCallStatus;
   attemptCount: number;
   retryCount: number;
+  retryReasons: string[];
   contextTokenEstimate: number | null;
+  inputBreakdown: TokenEstimateBreakdown | null;
+  rawEstimateErrorRatio: number | null;
+  estimateErrorRatio: number | null;
+  estimatedRetryInputTokens: number;
+  providerUsageReported: boolean;
   inputTokens: number;
   cachedInputTokens: number;
   cacheReadTokensReported: boolean;
@@ -85,6 +94,8 @@ export type UsageSummary = {
   failedRequestCount: number;
   runningRequestCount: number;
   turnCount: number;
+  successfulTurnCount: number;
+  failedTurnCount: number;
   inputTokens: number;
   cachedInputTokens: number;
   cacheReadInputTokens: number;
@@ -96,6 +107,27 @@ export type UsageSummary = {
   outputTokens: number;
   reasoningTokens: number;
   totalTokens: number;
+  uncachedInputTokens: number;
+  localInputEstimate: number;
+  rawLocalInputEstimate: number;
+  estimateCalibrationFactor: number | null;
+  tokenBreakdown: TokenEstimateBreakdown;
+  providerUsageReportedRequestCount: number;
+  providerUsageCoverage: number | null;
+  estimateErrorMean: number | null;
+  estimateErrorP95: number | null;
+  rawEstimateErrorMean: number | null;
+  rawEstimateErrorP95: number | null;
+  tokensPerSuccessfulTask: number | null;
+  uncachedTokensPerSuccessfulTask: number | null;
+  estimatedRetryInputTokens: number;
+  compatibilityRetryCount: number;
+  invalidToolLoopCount: number;
+  finalizationGuardRejectCount: number;
+  noProgressSignalCount: number;
+  duplicatePlanCount: number;
+  compactionRequestCount: number;
+  compactionTokens: number;
   cacheReadRatio: number | null;
   averageTokensPerRequest: number | null;
   averageLatencyMs: number | null;
@@ -123,6 +155,14 @@ type CacheRequestObservation = {
   previousResponseId: string | null;
   systemPrompt: string | null;
   toolCatalogSignature: string | null;
+};
+
+type UsageWasteSignals = {
+  compatibilityRetryCount: number;
+  invalidToolLoopCount: number;
+  finalizationGuardRejectCount: number;
+  noProgressSignalCount: number;
+  duplicatePlanCount: number;
 };
 
 type MutableUsageCall = UsageCall & {
@@ -160,16 +200,28 @@ export function aggregateUsageEvents(
     model: options.fallbackModelSelection?.modelId ?? null,
   };
   const contextEstimateByRequest = new Map<string, number>();
+  const inputBreakdownByRequest = new Map<string, TokenEstimateBreakdown>();
+  const purposeByRequest = new Map<string, ModelCallPurpose>();
   const cacheObservationByRequest = new Map<string, CacheRequestObservation>();
   const callsById = new Map<string, MutableUsageCall>();
   const latestRequestByTurn = new Map<string, string>();
   const includedTurns = new Set<string>();
   const terminalTurns = new Set<string>();
+  const successfulTurns = new Set<string>();
+  const failedTurns = new Set<string>();
+  const latestPlanSignatureByTurn = new Map<string, string>();
   const toolStarts = new Map<string, number>();
   const toolDurations: number[] = [];
   let errorEventCount = 0;
   let toolCallCount = 0;
   let toolErrorCount = 0;
+  const wasteSignals: UsageWasteSignals = {
+    compatibilityRetryCount: 0,
+    invalidToolLoopCount: 0,
+    finalizationGuardRejectCount: 0,
+    noProgressSignalCount: 0,
+    duplicatePlanCount: 0,
+  };
 
   for (const event of events) {
     const payload = event.payload;
@@ -188,6 +240,16 @@ export function aggregateUsageEvents(
 
     if (payload.type === "model_context_built") {
       contextEstimateByRequest.set(payload.request_id, payload.token_estimate);
+      if (payload.token_breakdown) {
+        inputBreakdownByRequest.set(
+          payload.request_id,
+          payload.token_breakdown,
+        );
+      }
+      purposeByRequest.set(
+        payload.request_id,
+        payload.purpose ?? "agent_round",
+      );
       const observation = getCacheObservation(
         cacheObservationByRequest,
         payload.request_id,
@@ -215,6 +277,35 @@ export function aggregateUsageEvents(
       includedTurns.add(event.turnId);
     }
 
+    if (payload.type === "turn_finished" && event.turnId) {
+      successfulTurns.add(event.turnId);
+      failedTurns.delete(event.turnId);
+    } else if (
+      (payload.type === "turn_cancelled" || payload.type === "error") &&
+      event.turnId
+    ) {
+      failedTurns.add(event.turnId);
+      successfulTurns.delete(event.turnId);
+    }
+
+    if (payload.type === "context_warning") {
+      if (payload.stage === "invalid_tool_call_circuit_breaker") {
+        wasteSignals.invalidToolLoopCount += 1;
+      } else if (payload.stage === "finalization_guard") {
+        wasteSignals.finalizationGuardRejectCount += 1;
+      } else if (payload.stage === "step_reminder.repeated_tool_calls") {
+        wasteSignals.noProgressSignalCount += 1;
+      }
+    }
+
+    if (payload.type === "plan_updated") {
+      const signature = stableSerialize(payload.plan);
+      if (latestPlanSignatureByTurn.get(turnKey) === signature) {
+        wasteSignals.duplicatePlanCount += 1;
+      }
+      latestPlanSignatureByTurn.set(turnKey, signature);
+    }
+
     switch (payload.type) {
       case "provider_request_sent": {
         if (event.turnId) includedTurns.add(event.turnId);
@@ -222,6 +313,7 @@ export function aggregateUsageEvents(
           id: payload.request_id,
           turnId: event.turnId ?? null,
           round: payload.round,
+          purpose: purposeByRequest.get(payload.request_id) ?? "agent_round",
           providerId: providerContext.providerId,
           model: providerContext.model,
           adapter: payload.adapter,
@@ -234,8 +326,15 @@ export function aggregateUsageEvents(
           status: "running",
           attemptCount: Math.max(1, payload.attempt),
           retryCount: 0,
+          retryReasons: [],
           contextTokenEstimate:
             contextEstimateByRequest.get(payload.request_id) ?? null,
+          inputBreakdown:
+            inputBreakdownByRequest.get(payload.request_id) ?? null,
+          rawEstimateErrorRatio: null,
+          estimateErrorRatio: null,
+          estimatedRetryInputTokens: 0,
+          providerUsageReported: false,
           inputTokens: 0,
           cachedInputTokens: 0,
           cacheReadTokensReported: false,
@@ -262,6 +361,12 @@ export function aggregateUsageEvents(
         if (!call) break;
         call.attemptCount = Math.max(call.attemptCount, payload.attempt);
         call.retryCount += 1;
+        call.retryReasons.push(payload.reason);
+        call.estimatedRetryInputTokens =
+          (call.contextTokenEstimate ?? 0) * call.retryCount;
+        if (isCompatibilityRetry(payload.reason)) {
+          wasteSignals.compatibilityRetryCount += 1;
+        }
         break;
       }
       case "provider_response_received": {
@@ -282,8 +387,14 @@ export function aggregateUsageEvents(
         break;
       }
       case "token_usage": {
-        const call = latestCallForTurn(callsById, latestRequestByTurn, turnKey);
+        const call = payload.request_id
+          ? callsById.get(payload.request_id)
+          : latestCallForTurn(callsById, latestRequestByTurn, turnKey);
         if (!call) break;
+        call.purpose = payload.purpose ?? call.purpose;
+        call.contextTokenEstimate =
+          payload.local_input_estimate ?? call.contextTokenEstimate;
+        call.inputBreakdown = payload.input_breakdown ?? call.inputBreakdown;
         call.inputTokens = payload.input_tokens;
         call.cachedInputTokens = payload.cached_input_tokens ?? 0;
         call.cacheReadTokensReported =
@@ -296,6 +407,17 @@ export function aggregateUsageEvents(
         call.outputTokens = payload.output_tokens;
         call.reasoningTokens = payload.reasoning_tokens ?? 0;
         call.totalTokens = payload.total_tokens;
+        call.estimateErrorRatio = relativeEstimateError(
+          call.contextTokenEstimate,
+          call.inputTokens,
+        );
+        call.rawEstimateErrorRatio = relativeEstimateError(
+          call.inputBreakdown?.total ?? null,
+          call.inputTokens,
+        );
+        call.estimatedRetryInputTokens =
+          (call.contextTokenEstimate ?? 0) * call.retryCount;
+        call.providerUsageReported = true;
         call.usageReceived = true;
         break;
       }
@@ -341,8 +463,15 @@ export function aggregateUsageEvents(
           !call.responseReceived &&
           !call.usageReceived);
       const succeeded = call.responseReceived || call.usageReceived;
-      const cacheReuse = diagnoseCacheReuse(call, previousReportedCall);
-      if (call.cacheReadTokensReported && call.usageReceived) {
+      const cacheReuse =
+        call.purpose === "agent_round"
+          ? diagnoseCacheReuse(call, previousReportedCall)
+          : emptyCacheDiagnostic();
+      if (
+        call.purpose === "agent_round" &&
+        call.cacheReadTokensReported &&
+        call.usageReceived
+      ) {
         previousReportedCall = call;
       }
       const {
@@ -371,10 +500,13 @@ export function aggregateUsageEvents(
     summary: summarizeUsage(
       calls,
       includedTurns.size,
+      successfulTurns.size,
+      failedTurns.size,
       errorEventCount,
       toolCallCount,
       toolErrorCount,
       toolDurations,
+      wasteSignals,
     ),
   };
 }
@@ -382,21 +514,36 @@ export function aggregateUsageEvents(
 function summarizeUsage(
   calls: UsageCall[],
   turnCount: number,
+  successfulTurnCount: number,
+  failedTurnCount: number,
   errorEventCount: number,
   toolCallCount: number,
   toolErrorCount: number,
   toolDurations: number[],
+  wasteSignals: UsageWasteSignals,
 ): UsageSummary {
+  const tokenBreakdown = emptyTokenBreakdown();
   const totals = calls.reduce(
-    (current, call) => ({
-      inputTokens: current.inputTokens + call.inputTokens,
-      cachedInputTokens: current.cachedInputTokens + call.cachedInputTokens,
-      cacheWriteTokens: current.cacheWriteTokens + call.cacheWriteTokens,
-      outputTokens: current.outputTokens + call.outputTokens,
-      reasoningTokens: current.reasoningTokens + call.reasoningTokens,
-      totalTokens: current.totalTokens + call.totalTokens,
-      retryCount: current.retryCount + call.retryCount,
-    }),
+    (current, call) => {
+      if (call.inputBreakdown) {
+        addTokenBreakdown(tokenBreakdown, call.inputBreakdown);
+      }
+      return {
+        inputTokens: current.inputTokens + call.inputTokens,
+        cachedInputTokens: current.cachedInputTokens + call.cachedInputTokens,
+        cacheWriteTokens: current.cacheWriteTokens + call.cacheWriteTokens,
+        outputTokens: current.outputTokens + call.outputTokens,
+        reasoningTokens: current.reasoningTokens + call.reasoningTokens,
+        totalTokens: current.totalTokens + call.totalTokens,
+        retryCount: current.retryCount + call.retryCount,
+        localInputEstimate:
+          current.localInputEstimate + (call.contextTokenEstimate ?? 0),
+        rawLocalInputEstimate:
+          current.rawLocalInputEstimate + (call.inputBreakdown?.total ?? 0),
+        estimatedRetryInputTokens:
+          current.estimatedRetryInputTokens + call.estimatedRetryInputTokens,
+      };
+    },
     {
       inputTokens: 0,
       cachedInputTokens: 0,
@@ -405,6 +552,9 @@ function summarizeUsage(
       reasoningTokens: 0,
       totalTokens: 0,
       retryCount: 0,
+      localInputEstimate: 0,
+      rawLocalInputEstimate: 0,
+      estimatedRetryInputTokens: 0,
     },
   );
   const completedDurations = calls.flatMap((call) =>
@@ -425,16 +575,63 @@ function summarizeUsage(
   const cacheWriteReportedRequestCount = calls.filter(
     (call) => call.cacheWriteTokensReported,
   ).length;
+  const successfulRequestCount = calls.filter(
+    (call) => call.status === "succeeded",
+  ).length;
+  const providerUsageReportedRequestCount = calls.filter(
+    (call) => call.status === "succeeded" && call.providerUsageReported,
+  ).length;
+  const estimateErrors = calls.flatMap((call) =>
+    call.estimateErrorRatio === null ? [] : [call.estimateErrorRatio],
+  );
+  const rawEstimateErrors = calls.flatMap((call) =>
+    call.rawEstimateErrorRatio === null ? [] : [call.rawEstimateErrorRatio],
+  );
+  const uncachedInputTokens = calls.reduce(
+    (total, call) =>
+      total + Math.max(0, call.inputTokens - call.cachedInputTokens),
+    0,
+  );
+  const compactionCalls = calls.filter(
+    (call) => call.purpose === "context_compaction",
+  );
 
   return {
     requestCount: calls.length,
-    successfulRequestCount: calls.filter((call) => call.status === "succeeded")
-      .length,
+    successfulRequestCount,
     failedRequestCount: calls.filter((call) => call.status === "failed").length,
     runningRequestCount: calls.filter((call) => call.status === "running")
       .length,
     turnCount,
+    successfulTurnCount,
+    failedTurnCount,
     ...totals,
+    uncachedInputTokens,
+    tokenBreakdown,
+    estimateCalibrationFactor: ratio(
+      totals.localInputEstimate,
+      totals.rawLocalInputEstimate,
+    ),
+    providerUsageReportedRequestCount,
+    providerUsageCoverage: ratio(
+      providerUsageReportedRequestCount,
+      successfulRequestCount,
+    ),
+    estimateErrorMean: average(estimateErrors),
+    estimateErrorP95: percentile(estimateErrors, 0.95),
+    rawEstimateErrorMean: average(rawEstimateErrors),
+    rawEstimateErrorP95: percentile(rawEstimateErrors, 0.95),
+    tokensPerSuccessfulTask: ratio(totals.totalTokens, successfulTurnCount),
+    uncachedTokensPerSuccessfulTask: ratio(
+      uncachedInputTokens + totals.outputTokens,
+      successfulTurnCount,
+    ),
+    ...wasteSignals,
+    compactionRequestCount: compactionCalls.length,
+    compactionTokens: compactionCalls.reduce(
+      (total, call) => total + call.totalTokens,
+      0,
+    ),
     cacheReadInputTokens,
     cacheReadReportedRequestCount: cacheReadCalls.length,
     cacheWriteReportedRequestCount,
@@ -791,6 +988,61 @@ function changedKnownValue(
 
 function isOpenAiCall(call: UsageCall): boolean {
   return call.adapter.toLowerCase().includes("openai");
+}
+
+function isCompatibilityRetry(reason: string): boolean {
+  return /(compatib|previous[_ ]response|stored response|cursor|replay|fallback)/i.test(
+    reason,
+  );
+}
+
+function relativeEstimateError(
+  estimate: number | null,
+  actual: number,
+): number | null {
+  if (estimate === null || actual <= 0) return null;
+  return Math.abs(estimate - actual) / actual;
+}
+
+function emptyTokenBreakdown(): TokenEstimateBreakdown {
+  return {
+    baseInstructions: 0,
+    developerInstructions: 0,
+    repositoryInstructions: 0,
+    runtimeContext: 0,
+    skillInstructions: 0,
+    summaries: 0,
+    checkpoints: 0,
+    conversation: 0,
+    currentUser: 0,
+    toolCalls: 0,
+    toolResults: 0,
+    toolSchemas: 0,
+    providerState: 0,
+    other: 0,
+    total: 0,
+  };
+}
+
+function addTokenBreakdown(
+  target: TokenEstimateBreakdown,
+  source: TokenEstimateBreakdown,
+): void {
+  target.baseInstructions += source.baseInstructions;
+  target.developerInstructions += source.developerInstructions;
+  target.repositoryInstructions += source.repositoryInstructions;
+  target.runtimeContext += source.runtimeContext;
+  target.skillInstructions += source.skillInstructions;
+  target.summaries += source.summaries;
+  target.checkpoints += source.checkpoints;
+  target.conversation += source.conversation;
+  target.currentUser += source.currentUser;
+  target.toolCalls += source.toolCalls;
+  target.toolResults += source.toolResults;
+  target.toolSchemas += source.toolSchemas;
+  target.providerState += source.providerState;
+  target.other += source.other;
+  target.total += source.total;
 }
 
 function stableSerialize(value: unknown): string {
