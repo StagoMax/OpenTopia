@@ -5502,6 +5502,8 @@ fn conversation_payload_json(
             round,
             context_hash,
             token_estimate,
+            purpose,
+            token_breakdown,
             ..
         } => serde_json::json!({
             "type": "model_context_built",
@@ -5509,6 +5511,8 @@ fn conversation_payload_json(
             "round": round,
             "context_hash": context_hash,
             "token_estimate": token_estimate,
+            "purpose": purpose,
+            "token_breakdown": token_breakdown,
         }),
         AgentEventPayload::ModelRequest {
             request_id, round, ..
@@ -6593,12 +6597,17 @@ mod tests {
                 ),
             },
             AgentEventPayload::TokenUsage {
+                request_id: None,
+                round: None,
+                purpose: crate::model::ModelCallPurpose::AgentRound,
                 input_tokens: 10,
                 output_tokens: 5,
                 total_tokens: 15,
                 cached_input_tokens: None,
                 cache_write_tokens: None,
                 reasoning_tokens: None,
+                local_input_estimate: None,
+                input_breakdown: None,
             },
             AgentEventPayload::TurnFinished {
                 summary: "done".to_string(),

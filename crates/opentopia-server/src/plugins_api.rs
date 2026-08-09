@@ -10,8 +10,8 @@ use opentopia_core::{
     ExperienceSurfaceProfile, PluginActivation, PluginActivationRecord, PluginContribution,
     PluginContributionRecord, PluginControlManifest, PluginControlScope, PluginControlScopeType,
     PluginDescriptor, PluginPermission, PluginPermissionGrantRecord, PluginPermissionGrantStatus,
-    PluginRuntimeHealthRecord, PluginSecretBindingRecord, PluginSettingsRecord, SessionStore,
-    SqliteSessionStore, Thread,
+    PluginRuntimeHealthRecord, PluginSecretBindingRecord, PluginSettingsRecord, PluginSource,
+    SessionStore, SqliteSessionStore, Thread,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -398,6 +398,37 @@ pub(crate) fn active_contributions_for_thread(
         .into_iter()
         .map(|active| active.contribution)
         .collect())
+}
+
+pub(crate) fn ensure_default_spreadsheet_permissions(
+    store: &SqliteSessionStore,
+) -> anyhow::Result<()> {
+    let Some(plugin) = discover_plugins(None).into_iter().find(|plugin| {
+        plugin.name == "spreadsheet"
+            && plugin.source == PluginSource::Bundled
+            && plugin.default_enabled
+    }) else {
+        return Ok(());
+    };
+
+    // Bootstrap the official default exactly once. Any existing grant or
+    // revocation is an explicit user decision and must remain authoritative.
+    if !store.list_plugin_permission_grants(&plugin.id)?.is_empty() {
+        return Ok(());
+    }
+
+    let manifest = inspect_plugin_control_manifest(&plugin)?;
+    for request in &manifest.permission_requests {
+        store.set_manifest_plugin_permission_grant(
+            &plugin.id,
+            &manifest,
+            &PluginControlScope::global(),
+            &request.permission,
+            &Value::Null,
+            PluginPermissionGrantStatus::Granted,
+        )?;
+    }
+    Ok(())
 }
 
 fn capability_activation(
@@ -895,8 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_plugins_are_installed_with_privileged_surfaces_off_and_spreadsheet_permission_gated()
-    {
+    fn bundled_plugins_keep_privileged_surfaces_off_and_bootstrap_spreadsheet_permissions() {
         let workspace = TestWorkspace::new();
         let store = SqliteSessionStore::open(":memory:").expect("open store");
         let thread = store
@@ -940,7 +970,7 @@ mod tests {
                 .any(|item| item.contribution.plugin_id == plugin.id));
         }
 
-        set_all_permissions(&store, spreadsheet, PluginPermissionGrantStatus::Granted);
+        ensure_default_spreadsheet_permissions(&store).expect("bootstrap spreadsheet permissions");
         let snapshot = capability_snapshot_for_thread(&store, &thread)
             .expect("authorized capability snapshot");
         let spreadsheet_kinds = snapshot
@@ -953,6 +983,36 @@ mod tests {
             spreadsheet_kinds,
             BTreeSet::from([ContributionKind::NativeTool, ContributionKind::Previewer])
         );
+    }
+
+    #[test]
+    fn spreadsheet_permission_bootstrap_preserves_explicit_revocation() {
+        let workspace = TestWorkspace::new();
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let thread = store
+            .create_thread(None, workspace.0.clone())
+            .expect("create thread");
+        let spreadsheet = discover_plugins(Some(&workspace.0))
+            .into_iter()
+            .find(|plugin| plugin.name == "spreadsheet")
+            .expect("spreadsheet bundled plugin");
+
+        set_all_permissions(&store, &spreadsheet, PluginPermissionGrantStatus::Revoked);
+        ensure_default_spreadsheet_permissions(&store).expect("preserve spreadsheet revocation");
+
+        let snapshot =
+            capability_snapshot_for_thread(&store, &thread).expect("revoked capability snapshot");
+        assert!(!snapshot
+            .active
+            .iter()
+            .any(|item| item.contribution.plugin_id == spreadsheet.id));
+        assert!(snapshot.unavailable.iter().any(|item| {
+            item.contribution.contribution.plugin_id == spreadsheet.id
+                && matches!(
+                    item.reason,
+                    CapabilityUnavailableReason::MissingPermissions(_)
+                )
+        }));
     }
 
     #[test]

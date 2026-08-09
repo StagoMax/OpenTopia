@@ -50,6 +50,11 @@ pub struct OpenAiCompatibilityReport {
     pub chat_completions: ProviderFeatureSupport,
     #[serde(default)]
     pub chat_function_tools: ProviderFeatureSupport,
+    /// Chat Completions function tools with provider-enforced strict JSON
+    /// Schema output. This is negotiated independently from ordinary function
+    /// tools because many compatible relays accept `tools` but reject `strict`.
+    #[serde(default)]
+    pub chat_strict_function_tools: ProviderFeatureSupport,
     pub responses: ProviderFeatureSupport,
     #[serde(default)]
     pub responses_native_tools: ProviderFeatureSupport,
@@ -58,6 +63,10 @@ pub struct OpenAiCompatibilityReport {
     /// rejecting application-defined functions, or vice versa.
     #[serde(default)]
     pub responses_function_tools: ProviderFeatureSupport,
+    /// Responses function tools with provider-enforced strict JSON Schema
+    /// output. Kept separate from the portable function-tool capability.
+    #[serde(default)]
+    pub responses_strict_function_tools: ProviderFeatureSupport,
     /// Freeform/custom tool definitions and `custom_tool_call` output items.
     #[serde(default)]
     pub responses_custom_tools: ProviderFeatureSupport,
@@ -118,6 +127,7 @@ pub struct ProviderCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderToolProtocolCapabilities {
     pub function_tools: ProviderFeatureSupport,
+    pub strict_function_tools: ProviderFeatureSupport,
     pub freeform_tools: ProviderFeatureSupport,
     pub hosted_apply_patch: ProviderFeatureSupport,
     pub assistant_phase: ProviderFeatureSupport,
@@ -322,6 +332,9 @@ impl ProviderSettings {
                         function_tools: negotiated
                             .map(|report| report.responses_function_tools)
                             .unwrap_or(ProviderFeatureSupport::Supported),
+                        strict_function_tools: negotiated
+                            .map(|report| report.responses_strict_function_tools)
+                            .unwrap_or_default(),
                         freeform_tools: negotiated
                             .map(|report| report.responses_custom_tools)
                             .unwrap_or_default(),
@@ -344,6 +357,12 @@ impl ProviderSettings {
                         .filter(|report| report.applies_to(&self.base_url, &self.model))
                         .map(|report| report.chat_function_tools)
                         .unwrap_or(ProviderFeatureSupport::Unknown),
+                    strict_function_tools: self
+                        .openai_compatibility
+                        .as_ref()
+                        .filter(|report| report.applies_to(&self.base_url, &self.model))
+                        .map(|report| report.chat_strict_function_tools)
+                        .unwrap_or_default(),
                     ..ProviderToolProtocolCapabilities::default()
                 },
                 ..ProviderCapabilities::default()
@@ -1657,9 +1676,11 @@ mod tests {
             selected_protocol: OpenAiProtocol::ChatCompletions,
             chat_completions: ProviderFeatureSupport::Supported,
             chat_function_tools: ProviderFeatureSupport::Supported,
+            chat_strict_function_tools: ProviderFeatureSupport::Unsupported,
             responses: ProviderFeatureSupport::Unsupported,
             responses_native_tools: ProviderFeatureSupport::Unsupported,
             responses_function_tools: ProviderFeatureSupport::Unknown,
+            responses_strict_function_tools: ProviderFeatureSupport::Unknown,
             responses_custom_tools: ProviderFeatureSupport::Unknown,
             responses_apply_patch: ProviderFeatureSupport::Unknown,
             developer_messages: ProviderFeatureSupport::Unsupported,
@@ -1851,9 +1872,11 @@ mod tests {
             selected_protocol: OpenAiProtocol::Responses,
             chat_completions: ProviderFeatureSupport::Unknown,
             chat_function_tools: ProviderFeatureSupport::Unknown,
+            chat_strict_function_tools: ProviderFeatureSupport::Unknown,
             responses: ProviderFeatureSupport::Supported,
             responses_native_tools: ProviderFeatureSupport::Supported,
             responses_function_tools: ProviderFeatureSupport::Supported,
+            responses_strict_function_tools: ProviderFeatureSupport::Supported,
             responses_custom_tools: ProviderFeatureSupport::Supported,
             responses_apply_patch: ProviderFeatureSupport::Unsupported,
             developer_messages: ProviderFeatureSupport::Unknown,
@@ -1871,11 +1894,16 @@ mod tests {
             capabilities.hosted_apply_patch,
             ProviderFeatureSupport::Unsupported
         );
+        assert_eq!(
+            capabilities.strict_function_tools,
+            ProviderFeatureSupport::Supported
+        );
 
         provider.model = "different-model".to_string();
         let stale = provider.capabilities().tool_protocol;
         assert_eq!(stale.freeform_tools, ProviderFeatureSupport::Unknown);
         assert_eq!(stale.hosted_apply_patch, ProviderFeatureSupport::Unknown);
+        assert_eq!(stale.strict_function_tools, ProviderFeatureSupport::Unknown);
     }
 
     #[test]

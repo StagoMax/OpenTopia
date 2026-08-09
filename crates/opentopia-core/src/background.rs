@@ -15,6 +15,7 @@ use crate::execution::{
     BackgroundOutputSink, ExecRequest, ExecutionContext, ExecutionEnvironment,
     ExecutionSandboxMetadata, OutputStream, StdioSession,
 };
+use crate::policy::approval_required;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,8 @@ pub struct BackgroundJobSnapshot {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Typed authorization boundary preserved across detached execution.
+    pub approval_required: Option<String>,
     /// True when the execution backend had to truncate process output.
     pub truncated: bool,
     /// Sandbox details captured when the process exits.
@@ -179,6 +182,7 @@ struct JobState {
     success: bool,
     finished_at: Option<DateTime<Utc>>,
     error: Option<String>,
+    approval_required: Option<String>,
     truncated: bool,
     sandbox: Option<ExecutionSandboxMetadata>,
     stdout: StreamBuffer,
@@ -220,6 +224,7 @@ impl Job {
             started_at: self.started_at,
             finished_at: state.finished_at,
             error: state.error.clone(),
+            approval_required: state.approval_required.clone(),
             truncated: state.truncated,
             sandbox: state.sandbox.clone(),
             stdout_bytes: state.stdout.total_bytes,
@@ -341,6 +346,7 @@ impl BackgroundProcessRegistry {
                 success: false,
                 finished_at: None,
                 error: None,
+                approval_required: None,
                 truncated: false,
                 sandbox: None,
                 stdout: StreamBuffer::default(),
@@ -416,6 +422,8 @@ impl BackgroundProcessRegistry {
                 // Cancellation and timeout surface as errors from the execution
                 // environment, so they are separated from a genuine spawn failure here.
                 Err(error) => {
+                    state.approval_required =
+                        approval_required(&error).map(|required| required.reason().to_string());
                     let message = error.to_string();
                     state.status = if job.cancel.is_cancelled() || message.contains("cancelled") {
                         BackgroundJobStatus::Cancelled
@@ -466,6 +474,8 @@ impl BackgroundProcessRegistry {
                     state.success = true;
                 }
                 Some(Err(error)) => {
+                    state.approval_required =
+                        approval_required(&error).map(|required| required.reason().to_string());
                     state.status = BackgroundJobStatus::Failed;
                     state.error = Some(error.to_string());
                 }
@@ -551,6 +561,7 @@ impl BackgroundProcessRegistry {
                 success: false,
                 finished_at: None,
                 error: None,
+                approval_required: None,
                 truncated: false,
                 sandbox: None,
                 stdout: StreamBuffer::default(),
@@ -640,6 +651,8 @@ impl BackgroundProcessRegistry {
                     state.sandbox = result.sandbox;
                 }
                 Err(error) => {
+                    state.approval_required =
+                        approval_required(&error).map(|required| required.reason().to_string());
                     let message = error.to_string();
                     state.status = if timed_out.load(Ordering::Acquire) {
                         BackgroundJobStatus::TimedOut

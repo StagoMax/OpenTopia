@@ -3,7 +3,9 @@ use crate::guardian::{
     GuardianDecisionSource, GuardianReviewFailureKind, GuardianReviewStatus, GuardianRiskLevel,
     GuardianUserAuthorization,
 };
-use crate::model_context::{ModelContextItem, ThreadContextSnapshot, TurnContextSnapshot};
+use crate::model_context::{
+    ModelContextItem, ThreadContextSnapshot, TokenEstimateBreakdown, TurnContextSnapshot,
+};
 use crate::provider::ModelUsage;
 use crate::skills::LoadedSkill;
 use crate::subagents::SubagentRun;
@@ -1693,6 +1695,10 @@ pub enum AgentEventPayload {
         round: usize,
         context_hash: String,
         token_estimate: usize,
+        #[serde(default)]
+        purpose: ModelCallPurpose,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_breakdown: Option<TokenEstimateBreakdown>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         items: Vec<ModelContextItem>,
     },
@@ -1824,6 +1830,12 @@ pub enum AgentEventPayload {
         message: String,
     },
     TokenUsage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        round: Option<usize>,
+        #[serde(default)]
+        purpose: ModelCallPurpose,
         input_tokens: usize,
         output_tokens: usize,
         total_tokens: usize,
@@ -1833,6 +1845,10 @@ pub enum AgentEventPayload {
         cache_write_tokens: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_tokens: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_input_estimate: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_breakdown: Option<TokenEstimateBreakdown>,
     },
     SubagentUpdated {
         run: SubagentRun,
@@ -1862,6 +1878,17 @@ pub enum AgentEventPayload {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallPurpose {
+    #[default]
+    AgentRound,
+    ContextCompaction,
+    GuardianReview,
+    TitleGeneration,
+    Other,
 }
 
 impl AgentEventPayload {

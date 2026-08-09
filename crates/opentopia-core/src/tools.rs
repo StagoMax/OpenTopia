@@ -2925,6 +2925,8 @@ struct BrowserInput {
     /// Wait condition; defaults to document_complete.
     #[serde(default)]
     condition: BrowserWaitConditionInput,
+    /// Operation timeout. Downloads default to one hour and allow up to six;
+    /// other browser actions remain capped at two minutes.
     #[serde(default)]
     #[schemars(range(min = 1, max = 21600000))]
     timeout_ms: Option<u64>,
@@ -3215,7 +3217,9 @@ impl TypedTool for BrowserTool {
                 let request = BrowserDownloadRequest {
                     url: url.clone(),
                     expected_filename: input.expected_filename,
-                    timeout,
+                    timeout: Some(
+                        timeout.unwrap_or(Duration::from_secs(DEFAULT_BACKGROUND_TIMEOUT_SECONDS)),
+                    ),
                 };
                 if let (Some(registry), Some(_)) = (ctx.background.as_ref(), ctx.thread_id) {
                     let scope = background_scope(&ctx)?;
@@ -3258,7 +3262,7 @@ impl TypedTool for BrowserTool {
                             "startedAt": job.started_at,
                             "autoDetached": true,
                             "yieldTimeMs": yield_time_ms,
-                            "note": "The download is still running. Completion is delivered automatically; background_output reads progress or stops it."
+                            "note": "The download is still running. Completion is delivered automatically; background_output checks its status or cancels the tracked wait."
                         });
                         return Ok(ToolResult {
                             call_id,
@@ -6472,6 +6476,9 @@ impl TypedTool for ShellTool {
                 } else {
                     chunk.stderr
                 };
+                if let Some(reason) = chunk.job.approval_required {
+                    return Err(ApprovalRequired::new(reason).into());
+                }
                 if !chunk.job.success && looks_like_sandbox_denial(&stderr) {
                     return Err(ApprovalRequired::new(format!(
                         "Command was blocked by the sandbox: {}",

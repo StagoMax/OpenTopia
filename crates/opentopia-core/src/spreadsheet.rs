@@ -5,7 +5,7 @@ use calamine::{
 use rust_xlsxwriter::{Formula, Workbook, Worksheet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -1003,7 +1003,7 @@ fn collect_sheet_stats(
     formulas: &Range<String>,
     sheet: &str,
 ) -> Result<SheetStats, SpreadsheetError> {
-    let mut positions = BTreeSet::new();
+    let mut positions = HashSet::new();
     add_used_positions(values, &mut positions, sheet)?;
     add_used_positions(formulas, &mut positions, sheet)?;
     let populated_cells = positions.len();
@@ -1042,7 +1042,7 @@ fn collect_sheet_stats(
 
 fn add_used_positions<T: CellType>(
     range: &Range<T>,
-    positions: &mut BTreeSet<(u32, u32)>,
+    positions: &mut HashSet<(u32, u32)>,
     sheet: &str,
 ) -> Result<(), SpreadsheetError> {
     let Some((base_row, base_column)) = range.start() else {

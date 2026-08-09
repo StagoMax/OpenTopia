@@ -177,18 +177,19 @@ pub use model::{
     ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextProjection,
     ContextSourceRef, ContextSummary, ExperienceMode, GoalAttemptStatus, GoalRecord, GoalSnapshot,
     GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart, MessageRole,
-    ModelContentPart, Project, SkillRef, TaskEvidenceKind, TaskEvidenceRef, TaskPlan,
-    TaskPlanCoverage, TaskPlanStep, TaskPlanStepStatus, TaskRequirement, TerminalCommandHistory,
-    TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet,
-    TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord, TurnStatus,
-    UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord, UserInputRequest,
-    UserInputResponse, UserInputStatus, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+    ModelCallPurpose, ModelContentPart, Project, SkillRef, TaskEvidenceKind, TaskEvidenceRef,
+    TaskPlan, TaskPlanCoverage, TaskPlanStep, TaskPlanStepStatus, TaskRequirement,
+    TerminalCommandHistory, TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall,
+    ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord,
+    TurnStatus, UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord,
+    UserInputRequest, UserInputResponse, UserInputStatus, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };
 pub use model_context::{
     content_fingerprint, estimate_tokens as estimate_model_context_tokens,
     world_state_catalog_item, world_state_item, CompiledModelContext, ContextCacheScope,
     ContextItemKind, ContextRole, ContextSensitivity, InstructionSnapshotRef, ModelContextItem,
-    ThreadContextSnapshot, TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
+    ThreadContextSnapshot, TokenEstimateBreakdown, TurnContextSnapshot, WorldStateSkill,
+    WorldStateSnapshot,
 };
 pub use plugin_control::{
     inspect_plugin_control_manifest, permission_requested, validate_plugin_settings,

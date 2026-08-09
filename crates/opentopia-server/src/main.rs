@@ -38,22 +38,22 @@ use opentopia_core::{
     GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill,
     LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment, LocalSandboxConfig,
     McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor, MediaHandlerSelection,
-    Message, MessagePart, MessageRole, ModelContentPart, ModelContextItem,
-    ModelConversationMessage, ModelConversationRole, ModelRequest, ObserveOptions,
-    OpenAiCompatibleProvider, OpenAiProtocol, PermissionMode, PluginControlScope, PluginDescriptor,
-    PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind,
-    PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook, ProviderConversationCursor,
-    ProviderConversationState, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth,
-    ProviderHealthCheck, ProviderKind, ProviderSettings, ProviderTransportEvent, ResolvedPreview,
-    ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxMode, SandboxSettings, SearchTool,
-    SessionStore, SkillDescriptor, SkillRef, SpawnSubagentRequest, SqliteSessionStore, StoreError,
-    SubagentExecutionContract, SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler,
-    SubagentSchedulerConfig, SubagentScope, SubagentWorkspaceMode, TaskPlan,
-    TerminalCommandHistory, TerminalCommandStatus, ThreadContextSnapshot, ThreadMcpServer,
-    ThreadModelSelection, Tool, ToolCall, ToolContext, ToolPermissionDescriptor, ToolResult,
-    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnRecord, TurnStatus,
-    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus, WorkspaceDiff,
-    WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
+    Message, MessagePart, MessageRole, ModelCallPurpose, ModelContentPart, ModelContextItem,
+    ModelConversationMessage, ModelConversationRole, ModelRequest, ModelStreamDelta,
+    ObserveOptions, OpenAiCompatibleProvider, OpenAiProtocol, PermissionMode, PluginControlScope,
+    PluginDescriptor, PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError,
+    PreviewKind, PreviewRange, PreviewRangeRequest, PreviewTarget, PreviewWorkbook,
+    ProviderConversationCursor, ProviderConversationState, ProviderDriverDescriptor,
+    ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck, ProviderKind, ProviderSettings,
+    ProviderTransportEvent, ResolvedPreview, ResourceLimit, RuntimeSurface, SandboxDescriptor,
+    SandboxMode, SandboxSettings, SearchTool, SessionStore, SkillDescriptor, SkillRef,
+    SpawnSubagentRequest, SqliteSessionStore, StoreError, SubagentExecutionContract,
+    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
+    SubagentScope, SubagentWorkspaceMode, TaskPlan, TerminalCommandHistory, TerminalCommandStatus,
+    ThreadContextSnapshot, ThreadMcpServer, ThreadModelSelection, Tool, ToolCall, ToolContext,
+    ToolPermissionDescriptor, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot,
+    TurnRecord, TurnStatus, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
+    WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
     CONTEXT_CHECKPOINT_SCHEMA_VERSION, GIT_NONINTERACTIVE_ENVIRONMENT, MAX_PREVIEW_CONTENT_BYTES,
     MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
@@ -127,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let store = Arc::new(SqliteSessionStore::open(&args.db)?);
+    plugins_api::ensure_default_spreadsheet_permissions(&store)?;
     let indeterminate_effects = store.mark_running_effects_indeterminate()?;
     if indeterminate_effects > 0 {
         warn!(
@@ -6622,7 +6623,7 @@ async fn run_new_agent_turn(
         if !flow_capabilities.allow_all_tools {
             flow_capabilities
                 .tools
-                .extend(surface_profile.capabilities.tools.iter().cloned());
+                .extend(ExperienceSurfaceProfile::flow_control_tools());
         }
         agent.restrict_capabilities(&flow_capabilities);
     } else {
@@ -6647,7 +6648,6 @@ async fn run_new_agent_turn(
     }
     if thread.experience_mode == ExperienceMode::Flow {
         let flow_node_harness = Arc::new(agent.clone());
-        agent.restrict_to_tools(surface_profile.capabilities.tools.iter().cloned());
         agent.set_flow_node_harness(flow_node_harness);
     }
     let built_context = build_turn_model_context(
@@ -8188,9 +8188,15 @@ mod experience_mode_tests {
         assert!(experience_mode_module(ExperienceMode::Flow)
             .text_content()
             .contains("enterprise design, run, and review surface"));
+        assert!(experience_mode_module(ExperienceMode::Flow)
+            .text_content()
+            .contains("inherits the visible code, shell, browser, document, preview, plugin, and MCP capabilities"));
         let flow_profile = ExperienceSurfaceProfile::for_mode(ExperienceMode::Flow);
-        assert!(!flow_profile.capabilities.allows_tool("shell"));
-        assert!(!flow_profile.capabilities.allow_all_mcp_servers);
+        assert!(flow_profile.capabilities.allows_tool("read_attachment"));
+        assert!(flow_profile.capabilities.allows_tool("spreadsheet"));
+        assert!(flow_profile.capabilities.allows_tool("shell"));
+        assert!(flow_profile.capabilities.allows_tool("write_file"));
+        assert!(flow_profile.capabilities.allow_all_mcp_servers);
     }
 
     #[test]
@@ -9129,17 +9135,37 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
                 && provider_state.model == active_provider.model
         });
     let mut usage = ContextUsageMetrics::default();
+    let mut estimate_errors = Vec::new();
+    let mut raw_estimate_errors = Vec::new();
+    let mut provider_response_request_ids = HashSet::new();
+    let mut provider_usage_request_ids = HashSet::new();
     for event in &events {
         match &event.payload {
             AgentEventPayload::TokenUsage {
                 input_tokens,
+                output_tokens,
+                total_tokens,
                 cached_input_tokens,
                 cache_write_tokens,
                 reasoning_tokens,
+                local_input_estimate,
+                input_breakdown,
+                purpose,
+                request_id,
                 ..
             } => {
+                if let Some(request_id) = request_id {
+                    provider_usage_request_ids.insert(*request_id);
+                }
                 usage.model_requests += 1;
+                match purpose {
+                    ModelCallPurpose::AgentRound => usage.agent_model_requests += 1,
+                    ModelCallPurpose::ContextCompaction => usage.compaction_model_requests += 1,
+                    _ => usage.auxiliary_model_requests += 1,
+                }
                 usage.input_tokens = usage.input_tokens.saturating_add(*input_tokens);
+                usage.output_tokens = usage.output_tokens.saturating_add(*output_tokens);
+                usage.total_tokens = usage.total_tokens.saturating_add(*total_tokens);
                 usage.cached_input_tokens = usage
                     .cached_input_tokens
                     .saturating_add(cached_input_tokens.unwrap_or_default());
@@ -9149,6 +9175,26 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
                 usage.reasoning_tokens = usage
                     .reasoning_tokens
                     .saturating_add(reasoning_tokens.unwrap_or_default());
+                usage.uncached_input_tokens = usage.uncached_input_tokens.saturating_add(
+                    input_tokens.saturating_sub(cached_input_tokens.unwrap_or_default()),
+                );
+                if let Some(estimate) = local_input_estimate {
+                    usage.local_input_estimate =
+                        usage.local_input_estimate.saturating_add(*estimate);
+                    if *input_tokens > 0 {
+                        estimate_errors
+                            .push(estimate.abs_diff(*input_tokens) as f64 / *input_tokens as f64);
+                    }
+                }
+                if let Some(breakdown) = input_breakdown {
+                    usage.raw_input_estimate =
+                        usage.raw_input_estimate.saturating_add(breakdown.total);
+                    if *input_tokens > 0 {
+                        raw_estimate_errors.push(
+                            breakdown.total.abs_diff(*input_tokens) as f64 / *input_tokens as f64,
+                        );
+                    }
+                }
             }
             AgentEventPayload::ContextCompacted { details, .. } => {
                 usage.compactions += 1;
@@ -9170,7 +9216,10 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
                         metrics.active_constraint_retention_percent;
                 }
             }
-            AgentEventPayload::ProviderResponseReceived { body, .. } => {
+            AgentEventPayload::ProviderResponseReceived {
+                request_id, body, ..
+            } => {
+                provider_response_request_ids.insert(*request_id);
                 usage.native_compactions = usage.native_compactions.saturating_add(
                     body.get("providerItems")
                         .and_then(Value::as_array)
@@ -9191,6 +9240,37 @@ fn context_status(state: &AppState, thread_id: Uuid) -> Result<ContextStatusResp
             AgentEventPayload::ContextWarning { .. } => usage.warnings += 1,
             _ => {}
         }
+    }
+    usage.provider_responses = provider_response_request_ids.len();
+    usage.provider_usage_coverage = (usage.provider_responses > 0).then(|| {
+        provider_response_request_ids
+            .intersection(&provider_usage_request_ids)
+            .count() as f64
+            / usage.provider_responses as f64
+    });
+    usage.estimate_calibration_factor = (usage.raw_input_estimate > 0)
+        .then_some(usage.local_input_estimate as f64 / usage.raw_input_estimate as f64);
+    if !estimate_errors.is_empty() {
+        usage.estimate_error_mean =
+            Some(estimate_errors.iter().sum::<f64>() / estimate_errors.len() as f64);
+        estimate_errors.sort_by(f64::total_cmp);
+        let p95_index = estimate_errors
+            .len()
+            .saturating_mul(95)
+            .div_ceil(100)
+            .saturating_sub(1);
+        usage.estimate_error_p95 = estimate_errors.get(p95_index).copied();
+    }
+    if !raw_estimate_errors.is_empty() {
+        usage.raw_estimate_error_mean =
+            Some(raw_estimate_errors.iter().sum::<f64>() / raw_estimate_errors.len() as f64);
+        raw_estimate_errors.sort_by(f64::total_cmp);
+        let p95_index = raw_estimate_errors
+            .len()
+            .saturating_mul(95)
+            .div_ceil(100)
+            .saturating_sub(1);
+        usage.raw_estimate_error_p95 = raw_estimate_errors.get(p95_index).copied();
     }
     let covered_through_seq = latest_summary
         .as_ref()
@@ -9346,6 +9426,25 @@ async fn generate_context_summary(
         final_output_json_schema: Some(context_checkpoint_schema()),
     };
     let request_id = Uuid::new_v4();
+    let input_breakdown = request.token_estimate_breakdown();
+    publish_payload(
+        state,
+        thread_id,
+        None,
+        AgentEventPayload::ModelContextBuilt {
+            request_id,
+            round: 0,
+            context_hash: content_fingerprint(
+                serde_json::to_string(&input_breakdown)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            ),
+            token_estimate: input_breakdown.total,
+            purpose: ModelCallPurpose::ContextCompaction,
+            token_breakdown: Some(input_breakdown.clone()),
+            items: Vec::new(),
+        },
+    );
     let request_snapshot = serde_json::to_value(&request)
         .map(|value| redact_model_observation(&value))
         .unwrap_or_else(|error| json!({ "serializationError": error.to_string() }));
@@ -9377,7 +9476,13 @@ async fn generate_context_summary(
         },
     );
     let mut transport_events = Vec::new();
-    let mut on_delta = |_| Ok(());
+    let mut streamed_usage = None;
+    let mut on_delta = |delta| {
+        if let ModelStreamDelta::Usage { usage } = delta {
+            streamed_usage = Some(usage);
+        }
+        Ok(())
+    };
     let mut on_transport = |event| {
         transport_events.push(event);
         Ok(())
@@ -9387,6 +9492,7 @@ async fn generate_context_summary(
         provider.stream_prepared(prepared, &mut on_delta, &mut on_transport),
     )
     .await;
+    drop(on_delta);
     drop(on_transport);
     for observation in transport_events {
         match observation {
@@ -9429,6 +9535,27 @@ async fn generate_context_summary(
     let response = response_result
         .map_err(|_| ApiError::gateway_timeout("context summarization timed out"))?
         .map_err(|err| ApiError::bad_gateway(format!("context summarization failed: {err}")))?;
+    let usage = response.usage.as_ref().or(streamed_usage.as_ref());
+    if let Some(usage) = usage {
+        publish_payload(
+            state,
+            thread_id,
+            None,
+            AgentEventPayload::TokenUsage {
+                request_id: Some(request_id),
+                round: Some(0),
+                purpose: ModelCallPurpose::ContextCompaction,
+                input_tokens: usage.input_tokens as usize,
+                output_tokens: usage.output_tokens as usize,
+                total_tokens: usage.total_tokens as usize,
+                cached_input_tokens: usage.cached_input_tokens.map(|value| value as usize),
+                cache_write_tokens: usage.cache_write_tokens.map(|value| value as usize),
+                reasoning_tokens: usage.reasoning_tokens.map(|value| value as usize),
+                local_input_estimate: Some(input_breakdown.total),
+                input_breakdown: Some(input_breakdown.clone()),
+            },
+        );
+    }
     if response.text.trim().is_empty() {
         return Err(ApiError::bad_gateway(
             "context summarization provider returned empty text",
@@ -11424,10 +11551,25 @@ struct ContextStatusResponse {
 #[serde(rename_all = "camelCase")]
 struct ContextUsageMetrics {
     model_requests: usize,
+    agent_model_requests: usize,
+    compaction_model_requests: usize,
+    auxiliary_model_requests: usize,
+    provider_responses: usize,
+    provider_usage_coverage: Option<f64>,
     input_tokens: usize,
+    output_tokens: usize,
+    total_tokens: usize,
+    uncached_input_tokens: usize,
     cached_input_tokens: usize,
     cache_write_tokens: usize,
     reasoning_tokens: usize,
+    local_input_estimate: usize,
+    raw_input_estimate: usize,
+    estimate_calibration_factor: Option<f64>,
+    estimate_error_mean: Option<f64>,
+    estimate_error_p95: Option<f64>,
+    raw_estimate_error_mean: Option<f64>,
+    raw_estimate_error_p95: Option<f64>,
     compactions: usize,
     native_compactions: usize,
     provider_fallbacks: usize,

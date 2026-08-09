@@ -1,6 +1,7 @@
 use crate::model::ModelContentPart;
 use crate::model_context::{
-    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ModelContextItem,
+    estimate_tokens, CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole,
+    ModelContextItem, TokenEstimateBreakdown,
 };
 use crate::settings::{
     model_accepts_temperature, OpenAiCompatibilityReport, OpenAiProtocol, PromptCachePolicy,
@@ -86,6 +87,67 @@ pub struct ModelRequest {
     pub prompt_cache_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_output_json_schema: Option<Value>,
+}
+
+impl ModelRequest {
+    /// Estimates the provider-neutral logical input by harness module.
+    /// Provider adapters add their own framing, so actual response usage remains
+    /// authoritative and is used to report the estimate error.
+    pub fn token_estimate_breakdown(&self) -> TokenEstimateBreakdown {
+        let mut breakdown = TokenEstimateBreakdown::from_context_items(&self.context_items);
+        let has_materialized_context = !self.context_items.is_empty();
+
+        if !has_materialized_context {
+            breakdown.base_instructions = estimate_tokens(&self.system_prompt);
+            breakdown.conversation = self
+                .conversation
+                .iter()
+                .map(|message| estimate_tokens(&message.content))
+                .sum();
+            breakdown.current_user = estimate_tokens(&self.user_message);
+            breakdown.tool_calls = estimate_serialized_slice(&self.previous_tool_calls);
+            breakdown.tool_results = estimate_serialized_slice(&self.tool_results);
+        }
+
+        breakdown.conversation = breakdown.conversation.saturating_add(
+            self.conversation
+                .iter()
+                .map(|message| estimate_serialized_slice(&message.content_parts))
+                .sum(),
+        );
+        breakdown.current_user = breakdown
+            .current_user
+            .saturating_add(estimate_serialized_slice(&self.user_content));
+        breakdown.developer_instructions = breakdown.developer_instructions.saturating_add(
+            self.branch_developer_instructions
+                .as_deref()
+                .map(estimate_tokens)
+                .unwrap_or_default(),
+        );
+        breakdown.tool_schemas = estimate_serialized_slice(&self.tool_candidates).saturating_add(
+            self.final_output_json_schema
+                .as_ref()
+                .map(estimate_serialized_tokens)
+                .unwrap_or_default(),
+        );
+        breakdown.provider_state = estimate_serialized_slice(&self.previous_response_items);
+        breakdown.recalculate_total();
+        breakdown
+    }
+}
+
+fn estimate_serialized_tokens(value: &impl Serialize) -> usize {
+    serde_json::to_string(value)
+        .map(|value| estimate_tokens(&value))
+        .unwrap_or_default()
+}
+
+fn estimate_serialized_slice(value: &[impl Serialize]) -> usize {
+    if value.is_empty() {
+        0
+    } else {
+        estimate_serialized_tokens(&value)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +381,7 @@ pub enum ProviderToolDefinition {
         name: String,
         description: String,
         input_schema: Value,
+        strict: bool,
     },
     Freeform {
         name: String,
@@ -620,9 +683,10 @@ pub struct OpenAiCompatibleProvider {
     prompt_cache_key: Option<String>,
     supports_vision: bool,
     compatibility_messages: Arc<AtomicBool>,
+    tool_protocol: ProviderToolProtocolCapabilities,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OpenAiProbeOutcome {
     support: ProviderFeatureSupport,
     detail: Option<String>,
@@ -650,6 +714,10 @@ impl OpenAiCompatibleProvider {
             prompt_cache_key: None,
             supports_vision: true,
             compatibility_messages: Arc::new(AtomicBool::new(compatibility_messages)),
+            tool_protocol: ProviderToolProtocolCapabilities {
+                function_tools: ProviderFeatureSupport::Supported,
+                ..ProviderToolProtocolCapabilities::default()
+            },
         }
     }
 
@@ -718,6 +786,7 @@ impl OpenAiCompatibleProvider {
         self.parallel_tool_calls = settings.parallel_tool_calls;
         self.prompt_cache_key = settings.prompt_cache_key.clone();
         self.supports_vision = settings.supports_vision_for_model();
+        self.tool_protocol = settings.capabilities().tool_protocol;
         if settings.kind == ProviderKind::OpenAiCompatible {
             if let Some(report) = settings
                 .openai_compatibility
@@ -772,7 +841,7 @@ impl OpenAiCompatibleProvider {
             "stream": false,
             "store": false
         });
-        let chat_tools_payload = json!({
+        let chat_strict_tools_payload = json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": "System compatibility probe."},
@@ -786,8 +855,10 @@ impl OpenAiCompatibleProvider {
                     "parameters": {
                         "type": "object",
                         "properties": {"token": {"type": "string", "const": TOOL_PROBE_TOKEN}},
-                        "required": ["token"]
-                    }
+                        "required": ["token"],
+                        "additionalProperties": false
+                    },
+                    "strict": true
                 }
             }],
             "tool_choice": {"type": "function", "function": {"name": "compatibility_probe"}},
@@ -803,7 +874,7 @@ impl OpenAiCompatibleProvider {
             "stream": false,
             "store": false
         });
-        let responses_function_tools_payload = json!({
+        let responses_strict_function_tools_payload = json!({
             "model": self.model,
             "input": format!("Call compatibility_probe exactly once with token {TOOL_PROBE_TOKEN}."),
             "tools": [{
@@ -813,8 +884,10 @@ impl OpenAiCompatibleProvider {
                 "parameters": {
                     "type": "object",
                     "properties": {"token": {"type": "string", "const": TOOL_PROBE_TOKEN}},
-                    "required": ["token"]
-                }
+                    "required": ["token"],
+                    "additionalProperties": false
+                },
+                "strict": true
             }],
             "tool_choice": {"type": "function", "name": "compatibility_probe"},
             "max_output_tokens": 32,
@@ -843,31 +916,48 @@ impl OpenAiCompatibleProvider {
             "stream": false,
             "store": false
         });
+        let mut chat_portable_tools_payload = chat_strict_tools_payload.clone();
+        chat_portable_tools_payload["tools"][0]["function"]
+            .as_object_mut()
+            .expect("chat function probe")
+            .remove("strict");
+        let mut responses_portable_function_tools_payload =
+            responses_strict_function_tools_payload.clone();
+        responses_portable_function_tools_payload["tools"][0]
+            .as_object_mut()
+            .expect("responses function probe")
+            .remove("strict");
+
         let (
             chat,
             responses,
-            chat_function_tools,
+            chat_function_tool_capabilities,
             responses_native_tools,
-            responses_function_tools,
+            responses_function_tool_capabilities,
             responses_custom_tools,
             responses_apply_patch,
         ) = tokio::join!(
             self.probe_openai_endpoint("/chat/completions", chat_payload, false),
             self.probe_openai_endpoint("/responses", responses_payload, false),
-            self.probe_openai_function_tool_roundtrip(
+            self.probe_openai_function_tool_capabilities(
                 "/chat/completions",
-                chat_tools_payload,
+                chat_strict_tools_payload,
+                chat_portable_tools_payload,
                 TOOL_PROBE_TOKEN,
             ),
             self.probe_openai_endpoint("/responses", responses_native_tools_payload, true),
-            self.probe_openai_function_tool_roundtrip(
+            self.probe_openai_function_tool_capabilities(
                 "/responses",
-                responses_function_tools_payload,
+                responses_strict_function_tools_payload,
+                responses_portable_function_tools_payload,
                 TOOL_PROBE_TOKEN,
             ),
             self.probe_openai_endpoint("/responses", responses_custom_tools_payload, true),
             self.probe_openai_endpoint("/responses", responses_apply_patch_payload, true),
         );
+        let (chat_function_tools, chat_strict_function_tools) = chat_function_tool_capabilities;
+        let (responses_function_tools, responses_strict_function_tools) =
+            responses_function_tool_capabilities;
 
         let developer = if chat.support == ProviderFeatureSupport::Supported {
             self.probe_openai_endpoint(
@@ -938,6 +1028,9 @@ impl OpenAiCompatibleProvider {
         if let Some(detail) = chat_function_tools.detail {
             notes.push(format!("Chat function tools: {detail}"));
         }
+        if let Some(detail) = chat_strict_function_tools.detail {
+            notes.push(format!("Chat strict function tools: {detail}"));
+        }
         if let Some(detail) = responses.detail {
             notes.push(format!("Responses: {detail}"));
         }
@@ -946,6 +1039,9 @@ impl OpenAiCompatibleProvider {
         }
         if let Some(detail) = responses_function_tools.detail {
             notes.push(format!("Responses function tools: {detail}"));
+        }
+        if let Some(detail) = responses_strict_function_tools.detail {
+            notes.push(format!("Responses strict function tools: {detail}"));
         }
         if let Some(detail) = responses_custom_tools.detail {
             notes.push(format!("Responses custom tools: {detail}"));
@@ -971,9 +1067,11 @@ impl OpenAiCompatibleProvider {
             selected_protocol,
             chat_completions: chat.support,
             chat_function_tools: chat_function_tools.support,
+            chat_strict_function_tools: chat_strict_function_tools.support,
             responses: responses.support,
             responses_native_tools: responses_native_tools.support,
             responses_function_tools: responses_function_tools.support,
+            responses_strict_function_tools: responses_strict_function_tools.support,
             responses_custom_tools: responses_custom_tools.support,
             responses_apply_patch: responses_apply_patch.support,
             developer_messages: developer.support,
@@ -1134,6 +1232,35 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    async fn probe_openai_function_tool_capabilities(
+        &self,
+        path: &str,
+        strict_payload: Value,
+        portable_payload: Value,
+        expected_token: &str,
+    ) -> (OpenAiProbeOutcome, OpenAiProbeOutcome) {
+        let strict = self
+            .probe_openai_function_tool_roundtrip(path, strict_payload, expected_token)
+            .await;
+        if strict.support == ProviderFeatureSupport::Supported {
+            return (
+                OpenAiProbeOutcome {
+                    support: ProviderFeatureSupport::Supported,
+                    detail: None,
+                },
+                strict,
+            );
+        }
+
+        // A relay may support ordinary function tools while rejecting the
+        // provider-specific `strict` field. Probe the portable shape separately
+        // so strict support never becomes a prerequisite for tool use.
+        let portable = self
+            .probe_openai_function_tool_roundtrip(path, portable_payload, expected_token)
+            .await;
+        (portable, strict)
+    }
+
     pub(crate) fn for_guardian(mut self) -> Self {
         self.temperature = Some(0.0);
         self.max_output_tokens = Some(self.max_output_tokens.unwrap_or(1_024).min(1_024));
@@ -1214,7 +1341,11 @@ impl OpenAiCompatibleProvider {
             }
         }
         if !request.tool_candidates.is_empty() {
-            payload["tools"] = json!(openai_tools(&request.tool_candidates));
+            let mut tool_protocol = self.tool_protocol;
+            if openai_chat_strict_tools_unsupported_cached(&self.base_url, &self.model) {
+                tool_protocol.strict_function_tools = ProviderFeatureSupport::Unsupported;
+            }
+            payload["tools"] = json!(openai_tools(&request.tool_candidates, tool_protocol));
             // DeepSeek V4 thinking mode rejects tool_choice and treats an
             // omitted value as auto. Non-thinking mode accepts the field.
             if !deepseek_thinking_enabled {
@@ -1272,7 +1403,8 @@ impl OpenAiCompatibleProvider {
         if response.status().as_u16() == 400
             && (chat_request_has_compatibility_fallback(&prepared.logical_request)
                 || request_image_part_count(&prepared.logical_request) > 0
-                || prepared.body.get("parallel_tool_calls").is_some())
+                || prepared.body.get("parallel_tool_calls").is_some()
+                || request_uses_strict_function_tools(&prepared.body))
         {
             let rejected_body = response.text().await?;
             attempt = 2;
@@ -1284,6 +1416,17 @@ impl OpenAiCompatibleProvider {
                     body.remove("parallel_tool_calls");
                 }
                 changes.push("parallel_tool_calls");
+            }
+            let rejected_strict_function_tools = request_uses_strict_function_tools(&prepared.body)
+                && provider_rejected_strict_function_tools(&rejected_body);
+            if rejected_strict_function_tools {
+                let mut portable_protocol = self.tool_protocol;
+                portable_protocol.strict_function_tools = ProviderFeatureSupport::Unsupported;
+                prepared.body["tools"] = json!(openai_tools(
+                    &prepared.logical_request.tool_candidates,
+                    portable_protocol,
+                ));
+                changes.push("strict function tools");
             }
             let image_parts = request_image_part_count(&prepared.logical_request);
             if image_parts > 0 && provider_rejected_image_input(&rejected_body) {
@@ -1303,6 +1446,7 @@ impl OpenAiCompatibleProvider {
             }
             if !chat_request_has_compatibility_fallback(&prepared.logical_request)
                 && !rejected_parallel_tool_calls
+                && !rejected_strict_function_tools
             {
                 on_transport(ProviderTransportEvent::Response {
                     attempt: 1,
@@ -1363,6 +1507,9 @@ impl OpenAiCompatibleProvider {
             if rejected_parallel_tool_calls {
                 remember_openai_chat_parallel_tools_unsupported(&self.base_url, &self.model);
             }
+            if rejected_strict_function_tools {
+                remember_openai_chat_strict_tools_unsupported(&self.base_url, &self.model);
+            }
             response = retry;
         }
         let status = response.status();
@@ -1383,9 +1530,7 @@ impl OpenAiCompatibleProvider {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let decoded = decode_openai_chat_response(response, streamed, on_delta, true).await;
-        let response = match decoded.and_then(|response| {
-            validate_provider_tool_response(&prepared.logical_request.tool_candidates, response)
-        }) {
+        let response = match decoded {
             Ok(response) => response,
             Err(error)
                 if streamed
@@ -1408,7 +1553,7 @@ impl OpenAiCompatibleProvider {
                 }
                 on_transport(ProviderTransportEvent::Retry {
                     attempt,
-                    reason: "streamed tool-call arguments violated the provider contract; retrying once with the non-streaming transport"
+                    reason: "streamed tool-call arguments could not be decoded; retrying once with the non-streaming transport"
                         .to_string(),
                     body: redact_transport_value(&prepared.body),
                 })?;
@@ -1433,14 +1578,7 @@ impl OpenAiCompatibleProvider {
                         "provider tool-call compatibility recovery failed ({retry_status}): {retry_body}"
                     );
                 }
-                let recovered = decode_openai_chat_response(retry, false, on_delta, false)
-                    .await
-                    .and_then(|response| {
-                        validate_provider_tool_response(
-                            &prepared.logical_request.tool_candidates,
-                            response,
-                        )
-                    });
+                let recovered = decode_openai_chat_response(retry, false, on_delta, false).await;
                 match recovered {
                     Ok(response) => {
                         remember_openai_chat_nonstream_tools(&self.base_url, &self.model);
@@ -1488,16 +1626,6 @@ fn is_tool_call_protocol_error(error: &anyhow::Error) -> bool {
             .to_string()
             .contains("provider tool-call protocol error")
     })
-}
-
-fn validate_provider_tool_response(
-    candidates: &[ProviderToolCandidate],
-    response: ModelResponse,
-) -> anyhow::Result<ModelResponse> {
-    if let Some(error) = provider_tool_call_schema_error(candidates, &response.tool_calls) {
-        anyhow::bail!(error);
-    }
-    Ok(response)
 }
 
 async fn decode_openai_chat_response(
@@ -1627,6 +1755,11 @@ impl ResponsesRequestError {
         matches!(self.status.as_u16(), 400 | 404 | 422)
             && provider_rejected_parallel_tool_calls(&self.body)
     }
+
+    fn unsupported_strict_function_tools(&self) -> bool {
+        matches!(self.status.as_u16(), 400 | 404 | 422)
+            && provider_rejected_strict_function_tools(&self.body)
+    }
 }
 
 fn responses_request_uses_enhanced_tools(prepared: &PreparedProviderRequest) -> bool {
@@ -1642,6 +1775,38 @@ fn responses_request_uses_enhanced_tools(prepared: &PreparedProviderRequest) -> 
                 )
             })
         })
+}
+
+fn request_uses_strict_function_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("strict").and_then(Value::as_bool) == Some(true)
+                    || tool
+                        .get("function")
+                        .and_then(|function| function.get("strict"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+        })
+}
+
+fn provider_rejected_strict_function_tools(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("strict")
+        && [
+            "unsupported",
+            "not supported",
+            "unknown field",
+            "unknown parameter",
+            "unrecognized",
+            "invalid schema",
+            "invalid tool",
+            "invalid value",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
 }
 
 impl OpenAiResponsesProvider {
@@ -1763,16 +1928,19 @@ impl OpenAiResponsesProvider {
         if self.native_web_search {
             tools.push(json!({ "type": "web_search" }));
         }
-        let tool_protocol = if openai_enhanced_tools_unsupported_cached(&self.base_url, &self.model)
-        {
-            ProviderToolProtocolCapabilities {
-                function_tools: ProviderFeatureSupport::Supported,
-                assistant_phase: self.tool_protocol.assistant_phase,
-                ..ProviderToolProtocolCapabilities::default()
-            }
-        } else {
-            self.tool_protocol
-        };
+        let mut tool_protocol =
+            if openai_enhanced_tools_unsupported_cached(&self.base_url, &self.model) {
+                ProviderToolProtocolCapabilities {
+                    function_tools: ProviderFeatureSupport::Supported,
+                    assistant_phase: self.tool_protocol.assistant_phase,
+                    ..ProviderToolProtocolCapabilities::default()
+                }
+            } else {
+                self.tool_protocol
+            };
+        if openai_responses_strict_tools_unsupported_cached(&self.base_url, &self.model) {
+            tool_protocol.strict_function_tools = ProviderFeatureSupport::Unsupported;
+        }
         tools.extend(responses_tools(&request.tool_candidates, tool_protocol));
         if !tools.is_empty() {
             payload["tools"] = json!(tools);
@@ -3032,6 +3200,10 @@ static OPENAI_CHAT_PARALLEL_TOOLS_UNSUPPORTED_CACHE: OnceLock<StdRwLock<HashSet<
     OnceLock::new();
 static OPENAI_RESPONSES_PARALLEL_TOOLS_UNSUPPORTED_CACHE: OnceLock<StdRwLock<HashSet<String>>> =
     OnceLock::new();
+static OPENAI_CHAT_STRICT_TOOLS_UNSUPPORTED_CACHE: OnceLock<StdRwLock<HashSet<String>>> =
+    OnceLock::new();
+static OPENAI_RESPONSES_STRICT_TOOLS_UNSUPPORTED_CACHE: OnceLock<StdRwLock<HashSet<String>>> =
+    OnceLock::new();
 
 fn openai_compatibility_cache_key(base_url: &str, model: &str) -> String {
     format!(
@@ -3118,6 +3290,52 @@ fn remember_openai_responses_parallel_tools_unsupported(base_url: &str, model: &
     if let Ok(mut cache) = cache.write() {
         cache.insert(openai_compatibility_cache_key(base_url, model));
     }
+}
+
+fn strict_tools_unsupported_cached(
+    cache: &OnceLock<StdRwLock<HashSet<String>>>,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    cache
+        .get()
+        .and_then(|cache| cache.read().ok())
+        .is_some_and(|cache| cache.contains(&openai_compatibility_cache_key(base_url, model)))
+}
+
+fn remember_strict_tools_unsupported(
+    cache: &OnceLock<StdRwLock<HashSet<String>>>,
+    base_url: &str,
+    model: &str,
+) {
+    let cache = cache.get_or_init(|| StdRwLock::new(HashSet::new()));
+    if let Ok(mut cache) = cache.write() {
+        cache.insert(openai_compatibility_cache_key(base_url, model));
+    }
+}
+
+fn openai_chat_strict_tools_unsupported_cached(base_url: &str, model: &str) -> bool {
+    strict_tools_unsupported_cached(&OPENAI_CHAT_STRICT_TOOLS_UNSUPPORTED_CACHE, base_url, model)
+}
+
+fn remember_openai_chat_strict_tools_unsupported(base_url: &str, model: &str) {
+    remember_strict_tools_unsupported(&OPENAI_CHAT_STRICT_TOOLS_UNSUPPORTED_CACHE, base_url, model);
+}
+
+fn openai_responses_strict_tools_unsupported_cached(base_url: &str, model: &str) -> bool {
+    strict_tools_unsupported_cached(
+        &OPENAI_RESPONSES_STRICT_TOOLS_UNSUPPORTED_CACHE,
+        base_url,
+        model,
+    )
+}
+
+fn remember_openai_responses_strict_tools_unsupported(base_url: &str, model: &str) {
+    remember_strict_tools_unsupported(
+        &OPENAI_RESPONSES_STRICT_TOOLS_UNSUPPORTED_CACHE,
+        base_url,
+        model,
+    );
 }
 
 fn model_uses_glm_thinking_control(model: &str) -> bool {
@@ -3745,21 +3963,170 @@ fn portable_function_tool_candidate(candidate: &ProviderToolCandidate) -> Provid
     }
 }
 
-fn openai_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
+fn openai_tools(
+    candidates: &[ProviderToolCandidate],
+    capabilities: ProviderToolProtocolCapabilities,
+) -> Vec<Value> {
     candidates
         .iter()
         .map(|candidate| {
             let candidate = portable_function_tool_candidate(candidate);
+            let strict_capable =
+                capabilities.strict_function_tools == ProviderFeatureSupport::Supported;
+            let strict_schema = strict_capable
+                .then(|| openai_strict_function_schema(&candidate.input_schema))
+                .flatten();
+            let strict = strict_schema.is_some();
+            let input_schema = strict_schema.unwrap_or(candidate.input_schema);
+            let mut function = json!({
+                "name": candidate.name,
+                "description": candidate.description,
+                "parameters": input_schema,
+            });
+            if strict_capable {
+                function["strict"] = json!(strict);
+            }
             json!({
-            "type": "function",
-            "function": {
-                    "name": candidate.name,
-                    "description": candidate.description,
-                    "parameters": candidate.input_schema
-                }
+                "type": "function",
+                "function": function,
             })
         })
         .collect()
+}
+
+/// Lowers the provider-neutral Draft 7 schema into the conservative subset
+/// accepted by OpenAI strict function tools. Failure is per tool: callers keep
+/// the original schema and send `strict: false` rather than weakening every
+/// function definition for the connection.
+fn openai_strict_function_schema(schema: &Value) -> Option<Value> {
+    let mut lowered = schema.clone();
+    lower_openai_strict_schema_node(&mut lowered)?;
+    let root = lowered.as_object()?;
+    let root_is_object = root.get("type").is_some_and(schema_type_includes_object)
+        || root.get("properties").is_some();
+    root_is_object.then_some(lowered)
+}
+
+fn schema_type_includes_object(value: &Value) -> bool {
+    value.as_str() == Some("object")
+        || value
+            .as_array()
+            .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("object")))
+}
+
+fn lower_openai_strict_schema_node(schema: &mut Value) -> Option<()> {
+    let object = schema.as_object_mut()?;
+    for annotation in ["$schema", "title", "default", "examples", "deprecated"] {
+        object.remove(annotation);
+    }
+    if object.keys().any(|keyword| {
+        matches!(
+            keyword.as_str(),
+            "$ref"
+                | "$defs"
+                | "definitions"
+                | "oneOf"
+                | "allOf"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "patternProperties"
+                | "unevaluatedProperties"
+                | "dependentSchemas"
+                | "dependencies"
+        )
+    }) {
+        return None;
+    }
+
+    if let Some(branches) = object.get_mut("anyOf") {
+        for branch in branches.as_array_mut()? {
+            lower_openai_strict_schema_node(branch)?;
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        lower_openai_strict_schema_node(items)?;
+    }
+
+    let is_object = object.get("type").is_some_and(schema_type_includes_object)
+        || object.get("properties").is_some();
+    if !is_object {
+        return Some(());
+    }
+
+    let originally_required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let properties = object
+        .entry("properties")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    let property_names = properties.keys().cloned().collect::<Vec<_>>();
+    for (name, property_schema) in properties.iter_mut() {
+        lower_openai_strict_schema_node(property_schema)?;
+        if !originally_required.contains(name) {
+            make_openai_schema_nullable(property_schema)?;
+        }
+    }
+    object.insert("required".to_string(), json!(property_names));
+    object.insert("additionalProperties".to_string(), Value::Bool(false));
+    Some(())
+}
+
+fn make_openai_schema_nullable(schema: &mut Value) -> Option<()> {
+    let object = schema.as_object_mut()?;
+    if object.get("type").is_some_and(|kind| {
+        kind.as_str() == Some("null")
+            || kind
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("null")))
+    }) || object
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .is_some_and(|branches| {
+            branches
+                .iter()
+                .any(|branch| branch.get("type").and_then(Value::as_str) == Some("null"))
+        })
+    {
+        return Some(());
+    }
+
+    if object.contains_key("const") {
+        let original = std::mem::take(schema);
+        *schema = json!({ "anyOf": [original, { "type": "null" }] });
+        return Some(());
+    }
+    if let Some(kind) = object.get_mut("type") {
+        match kind {
+            Value::String(existing) => {
+                *kind = json!([existing.clone(), "null"]);
+            }
+            Value::Array(types) => types.push(Value::String("null".to_string())),
+            _ => return None,
+        }
+        if let Some(values) = object.get_mut("enum").and_then(Value::as_array_mut) {
+            values.push(Value::Null);
+        }
+        return Some(());
+    }
+    if let Some(branches) = object.get_mut("anyOf").and_then(Value::as_array_mut) {
+        branches.push(json!({ "type": "null" }));
+        return Some(());
+    }
+
+    let original = std::mem::take(schema);
+    *schema = json!({ "anyOf": [original, { "type": "null" }] });
+    Some(())
 }
 
 fn responses_tool_definitions(
@@ -3803,10 +4170,16 @@ fn responses_tool_definitions(
                 }
             } else {
                 let candidate = portable_function_tool_candidate(candidate);
+                let strict_schema = (capabilities.strict_function_tools
+                    == ProviderFeatureSupport::Supported)
+                    .then(|| openai_strict_function_schema(&candidate.input_schema))
+                    .flatten();
+                let strict = strict_schema.is_some();
                 ProviderToolDefinition::Function {
                     name: candidate.name,
                     description: candidate.description,
-                    input_schema: candidate.input_schema,
+                    input_schema: strict_schema.unwrap_or(candidate.input_schema),
+                    strict,
                 }
             }
         })
@@ -3824,12 +4197,13 @@ fn responses_tools(
                 name,
                 description,
                 input_schema,
+                strict,
             } => json!({
                 "type": "function",
                 "name": name,
                 "description": description,
                 "parameters": input_schema,
-                "strict": false,
+                "strict": strict,
             }),
             ProviderToolDefinition::Freeform { name, description } => json!({
                 "type": "custom",
@@ -4963,25 +5337,6 @@ pub(crate) fn tool_input_schema_error(schema: &Value, value: &Value, path: &str)
     None
 }
 
-fn provider_tool_call_schema_error(
-    candidates: &[ProviderToolCandidate],
-    calls: &[ProviderToolCall],
-) -> Option<String> {
-    calls.iter().find_map(|call| {
-        let candidate = candidates
-            .iter()
-            .find(|candidate| candidate.name == call.name)?;
-        tool_input_schema_error(&candidate.input_schema, &call.arguments, "arguments").map(
-            |error| {
-                format!(
-                    "provider tool-call protocol error for '{}' ({}): {error}",
-                    call.name, call.id
-                )
-            },
-        )
-    })
-}
-
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleProvider {
     async fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
@@ -5142,10 +5497,33 @@ impl ModelProvider for OpenAiResponsesProvider {
     ) -> anyhow::Result<ModelResponse> {
         let previous_response_id = prepared.logical_request.previous_response_id.clone();
         let enhanced_tools = responses_request_uses_enhanced_tools(&prepared);
+        let strict_tools = request_uses_strict_function_tools(&prepared.body);
         match self
             .execute_responses_request(prepared.clone(), 1, on_delta, on_transport)
             .await
         {
+            Err(error)
+                if strict_tools
+                    && error
+                        .downcast_ref::<ResponsesRequestError>()
+                        .is_some_and(ResponsesRequestError::unsupported_strict_function_tools) =>
+            {
+                remember_openai_responses_strict_tools_unsupported(&self.base_url, &self.model);
+                let mut portable_provider = self.clone();
+                portable_provider.tool_protocol.strict_function_tools =
+                    ProviderFeatureSupport::Unsupported;
+                let replay = portable_provider
+                    .prepare_responses_request(prepared.request_id, prepared.logical_request)?;
+                on_transport(ProviderTransportEvent::Retry {
+                    attempt: 2,
+                    reason: "strict function tools unsupported; retrying portable schemas"
+                        .to_string(),
+                    body: replay.observation_body.clone(),
+                })?;
+                portable_provider
+                    .execute_responses_request(replay, 2, on_delta, on_transport)
+                    .await
+            }
             Err(error)
                 if error
                     .downcast_ref::<ResponsesRequestError>()
@@ -6366,6 +6744,56 @@ mod tests {
             prompt_cache_key: None,
             final_output_json_schema: None,
         }
+    }
+
+    #[test]
+    fn token_estimate_breakdown_attributes_materialized_context_and_schemas() {
+        let mut request = model_request();
+        request.system_prompt = "must not be counted twice".to_string();
+        request.context_items = vec![
+            ModelContextItem::text(
+                ContextItemKind::BaseInstructions,
+                ContextRole::System,
+                "base",
+                "base instructions",
+                ContextCacheScope::Stable,
+                crate::model_context::ContextSensitivity::Public,
+            ),
+            ModelContextItem::text(
+                ContextItemKind::User,
+                ContextRole::User,
+                "current",
+                "question",
+                ContextCacheScope::Turn,
+                crate::model_context::ContextSensitivity::Workspace,
+            ),
+        ];
+        request.branch_developer_instructions = Some("branch rules".to_string());
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "read_file".to_string(),
+            description: "Read one file".to_string(),
+            input_schema: json!({"type": "object"}),
+        }];
+
+        let breakdown = request.token_estimate_breakdown();
+
+        assert_eq!(
+            breakdown.base_instructions,
+            request.context_items[0].token_estimate
+        );
+        assert_eq!(
+            breakdown.current_user,
+            request.context_items[1].token_estimate
+        );
+        assert!(breakdown.developer_instructions > 0);
+        assert!(breakdown.tool_schemas > 0);
+        assert_eq!(
+            breakdown.total,
+            breakdown.base_instructions
+                + breakdown.developer_instructions
+                + breakdown.current_user
+                + breakdown.tool_schemas
+        );
     }
 
     #[test]
@@ -8037,7 +8465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_provider_recovers_invalid_streamed_tool_arguments_once_and_caches_transport() {
+    async fn chat_provider_recovers_malformed_streamed_tool_arguments_once_and_caches_transport() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8050,7 +8478,7 @@ mod tests {
                         "HTTP/1.1 200 OK\r\n",
                         "Content-Type: text/event-stream\r\n",
                         "Connection: close\r\n\r\n",
-                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_shell\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_shell\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                         "data: [DONE]\n\n"
                     )
                     .as_bytes(),
@@ -8114,6 +8542,156 @@ mod tests {
         let cached = provider.prepare(Uuid::new_v4(), request).unwrap();
         assert_eq!(cached.body["stream"], false);
         assert!(cached.body.get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_provider_returns_schema_mismatched_arguments_without_transport_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            assert!(request.contains(r#""stream":true"#));
+            socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_shell\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1"),
+            "test-key",
+            "schema-mismatch-model",
+        );
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "shell".to_string(),
+            description: "Run a command".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }),
+        }];
+        let mut transport = Vec::new();
+        let response = provider
+            .stream_prepared(
+                provider.prepare(Uuid::new_v4(), request.clone()).unwrap(),
+                &mut |_| Ok(()),
+                &mut |event| {
+                    transport.push(event);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.tool_calls[0].arguments, json!({}));
+        assert!(!transport
+            .iter()
+            .any(|event| matches!(event, ProviderTransportEvent::Retry { .. })));
+        let next = provider.prepare(Uuid::new_v4(), request).unwrap();
+        assert_eq!(next.body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn chat_strict_rejection_retries_with_the_original_portable_schema() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_http_request(&mut first).await;
+            let first_body =
+                serde_json::from_str::<Value>(first_request.split("\r\n\r\n").nth(1).unwrap())
+                    .unwrap();
+            assert_eq!(first_body["tools"][0]["function"]["strict"], true);
+            assert_eq!(
+                first_body["tools"][0]["function"]["parameters"]["required"],
+                json!(["limit", "query"])
+            );
+            let rejected = r#"{"error":{"message":"strict function tools are not supported"}}"#;
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        rejected.len(), rejected
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first.shutdown().await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let second_request = read_http_request(&mut second).await;
+            let second_body =
+                serde_json::from_str::<Value>(second_request.split("\r\n\r\n").nth(1).unwrap())
+                    .unwrap();
+            let function = &second_body["tools"][0]["function"];
+            assert!(function.get("strict").is_none());
+            assert_eq!(function["parameters"]["required"], json!(["query"]));
+            second
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            second.shutdown().await.unwrap();
+        });
+
+        let mut provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1"),
+            "test-key",
+            "strict-runtime-fallback-model",
+        );
+        provider.tool_protocol.strict_function_tools = ProviderFeatureSupport::Supported;
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "search".to_string(),
+            description: "Search records.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["query"]
+            }),
+        }];
+
+        let response = provider
+            .stream_prepared(
+                provider.prepare(Uuid::new_v4(), request.clone()).unwrap(),
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.text, "OK");
+        let cached = provider.prepare(Uuid::new_v4(), request).unwrap();
+        let function = &cached.body["tools"][0]["function"];
+        assert!(function.get("strict").is_none());
+        assert_eq!(function["parameters"]["required"], json!(["query"]));
     }
 
     #[tokio::test]
@@ -8277,7 +8855,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..8 {
+            // Responses is unavailable, so its strict function-tool probe falls
+            // back once to the portable shape before the developer-role probe.
+            for _ in 0..9 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut socket).await;
                 let is_responses = request.starts_with("POST /v1/responses ");
@@ -8807,7 +9387,10 @@ mod tests {
             }),
         };
 
-        let chat_tools = openai_tools(std::slice::from_ref(&candidate));
+        let chat_tools = openai_tools(
+            std::slice::from_ref(&candidate),
+            ProviderToolProtocolCapabilities::default(),
+        );
         let chat_function = &chat_tools[0]["function"];
         assert_eq!(chat_function["parameters"]["required"], json!(["patch"]));
         assert_eq!(
@@ -8837,6 +9420,123 @@ mod tests {
             json!(["patch"])
         );
         assert!(responses_tools[0]["parameters"].get("anyOf").is_none());
+    }
+
+    #[test]
+    fn strict_function_schema_is_lowered_per_provider_and_per_tool() {
+        let strict_capabilities = ProviderToolProtocolCapabilities {
+            function_tools: ProviderFeatureSupport::Supported,
+            strict_function_tools: ProviderFeatureSupport::Supported,
+            ..ProviderToolProtocolCapabilities::default()
+        };
+        let strict_ready = ProviderToolCandidate {
+            name: "search".to_string(),
+            description: "Search records.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1}
+                },
+                "required": ["query"]
+            }),
+        };
+
+        let chat = openai_tools(std::slice::from_ref(&strict_ready), strict_capabilities);
+        let chat_function = &chat[0]["function"];
+        assert_eq!(chat_function["strict"], true);
+        assert_eq!(
+            chat_function["parameters"]["required"],
+            json!(["limit", "query"])
+        );
+        assert_eq!(
+            chat_function["parameters"]["properties"]["limit"]["type"],
+            json!(["integer", "null"])
+        );
+        assert_eq!(chat_function["parameters"]["additionalProperties"], false);
+
+        let responses = responses_tools(std::slice::from_ref(&strict_ready), strict_capabilities);
+        assert_eq!(responses[0]["strict"], true);
+        assert_eq!(
+            responses[0]["parameters"]["properties"]["limit"]["type"],
+            json!(["integer", "null"])
+        );
+
+        let portable_only = ProviderToolCandidate {
+            name: "choose".to_string(),
+            description: "Choose exactly one shape.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "oneOf": [
+                    {"type": "object", "properties": {"a": {"type": "string"}}},
+                    {"type": "object", "properties": {"b": {"type": "string"}}}
+                ]
+            }),
+        };
+        let fallback = responses_tools(&[portable_only.clone()], strict_capabilities);
+        assert_eq!(fallback[0]["strict"], false);
+        assert!(fallback[0]["parameters"].get("oneOf").is_some());
+        let chat_fallback = openai_tools(&[portable_only], strict_capabilities);
+        assert_eq!(chat_fallback[0]["function"]["strict"], false);
+    }
+
+    #[test]
+    fn runtime_strict_rejection_cache_downgrades_each_openai_transport() {
+        let candidate = ProviderToolCandidate {
+            name: "search".to_string(),
+            description: "Search records.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["query"]
+            }),
+        };
+        let capabilities = ProviderToolProtocolCapabilities {
+            function_tools: ProviderFeatureSupport::Supported,
+            strict_function_tools: ProviderFeatureSupport::Supported,
+            ..ProviderToolProtocolCapabilities::default()
+        };
+
+        let mut chat = OpenAiCompatibleProvider::new(
+            "https://strict-chat-fallback.example/v1",
+            "secret",
+            "opaque-chat-model",
+        );
+        chat.tool_protocol = capabilities;
+        remember_openai_chat_strict_tools_unsupported(&chat.base_url, &chat.model);
+        let mut chat_request = model_request();
+        chat_request.tool_candidates = vec![candidate.clone()];
+        let chat_prepared = chat.prepare(Uuid::nil(), chat_request).unwrap();
+        let chat_function = &chat_prepared.body["tools"][0]["function"];
+        assert!(chat_function.get("strict").is_none());
+        assert_eq!(chat_function["parameters"]["required"], json!(["query"]));
+
+        let mut responses = OpenAiResponsesProvider::new(
+            "https://strict-responses-fallback.example/v1",
+            "secret",
+            "opaque-responses-model",
+        );
+        responses.tool_protocol = capabilities;
+        remember_openai_responses_strict_tools_unsupported(&responses.base_url, &responses.model);
+        let mut responses_request = model_request();
+        responses_request.tool_candidates = vec![candidate];
+        let responses_prepared = responses
+            .prepare_responses_request(Uuid::nil(), responses_request)
+            .unwrap();
+        let responses_function = responses_prepared.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.get("name") == Some(&json!("search")))
+            .expect("portable Responses function");
+        assert_eq!(responses_function["strict"], false);
+        assert_eq!(
+            responses_function["parameters"]["required"],
+            json!(["query"])
+        );
     }
 
     #[test]

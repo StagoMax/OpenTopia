@@ -494,7 +494,9 @@ fn flow_capabilities(state: &AppState, thread_id: Uuid) -> Result<CapabilityProj
     {
         let mut capabilities = instance.execution_context.capabilities;
         if !capabilities.allow_all_tools {
-            capabilities.tools.extend(surface.tools);
+            capabilities
+                .tools
+                .extend(ExperienceSurfaceProfile::flow_control_tools());
         }
         return Ok(capabilities);
     }

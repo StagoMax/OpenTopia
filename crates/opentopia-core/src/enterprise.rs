@@ -165,6 +165,26 @@ pub struct ExperienceSurfaceProfile {
 }
 
 impl ExperienceSurfaceProfile {
+    pub fn flow_control_tools() -> BTreeSet<String> {
+        [
+            "flow_search",
+            "flow_create",
+            "flow_update",
+            "flow_inspect",
+            "flow_validate",
+            "flow_simulate",
+            "flow_publish",
+            "flow_run",
+            "flow_status",
+            "flow_pause",
+            "flow_resume",
+            "flow_cancel",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
     pub fn for_mode(mode: ExperienceMode) -> Self {
         match mode {
             ExperienceMode::Code => Self {
@@ -179,43 +199,15 @@ impl ExperienceSurfaceProfile {
                 enterprise_only: false,
                 capabilities: CapabilityProjection::unrestricted(),
             },
-            ExperienceMode::Flow => {
-                let mut capabilities = CapabilityProjection::only_tools([
-                    "list_files",
-                    "read_file",
-                    "read_files",
-                    "search",
-                    "git_diff",
-                    "list_skills",
-                    "read_skill",
-                    "flow_search",
-                    "flow_create",
-                    "flow_update",
-                    "flow_inspect",
-                    "flow_validate",
-                    "flow_simulate",
-                    "flow_publish",
-                    "flow_run",
-                    "flow_status",
-                    "flow_pause",
-                    "flow_resume",
-                    "flow_cancel",
-                    "complete_task",
-                ]);
-                // Flow design is control-plane work. External plugins and MCP
-                // remain opt-in through an Agent template rather than being
-                // inherited from Code/Work mode.
-                capabilities.allow_all_plugins = false;
-                capabilities.plugins.clear();
-                capabilities.allow_all_mcp_servers = false;
-                capabilities.mcp_servers.clear();
-                Self {
-                    mode,
-                    prompt_profile_id: "flow.v1".to_string(),
-                    enterprise_only: true,
-                    capabilities,
-                }
-            }
+            ExperienceMode::Flow => Self {
+                mode,
+                prompt_profile_id: "flow.v1".to_string(),
+                enterprise_only: true,
+                // Flow coordinates work that can span every Work and Code
+                // capability. ExecutionContext projections may still narrow
+                // this unrestricted surface for a bound Agent or Flow run.
+                capabilities: CapabilityProjection::unrestricted(),
+            },
         }
     }
 }
@@ -1567,15 +1559,22 @@ mod tests {
     }
 
     #[test]
-    fn flow_profile_is_enterprise_only_and_excludes_external_capabilities() {
+    fn flow_profile_is_enterprise_only_and_inherits_full_capabilities() {
         let profile = ExperienceSurfaceProfile::for_mode(ExperienceMode::Flow);
         assert!(profile.enterprise_only);
         assert!(profile.capabilities.allows_tool("read_file"));
+        assert!(profile.capabilities.allows_tool("read_attachment"));
+        assert!(profile.capabilities.allows_tool("spreadsheet"));
+        assert!(profile.capabilities.allows_tool("shell"));
+        assert!(profile.capabilities.allows_tool("write_file"));
         assert!(profile.capabilities.allows_tool("flow_run"));
         assert!(profile.capabilities.allows_tool("flow_status"));
-        assert!(!profile.capabilities.allows_tool("shell"));
-        assert!(!profile.capabilities.allows_plugin("browser-automation"));
-        assert!(!profile.capabilities.allows_mcp_server("server-1"));
+        assert!(profile.capabilities.allows_plugin("browser-automation"));
+        assert!(profile.capabilities.allows_mcp_server("server-1"));
+        assert!(profile.capabilities.allow_all_workspace_roots);
+        assert!(ExperienceSurfaceProfile::flow_control_tools()
+            .iter()
+            .all(|tool| profile.capabilities.allows_tool(tool)));
     }
 
     #[test]

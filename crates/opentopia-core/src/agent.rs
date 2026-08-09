@@ -14,15 +14,15 @@ use crate::flow_runtime::{
 };
 use crate::guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext,
-    GuardianReviewSessionManager, GuardianReviewStatus, GuardianRolloutDecision,
-    GuardianRolloutReviewContext, GuardianRolloutReviewResult,
+    GuardianReviewSessionManager, GuardianReviewStatus,
 };
 use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
     AgentEventPayload, ApprovalStatus, CollaborationMode, GoalRecord, Message, MessagePart,
-    MessageRole, ModelContentPart, TaskEvidenceKind, TaskPlan, TaskPlanStepStatus,
-    ThreadModelSelection, ToolCall, ToolResult, UserInputRequest, UserInputResponse,
+    MessageRole, ModelCallPurpose, ModelContentPart, TaskEvidenceKind, TaskPlan,
+    TaskPlanStepStatus, ThreadModelSelection, ToolCall, ToolResult, UserInputRequest,
+    UserInputResponse,
 };
 use crate::model_context::{
     content_fingerprint, CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole,
@@ -73,16 +73,9 @@ const MAX_FINALIZATION_GUARD_ACTIVATIONS: usize = 3;
 const TOOL_SEARCH_NAME: &str = "tool_search";
 const AUTOMATIC_TOOL_DISCLOSURE_THRESHOLD: usize = 32;
 const MAX_TOOL_SEARCH_RESULTS: usize = 12;
-const ROLLOUT_REVIEW_TOOL_NAME: &str = "runtime_rollout_review";
+const ROLLOUT_CHECKPOINT_TOOL_NAME: &str = "runtime_rollout_checkpoint";
 const ROLLOUT_REVIEW_INTERVAL: usize = 90;
 const MAX_ROLLOUT_MODEL_ROUNDS: usize = 270;
-/// Round count is a coarse progress proxy, so a review is also scheduled when the
-/// shared rollout budget crosses one of these remaining-token fractions. A turn
-/// that burns tokens quickly is inspected long before round 90.
-const ROLLOUT_REVIEW_BUDGET_BANDS: [f64; 3] = [0.5, 0.25, 0.10];
-/// Reviews cost a full reviewer round trip each, so the extra budget-band triggers
-/// stay bounded rather than firing once per band per interval.
-const MAX_ROLLOUT_REVIEWS: usize = 6;
 
 /// Controls how much of the executable tool catalog is sent to the model.
 ///
@@ -101,27 +94,19 @@ impl Default for ToolExposurePolicy {
         Self::Automatic
     }
 }
-/// A short turn can cross a budget band simply because the work was expensive, not
-/// because it went wrong, and a reviewer has almost nothing to judge that early.
-/// Budget-band reviews therefore wait until a turn has a real history behind it;
-/// the budget reminder itself still reaches the model from the first crossing.
-const MIN_ROUNDS_BEFORE_BUDGET_REVIEW: usize = 8;
-/// How many recent tool-call signatures to keep when looking for a stalled agent.
-const STALL_SIGNATURE_WINDOW: usize = 12;
-/// How often the same signature may repeat inside the window before the runtime
-/// tells the model it looks stuck.
-const STALL_REPEAT_THRESHOLD: usize = 3;
+/// How many recent tool-call signatures to retain for objective repetition telemetry.
+const REPEATED_TOOL_CALL_WINDOW: usize = 12;
+/// Minimum occurrences inside the retained window before reporting the counts.
+/// This controls telemetry noise; it is not a progress or convergence judgement.
+const REPEATED_TOOL_CALL_REPORT_THRESHOLD: usize = 3;
 /// Invalid calls are never useful polling. Stop the turn once a provider repeats
 /// the exact same schema-invalid call instead of spending the rollout budget on it.
 const INVALID_TOOL_CALL_REPEAT_LIMIT: usize = 3;
 /// Keep independent tool work bounded so a provider cannot fan out an
 /// unbounded number of processes, writes, or external calls in one model round.
 const MAX_PARALLEL_TOOL_CALLS: usize = 8;
-/// Repeating a call a few times early in a turn is normal, so detection only starts
-/// once enough rounds exist to form a pattern.
-const MIN_ROUNDS_BEFORE_STALL_DETECTION: usize = 6;
-/// Rounds to wait before restating a stall observation the model already saw.
-const STALL_REMINDER_COOLDOWN_ROUNDS: usize = 12;
+/// Rounds to wait before restating repetition telemetry the model already received.
+const REPEATED_TOOL_CALL_REPORT_COOLDOWN_ROUNDS: usize = 12;
 
 pub type AgentEventSender = mpsc::UnboundedSender<AgentEventPayload>;
 
@@ -265,7 +250,7 @@ struct StepReminderBatch {
     budget_reminder: Option<RolloutBudgetReminder>,
     reported_agent_runs: Vec<Uuid>,
     reported_background_jobs: Vec<Uuid>,
-    stall_reminder_round: Option<usize>,
+    repeated_tool_call_report_round: Option<usize>,
 }
 
 /// Loop-carried bookkeeping for a single turn.
@@ -278,15 +263,12 @@ pub struct TurnRuntimeState {
     /// Subagent runs whose terminal result has already been surfaced to the model.
     #[serde(default)]
     reported_agent_runs: Vec<Uuid>,
-    /// Recent tool-call signatures, oldest first, used for stall detection.
+    /// Recent canonical tool-call signatures, oldest first, used only for telemetry.
     #[serde(default)]
     tool_call_signatures: Vec<String>,
-    /// Number of rollout-budget bands that have already scheduled a review.
-    #[serde(default)]
-    reviewed_budget_bands: usize,
-    /// Round at which the model last received a stall observation.
-    #[serde(default)]
-    last_stall_reminder_round: Option<usize>,
+    /// Round at which the model last received repetition telemetry.
+    #[serde(default, alias = "lastStallReminderRound")]
+    last_repeated_tool_call_report_round: Option<usize>,
     /// Exact provider call ids covered by one user-visible batch approval.
     /// Empty outside a suspended approval boundary.
     #[serde(default)]
@@ -302,32 +284,39 @@ impl TurnRuntimeState {
                 canonical_json_string(&call.arguments)
             ));
         }
-        if self.tool_call_signatures.len() > STALL_SIGNATURE_WINDOW {
-            let excess = self.tool_call_signatures.len() - STALL_SIGNATURE_WINDOW;
+        if self.tool_call_signatures.len() > REPEATED_TOOL_CALL_WINDOW {
+            let excess = self.tool_call_signatures.len() - REPEATED_TOOL_CALL_WINDOW;
             self.tool_call_signatures.drain(..excess);
         }
     }
 
-    /// Returns the repeated call and its count when the recent window suggests the
-    /// agent is retrying the same action without changing anything.
-    fn stalled_signature(&self) -> Option<(&str, usize)> {
+    /// Returns objective occurrence counts for canonical calls repeated inside
+    /// the retained window. No progress meaning is assigned to the repetition.
+    fn repeated_tool_call_counts(&self) -> Vec<(&str, usize)> {
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for signature in &self.tool_call_signatures {
             *counts.entry(signature.as_str()).or_default() += 1;
         }
-        counts
+        let mut repeated = counts
             .into_iter()
-            .max_by_key(|(_, count)| *count)
-            .filter(|(_, count)| *count >= STALL_REPEAT_THRESHOLD)
+            .filter(|(_, count)| *count >= REPEATED_TOOL_CALL_REPORT_THRESHOLD)
+            .collect::<Vec<_>>();
+        repeated.sort_by(
+            |(left_signature, left_count), (right_signature, right_count)| {
+                right_count
+                    .cmp(left_count)
+                    .then_with(|| left_signature.cmp(right_signature))
+            },
+        );
+        repeated
     }
 
-    fn stall_reminder_due(&self, model_rounds: usize) -> bool {
-        if model_rounds < MIN_ROUNDS_BEFORE_STALL_DETECTION {
-            return false;
-        }
-        match self.last_stall_reminder_round {
+    fn repeated_tool_call_report_due(&self, model_rounds: usize) -> bool {
+        match self.last_repeated_tool_call_report_round {
             None => true,
-            Some(last) => model_rounds.saturating_sub(last) >= STALL_REMINDER_COOLDOWN_ROUNDS,
+            Some(last) => {
+                model_rounds.saturating_sub(last) >= REPEATED_TOOL_CALL_REPORT_COOLDOWN_ROUNDS
+            }
         }
     }
 }
@@ -439,13 +428,6 @@ impl RolloutBudget {
         (self.settings.limit_tokens as f64 - self.weighted_tokens_used)
             .max(0.0)
             .floor() as u64
-    }
-
-    fn remaining_fraction(&self) -> f64 {
-        if self.settings.limit_tokens == 0 {
-            return 0.0;
-        }
-        (self.remaining_tokens() as f64 / self.settings.limit_tokens as f64).clamp(0.0, 1.0)
     }
 
     /// Returns the reminder that is due without consuming it.
@@ -1128,16 +1110,30 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             batch.budget_reminder = Some(reminder);
         }
 
-        if runtime_state.stall_reminder_due(model_rounds) {
-            if let Some((signature, count)) = runtime_state.stalled_signature() {
+        if runtime_state.repeated_tool_call_report_due(model_rounds) {
+            let repeated_calls = runtime_state.repeated_tool_call_counts();
+            if !repeated_calls.is_empty() {
+                let counts = repeated_calls
+                    .iter()
+                    .map(|(signature, count)| {
+                        json!({
+                            "toolAndArguments": truncate_for_summary(signature, 400),
+                            "occurrences": count,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let telemetry = json!({
+                    "windowSize": runtime_state.tool_call_signatures.len(),
+                    "windowLimit": REPEATED_TOOL_CALL_WINDOW,
+                    "groupedBy": "tool name and JSON arguments; provider call id excluded",
+                    "minimumReportedOccurrences": REPEATED_TOOL_CALL_REPORT_THRESHOLD,
+                    "counts": counts,
+                });
                 batch.reminders.push(StepReminder {
                     stage: "repeated_tool_calls",
-                    content: format!(
-                        "[Repeated tool calls]\nThe same call has now run {count} times inside the last {STALL_SIGNATURE_WINDOW} tool calls: {}\nIf those repeats were deliberate, ignore this note. Otherwise the current approach is probably not converging: change the approach, gather different evidence, or report what is blocking you instead of retrying the same action.",
-                        truncate_for_summary(signature, 400)
-                    ),
+                    content: format!("[Repeated tool-call telemetry]\n{telemetry}"),
                 });
-                batch.stall_reminder_round = Some(model_rounds);
+                batch.repeated_tool_call_report_round = Some(model_rounds);
             }
         }
 
@@ -1171,8 +1167,8 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         runtime_state
             .reported_agent_runs
             .extend(batch.reported_agent_runs);
-        if let Some(round) = batch.stall_reminder_round {
-            runtime_state.last_stall_reminder_round = Some(round);
+        if let Some(round) = batch.repeated_tool_call_report_round {
+            runtime_state.last_repeated_tool_call_report_round = Some(round);
         }
     }
 
@@ -1463,53 +1459,59 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         Ok(Some(FinalizationGuardIntervention { agent_delivery }))
     }
 
-    /// Hands a progress review back to the model as evidence.
+    /// Delivers an objective long-rollout checkpoint to the main model.
     ///
-    /// A reviewer that wants the turn to end says so here rather than ending it:
-    /// below the hard round limit the recommendation is advisory, because the model
-    /// holds context the reviewer cannot see and is better placed to judge whether
-    /// the remaining work is worth another round.
-    fn apply_rollout_review_observation(
+    /// The harness reports counters and recorded plan state but makes no semantic
+    /// judgement about progress. The main model owns the continue/finish decision.
+    fn apply_rollout_checkpoint_observation(
         &self,
-        observation: RolloutReviewObservation<'_>,
+        observation: RolloutCheckpointObservation<'_>,
         provider_tool_calls: &mut Vec<ProviderToolCall>,
         provider_tool_results: &mut Vec<ProviderToolResult>,
         provider_response_items: &mut Vec<Value>,
     ) -> anyhow::Result<()> {
-        let RolloutReviewObservation {
+        let RolloutCheckpointObservation {
             model_rounds,
-            trigger,
-            review,
             remaining_budget_tokens,
+            task_plan,
         } = observation;
-        let recommends_stop = review.decision == GuardianRolloutDecision::Stop;
-        let required_action = if recommends_stop {
-            json!([
-                "The reviewer recommends ending the turn. Finalize now if the recommendation is right, summarizing what is done and what remains.",
-                "You may continue instead, but only with a concrete next action and a short statement of why the reviewer's concern does not apply.",
-            ])
-        } else {
-            json!([
-                "Use the review guidance to choose a concrete next action that can produce measurable progress.",
-                "Do not repeat a stalled strategy merely by renaming or rearranging its steps.",
-            ])
-        };
+        let plan = task_plan.map(|plan| {
+            let count = |status| {
+                plan.steps
+                    .iter()
+                    .filter(|step| step.status == status)
+                    .count()
+            };
+            json!({
+                "goalId": plan.goal_id,
+                "planRevision": plan.plan_revision,
+                "stepCounts": {
+                    "pending": count(TaskPlanStepStatus::Pending),
+                    "inProgress": count(TaskPlanStepStatus::InProgress),
+                    "completed": count(TaskPlanStepStatus::Completed),
+                    "deferred": count(TaskPlanStepStatus::Deferred),
+                    "blocked": count(TaskPlanStepStatus::Blocked),
+                    "cancelled": count(TaskPlanStepStatus::Cancelled),
+                }
+            })
+        });
         let payload = json!({
-            "status": if recommends_stop { "stop_recommended" } else { "continue_approved" },
-            "decision": if recommends_stop { "stop" } else { "continue" },
-            "advisory": true,
-            "trigger": trigger.as_str(),
+            "status": "self_review_required",
+            "decision": null,
+            "trigger": "round_interval",
             "completedModelRounds": model_rounds,
             "maximumModelRounds": MAX_ROLLOUT_MODEL_ROUNDS,
             "remainingBudgetTokens": remaining_budget_tokens,
-            "rationale": review.rationale,
-            "guidance": review.message,
-            "requiredAction": required_action,
+            "recordedPlan": plan,
+            "requiredAction": [
+                "Review the original user request, current evidence, recorded plan, and remaining resources.",
+                "Decide yourself whether to continue, change approach, finish, or report a concrete blocker. The runtime has not made a progress judgement."
+            ],
         });
-        let call_id = format!("rollout_review_{}", Uuid::new_v4());
+        let call_id = format!("rollout_checkpoint_{}", Uuid::new_v4());
         let call = ProviderToolCall {
             id: call_id.clone(),
-            name: ROLLOUT_REVIEW_TOOL_NAME.to_string(),
+            name: ROLLOUT_CHECKPOINT_TOOL_NAME.to_string(),
             arguments: json!({
                 "completedModelRounds": model_rounds,
                 "agentPath": self.agent_path,
@@ -1518,18 +1520,18 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         provider_response_items.push(json!({
             "type": "function_call",
             "call_id": call_id,
-            "name": ROLLOUT_REVIEW_TOOL_NAME,
+            "name": ROLLOUT_CHECKPOINT_TOOL_NAME,
             "arguments": call.arguments.to_string(),
         }));
         provider_tool_calls.push(call);
         provider_tool_results.push(ProviderToolResult {
             call_id,
-            name: ROLLOUT_REVIEW_TOOL_NAME.to_string(),
+            name: ROLLOUT_CHECKPOINT_TOOL_NAME.to_string(),
             output: serde_json::to_string_pretty(&payload)?,
             content: vec![ModelContentPart::json(payload)],
             is_error: false,
             metadata: json!({
-                "runtimeGuard": "rollout_review",
+                "runtimeGuard": "rollout_checkpoint",
                 "success": true,
             }),
         });
@@ -2938,130 +2940,30 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 }
             }
 
-            if let Some(trigger) = rollout_review_trigger(
-                model_rounds,
-                rollout_reviews,
-                rollout_budget.as_ref(),
-                &runtime_state,
-            ) {
-                let hard_limit_reached = model_rounds >= MAX_ROLLOUT_MODEL_ROUNDS;
-                events.push(AgentEventPayload::ContextWarning {
-                    stage: "rollout_review_started".to_string(),
-                    message: format!(
-                        "Reviewing progress after {model_rounds} completed main-model rounds ({}).",
-                        trigger.as_str()
-                    ),
-                });
+            if model_rounds >= MAX_ROLLOUT_MODEL_ROUNDS {
+                return Ok(finalize_rollout_hard_limit_turn(
+                    thread_id,
+                    model_rounds,
+                    std::mem::replace(events, TurnEvents::new(None)),
+                ));
+            }
+
+            if rollout_checkpoint_due(model_rounds, rollout_reviews) {
+                rollout_reviews = rollout_reviews.saturating_add(1);
                 let latest_plan = latest_task_plan(events, &provider_tool_results);
-                let review_result = self
-                    .guardian
-                    .review_rollout(
-                        thread_id,
-                        user_message_id,
-                        GuardianRolloutReviewContext {
-                            parent: GuardianReviewContext {
-                                conversation: &conversation,
-                                current_user_message: &model_user_message,
-                                tool_calls: &provider_tool_calls,
-                                tool_results: &provider_tool_results,
-                                workspace_root: &workspace_root,
-                                sandbox_config: &self.sandbox_config,
-                            },
-                            model_rounds,
-                            max_model_rounds: MAX_ROLLOUT_MODEL_ROUNDS,
-                            hard_limit_reached,
-                            compacted_tool_history: &compacted_tool_history,
-                            task_plan: latest_plan.as_ref(),
-                        },
-                        cancellation.as_ref(),
-                    )
-                    .await;
-                if cancellation
-                    .as_ref()
-                    .is_some_and(CancellationToken::is_cancelled)
-                {
-                    anyhow::bail!("cancelled");
-                }
-                match trigger {
-                    RolloutReviewTrigger::BudgetBand(band) => {
-                        runtime_state.reviewed_budget_bands = band.saturating_add(1);
-                    }
-                    RolloutReviewTrigger::RoundInterval | RolloutReviewTrigger::HardLimit => {
-                        rollout_reviews = rollout_reviews.saturating_add(1);
-                    }
-                }
-                let review = review_result.unwrap_or_else(|error| {
-                    if hard_limit_reached {
-                        GuardianRolloutReviewResult {
-                            decision: GuardianRolloutDecision::Stop,
-                            rationale: format!(
-                                "The runtime hard limit of {MAX_ROLLOUT_MODEL_ROUNDS} main-model rounds was reached; the final reviewer decision was invalid: {error}"
-                            ),
-                            message: format!(
-                                "The task reached the hard limit of {MAX_ROLLOUT_MODEL_ROUNDS} model rounds and was stopped. Completed work is preserved; any unfinished work remains partial."
-                            ),
-                        }
-                    } else {
-                        // Below the hard limit a reviewer outage must not end the
-                        // user's turn. Report the gap and let the model carry on.
-                        GuardianRolloutReviewResult {
-                            decision: GuardianRolloutDecision::Continue,
-                            rationale: format!(
-                                "The progress reviewer could not produce a valid decision: {error}"
-                            ),
-                            message: format!(
-                                "No reviewer guidance is available at this checkpoint after {model_rounds} model rounds. Re-check your own progress against the original request before spending another round."
-                            ),
-                        }
-                    }
-                });
-                let review = if hard_limit_reached
-                    && review.decision == GuardianRolloutDecision::Continue
-                {
-                    GuardianRolloutReviewResult {
-                        decision: GuardianRolloutDecision::Stop,
-                        rationale: format!(
-                            "The runtime hard limit of {MAX_ROLLOUT_MODEL_ROUNDS} main-model rounds was reached."
-                        ),
-                        message: format!(
-                            "The task reached the hard limit of {MAX_ROLLOUT_MODEL_ROUNDS} model rounds and was stopped. Completed work is preserved; any unfinished work remains partial."
-                        ),
-                    }
-                } else {
-                    review
-                };
                 events.push(AgentEventPayload::ContextWarning {
-                    stage: "rollout_review_completed".to_string(),
+                    stage: "rollout_self_review_checkpoint".to_string(),
                     message: format!(
-                        "Rollout reviewer decided {:?} after {model_rounds} completed main-model rounds{}: {}",
-                        review.decision,
-                        if hard_limit_reached {
-                            ""
-                        } else {
-                            " (advisory)"
-                        },
-                        review.rationale
+                        "Main-model self-review checkpoint after {model_rounds} completed rounds; the runtime supplied counters without making a progress decision."
                     ),
                 });
-                // Only the hard round limit ends a turn on the runtime's authority.
-                // A reviewer that wants to stop earlier states its case to the model,
-                // which holds the context needed to judge whether it is right.
-                if review.decision == GuardianRolloutDecision::Stop && hard_limit_reached {
-                    return Ok(finalize_reviewer_stopped_turn(
-                        thread_id,
+                self.apply_rollout_checkpoint_observation(
+                    RolloutCheckpointObservation {
                         model_rounds,
-                        review,
-                        std::mem::replace(events, TurnEvents::new(None)),
-                    ));
-                }
-                self.apply_rollout_review_observation(
-                    RolloutReviewObservation {
-                        model_rounds,
-                        trigger,
-                        review: &review,
                         remaining_budget_tokens: rollout_budget
                             .as_ref()
                             .map(RolloutBudget::remaining_tokens),
+                        task_plan: latest_plan.as_ref(),
                     },
                     &mut provider_tool_calls,
                     &mut provider_tool_results,
@@ -3203,6 +3105,8 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         events: &mut TurnEvents,
     ) -> anyhow::Result<ModelResponse> {
         let request_id = Uuid::new_v4();
+        let input_breakdown = request.token_estimate_breakdown();
+        let local_input_estimate = calibrated_input_estimate(events, input_breakdown.total);
         let materialized_context = CompiledModelContext {
             items: request.context_items.clone(),
             prompt_cache_key: request.prompt_cache_key.clone(),
@@ -3211,7 +3115,9 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             request_id,
             round,
             context_hash: materialized_context.content_hash(),
-            token_estimate: materialized_context.token_estimate(),
+            token_estimate: local_input_estimate,
+            purpose: ModelCallPurpose::AgentRound,
+            token_breakdown: Some(input_breakdown.clone()),
             items: materialized_context.items,
         });
         let request_snapshot = serde_json::to_value(&request)
@@ -3237,6 +3143,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             transport_events.push(event);
             Ok(())
         };
+        let mut latest_usage = None;
         let mut on_delta = |delta| {
             match delta {
                 ModelStreamDelta::Text { text } => {
@@ -3246,14 +3153,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     events.push(AgentEventPayload::ReasoningDelta { text });
                 }
                 ModelStreamDelta::Usage { usage } => {
-                    events.push(AgentEventPayload::TokenUsage {
-                        input_tokens: usage.input_tokens as usize,
-                        output_tokens: usage.output_tokens as usize,
-                        total_tokens: usage.total_tokens as usize,
-                        cached_input_tokens: usage.cached_input_tokens.map(|value| value as usize),
-                        cache_write_tokens: usage.cache_write_tokens.map(|value| value as usize),
-                        reasoning_tokens: usage.reasoning_tokens.map(|value| value as usize),
-                    });
+                    latest_usage = Some(usage);
                 }
                 ModelStreamDelta::ToolCall { .. } => {}
             }
@@ -3265,6 +3165,12 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             .await;
         drop(on_delta);
         drop(on_transport);
+        let latest_usage = latest_usage.or_else(|| {
+            response
+                .as_ref()
+                .ok()
+                .and_then(|response| response.usage.clone())
+        });
         for observation in transport_events {
             match observation {
                 ProviderTransportEvent::Retry {
@@ -3301,6 +3207,21 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     body,
                 }),
             }
+        }
+        if let Some(usage) = latest_usage {
+            events.push(AgentEventPayload::TokenUsage {
+                request_id: Some(request_id),
+                round: Some(round),
+                purpose: ModelCallPurpose::AgentRound,
+                input_tokens: usage.input_tokens as usize,
+                output_tokens: usage.output_tokens as usize,
+                total_tokens: usage.total_tokens as usize,
+                cached_input_tokens: usage.cached_input_tokens.map(|value| value as usize),
+                cache_write_tokens: usage.cache_write_tokens.map(|value| value as usize),
+                reasoning_tokens: usage.reasoning_tokens.map(|value| value as usize),
+                local_input_estimate: Some(local_input_estimate),
+                input_breakdown: Some(input_breakdown),
+            });
         }
         response
     }
@@ -4500,26 +4421,28 @@ fn replayable_provider_state_items(items: &[Value]) -> Vec<Value> {
     replayable
 }
 
-fn finalize_reviewer_stopped_turn(
+fn finalize_rollout_hard_limit_turn(
     thread_id: Uuid,
     model_rounds: usize,
-    review: GuardianRolloutReviewResult,
     mut events: TurnEvents,
 ) -> AgentTurnResult {
+    let reason = format!(
+        "The runtime hard limit of {MAX_ROLLOUT_MODEL_ROUNDS} main-model rounds was reached."
+    );
+    let message = format!(
+        "The task reached the hard limit of {MAX_ROLLOUT_MODEL_ROUNDS} model rounds and was stopped. Completed work is preserved; any unfinished work remains partial."
+    );
     events.push(AgentEventPayload::AssistantMessage {
-        message: Message::text(thread_id, MessageRole::Assistant, review.message),
+        message: Message::text(thread_id, MessageRole::Assistant, message),
     });
     events.push(AgentEventPayload::TurnFinished {
         summary: format!(
-            "Rollout stopped by the progress reviewer after {model_rounds} main-model rounds: {}",
-            review.rationale
+            "Rollout stopped at the hard resource limit after {model_rounds} main-model rounds."
         ),
     });
     AgentTurnResult {
         events: events.into_vec(),
-        outcome: AgentTurnOutcome::Stopped {
-            reason: review.rationale,
-        },
+        outcome: AgentTurnOutcome::Stopped { reason },
         provider_cursor: None,
     }
 }
@@ -4554,71 +4477,18 @@ fn finalize_automatic_review_failure_turn(
     }
 }
 
-/// What a completed progress review has to say, on its way to the model.
-struct RolloutReviewObservation<'a> {
+/// Objective checkpoint state delivered to the main model for self-review.
+struct RolloutCheckpointObservation<'a> {
     model_rounds: usize,
-    trigger: RolloutReviewTrigger,
-    review: &'a GuardianRolloutReviewResult,
     remaining_budget_tokens: Option<u64>,
+    task_plan: Option<&'a TaskPlan>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RolloutReviewTrigger {
-    RoundInterval,
-    BudgetBand(usize),
-    HardLimit,
-}
-
-impl RolloutReviewTrigger {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::RoundInterval => "round_interval",
-            Self::BudgetBand(_) => "budget_band",
-            Self::HardLimit => "hard_round_limit",
-        }
-    }
-}
-
-/// Decides whether this round should be preceded by a progress review.
-///
-/// Rounds alone are a poor proxy for cost: a turn making expensive calls can burn
-/// most of its budget long before round 90. Budget bands catch that case, and the
-/// total review count stays bounded so the checks never dominate the turn.
-fn rollout_review_trigger(
-    model_rounds: usize,
-    interval_reviews: usize,
-    budget: Option<&RolloutBudget>,
-    runtime_state: &TurnRuntimeState,
-) -> Option<RolloutReviewTrigger> {
-    if model_rounds >= MAX_ROLLOUT_MODEL_ROUNDS {
-        return Some(RolloutReviewTrigger::HardLimit);
-    }
-    if interval_reviews.saturating_add(runtime_state.reviewed_budget_bands) >= MAX_ROLLOUT_REVIEWS {
-        return None;
-    }
-    if rollout_review_due(model_rounds, interval_reviews) {
-        return Some(RolloutReviewTrigger::RoundInterval);
-    }
-    if model_rounds < MIN_ROUNDS_BEFORE_BUDGET_REVIEW {
-        return None;
-    }
-    let budget = budget?;
-    let band = *ROLLOUT_REVIEW_BUDGET_BANDS.get(runtime_state.reviewed_budget_bands)?;
-    (budget.remaining_fraction() <= band).then_some(RolloutReviewTrigger::BudgetBand(
-        runtime_state.reviewed_budget_bands,
-    ))
-}
-
-fn rollout_review_due(model_rounds: usize, completed_reviews: usize) -> bool {
-    if model_rounds >= MAX_ROLLOUT_MODEL_ROUNDS {
-        return true;
-    }
-    let maximum_reviews = MAX_ROLLOUT_MODEL_ROUNDS / ROLLOUT_REVIEW_INTERVAL;
-    completed_reviews < maximum_reviews
-        && model_rounds
-            >= completed_reviews
-                .saturating_add(1)
-                .saturating_mul(ROLLOUT_REVIEW_INTERVAL)
+fn rollout_checkpoint_due(model_rounds: usize, completed_checkpoints: usize) -> bool {
+    let next_checkpoint = completed_checkpoints
+        .saturating_add(1)
+        .saturating_mul(ROLLOUT_REVIEW_INTERVAL);
+    next_checkpoint < MAX_ROLLOUT_MODEL_ROUNDS && model_rounds >= next_checkpoint
 }
 
 fn incomplete_model_response(reason: IncompleteReason, response: &ModelResponse) -> anyhow::Error {
@@ -5074,6 +4944,43 @@ fn base_agent_instructions() -> &'static str {
 #[cfg(test)]
 fn provider_system_prompt(workspace_root: &Path, sandbox_config: &LocalSandboxConfig) -> String {
     default_agent_model_context(workspace_root, sandbox_config).instructions()
+}
+
+/// Calibrates later rounds in the same task with provider usage observed from
+/// earlier rounds. The bounded median resists one unusual response while still
+/// correcting stable tokenizer/framing drift without treating estimates as
+/// billing facts.
+fn calibrated_input_estimate(events: &TurnEvents, raw_estimate: usize) -> usize {
+    if raw_estimate == 0 {
+        return 0;
+    }
+    let mut ratios = events
+        .items
+        .iter()
+        .filter_map(|event| match event {
+            AgentEventPayload::TokenUsage {
+                input_tokens,
+                input_breakdown: Some(breakdown),
+                purpose: ModelCallPurpose::AgentRound,
+                ..
+            } if *input_tokens > 0 && breakdown.total > 0 => {
+                Some(*input_tokens as f64 / breakdown.total as f64)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if ratios.is_empty() {
+        return raw_estimate;
+    }
+    ratios.sort_by(f64::total_cmp);
+    let middle = ratios.len() / 2;
+    let median = if ratios.len() % 2 == 0 {
+        (ratios[middle - 1] + ratios[middle]) / 2.0
+    } else {
+        ratios[middle]
+    };
+    let factor = median.clamp(0.5, 2.0);
+    ((raw_estimate as f64 * factor).round() as usize).max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5639,6 +5546,29 @@ mod tests {
         max_active: Arc<AtomicUsize>,
     }
 
+    #[test]
+    fn later_round_token_estimates_use_observed_provider_calibration() {
+        let mut events = TurnEvents::new(None);
+        let mut breakdown = crate::model_context::TokenEstimateBreakdown::default();
+        breakdown.current_user = 100;
+        breakdown.recalculate_total();
+        events.push(AgentEventPayload::TokenUsage {
+            request_id: Some(Uuid::new_v4()),
+            round: Some(1),
+            purpose: ModelCallPurpose::AgentRound,
+            input_tokens: 120,
+            output_tokens: 10,
+            total_tokens: 130,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            local_input_estimate: Some(100),
+            input_breakdown: Some(breakdown),
+        });
+
+        assert_eq!(calibrated_input_estimate(&events, 50), 60);
+    }
+
     #[async_trait]
     impl Tool for JournalTestTool {
         fn name(&self) -> &str {
@@ -6129,6 +6059,33 @@ mod tests {
         assert!(tools.contains("apply_patch"));
         assert!(!tools.contains("write_file"));
         assert!(agent.tools.get("write_file").is_some());
+    }
+
+    #[test]
+    fn flow_profile_exposes_work_code_and_orchestration_tools_to_the_provider() {
+        let mut agent = AgentCore::default();
+        agent.restrict_capabilities(
+            &crate::enterprise::ExperienceSurfaceProfile::for_mode(
+                crate::model::ExperienceMode::Flow,
+            )
+            .capabilities,
+        );
+        let tools = agent
+            .provider_tool_catalog()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+
+        for expected in [
+            "read_attachment",
+            "view_attachment",
+            "spreadsheet",
+            "apply_patch",
+            "shell",
+            "flow_run",
+        ] {
+            assert!(tools.contains(expected), "missing Flow tool: {expected}");
+        }
     }
 
     #[test]
@@ -8182,15 +8139,14 @@ mod tests {
     }
 
     #[test]
-    fn rollout_review_checkpoints_are_due_at_ninety_round_segments() {
-        assert!(!rollout_review_due(89, 0));
-        assert!(rollout_review_due(90, 0));
-        assert!(!rollout_review_due(179, 1));
-        assert!(rollout_review_due(180, 1));
-        assert!(!rollout_review_due(269, 2));
-        assert!(rollout_review_due(270, 2));
-        assert!(rollout_review_due(270, 3));
-        assert!(rollout_review_due(271, 3));
+    fn rollout_self_review_checkpoints_are_due_before_the_hard_limit() {
+        assert!(!rollout_checkpoint_due(89, 0));
+        assert!(rollout_checkpoint_due(90, 0));
+        assert!(!rollout_checkpoint_due(179, 1));
+        assert!(rollout_checkpoint_due(180, 1));
+        assert!(!rollout_checkpoint_due(269, 2));
+        assert!(!rollout_checkpoint_due(270, 2));
+        assert!(!rollout_checkpoint_due(271, 3));
     }
 
     fn spent_rollout_budget(limit_tokens: u64, spent: u64) -> RolloutBudget {
@@ -8211,84 +8167,6 @@ mod tests {
     }
 
     #[test]
-    fn budget_bands_schedule_reviews_once_a_turn_has_history() {
-        // Sixty percent spent: past the first band, short of the second.
-        let budget = spent_rollout_budget(1_000, 600);
-        let fresh = TurnRuntimeState::default();
-
-        // An expensive but young turn is left alone. A reviewer would have almost
-        // nothing to judge, and the budget reminder already reached the model.
-        assert_eq!(
-            rollout_review_trigger(
-                MIN_ROUNDS_BEFORE_BUDGET_REVIEW - 1,
-                0,
-                Some(&budget),
-                &fresh
-            ),
-            None
-        );
-        assert_eq!(
-            rollout_review_trigger(MIN_ROUNDS_BEFORE_BUDGET_REVIEW, 0, Some(&budget), &fresh),
-            Some(RolloutReviewTrigger::BudgetBand(0))
-        );
-
-        // Each band fires at most once.
-        let first_band_used = TurnRuntimeState {
-            reviewed_budget_bands: 1,
-            ..TurnRuntimeState::default()
-        };
-        assert_eq!(
-            rollout_review_trigger(
-                MIN_ROUNDS_BEFORE_BUDGET_REVIEW,
-                0,
-                Some(&budget),
-                &first_band_used
-            ),
-            None
-        );
-        assert_eq!(
-            rollout_review_trigger(
-                MIN_ROUNDS_BEFORE_BUDGET_REVIEW,
-                0,
-                Some(&spent_rollout_budget(1_000, 800)),
-                &first_band_used
-            ),
-            Some(RolloutReviewTrigger::BudgetBand(1))
-        );
-
-        // Without a shared budget there is nothing to band on.
-        assert_eq!(
-            rollout_review_trigger(MIN_ROUNDS_BEFORE_BUDGET_REVIEW, 0, None, &fresh),
-            None
-        );
-
-        // Reviews stay bounded, except for the hard round limit, which is not a
-        // judgement call and always runs.
-        let two_bands_used = TurnRuntimeState {
-            reviewed_budget_bands: 2,
-            ..TurnRuntimeState::default()
-        };
-        assert_eq!(
-            rollout_review_trigger(
-                ROLLOUT_REVIEW_INTERVAL - 1,
-                MAX_ROLLOUT_REVIEWS - 2,
-                Some(&budget),
-                &two_bands_used
-            ),
-            None
-        );
-        assert_eq!(
-            rollout_review_trigger(
-                MAX_ROLLOUT_MODEL_ROUNDS,
-                MAX_ROLLOUT_REVIEWS,
-                None,
-                &two_bands_used
-            ),
-            Some(RolloutReviewTrigger::HardLimit)
-        );
-    }
-
-    #[test]
     fn budget_reminder_is_only_consumed_once_delivery_is_confirmed() {
         let mut budget = spent_rollout_budget(100, 80);
         let reminder = budget
@@ -8304,7 +8182,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_tool_calls_are_detected_inside_the_recent_window() {
+    fn repeated_tool_call_counts_are_objective_windowed_telemetry() {
         fn listing(path: &str) -> Vec<ProviderToolCall> {
             vec![ProviderToolCall {
                 id: format!("call-{path}"),
@@ -8316,42 +8194,57 @@ mod tests {
         let mut repeating = TurnRuntimeState::default();
         repeating.record_tool_calls(&listing("."));
         repeating.record_tool_calls(&listing("."));
-        assert!(repeating.stalled_signature().is_none());
+        assert!(repeating.repeated_tool_call_counts().is_empty());
 
         // The call id deliberately stays out of the signature: only the action counts.
         repeating.record_tool_calls(&listing("."));
-        let (signature, count) = repeating
-            .stalled_signature()
-            .expect("the same call three times over looks stuck");
+        let repeated = repeating.repeated_tool_call_counts();
+        assert_eq!(repeated.len(), 1);
+        let (signature, count) = repeated[0];
         assert!(signature.contains("list_files"));
-        assert_eq!(count, STALL_REPEAT_THRESHOLD);
+        assert_eq!(count, REPEATED_TOOL_CALL_REPORT_THRESHOLD);
 
-        // Different arguments are different work, however many rounds it takes.
-        let mut progressing = TurnRuntimeState::default();
-        for index in 0..STALL_SIGNATURE_WINDOW {
-            progressing.record_tool_calls(&listing(&format!("dir{index}")));
+        // Counts describe canonical calls only; they do not label distinct calls
+        // as progress or repetition as lack of progress.
+        let mut distinct = TurnRuntimeState::default();
+        for index in 0..REPEATED_TOOL_CALL_WINDOW {
+            distinct.record_tool_calls(&listing(&format!("dir{index}")));
         }
-        assert!(progressing.stalled_signature().is_none());
+        assert!(distinct.repeated_tool_call_counts().is_empty());
 
-        assert!(!repeating.stall_reminder_due(MIN_ROUNDS_BEFORE_STALL_DETECTION - 1));
-        assert!(repeating.stall_reminder_due(MIN_ROUNDS_BEFORE_STALL_DETECTION));
+        assert!(repeating.repeated_tool_call_report_due(1));
         let reminded = TurnRuntimeState {
-            last_stall_reminder_round: Some(MIN_ROUNDS_BEFORE_STALL_DETECTION),
+            last_repeated_tool_call_report_round: Some(5),
             ..repeating.clone()
         };
-        assert!(!reminded.stall_reminder_due(MIN_ROUNDS_BEFORE_STALL_DETECTION + 1));
-        assert!(reminded.stall_reminder_due(
-            MIN_ROUNDS_BEFORE_STALL_DETECTION + STALL_REMINDER_COOLDOWN_ROUNDS
-        ));
+        assert!(!reminded.repeated_tool_call_report_due(6));
+        assert!(
+            reminded.repeated_tool_call_report_due(5 + REPEATED_TOOL_CALL_REPORT_COOLDOWN_ROUNDS)
+        );
+    }
+
+    #[test]
+    fn repetition_telemetry_state_accepts_the_legacy_stall_field() {
+        let state: TurnRuntimeState = serde_json::from_value(json!({
+            "lastStallReminderRound": 7
+        }))
+        .unwrap();
+        assert_eq!(state.last_repeated_tool_call_report_round, Some(7));
+
+        let serialized = serde_json::to_value(state).unwrap();
+        assert_eq!(serialized["lastRepeatedToolCallReportRound"], 7);
+        assert!(serialized.get("lastStallReminderRound").is_none());
     }
 
     #[tokio::test]
     async fn repeated_tool_calls_reach_the_model_as_an_observation() {
-        let workspace = test_workspace("stalled-tool-calls");
-        let mut responses = (1..=MIN_ROUNDS_BEFORE_STALL_DETECTION + 1)
+        let workspace = test_workspace("repeated-tool-call-telemetry");
+        let mut responses = (1..=REPEATED_TOOL_CALL_REPORT_THRESHOLD)
             .map(rollout_tool_response)
             .collect::<Vec<_>>();
-        responses.push(ModelResponse::text("Changed approach and finished."));
+        responses.push(ModelResponse::text(
+            "I interpreted the repetition using the results and finished.",
+        ));
         let provider = Arc::new(ScriptedProvider::new(responses));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
 
@@ -8374,19 +8267,23 @@ mod tests {
                 None,
             )
             .await
-            .expect("a stall observation does not end the turn");
+            .expect("repetition telemetry does not end the turn");
 
-        // The runtime reports what it noticed; the model keeps deciding.
+        // The runtime reports counts without assigning them progress meaning.
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
         let requests = provider.requests();
-        assert_eq!(requests.len(), MIN_ROUNDS_BEFORE_STALL_DETECTION + 2);
-        assert!(
-            requests.iter().any(|request| request
-                .conversation
-                .iter()
-                .any(|message| message.content.contains("[Repeated tool calls]"))),
-            "an agent repeating one call should hear about it"
-        );
+        assert_eq!(requests.len(), REPEATED_TOOL_CALL_REPORT_THRESHOLD + 1);
+        let telemetry = requests
+            .iter()
+            .flat_map(|request| &request.conversation)
+            .find(|message| message.content.contains("[Repeated tool-call telemetry]"))
+            .expect("repeated canonical calls should produce objective telemetry");
+        assert!(telemetry.content.contains(r#""occurrences":3"#));
+        assert!(telemetry
+            .content
+            .contains(r#""groupedBy":"tool name and JSON arguments; provider call id excluded"#));
+        assert!(!telemetry.content.contains("decide"));
+        assert!(!telemetry.content.contains("progress"));
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -8653,18 +8550,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollout_reviewer_stop_is_advisory_below_the_hard_limit() {
-        let workspace = test_workspace("rollout-review-stop");
+    async fn rollout_checkpoint_is_delivered_to_the_main_model_without_a_reviewer_call() {
+        let workspace = test_workspace("rollout-self-review-checkpoint");
         let mut responses = (1..=ROLLOUT_REVIEW_INTERVAL)
             .map(rollout_tool_response)
             .collect::<Vec<_>>();
         responses.push(ModelResponse::text(
-            "The reviewer was right that the scans stopped paying off, so here is what is done and what remains.",
+            "I reviewed the original request and current evidence myself, then completed the task.",
         ));
         let provider = Arc::new(ScriptedProvider::new(responses));
-        let reviewer = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
-            r#"{"decision":"stop","rationale":"The attempted strategies changed shape but produced no measurable progress.","message":"Stopped after the progress review. The workspace is preserved, but the task remains incomplete because the attempted strategies did not produce measurable progress."}"#,
-        )]));
+        let reviewer = Arc::new(ScriptedProvider::new(Vec::new()));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
             .with_guardian_provider(reviewer.clone());
 
@@ -8674,7 +8569,7 @@ mod tests {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "Keep inspecting until progress is possible.".to_string(),
+                    content: "Inspect and finish when the evidence is sufficient.".to_string(),
                     user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
@@ -8687,78 +8582,28 @@ mod tests {
                 None,
             )
             .await
-            .expect("an advisory stop still returns a structured turn result");
+            .expect("main-model self-review completes");
 
-        // The reviewer wanted the turn to end. Below the hard limit that is a
-        // recommendation delivered to the model, not a decision taken for it.
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
-        assert_eq!(reviewer.requests().len(), 1);
+        assert!(reviewer.requests().is_empty());
         let requests = provider.requests();
         assert_eq!(requests.len(), ROLLOUT_REVIEW_INTERVAL + 1);
-        let review_result = requests[ROLLOUT_REVIEW_INTERVAL]
+        let checkpoint = requests[ROLLOUT_REVIEW_INTERVAL]
             .tool_results
             .iter()
-            .find(|result| result.name == ROLLOUT_REVIEW_TOOL_NAME)
-            .expect("the recommendation reaches the model as a tool result");
-        assert!(review_result.output.contains("stop_recommended"));
-        assert!(review_result.output.contains("no measurable progress"));
-        assert!(review_result.output.contains("You may continue instead"));
+            .find(|result| result.name == ROLLOUT_CHECKPOINT_TOOL_NAME)
+            .expect("the objective checkpoint reaches the main model");
+        assert!(checkpoint.output.contains("self_review_required"));
+        assert!(checkpoint.output.contains("\"decision\": null"));
+        assert!(checkpoint
+            .output
+            .contains("runtime has not made a progress judgement"));
         assert!(result.events.iter().any(|event| matches!(
             event,
             AgentEventPayload::ContextWarning { stage, message }
-                if stage == "rollout_review_completed" && message.contains("(advisory)")
+                if stage == "rollout_self_review_checkpoint"
+                    && message.contains("without making a progress decision")
         )));
-
-        let _ = fs::remove_dir_all(workspace);
-    }
-
-    #[tokio::test]
-    async fn rollout_reviewer_guidance_is_injected_before_round_ninety_one() {
-        let workspace = test_workspace("rollout-review-continue");
-        let mut responses = (1..=ROLLOUT_REVIEW_INTERVAL)
-            .map(rollout_tool_response)
-            .collect::<Vec<_>>();
-        responses.push(ModelResponse::text(
-            "The reviewer identified a concrete next step, and the task is now complete.",
-        ));
-        let provider = Arc::new(ScriptedProvider::new(responses));
-        let reviewer = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
-            r#"{"decision":"continue","rationale":"A concrete bounded next action remains.","message":"Use the latest tool evidence to finalize without repeating the earlier scans."}"#,
-        )]));
-        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
-            .with_guardian_provider(reviewer);
-
-        let result = agent
-            .run_turn_detailed_streaming(
-                AgentTurnInput {
-                    thread_id: Uuid::new_v4(),
-                    user_message_id: Uuid::new_v4(),
-                    workspace_root: workspace.clone(),
-                    content: "Inspect and finish when evidence is sufficient.".to_string(),
-                    user_content: Vec::new(),
-                    context_summary: None,
-                    conversation: Vec::new(),
-                    permission_mode: PermissionMode::FullAccess,
-                    context_budget: None,
-                    provider_cursor: None,
-                    store: None,
-                    cancellation: None,
-                },
-                None,
-            )
-            .await
-            .expect("approved continuation completes");
-
-        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
-        let requests = provider.requests();
-        assert_eq!(requests.len(), ROLLOUT_REVIEW_INTERVAL + 1);
-        assert!(requests[ROLLOUT_REVIEW_INTERVAL]
-            .tool_results
-            .iter()
-            .any(|result| {
-                result.name == ROLLOUT_REVIEW_TOOL_NAME
-                    && result.output.contains("finalize without repeating")
-            }));
         assert!(result.events.iter().any(|event| matches!(
             event,
             AgentEventPayload::ModelRequest { round, .. }
@@ -8776,17 +8621,7 @@ mod tests {
                 .map(rollout_tool_response)
                 .collect(),
         ));
-        let reviewer = Arc::new(ScriptedProvider::new(vec![
-            ModelResponse::text(
-                r#"{"decision":"continue","rationale":"A bounded recovery step remains after the first segment.","message":"Try the bounded recovery step and measure its result."}"#,
-            ),
-            ModelResponse::text(
-                r#"{"decision":"continue","rationale":"One final bounded strategy remains after the second segment.","message":"Try only the final bounded strategy, then report its evidence."}"#,
-            ),
-            ModelResponse::text(
-                r#"{"decision":"stop","rationale":"The hard limit is reached and the remaining work is still incomplete.","message":"Stopped at the 270-round hard limit. Completed work is preserved, and the remaining work is partial."}"#,
-            ),
-        ]));
+        let reviewer = Arc::new(ScriptedProvider::new(Vec::new()));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
             .with_guardian_provider(reviewer.clone());
 
@@ -8796,7 +8631,8 @@ mod tests {
                     thread_id: Uuid::new_v4(),
                     user_message_id: Uuid::new_v4(),
                     workspace_root: workspace.clone(),
-                    content: "Continue only while the progress reviewer permits it.".to_string(),
+                    content: "Continue until the work is complete or a resource limit is reached."
+                        .to_string(),
                     user_content: Vec::new(),
                     context_summary: None,
                     conversation: Vec::new(),
@@ -8816,9 +8652,8 @@ mod tests {
             AgentTurnOutcome::Stopped { reason } if reason.contains("hard limit")
         ));
         assert_eq!(provider.requests().len(), MAX_ROLLOUT_MODEL_ROUNDS);
-        assert_eq!(reviewer.requests().len(), 3);
-        assert_eq!(reviewer.requests()[2].conversation.len(), 4);
-        assert!(assistant_text(&result.events).contains("270-round hard limit"));
+        assert!(reviewer.requests().is_empty());
+        assert!(assistant_text(&result.events).contains("hard limit of 270"));
         assert!(!result.events.iter().any(|event| matches!(
             event,
             AgentEventPayload::ModelRequest { round, .. }
@@ -9584,7 +9419,7 @@ mod tests {
                 .any(|candidate| candidate.name == "read_file"));
             assert!(request
                 .system_prompt
-                .contains("reviews progress after every 90 completed main-model rounds"));
+                .contains("supplies an objective self-review checkpoint"));
         }
         assert_eq!(
             fs::read_to_string(workspace.join("src").join("cli.js")).unwrap(),
@@ -10998,7 +10833,7 @@ mod tests {
         assert_eq!(provider.requests().len(), 9);
         assert!(provider.requests()[8]
             .system_prompt
-            .contains("hard ceiling of 270 main-model rounds"));
+            .contains("hard resource ceiling of 270 main-model rounds"));
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -11057,7 +10892,7 @@ mod tests {
         assert!(!final_request.tool_candidates.is_empty());
         assert!(final_request
             .system_prompt
-            .contains("hard ceiling of 270 main-model rounds"));
+            .contains("hard resource ceiling of 270 main-model rounds"));
 
         let _ = fs::remove_dir_all(workspace);
     }
