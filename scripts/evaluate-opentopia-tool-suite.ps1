@@ -377,13 +377,18 @@ $values = ConvertFrom-DotEnvFile $envFilePath
 $apiKey = @(
   [string]$values["${Profile}_API_KEY"]
   [string]$values["${Profile}_KEY"]
+  [Environment]::GetEnvironmentVariable("${Profile}_API_KEY", "Process")
+  [Environment]::GetEnvironmentVariable("${Profile}_KEY", "Process")
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
 $baseUrl = @(
   [string]$values["${Profile}_BASE_URL"]
+  [Environment]::GetEnvironmentVariable("${Profile}_BASE_URL", "Process")
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
 $configuredModel = @(
   [string]$values["${Profile}_MODEL"]
   [string]$values["${Profile}MODEL"]
+  [Environment]::GetEnvironmentVariable("${Profile}_MODEL", "Process")
+  [Environment]::GetEnvironmentVariable("${Profile}MODEL", "Process")
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
 $apiKey = [string]$apiKey
 $baseUrl = ([string]$baseUrl).TrimEnd("/")

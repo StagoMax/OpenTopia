@@ -1,0 +1,6 @@
+{
+  "name": "notification-digest-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

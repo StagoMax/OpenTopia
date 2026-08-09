@@ -2,7 +2,11 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ensureDirectory } from "./utils.mjs";
 
-const EXCLUDED_STATUSES = new Set(["infra_error", "grader_error", "invalid_task"]);
+const EXCLUDED_STATUSES = new Set([
+  "infra_error",
+  "grader_error",
+  "invalid_task",
+]);
 
 function finiteRatio(value, fallback = null) {
   return Number.isFinite(value) ? value : fallback;
@@ -10,7 +14,9 @@ function finiteRatio(value, fallback = null) {
 
 function average(values) {
   const finite = values.filter(Number.isFinite);
-  return finite.length === 0 ? null : finite.reduce((sum, value) => sum + value, 0) / finite.length;
+  return finite.length === 0
+    ? null
+    : finite.reduce((sum, value) => sum + value, 0) / finite.length;
 }
 
 function increaseRatio(baseline, candidate) {
@@ -21,14 +27,26 @@ function increaseRatio(baseline, candidate) {
 
 export function harnessMetrics(summary) {
   const results = summary.results ?? [];
-  const valid = results.filter((result) => !EXCLUDED_STATUSES.has(result.status));
+  const valid = results.filter(
+    (result) => !EXCLUDED_STATUSES.has(result.status),
+  );
   const passed = valid.filter((result) => result.status === "passed");
   const providerTokens = valid.reduce(
     (sum, result) => sum + (result.metrics?.usage?.providerTotalTokens ?? 0),
-    0
+    0,
   );
+  const uncachedTokens = valid.reduce(
+    (sum, result) =>
+      sum +
+      (result.metrics?.usage?.uncachedInputTokens ?? 0) +
+      (result.metrics?.usage?.outputTokens ?? 0),
+    0,
+  );
+  const reportedCosts = valid
+    .map((result) => result.metrics?.usage?.estimatedCost)
+    .filter(Number.isFinite);
   const taskRates = Object.fromEntries(
-    (summary.tasks ?? []).map((task) => [task.taskId, task.passRate])
+    (summary.tasks ?? []).map((task) => [task.taskId, task.passRate]),
   );
   return {
     requestedTrials: results.length,
@@ -36,10 +54,17 @@ export function harnessMetrics(summary) {
     passedTrials: passed.length,
     passRate: valid.length === 0 ? null : passed.length / valid.length,
     infrastructureFailures: results.length - valid.length,
-    tokensPerSuccess: passed.length === 0 ? null : providerTokens / passed.length,
+    tokensPerSuccess:
+      passed.length === 0 ? null : providerTokens / passed.length,
+    uncachedTokensPerSuccess:
+      passed.length === 0 ? null : uncachedTokens / passed.length,
+    costPerSuccess:
+      passed.length === 0 || reportedCosts.length !== valid.length
+        ? null
+        : reportedCosts.reduce((sum, value) => sum + value, 0) / passed.length,
     averageElapsedMs: average(valid.map((result) => result.elapsedMs)),
     averageToolCalls: average(valid.map((result) => result.metrics?.toolCalls)),
-    taskRates
+    taskRates,
   };
 }
 
@@ -53,21 +78,32 @@ function comparableRunContract(summary) {
     suiteSha256: summary.manifest?.suiteSha256 ?? null,
     targetSha256: summary.manifest?.targetSha256 ?? null,
     taskHashes: summary.manifest?.taskHashes ?? null,
-    repetitions: summary.manifest?.repetitions ?? null
+    repetitions: summary.manifest?.repetitions ?? null,
   };
 }
 
 function assertComparableRuns(baseline, candidate) {
   if (baseline.suite?.id !== candidate.suite?.id) {
     throw new Error(
-      `Cannot compare different suites: ${baseline.suite?.id ?? "unknown"} vs ${candidate.suite?.id ?? "unknown"}`
+      `Cannot compare different suites: ${baseline.suite?.id ?? "unknown"} vs ${candidate.suite?.id ?? "unknown"}`,
     );
   }
   const before = comparableRunContract(baseline);
   const after = comparableRunContract(candidate);
-  for (const field of ["targetId", "suiteSha256", "targetSha256", "repetitions"]) {
-    if (before[field] !== null && after[field] !== null && before[field] !== after[field]) {
-      throw new Error(`Cannot compare runs with different ${field}: ${before[field]} vs ${after[field]}`);
+  for (const field of [
+    "targetId",
+    "suiteSha256",
+    "targetSha256",
+    "repetitions",
+  ]) {
+    if (
+      before[field] !== null &&
+      after[field] !== null &&
+      before[field] !== after[field]
+    ) {
+      throw new Error(
+        `Cannot compare runs with different ${field}: ${before[field]} vs ${after[field]}`,
+      );
     }
   }
   if (before.taskHashes !== null && after.taskHashes !== null) {
@@ -87,25 +123,28 @@ export function compareSummaries(
     maxPassRateDrop = 0,
     maxTaskPassRateDrop = 0,
     maxTokenIncreaseRatio = 0.2,
-    maxLatencyIncreaseRatio = 0.2
-  } = {}
+    maxLatencyIncreaseRatio = 0.2,
+  } = {},
 ) {
   const runContract = assertComparableRuns(baseline, candidate);
   const baselineMetrics = harnessMetrics(baseline);
   const candidateMetrics = harnessMetrics(candidate);
-  const passRateDrop = Number.isFinite(baselineMetrics.passRate) && Number.isFinite(candidateMetrics.passRate)
-    ? baselineMetrics.passRate - candidateMetrics.passRate
-    : Infinity;
+  const passRateDrop =
+    Number.isFinite(baselineMetrics.passRate) &&
+    Number.isFinite(candidateMetrics.passRate)
+      ? baselineMetrics.passRate - candidateMetrics.passRate
+      : Infinity;
   const tokenIncrease = increaseRatio(
     baselineMetrics.tokensPerSuccess,
-    candidateMetrics.tokensPerSuccess
+    candidateMetrics.tokensPerSuccess,
   );
   const latencyIncrease = increaseRatio(
     baselineMetrics.averageElapsedMs,
-    candidateMetrics.averageElapsedMs
+    candidateMetrics.averageElapsedMs,
   );
-  const sharedTasks = Object.keys(baselineMetrics.taskRates)
-    .filter((taskId) => Object.hasOwn(candidateMetrics.taskRates, taskId));
+  const sharedTasks = Object.keys(baselineMetrics.taskRates).filter((taskId) =>
+    Object.hasOwn(candidateMetrics.taskRates, taskId),
+  );
   const taskRegressions = sharedTasks.flatMap((taskId) => {
     const before = baselineMetrics.taskRates[taskId];
     const after = candidateMetrics.taskRates[taskId];
@@ -119,36 +158,37 @@ export function compareSummaries(
       passRateDrop <= maxPassRateDrop,
       finiteRatio(passRateDrop),
       maxPassRateDrop,
-      "candidate pass-rate drop"
+      "candidate pass-rate drop",
     ),
     comparisonCheck(
       "task-pass-rate",
       taskRegressions.length === 0,
       taskRegressions,
       maxTaskPassRateDrop,
-      "per-task pass-rate regressions"
+      "per-task pass-rate regressions",
     ),
     comparisonCheck(
       "infrastructure-failures",
-      candidateMetrics.infrastructureFailures <= baselineMetrics.infrastructureFailures,
+      candidateMetrics.infrastructureFailures <=
+        baselineMetrics.infrastructureFailures,
       candidateMetrics.infrastructureFailures,
       baselineMetrics.infrastructureFailures,
-      "candidate infrastructure failures"
+      "candidate infrastructure failures",
     ),
     comparisonCheck(
       "tokens-per-success",
       tokenIncrease === null || tokenIncrease <= maxTokenIncreaseRatio,
       finiteRatio(tokenIncrease),
       maxTokenIncreaseRatio,
-      "relative token increase"
+      "relative token increase",
     ),
     comparisonCheck(
       "average-latency",
       latencyIncrease === null || latencyIncrease <= maxLatencyIncreaseRatio,
       finiteRatio(latencyIncrease),
       maxLatencyIncreaseRatio,
-      "relative elapsed-time increase"
-    )
+      "relative elapsed-time increase",
+    ),
   ];
   return {
     schemaVersion: 1,
@@ -161,21 +201,23 @@ export function compareSummaries(
       maxPassRateDrop,
       maxTaskPassRateDrop,
       maxTokenIncreaseRatio,
-      maxLatencyIncreaseRatio
+      maxLatencyIncreaseRatio,
     },
     baseline: baselineMetrics,
     candidate: candidateMetrics,
     deltas: {
       passRateDrop: finiteRatio(passRateDrop),
       tokenIncreaseRatio: finiteRatio(tokenIncrease),
-      latencyIncreaseRatio: finiteRatio(latencyIncrease)
+      latencyIncreaseRatio: finiteRatio(latencyIncrease),
     },
-    checks
+    checks,
   };
 }
 
 function renderNumber(value) {
-  return value === null || value === undefined ? "n/a" : Number(value).toFixed(3);
+  return value === null || value === undefined
+    ? "n/a"
+    : Number(value).toFixed(3);
 }
 
 export function renderComparisonMarkdown(comparison) {
@@ -190,16 +232,22 @@ export function renderComparisonMarkdown(comparison) {
     "|---|---:|---:|",
     `| Pass rate | ${renderNumber(comparison.baseline.passRate)} | ${renderNumber(comparison.candidate.passRate)} |`,
     `| Tokens/success | ${renderNumber(comparison.baseline.tokensPerSuccess)} | ${renderNumber(comparison.candidate.tokensPerSuccess)} |`,
+    `| Uncached tokens/success | ${renderNumber(comparison.baseline.uncachedTokensPerSuccess)} | ${renderNumber(comparison.candidate.uncachedTokensPerSuccess)} |`,
+    `| Cost/success | ${renderNumber(comparison.baseline.costPerSuccess)} | ${renderNumber(comparison.candidate.costPerSuccess)} |`,
     `| Average elapsed ms | ${renderNumber(comparison.baseline.averageElapsedMs)} | ${renderNumber(comparison.candidate.averageElapsedMs)} |`,
     `| Average tool calls | ${renderNumber(comparison.baseline.averageToolCalls)} | ${renderNumber(comparison.candidate.averageToolCalls)} |`,
     `| Infrastructure failures | ${comparison.baseline.infrastructureFailures} | ${comparison.candidate.infrastructureFailures} |`,
     "",
     "| Gate | Passed | Actual | Limit |",
-    "|---|---:|---:|---:|"
+    "|---|---:|---:|---:|",
   ];
   for (const check of comparison.checks) {
-    const actual = Array.isArray(check.actual) ? JSON.stringify(check.actual) : renderNumber(check.actual);
-    lines.push(`| ${check.id} | ${check.passed ? "yes" : "no"} | ${actual} | ${renderNumber(check.limit)} |`);
+    const actual = Array.isArray(check.actual)
+      ? JSON.stringify(check.actual)
+      : renderNumber(check.actual);
+    lines.push(
+      `| ${check.id} | ${check.passed ? "yes" : "no"} | ${actual} | ${renderNumber(check.limit)} |`,
+    );
   }
   lines.push("");
   return `${lines.join("\n")}\n`;
