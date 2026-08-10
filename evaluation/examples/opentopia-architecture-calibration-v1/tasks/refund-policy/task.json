@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-REFUND-001",
+  "version": "1.0.0",
+  "title": "Apply refund policy without duplicating ledger effects",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Implement and execute the refund workflow in POLICY.md across the controlled sessions, preserving policy constraints and ledger idempotency.",
+  "tags": ["calibration", "tau-bench-inspired", "policy", "state-transition", "restart"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 1200, "maxToolCalls": 140, "maxTotalTokens": 260000 },
+  "phases": [
+    {
+      "id": "policy-engine",
+      "prompt": "Read POLICY.md and the existing code. Implement and test the pure refund-decision engine. Do not apply the seeded requests or change ledger.json in this session.",
+      "graders": { "commands": [{ "id": "policy-library", "command": "node", "args": ["grader.cjs", "{workspace}", "library"], "timeoutSeconds": 120 }] }
+    },
+    {
+      "id": "ledger-application",
+      "restartBefore": true,
+      "prompt": "Resume the same refund task after restart. Implement the idempotent batch CLI, run the complete tests, and apply requests.json to ledger.json in place. Verify both accepted and rejected decisions before finishing.",
+      "graders": { "commands": [{ "id": "policy-full", "command": "node", "args": ["grader.cjs", "{workspace}", "full"], "timeoutSeconds": 120 }] }
+    }
+  ],
+  "graders": {
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true, "requireThreadReuse": true, "minimumPhaseCompletions": 2 },
+    "security": { "protectedPaths": ["POLICY.md", "test", "orders.json", "requests.json"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

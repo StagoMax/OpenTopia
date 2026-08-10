@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-architecture-calibration-v1",
+  "version": "1.0.0",
+  "title": "OpenTopia Architecture Calibration v1",
+  "description": "Twelve original tasks spanning repository bug fixing, terminal final-state work, policy reasoning, and controlled recovery. This public suite is for repeatable architecture comparisons, not a sealed holdout or an official external benchmark.",
+  "evaluationClass": "calibration",
+  "visibility": "public",
+  "frozen": true,
+  "benchmarkReferences": [
+    {
+      "name": "SWE-bench",
+      "url": "https://github.com/SWE-bench/SWE-bench",
+      "influence": "Existing-code issue repair, regression checks, and patch-oriented repository work."
+    },
+    {
+      "name": "Terminal-Bench 2.0",
+      "url": "https://github.com/harbor-framework/terminal-bench-2",
+      "influence": "Container-style final-state verification across services, recovery, documents, and command-line workflows."
+    },
+    {
+      "name": "tau-bench",
+      "url": "https://github.com/sierra-research/tau-bench",
+      "influence": "Policy compliance, deterministic state transitions, and outcome-versus-procedure separation."
+    }
+  ],
+  "repetitions": 1,
+  "tasks": [
+    "tasks/router-regression/task.json",
+    "tasks/async-cancellation/task.json",
+    "tasks/safe-paths/task.json",
+    "tasks/journal-recovery/task.json",
+    "tasks/static-deploy/task.json",
+    "tasks/document-triage/task.json",
+    "tasks/log-stream/task.json",
+    "tasks/workspace-build/task.json",
+    "tasks/refund-policy/task.json",
+    "tasks/state-migration/task.json",
+    "tasks/plugin-registry/task.json",
+    "tasks/durable-queue/task.json"
+  ]
+}

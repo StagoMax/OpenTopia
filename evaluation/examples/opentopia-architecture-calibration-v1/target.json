@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-http",
+  "description": "Connects to a running OpenTopia server and supports controlled restart phases.",
+  "command": "node",
+  "args": ["{targetDir}/../../adapters/opentopia-http.mjs"],
+  "cwd": "{targetDir}",
+  "env": {
+    "OPENTOPIA_EVAL_BASE_URL": "http://127.0.0.1:8812",
+    "OPENTOPIA_EVAL_APPROVAL_MODE": "deny",
+    "OPENTOPIA_EVAL_TIMEOUT_MS": "1800000"
+  },
+  "passEnvironment": ["OPENTOPIA_API_TOKEN"],
+  "inheritEnvironment": false,
+  "promptTransport": "stdin",
+  "eventTransport": "jsonl-file",
+  "lifecycle": {
+    "restart": {
+      "kind": "control-file",
+      "pathEnvironment": "OPENTOPIA_EVAL_RESTART_CONTROL",
+      "timeoutSeconds": 60,
+      "pollMs": 250
+    }
+  }
+}

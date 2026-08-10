@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-JOURNAL-001",
+  "version": "1.0.0",
+  "title": "Recover a snapshot from a checksummed append-only journal",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Recover the journal-backed data set described in INCIDENT.md, including verification after a controlled restart.",
+  "tags": ["calibration", "terminal-bench-inspired", "recovery", "data-integrity", "restart"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 1200, "maxToolCalls": 130, "maxTotalTokens": 240000 },
+  "phases": [
+    {
+      "id": "repair-engine",
+      "prompt": "Investigate INCIDENT.md and the existing project. Implement the reusable journal validation and replay engine, preserve the evidence files, and run npm test. Stop after the library contract is working; the CLI recovery will be completed in the next session.",
+      "graders": { "commands": [{ "id": "journal-library", "command": "node", "args": ["grader.cjs", "{workspace}", "library"], "timeoutSeconds": 120 }] }
+    },
+    {
+      "id": "recover-artifact",
+      "restartBefore": true,
+      "prompt": "Continue after the controlled server restart using the same workspace and thread. Finish the CLI, recover data/snapshot.json plus data/journal.log into recovered.json, run the complete tests, and verify the artifact rather than relying on a completion claim.",
+      "graders": { "commands": [{ "id": "journal-full", "command": "node", "args": ["grader.cjs", "{workspace}", "full"], "timeoutSeconds": 120 }] }
+    }
+  ],
+  "graders": {
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true, "requireThreadReuse": true, "minimumPhaseCompletions": 2 },
+    "security": { "protectedPaths": ["INCIDENT.md", "test", "data"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

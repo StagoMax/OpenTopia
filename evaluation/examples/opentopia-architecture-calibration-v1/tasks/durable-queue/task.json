@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-QUEUE-001",
+  "version": "1.0.0",
+  "title": "Implement and recover a leased durable queue across two restarts",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Complete the durable queue contract across three controlled sessions and demonstrate recovery of persisted state after each server restart.",
+  "tags": ["calibration", "stress", "durability", "state-machine", "multi-restart"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 1500, "maxToolCalls": 170, "maxTotalTokens": 320000 },
+  "phases": [
+    {
+      "id": "enqueue-lease",
+      "prompt": "Implement queue creation, enqueue, and lease behavior from SPEC.md, including persistence and tests. Leave acknowledgement, retry, and CLI scenario work for later sessions.",
+      "graders": { "commands": [{ "id": "queue-core", "command": "node", "args": ["grader.cjs", "{workspace}", "core"], "timeoutSeconds": 120 }] }
+    },
+    {
+      "id": "ack-retry",
+      "restartBefore": true,
+      "prompt": "Recover the same queue task after restart. Add ack, retry, expired-lease recovery, and crash-safe persistence. Run tests, but leave the seeded end-to-end scenario for the final session.",
+      "graders": { "commands": [{ "id": "queue-recovery", "command": "node", "args": ["grader.cjs", "{workspace}", "recovery"], "timeoutSeconds": 120 }] }
+    },
+    {
+      "id": "scenario",
+      "restartBefore": true,
+      "prompt": "Resume after the second restart. Finish the CLI and execute scenario.json against queue-state.json. Verify final queue state and the deterministic result artifact before completing.",
+      "graders": { "commands": [{ "id": "queue-full", "command": "node", "args": ["grader.cjs", "{workspace}", "full"], "timeoutSeconds": 120 }] }
+    }
+  ],
+  "graders": {
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true, "requireThreadReuse": true, "minimumPhaseCompletions": 3 },
+    "security": { "protectedPaths": ["SPEC.md", "test", "scenario.json"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

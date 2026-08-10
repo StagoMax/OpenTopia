@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -43,6 +43,63 @@ test("runs a black-box trial and produces separated scores and cache metrics", a
     const report = await readFile(result.reports.markdownPath, "utf8");
     assert.match(report, /Strict success: 1\/1/);
     assert.doesNotMatch(report, /EVAL_CANARY_DO_NOT_LEAK_8421/);
+  } finally {
+    await rm(output, { recursive: true, force: true });
+  }
+});
+
+test("records a paired experiment profile and its content hash", async () => {
+  const output = await mkdtemp(path.join(os.tmpdir(), "agent-eval-experiment-test-"));
+  const experimentPath = path.join(output, "experiment.json");
+  const experiment = {
+    schemaVersion: 1,
+    experimentId: "system-prompt-v2",
+    pairingKey: "smoke-fixed-model-seed-0",
+    variant: "candidate",
+    controlled: { model: "fixed-model", seed: 0 },
+    treatment: { systemPromptVersion: "2.0.0", systemPromptHash: "prompt-v2" },
+  };
+  try {
+    await writeFile(experimentPath, JSON.stringify(experiment), "utf8");
+    const result = await runSuite({
+      suitePath: path.join(example, "suite.json"),
+      targetPath: path.join(example, "target.json"),
+      outputDirectory: output,
+      repetitions: 1,
+      experimentPath,
+    });
+
+    assert.deepEqual(result.summary.manifest.experiment, experiment);
+    assert.equal(result.summary.manifest.experimentPath, experimentPath);
+    assert.match(result.summary.manifest.experimentSha256, /^[a-f0-9]{64}$/);
+  } finally {
+    await rm(output, { recursive: true, force: true });
+  }
+});
+
+test("runs only explicitly selected task IDs", async () => {
+  const output = await mkdtemp(path.join(os.tmpdir(), "agent-eval-filter-test-"));
+  try {
+    const result = await runSuite({
+      suitePath: path.join(example, "suite.json"),
+      targetPath: path.join(example, "target.json"),
+      outputDirectory: output,
+      repetitions: 1,
+      selectedTaskIds: ["SMOKE-BLACKBOX-001"],
+    });
+    assert.deepEqual(
+      result.summary.results.map((trial) => trial.taskId),
+      ["SMOKE-BLACKBOX-001"],
+    );
+    await assert.rejects(
+      runSuite({
+        suitePath: path.join(example, "suite.json"),
+        targetPath: path.join(example, "target.json"),
+        outputDirectory: output,
+        selectedTaskIds: ["UNKNOWN"],
+      }),
+      /Unknown selected task IDs: UNKNOWN/,
+    );
   } finally {
     await rm(output, { recursive: true, force: true });
   }

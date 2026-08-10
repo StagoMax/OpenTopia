@@ -238,6 +238,39 @@ export function validateSuite(suite) {
   if (!assertObject(suite, "suite", issues)) throw new ValidationError("Suite", issues);
   if (suite.schemaVersion !== 1) issues.push("schemaVersion must equal 1");
   for (const field of ["id", "title"]) assertString(suite[field], field, issues);
+  if (suite.version !== undefined) assertString(suite.version, "version", issues);
+  if (
+    suite.evaluationClass !== undefined &&
+    !["conformance", "stress", "calibration", "external"].includes(
+      suite.evaluationClass,
+    )
+  ) {
+    issues.push(
+      "evaluationClass must be conformance, stress, calibration, or external",
+    );
+  }
+  if (
+    suite.visibility !== undefined &&
+    !["public", "private", "sealed"].includes(suite.visibility)
+  ) {
+    issues.push("visibility must be public, private, or sealed");
+  }
+  if (suite.frozen !== undefined && typeof suite.frozen !== "boolean") {
+    issues.push("frozen must be a boolean");
+  }
+  if (suite.benchmarkReferences !== undefined) {
+    if (!Array.isArray(suite.benchmarkReferences)) {
+      issues.push("benchmarkReferences must be an array");
+    } else {
+      suite.benchmarkReferences.forEach((reference, index) => {
+        const prefix = `benchmarkReferences[${index}]`;
+        if (!assertObject(reference, prefix, issues)) return;
+        for (const field of ["name", "url", "influence"]) {
+          assertString(reference[field], `${prefix}.${field}`, issues);
+        }
+      });
+    }
+  }
   if (!Array.isArray(suite.tasks) || suite.tasks.length === 0) {
     issues.push("tasks must be a non-empty array");
   } else {
@@ -246,6 +279,32 @@ export function validateSuite(suite) {
   if (suite.repetitions !== undefined) assertPositiveInteger(suite.repetitions, "repetitions", issues, { maximum: 100 });
   if (issues.length > 0) throw new ValidationError("Suite", issues);
   return suite;
+}
+
+export function validateExperiment(experiment) {
+  const issues = [];
+  if (!assertObject(experiment, "experiment", issues)) {
+    throw new ValidationError("Experiment", issues);
+  }
+  if (experiment.schemaVersion !== 1) issues.push("schemaVersion must equal 1");
+  for (const field of ["experimentId", "pairingKey"]) {
+    assertString(experiment[field], field, issues);
+  }
+  if (
+    !["baseline", "candidate", "control", "treatment"].includes(
+      experiment.variant,
+    )
+  ) {
+    issues.push("variant must be baseline, candidate, control, or treatment");
+  }
+  for (const field of ["controlled", "treatment"]) {
+    assertObject(experiment[field], field, issues);
+  }
+  if (experiment.notes !== undefined) {
+    assertString(experiment.notes, "notes", issues, { allowEmpty: true });
+  }
+  if (issues.length > 0) throw new ValidationError("Experiment", issues);
+  return experiment;
 }
 
 export function validateTarget(target) {

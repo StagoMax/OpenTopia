@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-ROUTER-001",
+  "version": "1.0.0",
+  "title": "Repair precedence and decoding regressions in a small router",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Repair the router regression described in ISSUE.md. Work within the existing design, preserve compatible behavior, and run the repository tests. Do not modify ISSUE.md or files under test/.",
+  "tags": ["calibration", "swe-bench-inspired", "bugfix", "multi-file", "javascript"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 900, "maxToolCalls": 100, "maxTotalTokens": 180000 },
+  "graders": {
+    "commands": [{ "id": "router-contract", "command": "node", "args": ["grader.cjs", "{workspace}"], "timeoutSeconds": 120 }],
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true },
+    "security": { "protectedPaths": ["ISSUE.md", "test"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

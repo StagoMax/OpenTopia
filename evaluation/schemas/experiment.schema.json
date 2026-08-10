@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opentopia.local/evaluation/experiment.schema.json",
+  "title": "Paired evaluation experiment profile",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "experimentId",
+    "pairingKey",
+    "variant",
+    "controlled",
+    "treatment"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "experimentId": { "type": "string", "minLength": 1 },
+    "pairingKey": { "type": "string", "minLength": 1 },
+    "variant": {
+      "enum": ["baseline", "candidate", "control", "treatment"]
+    },
+    "controlled": { "type": "object" },
+    "treatment": { "type": "object" },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false
+}

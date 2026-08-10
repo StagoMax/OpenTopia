@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   ValidationError,
   validateEvent,
+  validateExperiment,
   validateSuite,
   validateTarget,
   validateTask
@@ -40,6 +41,14 @@ test("accepts valid task, suite, target, and event contracts", () => {
     type: "tool.call.completed",
     payload: {}
   }).type, "tool.call.completed");
+  assert.equal(validateExperiment({
+    schemaVersion: 1,
+    experimentId: "prompt-v2",
+    pairingKey: "glm-fixed-seed-0",
+    variant: "baseline",
+    controlled: { model: "glm-5.2" },
+    treatment: { systemPromptHash: "abc" }
+  }).variant, "baseline");
 });
 
 test("rejects contradictory capability requirements", () => {
@@ -60,6 +69,20 @@ test("rejects malformed suite and target definitions", () => {
   assert.throws(
     () => validateTarget({ schemaVersion: 1, id: "target", command: "node", promptTransport: "socket" }),
     /promptTransport/
+  );
+});
+
+test("rejects an unknown experiment variant", () => {
+  assert.throws(
+    () => validateExperiment({
+      schemaVersion: 1,
+      experimentId: "prompt-v2",
+      pairingKey: "seed-0",
+      variant: "maybe",
+      controlled: {},
+      treatment: {},
+    }),
+    /variant must be baseline, candidate, control, or treatment/,
   );
 });
 

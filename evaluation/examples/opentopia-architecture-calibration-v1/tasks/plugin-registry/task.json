@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-PLUGIN-001",
+  "version": "1.0.0",
+  "title": "Diagnose and repair plugin registry resolution",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Diagnose the plugin registry regression, persist evidence, survive the controlled restart, and then implement and verify the repair.",
+  "tags": ["calibration", "swe-bench-inspired", "diagnosis", "plugin-resolution", "restart"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 1200, "maxToolCalls": 140, "maxTotalTokens": 260000 },
+  "phases": [
+    {
+      "id": "diagnose",
+      "prompt": "Reproduce ISSUE.md without changing src/. Trace the failure across the existing modules and write diagnosis.json with keys rootCauseFile, rootCauseSymbol, reproductionCommand, and observedFailure. The evidence must identify the actual defect, not merely repeat the issue.",
+      "graders": { "commands": [{ "id": "diagnosis", "command": "node", "args": ["grader.cjs", "{workspace}", "diagnose"], "timeoutSeconds": 120 }] }
+    },
+    {
+      "id": "repair",
+      "restartBefore": true,
+      "prompt": "Resume the diagnosed issue after restart. Use diagnosis.json as evidence, repair the implementation, run all tests, and leave the diagnosis intact.",
+      "graders": { "commands": [{ "id": "repair", "command": "node", "args": ["grader.cjs", "{workspace}", "full"], "timeoutSeconds": 120 }] }
+    }
+  ],
+  "graders": {
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true, "requireThreadReuse": true, "minimumPhaseCompletions": 2 },
+    "security": { "protectedPaths": ["ISSUE.md", "test"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-ASYNC-001",
+  "version": "1.0.0",
+  "title": "Fix cancellation and ordering in an asynchronous worker pool",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Investigate and fix the asynchronous worker-pool issue in ISSUE.md. Preserve the exported API and prove the fix with tests. Do not modify ISSUE.md or test/.",
+  "tags": ["calibration", "swe-bench-inspired", "async", "cancellation", "javascript"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 900, "maxToolCalls": 100, "maxTotalTokens": 180000 },
+  "graders": {
+    "commands": [{ "id": "pool-contract", "command": "node", "args": ["grader.cjs", "{workspace}"], "timeoutSeconds": 120 }],
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true },
+    "security": { "protectedPaths": ["ISSUE.md", "test"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

@@ -1,0 +1,9 @@
+[
+  {"at":"2026-08-01T00:00:00Z","action":"enqueue","job":{"id":"b","payload":{"n":2},"availableAt":"2026-08-01T00:00:00Z"}},
+  {"at":"2026-08-01T00:00:00Z","action":"enqueue","job":{"id":"a","payload":{"n":1},"availableAt":"2026-08-01T00:00:00Z"}},
+  {"at":"2026-08-01T00:00:01Z","action":"lease","workerId":"w1","leaseMs":1000},
+  {"at":"2026-08-01T00:00:03Z","action":"lease","workerId":"w2","leaseMs":5000},
+  {"at":"2026-08-01T00:00:04Z","action":"ack","workerId":"w2","id":"a"},
+  {"at":"2026-08-01T00:00:05Z","action":"lease","workerId":"w1","leaseMs":5000},
+  {"at":"2026-08-01T00:00:06Z","action":"retry","workerId":"w1","id":"b","delayMs":4000}
+]

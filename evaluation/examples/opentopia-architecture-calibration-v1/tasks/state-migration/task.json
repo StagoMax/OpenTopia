@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-MIGRATION-001",
+  "version": "1.0.0",
+  "title": "Plan and apply a referentially safe state migration",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Perform the Python state migration in MIGRATION.md with a dry-run checkpoint before the controlled restart and an atomic application afterward.",
+  "tags": ["calibration", "terminal-bench-inspired", "python", "migration", "restart"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 1200, "maxToolCalls": 140, "maxTotalTokens": 260000 },
+  "phases": [
+    {
+      "id": "dry-run",
+      "prompt": "Implement the migration planner from MIGRATION.md, run the Python tests, and produce migration-plan.json for legacy/. Do not write migrated/ yet.",
+      "graders": { "commands": [{ "id": "migration-plan", "command": "node", "args": ["grader.cjs", "{workspace}", "plan"], "timeoutSeconds": 120 }] }
+    },
+    {
+      "id": "apply",
+      "restartBefore": true,
+      "prompt": "Resume after restart, validate the saved plan against the unchanged legacy inputs, implement atomic apply, and create migrated/. Run all tests and verify referential integrity.",
+      "graders": { "commands": [{ "id": "migration-apply", "command": "node", "args": ["grader.cjs", "{workspace}", "full"], "timeoutSeconds": 120 }] }
+    }
+  ],
+  "graders": {
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true, "requireThreadReuse": true, "minimumPhaseCompletions": 2 },
+    "security": { "protectedPaths": ["MIGRATION.md", "test", "legacy"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

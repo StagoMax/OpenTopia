@@ -1,0 +1,5 @@
+[
+  {"id":"physical","kind":"physical","paidCents":5000,"refundedCents":0,"deliveredAt":"2026-06-01T00:00:00Z","fraudHold":false},
+  {"id":"digital","kind":"digital","paidCents":2000,"refundedCents":0,"purchasedAt":"2026-07-01T00:00:00Z","downloadedAt":"2026-07-02T00:00:00Z","fraudHold":false},
+  {"id":"held","kind":"physical","paidCents":9000,"refundedCents":0,"deliveredAt":"2026-07-20T00:00:00Z","fraudHold":true}
+]

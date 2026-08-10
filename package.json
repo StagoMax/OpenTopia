@@ -12,6 +12,7 @@
     "check": "cargo check --workspace && pnpm --filter @opentopia/desktop typecheck && pnpm --filter @opentopia/desktop test && pnpm design:check && pnpm boundary:check && pnpm test:evaluation",
     "test": "pnpm --filter @opentopia/desktop test",
     "test:evaluation": "node --test evaluation/test/*.test.mjs",
+    "test:provider-release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-provider-tool-cache-release.ps1",
     "eval:catalog": "node evaluation/src/cli.mjs catalog --root .opentopia/evaluations",
     "boundary:check": "node scripts/check-evaluation-boundary.mjs",
     "design:check": "node scripts/check-design-system.mjs",

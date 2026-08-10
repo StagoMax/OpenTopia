@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-DEPLOY-001",
+  "version": "1.0.0",
+  "title": "Build and serve an atomic static deployment",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Complete the local deployment tool in RUNBOOK.md. The final implementation must build an atomic release and serve it with the required HTTP behavior. Run the tests, but do not modify RUNBOOK.md or test/.",
+  "tags": ["calibration", "terminal-bench-inspired", "service", "deployment", "javascript"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 1200, "maxToolCalls": 120, "maxTotalTokens": 220000 },
+  "graders": {
+    "commands": [{ "id": "deploy-contract", "command": "node", "args": ["grader.cjs", "{workspace}"], "timeoutSeconds": 180 }],
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true },
+    "security": { "protectedPaths": ["RUNBOOK.md", "test"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

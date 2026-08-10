@@ -1,8 +1,13 @@
 {
   "schemaVersion": 1,
   "id": "opentopia-long-horizon-new-5",
+  "version": "1.0.0",
   "title": "OpenTopia Long-Horizon Novel Five-Task Suite",
   "description": "Five distinct two-phase coding tasks that require a controlled server restart, durable planning, same-thread recovery, objective grading, and final CLI verification.",
+  "evaluationClass": "conformance",
+  "visibility": "public",
+  "frozen": true,
+  "benchmarkReferences": [],
   "repetitions": 1,
   "tasks": [
     "tasks/inventory-reservation/task.json",

@@ -56,6 +56,11 @@ function Assert-RuntimeStagePath {
 
 Push-Location $repoRoot
 try {
+  & (Join-Path $PSScriptRoot "test-provider-tool-cache-release.ps1")
+  if ($LASTEXITCODE -ne 0) {
+    throw "provider tool/cache release gate failed with exit code $LASTEXITCODE"
+  }
+
   Write-Host "Building Rust server and Windows sandbox: cargo build --release -p opentopia-server -p opentopia-windows-sandbox"
   cargo build --release -p opentopia-server -p opentopia-windows-sandbox
   if ($LASTEXITCODE -ne 0) {

@@ -27,6 +27,7 @@ import {
 } from "./utils.mjs";
 import {
   loadJson,
+  validateExperiment,
   validateSuite,
   validateTarget,
   validateTask,
@@ -674,7 +675,7 @@ async function runTrial({
   return result;
 }
 
-async function manifestFor(definitions, runId, repetitions) {
+async function manifestFor(definitions, runId, repetitions, experimentEntry) {
   const taskHashes = {};
   for (const entry of definitions.tasks)
     taskHashes[entry.task.id] = await sha256File(entry.taskPath);
@@ -693,6 +694,11 @@ async function manifestFor(definitions, runId, repetitions) {
     targetSha256: await sha256File(definitions.targetPath),
     taskHashes,
     repetitions,
+    experiment: experimentEntry?.experiment ?? null,
+    experimentPath: experimentEntry?.path ?? null,
+    experimentSha256: experimentEntry
+      ? await sha256File(experimentEntry.path)
+      : null,
   };
 }
 
@@ -701,8 +707,36 @@ export async function runSuite({
   targetPath,
   outputDirectory,
   repetitions,
+  experimentPath,
+  selectedTaskIds,
 }) {
-  const definitions = await validateDefinitions(suitePath, targetPath);
+  const loadedDefinitions = await validateDefinitions(suitePath, targetPath);
+  const requestedTaskIds = selectedTaskIds?.length
+    ? [...new Set(selectedTaskIds)]
+    : null;
+  const availableTaskIds = new Set(
+    loadedDefinitions.tasks.map((entry) => entry.task.id),
+  );
+  const unknownTaskIds = (requestedTaskIds ?? []).filter(
+    (taskId) => !availableTaskIds.has(taskId),
+  );
+  if (unknownTaskIds.length > 0) {
+    throw new Error(`Unknown selected task IDs: ${unknownTaskIds.join(", ")}`);
+  }
+  const definitions = requestedTaskIds
+    ? {
+        ...loadedDefinitions,
+        tasks: loadedDefinitions.tasks.filter((entry) =>
+          requestedTaskIds.includes(entry.task.id),
+        ),
+      }
+    : loadedDefinitions;
+  const experimentEntry = experimentPath
+    ? {
+        path: path.resolve(experimentPath),
+        experiment: validateExperiment(await loadJson(experimentPath)),
+      }
+    : null;
   const runId = makeId(
     definitions.suite.id.replace(/[^A-Za-z0-9]+/g, "-").toLowerCase(),
   );
@@ -714,6 +748,7 @@ export async function runSuite({
     definitions,
     runId,
     effectiveSuiteRepetitions,
+    experimentEntry,
   );
   await writeFile(
     path.join(runDirectory, "manifest.json"),

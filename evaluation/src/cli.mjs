@@ -12,7 +12,7 @@ function help() {
 
 Usage:
   agent-eval validate --suite <suite.json> --target <target.json>
-  agent-eval run --suite <suite.json> --target <target.json> [--output <dir>] [--repetitions <n>]
+  agent-eval run --suite <suite.json> --target <target.json> [--output <dir>] [--repetitions <n>] [--tasks <id,id,...>] [--experiment <profile.json>]
   agent-eval compare --baseline <summary.json> --candidate <summary.json> [--output <dir>]
   agent-eval catalog [--root <evaluations-dir>] [--output <catalog.md>]
 
@@ -106,11 +106,16 @@ async function main() {
     }
   }
   const outputDirectory = options.output ?? path.join(process.cwd(), "evaluation", ".runs");
+  const selectedTaskIds = options.tasks
+    ? options.tasks.split(",").map((value) => value.trim()).filter(Boolean)
+    : undefined;
   const result = await runSuite({
     suitePath: options.suite,
     targetPath: options.target,
     outputDirectory,
-    repetitions
+    repetitions,
+    experimentPath: options.experiment,
+    selectedTaskIds
   });
   process.stdout.write(`${JSON.stringify({
     status: result.summary.status,

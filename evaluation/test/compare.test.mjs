@@ -84,3 +84,55 @@ test("rejects runs when the supposedly fixed evaluation contract changed", () =>
   };
   assert.throws(() => compareSummaries(baseline, candidate), /different task fixture hashes/);
 });
+
+test("allows prompt and harness treatments while fixing controlled factors", () => {
+  const baseline = summary("base", [trial("patch", "passed", 1000, 1000)]);
+  const candidate = summary("next", [trial("patch", "passed", 900, 900)]);
+  baseline.manifest = {
+    experiment: {
+      schemaVersion: 1,
+      experimentId: "prompt-finalization",
+      pairingKey: "glm52-seed0",
+      variant: "baseline",
+      controlled: { model: "glm-5.2", reasoning: "high" },
+      treatment: { promptHash: "old", finalization: "v1" }
+    }
+  };
+  candidate.manifest = {
+    experiment: {
+      ...baseline.manifest.experiment,
+      variant: "candidate",
+      treatment: { promptHash: "new", finalization: "v2" }
+    }
+  };
+  const comparison = compareSummaries(baseline, candidate);
+  assert.equal(comparison.status, "passed");
+  assert.equal(comparison.experiment.baselineTreatment.promptHash, "old");
+  assert.equal(comparison.experiment.candidateTreatment.promptHash, "new");
+});
+
+test("rejects paired experiments when a controlled model changes", () => {
+  const baseline = summary("base", [trial("patch", "passed", 1000, 1000)]);
+  const candidate = summary("next", [trial("patch", "passed", 1000, 1000)]);
+  const experiment = {
+    schemaVersion: 1,
+    experimentId: "harness-change",
+    pairingKey: "seed0",
+    variant: "baseline",
+    controlled: { model: "glm-5.2" },
+    treatment: { harness: "old" }
+  };
+  baseline.manifest = { experiment };
+  candidate.manifest = {
+    experiment: {
+      ...experiment,
+      variant: "candidate",
+      controlled: { model: "other" },
+      treatment: { harness: "new" }
+    }
+  };
+  assert.throws(
+    () => compareSummaries(baseline, candidate),
+    /different controlled factors/
+  );
+});

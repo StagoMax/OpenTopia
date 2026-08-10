@@ -7,8 +7,13 @@ const token =
   process.env.OPENTOPIA_API_TOKEN ?? process.env.OPENTOPIA_EVAL_API_TOKEN;
 const workspace = process.env.AGENT_EVAL_WORKSPACE;
 const eventsPath = process.env.AGENT_EVAL_EVENTS_PATH;
-const title = process.env.AGENT_EVAL_TASK_ID ?? "application evaluation";
+const taskTitle = process.env.AGENT_EVAL_TASK_ID ?? "application evaluation";
+const titlePrefix = process.env.OPENTOPIA_EVAL_TITLE_PREFIX?.trim();
+const title = titlePrefix ? `${titlePrefix} · ${taskTitle}` : taskTitle;
 const approvalMode = process.env.OPENTOPIA_EVAL_APPROVAL_MODE ?? "deny";
+const providerId = process.env.OPENTOPIA_EVAL_PROVIDER_ID?.trim();
+const modelId = process.env.OPENTOPIA_EVAL_MODEL_ID?.trim();
+const reasoningEffort = process.env.OPENTOPIA_EVAL_REASONING_EFFORT?.trim();
 const pollMs = Number(process.env.OPENTOPIA_EVAL_POLL_MS ?? 500);
 const timeoutMs = Number(process.env.OPENTOPIA_EVAL_TIMEOUT_MS ?? 1_800_000);
 const phaseId = process.env.AGENT_EVAL_PHASE_ID ?? "default";
@@ -32,6 +37,11 @@ if (!token)
   throw new Error(
     "OPENTOPIA_API_TOKEN is required; pass it through target.passEnvironment",
   );
+if (Boolean(providerId) !== Boolean(modelId)) {
+  throw new Error(
+    "OPENTOPIA_EVAL_PROVIDER_ID and OPENTOPIA_EVAL_MODEL_ID must be configured together",
+  );
+}
 if (Boolean(browserResultUrl) !== Boolean(browserResultToken)) {
   throw new Error(
     "OPENTOPIA_EVAL_BROWSER_RESULT_URL and OPENTOPIA_EVAL_BROWSER_RESULT_TOKEN must be configured together",
@@ -521,6 +531,20 @@ async function main() {
     await emit(
       "application.thread.created",
       { phaseId, threadId: thread.id },
+      { threadId: thread.id },
+    );
+  }
+  if (!priorState?.threadId && providerId && modelId) {
+    await api("PUT", `/api/threads/${thread.id}/model`, {
+      selection: {
+        connectionId: providerId,
+        modelId,
+        reasoningEffort: reasoningEffort || null,
+      },
+    });
+    await emit(
+      "application.thread.model_pinned",
+      { providerId, modelId, reasoningEffort: reasoningEffort || null },
       { threadId: thread.id },
     );
   }

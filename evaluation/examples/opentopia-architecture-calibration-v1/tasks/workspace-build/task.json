@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-WORKSPACE-001",
+  "version": "1.0.0",
+  "title": "Repair incremental builds in a small multi-package workspace",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Resolve the workspace build regression described in ISSUE.md. Trace the existing modules instead of replacing the architecture, preserve deterministic output, and run all tests. Do not modify ISSUE.md or test/.",
+  "tags": ["calibration", "swe-bench-inspired", "repository", "incremental-build", "multi-file"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 1200, "maxToolCalls": 120, "maxTotalTokens": 220000 },
+  "graders": {
+    "commands": [{ "id": "workspace-contract", "command": "node", "args": ["grader.cjs", "{workspace}"], "timeoutSeconds": 180 }],
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true },
+    "security": { "protectedPaths": ["ISSUE.md", "test"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

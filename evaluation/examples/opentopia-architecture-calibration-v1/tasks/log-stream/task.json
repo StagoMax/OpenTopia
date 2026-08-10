@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "CAL-LOG-001",
+  "version": "1.0.0",
+  "title": "Stream and summarize compressed service logs",
+  "suite": "opentopia-architecture-calibration-v1",
+  "prompt": "Implement the streaming incident-log summarizer in SPEC.md. Preserve bounded-memory behavior, add no dependencies, and run all tests. Do not modify SPEC.md or test/.",
+  "tags": ["calibration", "terminal-bench-inspired", "streaming", "gzip", "data-processing"],
+  "fixture": { "source": "seed" },
+  "budgets": { "watchdogSeconds": 1200, "maxToolCalls": 110, "maxTotalTokens": 200000 },
+  "graders": {
+    "commands": [{ "id": "log-contract", "command": "node", "args": ["grader.cjs", "{workspace}"], "timeoutSeconds": 180 }],
+    "trajectory": { "requireValidEvents": true, "requireCompletionClaim": true },
+    "security": { "protectedPaths": ["SPEC.md", "test"], "forbiddenEventTypes": ["security.*"] }
+  }
+}

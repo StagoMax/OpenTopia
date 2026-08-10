@@ -3,6 +3,8 @@ param(
   [string]$Profile = "AUDIT_COPILOT_LLM",
   [string]$ExpectedModel = "",
   [string]$ModelOverride = "",
+  [string]$BaseUrlOverride = "",
+  [string]$ProviderId = "",
   [string]$ReasoningEffort = "",
   [ValidateRange(1024, 65535)][int]$Port = 8812,
   [ValidateRange(1, 100)][int]$Repetitions = 1,
@@ -10,6 +12,14 @@ param(
   [string]$TargetPath = "",
   [string]$OutputDirectory = "",
   [string]$SummaryPath = "",
+  [string]$ExperimentPath = "",
+  [string]$ExperimentId = "",
+  [string]$PairingKey = "",
+  [ValidateSet("", "baseline", "candidate", "control", "treatment")]
+  [string]$Variant = "",
+  [string]$TreatmentLabel = "",
+  [string]$TaskIds = "",
+  [switch]$VisibleInDesktop,
   [switch]$SkipBuild,
   [switch]$BrowserFixture,
   [ValidateRange(1024, 65535)][int]$BrowserFixturePort = 8999
@@ -60,6 +70,41 @@ function New-EvaluationToken {
   return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
 }
 
+function Get-TextSha256 {
+  param([AllowEmptyString()][string]$Text)
+
+  $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+  $algorithm = [Security.Cryptography.SHA256]::Create()
+  try {
+    return ([BitConverter]::ToString($algorithm.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+  } finally {
+    $algorithm.Dispose()
+  }
+}
+
+function Get-ContentTreeSha256 {
+  param([Parameter(Mandatory = $true)][string[]]$Paths)
+
+  $files = @($Paths | ForEach-Object {
+    if (Test-Path -LiteralPath $_ -PathType Container) {
+      Get-ChildItem -LiteralPath $_ -Recurse -File
+    } elseif (Test-Path -LiteralPath $_ -PathType Leaf) {
+      Get-Item -LiteralPath $_
+    }
+  } | Sort-Object FullName)
+  if (-not $files) {
+    throw "No prompt source files were found"
+  }
+  $content = [Text.StringBuilder]::new()
+  foreach ($file in $files) {
+    [void]$content.Append($file.FullName)
+    [void]$content.Append([char]0)
+    [void]$content.Append([IO.File]::ReadAllText($file.FullName))
+    [void]$content.Append([char]0)
+  }
+  return Get-TextSha256 $content.ToString()
+}
+
 function Protect-Text {
   param(
     [AllowNull()][string]$Text,
@@ -87,10 +132,31 @@ function Protect-File {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     return
   }
-  $text = [IO.File]::ReadAllText($Path)
+  $text = $null
+  for ($attempt = 1; $attempt -le 10; $attempt += 1) {
+    try {
+      $text = [IO.File]::ReadAllText($Path)
+      break
+    } catch [IO.IOException] {
+      if ($attempt -eq 10) {
+        throw
+      }
+      Start-Sleep -Milliseconds 100
+    }
+  }
   $safe = Protect-Text $text $Secrets
   if ($safe -ne $text) {
-    [IO.File]::WriteAllText($Path, $safe, [Text.UTF8Encoding]::new($false))
+    for ($attempt = 1; $attempt -le 10; $attempt += 1) {
+      try {
+        [IO.File]::WriteAllText($Path, $safe, [Text.UTF8Encoding]::new($false))
+        break
+      } catch [IO.IOException] {
+        if ($attempt -eq 10) {
+          throw
+        }
+        Start-Sleep -Milliseconds 100
+      }
+    }
   }
 }
 
@@ -321,7 +387,10 @@ function New-RuntimeTarget {
   param(
     [Parameter(Mandatory = $true)][string]$SourcePath,
     [Parameter(Mandatory = $true)][string]$DestinationPath,
-    [Parameter(Mandatory = $true)][string]$AdapterPath
+    [Parameter(Mandatory = $true)][string]$AdapterPath,
+    [AllowEmptyString()][string]$ProviderId = "",
+    [AllowEmptyString()][string]$ModelId = "",
+    [AllowEmptyString()][string]$ReasoningEffort = ""
   )
 
   $target = Get-Content -Raw -Encoding UTF8 -LiteralPath $SourcePath | ConvertFrom-Json
@@ -333,6 +402,14 @@ function New-RuntimeTarget {
     $baseUrlProperty.Value = "http://127.0.0.1:$Port"
   } else {
     $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_BASE_URL" -NotePropertyValue "http://127.0.0.1:$Port"
+  }
+  if ($ProviderId -and $ModelId) {
+    $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_PROVIDER_ID" -NotePropertyValue $ProviderId -Force
+    $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_MODEL_ID" -NotePropertyValue $ModelId -Force
+    $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_TITLE_PREFIX" -NotePropertyValue "Kimi-k3 Architecture Eval" -Force
+    if ($ReasoningEffort) {
+      $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_REASONING_EFFORT" -NotePropertyValue $ReasoningEffort -Force
+    }
   }
   $target.args = @($target.args | ForEach-Object {
     $_.Replace("{targetDir}/../../adapters/opentopia-http.mjs", $AdapterPath)
@@ -391,7 +468,11 @@ $configuredModel = @(
   [Environment]::GetEnvironmentVariable("${Profile}MODEL", "Process")
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
 $apiKey = [string]$apiKey
-$baseUrl = ([string]$baseUrl).TrimEnd("/")
+$baseUrl = if ($BaseUrlOverride) {
+  $BaseUrlOverride.TrimEnd("/")
+} else {
+  ([string]$baseUrl).TrimEnd("/")
+}
 $configuredModel = [string]$configuredModel
 $model = if ($ModelOverride) { $ModelOverride.Trim() } else { $configuredModel }
 if (-not $apiKey -or -not $baseUrl -or -not $model) {
@@ -403,6 +484,15 @@ if ($ExpectedModel -and $model -ne $ExpectedModel) {
 $supportedReasoningEfforts = @("none", "minimal", "low", "medium", "high", "xhigh", "max")
 if ($ReasoningEffort -and $supportedReasoningEfforts -notcontains $ReasoningEffort) {
   throw "ReasoningEffort must be one of: $($supportedReasoningEfforts -join ', ')"
+}
+if ($ExperimentPath -and ($ExperimentId -or $PairingKey -or $Variant)) {
+  throw "Use either ExperimentPath or the generated ExperimentId/PairingKey/Variant parameters"
+}
+if (($ExperimentId -or $PairingKey -or $Variant) -and -not ($ExperimentId -and $PairingKey -and $Variant)) {
+  throw "ExperimentId, PairingKey, and Variant must be supplied together"
+}
+if ($VisibleInDesktop -and -not $ProviderId) {
+  throw "ProviderId is required when VisibleInDesktop is enabled"
 }
 
 $suitePath = if ([IO.Path]::IsPathRooted($SuitePath)) {
@@ -448,7 +538,8 @@ foreach ($name in @(
   "OPENTOPIA_BROWSER_DATA_ROOT",
   "OPENTOPIA_EVAL_BROWSER_FIXTURE_URL",
   "OPENTOPIA_EVAL_BROWSER_FIXTURE_STATE",
-  "OPENTOPIA_EVAL_BROWSER_DATA_ROOT"
+  "OPENTOPIA_EVAL_BROWSER_DATA_ROOT",
+  "OPENTOPIA_WINDOWS_SANDBOX_BIN"
 )) {
   $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
 }
@@ -462,6 +553,8 @@ $script:Secrets = @($apiKey, $evaluationToken)
 [Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_MODE", "workspace-write", "Process")
 [Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_ENFORCEMENT", "best-effort", "Process")
 [Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_NETWORK", "deny", "Process")
+$sandboxBinary = Join-Path $repoRoot ".opentopia\verify-target\debug\opentopia-sandbox.exe"
+[Environment]::SetEnvironmentVariable("OPENTOPIA_WINDOWS_SANDBOX_BIN", $sandboxBinary, "Process")
 $script:ApiHeaders = @{ Authorization = "Bearer $evaluationToken" }
 
 $runId = "$safeSuiteId-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
@@ -475,12 +568,18 @@ $harnessOutput = if ($OutputDirectory) {
 } else {
   Join-Path $runRoot "harness-runs"
 }
-$databasePath = Join-Path $runRoot "evaluation.db"
+$databasePath = if ($VisibleInDesktop) {
+  Join-Path $repoRoot ".opentopia\opentopia.db"
+} else {
+  Join-Path $runRoot "evaluation.db"
+}
 $runtimeTargetPath = Join-Path $runRoot "target.json"
 $restartControlPath = Join-Path $runRoot "restart-control.json"
 $harnessStdoutPath = Join-Path $runRoot "harness.stdout.log"
 $harnessStderrPath = Join-Path $runRoot "harness.stderr.log"
 $resultPath = Join-Path $runRoot "runner-result.json"
+$runtimeExperimentPath = $null
+$runtimeExperiment = $null
 $script:ServerProcess = $null
 $script:BrowserFixtureProcess = $null
 $script:RestartCount = 0
@@ -517,7 +616,7 @@ try {
   if (-not $SkipBuild) {
     Push-Location $repoRoot
     try {
-      cargo build -p opentopia-server
+      cargo build -p opentopia-server -p opentopia-windows-sandbox
       if ($LASTEXITCODE -ne 0) {
         throw "opentopia-server build failed"
       }
@@ -541,40 +640,121 @@ try {
     $script:BrowserFixtureProcess = Start-BrowserFixture $fixturePath $browserFixtureStatePath $runRoot
   }
 
-  New-RuntimeTarget $targetPath $runtimeTargetPath $adapterPath
+  New-RuntimeTarget $targetPath $runtimeTargetPath $adapterPath $ProviderId $model $ReasoningEffort
   $script:ServerProcess = Start-EvalServer "initial" $serverPath $databasePath $runRoot
-  $settings = Set-EvaluationProviderSettings $model $ReasoningEffort
-  $providerHealth = Invoke-EvalApi "Post" "/api/provider/test" @{}
+  if ($VisibleInDesktop) {
+    $settings = Invoke-EvalApi "Get" "/api/settings"
+    $activeProvider = @($settings.providers | Where-Object { $_.id -eq $ProviderId })[0]
+    if (-not $activeProvider) {
+      throw "Configured desktop provider was not found: $ProviderId"
+    }
+    if (@($activeProvider.syncedModels) -notcontains $model -and $activeProvider.model -ne $model) {
+      throw "Model $model is not available on desktop provider $ProviderId"
+    }
+    $providerHealth = Invoke-EvalApi "Post" "/api/provider/test" @{ providerId = $ProviderId } 90
+  } else {
+    $settings = Set-EvaluationProviderSettings $model $ReasoningEffort
+    $providerHealth = Invoke-EvalApi "Post" "/api/provider/test" @{}
+  }
   if (-not $providerHealth.reachable -or -not $providerHealth.modelAvailable) {
     throw "OpenTopia provider health check failed"
   }
   $settings = Invoke-EvalApi "Get" "/api/settings"
   $activeProvider = @($settings.providers | Where-Object {
-    $_.id -eq $settings.activeProviderId
+    $_.id -eq $(if ($VisibleInDesktop) { $ProviderId } else { $settings.activeProviderId })
   })[0]
   if (-not $activeProvider) {
     $activeProvider = @($settings.providers | Where-Object { $_.model -eq $model })[0]
   }
   if (
     -not $activeProvider -or
-    $activeProvider.model -ne $model -or
+    ((-not $VisibleInDesktop) -and $activeProvider.model -ne $model) -or
     $activeProvider.baseUrl.TrimEnd("/") -ne $baseUrl -or
     ($ReasoningEffort -and $activeProvider.reasoningEffort -ne $ReasoningEffort)
   ) {
     throw "OpenTopia active provider settings do not match the selected evaluation configuration"
   }
 
+  if ($ExperimentPath) {
+    $candidateExperimentPath = if ([IO.Path]::IsPathRooted($ExperimentPath)) {
+      $ExperimentPath
+    } else {
+      Join-Path $repoRoot $ExperimentPath
+    }
+    $runtimeExperimentPath = (Resolve-Path -LiteralPath $candidateExperimentPath).Path
+    $runtimeExperiment = Get-Content -LiteralPath $runtimeExperimentPath -Raw | ConvertFrom-Json
+  } elseif ($ExperimentId) {
+    $agentSourcePath = Join-Path $repoRoot "crates\opentopia-core\src\agent.rs"
+    $basePromptModulePath = Join-Path $repoRoot "crates\opentopia-core\src\base_prompt.rs"
+    $basePromptDirectory = Join-Path $repoRoot "crates\opentopia-core\src\prompts\base"
+    $serverSourcePath = Join-Path $repoRoot "crates\opentopia-server\src\main.rs"
+    $basePromptVersion = [regex]::Match(
+      [IO.File]::ReadAllText($agentSourcePath),
+      'BASE_AGENT_PROMPT_VERSION:\s*&str\s*=\s*"([^"]+)"'
+    ).Groups[1].Value
+    $gitRevision = (& git -C $repoRoot rev-parse HEAD 2>$null).Trim()
+    $gitDirty = [bool](& git -C $repoRoot status --porcelain 2>$null)
+    $agentRuntimeJson = if ($settings.agentRuntime) {
+      $settings.agentRuntime | ConvertTo-Json -Compress -Depth 20
+    } else {
+      "{}"
+    }
+    $experiment = [ordered]@{
+      schemaVersion = 1
+      experimentId = $ExperimentId
+      pairingKey = $PairingKey
+      variant = $Variant
+      controlled = [ordered]@{
+        suite = $suiteId
+        providerProfile = $Profile
+        model = $model
+        reasoningEffort = if ($ReasoningEffort) { $ReasoningEffort } else { [string]$activeProvider.reasoningEffort }
+        repetitions = $Repetitions
+        sandbox = [ordered]@{
+          mode = "workspace-write"
+          network = "deny"
+        }
+      }
+      treatment = [ordered]@{
+        label = $TreatmentLabel
+        gitRevision = $gitRevision
+        gitDirty = $gitDirty
+        basePromptVersion = $basePromptVersion
+        basePromptSha256 = Get-ContentTreeSha256 @($basePromptModulePath, $basePromptDirectory)
+        agentRuntimeSha256 = Get-TextSha256 $agentRuntimeJson
+        coreAgentSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $agentSourcePath).Hash.ToLowerInvariant()
+        serverSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $serverSourcePath).Hash.ToLowerInvariant()
+        adapterSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $adapterPath).Hash.ToLowerInvariant()
+      }
+      notes = "Generated by evaluate-opentopia-tool-suite.ps1 from the effective evaluation configuration."
+    }
+    $runtimeExperiment = $experiment
+    $runtimeExperimentPath = Join-Path $runRoot "experiment.json"
+    [IO.File]::WriteAllText(
+      $runtimeExperimentPath,
+      "$(($experiment | ConvertTo-Json -Depth 20))`n",
+      [Text.UTF8Encoding]::new($false)
+    )
+  }
+
   $nodePath = (Get-Command node -ErrorAction Stop).Source
+  $harnessArguments = @(
+    "evaluation/src/cli.mjs",
+    "run",
+    "--suite", $suitePath,
+    "--target", $runtimeTargetPath,
+    "--output", $harnessOutput,
+    "--repetitions", $Repetitions
+  )
+  if ($runtimeExperimentPath) {
+    $harnessArguments += @("--experiment", $runtimeExperimentPath)
+  }
+  if ($TaskIds) {
+    $harnessArguments += @("--tasks", $TaskIds)
+  }
   $harnessProcess = Start-Process `
     -FilePath $nodePath `
-    -ArgumentList @(
-      "evaluation/src/cli.mjs",
-      "run",
-      "--suite", $suitePath,
-      "--target", $runtimeTargetPath,
-      "--output", $harnessOutput,
-      "--repetitions", $Repetitions
-    ) `
+    -ArgumentList $harnessArguments `
     -WorkingDirectory $repoRoot `
     -RedirectStandardOutput $harnessStdoutPath `
     -RedirectStandardError $harnessStderrPath `
@@ -631,6 +811,14 @@ $status = if ($runError) {
 } else {
   "failed"
 }
+$runtimeExperimentDisplayPath = if (
+  $runtimeExperimentPath -and
+  $runtimeExperimentPath.StartsWith($repoRoot, [StringComparison]::OrdinalIgnoreCase)
+) {
+  $runtimeExperimentPath.Substring($repoRoot.Length).TrimStart('\', '/')
+} else {
+  $runtimeExperimentPath
+}
 $result = [ordered]@{
   schemaVersion = 1
   runId = $runId
@@ -653,7 +841,13 @@ $result = [ordered]@{
     target = $targetPath.Substring($repoRoot.Length).TrimStart('\', '/')
     repetitions = $Repetitions
     port = $Port
-    database = ".opentopia/evaluations/$runId/evaluation.db"
+    database = if ($VisibleInDesktop) { ".opentopia/opentopia.db" } else { ".opentopia/evaluations/$runId/evaluation.db" }
+    desktopVisible = [bool]$VisibleInDesktop
+    selectedTaskIds = if ($TaskIds) {
+      @($TaskIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } else {
+      $null
+    }
     browserFixture = if ($BrowserFixture) {
       [ordered]@{
         url = "http://127.0.0.1:$BrowserFixturePort"
@@ -667,6 +861,16 @@ $result = [ordered]@{
       mode = "workspace-write"
       enforcement = "best-effort"
       network = "deny"
+    }
+    experiment = if ($runtimeExperimentPath) {
+      [ordered]@{
+        path = $runtimeExperimentDisplayPath
+        experimentId = [string]$runtimeExperiment.experimentId
+        pairingKey = [string]$runtimeExperiment.pairingKey
+        variant = [string]$runtimeExperiment.variant
+      }
+    } else {
+      $null
     }
   }
   lifecycle = [ordered]@{

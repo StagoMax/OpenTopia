@@ -1,0 +1,6 @@
+INVOICE
+Invoice Number: A-100
+Subtotal 10.00
+VAT 2.00
+Grand Total 12.00
+Amount Due 7.00
