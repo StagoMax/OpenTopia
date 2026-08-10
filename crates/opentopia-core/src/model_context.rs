@@ -115,6 +115,13 @@ pub struct TokenEstimateBreakdown {
     pub current_user: usize,
     pub tool_calls: usize,
     pub tool_results: usize,
+    /// Full schemas sent directly on this request (including output schemas).
+    pub direct_tool_schemas: usize,
+    /// Names/descriptions visible before a deferred tool is selected.
+    pub deferred_tool_catalog: usize,
+    /// Schemas appended by a provider Tool Search continuation.
+    pub loaded_tool_schemas: usize,
+    /// Sum of the three tool-surface buckets above. Counted in `total` once.
     pub tool_schemas: usize,
     pub provider_state: usize,
     pub other: usize,

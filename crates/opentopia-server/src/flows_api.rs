@@ -416,6 +416,7 @@ async fn flow_runtime_context(
 ) -> Result<ToolContext, ApiError> {
     let settings = current_settings(state);
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
+    agent.apply_experience_mode(thread.experience_mode);
     if thread.model_selection.is_some() {
         agent.set_provider_from_settings_with_model(&settings, thread.model_selection.as_ref());
     }

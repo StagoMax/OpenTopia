@@ -1,0 +1,3 @@
+## Completion conditions
+
+Continue autonomously until the requested outcome is resolved, the user cancels or redirects the work, a real permission boundary requires user action, an unrecoverable error prevents progress, or the harness reports that a configured resource limit is exhausted. Before returning a final answer, ensure there are no required tool calls still running, no plan commitments you recorded left unfinished, no necessary child results outstanding, and no known failure omitted from the report. Work outside the current scope must use an explicit deferred, blocked, or cancelled status with a concrete reason rather than remaining pending.

@@ -4,9 +4,9 @@ use crate::model_context::{
     ModelContextItem, TokenEstimateBreakdown,
 };
 use crate::settings::{
-    model_accepts_temperature, OpenAiCompatibilityReport, OpenAiProtocol, PromptCachePolicy,
-    ProviderFeatureSupport, ProviderHealthCheck, ProviderKind, ProviderSettings,
-    ProviderToolProtocolCapabilities,
+    model_accepts_temperature, official_openai_tool_search_support, OpenAiCompatibilityReport,
+    OpenAiProtocol, PromptCachePolicy, ProviderFeatureSupport, ProviderHealthCheck, ProviderKind,
+    ProviderSettings, ProviderToolProtocolCapabilities,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -124,16 +124,81 @@ impl ModelRequest {
                 .map(estimate_tokens)
                 .unwrap_or_default(),
         );
-        breakdown.tool_schemas = estimate_serialized_slice(&self.tool_candidates).saturating_add(
-            self.final_output_json_schema
-                .as_ref()
-                .map(estimate_serialized_tokens)
-                .unwrap_or_default(),
-        );
-        breakdown.provider_state = estimate_serialized_slice(&self.previous_response_items);
+        let output_schema_tokens = self
+            .final_output_json_schema
+            .as_ref()
+            .map(estimate_serialized_tokens)
+            .unwrap_or_default();
+        let (direct, deferred) = estimate_tool_surface(&self.tool_candidates);
+        breakdown.direct_tool_schemas = direct.saturating_add(output_schema_tokens);
+        breakdown.deferred_tool_catalog = deferred;
+        breakdown.loaded_tool_schemas = estimate_loaded_tool_schemas(&self.previous_response_items);
+        breakdown.tool_schemas = breakdown
+            .direct_tool_schemas
+            .saturating_add(breakdown.deferred_tool_catalog)
+            .saturating_add(breakdown.loaded_tool_schemas);
+        let provider_state_items = self
+            .previous_response_items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) != Some("tool_search_output"))
+            .collect::<Vec<_>>();
+        breakdown.provider_state = if provider_state_items.is_empty() {
+            0
+        } else {
+            estimate_serialized_tokens(&provider_state_items)
+        };
         breakdown.recalculate_total();
         breakdown
     }
+}
+
+fn estimate_tool_surface(candidates: &[ProviderToolCandidate]) -> (usize, usize) {
+    let direct = candidates
+        .iter()
+        .filter(|candidate| candidate.disclosure == ProviderToolDisclosure::Direct)
+        .map(|candidate| {
+            estimate_serialized_tokens(&json!({
+                "name": candidate.name,
+                "description": candidate.description,
+                "parameters": candidate.input_schema,
+            }))
+        })
+        .sum();
+    let individual = candidates
+        .iter()
+        .filter(|candidate| candidate.disclosure == ProviderToolDisclosure::DeferredIndividual)
+        .map(|candidate| {
+            estimate_serialized_tokens(&json!({
+                "name": candidate.name,
+                "description": candidate.description,
+            }))
+        })
+        .sum::<usize>();
+    let namespaces = candidates
+        .iter()
+        .filter(|candidate| candidate.disclosure == ProviderToolDisclosure::DeferredNamespace)
+        .filter_map(|candidate| candidate.namespace.as_ref())
+        .map(|namespace| (namespace.name.as_str(), namespace.description.as_str()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|(name, description)| {
+            estimate_serialized_tokens(&json!({ "name": name, "description": description }))
+        })
+        .sum::<usize>();
+    (direct, individual.saturating_add(namespaces))
+}
+
+pub fn estimate_provider_tool_surface_tokens(candidates: &[ProviderToolCandidate]) -> usize {
+    let (direct, deferred) = estimate_tool_surface(candidates);
+    direct.saturating_add(deferred)
+}
+
+fn estimate_loaded_tool_schemas(items: &[Value]) -> usize {
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_output"))
+        .map(estimate_serialized_tokens)
+        .sum()
 }
 
 fn estimate_serialized_tokens(value: &impl Serialize) -> usize {
@@ -355,12 +420,48 @@ pub enum ProviderTransportEvent {
 pub type ProviderTransportCallback<'a> =
     dyn FnMut(ProviderTransportEvent) -> anyhow::Result<()> + Send + 'a;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderToolCandidate {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    #[serde(default)]
+    pub disclosure: ProviderToolDisclosure,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<ProviderToolNamespace>,
+}
+
+impl ProviderToolCandidate {
+    pub fn direct(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            disclosure: ProviderToolDisclosure::Direct,
+            namespace: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderToolDisclosure {
+    #[default]
+    Direct,
+    DeferredIndividual,
+    DeferredNamespace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderToolNamespace {
+    pub name: String,
+    pub description: String,
 }
 
 /// Provider-facing representations are selected from negotiated protocol
@@ -1771,8 +1872,8 @@ fn responses_request_uses_enhanced_tools(prepared: &PreparedProviderRequest) -> 
             tools.iter().any(|tool| {
                 matches!(
                     tool.get("type").and_then(Value::as_str),
-                    Some("custom") | Some("apply_patch")
-                )
+                    Some("custom") | Some("apply_patch") | Some("namespace") | Some("tool_search")
+                ) || tool.get("defer_loading").and_then(Value::as_bool) == Some(true)
             })
         })
 }
@@ -1815,11 +1916,14 @@ impl OpenAiResponsesProvider {
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let base_url = base_url.into();
+        let model = model.into();
+        let native_tool_search = official_openai_tool_search_support(&base_url, &model);
         Self {
             client: reqwest::Client::new(),
-            base_url: base_url.into(),
+            base_url,
             api_key: api_key.into(),
-            model: model.into(),
+            model,
             temperature: None,
             max_output_tokens: None,
             reasoning_effort: None,
@@ -1832,6 +1936,9 @@ impl OpenAiResponsesProvider {
             supports_vision: true,
             tool_protocol: ProviderToolProtocolCapabilities {
                 function_tools: ProviderFeatureSupport::Supported,
+                deferred_tool_loading: native_tool_search,
+                namespace_tools: native_tool_search,
+                hosted_tool_search: native_tool_search,
                 ..ProviderToolProtocolCapabilities::default()
             },
         }
@@ -3960,6 +4067,8 @@ fn portable_function_tool_candidate(candidate: &ProviderToolCandidate) -> Provid
             "required": ["patch"],
             "additionalProperties": false
         }),
+        disclosure: candidate.disclosure,
+        namespace: candidate.namespace.clone(),
     }
 }
 
@@ -4190,9 +4299,8 @@ fn responses_tools(
     candidates: &[ProviderToolCandidate],
     capabilities: ProviderToolProtocolCapabilities,
 ) -> Vec<Value> {
-    responses_tool_definitions(candidates, capabilities)
-        .into_iter()
-        .map(|definition| match definition {
+    fn lower_definition(definition: ProviderToolDefinition) -> Value {
+        match definition {
             ProviderToolDefinition::Function {
                 name,
                 description,
@@ -4211,8 +4319,56 @@ fn responses_tools(
                 "description": description,
             }),
             ProviderToolDefinition::Hosted { kind } => json!({ "type": kind }),
-        })
-        .collect()
+        }
+    }
+
+    let definitions = responses_tool_definitions(candidates, capabilities);
+    let mut tools = Vec::new();
+    let mut namespaces: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
+    let native_deferred = capabilities.deferred_tool_loading == ProviderFeatureSupport::Supported
+        && capabilities.hosted_tool_search == ProviderFeatureSupport::Supported;
+
+    for (candidate, definition) in candidates.iter().zip(definitions) {
+        let mut tool = lower_definition(definition);
+        match candidate.disclosure {
+            ProviderToolDisclosure::Direct if native_deferred => tools.push(tool),
+            ProviderToolDisclosure::DeferredIndividual if native_deferred => {
+                tool["defer_loading"] = json!(true);
+                tools.push(tool);
+            }
+            ProviderToolDisclosure::DeferredNamespace
+                if native_deferred
+                    && capabilities.namespace_tools == ProviderFeatureSupport::Supported =>
+            {
+                tool["defer_loading"] = json!(true);
+                if let Some(namespace) = candidate.namespace.as_ref() {
+                    namespaces
+                        .entry((namespace.name.clone(), namespace.description.clone()))
+                        .or_default()
+                        .push(tool);
+                } else {
+                    tools.push(tool);
+                }
+            }
+            _ => tools.push(tool),
+        }
+    }
+
+    let has_deferred = candidates
+        .iter()
+        .any(|candidate| candidate.disclosure != ProviderToolDisclosure::Direct);
+    for ((name, description), namespace_tools) in namespaces {
+        tools.push(json!({
+            "type": "namespace",
+            "name": name,
+            "description": description,
+            "tools": namespace_tools,
+        }));
+    }
+    if native_deferred && has_deferred {
+        tools.push(json!({ "type": "tool_search" }));
+    }
+    tools
 }
 
 fn responses_input(request: &ModelRequest) -> Vec<Value> {
@@ -6773,6 +6929,7 @@ mod tests {
             name: "read_file".to_string(),
             description: "Read one file".to_string(),
             input_schema: json!({"type": "object"}),
+            ..Default::default()
         }];
 
         let breakdown = request.token_estimate_breakdown();
@@ -7050,6 +7207,7 @@ mod tests {
             name: "read_file".to_string(),
             description: "Read a workspace file".to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
+            ..Default::default()
         });
         request.user_content.push(ModelInputContent::image(
             "image/png",
@@ -7146,6 +7304,7 @@ mod tests {
             name: "mcp_search".to_string(),
             description: "Search the web through an MCP server".to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
+            ..Default::default()
         });
 
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
@@ -7574,6 +7733,7 @@ mod tests {
                 "type": "object",
                 "properties": { "path": { "type": "string" } }
             }),
+            ..Default::default()
         }];
 
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
@@ -7598,6 +7758,7 @@ mod tests {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
+            ..Default::default()
         }];
 
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
@@ -8272,6 +8433,7 @@ mod tests {
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"]
             }),
+            ..Default::default()
         });
         let mut deltas = Vec::new();
 
@@ -8365,6 +8527,7 @@ mod tests {
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"]
             }),
+            ..Default::default()
         });
         let mut transport = Vec::new();
         let response = provider
@@ -8518,6 +8681,7 @@ mod tests {
                 "properties": {"command": {"type": "string"}},
                 "required": ["command"]
             }),
+            ..Default::default()
         }];
         let mut transport = Vec::new();
         let response = provider
@@ -8582,6 +8746,7 @@ mod tests {
                 "properties": {"command": {"type": "string"}},
                 "required": ["command"]
             }),
+            ..Default::default()
         }];
         let mut transport = Vec::new();
         let response = provider
@@ -8675,6 +8840,7 @@ mod tests {
                 },
                 "required": ["query"]
             }),
+            ..Default::default()
         }];
 
         let response = provider
@@ -9231,6 +9397,7 @@ mod tests {
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"]
             }),
+            ..Default::default()
         }];
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
         assert_eq!(prepared.adapter, "openai_responses");
@@ -9385,6 +9552,7 @@ mod tests {
                     }
                 ]
             }),
+            ..Default::default()
         };
 
         let chat_tools = openai_tools(
@@ -9440,6 +9608,7 @@ mod tests {
                 },
                 "required": ["query"]
             }),
+            ..Default::default()
         };
 
         let chat = openai_tools(std::slice::from_ref(&strict_ready), strict_capabilities);
@@ -9472,6 +9641,7 @@ mod tests {
                     {"type": "object", "properties": {"b": {"type": "string"}}}
                 ]
             }),
+            ..Default::default()
         };
         let fallback = responses_tools(&[portable_only.clone()], strict_capabilities);
         assert_eq!(fallback[0]["strict"], false);
@@ -9493,6 +9663,7 @@ mod tests {
                 },
                 "required": ["query"]
             }),
+            ..Default::default()
         };
         let capabilities = ProviderToolProtocolCapabilities {
             function_tools: ProviderFeatureSupport::Supported,
@@ -9578,6 +9749,7 @@ mod tests {
                 "properties": { "patch": { "type": "string" } },
                 "required": ["patch"]
             }),
+            ..Default::default()
         };
 
         let fallback = responses_tools(
@@ -9634,6 +9806,7 @@ mod tests {
                 "type": "object",
                 "properties": { "patch": { "type": "string" } }
             }),
+            ..Default::default()
         }];
         let prepared = provider
             .prepare_responses_request(Uuid::nil(), request)
@@ -9799,5 +9972,196 @@ mod tests {
         unconfigured.api_key_configured = false;
         assert!(configured_provider_from_settings(&unconfigured).is_none());
         let _fallback = provider_from_settings(&unconfigured);
+    }
+
+    #[test]
+    fn release_gate_provider_capability_tiers_lower_deferred_tools_safely() {
+        let mut candidate = ProviderToolCandidate::direct(
+            "github__search_issues",
+            "Search repository issues.",
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        );
+        candidate.disclosure = ProviderToolDisclosure::DeferredNamespace;
+        candidate.namespace = Some(ProviderToolNamespace {
+            name: "github".to_string(),
+            description: "GitHub repository tools.".to_string(),
+        });
+
+        let native_capabilities = ProviderToolProtocolCapabilities {
+            function_tools: ProviderFeatureSupport::Supported,
+            deferred_tool_loading: ProviderFeatureSupport::Supported,
+            namespace_tools: ProviderFeatureSupport::Supported,
+            hosted_tool_search: ProviderFeatureSupport::Supported,
+            ..ProviderToolProtocolCapabilities::default()
+        };
+        let native = responses_tools(std::slice::from_ref(&candidate), native_capabilities);
+        let namespace = native
+            .iter()
+            .find(|tool| tool["type"] == "namespace")
+            .expect("Responses namespace");
+        assert_eq!(namespace["name"], "github");
+        assert_eq!(namespace["tools"][0]["name"], "github__search_issues");
+        assert_eq!(namespace["tools"][0]["defer_loading"], true);
+        assert!(native.iter().any(|tool| tool["type"] == "tool_search"));
+
+        let individual_capabilities = ProviderToolProtocolCapabilities {
+            namespace_tools: ProviderFeatureSupport::Unsupported,
+            ..native_capabilities
+        };
+        let mut individual = candidate.clone();
+        individual.disclosure = ProviderToolDisclosure::DeferredIndividual;
+        individual.namespace = None;
+        let individual_tools = responses_tools(&[individual], individual_capabilities);
+        assert_eq!(individual_tools[0]["type"], "function");
+        assert_eq!(individual_tools[0]["defer_loading"], true);
+        assert_eq!(individual_tools[1]["type"], "tool_search");
+
+        // Chat Completions and Anthropic do not receive Responses-only fields.
+        let chat = openai_tools(
+            std::slice::from_ref(&candidate),
+            ProviderToolProtocolCapabilities::default(),
+        );
+        assert_eq!(chat[0]["type"], "function");
+        assert!(chat[0].get("defer_loading").is_none());
+        let anthropic = anthropic_tools(std::slice::from_ref(&candidate));
+        assert_eq!(anthropic[0]["name"], "github__search_issues");
+        assert!(anthropic[0].get("defer_loading").is_none());
+
+        let portable_responses = responses_tools(
+            std::slice::from_ref(&candidate),
+            ProviderToolProtocolCapabilities::default(),
+        );
+        assert_eq!(portable_responses.len(), 1);
+        assert_eq!(portable_responses[0]["type"], "function");
+        assert!(portable_responses[0].get("defer_loading").is_none());
+    }
+
+    #[test]
+    fn release_gate_provider_payloads_keep_initial_user_message_last() {
+        let mut request = model_request();
+        request.conversation = vec![
+            ModelConversationMessage {
+                role: ModelConversationRole::User,
+                content: "earlier question".to_string(),
+                content_parts: Vec::new(),
+            },
+            ModelConversationMessage {
+                role: ModelConversationRole::Assistant,
+                content: "earlier answer".to_string(),
+                content_parts: Vec::new(),
+            },
+        ];
+        request.user_message = "current user request".to_string();
+
+        let chat = OpenAiCompatibleProvider::new(
+            "https://compatible.example/v1",
+            "test-key",
+            "compatible-model",
+        )
+        .prepare(Uuid::nil(), request.clone())
+        .expect("chat payload");
+        let chat_messages = chat.body["messages"].as_array().expect("chat messages");
+        assert_eq!(chat_messages.last().unwrap()["role"], "user");
+        assert!(chat_messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("current user request"));
+
+        let responses =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.4")
+                .prepare(Uuid::nil(), request.clone())
+                .expect("Responses payload");
+        let responses_input = responses.body["input"].as_array().expect("Responses input");
+        assert_eq!(responses_input.last().unwrap()["role"], "user");
+
+        let anthropic =
+            AnthropicMessagesProvider::new("https://api.anthropic.com", "test-key", "claude-test")
+                .prepare(Uuid::nil(), request)
+                .expect("Anthropic payload");
+        let anthropic_messages = anthropic.body["messages"]
+            .as_array()
+            .expect("Anthropic messages");
+        assert_eq!(anthropic_messages.last().unwrap()["role"], "user");
+    }
+
+    #[test]
+    fn release_gate_cache_breakpoints_preserve_stable_prefix_and_user_tail() {
+        let mut provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.4");
+        provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
+        let mut request = layered_model_request();
+        request.context_items.push(ModelContextItem::text(
+            ContextItemKind::RepositoryInstructions,
+            ContextRole::Developer,
+            "AGENTS.md",
+            "stable repository instructions",
+            ContextCacheScope::Stable,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
+        request.conversation = vec![ModelConversationMessage {
+            role: ModelConversationRole::Assistant,
+            content: "inherited answer".to_string(),
+            content_parts: Vec::new(),
+        }];
+        request.branch_developer_instructions = Some("branch instructions".to_string());
+        request.user_message = "new user request".to_string();
+
+        let prepared = provider
+            .prepare(Uuid::nil(), request)
+            .expect("cache payload");
+        let input = prepared.body["input"].as_array().expect("Responses input");
+        assert_eq!(input.last().unwrap()["role"], "user");
+        assert_eq!(
+            input.last().unwrap()["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert!(input.iter().any(|item| {
+            item["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("stable repository instructions"))
+                        && part["prompt_cache_breakpoint"]["mode"] == "explicit"
+                })
+            })
+        }));
+        let inherited = input
+            .iter()
+            .find(|item| item["role"] == "assistant")
+            .expect("inherited assistant message");
+        assert_eq!(
+            inherited["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+    }
+
+    #[test]
+    fn release_gate_tool_search_continuation_appends_after_current_user() {
+        let mut request = model_request();
+        request.previous_response_items = vec![
+            json!({ "type": "tool_search_call", "id": "ts_1", "arguments": {"query": "issues"} }),
+            json!({ "type": "tool_search_output", "id": "tso_1", "tools": [{"type": "function", "name": "github__search_issues"}] }),
+            json!({ "type": "function_call", "call_id": "call_1", "name": "github__search_issues", "arguments": "{\"query\":\"bug\"}" }),
+        ];
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "call_1".to_string(),
+            name: "github__search_issues".to_string(),
+            output: "[]".to_string(),
+            content: Vec::new(),
+            is_error: false,
+            metadata: json!({}),
+        }];
+
+        let input = responses_input(&request);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "tool_search_call");
+        assert_eq!(input[2]["type"], "tool_search_output");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[4]["type"], "function_call_output");
     }
 }

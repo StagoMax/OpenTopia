@@ -1114,7 +1114,7 @@ const MAX_TASK_COMPLETION_ITEMS: usize = 20;
 const MAX_TASK_COMPLETION_ITEM_CHARS: usize = 1_000;
 
 const MAX_USER_INPUT_QUESTIONS: usize = 3;
-const MAX_USER_INPUT_OPTIONS: usize = 4;
+const MAX_USER_INPUT_OPTIONS: usize = 3;
 const MAX_USER_INPUT_ID_CHARS: usize = 64;
 const MAX_USER_INPUT_HEADER_CHARS: usize = 24;
 const MAX_USER_INPUT_QUESTION_CHARS: usize = 500;
@@ -1170,13 +1170,17 @@ impl TypedTool for RequestUserInputTool {
     }
 
     fn description(&self) -> &str {
-        "Pause plan generation and ask the user to choose between materially different approaches. Use one to three concise questions with two to four concrete options each. Mark at most one option per question as recommended."
+        "Pause Plan and ask the user to choose between materially different approaches. Use one to three concise questions with two to three concrete options each. Put the recommended option first and mark at most one option per question as recommended."
     }
 
     fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
         anyhow::ensure!(
             ctx.collaboration_mode == CollaborationMode::Plan,
             "request_user_input is only available in plan mode"
+        );
+        anyhow::ensure!(
+            ctx.agent_path == "/root",
+            "only the root agent may ask the user a Plan question"
         );
         Ok(())
     }
@@ -1216,7 +1220,7 @@ impl TypedTool for RequestUserInputTool {
             let mut option_labels = HashSet::new();
             let mut recommended_count = 0usize;
             let mut options = Vec::with_capacity(question.options.len());
-            for option in question.options {
+            for (option_index, option) in question.options.into_iter().enumerate() {
                 let option_id = validate_user_input_id("option id", option.id)?;
                 anyhow::ensure!(
                     option_ids.insert(option_id.clone()),
@@ -1237,6 +1241,10 @@ impl TypedTool for RequestUserInputTool {
                     MAX_USER_INPUT_DESCRIPTION_CHARS,
                 )?;
                 recommended_count += usize::from(option.recommended);
+                anyhow::ensure!(
+                    !option.recommended || option_index == 0,
+                    "question {id} must place its recommended option first"
+                );
                 options.push(UserInputOption {
                     id: option_id,
                     label,
@@ -5916,8 +5924,6 @@ pub struct SearchTool;
 
 const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
 const SEARCH_MAX_RESULTS_LIMIT: usize = 1_000;
-const SEARCH_OUTPUT_MAX_BYTES: usize = 32_000;
-const SEARCH_ARTIFACT_THRESHOLD: usize = 32_000;
 const FALLBACK_MAX_FILE_BYTES: u64 = 1_048_576;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -6040,51 +6046,12 @@ impl TypedTool for SearchTool {
             "fallback": result.fallback
         });
 
-        let mut tool_result = ToolResult {
+        let tool_result = ToolResult {
             call_id,
             output: result.output,
             content: Vec::new(),
             metadata,
         };
-
-        if let Some(ref store) = ctx.store {
-            if let Some(thread_id) = ctx.thread_id {
-                if tool_result.output.len() > SEARCH_ARTIFACT_THRESHOLD {
-                    if let Ok(Some(artifact)) = store.insert_large_tool_output_artifact(
-                        thread_id,
-                        &tool_result,
-                        SEARCH_ARTIFACT_THRESHOLD,
-                    ) {
-                        if let Some(obj) = tool_result.metadata.as_object_mut() {
-                            obj.insert("artifactId".to_string(), json!(artifact.id));
-                            obj.insert("artifactKind".to_string(), json!("tool_output"));
-                            obj.insert(
-                                "artifact".to_string(),
-                                json!({
-                                    "id": artifact.id,
-                                    "kind": "tool_output",
-                                    "bytes": tool_result.output.len()
-                                }),
-                            );
-                        }
-                        tool_result
-                            .output
-                            .push_str(&format!("\n\n[Artifact: {}]", artifact.id));
-                    }
-                } else if let Some(obj) = tool_result.metadata.as_object_mut() {
-                    obj.insert(
-                        "artifact".to_string(),
-                        json!({
-                            "kind": "tool_output",
-                            "contentType": "text/plain",
-                            "status": "inline",
-                            "eligible": result.truncated
-                        }),
-                    );
-                }
-            }
-        }
-
         Ok(tool_result)
     }
 }
@@ -6099,7 +6066,6 @@ pub struct ShellTool;
 const SHELL_DISPLAY_STDOUT_LIMIT: usize = 16_000;
 const SHELL_DISPLAY_STDERR_LIMIT: usize = 8_000;
 
-const ARTIFACT_THRESHOLD: usize = 16_000;
 /// A foreground command blocks the model for its whole runtime, so its ceiling stays
 /// modest; anything longer belongs in the background, where waiting costs nothing.
 const MAX_FOREGROUND_TIMEOUT_SECONDS: u64 = 1_800;
@@ -6497,7 +6463,6 @@ impl TypedTool for ShellTool {
                     chunk.job.success,
                     chunk.job.truncated,
                     chunk.job.sandbox,
-                    &ctx,
                 );
             }
 
@@ -6533,7 +6498,6 @@ impl TypedTool for ShellTool {
             output.success,
             output.truncated,
             output.sandbox,
-            &ctx,
         )
     }
 }
@@ -6589,25 +6553,17 @@ fn shell_completed_result(
     success: bool,
     truncated: bool,
     sandbox: Option<crate::execution::ExecutionSandboxMetadata>,
-    ctx: &ToolContext,
 ) -> anyhow::Result<ToolResult> {
     let full_combined = format!(
         "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
         command, stdout, stderr
     );
-    let combined = format!(
-        "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
-        command,
-        truncate(&stdout, 24_000),
-        truncate(&stderr, 12_000)
-    );
-
-    // `output` above is the model-facing envelope. The UI renders the call
-    // from these structured fields instead of re-parsing that text, so a
-    // terminal view can separate the command, stdout and stderr reliably.
-    let mut result = ToolResult {
+    // The ingress normalizer stores this lossless envelope as an artifact before
+    // it creates the bounded model-facing view. The UI uses the smaller stream
+    // previews below and therefore does not need the artifact in its timeline.
+    let result = ToolResult {
         call_id,
-        output: combined,
+        output: full_combined,
         content: Vec::new(),
         metadata: json!({
             "command": command,
@@ -6622,40 +6578,6 @@ fn shell_completed_result(
             "sandbox": sandbox
         }),
     };
-
-    if let Some(ref store) = ctx.store {
-        if let Some(thread_id) = ctx.thread_id {
-            if full_combined.len() > ARTIFACT_THRESHOLD {
-                let artifact_result = ToolResult {
-                    call_id: result.call_id,
-                    output: full_combined,
-                    content: Vec::new(),
-                    metadata: result.metadata.clone(),
-                };
-                if let Ok(Some(artifact)) = store.insert_large_tool_output_artifact(
-                    thread_id,
-                    &artifact_result,
-                    ARTIFACT_THRESHOLD,
-                ) {
-                    if let Some(obj) = result.metadata.as_object_mut() {
-                        obj.insert("artifactId".to_string(), json!(artifact.id));
-                        obj.insert("artifactKind".to_string(), json!("tool_output"));
-                        obj.insert(
-                            "artifact".to_string(),
-                            json!({
-                                "id": artifact.id,
-                                "kind": "tool_output",
-                                "bytes": artifact_result.output.len()
-                            }),
-                        );
-                    }
-                    result
-                        .output
-                        .push_str(&format!("\n\n[Artifact: {}]", artifact.id));
-                }
-            }
-        }
-    }
 
     Ok(result)
 }
@@ -8019,15 +7941,14 @@ fn parse_rg_json_context(
         rendered
     };
     let original_bytes = text.len();
-    let (output, byte_truncated) = truncate_bytes(&text, SEARCH_OUTPUT_MAX_BYTES);
-    let output_bytes = output.len();
+    let output_bytes = text.len();
     Ok(SearchRun {
         engine: "rg",
-        output,
+        output: text,
         matches: match_count,
         returned_matches,
         locations,
-        truncated: match_count > max_results || byte_truncated,
+        truncated: match_count > max_results,
         original_bytes,
         output_bytes,
         fallback,
@@ -8054,21 +7975,21 @@ fn finalize_search_run(
             .join("\n")
     };
     let line_truncated = matches > max_results;
-    let (output, byte_truncated) = truncate_bytes(&text, SEARCH_OUTPUT_MAX_BYTES);
-    let output_bytes = output.len();
+    let output_bytes = text.len();
     SearchRun {
         engine,
-        output,
+        output: text,
         matches,
         returned_matches,
         locations,
-        truncated: line_truncated || byte_truncated,
+        truncated: line_truncated,
         original_bytes,
         output_bytes,
         fallback,
     }
 }
 
+#[cfg(test)]
 fn truncate_bytes(value: &str, max_bytes: usize) -> (String, bool) {
     if value.len() <= max_bytes {
         return (value.to_string(), false);

@@ -1347,6 +1347,10 @@ pub struct UserInputAnswer {
 #[serde(rename_all = "camelCase")]
 pub struct UserInputResponse {
     pub answers: Vec<UserInputAnswer>,
+    /// The user may deliberately skip Plan's optional clarification step.
+    /// The model then continues with explicit, reasonable assumptions.
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

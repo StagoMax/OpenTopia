@@ -2823,20 +2823,13 @@ fn resolve_message_goal(
     requested_goal_id: Option<Uuid>,
     objective: &str,
 ) -> Result<Option<GoalSnapshot>, ApiError> {
-    if mode == CollaborationMode::Default {
+    if mode != CollaborationMode::Goal {
         if requested_goal_id.is_some() {
-            return Err(ApiError::bad_request(
-                "goalId is only valid in plan or goal mode",
-            ));
+            return Err(ApiError::bad_request("goalId is only valid in goal mode"));
         }
         return Ok(None);
     }
 
-    let initial_status = match mode {
-        CollaborationMode::Plan => GoalStatus::Draft,
-        CollaborationMode::Goal => GoalStatus::Active,
-        CollaborationMode::Default => unreachable!(),
-    };
     let mut snapshot = match requested_goal_id {
         Some(goal_id) => state
             .store
@@ -2845,7 +2838,7 @@ fn resolve_message_goal(
         None => state.store.create_goal(
             thread_id,
             objective.trim().to_string(),
-            initial_status,
+            GoalStatus::Active,
             None,
         )?,
     };
@@ -2862,7 +2855,7 @@ fn resolve_message_goal(
             snapshot.goal.status.as_str()
         )));
     }
-    if mode == CollaborationMode::Goal && snapshot.goal.status != GoalStatus::Active {
+    if snapshot.goal.status != GoalStatus::Active {
         snapshot = state
             .store
             .update_goal_status(thread_id, snapshot.goal.id, GoalStatus::Active)?
@@ -3021,7 +3014,7 @@ fn launch_next_queued_turn(state: &AppState, thread_id: Uuid) {
                 return;
             }
         },
-        None if collaboration_mode != CollaborationMode::Default => {
+        None if collaboration_mode == CollaborationMode::Goal => {
             fail_queued_turn(
                 state,
                 thread_id,
@@ -3252,6 +3245,14 @@ fn validate_user_input_response(
     request: &UserInputRequest,
     response: UserInputResponse,
 ) -> Result<UserInputResponse, ApiError> {
+    if response.skipped {
+        if !response.answers.is_empty() {
+            return Err(ApiError::bad_request(
+                "a skipped planning question response cannot contain answers",
+            ));
+        }
+        return Ok(response);
+    }
     if response.answers.len() != request.questions.len() {
         return Err(ApiError::bad_request(
             "every planning question requires exactly one answer",
@@ -3325,7 +3326,10 @@ fn validate_user_input_response(
             "user input response contains an unknown question id",
         ));
     }
-    Ok(UserInputResponse { answers })
+    Ok(UserInputResponse {
+        answers,
+        skipped: false,
+    })
 }
 
 async fn get_turn_status(
@@ -6314,10 +6318,6 @@ fn finalize_goal_after_turn(
         return;
     };
     let target = match (mode, turn_status) {
-        (CollaborationMode::Plan, TurnStatus::Failed | TurnStatus::Interrupted) => {
-            Some(GoalStatus::Failed)
-        }
-        (CollaborationMode::Plan, TurnStatus::Cancelled) => Some(GoalStatus::Cancelled),
         (CollaborationMode::Goal, TurnStatus::Failed | TurnStatus::Interrupted) => {
             Some(GoalStatus::Blocked)
         }
@@ -6582,6 +6582,7 @@ async fn run_new_agent_turn(
         .await;
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
+    agent.apply_experience_mode(thread.experience_mode);
     // The thread's pinned model wins over the globally active connection, so a
     // settings change never swaps the model mid-conversation.
     if thread.model_selection.is_some() {
@@ -6663,9 +6664,7 @@ async fn run_new_agent_turn(
         bound_agent_template.as_ref(),
     )
     .await;
-    let tool_schema_tokens = serde_json::to_string(&agent.provider_tool_catalog())
-        .map(|catalog| estimate_tokens(&catalog))
-        .unwrap_or_default();
+    let tool_schema_tokens = agent.provider_tool_token_estimate();
     let context_reservation = turn_context_reservation(
         &selected_provider,
         &built_context.context,
@@ -6955,14 +6954,11 @@ async fn run_resumed_agent_turn(
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
     // Continuations must stay on the model the conversation started with.
-    if let Some(selection) = state
-        .store
-        .get_thread(thread_id)
-        .ok()
-        .flatten()
-        .and_then(|thread| thread.model_selection)
-    {
-        agent.set_provider_from_settings_with_model(&settings, Some(&selection));
+    if let Some(thread) = state.store.get_thread(thread_id).ok().flatten() {
+        agent.apply_experience_mode(thread.experience_mode);
+        if let Some(selection) = thread.model_selection.as_ref() {
+            agent.set_provider_from_settings_with_model(&settings, Some(selection));
+        }
     }
     if let Err(error) = agent.apply_collaboration_mode(collaboration_mode, goal.clone()) {
         let message = error.to_string();
@@ -13275,5 +13271,38 @@ mod tests {
         );
 
         assert!(project_conversation_event(event).is_none());
+    }
+
+    #[test]
+    fn plan_questions_can_be_skipped_only_without_answers() {
+        let request: UserInputRequest = serde_json::from_value(json!({
+            "requestId": Uuid::new_v4(),
+            "questions": [{
+                "id": "runtime",
+                "header": "Runtime",
+                "question": "Which runtime should the plan use?",
+                "options": [
+                    { "id": "rust", "label": "Rust", "description": "Native runtime." },
+                    { "id": "node", "label": "Node", "description": "JavaScript runtime." }
+                ]
+            }]
+        }))
+        .expect("request");
+        let skipped = validate_user_input_response(
+            &request,
+            UserInputResponse {
+                answers: Vec::new(),
+                skipped: true,
+            },
+        )
+        .expect("skip is valid");
+        assert!(skipped.skipped);
+
+        let invalid: UserInputResponse = serde_json::from_value(json!({
+            "answers": [{ "questionId": "runtime", "optionId": "rust" }],
+            "skipped": true
+        }))
+        .expect("response");
+        assert!(validate_user_input_response(&request, invalid).is_err());
     }
 }

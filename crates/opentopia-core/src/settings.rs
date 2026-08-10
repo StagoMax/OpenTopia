@@ -124,13 +124,19 @@ pub struct ProviderCapabilities {
 /// connection. `Unknown` intentionally behaves like unsupported at selection
 /// time so compatible relays always retain the portable function-tool path.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct ProviderToolProtocolCapabilities {
     pub function_tools: ProviderFeatureSupport,
     pub strict_function_tools: ProviderFeatureSupport,
     pub freeform_tools: ProviderFeatureSupport,
     pub hosted_apply_patch: ProviderFeatureSupport,
     pub assistant_phase: ProviderFeatureSupport,
+    /// Function definitions may be advertised with `defer_loading`.
+    pub deferred_tool_loading: ProviderFeatureSupport,
+    /// Deferred functions may be grouped under native namespaces.
+    pub namespace_tools: ProviderFeatureSupport,
+    /// The provider can execute the hosted `tool_search` tool.
+    pub hosted_tool_search: ProviderFeatureSupport,
 }
 
 impl ProviderKind {
@@ -142,6 +148,31 @@ impl ProviderKind {
             Self::CodexAppServer => "codex_app_server",
             Self::Anthropic => "anthropic",
         }
+    }
+}
+
+pub(crate) fn official_openai_tool_search_support(
+    base_url: &str,
+    model: &str,
+) -> ProviderFeatureSupport {
+    let official_endpoint = base_url
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case("https://api.openai.com/v1");
+    let version = model.strip_prefix("gpt-").and_then(|suffix| {
+        let version = suffix
+            .split(|character: char| !character.is_ascii_digit() && character != '.')
+            .next()?;
+        let mut parts = version.split('.');
+        let major = parts.next()?.parse::<u32>().ok()?;
+        let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+        Some((major, minor))
+    });
+    if official_endpoint
+        && version.is_some_and(|(major, minor)| major > 5 || (major == 5 && minor >= 4))
+    {
+        ProviderFeatureSupport::Supported
+    } else {
+        ProviderFeatureSupport::Unknown
     }
 }
 
@@ -345,6 +376,18 @@ impl ProviderSettings {
                         // without observing an assistant message. Parsing is
                         // always tolerant; replayed items are authoritative.
                         assistant_phase: ProviderFeatureSupport::Unknown,
+                        deferred_tool_loading: official_openai_tool_search_support(
+                            &self.base_url,
+                            &self.model,
+                        ),
+                        namespace_tools: official_openai_tool_search_support(
+                            &self.base_url,
+                            &self.model,
+                        ),
+                        hosted_tool_search: official_openai_tool_search_support(
+                            &self.base_url,
+                            &self.model,
+                        ),
                     },
                 }
             }
@@ -1990,5 +2033,45 @@ mod tests {
         assert_eq!(settings.sandbox_mode, SandboxMode::ReadOnly);
         assert_eq!(settings.enforcement, SandboxEnforcement::Enforce);
         assert_eq!(settings.network, NetworkPolicy::Deny);
+    }
+
+    #[test]
+    fn release_gate_provider_settings_enable_native_tool_search_only_when_known() {
+        let mut official = ProviderSettings::default();
+        official.kind = ProviderKind::OpenAiResponses;
+        official.base_url = "https://api.openai.com/v1".to_string();
+        official.model = "gpt-5.4".to_string();
+        let native = official.capabilities().tool_protocol;
+        assert_eq!(
+            native.deferred_tool_loading,
+            ProviderFeatureSupport::Supported
+        );
+        assert_eq!(native.namespace_tools, ProviderFeatureSupport::Supported);
+        assert_eq!(native.hosted_tool_search, ProviderFeatureSupport::Supported);
+
+        official.model = "gpt-5.3".to_string();
+        assert_eq!(
+            official.capabilities().tool_protocol.hosted_tool_search,
+            ProviderFeatureSupport::Unknown
+        );
+
+        official.model = "gpt-6".to_string();
+        assert_eq!(
+            official.capabilities().tool_protocol.hosted_tool_search,
+            ProviderFeatureSupport::Supported
+        );
+
+        official.model = "gpt-5.4".to_string();
+        official.base_url = "https://responses-relay.example/v1".to_string();
+        assert_eq!(
+            official.capabilities().tool_protocol.namespace_tools,
+            ProviderFeatureSupport::Unknown
+        );
+
+        official.kind = ProviderKind::Anthropic;
+        assert_eq!(
+            official.capabilities().tool_protocol.hosted_tool_search,
+            ProviderFeatureSupport::Unknown
+        );
     }
 }

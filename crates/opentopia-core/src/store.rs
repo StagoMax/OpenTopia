@@ -6515,6 +6515,7 @@ mod tests {
                 option_id: Some("modular".to_string()),
                 custom_text: None,
             }],
+            skipped: false,
         };
         let answered = store
             .resolve_user_input_request(request.request_id, thread.id, &response)

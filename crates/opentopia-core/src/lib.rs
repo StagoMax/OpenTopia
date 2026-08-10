@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod agent_profiles;
 pub mod background;
+mod base_prompt;
 pub mod browser;
 pub mod bundled_plugins;
 pub mod capabilities;
@@ -44,6 +45,8 @@ pub mod spreadsheet;
 pub mod store;
 pub mod subagents;
 mod tool_adapter;
+mod tool_result_ingress;
+mod tool_surface;
 pub mod tools;
 pub mod workspace;
 
@@ -221,14 +224,15 @@ pub use prompt_runtime::{
     PromptRuntimeCapabilities, RuntimeSurface,
 };
 pub use provider::{
-    configured_provider_from_settings, guardian_provider_from_settings, provider_from_settings,
-    redact_model_observation, AnthropicMessagesProvider, CodexAccountManager, CodexAccountStatus,
-    CodexAppServerProvider, CodexLoginStart, IncompleteReason, MockProvider,
-    ModelConversationMessage, ModelConversationRole, ModelDecision, ModelFinishReason,
-    ModelInputContent, ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
-    OpenAiCompatibleProvider, OpenAiResponsesProvider, PreparedProviderRequest,
-    ProviderDriverDescriptor, ProviderDriverRegistry, ProviderDriverTrust, ProviderToolCall,
-    ProviderToolCandidate, ProviderToolResult, ProviderTransportEvent,
+    configured_provider_from_settings, estimate_provider_tool_surface_tokens,
+    guardian_provider_from_settings, provider_from_settings, redact_model_observation,
+    AnthropicMessagesProvider, CodexAccountManager, CodexAccountStatus, CodexAppServerProvider,
+    CodexLoginStart, IncompleteReason, MockProvider, ModelConversationMessage,
+    ModelConversationRole, ModelDecision, ModelFinishReason, ModelInputContent, ModelProvider,
+    ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider,
+    OpenAiResponsesProvider, PreparedProviderRequest, ProviderDriverDescriptor,
+    ProviderDriverRegistry, ProviderDriverTrust, ProviderToolCall, ProviderToolCandidate,
+    ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,

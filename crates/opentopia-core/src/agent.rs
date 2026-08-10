@@ -1,5 +1,6 @@
 use crate::agent_profiles::AgentProfile;
 use crate::background::{BackgroundProcessRegistry, BackgroundScope};
+use crate::base_prompt::{base_agent_prompt, base_prompt_module_ids};
 use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime};
@@ -19,8 +20,8 @@ use crate::guardian::{
 use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    AgentEventPayload, ApprovalStatus, CollaborationMode, GoalRecord, Message, MessagePart,
-    MessageRole, ModelCallPurpose, ModelContentPart, TaskEvidenceKind, TaskPlan,
+    AgentEventPayload, ApprovalStatus, CollaborationMode, ExperienceMode, GoalRecord, Message,
+    MessagePart, MessageRole, ModelCallPurpose, ModelContentPart, TaskEvidenceKind, TaskPlan,
     TaskPlanStepStatus, ThreadModelSelection, ToolCall, ToolResult, UserInputRequest,
     UserInputResponse,
 };
@@ -37,16 +38,23 @@ use crate::prompt_runtime::{
     PromptRuntimeCapabilities, RuntimeSurface,
 };
 use crate::provider::{
-    guardian_provider_from_settings, provider_from_settings, redact_model_observation,
-    tool_input_schema_error, IncompleteReason, MockProvider, ModelConversationMessage,
-    ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider, ProviderToolCall,
-    ProviderToolCandidate, ProviderToolResult, ProviderTransportEvent,
+    estimate_provider_tool_surface_tokens, guardian_provider_from_settings, provider_from_settings,
+    redact_model_observation, tool_input_schema_error, IncompleteReason, MockProvider,
+    ModelConversationMessage, ModelConversationRole, ModelDecision, ModelProvider, ModelRequest,
+    ModelResponse, ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
+    ProviderTransportEvent,
 };
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
-use crate::settings::{AppSettings, RolloutBudgetSettings};
+use crate::settings::{
+    AppSettings, ProviderFeatureSupport, ProviderToolProtocolCapabilities, RolloutBudgetSettings,
+};
 use crate::store::{ProviderContextStateKind, SessionStore};
 use crate::subagents::{SubagentScheduler, SubagentScope};
+use crate::tool_result_ingress::{
+    normalize_tool_result_at_ingress, provider_tool_result_content, provider_tool_result_metadata,
+};
+use crate::tool_surface::{bundle_is_visible, external_namespace, tool_bundle};
 use crate::tools::{
     browser_handoff_required, mcp_tool_declares_image_inspection, McpToolWrapper, ToolContext,
     ToolRegistry, ToolSideEffect, ToolSource,
@@ -71,7 +79,6 @@ const MAX_COMPACTED_TOOL_HISTORY_CHARS: usize = 12_000;
 const FINALIZATION_GUARD_TOOL_NAME: &str = "runtime_finalization_guard";
 const MAX_FINALIZATION_GUARD_ACTIVATIONS: usize = 3;
 const TOOL_SEARCH_NAME: &str = "tool_search";
-const AUTOMATIC_TOOL_DISCLOSURE_THRESHOLD: usize = 32;
 const MAX_TOOL_SEARCH_RESULTS: usize = 12;
 const ROLLOUT_CHECKPOINT_TOOL_NAME: &str = "runtime_rollout_checkpoint";
 const ROLLOUT_REVIEW_INTERVAL: usize = 90;
@@ -492,6 +499,8 @@ pub struct AgentCore {
     rollout_budget_settings: Option<RolloutBudgetSettings>,
     agent_runtime_settings: AgentRuntimeSettings,
     collaboration_mode: CollaborationMode,
+    experience_mode: ExperienceMode,
+    provider_tool_protocol: ProviderToolProtocolCapabilities,
     goal: Option<GoalRecord>,
     flow_harness_override: Option<Arc<dyn FlowNodeHarness>>,
     tool_call_budget: Option<u32>,
@@ -532,6 +541,8 @@ impl Default for AgentCore {
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
+            experience_mode: ExperienceMode::Code,
+            provider_tool_protocol: ProviderToolProtocolCapabilities::default(),
             goal: None,
             flow_harness_override: None,
             tool_call_budget: None,
@@ -570,9 +581,11 @@ impl AgentCore {
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
-            rollout_budget_settings: provider_settings.rollout_budget,
+            rollout_budget_settings: provider_settings.rollout_budget.clone(),
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
+            experience_mode: ExperienceMode::Code,
+            provider_tool_protocol: provider_settings.capabilities().tool_protocol,
             goal: None,
             flow_harness_override: None,
             tool_call_budget: None,
@@ -608,6 +621,8 @@ impl AgentCore {
             rollout_budget_settings: active.rollout_budget.clone(),
             agent_runtime_settings: settings.agent_runtime.clone(),
             collaboration_mode: CollaborationMode::Default,
+            experience_mode: ExperienceMode::Code,
+            provider_tool_protocol: active.capabilities().tool_protocol,
             goal: None,
             flow_harness_override: None,
             tool_call_budget: None,
@@ -640,6 +655,8 @@ impl AgentCore {
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
+            experience_mode: ExperienceMode::Code,
+            provider_tool_protocol: ProviderToolProtocolCapabilities::default(),
             goal: None,
             flow_harness_override: None,
             tool_call_budget: None,
@@ -752,6 +769,10 @@ impl AgentCore {
         self.agent_runtime_settings = settings;
     }
 
+    pub fn apply_experience_mode(&mut self, mode: ExperienceMode) {
+        self.experience_mode = mode;
+    }
+
     /// Selects an internal tool-schema exposure policy. Product surfaces should
     /// normally leave this on `Automatic`; it is intentionally not a per-model
     /// or per-user patch-format preference.
@@ -844,29 +865,17 @@ impl AgentCore {
         mode: CollaborationMode,
         goal: Option<GoalRecord>,
     ) -> anyhow::Result<()> {
-        if mode != CollaborationMode::Default {
+        if mode == CollaborationMode::Goal {
             let goal = goal
                 .as_ref()
-                .context("plan and goal modes require a server-assigned goal")?;
-            let mode_instructions = match mode {
-                CollaborationMode::Plan => format!(
-                    r#"[Plan collaboration mode]
-You are planning goal {goal_id}: {objective}
-Investigate the workspace using only the tools exposed by the runtime. This mode is strictly read-only: do not execute commands, change files, open interactive browser sessions, or delegate work.
-Before creating the plan, identify any unresolved choice that would materially change architecture, scope, product behavior, dependencies, or risk. If the user has not already made those choices, call request_user_input with one to three concise questions and concrete trade-off descriptions. Do not ask those questions in ordinary assistant text, do not invent a preference, and do not ask about trivial implementation details. After the user's structured answers return, continue investigating if needed.
-When the material decisions are resolved, call set_plan exactly once with goal_id "{goal_id}", the current expected_revision, the complete currently known requirements and their source references, a complete dependency-aware DAG, explicit step-to-requirement coverage, and measurable acceptance criteria. Keep every step pending. Do not perform any step from the plan. Your final response should summarize the proposed plan and important risks or decisions."#,
-                    goal_id = goal.id,
-                    objective = goal.objective,
-                ),
-                CollaborationMode::Goal => format!(
-                    r#"[Goal collaboration mode]
+                .context("goal mode requires a server-assigned goal")?;
+            let mode_instructions = format!(
+                r#"[Goal collaboration mode]
 You are executing persistent goal {goal_id}: {objective}
 The server owns this exact goal id. If no plan exists, call set_plan first with goal_id "{goal_id}", the complete currently known requirements and source references, and explicit step-to-requirement coverage. Use the DAG as durable external memory: keep the work you have committed to current, respect dependencies, and attach structured references to successful implementation or observation and verification tool results when resolving steps. Replace the requirement set before claiming completion when later evidence changes scope. You may reorder or work on independent runnable steps together when that improves the outcome; update the plan when evidence changes the approach instead of following stale sequencing. If a step cannot proceed, resolve it explicitly as blocked, deferred, or cancelled with a status_reason. Continue until every committed step is resolved. Call complete_task only after the runtime plan has no actionable steps and all completed steps have current tool-backed evidence."#,
-                    goal_id = goal.id,
-                    objective = goal.objective,
-                ),
-                CollaborationMode::Default => unreachable!(),
-            };
+                goal_id = goal.id,
+                objective = goal.objective,
+            );
             self.additional_developer_instructions =
                 Some(match self.additional_developer_instructions.take() {
                     Some(existing) if !existing.trim().is_empty() => {
@@ -874,29 +883,25 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                     }
                     _ => mode_instructions,
                 });
-        }
-
-        if mode == CollaborationMode::Plan {
-            let plan_tools = [
-                "list_files",
-                "read_attachment",
-                "view_attachment",
-                "read_file",
-                "read_files",
-                "search",
-                "git_diff",
-                "list_skills",
-                "read_skill",
-                "request_user_input",
-                "set_plan",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<HashSet<_>>();
-            self.restrict_to_tools(plan_tools);
+        } else if mode == CollaborationMode::Plan {
+            let mode_instructions = r#"[Plan collaboration mode]
+Use the default runtime's investigation capabilities, including shell, search, browser, and multi-agent tools when appropriate, to produce a decision-complete implementation plan. Investigation may read the workspace and run non-mutating diagnostics, but do not implement the plan or modify the workspace while this turn is in Plan mode. Subagents may investigate; the root agent owns any question to the user.
+Ask only when a material ambiguity in requirements, architecture, technology choice, scope, or risk cannot be safely resolved from the available context. Use request_user_input with one to three concise questions and two to three mutually exclusive options per question, put the recommended option first, and allow the user to supply a custom answer. Asking no question is valid. If the user skips the questions, proceed with explicit, reasonable assumptions.
+Do not call set_plan, update_plan, or create Goal state. When ready, respond as an ordinary assistant message with the complete plan, affected files or areas, verification, risks, and assumptions. There is no separate proposed-plan artifact."#;
+            self.additional_developer_instructions =
+                Some(match self.additional_developer_instructions.take() {
+                    Some(existing) if !existing.trim().is_empty() => {
+                        format!("{}\n\n{}", existing.trim(), mode_instructions)
+                    }
+                    _ => mode_instructions.to_string(),
+                });
         }
         self.collaboration_mode = mode;
-        self.goal = goal;
+        self.goal = if mode == CollaborationMode::Goal {
+            goal
+        } else {
+            None
+        };
         Ok(())
     }
 
@@ -925,6 +930,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         self.guardian =
             GuardianReviewSessionManager::new(guardian_provider_from_settings(&resolved));
         self.model_supports_vision = resolved.supports_vision_for_model();
+        self.provider_tool_protocol = resolved.capabilities().tool_protocol;
         self.rollout_budget_settings = resolved.rollout_budget.clone();
         self.agent_runtime_settings = settings.agent_runtime.clone();
     }
@@ -1209,11 +1215,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         } else {
             None
         };
-        if matches!(
-            self.collaboration_mode,
-            CollaborationMode::Plan | CollaborationMode::Goal
-        ) && latest_plan.is_none()
-        {
+        if self.collaboration_mode == CollaborationMode::Goal && latest_plan.is_none() {
             blockers.push(json!({
                 "kind": "plan_missing",
                 "reason": "This collaboration mode requires a durable plan created with set_plan.",
@@ -1568,6 +1570,10 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
 
     pub fn provider_tool_catalog(&self) -> Vec<ProviderToolCandidate> {
         self.provider_tool_candidates()
+    }
+
+    pub fn provider_tool_token_estimate(&self) -> usize {
+        estimate_provider_tool_surface_tokens(&self.provider_tool_candidates())
     }
 
     pub async fn sync_mcp_tools(&mut self) -> Vec<String> {
@@ -3238,6 +3244,14 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             .filter(|name| name != "write_file")
             .filter(|name| subagents_available || !is_subagent_tool(name))
             .filter(|name| structured_input_available || name.as_str() != "request_user_input")
+            .filter(|name| {
+                let source = self.tools.source(name).unwrap_or(ToolSource::Core);
+                bundle_is_visible(
+                    tool_bundle(name, &source),
+                    self.experience_mode,
+                    self.collaboration_mode,
+                )
+            })
             .filter(|name| self.tool_is_allowed(name))
             // MCP tools bound as attachment-inspection backends are implementation
             // details of view_attachment, not a competing model-visible route.
@@ -3247,43 +3261,91 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 })
             })
             .filter_map(|name| {
-                self.tools.get(&name).map(|tool| ProviderToolCandidate {
-                    name,
-                    description: tool.description().to_string(),
-                    input_schema: tool.schema(),
+                self.tools.get(&name).map(|tool| {
+                    ProviderToolCandidate::direct(name, tool.description(), tool.schema())
                 })
             })
             .collect()
     }
 
+    fn native_tool_search_active(&self, eligible: &[ProviderToolCandidate]) -> bool {
+        let has_external_tools = eligible
+            .iter()
+            .any(|candidate| self.tools.source(&candidate.name) != Some(ToolSource::Core));
+        has_external_tools
+            && self.tool_exposure_policy != ToolExposurePolicy::Eager
+            && self.provider_tool_protocol.hosted_tool_search == ProviderFeatureSupport::Supported
+            && self.provider_tool_protocol.deferred_tool_loading
+                == ProviderFeatureSupport::Supported
+    }
+
     fn progressive_tool_disclosure_active(&self, eligible: &[ProviderToolCandidate]) -> bool {
         let has_deferred_tools = eligible
             .iter()
-            .any(|candidate| self.tools.source(&candidate.name) == Some(ToolSource::Mcp));
+            .any(|candidate| self.tools.source(&candidate.name) != Some(ToolSource::Core));
         has_deferred_tools
             && match self.tool_exposure_policy {
                 ToolExposurePolicy::Eager => false,
-                ToolExposurePolicy::Automatic => {
-                    eligible.len() > AUTOMATIC_TOOL_DISCLOSURE_THRESHOLD
-                }
-                ToolExposurePolicy::Progressive => true,
+                ToolExposurePolicy::Automatic | ToolExposurePolicy::Progressive => true,
             }
     }
 
+    fn deferred_namespace_catalog(&self, eligible: &[ProviderToolCandidate]) -> String {
+        let namespaces = eligible
+            .iter()
+            .filter_map(|candidate| {
+                let source = self.tools.source(&candidate.name)?;
+                external_namespace(&candidate.name, &source)
+            })
+            .collect::<BTreeMap<_, _>>();
+        if namespaces.is_empty() {
+            return String::new();
+        }
+        let groups = namespaces
+            .into_iter()
+            .map(|(name, description)| format!("{name}: {description}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(" Available deferred tool groups: {groups}")
+    }
+
     fn provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
-        let eligible = self.eligible_provider_tool_candidates();
+        let mut eligible = self.eligible_provider_tool_candidates();
+        if self.native_tool_search_active(&eligible) {
+            for candidate in &mut eligible {
+                let source = self
+                    .tools
+                    .source(&candidate.name)
+                    .unwrap_or(ToolSource::Core);
+                let Some((name, description)) = external_namespace(&candidate.name, &source) else {
+                    continue;
+                };
+                if self.provider_tool_protocol.namespace_tools == ProviderFeatureSupport::Supported
+                {
+                    candidate.disclosure = ProviderToolDisclosure::DeferredNamespace;
+                    candidate.namespace = Some(ProviderToolNamespace { name, description });
+                } else {
+                    candidate.disclosure = ProviderToolDisclosure::DeferredIndividual;
+                }
+            }
+            return eligible;
+        }
         if !self.progressive_tool_disclosure_active(&eligible) {
             return eligible;
         }
 
+        let search_description = format!(
+            "Search the deferred tool catalog by capability. Matching tools are made available on the next model round; use the returned names rather than guessing an unloaded tool schema.{}",
+            self.deferred_namespace_catalog(&eligible)
+        );
         let mut exposed = eligible
             .into_iter()
-            .filter(|candidate| self.tools.source(&candidate.name) != Some(ToolSource::Mcp))
+            .filter(|candidate| self.tools.source(&candidate.name) == Some(ToolSource::Core))
             .collect::<Vec<_>>();
-        exposed.push(ProviderToolCandidate {
-            name: TOOL_SEARCH_NAME.to_string(),
-            description: "Search the deferred tool catalog by capability. Matching tools are made available on the next model round; use the returned names rather than guessing an unloaded tool schema.".to_string(),
-            input_schema: json!({
+        exposed.push(ProviderToolCandidate::direct(
+            TOOL_SEARCH_NAME,
+            search_description,
+            json!({
                 "type": "object",
                 "properties": {
                     "query": {
@@ -3300,7 +3362,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
                 "required": ["query"],
                 "additionalProperties": false
             }),
-        });
+        ));
         exposed
     }
 
@@ -3318,7 +3380,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         let mut matches = self
             .eligible_provider_tool_candidates()
             .into_iter()
-            .filter(|candidate| self.tools.source(&candidate.name) == Some(ToolSource::Mcp))
+            .filter(|candidate| self.tools.source(&candidate.name) != Some(ToolSource::Core))
             .filter_map(|candidate| {
                 let name = candidate.name.to_lowercase();
                 let description = candidate.description.to_lowercase();
@@ -3383,6 +3445,7 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
     /// predicate so they cannot drift apart.
     fn request_user_input_is_available(&self) -> bool {
         self.collaboration_mode == CollaborationMode::Plan
+            && self.subagent_depth == 0
             && self.tools.get("request_user_input").is_some()
             && self.tool_is_allowed("request_user_input")
     }
@@ -3680,14 +3743,15 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         let provider_result = match result {
             Ok(result) => {
                 let is_error = tool_result_is_error(&result);
-                let content = result.content_or_legacy_text();
+                let content = provider_tool_result_content(&result);
+                let metadata = provider_tool_result_metadata(&provider_call.name, &result.metadata);
                 Ok(ProviderToolResult {
                     call_id: provider_call.id.clone(),
                     name: provider_call.name.clone(),
                     output: result.output,
                     content,
                     is_error,
-                    metadata: result.metadata,
+                    metadata,
                 })
             }
             Err(err) if approval_required(&err).is_some() => Err(err),
@@ -3864,14 +3928,15 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
             result: result.clone(),
         });
         let is_error = tool_result_is_error(&result);
-        let content = result.content_or_legacy_text();
+        let content = provider_tool_result_content(&result);
+        let metadata = provider_tool_result_metadata(TOOL_SEARCH_NAME, &result.metadata);
         Ok(ProviderToolResult {
             call_id: provider_call.id.clone(),
             name: TOOL_SEARCH_NAME.to_string(),
             output: result.output,
             content,
             is_error,
-            metadata: result.metadata,
+            metadata,
         })
     }
 
@@ -3883,6 +3948,8 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         metadata_overlay: Option<Value>,
     ) -> anyhow::Result<crate::model::ToolResult> {
         let name = call.name.clone();
+        let result_store = ctx.store.clone();
+        let result_thread_id = ctx.thread_id;
         let approval_granted = ctx.approval_granted;
         let current_task_plan = current_task_plan_for_tool(&ctx, events)?;
         let active_plan_step_id = current_task_plan.as_ref().and_then(|plan| {
@@ -4023,6 +4090,12 @@ The server owns this exact goal id. If no plan exists, call set_plan first with 
         insert_approval_execution_metadata(&mut result.metadata, approval_granted, None);
         merge_metadata_overlay(&mut result.metadata, metadata_overlay.as_ref());
         insert_task_plan_step_metadata(&mut result.metadata, active_plan_step_id.as_deref());
+        result = normalize_tool_result_at_ingress(
+            &name,
+            result,
+            result_store.as_deref(),
+            result_thread_id,
+        );
         ensure_tool_error_record(&mut result);
         events.push(AgentEventPayload::ToolCallFinished {
             result: result.clone(),
@@ -4615,7 +4688,11 @@ fn successful_provider_tool_call_ids(
             .unwrap_or_default();
         if matches!(
             tool_name,
-            "set_plan" | "update_plan" | "complete_task" | FINALIZATION_GUARD_TOOL_NAME
+            "request_user_input"
+                | "set_plan"
+                | "update_plan"
+                | "complete_task"
+                | FINALIZATION_GUARD_TOOL_NAME
         ) {
             return;
         }
@@ -4902,6 +4979,7 @@ pub fn agent_model_context_with_runtime(
         "promptHash": base_agent_prompt_hash(),
         "assemblyClass": "fixed",
         "promptModuleId": "base_contract",
+        "promptModules": base_prompt_module_ids(),
     }))];
     items.extend(compile_runtime_prompt_modules(
         runtime_settings,
@@ -4931,14 +5009,13 @@ pub fn agent_model_context_with_runtime(
 }
 
 pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-08-01.1";
-pub const BASE_AGENT_PROMPT: &str = include_str!("base_agent_prompt.md");
 
 pub fn base_agent_prompt_hash() -> String {
-    crate::model_context::content_fingerprint(BASE_AGENT_PROMPT.as_bytes())
+    crate::model_context::content_fingerprint(base_agent_prompt().as_bytes())
 }
 
 fn base_agent_instructions() -> &'static str {
-    BASE_AGENT_PROMPT
+    base_agent_prompt()
 }
 
 #[cfg(test)]
@@ -5797,6 +5874,92 @@ mod tests {
     }
 
     #[test]
+    fn release_gate_native_tool_search_keeps_common_tools_direct_and_defers_external_namespace() {
+        let mut registry = ToolRegistry::with_builtins();
+        registry.insert_mcp(
+            "github__search_issues".to_string(),
+            Arc::new(CatalogTestTool {
+                name: "github__search_issues".to_string(),
+                description: "Search GitHub issues".to_string(),
+            }),
+        );
+        let mut agent = AgentCore::new(Arc::new(MockProvider), registry);
+        agent.provider_tool_protocol = ProviderToolProtocolCapabilities {
+            function_tools: ProviderFeatureSupport::Supported,
+            deferred_tool_loading: ProviderFeatureSupport::Supported,
+            namespace_tools: ProviderFeatureSupport::Supported,
+            hosted_tool_search: ProviderFeatureSupport::Supported,
+            ..ProviderToolProtocolCapabilities::default()
+        };
+
+        let catalog = agent.provider_tool_catalog();
+        let read_file = catalog
+            .iter()
+            .find(|candidate| candidate.name == "read_file")
+            .expect("common tool");
+        assert_eq!(read_file.disclosure, ProviderToolDisclosure::Direct);
+        let github = catalog
+            .iter()
+            .find(|candidate| candidate.name == "github__search_issues")
+            .expect("external tool descriptor");
+        assert_eq!(github.disclosure, ProviderToolDisclosure::DeferredNamespace);
+        assert_eq!(github.namespace.as_ref().unwrap().name, "github");
+        assert!(!catalog
+            .iter()
+            .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
+    }
+
+    #[test]
+    fn release_gate_mode_bundles_add_only_flow_plan_or_goal_tools() {
+        let names = |agent: &AgentCore| {
+            agent
+                .provider_tool_catalog()
+                .into_iter()
+                .map(|candidate| candidate.name)
+                .collect::<HashSet<_>>()
+        };
+
+        let mut code = AgentCore::default();
+        code.apply_experience_mode(ExperienceMode::Code);
+        let code_names = names(&code);
+        assert!(!code_names.iter().any(|name| name.starts_with("flow_")));
+        assert!(!code_names.contains("request_user_input"));
+        assert!(!code_names.contains("set_plan"));
+
+        let mut work = AgentCore::default();
+        work.apply_experience_mode(ExperienceMode::Work);
+        assert_eq!(code_names, names(&work));
+
+        let mut flow = AgentCore::default();
+        flow.apply_experience_mode(ExperienceMode::Flow);
+        assert!(names(&flow).contains("flow_run"));
+
+        let mut plan = AgentCore::default();
+        plan.apply_collaboration_mode(CollaborationMode::Plan, None)
+            .expect("Plan mode");
+        let plan_names = names(&plan);
+        assert!(plan_names.contains("request_user_input"));
+        assert!(!plan_names.contains("set_plan"));
+
+        let thread_id = Uuid::new_v4();
+        let goal = GoalRecord::new(
+            thread_id,
+            "Execute a durable goal",
+            crate::model::GoalStatus::Active,
+            None,
+        );
+        let mut goal_agent = AgentCore::default();
+        goal_agent
+            .apply_collaboration_mode(CollaborationMode::Goal, Some(goal))
+            .expect("Goal mode");
+        let goal_names = names(&goal_agent);
+        assert!(goal_names.contains("set_plan"));
+        assert!(goal_names.contains("update_plan"));
+        assert!(goal_names.contains("complete_task"));
+        assert!(!goal_names.contains("request_user_input"));
+    }
+
+    #[test]
     fn attachment_capability_backend_is_hidden_behind_view_attachment() {
         let public_name = "opaque_server__run";
         let mut registry = ToolRegistry::with_builtins();
@@ -6064,6 +6227,7 @@ mod tests {
     #[test]
     fn flow_profile_exposes_work_code_and_orchestration_tools_to_the_provider() {
         let mut agent = AgentCore::default();
+        agent.apply_experience_mode(ExperienceMode::Flow);
         agent.restrict_capabilities(
             &crate::enterprise::ExperienceSurfaceProfile::for_mode(
                 crate::model::ExperienceMode::Flow,
@@ -6079,13 +6243,14 @@ mod tests {
         for expected in [
             "read_attachment",
             "view_attachment",
-            "spreadsheet",
             "apply_patch",
             "shell",
             "flow_run",
+            TOOL_SEARCH_NAME,
         ] {
             assert!(tools.contains(expected), "missing Flow tool: {expected}");
         }
+        assert!(!tools.contains("spreadsheet"));
     }
 
     #[test]
@@ -6126,17 +6291,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_exposes_only_read_only_inspection_and_atomic_planning_tools() {
-        let thread_id = Uuid::new_v4();
-        let goal = GoalRecord::new(
-            thread_id,
-            "Plan a safe change",
-            crate::model::GoalStatus::Draft,
-            None,
-        );
+    fn plan_mode_reuses_the_runtime_and_adds_only_structured_questions() {
         let mut agent = AgentCore::default();
         agent
-            .apply_collaboration_mode(CollaborationMode::Plan, Some(goal))
+            .apply_collaboration_mode(CollaborationMode::Plan, None)
             .expect("apply plan mode");
         let tools = agent
             .provider_tool_catalog()
@@ -6149,13 +6307,13 @@ mod tests {
         assert!(tools.contains("search"));
         assert!(tools.contains("git_diff"));
         assert!(tools.contains("request_user_input"));
-        assert!(tools.contains("set_plan"));
-        assert!(!tools.contains("shell"));
+        assert!(!tools.contains("set_plan"));
+        assert!(!tools.contains("update_plan"));
+        assert!(!tools.contains("complete_task"));
+        assert!(tools.contains("shell"));
         assert!(!tools.contains("write_file"));
-        assert!(!tools.contains("apply_patch"));
-        assert!(!tools.contains("create_skill"));
-        assert!(!tools.contains("browser"));
-        assert!(!tools.contains("computer"));
+        assert!(tools.contains("apply_patch"));
+        assert!(tools.contains("create_skill"));
         assert!(!tools.contains("spawn_agent"));
     }
 
@@ -6178,16 +6336,9 @@ mod tests {
                 .request_user_input_available
         );
 
-        let thread_id = Uuid::new_v4();
-        let goal = GoalRecord::new(
-            thread_id,
-            "Plan a safe change",
-            crate::model::GoalStatus::Draft,
-            None,
-        );
         let mut plan_agent = AgentCore::default();
         plan_agent
-            .apply_collaboration_mode(CollaborationMode::Plan, Some(goal))
+            .apply_collaboration_mode(CollaborationMode::Plan, None)
             .expect("apply plan mode");
         assert!(
             plan_agent
@@ -6217,7 +6368,7 @@ mod tests {
             .iter()
             .any(|candidate| candidate.name == "read_file"));
 
-        agent.restrict_to_tools(["read_file", "complete_task"]);
+        agent.restrict_to_tools(["read_file", "shell"]);
         let names = agent
             .provider_tool_candidates()
             .into_iter()
@@ -6225,21 +6376,18 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(
             names,
-            HashSet::from(["read_file".to_string(), "complete_task".to_string()])
+            HashSet::from(["read_file".to_string(), "shell".to_string()])
         );
 
-        agent.restrict_to_tools(["complete_task"]);
-        assert!(agent.tool_is_allowed("complete_task"));
+        agent.restrict_to_tools(["shell"]);
+        assert!(agent.tool_is_allowed("shell"));
         assert!(!agent.tool_is_allowed("read_file"));
     }
 
     #[test]
     fn execution_context_projection_filters_catalog_and_execution_guard() {
         let mut agent = AgentCore::default();
-        agent.restrict_capabilities(&CapabilityProjection::only_tools([
-            "read_file",
-            "complete_task",
-        ]));
+        agent.restrict_capabilities(&CapabilityProjection::only_tools(["read_file", "shell"]));
         let names = agent
             .provider_tool_catalog()
             .into_iter()
@@ -6247,13 +6395,13 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(
             names,
-            HashSet::from(["read_file".to_string(), "complete_task".to_string()])
+            HashSet::from(["read_file".to_string(), "shell".to_string()])
         );
-        assert!(!agent.tool_is_allowed("shell"));
+        assert!(!agent.tool_is_allowed("apply_patch"));
 
-        agent.restrict_capabilities(&CapabilityProjection::only_tools(["complete_task"]));
+        agent.restrict_capabilities(&CapabilityProjection::only_tools(["shell"]));
         assert!(!agent.tool_is_allowed("read_file"));
-        assert!(agent.tool_is_allowed("complete_task"));
+        assert!(agent.tool_is_allowed("shell"));
     }
 
     #[test]
@@ -6621,13 +6769,6 @@ mod tests {
     #[tokio::test]
     async fn plan_mode_suspends_for_structured_input_and_resumes_with_the_answer() {
         let thread_id = Uuid::new_v4();
-        let goal = GoalRecord::new(
-            thread_id,
-            "Choose and plan a persistence architecture",
-            crate::model::GoalStatus::Draft,
-            None,
-        );
-        let goal_id = goal.id;
         let provider = Arc::new(ScriptedProvider::new(vec![
             ModelResponse {
                 text: String::new(),
@@ -6660,41 +6801,16 @@ mod tests {
                 provider_items: Vec::new(),
                 finish_reason: ModelFinishReason::ToolCalls,
             },
-            ModelResponse {
-                text: String::new(),
-                tool_calls: vec![ProviderToolCall {
-                    id: "set_plan_after_answer".to_string(),
-                    name: "set_plan".to_string(),
-                    arguments: json!({
-                        "goal_id": goal_id,
-                        "expected_revision": 0,
-                        "change_reason": "Use the selected SQLite strategy",
-                        "requirements": [{
-                            "id": "sqlite-persistence",
-                            "statement": "Use SQLite persistence that survives restart",
-                            "source_refs": ["user answer: storage=sqlite"]
-                        }],
-                        "steps": [{
-                            "id": "implement",
-                            "title": "Implement SQLite persistence",
-                            "dependencies": [],
-                            "covers_requirement_ids": ["sqlite-persistence"],
-                            "acceptance_criteria": ["Persistence survives restart"]
-                        }]
-                    }),
-                }],
-                usage: None,
-                response_id: None,
-                provider_items: Vec::new(),
-                finish_reason: ModelFinishReason::ToolCalls,
-            },
             ModelResponse::text("The plan uses SQLite as selected."),
         ]));
         let workspace = test_workspace("plan-user-input");
         let mut agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
         agent
-            .apply_collaboration_mode(CollaborationMode::Plan, Some(goal))
+            .apply_collaboration_mode(CollaborationMode::Plan, None)
             .expect("apply plan mode");
+        let catalog = agent.provider_tool_catalog();
+        assert!(catalog.iter().any(|tool| tool.name == "request_user_input"));
+        assert!(!catalog.iter().any(|tool| tool.name == "set_plan"));
 
         let initial = agent
             .run_turn_detailed_streaming(
@@ -6735,6 +6851,7 @@ mod tests {
                         option_id: Some("sqlite".to_string()),
                         custom_text: None,
                     }],
+                    skipped: false,
                 },
                 None,
                 None,
@@ -6743,7 +6860,7 @@ mod tests {
             .await
             .expect("resume plan turn");
         assert!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
-        assert!(resumed
+        assert!(!resumed
             .events
             .iter()
             .any(|event| matches!(event, AgentEventPayload::PlanUpdated { .. })));
@@ -6854,6 +6971,7 @@ mod tests {
 
     #[test]
     fn base_agent_prompt_is_versioned_and_contains_the_runtime_contract() {
+        let prompt = base_agent_prompt();
         let workspace = test_workspace("base-agent-prompt-contract");
         let context =
             default_agent_model_context(&workspace, &LocalSandboxConfig::danger_full_access());
@@ -6863,9 +6981,25 @@ mod tests {
             .find(|item| item.kind == ContextItemKind::BaseInstructions)
             .expect("base instructions are present");
 
-        assert_eq!(base.text_content(), BASE_AGENT_PROMPT);
+        assert_eq!(base.text_content(), prompt);
         assert_eq!(base.metadata["promptVersion"], BASE_AGENT_PROMPT_VERSION);
         assert_eq!(base.metadata["promptHash"], base_agent_prompt_hash());
+        assert_eq!(
+            base.metadata["promptModules"],
+            json!([
+                "identity_and_objective",
+                "instruction_hierarchy",
+                "request_interpretation",
+                "workspace_discipline",
+                "codebase_exploration",
+                "git_safety",
+                "skills",
+                "tool_loop",
+                "validation",
+                "communication",
+                "completion",
+            ])
+        );
         for required_contract in [
             "Interpret the request precisely",
             "Workspace and repository discipline",
@@ -6886,14 +7020,14 @@ mod tests {
             "sets a terminal condition for effort, not a wider grant of authority",
         ] {
             assert!(
-                BASE_AGENT_PROMPT.contains(required_contract),
+                prompt.contains(required_contract),
                 "missing base prompt contract: {required_contract}"
             );
         }
 
         // The user's explicit request outranks repository and skill instructions.
         // Guard the ordering itself, not just the presence of the sentence.
-        let hierarchy = BASE_AGENT_PROMPT
+        let hierarchy = prompt
             .split_once("Follow instructions in priority order, highest first")
             .expect("hierarchy sentence is present")
             .1;
@@ -10769,6 +10903,15 @@ mod tests {
             .any(|tool| tool.name == "read_file"));
         assert!(requests[2].tool_results[0].output.contains("first result"));
         assert!(requests[2].tool_results[1].output.contains("second result"));
+        assert_eq!(
+            serde_json::to_value(&requests[1].tool_results[0]).unwrap(),
+            serde_json::to_value(&requests[2].tool_results[0]).unwrap(),
+            "a previously exposed tool result must remain byte-stable in later rounds"
+        );
+        assert_eq!(
+            requests[1].tool_results[0].metadata["toolResultEnvelope"]["stage"],
+            "pre_model_ingress"
+        );
 
         let _ = fs::remove_dir_all(workspace);
     }
