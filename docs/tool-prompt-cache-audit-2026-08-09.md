@@ -2,6 +2,35 @@
 
 日期：2026-08-09
 
+> 2026-08-10 实现更新：本文第 1～7 节保留修复前的实测基线；第 8～12 节描述的是修复前实现与当时建议。当前实现状态以紧随其后的“实现结果”小节为准。
+
+## 0. 2026-08-10 实现结果
+
+本次已经把工具面改成两层正交分类，而不是根据每条消息做复杂的逐工具意图门控：
+
+- 工作体验模式：Work/Code 共享 Common；Flow 在 Common 上追加 `flow_*`。
+- 协作流程模式：Plan 只追加 `request_user_input`；Goal 追加 `set_plan`、`update_plan`、`complete_task`。
+- Multi-agent 属于 Common，但仅在运行时确实配置了 scheduler 且没有关闭多 Agent 时暴露。
+- Bundled plugin 与 MCP 统一视为 External，完整 Schema 默认延迟。
+
+Provider 降级矩阵如下：
+
+| 能力层 | 初始可见内容 | 完整 Schema 何时出现 |
+|---|---|---|
+| OpenAI Responses + 已知支持 Tool Search | `DeferredNamespace` 默认只让模型看到 namespace 名称和简述；也支持 `DeferredIndividual` 的工具名称和简述 | Provider 执行 hosted `tool_search` 后追加 |
+| 不支持 namespace、但支持 deferred/tool search | 单工具名称和简述 | Provider 执行 hosted `tool_search` 后追加 |
+| Chat Completions、Anthropic、未知 Responses relay | Common 完整 Schema；External 用本地 `tool_search` 和精简工具组目录 | 本地搜索命中后的下一模型 Round 追加；若明确选择 Eager 则直接展平 |
+
+当前用户消息仍是三种 Provider 初始消息序列的最后一项。Responses Tool Search continuation 的 call/output 与后续 function result 只能追加在它后面。工具仍通过 Provider 顶层协议传递，OpenTopia 不声称能够控制厂商内部 token 编译位置。
+
+Usage 日志现在把原来的 `toolSchemas` 进一步拆成：
+
+- `directToolSchemas`：初始直接加载的工具和输出 Schema；
+- `deferredToolCatalog`：延迟工具的名称/简述或 namespace 目录；
+- `loadedToolSchemas`：Tool Search continuation 实际追加的定义。
+
+桌面发布脚本会强制运行 `scripts/test-provider-tool-cache-release.ps1`。门禁跨 OpenAI Responses、OpenAI-compatible Chat 和 Anthropic 三个适配层验证能力降级、初始用户消息位置、显式缓存 breakpoint 与 Tool Search 追加顺序。详见 `docs/provider-tool-cache-release-gate.md`。
+
 ## 1. 结论先行
 
 1. **第一次模型请求已经知道本轮用户消息。** 服务端先收到用户的 `content`，再构建上下文和 `ModelRequest`。因此从技术上可以在第一轮请求前按用户当前意图筛选工具，不需要等模型请求完成一次。

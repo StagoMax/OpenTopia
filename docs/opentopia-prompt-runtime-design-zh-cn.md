@@ -52,7 +52,7 @@ ExecutableBehavior =
 
 | 装配类别 | OpenTopia 模块 | 变化来源 | 普通用户是否直接编辑 |
 |---|---|---|---|
-| 固定 | `base_contract` | 产品版本 | 否 |
+| 固定 | `base_contract`（由 11 个职责模块按清单组装） | 产品版本 | 否 |
 | 固定 | `skills_protocol` | 产品版本 | 否 |
 | 条件 | `personality` | `agentRuntime.personality` | 是 |
 | 条件 | `autonomy` | `agentRuntime.autonomy` | 是 |
@@ -66,7 +66,9 @@ ExecutableBehavior =
 | 动态 | plugin / Skill modules | 安装、启用和逐轮选择 | 是 |
 | 动态 | world state | Git、工具、日期、平台和运行时能力 | 否 |
 
-每个 Prompt Runtime 模块带有 `promptModuleId`、`assemblyClass`、`selectedBy`、`settingValue` 和 `editable` 元数据。多 Agent 模块还记录真实能力是否存在、并发上限和用户输入工具是否可用。
+每个 Prompt Runtime 模块带有 `promptModuleId`、`assemblyClass`、`selectedBy`、`settingValue` 和 `editable` 元数据。固定底座的 `promptModules` 元数据还按实际顺序记录组成它的 11 个职责模块。多 Agent 模块还记录真实能力是否存在、并发上限和用户输入工具是否可用。
+
+固定底座不再维护为一个长 Markdown 文件。各职责文件位于 `crates/opentopia-core/src/prompts/base/`，`crates/opentopia-core/src/base_prompt.rs` 中的 `BASE_PROMPT_MODULES` 是唯一装配清单。修改文案时只编辑对应模块；新增、删除或重排模块时修改清单及其顺序测试。装配器统一插入模块间空行和最终换行，避免文件边界的空白差异意外改变提示词。
 
 ## 4. 用户可配置策略
 
@@ -172,7 +174,9 @@ Codex 样本的策略是只有显式请求才允许委派。OpenTopia 保留该�
 
 ## 9. 主要实现位置
 
-- `crates/opentopia-core/src/prompt_runtime.rs`：设置类型、模块编译器和装配元数据。
+- `crates/opentopia-core/src/base_prompt.rs`：固定核心模块清单、规定顺序与文本装配器。
+- `crates/opentopia-core/src/prompts/base/`：可独立维护的固定核心提示词模块。
+- `crates/opentopia-core/src/prompt_runtime.rs`：设置类型、条件模块编译器和装配元数据。
 - `crates/opentopia-core/src/agent.rs`：运行时设置、能力探测、工具过滤和默认上下文装配。
 - `crates/opentopia-core/src/settings.rs`：持久化设置与旧配置兼容。
 - `crates/opentopia-server/src/main.rs`：每轮上下文、世界状态、缓存键和设置 API。
