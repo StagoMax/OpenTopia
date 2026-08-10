@@ -10,7 +10,6 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
-  RotateCcw,
   Search,
   Settings,
 } from "lucide-react";
@@ -20,7 +19,6 @@ import {
   buildConnectionModelGroups,
   formatModelDisplayName,
   reconcileReasoningEffort,
-  resolveDefaultModelId,
   resolveReasoningOptions,
   REASONING_EFFORT_DETAILS,
 } from "../modelCatalog";
@@ -231,15 +229,6 @@ export function ModelSelector({
     : null;
   const supportsEffort = capability.supportedEfforts.length > 0;
 
-  const fallback = defaultSelectionFor(
-    connections.find((item) => item.id === activeConnectionId) ??
-      connections[0],
-  );
-  const isDefault =
-    connection.id === fallback.connectionId &&
-    modelId === fallback.modelId &&
-    reasoningEffort === fallback.reasoningEffort;
-
   return (
     <div
       className="model-selector"
@@ -301,10 +290,6 @@ export function ModelSelector({
               >
                 <ModelMenu
                   connections={connections}
-                  onOpenSettings={() => {
-                    closeAll();
-                    onOpenSettings();
-                  }}
                   onSelect={(option) => {
                     onChange({
                       connectionId: option.connection.id,
@@ -393,18 +378,17 @@ export function ModelSelector({
           <div className="model-selector-menu-separator" />
 
           <button
-            className="model-selector-row model-selector-row--reset"
-            disabled={isDefault}
+            className="model-selector-row model-selector-row--manage"
             onClick={() => {
-              onChange(fallback);
               closeAll();
+              onOpenSettings();
             }}
             onMouseEnter={() => setSubmenu(null)}
             role="menuitem"
             type="button"
           >
-            <span className="model-selector-row-label">重置为默认设置</span>
-            <RotateCcw aria-hidden="true" size={14} />
+            <span className="model-selector-row-label">管理模型和 API</span>
+            <Settings aria-hidden="true" size={14} />
           </button>
         </div>
       ) : null}
@@ -414,13 +398,11 @@ export function ModelSelector({
 
 function ModelMenu({
   connections,
-  onOpenSettings,
   onSelect,
   selectedConnectionId,
   selectedModelId,
 }: {
   connections: ProviderSettings[];
-  onOpenSettings: () => void;
   onSelect: (option: ModelOption) => void;
   selectedConnectionId: string;
   selectedModelId: string;
@@ -585,15 +567,6 @@ function ModelMenu({
           })}
         </div>
       )}
-
-      <button
-        className="model-menu-footer"
-        onClick={onOpenSettings}
-        type="button"
-      >
-        <Settings aria-hidden="true" size={14} />
-        <span>管理模型和 API</span>
-      </button>
     </div>
   );
 }
@@ -683,30 +656,6 @@ function connectionModelIds(connection: ProviderSettings): string[] {
     return [configured, ...synced];
   }
   return synced.length > 0 ? synced : configured ? [configured] : [];
-}
-
-/**
- * What "重置为默认设置" restores: the newest stable model of the active
- * connection, matching how a brand-new task picks its model.
- */
-function defaultSelectionFor(
-  connection: ProviderSettings,
-): ThreadModelSelection {
-  const modelIds = connectionModelIds(connection);
-  const modelId = resolveDefaultModelId(
-    modelIds,
-    connection.enabledFamilies ?? [],
-    connection.model,
-  );
-  return {
-    connectionId: connection.id,
-    modelId,
-    reasoningEffort: reconcileReasoningEffort(
-      connection.kind,
-      modelId,
-      connection.reasoningEffort ?? null,
-    ),
-  };
 }
 
 /**

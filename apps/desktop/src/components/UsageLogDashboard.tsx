@@ -512,6 +512,17 @@ function MetricList({ items }: { items: Array<[string, string]> }) {
 
 function TokenBreakdownTable({ summary }: { summary: UsageSummary }) {
   const breakdown = summary.tokenBreakdown;
+  const hasDetailedToolSurface =
+    (breakdown.directToolSchemas ?? 0) > 0 ||
+    (breakdown.deferredToolCatalog ?? 0) > 0 ||
+    (breakdown.loadedToolSchemas ?? 0) > 0;
+  const toolRows: Array<[string, number]> = hasDetailedToolSurface
+    ? [
+        ["直接加载的工具 / 输出 Schema", breakdown.directToolSchemas ?? 0],
+        ["延迟工具目录", breakdown.deferredToolCatalog ?? 0],
+        ["Tool Search 后加载的 Schema", breakdown.loadedToolSchemas ?? 0],
+      ]
+    : [["工具 / 输出 Schema", breakdown.toolSchemas]];
   const allRows: Array<[string, number]> = [
     ["基础指令", breakdown.baseInstructions],
     ["开发者指令", breakdown.developerInstructions],
@@ -524,7 +535,7 @@ function TokenBreakdownTable({ summary }: { summary: UsageSummary }) {
     ["当前用户输入", breakdown.currentUser],
     ["工具调用", breakdown.toolCalls],
     ["工具结果", breakdown.toolResults],
-    ["工具 / 输出 Schema", breakdown.toolSchemas],
+    ...toolRows,
     ["Provider 状态对象", breakdown.providerState],
     ["其他", breakdown.other],
   ];

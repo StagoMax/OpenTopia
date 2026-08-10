@@ -4,7 +4,7 @@
 
 .plan-choice-card {
   position: relative;
-  z-index: 20;
+  z-index: var(--z-popover);
   display: grid;
   box-sizing: border-box;
   width: min(720px, calc(100% - 32px));
@@ -17,7 +17,7 @@
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 8px 28px rgb(35 45 35 / 12%);
+  box-shadow: var(--shadow-float);
 }
 
 .plan-choice-header {
@@ -138,7 +138,7 @@
 }
 
 .plan-choice-option:focus-within {
-  outline: 2px solid #2675d8;
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -146,7 +146,7 @@
   width: 16px;
   height: 16px;
   margin: 2px 0 0;
-  accent-color: #2675d8;
+  accent-color: var(--focus-ring);
 }
 
 .plan-choice-option-copy {
@@ -210,7 +210,7 @@
 }
 
 .plan-choice-custom textarea:focus-visible {
-  outline: 2px solid #2675d8;
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -239,6 +239,12 @@
   font-size: 11px;
 }
 
+.plan-choice-action-buttons {
+  display: flex;
+  gap: var(--space-4);
+  align-items: center;
+}
+
 .plan-choice-actions button {
   display: inline-flex;
   min-width: 104px;
@@ -247,8 +253,6 @@
   justify-content: center;
   gap: 6px;
   padding: 7px 14px;
-  color: var(--on-accent);
-  background: var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
   border-radius: 6px;
   font: inherit;
@@ -257,12 +261,29 @@
   cursor: pointer;
 }
 
-.plan-choice-actions button:hover:not(:disabled) {
+.plan-choice-submit {
+  color: var(--on-accent);
   background: var(--accent);
 }
 
+.plan-choice-submit:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.plan-choice-actions .plan-choice-skip {
+  min-width: auto;
+  color: var(--text-secondary);
+  background: transparent;
+  border-color: var(--border);
+}
+
+.plan-choice-skip:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
 .plan-choice-actions button:focus-visible {
-  outline: 2px solid #2675d8;
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -298,6 +319,10 @@
   .plan-choice-actions button {
     width: 100%;
     min-height: 44px;
+  }
+
+  .plan-choice-action-buttons {
+    width: 100%;
   }
 }
 

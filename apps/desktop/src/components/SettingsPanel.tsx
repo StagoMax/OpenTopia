@@ -92,7 +92,7 @@ import type {
   SecretSources,
 } from "../types";
 
-type SettingsTab =
+export type SettingsTab =
   | "general"
   | "appearance"
   | "personalization"
@@ -239,6 +239,7 @@ type SettingsSidebarResize = {
 };
 
 type SettingsPanelProps = {
+  initialTab: SettingsTab;
   platform: PlatformInfo | null;
   settings: AppSettings | null;
   providerHealth: ProviderHealth[];
@@ -364,6 +365,7 @@ const defaultAgentRuntimeSettings: AgentRuntimeSettings = {
 };
 
 export function SettingsPanel({
+  initialTab,
   platform,
   settings,
   providerHealth,
@@ -397,7 +399,7 @@ export function SettingsPanel({
   onOpenLogs,
   onClose,
 }: SettingsPanelProps) {
-  const [activeTab, setActiveTab] = useState<SettingsTab>("general");
+  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const [searchQuery, setSearchQuery] = useState("");
   const [providers, setProviders] = useState<ProviderSettings[]>(
     normalizeProviderNames(settings?.providers ?? []),

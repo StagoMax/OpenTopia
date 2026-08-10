@@ -1017,6 +1017,9 @@ function emptyTokenBreakdown(): TokenEstimateBreakdown {
     currentUser: 0,
     toolCalls: 0,
     toolResults: 0,
+    directToolSchemas: 0,
+    deferredToolCatalog: 0,
+    loadedToolSchemas: 0,
     toolSchemas: 0,
     providerState: 0,
     other: 0,
@@ -1039,6 +1042,12 @@ function addTokenBreakdown(
   target.currentUser += source.currentUser;
   target.toolCalls += source.toolCalls;
   target.toolResults += source.toolResults;
+  target.directToolSchemas =
+    (target.directToolSchemas ?? 0) + (source.directToolSchemas ?? 0);
+  target.deferredToolCatalog =
+    (target.deferredToolCatalog ?? 0) + (source.deferredToolCatalog ?? 0);
+  target.loadedToolSchemas =
+    (target.loadedToolSchemas ?? 0) + (source.loadedToolSchemas ?? 0);
   target.toolSchemas += source.toolSchemas;
   target.providerState += source.providerState;
   target.other += source.other;

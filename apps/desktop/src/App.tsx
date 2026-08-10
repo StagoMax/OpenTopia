@@ -111,7 +111,10 @@ import {
 } from "./components/PreviewHost";
 import { FlowWorkspacePanel } from "./components/FlowWorkspacePanel";
 import { RightContextRail } from "./components/RightContextRail";
-import { SettingsPanel as RedesignedSettingsPanel } from "./components/SettingsPanel";
+import {
+  SettingsPanel as RedesignedSettingsPanel,
+  type SettingsTab,
+} from "./components/SettingsPanel";
 import { TaskSearchDialog } from "./components/TaskSearchDialog";
 import { UsageLogDashboard } from "./components/UsageLogDashboard";
 import {
@@ -462,14 +465,11 @@ function reusableGoalId(
   mode: CollaborationMode,
   snapshot: GoalSnapshot | null,
 ): string | undefined {
-  if (!snapshot || mode === "default") return undefined;
+  if (!snapshot || mode !== "goal") return undefined;
   if (["completed", "cancelled", "failed"].includes(snapshot.goal.status)) {
     return undefined;
   }
-  if (mode === "goal") return snapshot.goal.id;
-  return ["draft", "ready", "paused", "blocked"].includes(snapshot.goal.status)
-    ? snapshot.goal.id
-    : undefined;
+  return snapshot.goal.id;
 }
 
 function goalSnapshotAsTaskPlan(snapshot: GoalSnapshot): TaskPlan | null {
@@ -745,6 +745,20 @@ export function App() {
   >(null);
   const [userInputError, setUserInputError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] =
+    useState<SettingsTab>("general");
+  const openSettings = useCallback(() => {
+    setSettingsInitialTab("general");
+    setSettingsOpen(true);
+  }, []);
+  const openModelSettings = useCallback(() => {
+    setSettingsInitialTab("providers");
+    setSettingsOpen(true);
+  }, []);
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    setSettingsInitialTab("general");
+  }, []);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [taskNotificationPreferences, setTaskNotificationPreferences] =
     useState(readTaskNotificationPreferences);
@@ -1515,6 +1529,9 @@ export function App() {
         );
         setCancellingTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
+        );
+        setCollaborationMode((current) =>
+          current === "plan" ? "default" : current,
         );
       } else if (event.payload.type === "turn_suspended") {
         setThreadActivityStatus(event.threadId, "approval");
@@ -4171,7 +4188,7 @@ export function App() {
       if (taskSearchOpen) return;
       if (key === ",") {
         event.preventDefault();
-        if (!settingsOpen) setSettingsOpen(true);
+        if (!settingsOpen) openSettings();
         return;
       }
       if (
@@ -4245,7 +4262,7 @@ export function App() {
           onLogout={() => void logoutCodexAccount()}
           onQuit={() => void quitApp()}
           onToggleTool={toggleToolPanel}
-          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenSettings={openSettings}
           onOpenLogs={() => setLogViewerOpen(true)}
           onShowKeyboardShortcuts={() => setKeyboardShortcutsOpen(true)}
           onShowAbout={() => setAboutOpen(true)}
@@ -4316,7 +4333,7 @@ export function App() {
             }
             onOpenExtensions={() => openToolTab("extensions")}
             onOpenTaskSearch={() => setTaskSearchOpen(true)}
-            onSettings={() => setSettingsOpen(true)}
+            onSettings={openSettings}
           />
           {!settingsOpen && !sidebarCollapsed ? (
             <div
@@ -4498,6 +4515,12 @@ export function App() {
                         response,
                       )
                     }
+                    onSkip={() =>
+                      void submitUserInput(activeUserInput.request.requestId, {
+                        answers: [],
+                        skipped: true,
+                      })
+                    }
                   />
                 ) : (
                   <Composer
@@ -4535,7 +4558,7 @@ export function App() {
                     onChangeCollaborationMode={setCollaborationMode}
                     onChangeSandboxMode={changeSandboxMode}
                     onChangeModelSelection={changeModelSelection}
-                    onOpenSettings={() => setSettingsOpen(true)}
+                    onOpenSettings={openModelSettings}
                     onAddContextSources={addContextSources}
                     onRemoveContextSource={removeContextSource}
                     onToggleSkill={toggleSkill}
@@ -4568,7 +4591,7 @@ export function App() {
                 onChangeCollaborationMode={setCollaborationMode}
                 onChangeSandboxMode={changeSandboxMode}
                 onChangeModelSelection={changeModelSelection}
-                onOpenSettings={() => setSettingsOpen(true)}
+                onOpenSettings={openModelSettings}
                 onAddContextSources={addContextSources}
                 onRemoveContextSource={removeContextSource}
                 onToggleSkill={toggleSkill}
@@ -4699,7 +4722,7 @@ export function App() {
             onMarkThreadActivityRead={markThreadActivityRead}
             onChangePermissionMode={changeExecutionPreset}
             onChangeSandboxMode={changeSandboxMode}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={openModelSettings}
             onActivateToolTab={setActiveToolTabId}
             onCloseToolTab={closeToolTab}
             onToggleConversation={() =>
@@ -4715,6 +4738,7 @@ export function App() {
         </main>
         {settingsOpen && (
           <RedesignedSettingsPanel
+            initialTab={settingsInitialTab}
             platform={platform}
             settings={settings}
             providerHealth={providerHealth}
@@ -4766,10 +4790,10 @@ export function App() {
               )
             }
             onOpenLogs={() => {
-              setSettingsOpen(false);
+              closeSettings();
               setLogViewerOpen(true);
             }}
-            onClose={() => setSettingsOpen(false)}
+            onClose={closeSettings}
           />
         )}
         {taskSearchOpen ? (
@@ -10624,6 +10648,9 @@ function SideTaskConversation({
         );
         setCancellingTurnId(null);
         setPendingTurnFeedback(null);
+        setCollaborationMode((current) =>
+          current === "plan" ? "default" : current,
+        );
         onMarkThreadActivityRead(threadId);
       } else if (event.payload.type === "turn_suspended") {
         onSetThreadActivity(threadId, "approval");
@@ -11046,6 +11073,12 @@ function SideTaskConversation({
               activeUserInput.request.requestId,
               response,
             )
+          }
+          onSkip={() =>
+            void submitSideTaskUserInput(activeUserInput.request.requestId, {
+              answers: [],
+              skipped: true,
+            })
           }
         />
       ) : (

@@ -5,6 +5,7 @@ import type {
   UserInputRequest,
   UserInputResponse,
 } from "../types";
+import { Button } from "./ui";
 import "./PlanChoiceCard.css";
 
 const CUSTOM_OPTION_ID = "__custom__";
@@ -14,6 +15,7 @@ type PlanChoiceCardProps = {
   isSubmitting: boolean;
   error: string | null;
   onSubmit(response: UserInputResponse): void;
+  onSkip(): void;
 };
 
 type Selections = Record<string, string>;
@@ -24,6 +26,7 @@ export function PlanChoiceCard({
   isSubmitting,
   error,
   onSubmit,
+  onSkip,
 }: PlanChoiceCardProps) {
   const [selections, setSelections] = useState<Selections>({});
   const [customAnswers, setCustomAnswers] = useState<CustomAnswers>({});
@@ -185,20 +188,31 @@ export function PlanChoiceCard({
             ? "选择已完整"
             : `还需选择 ${request.questions.filter((question) => !selections[question.id] || (selections[question.id] === CUSTOM_OPTION_ID && !customAnswers[question.id]?.trim())).length} 项`}
         </span>
-        <button
-          type="button"
-          disabled={!complete || isSubmitting}
-          onClick={submit}
-        >
-          {isSubmitting ? (
-            <>
-              <Loader2 className="plan-choice-spinner" size={15} />
-              正在提交
-            </>
-          ) : (
-            "继续规划"
-          )}
-        </button>
+        <div className="plan-choice-action-buttons">
+          <Button
+            className="plan-choice-skip"
+            variant="quiet"
+            disabled={isSubmitting}
+            onClick={onSkip}
+          >
+            跳过
+          </Button>
+          <Button
+            className="plan-choice-submit"
+            variant="primary"
+            disabled={!complete || isSubmitting}
+            onClick={submit}
+          >
+            {isSubmitting ? (
+              <>
+                <Loader2 className="plan-choice-spinner" size={15} />
+                正在提交
+              </>
+            ) : (
+              "继续规划"
+            )}
+          </Button>
+        </div>
       </footer>
     </aside>
   );

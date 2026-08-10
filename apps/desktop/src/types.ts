@@ -2171,6 +2171,9 @@ export type TokenEstimateBreakdown = {
   currentUser: number;
   toolCalls: number;
   toolResults: number;
+  directToolSchemas?: number;
+  deferredToolCatalog?: number;
+  loadedToolSchemas?: number;
   toolSchemas: number;
   providerState: number;
   other: number;
@@ -2245,6 +2248,7 @@ export type UserInputAnswer = {
 
 export type UserInputResponse = {
   answers: UserInputAnswer[];
+  skipped?: boolean;
 };
 
 export type UserInputRecord = {
