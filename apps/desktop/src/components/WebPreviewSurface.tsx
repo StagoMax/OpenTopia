@@ -66,6 +66,8 @@ function NativeWebPreview({
   const [address, setAddress] = useState("");
   const [state, setState] = useState<WebPreviewState>({
     sessionId,
+    profileId: "default",
+    profilePersistence: "persistent",
     url: "",
     loading: false,
     canGoBack: false,
@@ -116,6 +118,8 @@ function NativeWebPreview({
     setError(null);
     setState({
       sessionId,
+      profileId: "default",
+      profilePersistence: "persistent",
       url: "",
       loading: false,
       canGoBack: false,

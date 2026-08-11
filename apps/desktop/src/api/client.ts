@@ -94,6 +94,7 @@ import type {
   WorkspaceDiffHunkAction,
   WorkspaceFilePreview,
   WorkspaceTree,
+  WindowsSandboxSetupStatus,
   CapabilityProjection,
   ExecutionResourceGrant,
 } from "../types";
@@ -190,6 +191,18 @@ export class ApiClient {
     sandbox?: AppSettings["sandbox"];
   }): Promise<AppSettings> {
     return this.patch("/api/settings", input);
+  }
+
+  async getWindowsSandboxSetup(): Promise<WindowsSandboxSetupStatus> {
+    return this.get("/api/sandbox/windows/setup");
+  }
+
+  async setupWindowsSandbox(): Promise<WindowsSandboxSetupStatus> {
+    return this.post("/api/sandbox/windows/setup", {});
+  }
+
+  async removeWindowsSandbox(): Promise<WindowsSandboxSetupStatus> {
+    return this.delete("/api/sandbox/windows/setup");
   }
 
   async getProviderHealth(): Promise<ProviderHealth[]> {

@@ -39,6 +39,10 @@ const MAX_NETWORK_HOSTS = 256;
 const MAX_OBSERVATIONS_PER_SESSION = 12;
 const OBSERVATION_TTL_MS = 120_000;
 const MAX_NODE_POSITION_DRIFT = 24;
+const DEFAULT_PROFILE_ID = "default";
+const PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const PROFILE_PERSISTENCE = new Set(["persistent", "ephemeral"]);
+const EPHEMERAL_PARTITION_NONCE = crypto.randomBytes(16).toString("hex");
 const DEFAULT_BACKGROUND_BOUNDS = Object.freeze({
   x: 0,
   y: 0,
@@ -66,6 +70,37 @@ function normalizeSessionId(value) {
     );
   }
   return value;
+}
+
+function normalizeProfileId(value) {
+  const normalized = value ?? DEFAULT_PROFILE_ID;
+  if (typeof normalized !== "string" || !PROFILE_ID_PATTERN.test(normalized)) {
+    throw new BrowserHostError(
+      "invalid_profile_id",
+      "profileId must be 1-64 characters using letters, numbers, '.', '_' or '-'.",
+    );
+  }
+  return normalized;
+}
+
+function normalizeProfilePersistence(value) {
+  const normalized = value ?? "persistent";
+  if (!PROFILE_PERSISTENCE.has(normalized)) {
+    throw new BrowserHostError(
+      "invalid_profile_persistence",
+      "profilePersistence must be 'persistent' or 'ephemeral'.",
+    );
+  }
+  return normalized;
+}
+
+function partitionForProfile(profileId, profilePersistence) {
+  if (profilePersistence === "ephemeral") {
+    return `opentopia-browser:${EPHEMERAL_PARTITION_NONCE}:${profileId}`;
+  }
+  return profileId === DEFAULT_PROFILE_ID
+    ? "persist:opentopia-browser"
+    : `persist:opentopia-browser:${profileId}`;
 }
 
 function normalizeUrl(value) {
@@ -390,7 +425,7 @@ function createDesktopBrowserHost(options) {
   let attachedWindow = null;
   let windowSuspended = false;
   let windowListeners = [];
-  let networkInterceptorInstalled = false;
+  const networkInterceptedSessions = new WeakSet();
 
   function log(level, event, metadata = {}) {
     try {
@@ -427,6 +462,8 @@ function createDesktopBrowserHost(options) {
     const webContents = entry.view.webContents;
     return {
       sessionId: entry.sessionId,
+      profileId: entry.profileId,
+      profilePersistence: entry.profilePersistence,
       url: webContents.isDestroyed() ? "" : webContents.getURL(),
       title: webContents.isDestroyed() ? "" : webContents.getTitle(),
       loading: webContents.isDestroyed() ? false : webContents.isLoading(),
@@ -443,6 +480,15 @@ function createDesktopBrowserHost(options) {
       ),
       bounds: { ...entry.bounds },
       error: entry.lastError,
+    };
+  }
+
+  function browserSessionInfo(entry) {
+    return {
+      sessionId: entry.sessionId,
+      profileId: entry.profileId,
+      profilePersistence: entry.profilePersistence,
+      backend: "electron",
     };
   }
 
@@ -550,7 +596,7 @@ function createDesktopBrowserHost(options) {
     const webContents = target.view.webContents;
     const browserSession = webContents.session;
 
-    if (!networkInterceptorInstalled) {
+    if (!networkInterceptedSessions.has(browserSession)) {
       browserSession.webRequest.onBeforeRequest(
         { urls: ["http://*/*", "https://*/*"] },
         (details, callback) => {
@@ -584,7 +630,7 @@ function createDesktopBrowserHost(options) {
           callback({ cancel: true });
         },
       );
-      networkInterceptorInstalled = true;
+      networkInterceptedSessions.add(browserSession);
     }
 
     webContents.setWindowOpenHandler((details) => {
@@ -592,7 +638,7 @@ function createDesktopBrowserHost(options) {
         if (entry.destroyed || !entry.targets.has(target.targetRef)) return;
         const popupView = new WebContentsView({
           webPreferences: {
-            partition: "persist:opentopia-browser",
+            partition: entry.partition,
             nodeIntegration: false,
             contextIsolation: true,
             sandbox: true,
@@ -712,10 +758,31 @@ function createDesktopBrowserHost(options) {
     });
   }
 
-  function createSession(sessionId) {
+  function createSession(sessionId, options = {}) {
     const normalized = normalizeSessionId(sessionId);
     const existing = sessions.get(normalized);
-    if (existing && !existing.destroyed) return existing;
+    if (existing && !existing.destroyed) {
+      const explicitProfile =
+        options.profileId !== undefined ||
+        options.profilePersistence !== undefined;
+      if (explicitProfile) {
+        const profileId = normalizeProfileId(options.profileId);
+        const profilePersistence = normalizeProfilePersistence(
+          options.profilePersistence,
+        );
+        if (
+          existing.profileId !== profileId ||
+          existing.profilePersistence !== profilePersistence
+        ) {
+          throw new BrowserHostError(
+            "session_profile_conflict",
+            `Browser session '${normalized}' is already bound to another profile.`,
+            409,
+          );
+        }
+      }
+      return existing;
+    }
     if (sessions.size >= MAX_SESSIONS) {
       throw new BrowserHostError(
         "too_many_sessions",
@@ -724,9 +791,15 @@ function createDesktopBrowserHost(options) {
       );
     }
 
+    const profileId = normalizeProfileId(options.profileId);
+    const profilePersistence = normalizeProfilePersistence(
+      options.profilePersistence,
+    );
+    const partition = partitionForProfile(profileId, profilePersistence);
+
     const view = new WebContentsView({
       webPreferences: {
-        partition: "persist:opentopia-browser",
+        partition,
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
@@ -739,6 +812,9 @@ function createDesktopBrowserHost(options) {
     view.setBounds(DEFAULT_BACKGROUND_BOUNDS);
     const entry = {
       sessionId: normalized,
+      profileId,
+      profilePersistence,
+      partition,
       view,
       targets: new Map(),
       activeTargetRef: null,
@@ -760,7 +836,11 @@ function createDesktopBrowserHost(options) {
     entry.activeTargetRef = target.targetRef;
     attachEntry(entry);
     emitState(entry);
-    log("info", "browser.session.created", { sessionId: normalized });
+    log("info", "browser.session.created", {
+      sessionId: normalized,
+      profileId,
+      profilePersistence,
+    });
     return entry;
   }
 
@@ -1913,6 +1993,7 @@ function createDesktopBrowserHost(options) {
       throw new BrowserHostError("invalid_action", "action must be a string.");
     }
     const supported = new Set([
+      "create_session",
       "navigate",
       "snapshot",
       "observe",
@@ -1930,6 +2011,14 @@ function createDesktopBrowserHost(options) {
         "invalid_action",
         `Unsupported browser action '${action}'.`,
       );
+    }
+
+    if (action === "create_session") {
+      const entry = createSession(sessionId, {
+        profileId: request.profileId,
+        profilePersistence: request.profilePersistence,
+      });
+      return browserSessionInfo(entry);
     }
 
     if (action === "close") {
@@ -2174,7 +2263,7 @@ function createDesktopBrowserHost(options) {
       });
     };
     handle(IPC_CHANNELS.create, async (options = {}) => {
-      const entry = createSession(options.sessionId);
+      const entry = createSession(options.sessionId, options);
       if (options.bounds) setBounds(entry, options.bounds);
       if (options.visible !== undefined) setVisibility(entry, options.visible);
       if (options.url) {

@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Check, ClipboardPaste, Copy, RotateCcw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Check, ClipboardPaste, Clock3, Copy, RotateCcw } from "lucide-react";
 import {
   CODE_FONT_SIZE_RANGE,
   UI_FONT_SIZE_RANGE,
@@ -14,6 +14,15 @@ import {
   type ThemeMode,
   type ThemeOverrides,
 } from "../appearance";
+import {
+  SOLAR_CHROME_SLOT_MINUTES,
+  clearSolarChromePreview,
+  getSolarChromeState,
+  getSolarChromeStateForMinutes,
+  millisecondsUntilNextSolarSlot,
+  setSolarChromePreview,
+  type SolarChromeSegment,
+} from "../solarChrome";
 import { SettingsGroup, SettingsPage, SettingsRow } from "./SettingsLayout";
 import {
   Button,
@@ -47,11 +56,60 @@ const diffMarkerOptions = [
   { value: "sign" as DiffMarkers, label: "+/-" },
 ];
 
+const solarSegmentLabels: Record<SolarChromeSegment, string> = {
+  "night-sunrise": "夜晚",
+  "sunrise-morning": "日出",
+  "morning-noon": "上午",
+  "noon-afternoon": "正午",
+  "afternoon-sunset": "下午",
+  "sunset-night": "日落",
+};
+
 export function AppearanceSettingsView({
   value,
   resolvedTheme,
   onChange,
 }: AppearanceSettingsViewProps) {
+  const [previewMinutes, setPreviewMinutes] = useState(
+    () => getSolarChromeState(new Date()).slotMinutes,
+  );
+  const [isPreviewingTime, setIsPreviewingTime] = useState(false);
+
+  useEffect(
+    () => () => {
+      clearSolarChromePreview();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (isPreviewingTime) return;
+
+    let timer: number | undefined;
+    const syncWithCurrentTime = () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      const now = new Date();
+      setPreviewMinutes(getSolarChromeState(now).slotMinutes);
+      timer = window.setTimeout(
+        syncWithCurrentTime,
+        millisecondsUntilNextSolarSlot(now) + 20,
+      );
+    };
+    const syncWhenVisible = () => {
+      if (document.visibilityState === "visible") syncWithCurrentTime();
+    };
+
+    syncWithCurrentTime();
+    window.addEventListener("focus", syncWithCurrentTime);
+    document.addEventListener("visibilitychange", syncWhenVisible);
+
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      window.removeEventListener("focus", syncWithCurrentTime);
+      document.removeEventListener("visibilitychange", syncWhenVisible);
+    };
+  }, [isPreviewingTime]);
+
   function patch(partial: Partial<AppearanceState>) {
     onChange({ ...value, ...partial });
   }
@@ -62,6 +120,20 @@ export function AppearanceSettingsView({
   ) {
     onChange({ ...value, [target]: { ...value[target], ...partial } });
   }
+
+  function previewSolarTime(minutes: number) {
+    setPreviewMinutes(minutes);
+    setIsPreviewingTime(true);
+    setSolarChromePreview(minutes);
+  }
+
+  function followCurrentTime() {
+    setPreviewMinutes(getSolarChromeState(new Date()).slotMinutes);
+    setIsPreviewingTime(false);
+    clearSolarChromePreview();
+  }
+
+  const previewState = getSolarChromeStateForMinutes(previewMinutes);
 
   return (
     <SettingsPage title="外观" description="主题、字体与界面密度">
@@ -105,6 +177,46 @@ export function AppearanceSettingsView({
           codeFontSize={value.codeFontSize}
         />
       </section>
+
+      <SettingsGroup
+        title="时间色调预览"
+        description={
+          isPreviewingTime ? "已暂停跟随当前时间" : "正在跟随当前时间"
+        }
+      >
+        <SettingsRow
+          title="时间"
+          description="半小时一档，仅用于本次预览"
+          control={
+            <div className="settings-group-actions-inline">
+              <Slider
+                label="预览时间"
+                min={0}
+                max={24 * 60 - SOLAR_CHROME_SLOT_MINUTES}
+                step={SOLAR_CHROME_SLOT_MINUTES}
+                value={previewMinutes}
+                showValue={false}
+                onChange={previewSolarTime}
+              />
+              <output
+                className="settings-inline-badge appearance-time-preview__value"
+                aria-live="polite"
+              >
+                {formatSolarTime(previewMinutes)} ·{" "}
+                {solarSegmentLabels[previewState.segment]}
+              </output>
+              <Button
+                size="compact"
+                disabled={!isPreviewingTime}
+                onClick={followCurrentTime}
+              >
+                <Clock3 size={14} aria-hidden="true" focusable="false" />
+                跟随当前时间
+              </Button>
+            </div>
+          }
+        />
+      </SettingsGroup>
 
       <ThemeEditor
         title="浅色主题"
@@ -205,6 +317,14 @@ export function AppearanceSettingsView({
       </SettingsGroup>
     </SettingsPage>
   );
+}
+
+function formatSolarTime(minutes: number): string {
+  const hours = Math.floor(minutes / 60)
+    .toString()
+    .padStart(2, "0");
+  const minute = (minutes % 60).toString().padStart(2, "0");
+  return `${hours}:${minute}`;
 }
 
 /**

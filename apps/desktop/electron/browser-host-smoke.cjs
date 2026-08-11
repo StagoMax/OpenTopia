@@ -143,8 +143,66 @@ async function main() {
     const address = pageServer.address();
     const url = `http://127.0.0.1:${address.port}/`;
     const sessionId = "00000000-0000-4000-8000-000000000001";
+    const ephemeralSessionId = "00000000-0000-4000-8000-000000000005";
     const executeAction = (name, request) =>
       runStep(name, () => host.executeAction(request));
+    const sessionInfo = await executeAction("create named profile session", {
+      sessionId,
+      action: "create_session",
+      profileId: "smoke-primary",
+      profilePersistence: "persistent",
+    });
+    if (
+      sessionInfo.profileId !== "smoke-primary" ||
+      sessionInfo.profilePersistence !== "persistent" ||
+      sessionInfo.backend !== "electron"
+    ) {
+      throw new Error("browser session did not retain its explicit profile");
+    }
+    let profileConflict = false;
+    try {
+      await host.executeAction({
+        sessionId,
+        action: "create_session",
+        profileId: "different-profile",
+        profilePersistence: "persistent",
+      });
+    } catch (error) {
+      profileConflict = error?.code === "session_profile_conflict";
+    }
+    if (!profileConflict) {
+      throw new Error("browser session accepted a conflicting profile binding");
+    }
+    let invalidProfileRejected = false;
+    try {
+      await host.executeAction({
+        sessionId: "00000000-0000-4000-8000-000000000006",
+        action: "create_session",
+        profileId: "../escape",
+        profilePersistence: "persistent",
+      });
+    } catch (error) {
+      invalidProfileRejected = error?.code === "invalid_profile_id";
+    }
+    if (!invalidProfileRejected) {
+      throw new Error("browser host accepted an unsafe profile ID");
+    }
+    await executeAction("create ephemeral profile session", {
+      sessionId: ephemeralSessionId,
+      action: "create_session",
+      profileId: "smoke-ephemeral",
+      profilePersistence: "ephemeral",
+    });
+    await executeAction("grant ephemeral profile network access", {
+      sessionId: ephemeralSessionId,
+      action: "grant_network_access",
+      allowedHosts: ["127.0.0.1"],
+    });
+    await executeAction("navigate ephemeral profile", {
+      sessionId: ephemeralSessionId,
+      action: "navigate",
+      url,
+    });
     await executeAction("grant network access", {
       sessionId,
       action: "grant_network_access",
@@ -493,8 +551,34 @@ async function main() {
         `broker did not preserve the typed network rejection: ${JSON.stringify(blockedNavigationError)}`,
       );
     }
+    const blockedEphemeralNavigation = await fetch(`${broker.url}/v1/browser`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${broker.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: ephemeralSessionId,
+        action: "navigate",
+        url: `${url}redirect`,
+      }),
+    });
+    const blockedEphemeralError = await blockedEphemeralNavigation.json();
+    if (
+      blockedEphemeralNavigation.status !== 403 ||
+      blockedEphemeralError?.error?.code !== "network_host_blocked" ||
+      blockedEphemeralError?.error?.host !== "localhost"
+    ) {
+      throw new Error(
+        `ephemeral profile did not enforce its network policy: ${JSON.stringify(blockedEphemeralError)}`,
+      );
+    }
 
     await executeAction("close session", { sessionId, action: "close" });
+    await executeAction("close ephemeral session", {
+      sessionId: ephemeralSessionId,
+      action: "close",
+    });
     await executeAction("close address-bar session", {
       sessionId: addressBarSessionId,
       action: "close",
@@ -509,6 +593,7 @@ async function main() {
         screenshotBytes: screenshotBytes.length,
         crossHostRedirectBlocked: true,
         crossHostSubresourceBlocked: true,
+        profileIsolation: true,
         addressBarRedirectAllowed: true,
         unauthorizedStatus: unauthorized.status,
         healthyStatus: healthy.status,

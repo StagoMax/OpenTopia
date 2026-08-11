@@ -24,3 +24,10 @@ export { Select, type SelectOption, type SelectProps } from "./Select";
 export { Slider, type SliderProps } from "./Slider";
 export { Switch, type SwitchProps } from "./Switch";
 export { TextField, type TextFieldProps } from "./TextField";
+export {
+  Tooltip,
+  type TooltipAnchor,
+  type TooltipProps,
+  type TooltipTriggerProps,
+} from "./Tooltip";
+export { type TooltipPlacement } from "./tooltipPosition";

@@ -129,8 +129,12 @@ import {
   WorkbenchPanel,
   type WorkbenchTab,
 } from "./components/WorkbenchPanel";
-import { Button, IconButton, Popover } from "./components/ui";
+import { Button, IconButton, Popover, Tooltip } from "./components/ui";
 import { normalizeCopiedText } from "./clipboardText";
+import {
+  conversationMessageCopyText,
+  formatConversationMessageTimestamp,
+} from "./conversationMessageMeta";
 import { formatPathForDisplay } from "./pathDisplay";
 import {
   composerContentText,
@@ -218,7 +222,12 @@ import {
   readPersonalizationSettings,
   writePersonalizationSettings,
 } from "./personalization";
-import { hasPendingProviderRequest } from "./turnActivityStatus";
+import {
+  hasPendingProviderRequest,
+  inactiveTurnIdFromEvent,
+  inactiveTurnIdsFromEvents,
+  resolveActiveTurnId,
+} from "./turnActivityStatus";
 import {
   readEditorPreferences,
   writeEditorPreferences,
@@ -288,6 +297,7 @@ import type {
   WorkspaceEntry,
   WorkspaceFilePreview,
   WorkspaceTree,
+  WindowsSandboxSetupStatus,
 } from "./types";
 
 type ServerStatus = "checking" | "online" | "offline";
@@ -693,6 +703,7 @@ export function App() {
     new Map<string, ConversationCacheEntry>(),
   );
   const conversationCacheClientRef = useRef<ApiClient | null>(null);
+  const inactiveTurnIdsRef = useRef<ReadonlySet<string>>(new Set());
   const [subagentRuns, setSubagentRuns] = useState<SubagentRun[]>([]);
   const [terminalEvents, setTerminalEvents] = useState<TerminalEvent[]>([]);
   const [terminalSession, setTerminalSession] =
@@ -755,6 +766,10 @@ export function App() {
     setSettingsInitialTab("providers");
     setSettingsOpen(true);
   }, []);
+  const openPermissionSettings = useCallback(() => {
+    setSettingsInitialTab("permissions");
+    setSettingsOpen(true);
+  }, []);
   const closeSettings = useCallback(() => {
     setSettingsOpen(false);
     setSettingsInitialTab("general");
@@ -792,6 +807,88 @@ export function App() {
       setCodexAccountLoading(false);
     }
   }, [client]);
+  const [windowsSandboxSetup, setWindowsSandboxSetup] =
+    useState<WindowsSandboxSetupStatus | null>(null);
+  const [windowsSandboxSetupBusy, setWindowsSandboxSetupBusy] = useState(false);
+  const [windowsSandboxSetupError, setWindowsSandboxSetupError] = useState<
+    string | null
+  >(null);
+  const [windowsSandboxPromptDismissed, setWindowsSandboxPromptDismissed] =
+    useState(false);
+  const isWindows = platform?.os === "win32" || platform?.os === "windows";
+
+  useEffect(() => {
+    if (!client || !isWindows) {
+      setWindowsSandboxSetup(null);
+      setWindowsSandboxSetupError(null);
+      return;
+    }
+    let cancelled = false;
+    setWindowsSandboxSetupBusy(true);
+    void client
+      .getWindowsSandboxSetup()
+      .then((status) => {
+        if (cancelled) return;
+        setWindowsSandboxSetup(status);
+        setWindowsSandboxSetupError(null);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setWindowsSandboxSetupError(errorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setWindowsSandboxSetupBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, isWindows]);
+
+  const setupWindowsSandbox = useCallback(
+    async (): Promise<WindowsSandboxSetupStatus> => {
+      if (!client) throw new Error("后端尚未连接");
+      setWindowsSandboxSetupBusy(true);
+      setWindowsSandboxSetupError(null);
+      try {
+        const status = await client.setupWindowsSandbox();
+        setWindowsSandboxSetup(status);
+        return status;
+      } catch (error) {
+        setWindowsSandboxSetupError(errorMessage(error));
+        // Setup is deliberately repairable and can leave useful partial state.
+        // Refresh after a failed privileged operation so the persistent
+        // settings entry reflects what actually exists and offers the right
+        // recovery action.
+        try {
+          setWindowsSandboxSetup(await client.getWindowsSandboxSetup());
+        } catch {
+          // Preserve the original setup error; it is the actionable failure.
+        }
+        throw error;
+      } finally {
+        setWindowsSandboxSetupBusy(false);
+      }
+    },
+    [client],
+  );
+  const removeWindowsSandbox = useCallback(
+    async (): Promise<WindowsSandboxSetupStatus> => {
+      if (!client) throw new Error("后端尚未连接");
+      setWindowsSandboxSetupBusy(true);
+      setWindowsSandboxSetupError(null);
+      try {
+        const status = await client.removeWindowsSandbox();
+        setWindowsSandboxSetup(status);
+        setWindowsSandboxPromptDismissed(false);
+        return status;
+      } catch (error) {
+        setWindowsSandboxSetupError(errorMessage(error));
+        throw error;
+      } finally {
+        setWindowsSandboxSetupBusy(false);
+      }
+    },
+    [client],
+  );
   const [providerTest, setProviderTest] = useState<{
     providerId: string;
     status: "testing" | "complete";
@@ -1411,6 +1508,13 @@ export function App() {
       if (event.threadId !== activeThreadIdRef.current) return;
       if (ingestedEventIdsRef.current.has(event.id)) return;
       ingestedEventIdsRef.current.add(event.id);
+      const inactiveTurnId = inactiveTurnIdFromEvent(event);
+      if (inactiveTurnId) {
+        inactiveTurnIdsRef.current = new Set([
+          ...inactiveTurnIdsRef.current,
+          inactiveTurnId,
+        ]);
+      }
       if (ingestedEventIdsRef.current.size > 4096) {
         const oldestId = ingestedEventIdsRef.current.values().next().value;
         if (oldestId) ingestedEventIdsRef.current.delete(oldestId);
@@ -1938,6 +2042,7 @@ export function App() {
     setUserInputError(null);
     setActiveTurnId(null);
     setCancellingTurnId(null);
+    inactiveTurnIdsRef.current = new Set();
     setGoalSnapshot(null);
     if (!client || !activeThreadId) {
       setMessages([]);
@@ -1958,6 +2063,9 @@ export function App() {
       conversationCacheClientRef.current = client;
     }
     const cached = conversationCacheRef.current.get(threadId) ?? null;
+    inactiveTurnIdsRef.current = inactiveTurnIdsFromEvents(
+      cached?.events ?? [],
+    );
     if (cached) {
       cacheConversation(conversationCacheRef.current, threadId, cached);
       setMessages(cached.messages);
@@ -1986,7 +2094,15 @@ export function App() {
           cached?.events ?? [],
           loadedEvents,
         );
+        const inactiveTurnIds = inactiveTurnIdsFromEvents(nextEvents);
+        inactiveTurnIdsRef.current = inactiveTurnIds;
         setEvents(nextEvents);
+        setActiveTurnId((current) =>
+          current && inactiveTurnIds.has(current) ? null : current,
+        );
+        setCancellingTurnId((current) =>
+          current && inactiveTurnIds.has(current) ? null : current,
+        );
         setConversationLoadState({ threadId, status: "ready", error: null });
         source = client.openEventStream(
           threadId,
@@ -2024,10 +2140,7 @@ export function App() {
         ]) => {
           if (cancelled) return;
           setActiveTurnId(
-            turnStatus?.status === "running" ||
-              turnStatus?.status === "cancelling"
-              ? turnStatus.turnId
-              : null,
+            resolveActiveTurnId(turnStatus, inactiveTurnIdsRef.current),
           );
           const activityStatus =
             pendingApprovals.length > 0
@@ -3362,10 +3475,7 @@ export function App() {
         const turnStatus = await client.getTurnStatus(threadId);
         if (activeThreadIdRef.current === threadId) {
           setActiveTurnId(
-            turnStatus?.status === "running" ||
-              turnStatus?.status === "cancelling"
-              ? turnStatus.turnId
-              : null,
+            resolveActiveTurnId(turnStatus, inactiveTurnIdsRef.current),
           );
         }
       } catch {
@@ -3403,7 +3513,20 @@ export function App() {
       const result = await client.cancelTurn(activeThread.id, turnId);
       if (!result.cancelled) {
         setCancellingTurnId(null);
-        setActionError(result.message);
+        let reconciledTurnId: string | null = turnId;
+        try {
+          const turnStatus = await client.getTurnStatus(activeThread.id);
+          reconciledTurnId = resolveActiveTurnId(
+            turnStatus,
+            inactiveTurnIdsRef.current,
+          );
+        } catch {
+          // Keep the original cancellation response when status reconciliation fails.
+        }
+        if (activeThreadIdRef.current === activeThread.id) {
+          setActiveTurnId(reconciledTurnId);
+          if (reconciledTurnId) setActionError(result.message);
+        }
       }
     } catch (error) {
       setCancellingTurnId(null);
@@ -4138,8 +4261,11 @@ export function App() {
       void saveSettings({ activeProviderId: selection.connectionId });
     }
 
+    // Keep the new-task composer on the last model state chosen by the user,
+    // including selections made while an existing thread is open.
+    setDraftModelSelection(selection);
+
     if (!activeThreadId) {
-      setDraftModelSelection(selection);
       return;
     }
 
@@ -4248,6 +4374,14 @@ export function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   });
+
+  const showWindowsSandboxSetupPrompt =
+    isWindows &&
+    settings?.sandbox.enforcement === "enforce" &&
+    settings.sandbox.sandboxMode !== "danger-full-access" &&
+    windowsSandboxSetup !== null &&
+    windowsSandboxSetup.state !== "ready" &&
+    !windowsSandboxPromptDismissed;
 
   return (
     <WorkspacePathIndexContext.Provider value={workspacePathIndex}>
@@ -4789,6 +4923,11 @@ export function App() {
                 true,
               )
             }
+            windowsSandboxSetup={windowsSandboxSetup}
+            windowsSandboxSetupBusy={windowsSandboxSetupBusy}
+            windowsSandboxSetupError={windowsSandboxSetupError}
+            onSetupWindowsSandbox={setupWindowsSandbox}
+            onRemoveWindowsSandbox={removeWindowsSandbox}
             onOpenLogs={() => {
               closeSettings();
               setLogViewerOpen(true);
@@ -4796,6 +4935,21 @@ export function App() {
             onClose={closeSettings}
           />
         )}
+        {showWindowsSandboxSetupPrompt ? (
+          <WindowsSandboxSetupDialog
+            status={windowsSandboxSetup}
+            busy={windowsSandboxSetupBusy}
+            error={windowsSandboxSetupError}
+            onSetup={() => {
+              void setupWindowsSandbox().catch(() => undefined);
+            }}
+            onOpenSettings={() => {
+              setWindowsSandboxPromptDismissed(true);
+              openPermissionSettings();
+            }}
+            onLater={() => setWindowsSandboxPromptDismissed(true)}
+          />
+        ) : null}
         {taskSearchOpen ? (
           <TaskSearchDialog
             activeThreadId={activeThreadId}
@@ -5523,6 +5677,97 @@ function AboutDialog({ onClose }: { onClose(): void }) {
           </button>
         </header>
         <p>本地优先的 AI 编码与工作代理。</p>
+      </section>
+    </div>
+  );
+}
+
+function WindowsSandboxSetupDialog({
+  status,
+  busy,
+  error,
+  onSetup,
+  onOpenSettings,
+  onLater,
+}: {
+  status: WindowsSandboxSetupStatus;
+  busy: boolean;
+  error: string | null;
+  onSetup(): void;
+  onOpenSettings(): void;
+  onLater(): void;
+}) {
+  useEffect(() => {
+    const deferOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || busy) return;
+      event.preventDefault();
+      onLater();
+    };
+    window.addEventListener("keydown", deferOnEscape);
+    return () => window.removeEventListener("keydown", deferOnEscape);
+  }, [busy, onLater]);
+
+  const unavailable = status.state === "unavailable";
+  const degraded = status.state === "degraded";
+
+  return (
+    <div className="modal-backdrop chrome-dialog-backdrop" role="presentation">
+      <section
+        className="chrome-dialog chrome-about-dialog sandbox-setup-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="windows-sandbox-setup-title"
+        aria-describedby="windows-sandbox-setup-description"
+      >
+        <header>
+          <h2 id="windows-sandbox-setup-title">
+            {degraded ? "修复 Windows 安全沙箱" : "配置 Windows 安全沙箱"}
+          </h2>
+          <ShieldCheck size={20} aria-hidden="true" />
+        </header>
+        <p id="windows-sandbox-setup-description">
+          {unavailable
+            ? "OpenTopia 默认使用强制沙箱，但当前安装中没有可用的 Windows 沙箱组件。"
+            : degraded
+              ? "检测到专用账户、凭据或离线网络规则不完整，需要修复后才能安全运行工具。"
+              : "OpenTopia 默认使用强制沙箱。首次配置会创建两个隔离的普通用户，并安装离线网络规则。"}
+        </p>
+        {!unavailable ? (
+          <p>
+            点击继续后，Windows 会弹出标准 UAC
+            窗口；普通任务运行时不会重复弹出。完成配置前，需要强制沙箱的工具会保持禁用。
+          </p>
+        ) : null}
+        {error ? (
+          <div className="settings-danger-notice" role="alert">
+            <ShieldAlert size={16} />
+            <span>{error}</span>
+          </div>
+        ) : null}
+        {!error && status.issues.length > 0 ? (
+          <div className="settings-warning-notice" role="status">
+            <ShieldAlert size={16} />
+            <span>{status.issues.join("；")}</span>
+          </div>
+        ) : null}
+        <div className="sandbox-setup-dialog__actions">
+          <Button variant="quiet" disabled={busy} onClick={onLater}>
+            稍后
+          </Button>
+          {unavailable ? (
+            <Button variant="primary" onClick={onOpenSettings}>
+              打开权限设置
+            </Button>
+          ) : (
+            <Button
+              variant="primary"
+              disabled={busy || !status.helperAvailable}
+              onClick={onSetup}
+            >
+              {busy ? "正在等待 Windows 授权…" : degraded ? "修复配置" : "继续配置"}
+            </Button>
+          )}
+        </div>
       </section>
     </div>
   );
@@ -8055,6 +8300,9 @@ const MessageBubble = memo(function MessageBubble({
   onOpenAttachmentPreview(source: ContextSourceRef): void;
   onOpenMarkdownLink(href: string): void;
 }) {
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">(
+    "idle",
+  );
   const renderedParts = useMemo(() => {
     const referencedImageIds = new Set(
       message.parts.flatMap((part) =>
@@ -8091,6 +8339,20 @@ const MessageBubble = memo(function MessageBubble({
   const [imagePreviews, setImagePreviews] = useState<ImageLightboxAttachment[]>(
     [],
   );
+  const copyText = useMemo(
+    () => conversationMessageCopyText(message.parts),
+    [message.parts],
+  );
+  const timestamp = useMemo(
+    () => formatConversationMessageTimestamp(message.createdAt),
+    [message.createdAt],
+  );
+
+  useEffect(() => {
+    if (copyStatus === "idle") return;
+    const timer = window.setTimeout(() => setCopyStatus("idle"), 1600);
+    return () => window.clearTimeout(timer);
+  }, [copyStatus]);
 
   useLayoutEffect(() => {
     // Create and revoke object URLs in the same lifecycle. React StrictMode
@@ -8124,8 +8386,8 @@ const MessageBubble = memo(function MessageBubble({
   if (renderedParts.length === 0) return null;
 
   return (
-    <>
-      <article className={`message ${message.role}`}>
+    <article className={`message ${message.role}`}>
+      <div className="message-content">
         <div className="message-body">
           {renderedParts.map(
             ({ part, referencedImage, previewImage, previewIndex }, index) => (
@@ -8158,8 +8420,65 @@ const MessageBubble = memo(function MessageBubble({
             ),
           )}
         </div>
-      </article>
-    </>
+        <div className="message-actions">
+          {timestamp ? (
+            <time dateTime={message.createdAt} title={timestamp.title}>
+              {timestamp.label}
+            </time>
+          ) : null}
+          {copyText ? (
+            <IconButton
+              className="message-copy-button"
+              size="compact"
+              variant="quiet"
+              aria-label={
+                copyStatus === "copied"
+                  ? "消息已复制"
+                  : copyStatus === "error"
+                    ? "复制失败，重试"
+                    : "复制消息"
+              }
+              title={
+                copyStatus === "copied"
+                  ? "已复制"
+                  : copyStatus === "error"
+                    ? "复制失败，点击重试"
+                    : "复制消息"
+              }
+              data-state={copyStatus}
+              onClick={() => {
+                void (async () => {
+                  try {
+                    if (!navigator.clipboard?.writeText) {
+                      throw new Error("Clipboard API unavailable");
+                    }
+                    await navigator.clipboard.writeText(copyText);
+                    setCopyStatus("copied");
+                  } catch {
+                    setCopyStatus("error");
+                  }
+                })();
+              }}
+            >
+              {copyStatus === "copied" ? (
+                <Check size={14} aria-hidden="true" />
+              ) : copyStatus === "error" ? (
+                <CircleAlert size={14} aria-hidden="true" />
+              ) : (
+                <Copy size={14} aria-hidden="true" />
+              )}
+            </IconButton>
+          ) : null}
+          <span className="ot-sr-only" aria-live="polite">
+            {copyStatus === "copied"
+              ? "消息已复制到剪贴板"
+              : copyStatus === "error"
+                ? "消息复制失败"
+                : ""}
+          </span>
+        </div>
+      </div>
+    </article>
   );
 });
 
@@ -10148,23 +10467,34 @@ function Composer({
                 {skills.map((skill) => {
                   const selected = selectedSkillIds.includes(skill.id);
                   return (
-                    <button
-                      className={`composer-tool-option ${selected ? "active" : ""}`}
+                    <Tooltip
+                      anchor="pointer"
+                      content={skill.description || skill.path}
                       key={skill.id}
-                      role="menuitemcheckbox"
-                      aria-checked={selected}
-                      disabled={!selected && selectedSkillIds.length >= 5}
-                      onClick={() => onToggleSkill(skill.id)}
+                      placement="top"
                     >
-                      <Plug size={14} aria-hidden="true" />
-                      <span className="composer-action-copy">
-                        <strong>{skill.name}</strong>
-                        {skill.description ? (
-                          <small>{skill.description}</small>
-                        ) : null}
-                      </span>
-                      {selected ? <Check size={14} aria-hidden="true" /> : null}
-                    </button>
+                      {(tooltipProps) => (
+                        <button
+                          {...tooltipProps}
+                          className={`composer-tool-option ${selected ? "active" : ""}`}
+                          role="menuitemcheckbox"
+                          aria-checked={selected}
+                          disabled={!selected && selectedSkillIds.length >= 5}
+                          onClick={() => onToggleSkill(skill.id)}
+                        >
+                          <Plug size={14} aria-hidden="true" />
+                          <span className="composer-action-copy">
+                            <strong>{skill.name}</strong>
+                            {skill.description ? (
+                              <small>{skill.description}</small>
+                            ) : null}
+                          </span>
+                          {selected ? (
+                            <Check size={14} aria-hidden="true" />
+                          ) : null}
+                        </button>
+                      )}
+                    </Tooltip>
                   );
                 })}
               </>
@@ -10731,10 +11061,10 @@ function SideTaskConversation({
           setMessages(loadedMessages);
           setEvents(loadedEvents);
           setActiveTurnId(
-            turnStatus?.status === "running" ||
-              turnStatus?.status === "cancelling"
-              ? turnStatus.turnId
-              : null,
+            resolveActiveTurnId(
+              turnStatus,
+              inactiveTurnIdsFromEvents(loadedEvents),
+            ),
           );
           setPendingApprovalIds(
             pendingApprovals.map((approval) => approval.approvalId),
@@ -10895,7 +11225,16 @@ function SideTaskConversation({
     setActionError(null);
     try {
       const result = await client.cancelTurn(thread.id, activeTurnId);
-      if (!result.cancelled) throw new Error(result.message);
+      if (!result.cancelled) {
+        const turnStatus = await client.getTurnStatus(thread.id);
+        const reconciledTurnId = resolveActiveTurnId(
+          turnStatus,
+          inactiveTurnIdsFromEvents(events),
+        );
+        setActiveTurnId(reconciledTurnId);
+        setCancellingTurnId(null);
+        if (reconciledTurnId) throw new Error(result.message);
+      }
     } catch (error) {
       setCancellingTurnId(null);
       setActionError(errorMessage(error));

@@ -308,6 +308,22 @@ export type SandboxSettings = {
   network: "inherit" | "allow" | "deny";
   writableRoots: string[];
   readPaths: string[];
+  windowsBackend?: "auto" | "dedicated_user" | "elevated" | "unelevated";
+};
+
+export type WindowsSandboxSetupStatus = {
+  supported: boolean;
+  helperAvailable: boolean;
+  state: "unavailable" | "not_configured" | "ready" | "degraded";
+  backend: "dedicated_user";
+  stateDir?: string | null;
+  components: {
+    credentials: boolean;
+    offlineIdentity: boolean;
+    onlineIdentity: boolean;
+    offlineNetworkPolicy: boolean;
+  };
+  issues: string[];
 };
 
 export type ReasoningEffort =
@@ -1155,8 +1171,12 @@ export type WebPreviewBounds = {
   height: number;
 };
 
+export type BrowserProfilePersistence = "persistent" | "ephemeral";
+
 export type WebPreviewState = {
   sessionId: string;
+  profileId: string;
+  profilePersistence: BrowserProfilePersistence;
   url: string;
   title?: string;
   loading: boolean;
@@ -2295,6 +2315,9 @@ export type AgentEventPayload =
       request_id: string;
       round: number;
       attempt: number;
+      retry_kind?: "compatibility" | "network";
+      retry_index?: number | null;
+      retry_limit?: number | null;
       reason: string;
       body?: unknown;
     }
@@ -2473,6 +2496,20 @@ export type PlatformOpenRequest = {
   receivedAt: string;
 };
 
+export type FileLinkAction =
+  "open-default" | "open-vscode" | "open-with" | "save-as" | "reveal";
+
+export type FileLinkActionRequest = {
+  action: FileLinkAction;
+  path: string;
+  line?: number | null;
+};
+
+export type FileLinkActionResult = {
+  canceled?: boolean;
+  path?: string;
+};
+
 declare global {
   interface Window {
     opentopia?: {
@@ -2488,6 +2525,9 @@ declare global {
       setTheme(theme: "light" | "dark"): Promise<boolean>;
       openExternal(url: string): Promise<void>;
       openPath(targetPath: string): Promise<{ path: string }>;
+      performFileLinkAction(
+        request: FileLinkActionRequest,
+      ): Promise<FileLinkActionResult>;
       showSystemNotification(
         options: SystemNotificationOptions,
       ): Promise<boolean>;
@@ -2541,6 +2581,8 @@ declare global {
       browserHost?: {
         createSession(input: {
           sessionId: string;
+          profileId?: string;
+          profilePersistence?: BrowserProfilePersistence;
           url?: string;
           bounds?: WebPreviewBounds;
           visible?: boolean;

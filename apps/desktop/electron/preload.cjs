@@ -55,6 +55,8 @@ contextBridge.exposeInMainWorld("opentopia", {
   openExternal: (url) => ipcRenderer.invoke("platform:open-external", url),
   openPath: (targetPath) =>
     ipcRenderer.invoke("platform:open-path", targetPath),
+  performFileLinkAction: (request) =>
+    ipcRenderer.invoke("platform:file-link-action", request),
   showSystemNotification: (options) =>
     ipcRenderer.invoke("platform:show-system-notification", options),
   writeClipboardImage: (bytes) =>

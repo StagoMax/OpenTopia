@@ -90,6 +90,7 @@ import type {
   ProviderSecretOutcome,
   ProviderSettings,
   SecretSources,
+  WindowsSandboxSetupStatus,
 } from "../types";
 
 export type SettingsTab =
@@ -281,6 +282,11 @@ type SettingsPanelProps = {
     preferences: TaskNotificationPreferences,
   ): void;
   onTestNotification(): void;
+  windowsSandboxSetup: WindowsSandboxSetupStatus | null;
+  windowsSandboxSetupBusy: boolean;
+  windowsSandboxSetupError: string | null;
+  onSetupWindowsSandbox(): Promise<WindowsSandboxSetupStatus>;
+  onRemoveWindowsSandbox(): Promise<WindowsSandboxSetupStatus>;
   onOpenLogs(): void;
   onClose(): void;
 };
@@ -396,6 +402,11 @@ export function SettingsPanel({
   onLogoutCodexAccount,
   onNotificationPreferencesChange,
   onTestNotification,
+  windowsSandboxSetup,
+  windowsSandboxSetupBusy,
+  windowsSandboxSetupError,
+  onSetupWindowsSandbox,
+  onRemoveWindowsSandbox,
   onOpenLogs,
   onClose,
 }: SettingsPanelProps) {
@@ -1205,8 +1216,16 @@ export function SettingsPanel({
               <PermissionSettings
                 permissionMode={permissionMode}
                 sandbox={sandboxSettings}
+                isWindows={
+                  platform?.os === "win32" || platform?.os === "windows"
+                }
                 onPermissionModeChange={updatePermissionMode}
                 onSandboxChange={updateSandbox}
+                windowsSetup={windowsSandboxSetup}
+                windowsSetupBusy={windowsSandboxSetupBusy}
+                windowsSetupError={windowsSandboxSetupError}
+                onSetupWindowsSandbox={onSetupWindowsSandbox}
+                onRemoveWindowsSandbox={onRemoveWindowsSandbox}
               />
             ) : null}
             {activeTab === "advanced" ? (
@@ -2336,14 +2355,49 @@ function ModelDiscoveryStatus({
 function PermissionSettings({
   permissionMode,
   sandbox,
+  isWindows,
   onPermissionModeChange,
   onSandboxChange,
+  windowsSetup,
+  windowsSetupBusy,
+  windowsSetupError,
+  onSetupWindowsSandbox,
+  onRemoveWindowsSandbox,
 }: {
   permissionMode: "chat" | "read_only" | "auto" | "approve" | "full_access";
   sandbox: AppSettings["sandbox"];
+  isWindows: boolean;
   onPermissionModeChange(mode: "auto" | "approve" | "full_access"): void;
   onSandboxChange(settings: AppSettings["sandbox"]): void;
+  windowsSetup: WindowsSandboxSetupStatus | null;
+  windowsSetupBusy: boolean;
+  windowsSetupError: string | null;
+  onSetupWindowsSandbox(): Promise<WindowsSandboxSetupStatus>;
+  onRemoveWindowsSandbox(): Promise<WindowsSandboxSetupStatus>;
 }) {
+  async function configureWindowsSandbox() {
+    try {
+      await onSetupWindowsSandbox();
+    } catch {
+      return;
+    }
+  }
+
+  async function removeWindowsSandbox() {
+    if (
+      !window.confirm(
+        "移除会删除 OpenTopia 的隔离账户、离线网络规则和已记录的目录权限。继续吗？",
+      )
+    ) {
+      return;
+    }
+    try {
+      await onRemoveWindowsSandbox();
+    } catch {
+      return;
+    }
+  }
+
   return (
     <SettingsPage title="权限" description="控制工具调用的审批与系统访问范围。">
       <SettingsGroup title="审批策略">
@@ -2381,6 +2435,113 @@ function PermissionSettings({
       </SettingsGroup>
 
       <SettingsGroup title="沙箱">
+        {isWindows && windowsSetup === null ? (
+          <div
+            className="settings-warning-notice settings-sandbox-status"
+            role="status"
+          >
+            <Shield size={16} />
+            <span>
+              {windowsSetupBusy
+                ? "正在读取 Windows 强制沙箱状态…"
+                : "尚未读取到 Windows 强制沙箱状态，可从这里重新配置。"}
+            </span>
+            <Button
+              size="compact"
+              variant="secondary"
+              disabled={windowsSetupBusy}
+              onClick={() => void configureWindowsSandbox()}
+            >
+              {windowsSetupBusy ? "读取中…" : "配置或修复"}
+            </Button>
+          </div>
+        ) : null}
+        {isWindows && windowsSetup?.state === "not_configured" ? (
+          <div
+            className="settings-warning-notice settings-sandbox-status"
+            role="status"
+          >
+            <Shield size={16} />
+            <span>
+              Windows 强制沙箱尚未配置。点击后会出现标准 UAC
+              授权窗口，并创建两个隔离的普通用户。
+            </span>
+            <Button
+              size="compact"
+              variant="secondary"
+              disabled={windowsSetupBusy || !windowsSetup.helperAvailable}
+              onClick={() => void configureWindowsSandbox()}
+            >
+              {windowsSetupBusy ? "配置中…" : "配置强制沙箱"}
+            </Button>
+          </div>
+        ) : null}
+        {isWindows && windowsSetup?.state === "degraded" ? (
+          <div
+            className="settings-danger-notice settings-sandbox-status"
+            role="alert"
+          >
+            <Shield size={16} />
+            <span>
+              Windows 沙箱配置不完整：
+              {windowsSetup.issues.join("；") || "组件健康检查未通过"}
+            </span>
+            <Button
+              size="compact"
+              variant="secondary"
+              disabled={windowsSetupBusy || !windowsSetup.helperAvailable}
+              onClick={() => void configureWindowsSandbox()}
+            >
+              {windowsSetupBusy ? "处理中…" : "修复"}
+            </Button>
+            <Button
+              size="compact"
+              variant="danger"
+              disabled={windowsSetupBusy || !windowsSetup.helperAvailable}
+              onClick={() => void removeWindowsSandbox()}
+            >
+              移除
+            </Button>
+          </div>
+        ) : null}
+        {isWindows && windowsSetup?.state === "ready" ? (
+          <div
+            className="settings-success-notice settings-sandbox-status"
+            role="status"
+          >
+            <Shield size={16} />
+            <span>Windows 专用账户沙箱已就绪，运行工具时不需要再次授权。</span>
+            <Button
+              size="compact"
+              variant="danger"
+              disabled={windowsSetupBusy}
+              onClick={() => void removeWindowsSandbox()}
+            >
+              {windowsSetupBusy ? "移除中…" : "移除"}
+            </Button>
+          </div>
+        ) : null}
+        {isWindows && windowsSetup?.state === "unavailable" ? (
+          <div
+            className="settings-danger-notice settings-sandbox-status"
+            role="alert"
+          >
+            <Shield size={16} />
+            <span>
+              Windows 沙箱不可用：
+              {windowsSetup.issues.join("；") || "未找到兼容的沙箱组件"}
+            </span>
+          </div>
+        ) : null}
+        {isWindows && windowsSetupError ? (
+          <div
+            className="settings-danger-notice settings-sandbox-status"
+            role="alert"
+          >
+            <Shield size={16} />
+            <span>管理 Windows 沙箱失败：{windowsSetupError}</span>
+          </div>
+        ) : null}
         <div className="settings-form-grid settings-sandbox-grid">
           <label>
             <span>访问模式</span>

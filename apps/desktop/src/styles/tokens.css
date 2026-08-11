@@ -50,7 +50,86 @@
 
   --app-bg: #ffffff;
   --sidebar-bg: #f3f6fa;
-  --sidebar-gradient: linear-gradient(180deg, #f5f8fc 0%, #e2e9f1 100%);
+
+  /* Time-aware application chrome. Each theme owns its palette anchors; the
+   * clock only selects a segment and its half-hour interpolation progress. */
+  --solar-sunrise-1: #ddedef;
+  --solar-sunrise-2: #dce9f2;
+  --solar-sunrise-3: #f1d8d0;
+  --solar-sunrise-4: #f7e7b9;
+  --solar-morning-1: #e0efdc;
+  --solar-morning-2: #d6efeb;
+  --solar-morning-3: #d9eef3;
+  --solar-morning-4: #f7f0c3;
+  --solar-noon-1: #ddefe4;
+  --solar-noon-2: #d5ecf2;
+  --solar-noon-3: #dde6f3;
+  --solar-noon-4: #f1eecf;
+  --solar-afternoon-1: #e8edcd;
+  --solar-afternoon-2: #f2e6bc;
+  --solar-afternoon-3: #f4d7cb;
+  --solar-afternoon-4: #e8d9e3;
+  --solar-sunset-1: #edd5cc;
+  --solar-sunset-2: #efcbd6;
+  --solar-sunset-3: #dcd8ec;
+  --solar-sunset-4: #d1e5ee;
+  --solar-night-1: #d7e5ed;
+  --solar-night-2: #d8e0f0;
+  --solar-night-3: #e2d6eb;
+  --solar-night-4: #eee1d5;
+  --solar-phase-from-1: var(--solar-morning-1);
+  --solar-phase-from-2: var(--solar-morning-2);
+  --solar-phase-from-3: var(--solar-morning-3);
+  --solar-phase-from-4: var(--solar-morning-4);
+  --solar-phase-to-1: var(--solar-morning-1);
+  --solar-phase-to-2: var(--solar-morning-2);
+  --solar-phase-to-3: var(--solar-morning-3);
+  --solar-phase-to-4: var(--solar-morning-4);
+  --solar-phase-progress: 0%;
+  --solar-chrome-1: color-mix(
+    in oklch,
+    var(--solar-phase-from-1),
+    var(--solar-phase-to-1) var(--solar-phase-progress)
+  );
+  --solar-chrome-2: color-mix(
+    in oklch,
+    var(--solar-phase-from-2),
+    var(--solar-phase-to-2) var(--solar-phase-progress)
+  );
+  --solar-chrome-3: color-mix(
+    in oklch,
+    var(--solar-phase-from-3),
+    var(--solar-phase-to-3) var(--solar-phase-progress)
+  );
+  --solar-chrome-4: color-mix(
+    in oklch,
+    var(--solar-phase-from-4),
+    var(--solar-phase-to-4) var(--solar-phase-progress)
+  );
+  --chrome-gradient: linear-gradient(
+    125deg,
+    var(--solar-chrome-1) 0%,
+    var(--solar-chrome-2) 32%,
+    var(--solar-chrome-3) 68%,
+    var(--solar-chrome-4) 100%
+  );
+  --topbar-gradient: var(--chrome-gradient);
+  --sidebar-gradient: var(--chrome-gradient);
+  --chrome-translucent-bg: color-mix(
+    in srgb,
+    var(--sidebar-bg) 78%,
+    transparent
+  );
+  --chrome-translucent-gradient: linear-gradient(
+    125deg,
+    color-mix(in srgb, var(--solar-chrome-1) 78%, transparent) 0%,
+    color-mix(in srgb, var(--solar-chrome-2) 78%, transparent) 32%,
+    color-mix(in srgb, var(--solar-chrome-3) 78%, transparent) 68%,
+    color-mix(in srgb, var(--solar-chrome-4) 78%, transparent) 100%
+  );
+  --chrome-backdrop-blur: 18px;
+  --sidebar-item-hover: color-mix(in srgb, var(--text) 8%, transparent);
+  --sidebar-item-active: color-mix(in srgb, var(--text) 14%, transparent);
   --surface: #ffffff;
   --surface-subtle: #f8f9fb;
   --surface-chrome: #f4f7fa;
@@ -147,6 +226,72 @@
   --z-toast: 40;
 }
 
+:root[data-solar-segment="night-sunrise"] {
+  --solar-phase-from-1: var(--solar-night-1);
+  --solar-phase-from-2: var(--solar-night-2);
+  --solar-phase-from-3: var(--solar-night-3);
+  --solar-phase-from-4: var(--solar-night-4);
+  --solar-phase-to-1: var(--solar-sunrise-1);
+  --solar-phase-to-2: var(--solar-sunrise-2);
+  --solar-phase-to-3: var(--solar-sunrise-3);
+  --solar-phase-to-4: var(--solar-sunrise-4);
+}
+
+:root[data-solar-segment="sunrise-morning"] {
+  --solar-phase-from-1: var(--solar-sunrise-1);
+  --solar-phase-from-2: var(--solar-sunrise-2);
+  --solar-phase-from-3: var(--solar-sunrise-3);
+  --solar-phase-from-4: var(--solar-sunrise-4);
+  --solar-phase-to-1: var(--solar-morning-1);
+  --solar-phase-to-2: var(--solar-morning-2);
+  --solar-phase-to-3: var(--solar-morning-3);
+  --solar-phase-to-4: var(--solar-morning-4);
+}
+
+:root[data-solar-segment="morning-noon"] {
+  --solar-phase-from-1: var(--solar-morning-1);
+  --solar-phase-from-2: var(--solar-morning-2);
+  --solar-phase-from-3: var(--solar-morning-3);
+  --solar-phase-from-4: var(--solar-morning-4);
+  --solar-phase-to-1: var(--solar-noon-1);
+  --solar-phase-to-2: var(--solar-noon-2);
+  --solar-phase-to-3: var(--solar-noon-3);
+  --solar-phase-to-4: var(--solar-noon-4);
+}
+
+:root[data-solar-segment="noon-afternoon"] {
+  --solar-phase-from-1: var(--solar-noon-1);
+  --solar-phase-from-2: var(--solar-noon-2);
+  --solar-phase-from-3: var(--solar-noon-3);
+  --solar-phase-from-4: var(--solar-noon-4);
+  --solar-phase-to-1: var(--solar-afternoon-1);
+  --solar-phase-to-2: var(--solar-afternoon-2);
+  --solar-phase-to-3: var(--solar-afternoon-3);
+  --solar-phase-to-4: var(--solar-afternoon-4);
+}
+
+:root[data-solar-segment="afternoon-sunset"] {
+  --solar-phase-from-1: var(--solar-afternoon-1);
+  --solar-phase-from-2: var(--solar-afternoon-2);
+  --solar-phase-from-3: var(--solar-afternoon-3);
+  --solar-phase-from-4: var(--solar-afternoon-4);
+  --solar-phase-to-1: var(--solar-sunset-1);
+  --solar-phase-to-2: var(--solar-sunset-2);
+  --solar-phase-to-3: var(--solar-sunset-3);
+  --solar-phase-to-4: var(--solar-sunset-4);
+}
+
+:root[data-solar-segment="sunset-night"] {
+  --solar-phase-from-1: var(--solar-sunset-1);
+  --solar-phase-from-2: var(--solar-sunset-2);
+  --solar-phase-from-3: var(--solar-sunset-3);
+  --solar-phase-from-4: var(--solar-sunset-4);
+  --solar-phase-to-1: var(--solar-night-1);
+  --solar-phase-to-2: var(--solar-night-2);
+  --solar-phase-to-3: var(--solar-night-3);
+  --solar-phase-to-4: var(--solar-night-4);
+}
+
 /*
  * Dark theme.
  *
@@ -167,7 +312,30 @@
    */
   --app-bg: #181818;
   --sidebar-bg: #1a2227;
-  --sidebar-gradient: linear-gradient(180deg, #1f2d37 0%, #141a1e 100%);
+  --solar-sunrise-1: #1c3234;
+  --solar-sunrise-2: #222e3e;
+  --solar-sunrise-3: #3c2b31;
+  --solar-sunrise-4: #413525;
+  --solar-morning-1: #18342f;
+  --solar-morning-2: #17333b;
+  --solar-morning-3: #25352f;
+  --solar-morning-4: #3b3824;
+  --solar-noon-1: #1d3731;
+  --solar-noon-2: #1a343e;
+  --solar-noon-3: #283542;
+  --solar-noon-4: #3b3a2d;
+  --solar-afternoon-1: #323625;
+  --solar-afternoon-2: #3d3523;
+  --solar-afternoon-3: #412e2a;
+  --solar-afternoon-4: #372b35;
+  --solar-sunset-1: #3d292d;
+  --solar-sunset-2: #412934;
+  --solar-sunset-3: #312f46;
+  --solar-sunset-4: #203942;
+  --solar-night-1: #172e38;
+  --solar-night-2: #1b293f;
+  --solar-night-3: #32283f;
+  --solar-night-4: #2e2b31;
   --surface: #2d2d2d;
   --surface-subtle: #353535;
   --surface-chrome: #1f1f1f;

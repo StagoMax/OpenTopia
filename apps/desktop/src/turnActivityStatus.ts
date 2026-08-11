@@ -1,6 +1,45 @@
-import type { AgentEvent } from "./types";
+import type { AgentEvent, TurnStatus } from "./types";
 
 export type ActiveTurnPhase = "thinking" | "processing";
+
+const inactiveTurnEventTypes = new Set<AgentEvent["payload"]["type"]>([
+  "turn_finished",
+  "turn_suspended",
+  "turn_awaiting_input",
+  "turn_cancelled",
+  "browser_handoff_required",
+  "error",
+]);
+
+export function inactiveTurnIdFromEvent(event: AgentEvent): string | null {
+  return event.turnId && inactiveTurnEventTypes.has(event.payload.type)
+    ? event.turnId
+    : null;
+}
+
+export function inactiveTurnIdsFromEvents(
+  events: AgentEvent[],
+): ReadonlySet<string> {
+  const inactiveTurnIds = new Set<string>();
+  for (const event of events) {
+    const turnId = inactiveTurnIdFromEvent(event);
+    if (turnId) inactiveTurnIds.add(turnId);
+  }
+  return inactiveTurnIds;
+}
+
+export function resolveActiveTurnId(
+  turnStatus: TurnStatus | null,
+  inactiveTurnIds: ReadonlySet<string>,
+): string | null {
+  if (
+    !turnStatus ||
+    (turnStatus.status !== "running" && turnStatus.status !== "cancelling")
+  ) {
+    return null;
+  }
+  return inactiveTurnIds.has(turnStatus.turnId) ? null : turnStatus.turnId;
+}
 
 export function hasPendingProviderRequest(events: AgentEvent[]): boolean {
   const pendingRequestIds = new Set<string>();

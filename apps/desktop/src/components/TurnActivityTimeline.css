@@ -18,6 +18,11 @@
   color: var(--success);
 }
 
+.activity-notice.is-reconnect strong {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .activity-notice-metrics {
   display: flex;
   flex-wrap: wrap;

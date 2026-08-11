@@ -1,8 +1,8 @@
-import type {
-  ConversationRenderTrace,
-} from "./conversationRenderTrace";
+import type { ConversationRenderTrace } from "./conversationRenderTrace";
 import type {
   ContextSourcePickResult,
+  FileLinkActionRequest,
+  FileLinkActionResult,
   KeyringMetadata,
   LogFileInfo,
   PlatformInfo,
@@ -101,6 +101,15 @@ export async function selectPluginDirectory(options?: {
 export async function openPath(targetPath: string): Promise<void> {
   if (!window.opentopia) return;
   await window.opentopia.openPath(targetPath);
+}
+
+export async function performFileLinkAction(
+  request: FileLinkActionRequest,
+): Promise<FileLinkActionResult> {
+  if (!window.opentopia?.performFileLinkAction) {
+    throw new Error("文件操作仅在桌面应用中可用。");
+  }
+  return window.opentopia.performFileLinkAction(request);
 }
 
 export async function openExternal(url: string): Promise<void> {

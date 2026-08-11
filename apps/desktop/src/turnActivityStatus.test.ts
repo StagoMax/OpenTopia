@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { hasPendingProviderRequest } from "./turnActivityStatus.ts";
-import type { AgentEvent } from "./types.ts";
+import {
+  hasPendingProviderRequest,
+  inactiveTurnIdsFromEvents,
+  resolveActiveTurnId,
+} from "./turnActivityStatus.ts";
+import type { AgentEvent, TurnStatus } from "./types.ts";
 
 function event(seq: number, payload: AgentEvent["payload"]): AgentEvent {
   return {
@@ -37,6 +41,20 @@ function providerResponse(
     round: 1,
     attempt,
   });
+}
+
+function turnStatus(
+  status: TurnStatus["status"] = "running",
+  turnId = "turn-1",
+): TurnStatus {
+  return {
+    turnId,
+    threadId: "thread-1",
+    userMessageId: "message-1",
+    status,
+    startedAt: "2026-07-30T10:00:00.000Z",
+    updatedAt: "2026-07-30T10:00:01.000Z",
+  };
 }
 
 test("derives thinking from an unanswered provider request", () => {
@@ -92,4 +110,39 @@ test("keeps thinking while any provider request remains unanswered", () => {
     ]),
     false,
   );
+});
+
+test("keeps an active turn when its event history has no stopping boundary", () => {
+  const inactiveTurnIds = inactiveTurnIdsFromEvents([
+    event(1, { type: "turn_started", user_message_id: "message-1" }),
+    providerRequest(2, "request-1"),
+  ]);
+
+  assert.equal(resolveActiveTurnId(turnStatus(), inactiveTurnIds), "turn-1");
+});
+
+test("lets a persisted error override a stale running status snapshot", () => {
+  const inactiveTurnIds = inactiveTurnIdsFromEvents([
+    event(1, { type: "turn_started", user_message_id: "message-1" }),
+    event(2, { type: "error", message: "provider unavailable" }),
+  ]);
+
+  assert.equal(resolveActiveTurnId(turnStatus(), inactiveTurnIds), null);
+});
+
+test("does not let another turn's terminal event hide the active turn", () => {
+  const inactiveTurnIds = inactiveTurnIdsFromEvents([
+    {
+      ...event(1, { type: "turn_cancelled", reason: "cancelled" }),
+      turnId: "turn-older",
+    },
+  ]);
+
+  assert.equal(resolveActiveTurnId(turnStatus(), inactiveTurnIds), "turn-1");
+});
+
+test("treats persisted non-running statuses as inactive", () => {
+  assert.equal(resolveActiveTurnId(turnStatus("failed"), new Set()), null);
+  assert.equal(resolveActiveTurnId(turnStatus("cancelled"), new Set()), null);
+  assert.equal(resolveActiveTurnId(null, new Set()), null);
 });

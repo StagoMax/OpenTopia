@@ -7,7 +7,9 @@ const {
   parseDraftModelSelection,
   parseLastActiveThreadIds,
   parseSidebarNavigationState,
+  readDraftModelSelection,
   resolveDraftModelSelection,
+  writeDraftModelSelection,
 } = (await import(
   "./workbenchPreferences" + ".ts"
 )) as typeof PreferencesModule;
@@ -75,6 +77,47 @@ test("restores the chosen new-task model and reasoning effort", () => {
       reasoningEffort: "high",
     },
   );
+});
+
+test("persists the complete last-used model state for the next task", () => {
+  const stored = new Map<string, string>();
+  const originalWindow = globalThis.window;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      localStorage: {
+        getItem(key: string) {
+          return stored.get(key) ?? null;
+        },
+        removeItem(key: string) {
+          stored.delete(key);
+        },
+        setItem(key: string, value: string) {
+          stored.set(key, value);
+        },
+      },
+    },
+  });
+
+  try {
+    const selection = {
+      connectionId: "openai",
+      modelId: "gpt-5.6-sol",
+      reasoningEffort: "xhigh" as const,
+    };
+    writeDraftModelSelection(selection);
+
+    assert.deepEqual(readDraftModelSelection(), selection);
+  } finally {
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: originalWindow,
+      });
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
 });
 
 test("falls back only when a stored connection or model is no longer usable", () => {

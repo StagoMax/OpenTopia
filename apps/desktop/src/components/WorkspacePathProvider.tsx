@@ -37,6 +37,13 @@ export function useWorkspacePathIndex({
           .filter((entry) => entry.kind === "file" || entry.kind === "symlink")
           .map((entry) => entry.name);
       },
+      async readTextFile(path) {
+        const preview = await client.readWorkspaceFile(threadId, path);
+        if (preview.truncated) {
+          throw new Error("File is too large to copy in full.");
+        }
+        return preview.content;
+      },
     });
   }, [client, threadId, workspaceRoot]);
 }
@@ -55,4 +62,18 @@ export function useWorkspacePathStatus(
 
   if (!index || !path) return "unknown";
   return index.status(path);
+}
+
+/** Resolves a verified Markdown target to the path used by desktop file APIs. */
+export function useWorkspaceAbsolutePath(path: string | null): string | null {
+  const index = useContext(WorkspacePathIndexContext);
+  return index && path ? index.absolutePath(path) : null;
+}
+
+/** Returns a task-scoped reader that cannot escape the active workspace. */
+export function useWorkspaceFileTextReader(
+  path: string | null,
+): (() => Promise<string>) | null {
+  const index = useContext(WorkspacePathIndexContext);
+  return index && path ? () => index.readTextFile(path) : null;
 }

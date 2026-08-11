@@ -25,6 +25,7 @@ import {
   RotateCcw,
   ShieldCheck,
   ShieldX,
+  Wifi,
   X,
 } from "lucide-react";
 import type {
@@ -147,6 +148,14 @@ type PrimitiveActivity =
       createdAt: string;
     }
   | { kind: "browser-handoff-completed"; seq: number; createdAt: string }
+  | {
+      kind: "reconnect";
+      seq: number;
+      requestId: string;
+      retryIndex: number;
+      retryLimit: number;
+      createdAt: string;
+    }
   | { kind: "error"; seq: number; message: string; createdAt: string }
   | { kind: "cancelled"; seq: number; reason: string; createdAt: string }
   | { kind: "suspended"; seq: number; reason: string; createdAt: string };
@@ -1100,6 +1109,15 @@ function ActivityEntryView({
       />
     );
   }
+  if (entry.kind === "reconnect") {
+    return (
+      <ActivityNotice
+        className="is-reconnect"
+        icon={<Wifi size={13} />}
+        title={`正在重新连接 ${entry.retryIndex}/${entry.retryLimit}`}
+      />
+    );
+  }
   if (entry.kind === "cancelled") {
     return (
       <ActivityNotice
@@ -1537,24 +1555,29 @@ function SubagentActivity({ run, now }: { run: SubagentRun; now: number }) {
 }
 
 function ActivityNotice({
+  className,
   icon,
   title,
   detail,
   metrics = [],
   tone = "neutral",
 }: {
+  className?: string;
   icon: ReactNode;
   title: string;
-  detail: string;
+  detail?: string;
   metrics?: GuardianActivityMetric[];
   tone?: "neutral" | "waiting" | "success" | "error";
 }) {
   return (
-    <div className="activity-notice" data-tone={tone}>
+    <div
+      className={`activity-notice${className ? ` ${className}` : ""}`}
+      data-tone={tone}
+    >
       <span aria-hidden="true">{icon}</span>
       <div>
         <strong>{title}</strong>
-        <p>{detail}</p>
+        {detail && <p>{detail}</p>}
         {metrics.length > 0 && (
           <dl className="activity-notice-metrics">
             {metrics.map((metric) => (
@@ -1703,6 +1726,10 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
   const guardianReviews = new Map<
     string,
     Extract<PrimitiveActivity, { kind: "guardian-review" }>
+  >();
+  const reconnects = new Map<
+    string,
+    Extract<PrimitiveActivity, { kind: "reconnect" }>
   >();
   const primitives: PrimitiveActivity[] = [];
   const planEvents = sorted.filter(
@@ -1853,6 +1880,29 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         seq: event.seq,
         createdAt: event.createdAt,
       });
+    } else if (
+      payload.type === "provider_request_retried" &&
+      payload.retry_kind === "network" &&
+      typeof payload.retry_index === "number" &&
+      typeof payload.retry_limit === "number"
+    ) {
+      const current = reconnects.get(payload.request_id);
+      if (current) {
+        current.retryIndex = payload.retry_index;
+        current.retryLimit = payload.retry_limit;
+        current.createdAt = event.createdAt;
+      } else {
+        const entry: Extract<PrimitiveActivity, { kind: "reconnect" }> = {
+          kind: "reconnect",
+          seq: event.seq,
+          requestId: payload.request_id,
+          retryIndex: payload.retry_index,
+          retryLimit: payload.retry_limit,
+          createdAt: event.createdAt,
+        };
+        reconnects.set(payload.request_id, entry);
+        primitives.push(entry);
+      }
     } else if (payload.type === "error") {
       primitives.push({
         kind: "error",

@@ -33,7 +33,12 @@ import {
   resolveMarkdownFileLink,
 } from "../markdownLinks";
 import { recordConversationRenderTrace } from "../platform";
-import { useWorkspacePathStatus } from "./WorkspacePathProvider";
+import { FileLinkContextMenu } from "./FileLinkContextMenu";
+import {
+  useWorkspaceAbsolutePath,
+  useWorkspaceFileTextReader,
+  useWorkspacePathStatus,
+} from "./WorkspacePathProvider";
 import "./MarkdownContent.css";
 
 export type MarkdownContentProps = {
@@ -129,6 +134,13 @@ function MarkdownAnchor({
     ? resolveMarkdownFileLink(href, baseWorkspacePath)
     : null;
   const pathStatus = useWorkspacePathStatus(linkInfo?.path ?? null);
+  const absolutePath = useWorkspaceAbsolutePath(linkInfo?.path ?? null);
+  const readFileText = useWorkspaceFileTextReader(linkInfo?.path ?? null);
+  const anchorRef = useRef<HTMLAnchorElement>(null);
+  const [contextMenuPoint, setContextMenuPoint] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
 
   // Both automatically detected paths and explicit Markdown file links use a
   // filename-only label after the target is confirmed in the workspace.
@@ -137,20 +149,51 @@ function MarkdownAnchor({
       ? `${linkInfo.path}#${linkInfo.fragment}`
       : linkInfo.path;
 
+    const line = markdownLineNumber(linkInfo.fragment);
+
     return (
-      <a
-        href={href}
-        title={targetTitle}
-        className="markdown-file-link"
-        onClick={(event) => {
-          if (event.defaultPrevented || !href) return;
-          if (!onOpenLink) return;
-          event.preventDefault();
-          onOpenLink(href);
-        }}
-      >
-        {linkInfo.fileName}
-      </a>
+      <>
+        <a
+          aria-haspopup="menu"
+          href={href}
+          title={targetTitle}
+          className="markdown-file-link"
+          ref={anchorRef}
+          onClick={(event) => {
+            if (event.defaultPrevented || !href) return;
+            if (!onOpenLink) return;
+            event.preventDefault();
+            onOpenLink(href);
+          }}
+          onContextMenu={(event) => {
+            if (!absolutePath) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const bounds = event.currentTarget.getBoundingClientRect();
+            setContextMenuPoint({
+              x: event.clientX || bounds.left,
+              y: event.clientY || bounds.bottom,
+            });
+          }}
+        >
+          {linkInfo.fileName}
+        </a>
+        {absolutePath && contextMenuPoint ? (
+          <FileLinkContextMenu
+            line={line}
+            onClose={(options) => {
+              setContextMenuPoint(null);
+              if (options?.restoreFocus) {
+                window.requestAnimationFrame(() => anchorRef.current?.focus());
+              }
+            }}
+            onOpen={onOpenLink && href ? () => onOpenLink(href) : undefined}
+            path={absolutePath}
+            point={contextMenuPoint}
+            readText={readFileText ?? undefined}
+          />
+        ) : null}
+      </>
     );
   }
 
@@ -174,6 +217,13 @@ function MarkdownAnchor({
       {children}
     </a>
   );
+}
+
+function markdownLineNumber(fragment: string | null): number | null {
+  const value = /^L(\d+)(?:C\d+)?$/i.exec(fragment ?? "")?.[1];
+  if (!value) return null;
+  const line = Number.parseInt(value, 10);
+  return Number.isSafeInteger(line) && line > 0 ? line : null;
 }
 
 function MarkdownImage({

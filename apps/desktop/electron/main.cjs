@@ -39,15 +39,15 @@ const backendApiToken = crypto.randomBytes(32).toString("base64url");
 const openTopiaProtocol = "opentopia";
 
 /*
- * The Windows caption buttons are drawn by the OS, not by our CSS, so they have
- * to be repainted explicitly whenever the renderer resolves a different theme.
- * These values mirror --surface-chrome / --text-secondary in styles/tokens.css;
- * keep them in step with it.
+ * The Windows caption buttons are drawn by the OS above the renderer. Keep the
+ * overlay transparent so the time-aware topbar remains visible underneath,
+ * while the symbols still follow the resolved theme for contrast.
  */
 const titleBarOverlayColors = {
-  light: { color: "#f4f7fa", symbolColor: "#5c6570" },
-  dark: { color: "#1f1f1f", symbolColor: "#c2c2c2" },
+  light: { color: "rgba(1, 0, 0, 0)", symbolColor: "#5c6570" },
+  dark: { color: "rgba(1, 0, 0, 0)", symbolColor: "#c2c2c2" },
 };
+const windowBackgroundColors = { light: "#ffffff", dark: "#181818" };
 
 function titleBarOverlayFor(theme) {
   const palette = titleBarOverlayColors[theme] ?? titleBarOverlayColors.light;
@@ -843,6 +843,55 @@ function normalizeExistingPath(rawPath) {
   return (
     fs.realpathSync.native?.(resolvedPath) || fs.realpathSync(resolvedPath)
   );
+}
+
+function normalizeExistingFile(rawPath) {
+  const filePath = normalizeExistingPath(rawPath);
+  if (!fs.statSync(filePath).isFile()) {
+    throw new Error(`Path is not a file: ${filePath}`);
+  }
+  return filePath;
+}
+
+function userVisibleWindowsPath(filePath) {
+  const verbatimUncPrefix = "\\\\?\\UNC\\";
+  if (
+    filePath.slice(0, verbatimUncPrefix.length).toUpperCase() ===
+    verbatimUncPrefix
+  ) {
+    return `\\\\${filePath.slice(verbatimUncPrefix.length)}`;
+  }
+  return filePath.startsWith("\\\\?\\") ? filePath.slice(4) : filePath;
+}
+
+function visualStudioCodeFileUrl(filePath, line) {
+  const normalized = userVisibleWindowsPath(filePath).replaceAll("\\", "/");
+  const encoded = encodeURI(normalized)
+    .replaceAll("#", "%23")
+    .replaceAll("?", "%3F");
+  const location = Number.isInteger(line) && line > 0 ? `:${line}` : "";
+  return `vscode://file/${encoded}${location}`;
+}
+
+async function showOpenWithDialog(filePath) {
+  if (process.platform !== "win32") {
+    const error = await shell.openPath(filePath);
+    if (error) throw new Error(error);
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(
+      "rundll32.exe",
+      ["shell32.dll,OpenAs_RunDLL", filePath],
+      { detached: true, stdio: "ignore", windowsHide: true },
+    );
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
 }
 
 function normalizeComparablePath(rawPath) {
@@ -1705,7 +1754,7 @@ function createMainWindow() {
     minWidth: 1080,
     minHeight: 720,
     title: isDev ? "OpenTopia Dev" : "OpenTopia",
-    backgroundColor: "#ffffff",
+    backgroundColor: windowBackgroundColors.light,
     show: false,
     ...(process.platform === "win32"
       ? {
@@ -1947,7 +1996,7 @@ function registerIpc() {
     const resolved = theme === "dark" ? "dark" : "light";
     if (!mainWindow || mainWindow.isDestroyed()) return false;
     // Repainting the window background too avoids a pale flash on resize.
-    mainWindow.setBackgroundColor(titleBarOverlayColors[resolved].color);
+    mainWindow.setBackgroundColor(windowBackgroundColors[resolved]);
     if (process.platform === "win32") {
       try {
         mainWindow.setTitleBarOverlay(titleBarOverlayFor(resolved));
@@ -2139,6 +2188,49 @@ function registerIpc() {
     const error = await shell.openPath(targetPath);
     if (error) throw new Error(error);
     return { path: targetPath };
+  });
+
+  ipcMain.handle("platform:file-link-action", async (event, request) => {
+    if (!request || typeof request !== "object" || Array.isArray(request)) {
+      throw new Error("File action request must be an object.");
+    }
+    const filePath = normalizeExistingFile(request.path);
+
+    if (request.action === "open-default") {
+      const error = await shell.openPath(filePath);
+      if (error) throw new Error(error);
+      return { path: filePath };
+    }
+    if (request.action === "open-vscode") {
+      await shell.openExternal(visualStudioCodeFileUrl(filePath, request.line));
+      return { path: filePath };
+    }
+    if (request.action === "open-with") {
+      await showOpenWithDialog(userVisibleWindowsPath(filePath));
+      return { path: filePath };
+    }
+    if (request.action === "save-as") {
+      const owner = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+      const dialogOptions = {
+        title: "另存文件",
+        defaultPath: userVisibleWindowsPath(filePath),
+      };
+      const result = owner
+        ? await dialog.showSaveDialog(owner, dialogOptions)
+        : await dialog.showSaveDialog(dialogOptions);
+      if (result.canceled || !result.filePath) return { canceled: true };
+      const destination = path.resolve(result.filePath);
+      if (destination !== path.resolve(filePath)) {
+        fs.copyFileSync(filePath, destination);
+      }
+      return { canceled: false, path: destination };
+    }
+    if (request.action === "reveal") {
+      shell.showItemInFolder(filePath);
+      return { path: filePath };
+    }
+
+    throw new Error(`Unsupported file action: ${request.action}`);
   });
 
   ipcMain.handle("workspace:select", async (event, options = {}) => {

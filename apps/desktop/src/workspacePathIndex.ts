@@ -4,6 +4,8 @@ export type WorkspacePathIndexOptions = {
   workspaceRoot: string | null;
   /** Lists file names in a workspace-relative directory ("" is the root). */
   listDirectory(directory: string): Promise<string[]>;
+  /** Reads a text file after this index has constrained it to the workspace. */
+  readTextFile?(path: string): Promise<string>;
   /** How long a "missing" answer is trusted before the directory is re-read. */
   missingRetryMs?: number;
   now?(): number;
@@ -41,6 +43,20 @@ export class WorkspacePathIndex {
       record.lowercase.has(relative.name.toLowerCase())
       ? "known"
       : "missing";
+  }
+
+  /** Returns the absolute on-disk path for a target inside this workspace. */
+  absolutePath(path: string): string | null {
+    return toWorkspaceAbsolutePath(path, this.options.workspaceRoot);
+  }
+
+  async readTextFile(path: string): Promise<string> {
+    const relative = toWorkspaceRelativePath(path, this.options.workspaceRoot);
+    if (!relative) throw new Error("File is outside the active workspace.");
+    if (!this.options.readTextFile) {
+      throw new Error("Workspace file reading is unavailable.");
+    }
+    return this.options.readTextFile(relative);
   }
 
   /** Subscribes to status changes for `path` and starts the lookup it needs. */
@@ -118,6 +134,20 @@ export function toWorkspaceRelativePath(
   const needle = caseInsensitive ? root.toLowerCase() : root;
   if (haystack !== needle && !haystack.startsWith(`${needle}/`)) return null;
   return collapse(normalized.slice(root.length));
+}
+
+/** Resolves a workspace-relative mention without allowing it to escape. */
+export function toWorkspaceAbsolutePath(
+  path: string,
+  workspaceRoot: string | null,
+): string | null {
+  if (!workspaceRoot) return null;
+  const relative = toWorkspaceRelativePath(path, workspaceRoot);
+  if (!relative) return null;
+
+  const root = workspaceRoot.replace(/[\\/]+$/, "");
+  const separator = root.includes("\\") ? "\\" : "/";
+  return `${root}${separator}${relative.replaceAll("/", separator)}`;
 }
 
 function splitDirectoryAndName(relative: string): {

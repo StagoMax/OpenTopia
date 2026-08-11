@@ -7,16 +7,22 @@ const workspacePathIndex: typeof WorkspacePathIndexModule = await import(
   "./workspacePathIndex" + ".ts"
 );
 
-const { WorkspacePathIndex, toWorkspaceRelativePath } = workspacePathIndex;
+const { WorkspacePathIndex, toWorkspaceAbsolutePath, toWorkspaceRelativePath } =
+  workspacePathIndex;
 
 function indexOf(
   listings: Record<string, string[]>,
-  options: { workspaceRoot?: string | null; now?(): number } = {},
+  options: {
+    workspaceRoot?: string | null;
+    now?(): number;
+    readTextFile?(path: string): Promise<string>;
+  } = {},
 ) {
   const calls: string[] = [];
   const index = new WorkspacePathIndex({
     workspaceRoot: options.workspaceRoot ?? "J:/Project/OpenTopia",
     now: options.now,
+    readTextFile: options.readTextFile,
     async listDirectory(directory) {
       calls.push(directory);
       const entries = listings[directory];
@@ -45,6 +51,39 @@ test("maps absolute and relative paths onto the workspace", () => {
     toWorkspaceRelativePath("/srv/app/main.rs", "/srv/app"),
     "main.rs",
   );
+});
+
+test("resolves workspace paths to the platform's absolute path style", () => {
+  assert.equal(
+    toWorkspaceAbsolutePath("docs/plan.md", "J:\\Project\\OpenTopia\\"),
+    "J:\\Project\\OpenTopia\\docs\\plan.md",
+  );
+  assert.equal(
+    toWorkspaceAbsolutePath("/srv/app/src/main.rs", "/srv/app"),
+    "/srv/app/src/main.rs",
+  );
+  assert.equal(
+    toWorkspaceAbsolutePath("D:/elsewhere/plan.md", "J:/Project/OpenTopia"),
+    null,
+  );
+  assert.equal(toWorkspaceAbsolutePath("docs/plan.md", null), null);
+});
+
+test("reads text only through a workspace-relative target", async () => {
+  const paths: string[] = [];
+  const { index } = indexOf(
+    {},
+    {
+      async readTextFile(path) {
+        paths.push(path);
+        return "hello";
+      },
+    },
+  );
+
+  assert.equal(await index.readTextFile("docs/plan.md"), "hello");
+  await assert.rejects(() => index.readTextFile("D:/elsewhere/secret.txt"));
+  assert.deepEqual(paths, ["docs/plan.md"]);
 });
 
 test("reports a path as known only after the directory is read", async () => {

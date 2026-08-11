@@ -206,6 +206,25 @@
   box-shadow: var(--shadow-float);
 }
 
+.ot-tooltip-surface {
+  position: fixed;
+  right: auto;
+  bottom: auto;
+  z-index: var(--z-popover);
+  width: max-content;
+  max-width: min(var(--popover-width-compact), calc(100vw - var(--space-8)));
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+  color: var(--text-secondary);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
 /* Switch */
 .ot-switch {
   position: relative;
