@@ -25,6 +25,7 @@ import {
   sha256File,
   snapshotPaths,
 } from "./utils.mjs";
+import { classifyTrialFailure } from "./failures.mjs";
 import {
   loadJson,
   validateExperiment,
@@ -598,6 +599,7 @@ async function runTrial({
 
   const scores = scoresFromChecks(checks);
   const status = determineStatus({ targetResult, checks, scores, events });
+  const failure = classifyTrialFailure({ status, checks, events, targetResult });
   const domainMetrics = summarizeDomainMetrics(events);
   const completedAt = new Date().toISOString();
   const sanitizedEventsText = events
@@ -628,6 +630,13 @@ async function runTrial({
     targetId: target.id,
     repetition,
     status,
+    ...(failure
+      ? {
+          failure: { ...failure, summary: redact(failure.summary, secrets) },
+          failureCategory: failure.category,
+          error: redact(failure.summary, secrets),
+        }
+      : {}),
     startedAt,
     completedAt,
     elapsedMs: targetResult.elapsedMs,

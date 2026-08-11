@@ -4,6 +4,7 @@ import process from "node:process";
 import path from "node:path";
 import { writeEvaluationCatalog } from "./catalog.mjs";
 import { compareSummaries, writeComparison } from "./compare.mjs";
+import { writeRegressionReport } from "./regressions.mjs";
 import { runSuite, validateDefinitions } from "./runner.mjs";
 import { loadJson } from "./validation.mjs";
 
@@ -15,6 +16,7 @@ Usage:
   agent-eval run --suite <suite.json> --target <target.json> [--output <dir>] [--repetitions <n>] [--tasks <id,id,...>] [--experiment <profile.json>]
   agent-eval compare --baseline <summary.json> --candidate <summary.json> [--output <dir>]
   agent-eval catalog [--root <evaluations-dir>] [--output <catalog.md>]
+  agent-eval regressions [--registry <registry.json>] [--summaries <summary.json,...>] [--output <report.md>]
 
 The target is a black-box process adapter. The harness passes the prompt through
 stdin or a file, exposes trial paths through AGENT_EVAL_* environment variables,
@@ -53,6 +55,29 @@ async function main() {
       runs: catalog.runs.length,
       skipped: catalog.warnings.length,
       catalog: catalog.outputPath
+    }, null, 2)}\n`);
+    return;
+  }
+  if (command === "regressions") {
+    const registryPath = path.resolve(
+      options.registry ?? path.join(process.cwd(), "evaluation", "regressions", "registry.json")
+    );
+    const outputPath = path.resolve(
+      options.output ?? path.join(path.dirname(registryPath), "index.md")
+    );
+    const summaryValue = options.summaries ?? options.summary ?? "";
+    const summaryPaths = summaryValue
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const result = await writeRegressionReport({ registryPath, summaryPaths, outputPath });
+    process.stdout.write(`${JSON.stringify({
+      cases: result.report.aggregate.totalCases,
+      open: result.report.aggregate.openCases,
+      regressionCoverageRate: result.report.aggregate.regressionCoverageRate,
+      passRate: result.report.aggregate.passRate,
+      report: result.markdownPath,
+      json: result.jsonPath
     }, null, 2)}\n`);
     return;
   }

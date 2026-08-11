@@ -14,6 +14,7 @@
     "test:evaluation": "node --test evaluation/test/*.test.mjs",
     "test:provider-release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-provider-tool-cache-release.ps1",
     "eval:catalog": "node evaluation/src/cli.mjs catalog --root .opentopia/evaluations",
+    "eval:regressions": "node evaluation/src/cli.mjs regressions --registry evaluation/regressions/registry.json --output .opentopia/evaluations/regressions.md",
     "boundary:check": "node scripts/check-evaluation-boundary.mjs",
     "design:check": "node scripts/check-design-system.mjs",
     "format": "pnpm --filter @opentopia/desktop format"

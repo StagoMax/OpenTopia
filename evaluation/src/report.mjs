@@ -1,12 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ensureDirectory } from "./utils.mjs";
-
-const EXCLUDED_FROM_ABILITY_DENOMINATOR = new Set([
-  "infra_error",
-  "grader_error",
-  "invalid_task",
-]);
+import { isAbilityEligible } from "./failures.mjs";
 
 function percentage(numerator, denominator) {
   if (denominator === 0) return "n/a";
@@ -22,9 +17,7 @@ export function aggregateResults({
   startedAt,
   completedAt,
 }) {
-  const validResults = results.filter(
-    (result) => !EXCLUDED_FROM_ABILITY_DENOMINATOR.has(result.status),
-  );
+  const validResults = results.filter(isAbilityEligible);
   const passedResults = validResults.filter(
     (result) => result.status === "passed",
   );
@@ -36,9 +29,7 @@ export function aggregateResults({
   }
 
   const tasks = [...taskMap.entries()].map(([taskId, trials]) => {
-    const valid = trials.filter(
-      (trial) => !EXCLUDED_FROM_ABILITY_DENOMINATOR.has(trial.status),
-    );
+    const valid = trials.filter(isAbilityEligible);
     const passed = valid.filter((trial) => trial.status === "passed");
     return {
       taskId,
@@ -211,6 +202,12 @@ export function aggregateResults({
     };
   }
 
+  const failureCategories = {};
+  for (const result of results) {
+    const category = result.failureCategory ?? result.failure?.category;
+    if (category) failureCategories[category] = (failureCategories[category] ?? 0) + 1;
+  }
+
   return {
     schemaVersion: 1,
     runId,
@@ -231,6 +228,7 @@ export function aggregateResults({
           ? null
           : passedResults.length / validResults.length,
       infrastructureFailures: results.length - validResults.length,
+      failureCategories,
       categoryPass,
       usage,
     },
@@ -292,6 +290,17 @@ export function renderMarkdown(summary) {
     lines.push(
       `| ${category} | ${value.passed} | ${value.total} | ${number(value.rate)} |`,
     );
+  }
+
+  lines.push("", "## Failure Classification", "");
+  const failureCategories = Object.entries(summary.aggregate.failureCategories ?? {});
+  if (failureCategories.length === 0) {
+    lines.push("None.");
+  } else {
+    lines.push("| Category | Trials |", "|---|---:|");
+    for (const [category, count] of failureCategories) {
+      lines.push(`| ${category} | ${count} |`);
+    }
   }
 
   const failures = summary.results.flatMap((result) =>

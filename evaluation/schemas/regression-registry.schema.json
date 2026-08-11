@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opentopia.local/evaluation/regression-registry.schema.json",
+  "title": "OpenTopia regression and risk registry",
+  "type": "object",
+  "required": ["schemaVersion", "id", "title", "cases"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "title",
+          "state",
+          "severity",
+          "area",
+          "gate",
+          "firstObservedAt",
+          "origin",
+          "observedBehavior",
+          "rootCause",
+          "expectedBehavior",
+          "tags",
+          "coverage"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["incident", "risk"] },
+          "title": { "type": "string", "minLength": 1 },
+          "state": { "enum": ["open", "active", "fixed", "monitoring", "retired"] },
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "area": {
+            "enum": [
+              "tool_call",
+              "cross_tool",
+              "provider_transport",
+              "recovery",
+              "safety",
+              "model_behavior",
+              "edge_case",
+              "grader"
+            ]
+          },
+          "gate": { "enum": ["smoke", "pr", "nightly", "manual"] },
+          "firstObservedAt": { "type": "string", "format": "date-time" },
+          "origin": {
+            "type": "object",
+            "required": ["kind"],
+            "properties": {
+              "kind": { "enum": ["eval-run", "production", "risk-analysis"] },
+              "runId": { "type": "string", "minLength": 1 },
+              "trialId": { "type": "string", "minLength": 1 },
+              "threadId": { "type": "string", "minLength": 1 },
+              "reference": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          },
+          "observedBehavior": { "type": "string", "minLength": 1 },
+          "rootCause": {
+            "type": "object",
+            "required": ["status", "summary"],
+            "properties": {
+              "status": { "enum": ["confirmed", "suspected", "unknown", "not_applicable"] },
+              "summary": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          },
+          "expectedBehavior": { "type": "string", "minLength": 1 },
+          "nextAction": { "type": "string", "minLength": 1 },
+          "tags": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "coverage": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["kind", "purpose", "suite", "target", "taskId"],
+                  "properties": {
+                    "kind": { "const": "evaluation-task" },
+                    "purpose": { "enum": ["regression", "reproducer", "monitor"] },
+                    "suite": { "type": "string", "minLength": 1 },
+                    "target": { "type": "string", "minLength": 1 },
+                    "taskId": { "type": "string", "minLength": 1 },
+                    "checkIds": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": { "type": "string", "minLength": 1 }
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["kind", "purpose", "file", "anchor", "command"],
+                  "properties": {
+                    "kind": { "const": "source-test" },
+                    "purpose": { "enum": ["regression", "reproducer", "monitor"] },
+                    "file": { "type": "string", "minLength": 1 },
+                    "anchor": { "type": "string", "minLength": 1 },
+                    "command": { "type": "string", "minLength": 1 }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

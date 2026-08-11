@@ -13,6 +13,48 @@
     "status": {
       "enum": ["passed", "task_failed", "false_completion", "safety_violation", "watchdog_timeout", "runtime_dependency_error", "application_crash", "grader_error", "infra_error", "invalid_task", "cancelled_by_evaluator"]
     },
+    "failureCategory": {
+      "enum": [
+        "provider_transport",
+        "harness_adapter",
+        "grader",
+        "safety",
+        "model_behavior",
+        "task_outcome",
+        "watchdog",
+        "application_runtime",
+        "invalid_task",
+        "cancelled"
+      ]
+    },
+    "error": { "type": "string" },
+    "failure": {
+      "type": "object",
+      "required": ["category", "summary", "terminalStatus", "failedCheckIds"],
+      "properties": {
+        "category": {
+          "enum": [
+            "provider_transport",
+            "harness_adapter",
+            "grader",
+            "safety",
+            "model_behavior",
+            "task_outcome",
+            "watchdog",
+            "application_runtime",
+            "invalid_task",
+            "cancelled"
+          ]
+        },
+        "summary": { "type": "string", "minLength": 1 },
+        "terminalStatus": { "type": ["string", "null"] },
+        "failedCheckIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
     "startedAt": { "type": "string", "format": "date-time" },
     "completedAt": { "type": "string", "format": "date-time" },
     "scores": {

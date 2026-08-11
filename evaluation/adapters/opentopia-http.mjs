@@ -642,6 +642,7 @@ async function main() {
     turnId: turn.turnId,
     messageId: message.id,
     completionSource,
+    error: turn.error ?? null,
   };
   await emit(
     turn.status === "waiting_user_action"
