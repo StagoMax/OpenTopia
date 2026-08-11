@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,8 +11,27 @@ use uuid::Uuid;
 pub enum WindowsSandboxBackend {
     #[default]
     Auto,
-    Elevated,
+    #[serde(alias = "elevated")]
+    DedicatedUser,
     Unelevated,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsSandboxSetupState {
+    Unavailable,
+    NotConfigured,
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsSandboxSetupComponents {
+    pub credentials: bool,
+    pub offline_identity: bool,
+    pub online_identity: bool,
+    pub offline_network_policy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,13 +44,34 @@ pub struct SandboxBackendCapabilities {
     pub network_offline: bool,
     pub network_online: bool,
     pub private_desktop: bool,
+    /// The backend preserves ordinary child-process IPC such as anonymous and
+    /// named pipes used by language runtimes to capture nested process output.
+    pub native_subprocess_ipc: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsSandboxSetupStatus {
+    pub supported: bool,
+    pub helper_available: bool,
+    pub state: WindowsSandboxSetupState,
+    pub backend: String,
+    pub state_dir: Option<String>,
+    pub components: WindowsSandboxSetupComponents,
+    pub issues: Vec<String>,
+}
+
+impl WindowsSandboxSetupStatus {
+    pub fn is_ready(&self) -> bool {
+        self.state == WindowsSandboxSetupState::Ready
+    }
 }
 
 impl SandboxBackendCapabilities {
     pub fn for_platform(platform: OsSandboxPlatform, backend: WindowsSandboxBackend) -> Self {
         match platform {
             OsSandboxPlatform::Windows => match backend {
-                WindowsSandboxBackend::Elevated => Self {
+                WindowsSandboxBackend::DedicatedUser => Self {
                     // A dedicated local user removes access to the host user's
                     // private profile and supports explicit deny-read ACEs, but
                     // Windows still has machine paths readable by all Users.
@@ -44,6 +85,7 @@ impl SandboxBackendCapabilities {
                     // Do not claim a private interactive desktop until the
                     // backend creates and assigns one.
                     private_desktop: false,
+                    native_subprocess_ipc: true,
                 },
                 WindowsSandboxBackend::Auto | WindowsSandboxBackend::Unelevated => Self {
                     // WRITE_RESTRICTED constrains writes, not reads. The
@@ -55,6 +97,7 @@ impl SandboxBackendCapabilities {
                     network_offline: false,
                     network_online: true,
                     private_desktop: false,
+                    native_subprocess_ipc: false,
                 },
             },
             OsSandboxPlatform::Linux | OsSandboxPlatform::Macos => Self {
@@ -68,6 +111,7 @@ impl SandboxBackendCapabilities {
                 network_offline: true,
                 network_online: true,
                 private_desktop: false,
+                native_subprocess_ipc: true,
             },
             OsSandboxPlatform::Unsupported => Self {
                 recursive_read_allowlist: false,
@@ -77,6 +121,7 @@ impl SandboxBackendCapabilities {
                 network_offline: false,
                 network_online: false,
                 private_desktop: false,
+                native_subprocess_ipc: false,
             },
         }
     }
@@ -231,15 +276,26 @@ impl LocalSandboxConfig {
         }
     }
 
+    /// Resolve the policy-level `auto` choice before capability checks and
+    /// command construction. Enforce mode requires the complete dedicated-user
+    /// contract; best-effort mode may use the compatibility-limited restricted
+    /// token backend.
+    pub fn effective_windows_backend(&self) -> WindowsSandboxBackend {
+        match (self.windows_backend, self.mode) {
+            (WindowsSandboxBackend::Auto, OsSandboxMode::Enforce) => {
+                WindowsSandboxBackend::DedicatedUser
+            }
+            (WindowsSandboxBackend::Auto, OsSandboxMode::BestEffort) => WindowsSandboxBackend::Auto,
+            (backend, _) => backend,
+        }
+    }
+
     pub fn with_sandbox_mode(mut self, sandbox_mode: SandboxMode) -> Self {
         self.sandbox_mode = sandbox_mode;
         if sandbox_mode == SandboxMode::DangerFullAccess {
             self.enabled = false;
             self.mode = OsSandboxMode::Disabled;
             self.network = NetworkPolicy::Allow;
-        } else if self.mode == OsSandboxMode::Disabled {
-            self.enabled = true;
-            self.mode = OsSandboxMode::Enforce;
         }
         self
     }
@@ -327,11 +383,13 @@ impl LocalSandboxConfig {
             windows_backend: match std::env::var("OPENTOPIA_WINDOWS_SANDBOX") {
                 Ok(value) => match value.to_ascii_lowercase().as_str() {
                     "auto" => WindowsSandboxBackend::Auto,
-                    "elevated" => WindowsSandboxBackend::Elevated,
+                    "dedicated_user" | "dedicated-user" | "elevated" => {
+                        WindowsSandboxBackend::DedicatedUser
+                    }
                     "unelevated" | "legacy" => WindowsSandboxBackend::Unelevated,
                     // Fail closed: an invalid backend name must not silently
                     // select the weaker fallback.
-                    _ => WindowsSandboxBackend::Elevated,
+                    _ => WindowsSandboxBackend::DedicatedUser,
                 },
                 Err(_) => WindowsSandboxBackend::Auto,
             },
@@ -921,14 +979,20 @@ fn build_windows_sandbox_command_with_binary(
     const ERROR_NONCE_ENV: &str = "OPENTOPIA_SANDBOX_ERROR_NONCE";
     let workspace_root = absolute_path(workspace_root);
     let error_nonce = Uuid::new_v4().simple().to_string();
+    let backend = config.effective_windows_backend();
+    if config.mode == OsSandboxMode::Enforce && backend != WindowsSandboxBackend::DedicatedUser {
+        anyhow::bail!(
+            "Windows enforce mode requires the dedicated-user sandbox backend because the restricted-token backend cannot preserve arbitrary child-process IPC; choose auto/dedicated_user and complete `opentopia-sandbox setup`, or explicitly use best-effort mode"
+        );
+    }
     let mut sandbox_args = vec![
         "run".to_string(),
         "--cwd".to_string(),
         path_to_string(&absolute_path(cwd)),
         "--backend".to_string(),
-        match config.windows_backend {
+        match backend {
             WindowsSandboxBackend::Auto => "auto",
-            WindowsSandboxBackend::Elevated => "elevated",
+            WindowsSandboxBackend::DedicatedUser => "dedicated-user",
             WindowsSandboxBackend::Unelevated => "unelevated",
         }
         .to_string(),
@@ -1051,9 +1115,9 @@ fn build_windows_sandbox_command_with_binary(
         },
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Windows,
-            backend: match config.windows_backend {
+            backend: match backend {
                 WindowsSandboxBackend::Auto => "opentopia-windows-auto",
-                WindowsSandboxBackend::Elevated => "opentopia-windows-elevated",
+                WindowsSandboxBackend::DedicatedUser => "opentopia-windows-dedicated-user",
                 WindowsSandboxBackend::Unelevated => "opentopia-windows-restricted-token",
             }
             .to_string(),
@@ -1100,6 +1164,11 @@ fn opentopia_sandbox_state_dir() -> Option<PathBuf> {
                 .map(PathBuf::from)
                 .map(|root| root.join("OpenTopia").join("sandbox"))
         })
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn dedicated_user_credentials_are_installed_for_tests() -> bool {
+    opentopia_sandbox_state_dir().is_some_and(|path| path.join("credentials.dpapi").is_file())
 }
 
 fn windows_minimal_runtime_roots() -> impl Iterator<Item = PathBuf> {
@@ -1285,6 +1354,118 @@ fn resolve_opentopia_sandbox_binary() -> anyhow::Result<Option<PathBuf>> {
     }
 }
 
+pub fn windows_sandbox_setup_status() -> anyhow::Result<WindowsSandboxSetupStatus> {
+    if OsSandboxPlatform::current() != OsSandboxPlatform::Windows {
+        return Ok(WindowsSandboxSetupStatus {
+            supported: false,
+            helper_available: false,
+            state: WindowsSandboxSetupState::Unavailable,
+            backend: "dedicated_user".to_string(),
+            state_dir: None,
+            components: WindowsSandboxSetupComponents::default(),
+            issues: vec!["the dedicated-user sandbox backend is available only on Windows".into()],
+        });
+    }
+    let Some(helper) = resolve_opentopia_sandbox_binary()? else {
+        return Ok(WindowsSandboxSetupStatus {
+            supported: true,
+            helper_available: false,
+            state: WindowsSandboxSetupState::Unavailable,
+            backend: "dedicated_user".to_string(),
+            state_dir: None,
+            components: WindowsSandboxSetupComponents::default(),
+            issues: vec!["the OpenTopia Windows sandbox helper was not found".into()],
+        });
+    };
+    let output = Command::new(&helper)
+        .args(["setup", "--status", "--json"])
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to query Windows sandbox setup through '{}': {error}",
+                helper.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Windows sandbox setup status failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let status: opentopia_sandbox_protocol::SandboxSetupStatus =
+        serde_json::from_slice(&output.stdout).context("parse Windows sandbox setup status")?;
+    if let Some(error) = status.compatibility_error() {
+        anyhow::bail!("incompatible Windows sandbox setup status: {error}");
+    }
+    Ok(WindowsSandboxSetupStatus {
+        supported: true,
+        helper_available: true,
+        state: match status.state {
+            opentopia_sandbox_protocol::SandboxSetupState::NotConfigured => {
+                WindowsSandboxSetupState::NotConfigured
+            }
+            opentopia_sandbox_protocol::SandboxSetupState::Ready => WindowsSandboxSetupState::Ready,
+            opentopia_sandbox_protocol::SandboxSetupState::Degraded => {
+                WindowsSandboxSetupState::Degraded
+            }
+        },
+        backend: "dedicated_user".to_string(),
+        state_dir: Some(status.state_dir),
+        components: WindowsSandboxSetupComponents {
+            credentials: status.components.credentials,
+            offline_identity: status.components.offline_identity,
+            online_identity: status.components.online_identity,
+            offline_network_policy: status.components.offline_network_policy,
+        },
+        issues: status.issues,
+    })
+}
+
+pub fn setup_windows_sandbox() -> anyhow::Result<WindowsSandboxSetupStatus> {
+    run_windows_sandbox_lifecycle("setup", WindowsSandboxSetupState::Ready)
+}
+
+pub fn remove_windows_sandbox() -> anyhow::Result<WindowsSandboxSetupStatus> {
+    run_windows_sandbox_lifecycle("teardown", WindowsSandboxSetupState::NotConfigured)
+}
+
+fn run_windows_sandbox_lifecycle(
+    action: &str,
+    expected_state: WindowsSandboxSetupState,
+) -> anyhow::Result<WindowsSandboxSetupStatus> {
+    anyhow::ensure!(
+        OsSandboxPlatform::current() == OsSandboxPlatform::Windows,
+        "the dedicated-user sandbox backend can be managed only on Windows"
+    );
+    let helper = resolve_opentopia_sandbox_binary()?
+        .context("the OpenTopia Windows sandbox helper was not found")?;
+    let output = Command::new(&helper)
+        .arg(action)
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to start Windows sandbox {action} through '{}': {error}",
+                helper.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Windows sandbox {action} failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let status = windows_sandbox_setup_status()?;
+    anyhow::ensure!(
+        status.state == expected_state,
+        "Windows sandbox {action} exited successfully but reached state {:?}: {}",
+        status.state,
+        status.issues.join("; ")
+    );
+    Ok(status)
+}
+
 fn first_existing_executable(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|path| path.is_file()).cloned()
 }
@@ -1456,6 +1637,18 @@ mod tests {
     }
 
     #[test]
+    fn dedicated_user_backend_keeps_the_legacy_elevated_setting_compatible() {
+        assert_eq!(
+            serde_json::from_str::<WindowsSandboxBackend>(r#""elevated""#).unwrap(),
+            WindowsSandboxBackend::DedicatedUser
+        );
+        assert_eq!(
+            serde_json::to_string(&WindowsSandboxBackend::DedicatedUser).unwrap(),
+            r#""dedicated_user""#
+        );
+    }
+
+    #[test]
     fn approved_missing_path_matches_its_canonical_parent_representation() {
         let root =
             std::env::temp_dir().join(format!("opentopia-approved-path-{}", uuid::Uuid::new_v4()));
@@ -1528,6 +1721,15 @@ mod tests {
         assert_eq!(plan.program, "sh");
         assert_eq!(plan.args, args);
         assert_eq!(plan.status, SandboxCommandStatus::Unrestricted);
+    }
+
+    #[test]
+    fn narrowing_a_tool_profile_does_not_enable_a_disabled_os_sandbox() {
+        let config =
+            LocalSandboxConfig::danger_full_access().with_sandbox_mode(SandboxMode::ReadOnly);
+        assert_eq!(config.sandbox_mode, SandboxMode::ReadOnly);
+        assert_eq!(config.mode, OsSandboxMode::Disabled);
+        assert!(!config.is_enabled());
     }
 
     #[test]
@@ -1652,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_adapter_builds_first_party_broker_command() {
+    fn windows_enforce_auto_selects_the_complete_dedicated_user_backend() {
         let root =
             std::env::temp_dir().join(format!("opentopia-windows-plan-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
@@ -1701,6 +1903,10 @@ mod tests {
             .args
             .windows(2)
             .any(|args| args == ["--max-output-bytes", "65536"]));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|args| args == ["--backend", "dedicated-user"]));
         assert!(plan.args.iter().any(|arg| arg == "--interactive"));
         assert!(plan
             .args
@@ -1711,7 +1917,7 @@ mod tests {
             SandboxCommandStatus::Wrapped {
                 platform: OsSandboxPlatform::Windows,
                 ref backend,
-            } if backend == "opentopia-windows-auto"
+            } if backend == "opentopia-windows-dedicated-user"
         ));
         assert!(plan
             .env
@@ -1719,6 +1925,80 @@ mod tests {
             .any(|(key, value)| key == "OPENTOPIA_SANDBOX_ERROR_NONCE" && !value.is_empty()));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_best_effort_defers_backend_selection_to_provisioning_state() {
+        let root =
+            std::env::temp_dir().join(format!("opentopia-windows-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create workspace");
+        let mut config = LocalSandboxConfig::best_effort();
+        config.network = NetworkPolicy::Allow;
+
+        let plan = build_windows_sandbox_command_with_binary(
+            std::env::current_exe().expect("current executable"),
+            "cmd.exe",
+            &["/c".to_string(), "echo ok".to_string()],
+            &root,
+            &root,
+            &config,
+            &SandboxLaunchOptions::default(),
+        )
+        .expect("build best-effort Windows sandbox plan");
+
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|args| args == ["--backend", "auto"]));
+        assert!(matches!(
+            plan.status,
+            SandboxCommandStatus::Wrapped {
+                platform: OsSandboxPlatform::Windows,
+                ref backend,
+            } if backend == "opentopia-windows-auto"
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_enforce_rejects_the_partial_restricted_token_backend() {
+        let root =
+            std::env::temp_dir().join(format!("opentopia-windows-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create workspace");
+        let mut config = LocalSandboxConfig::enforce();
+        config.windows_backend = WindowsSandboxBackend::Unelevated;
+
+        let error = build_windows_sandbox_command_with_binary(
+            std::env::current_exe().expect("current executable"),
+            "cmd.exe",
+            &["/c".to_string(), "echo ok".to_string()],
+            &root,
+            &root,
+            &config,
+            &SandboxLaunchOptions::default(),
+        )
+        .expect_err("enforce mode must reject a partial backend");
+
+        assert!(error.to_string().contains("arbitrary child-process IPC"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_backend_capabilities_report_subprocess_ipc_truthfully() {
+        assert!(
+            SandboxBackendCapabilities::for_platform(
+                OsSandboxPlatform::Windows,
+                WindowsSandboxBackend::DedicatedUser,
+            )
+            .native_subprocess_ipc
+        );
+        assert!(
+            !SandboxBackendCapabilities::for_platform(
+                OsSandboxPlatform::Windows,
+                WindowsSandboxBackend::Unelevated,
+            )
+            .native_subprocess_ipc
+        );
     }
 
     #[test]

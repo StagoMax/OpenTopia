@@ -234,7 +234,7 @@ fn unelevated_backend_rejects_an_offline_guarantee_it_cannot_enforce() {
 }
 
 #[test]
-fn elevated_state_cannot_be_exposed_to_a_host_identity_child() {
+fn dedicated_user_credentials_cannot_be_exposed_to_a_host_identity_child() {
     let root = std::env::temp_dir().join(format!("opentopia-credential-test-{}", Uuid::new_v4()));
     let state = root.join("state");
     std::fs::create_dir_all(&state).expect("create state fixture");
@@ -264,7 +264,7 @@ fn elevated_state_cannot_be_exposed_to_a_host_identity_child() {
     assert_eq!(result.status.code(), Some(125));
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("OPENTOPIA_SANDBOX_ERROR"));
-    assert!(stderr.contains("disabled after elevated setup"));
+    assert!(stderr.contains("disabled while dedicated-user credentials are installed"));
     assert!(stderr.contains("credential-test"));
     std::fs::remove_dir_all(root).expect("remove credential fixture");
 }
@@ -312,19 +312,58 @@ fn restricted_token_preserves_recursive_host_reads() {
 }
 
 #[test]
+fn auto_backend_uses_restricted_token_only_without_dedicated_credentials() {
+    let root = std::env::temp_dir().join(format!("opentopia-auto-test-{}", Uuid::new_v4()));
+    let state = root.join("empty-state");
+    std::fs::create_dir_all(&root).expect("create auto backend fixture");
+
+    let output = sandbox_command(&state)
+        .env("OPENTOPIA_SANDBOX_ERROR_NONCE", "auto-backend-test")
+        .args([
+            "run",
+            "--cwd",
+            root.to_str().expect("workspace utf-8"),
+            "--read-root",
+            root.to_str().expect("workspace utf-8"),
+            "--network",
+            "internet",
+            "--backend",
+            "auto",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo best-effort-ok",
+        ])
+        .output()
+        .expect("run auto backend test");
+
+    assert!(
+        output.status.success(),
+        "auto best-effort failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("best-effort-ok"));
+    std::fs::remove_dir_all(root).expect("remove auto backend fixture");
+}
+
+#[test]
 fn helper_timeout_terminates_the_process_tree() {
     let root = std::env::temp_dir().join(format!("opentopia-timeout-test-{}", Uuid::new_v4()));
     let workspace = root.join("workspace");
     let survivor = workspace.join("survivor.txt");
+    let child_started = workspace.join("child-started.txt");
     std::fs::create_dir_all(&workspace).expect("create workspace");
-    let child_script = format!(
-        "Start-Sleep -Seconds 2; Set-Content -LiteralPath '{}' -Value survived",
-        survivor.display()
-    );
-    let parent_script = format!(
-        "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-Command',\"{}\"); Start-Sleep -Seconds 30",
-        child_script.replace('"', "`\"")
-    );
+    std::fs::write(
+        workspace.join("child.cmd"),
+        "@echo off\r\necho child-started>child-started.txt\r\npowershell.exe -NoProfile -Command \"Start-Sleep -Seconds 2\"\r\necho survived>survivor.txt\r\n",
+    )
+    .expect("write child script");
+    std::fs::write(
+        workspace.join("parent.cmd"),
+        "@echo off\r\nstart \"\" /b cmd.exe /d /c child.cmd\r\npowershell.exe -NoProfile -Command \"Start-Sleep -Seconds 30\"\r\n",
+    )
+    .expect("write parent script");
     let output = sandbox_command(&root.join("sandbox-state"))
         .args([
             "run",
@@ -343,10 +382,10 @@ fn helper_timeout_terminates_the_process_tree() {
             "--termination-timeout-ms",
             "2000",
             "--",
-            "powershell.exe",
-            "-NoProfile",
-            "-Command",
-            &parent_script,
+            "cmd.exe",
+            "/d",
+            "/c",
+            "parent.cmd",
         ])
         .output()
         .expect("run timeout test");
@@ -358,6 +397,10 @@ fn helper_timeout_terminates_the_process_tree() {
         String::from_utf8_lossy(&output.stderr).contains("stage=wait"),
         "timeout did not report its stage: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        child_started.exists(),
+        "the timeout test must prove that a descendant started before checking containment"
     );
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert!(

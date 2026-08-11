@@ -123,24 +123,21 @@ pub(super) fn run(request: SandboxRequest) -> Result<i32> {
         ),
     );
     match request.backend {
-        BackendMode::Elevated if request.interactive => anyhow::bail!(
+        BackendMode::DedicatedUser if request.interactive => anyhow::bail!(
             "stage=validate_policy interactive PTY sessions currently require the unelevated Windows sandbox backend"
         ),
-        BackendMode::Auto if request.interactive && crate::setup::is_complete() => anyhow::bail!(
+        BackendMode::Auto if request.interactive && crate::setup::credentials_present() => anyhow::bail!(
             "stage=validate_policy interactive PTY sessions currently require the unelevated Windows sandbox backend"
         ),
-        BackendMode::Unelevated if crate::setup::is_complete() => anyhow::bail!(
-            "stage=validate_policy unelevated execution is disabled after elevated setup because it shares the host identity; use auto or elevated"
+        BackendMode::Unelevated if crate::setup::credentials_present() => anyhow::bail!(
+            "stage=validate_policy unelevated execution is disabled while dedicated-user credentials are installed because it shares the host identity; use auto/dedicated-user, or remove the dedicated-user sandbox first"
         ),
         BackendMode::Unelevated if !request.denied_read_paths.is_empty() => anyhow::bail!(
             "stage=validate_policy unelevated backend cannot enforce deny-read requirements"
         ),
         BackendMode::Unelevated => run_unelevated(request),
-        BackendMode::Elevated => run_elevated(request),
-        BackendMode::Auto if crate::setup::is_complete() => run_elevated(request),
-        BackendMode::Auto if !request.denied_read_paths.is_empty() => anyhow::bail!(
-            "stage=validate_policy deny-read requirements need completed elevated sandbox setup"
-        ),
+        BackendMode::DedicatedUser => run_dedicated_user(request),
+        BackendMode::Auto if crate::setup::credentials_present() => run_dedicated_user(request),
         BackendMode::Auto => run_unelevated(request),
     }
 }
@@ -152,7 +149,7 @@ fn run_unelevated(request: SandboxRequest) -> Result<i32> {
     );
     if request.network == NetworkMode::Deny {
         anyhow::bail!(
-            "stage=validate_policy unelevated backend cannot authoritatively enforce offline networking; run elevated setup or allow network"
+            "stage=validate_policy unelevated backend cannot authoritatively enforce offline networking; configure the dedicated-user backend or allow network"
         )
     }
     let capability_principal = capability_principal(&request);
@@ -189,36 +186,34 @@ fn run_unelevated(request: SandboxRequest) -> Result<i32> {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ElevatedRunnerResult {
+struct DedicatedUserRunnerResult {
     exit_code: i32,
     error: Option<String>,
 }
 
-const ELEVATED_RUNNER_PROTOCOL_VERSION: u32 = 1;
+const DEDICATED_USER_RUNNER_PROTOCOL_VERSION: u32 = 1;
 const LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL: &str = "opentopia:unelevated-capability:v1";
 const UNELEVATED_CAPABILITY_PRINCIPAL_PREFIX: &str = "opentopia:unelevated-capability:v2:";
 const UNELEVATED_CAPABILITY_NAMESPACE: u128 = 0xa678_2ac1_8754_5ef2_99b0_b62a_15c7_c90e;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ElevatedRunnerRequestEnvelope {
+struct DedicatedUserRunnerRequestEnvelope {
     protocol_version: u32,
     request: SandboxRequest,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ElevatedRunnerResultEnvelope {
+struct DedicatedUserRunnerResultEnvelope {
     protocol_version: u32,
-    result: ElevatedRunnerResult,
+    result: DedicatedUserRunnerResult,
 }
 
-fn run_elevated(request: SandboxRequest) -> Result<i32> {
-    crate::logging::event(
-        "prepare_sandbox",
-        "starting elevated dedicated-user backend",
-    );
+fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
+    crate::logging::event("prepare_sandbox", "starting dedicated-user backend");
     let credentials = crate::setup::load_credentials().map_err(|error| {
-        anyhow::anyhow!("stage=prepare_sandbox elevated backend unavailable: {error:#}")
+        anyhow::anyhow!("stage=prepare_sandbox dedicated-user backend unavailable: {error:#}")
     })?;
+    crate::logging::event("prepare_sandbox", "loaded dedicated-user credentials");
     let (username, password) = match request.network {
         NetworkMode::Deny => (
             credentials.offline_username.as_str(),
@@ -230,6 +225,10 @@ fn run_elevated(request: SandboxRequest) -> Result<i32> {
         ),
     };
     let mut user_sid = account_sid(username)?;
+    crate::logging::event(
+        "prepare_sandbox",
+        format!("resolved dedicated-user SID for {username}"),
+    );
     ensure_persistent_user_permissions(&request, username, user_sid.as_ptr())?;
     let _protected_write_lock = (!request.allowed_protected_roots.is_empty())
         .then(NamedAclMutex::acquire)
@@ -238,12 +237,12 @@ fn run_elevated(request: SandboxRequest) -> Result<i32> {
         ProtectedWriteWindow::open(request.allowed_protected_roots.clone(), user_sid.as_ptr())?;
 
     let run_root = std::env::temp_dir().join(format!(
-        "opentopia-elevated-run-{}",
+        "opentopia-dedicated-user-run-{}",
         Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&run_root).with_context(|| {
         format!(
-            "stage=prepare_sandbox create elevated run directory {}",
+            "stage=prepare_sandbox create dedicated-user run directory {}",
             run_root.display()
         )
     })?;
@@ -263,8 +262,8 @@ fn run_elevated(request: SandboxRequest) -> Result<i32> {
     crate::setup::ensure_parent(&request_path)?;
     std::fs::write(
         &request_path,
-        serde_json::to_vec(&ElevatedRunnerRequestEnvelope {
-            protocol_version: ELEVATED_RUNNER_PROTOCOL_VERSION,
+        serde_json::to_vec(&DedicatedUserRunnerRequestEnvelope {
+            protocol_version: DEDICATED_USER_RUNNER_PROTOCOL_VERSION,
             request: request.clone(),
         })?,
     )?;
@@ -310,7 +309,7 @@ fn run_elevated(request: SandboxRequest) -> Result<i32> {
     if created == 0 {
         return Err(last_error("stage=spawn CreateProcessWithLogonW"));
     }
-    crate::logging::event("spawn", format!("elevated runner user={username}"));
+    crate::logging::event("spawn", format!("dedicated-user runner user={username}"));
     unsafe { CloseHandle(process.hThread) };
     let broker_timeout = request
         .timeout_ms
@@ -329,25 +328,25 @@ fn run_elevated(request: SandboxRequest) -> Result<i32> {
             CloseHandle(process.hProcess);
         }
         anyhow::bail!(
-            "stage=wait elevated runner exceeded the command lifecycle timeout of {broker_timeout}ms"
+            "stage=wait dedicated-user runner exceeded the command lifecycle timeout of {broker_timeout}ms"
         )
     }
     if waited == u32::MAX {
         unsafe { CloseHandle(process.hProcess) };
-        return Err(last_error("stage=wait elevated runner"));
+        return Err(last_error("stage=wait dedicated-user runner"));
     }
     unsafe { CloseHandle(process.hProcess) };
 
     forward_file(&stdout_path, std::io::stdout())?;
     forward_file(&stderr_path, std::io::stderr())?;
-    let runner_result: ElevatedRunnerResultEnvelope = serde_json::from_slice(
+    let runner_result: DedicatedUserRunnerResultEnvelope = serde_json::from_slice(
         &std::fs::read(&result_path).context("stage=collect_output read runner result")?,
     )
     .context("stage=collect_output parse runner result")?;
-    if runner_result.protocol_version != ELEVATED_RUNNER_PROTOCOL_VERSION {
+    if runner_result.protocol_version != DEDICATED_USER_RUNNER_PROTOCOL_VERSION {
         anyhow::bail!(
-            "stage=collect_output elevated runner protocol mismatch: expected {} got {}",
-            ELEVATED_RUNNER_PROTOCOL_VERSION,
+            "stage=collect_output dedicated-user runner protocol mismatch: expected {} got {}",
+            DEDICATED_USER_RUNNER_PROTOCOL_VERSION,
             runner_result.protocol_version
         )
     }
@@ -357,8 +356,8 @@ fn run_elevated(request: SandboxRequest) -> Result<i32> {
     Ok(runner_result.result.exit_code)
 }
 
-pub(super) fn run_elevated_runner(args: &[String]) -> Result<i32> {
-    crate::logging::event("runner", "elevated runner started");
+pub(super) fn run_dedicated_user_runner(args: &[String]) -> Result<i32> {
+    crate::logging::event("runner", "dedicated-user runner started");
     let mut request_path = None;
     let mut result_path = None;
     let mut stdout_path = None;
@@ -370,7 +369,7 @@ pub(super) fn run_elevated_runner(args: &[String]) -> Result<i32> {
             "--result" => &mut result_path,
             "--stdout" => &mut stdout_path,
             "--stderr" => &mut stderr_path,
-            value => anyhow::bail!("unexpected elevated runner argument: {value}"),
+            value => anyhow::bail!("unexpected dedicated-user runner argument: {value}"),
         };
         index += 1;
         let value = args
@@ -383,36 +382,36 @@ pub(super) fn run_elevated_runner(args: &[String]) -> Result<i32> {
     let result_path = result_path.context("missing --result")?;
     let stdout_path = stdout_path.context("missing --stdout")?;
     let stderr_path = stderr_path.context("missing --stderr")?;
-    let envelope: ElevatedRunnerRequestEnvelope =
+    let envelope: DedicatedUserRunnerRequestEnvelope =
         serde_json::from_slice(&std::fs::read(request_path)?)?;
-    if envelope.protocol_version != ELEVATED_RUNNER_PROTOCOL_VERSION {
+    if envelope.protocol_version != DEDICATED_USER_RUNNER_PROTOCOL_VERSION {
         anyhow::bail!(
-            "stage=prepare_sandbox elevated runner protocol mismatch: expected {} got {}",
-            ELEVATED_RUNNER_PROTOCOL_VERSION,
+            "stage=prepare_sandbox dedicated-user runner protocol mismatch: expected {} got {}",
+            DEDICATED_USER_RUNNER_PROTOCOL_VERSION,
             envelope.protocol_version
         )
     }
-    let result = match launch_elevated_target(&envelope.request, &stdout_path, &stderr_path) {
-        Ok(exit_code) => ElevatedRunnerResult {
+    let result = match launch_dedicated_user_target(&envelope.request, &stdout_path, &stderr_path) {
+        Ok(exit_code) => DedicatedUserRunnerResult {
             exit_code,
             error: None,
         },
-        Err(error) => ElevatedRunnerResult {
+        Err(error) => DedicatedUserRunnerResult {
             exit_code: 1,
             error: Some(format!("{error:#}")),
         },
     };
     std::fs::write(
         result_path,
-        serde_json::to_vec(&ElevatedRunnerResultEnvelope {
-            protocol_version: ELEVATED_RUNNER_PROTOCOL_VERSION,
+        serde_json::to_vec(&DedicatedUserRunnerResultEnvelope {
+            protocol_version: DEDICATED_USER_RUNNER_PROTOCOL_VERSION,
             result,
         })?,
     )?;
     Ok(0)
 }
 
-fn launch_elevated_target(
+fn launch_dedicated_user_target(
     request: &SandboxRequest,
     stdout_path: &Path,
     stderr_path: &Path,
@@ -506,7 +505,7 @@ fn launch_elevated_target(
                     break Some((
                         124,
                         format!(
-                            "stage=wait command timed out after {timeout}ms; elevated process tree terminated"
+                            "stage=wait command timed out after {timeout}ms; dedicated-user process tree terminated"
                         ),
                     ));
                 }
@@ -540,7 +539,7 @@ fn launch_elevated_target(
         }
         if stopped == WAIT_TIMEOUT {
             anyhow::bail!(
-                "stage=terminate elevated process tree did not exit within {}ms after {reason}",
+                "stage=terminate dedicated-user process tree did not exit within {}ms after {reason}",
                 request.termination_timeout_ms
             )
         }
@@ -596,6 +595,8 @@ struct PersistentAclEntry {
     account: String,
     path: std::path::PathBuf,
     kind: PersistentAclKind,
+    #[serde(default)]
+    sid: Vec<u8>,
     #[serde(default = "legacy_acl_entry_permissions_version")]
     permissions_version: u32,
 }
@@ -673,6 +674,7 @@ fn ensure_persistent_user_permissions(
     let _guard = NamedAclMutex::acquire()?;
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
+    let sid_bytes = SidBuffer::copy_from_sid(sid)?.0;
     let mut desired = Vec::new();
     desired.extend(
         request
@@ -724,11 +726,21 @@ fn ensure_persistent_user_permissions(
             account: account.to_string(),
             path: path.clone(),
             kind: kind.clone(),
+            sid: sid_bytes.clone(),
             permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
         };
+        revoke_replaced_acl_principals(&ledger, &entry)?;
         if ledger.entries.contains(&entry) {
             continue;
         }
+        crate::logging::event(
+            "apply_acl",
+            format!(
+                "applying persistent {:?} permissions for {account} to {}",
+                kind,
+                path.display()
+            ),
+        );
         match kind {
             PersistentAclKind::Read => {
                 transaction.grant(&path, sid, true, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
@@ -761,6 +773,7 @@ fn ensure_persistent_capability_permissions(
     let _guard = NamedAclMutex::acquire()?;
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
+    let sid_bytes = SidBuffer::copy_from_sid(sid)?.0;
     let legacy_entries = ledger
         .entries
         .iter()
@@ -795,8 +808,10 @@ fn ensure_persistent_capability_permissions(
             account: principal.to_string(),
             path: path.clone(),
             kind: kind.clone(),
+            sid: sid_bytes.clone(),
             permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
         };
+        revoke_replaced_acl_principals(&ledger, &entry)?;
         if ledger.entries.contains(&entry) {
             continue;
         }
@@ -819,6 +834,66 @@ fn ensure_persistent_capability_permissions(
     Ok(())
 }
 
+fn revoke_replaced_acl_principals(
+    ledger: &PersistentAclLedger,
+    desired: &PersistentAclEntry,
+) -> Result<()> {
+    let mut replaced = BTreeSet::new();
+    for entry in ledger.entries.iter().filter(|entry| {
+        entry.account == desired.account
+            && entry.path == desired.path
+            && entry.kind == desired.kind
+            && !entry.sid.is_empty()
+            && entry.sid != desired.sid
+    }) {
+        if replaced.insert(entry.sid.clone()) {
+            let mut sid = SidBuffer(entry.sid.clone());
+            update_dacl(&entry.path, sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn has_dedicated_user_permissions(accounts: &[&str]) -> Result<bool> {
+    Ok(load_acl_ledger()?.entries.iter().any(|entry| {
+        accounts
+            .iter()
+            .any(|account| entry.account.eq_ignore_ascii_case(account))
+    }))
+}
+
+pub(super) fn revoke_dedicated_user_permissions(accounts: &[&str]) -> Result<()> {
+    let _guard = NamedAclMutex::acquire()?;
+    let mut ledger = load_acl_ledger()?;
+    let mut revoked = BTreeSet::new();
+    for entry in ledger.entries.iter().filter(|entry| {
+        accounts
+            .iter()
+            .any(|account| entry.account.eq_ignore_ascii_case(account))
+    }) {
+        let mut sid = acl_entry_sid(entry)?;
+        let key = (entry.path.clone(), sid.0.clone());
+        if revoked.insert(key) {
+            update_dacl(&entry.path, sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
+        }
+    }
+    ledger.entries.retain(|entry| {
+        !accounts
+            .iter()
+            .any(|account| entry.account.eq_ignore_ascii_case(account))
+    });
+    save_acl_ledger(&ledger)?;
+    Ok(())
+}
+
+fn acl_entry_sid(entry: &PersistentAclEntry) -> Result<SidBuffer> {
+    if entry.sid.is_empty() {
+        acl_principal_sid(&entry.account)
+    } else {
+        Ok(SidBuffer(entry.sid.clone()))
+    }
+}
+
 pub(super) fn cleanup_workspace_acl(args: &[String]) -> Result<i32> {
     let workspace = match args {
         [flag, value] if flag == "--workspace" => {
@@ -838,7 +913,7 @@ pub(super) fn cleanup_workspace_acl(args: &[String]) -> Result<i32> {
         path_starts_with(&entry.path, &workspace)
             && revoked.insert((entry.account.clone(), entry.path.clone()))
     }) {
-        let mut sid = acl_principal_sid(&entry.account)?;
+        let mut sid = acl_entry_sid(entry)?;
         update_dacl(&entry.path, sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
     }
     ledger
@@ -1736,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn elevated_runner_envelopes_are_explicitly_versioned() {
+    fn dedicated_user_runner_envelopes_are_explicitly_versioned() {
         let request = SandboxRequest {
             interactive: false,
             cwd: Path::new(r"C:\workspace").to_path_buf(),
@@ -1752,17 +1827,20 @@ mod tests {
             max_memory_bytes: None,
             max_cpu_time_ms: None,
             max_output_bytes: None,
-            backend: BackendMode::Elevated,
+            backend: BackendMode::DedicatedUser,
             command: vec!["cmd.exe".to_string()],
         };
-        let encoded = serde_json::to_vec(&ElevatedRunnerRequestEnvelope {
-            protocol_version: ELEVATED_RUNNER_PROTOCOL_VERSION,
+        let encoded = serde_json::to_vec(&DedicatedUserRunnerRequestEnvelope {
+            protocol_version: DEDICATED_USER_RUNNER_PROTOCOL_VERSION,
             request,
         })
         .expect("serialize request envelope");
-        let decoded: ElevatedRunnerRequestEnvelope =
+        let decoded: DedicatedUserRunnerRequestEnvelope =
             serde_json::from_slice(&encoded).expect("deserialize request envelope");
-        assert_eq!(decoded.protocol_version, ELEVATED_RUNNER_PROTOCOL_VERSION);
+        assert_eq!(
+            decoded.protocol_version,
+            DEDICATED_USER_RUNNER_PROTOCOL_VERSION
+        );
     }
 
     #[test]

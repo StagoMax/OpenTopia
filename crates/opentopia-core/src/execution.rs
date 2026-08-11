@@ -504,7 +504,7 @@ impl LocalExecutionEnvironment {
     fn validate_execution_requirements(&self, request: &ExecRequest) -> anyhow::Result<()> {
         let capabilities = SandboxBackendCapabilities::for_platform(
             OsSandboxPlatform::current(),
-            self.sandbox_config.windows_backend,
+            self.sandbox_config.effective_windows_backend(),
         );
         if !request.requirements.deny_read_paths.is_empty() && !capabilities.deny_read {
             return Err(ExecutionFailure::without_os_error(
@@ -1661,12 +1661,16 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn local_environment_windows_best_effort_sandbox_executes() {
+    async fn local_environment_windows_best_effort_unelevated_sandbox_executes() {
+        if crate::sandbox::dedicated_user_credentials_are_installed_for_tests() {
+            return;
+        }
         let root =
             std::env::temp_dir().join(format!("opentopia-core-execution-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create temp workspace");
         let mut config = LocalSandboxConfig::best_effort();
         config.network = NetworkPolicy::Allow;
+        config.windows_backend = crate::sandbox::WindowsSandboxBackend::Unelevated;
         let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
 
         let exec = env
@@ -1701,7 +1705,10 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn local_environment_windows_enforced_sandbox_denies_outside_write() {
+    async fn local_environment_windows_restricted_token_denies_outside_write() {
+        if crate::sandbox::dedicated_user_credentials_are_installed_for_tests() {
+            return;
+        }
         let id = Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("opentopia-core-sandbox-{id}"));
         let outside = std::env::current_dir()
@@ -1710,8 +1717,9 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
             .expect("workspace parent")
             .join(format!("opentopia-core-outside-{id}.txt"));
         std::fs::create_dir_all(&root).expect("create temp workspace");
-        let mut config = LocalSandboxConfig::enforce();
+        let mut config = LocalSandboxConfig::best_effort();
         config.network = NetworkPolicy::Allow;
+        config.windows_backend = crate::sandbox::WindowsSandboxBackend::Unelevated;
         let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
         let escaped_outside = outside.to_string_lossy().replace("'", "''");
         let command = format!(
@@ -1733,19 +1741,23 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
         assert!(!outside_was_written, "sandbox wrote outside the workspace");
         assert!(
             !command_succeeded,
-            "outside write should fail in enforced mode"
+            "outside write should fail in the restricted-token backend"
         );
     }
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn local_environment_windows_read_only_denies_workspace_write() {
+    async fn local_environment_windows_restricted_token_read_only_denies_workspace_write() {
+        if crate::sandbox::dedicated_user_credentials_are_installed_for_tests() {
+            return;
+        }
         let id = Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("opentopia-core-readonly-{id}"));
         let sandbox_home = std::env::temp_dir().join(format!("opentopia-core-readonly-home-{id}"));
         std::fs::create_dir_all(&root).expect("create temp workspace");
-        let mut config = LocalSandboxConfig::enforce().with_sandbox_mode(SandboxMode::ReadOnly);
+        let mut config = LocalSandboxConfig::best_effort().with_sandbox_mode(SandboxMode::ReadOnly);
         config.network = NetworkPolicy::Allow;
+        config.windows_backend = crate::sandbox::WindowsSandboxBackend::Unelevated;
         config.sandbox_home = Some(sandbox_home.clone());
         let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
         let target = root.join("blocked.txt");
@@ -1770,15 +1782,19 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn local_environment_windows_allows_additional_writable_root() {
+    async fn local_environment_windows_restricted_token_allows_additional_writable_root() {
+        if crate::sandbox::dedicated_user_credentials_are_installed_for_tests() {
+            return;
+        }
         let id = Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("opentopia-core-root-{id}"));
         let extra = std::env::temp_dir().join(format!("opentopia-core-writable-{id}"));
         let sandbox_home = std::env::temp_dir().join(format!("opentopia-core-writable-home-{id}"));
         std::fs::create_dir_all(&root).expect("create temp workspace");
         std::fs::create_dir_all(&extra).expect("create extra writable root");
-        let mut config = LocalSandboxConfig::enforce();
+        let mut config = LocalSandboxConfig::best_effort();
         config.network = NetworkPolicy::Allow;
+        config.windows_backend = crate::sandbox::WindowsSandboxBackend::Unelevated;
         config.writable_roots = vec![extra.clone()];
         config.sandbox_home = Some(sandbox_home.clone());
         let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);

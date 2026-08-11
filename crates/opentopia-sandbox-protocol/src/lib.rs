@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub const SANDBOX_PROTOCOL_SCHEMA: &str = "ai.opentopia.sandbox.protocol";
 pub const SANDBOX_PROTOCOL_VERSION: u32 = 1;
+pub const SANDBOX_SETUP_STATUS_SCHEMA: &str = "ai.opentopia.sandbox.setup-status";
+pub const SANDBOX_SETUP_STATUS_VERSION: u32 = 2;
 pub const REQUIRED_SANDBOX_FEATURES: &[&str] = &[
     "error.envelope.v1",
     "run.backend",
@@ -10,7 +12,73 @@ pub const REQUIRED_SANDBOX_FEATURES: &[&str] = &[
     "run.protected_roots",
     "run.resource_limits",
     "run.runtime_roots",
+    "setup.lifecycle.v1",
 ];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxSetupState {
+    NotConfigured,
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxSetupComponents {
+    pub credentials: bool,
+    pub offline_identity: bool,
+    pub online_identity: bool,
+    pub offline_network_policy: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxSetupStatus {
+    pub schema: String,
+    pub status_version: u32,
+    pub state: SandboxSetupState,
+    pub state_dir: String,
+    pub components: SandboxSetupComponents,
+    pub issues: Vec<String>,
+}
+
+impl SandboxSetupStatus {
+    pub fn current(
+        state: SandboxSetupState,
+        state_dir: impl Into<String>,
+        components: SandboxSetupComponents,
+        issues: Vec<String>,
+    ) -> Self {
+        Self {
+            schema: SANDBOX_SETUP_STATUS_SCHEMA.to_string(),
+            status_version: SANDBOX_SETUP_STATUS_VERSION,
+            state,
+            state_dir: state_dir.into(),
+            components,
+            issues,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.state == SandboxSetupState::Ready
+    }
+
+    pub fn compatibility_error(&self) -> Option<String> {
+        if self.schema != SANDBOX_SETUP_STATUS_SCHEMA {
+            return Some(format!(
+                "unexpected setup-status schema '{}'; expected '{}'",
+                self.schema, SANDBOX_SETUP_STATUS_SCHEMA
+            ));
+        }
+        (self.status_version != SANDBOX_SETUP_STATUS_VERSION).then(|| {
+            format!(
+                "setup-status version {} is incompatible with required version {}",
+                self.status_version, SANDBOX_SETUP_STATUS_VERSION
+            )
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -78,5 +146,17 @@ mod tests {
             info.compatibility_error().as_deref(),
             Some("missing required features: run.backend")
         );
+    }
+
+    #[test]
+    fn current_setup_status_is_compatible() {
+        let status = SandboxSetupStatus::current(
+            SandboxSetupState::NotConfigured,
+            "C:/state",
+            SandboxSetupComponents::default(),
+            Vec::new(),
+        );
+        assert_eq!(status.compatibility_error(), None);
+        assert!(!status.is_ready());
     }
 }

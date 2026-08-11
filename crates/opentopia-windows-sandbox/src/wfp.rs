@@ -5,12 +5,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
-    LocalFree, FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, FWP_E_NOT_FOUND, HANDLE, HLOCAL,
+    GetLastError, LocalFree, FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, FWP_E_NOT_FOUND,
+    FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE, HLOCAL,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmProviderAdd0,
-    FwpmSubLayerAdd0, FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
-    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID, FWPM_DISPLAY_DATA0, FWPM_FILTER0,
+    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmFilterGetByKey0,
+    FwpmFilterGetSecurityInfoByKey0, FwpmFilterSetSecurityInfoByKey0, FwpmFreeMemory0,
+    FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
+    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
+    FWPM_ACTION0_0, FWPM_ACTRL_READ, FWPM_CONDITION_ALE_USER_ID, FWPM_DISPLAY_DATA0, FWPM_FILTER0,
     FWPM_FILTER0_0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT,
     FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_PROVIDER0,
     FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_SESSION0, FWPM_SUBLAYER0, FWPM_SUBLAYER_FLAG_PERSISTENT,
@@ -18,9 +21,13 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_VALUE0,
 };
 use windows_sys::Win32::Security::Authorization::{
-    BuildExplicitAccessWithNameW, BuildSecurityDescriptorW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+    BuildExplicitAccessWithNameW, BuildSecurityDescriptorW, BuildTrusteeWithSidW, SetEntriesInAclW,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS,
 };
-use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+use windows_sys::Win32::Security::{
+    CreateWellKnownSid, WinBuiltinUsersSid, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SECURITY_MAX_SID_SIZE,
+};
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows_sys::Win32::System::Threading::INFINITE;
 
@@ -49,7 +56,135 @@ pub(crate) fn install_offline_filters(account: &str) -> Result<()> {
         FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         &user,
     )?;
+    transaction.commit()?;
+    // WFP objects inherit an administrator-only read ACL by default. Runtime
+    // health checks run without elevation, so grant the local Users group only
+    // the object-level read right after the transaction commits. WFP security
+    // descriptors cannot be changed from inside an explicit transaction.
+    grant_filter_read_access(engine.handle, &FILTER_V4_KEY)?;
+    grant_filter_read_access(engine.handle, &FILTER_V6_KEY)
+}
+
+pub(crate) fn offline_filters_installed() -> Result<bool> {
+    let engine = Engine::open()?;
+    Ok(filter_exists(engine.handle, &FILTER_V4_KEY)?
+        && filter_exists(engine.handle, &FILTER_V6_KEY)?)
+}
+
+pub(crate) fn remove_offline_filters() -> Result<()> {
+    let engine = Engine::open()?;
+    let transaction = Transaction::begin(&engine)?;
+    delete_filter_if_present(engine.handle, &FILTER_V4_KEY)?;
+    delete_filter_if_present(engine.handle, &FILTER_V6_KEY)?;
+    check_allowed(
+        unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &SUBLAYER_KEY) },
+        "FwpmSubLayerDeleteByKey0",
+        &[FWP_E_NOT_FOUND as u32, FWP_E_SUBLAYER_NOT_FOUND as u32],
+    )?;
+    check_allowed(
+        unsafe { FwpmProviderDeleteByKey0(engine.handle, &PROVIDER_KEY) },
+        "FwpmProviderDeleteByKey0",
+        &[FWP_E_NOT_FOUND as u32, FWP_E_PROVIDER_NOT_FOUND as u32],
+    )?;
     transaction.commit()
+}
+
+fn filter_exists(engine: HANDLE, key: &GUID) -> Result<bool> {
+    let mut filter: *mut FWPM_FILTER0 = null_mut();
+    let result = unsafe { FwpmFilterGetByKey0(engine, key, &mut filter) };
+    if result == FWP_E_FILTER_NOT_FOUND as u32 || result == FWP_E_NOT_FOUND as u32 {
+        return Ok(false);
+    }
+    check(result, "FwpmFilterGetByKey0")?;
+    if !filter.is_null() {
+        unsafe { FwpmFreeMemory0((&mut filter as *mut *mut FWPM_FILTER0).cast()) };
+    }
+    Ok(true)
+}
+
+fn grant_filter_read_access(engine: HANDLE, key: &GUID) -> Result<()> {
+    let mut existing_dacl: *mut ACL = null_mut();
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    check(
+        unsafe {
+            FwpmFilterGetSecurityInfoByKey0(
+                engine,
+                key,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut existing_dacl,
+                null_mut(),
+                &mut security_descriptor,
+            )
+        },
+        "FwpmFilterGetSecurityInfoByKey0",
+    )?;
+
+    let mut updated_dacl: *mut ACL = null_mut();
+    let result = (|| {
+        // A null DACL already allows all access and therefore needs no new ACE.
+        if existing_dacl.is_null() {
+            return Ok(());
+        }
+        let mut users_sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut users_sid_size = users_sid.len() as u32;
+        let created = unsafe {
+            CreateWellKnownSid(
+                WinBuiltinUsersSid,
+                null_mut(),
+                users_sid.as_mut_ptr().cast(),
+                &mut users_sid_size,
+            )
+        };
+        if created == 0 {
+            return Err(anyhow!(
+                "CreateWellKnownSid(WinBuiltinUsersSid) failed with Windows error {}",
+                unsafe { GetLastError() }
+            ));
+        }
+
+        let mut access: EXPLICIT_ACCESS_W = unsafe { zeroed() };
+        access.grfAccessPermissions = FWPM_ACTRL_READ;
+        access.grfAccessMode = GRANT_ACCESS;
+        unsafe {
+            BuildTrusteeWithSidW(&mut access.Trustee, users_sid.as_mut_ptr().cast());
+        }
+        check(
+            unsafe { SetEntriesInAclW(1, &access, existing_dacl, &mut updated_dacl) },
+            "SetEntriesInAclW(WFP read access)",
+        )?;
+        check(
+            unsafe {
+                FwpmFilterSetSecurityInfoByKey0(
+                    engine,
+                    key,
+                    DACL_SECURITY_INFORMATION,
+                    null(),
+                    null(),
+                    updated_dacl,
+                    null(),
+                )
+            },
+            "FwpmFilterSetSecurityInfoByKey0",
+        )
+    })();
+
+    if !updated_dacl.is_null() {
+        unsafe { LocalFree(updated_dacl as HLOCAL) };
+    }
+    if !security_descriptor.is_null() {
+        unsafe { FwpmFreeMemory0(&mut security_descriptor) };
+    }
+    result
+}
+
+fn delete_filter_if_present(engine: HANDLE, key: &GUID) -> Result<()> {
+    check_allowed(
+        unsafe { FwpmFilterDeleteByKey0(engine, key) },
+        "FwpmFilterDeleteByKey0",
+        &[FWP_E_FILTER_NOT_FOUND as u32, FWP_E_NOT_FOUND as u32],
+    )
 }
 
 struct Engine {

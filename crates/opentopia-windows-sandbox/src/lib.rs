@@ -1,7 +1,7 @@
 //! First-party Windows command sandbox used by OpenTopia.
 //!
 //! The executable deliberately accepts only a structured launch request with
-//! absolute policy paths. Its elevated backend uses dedicated offline/online users; its
+//! absolute policy paths. Its dedicated-user backend uses isolated offline/online users; its
 //! fallback uses a WRITE_RESTRICTED token and intentionally advertises only
 //! write containment. Both contain the target process tree in a kill-on-close
 //! Job Object.
@@ -28,7 +28,7 @@ enum NetworkMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum BackendMode {
     Auto,
-    Elevated,
+    DedicatedUser,
     Unelevated,
 }
 
@@ -73,7 +73,11 @@ pub fn run_from_env() -> Result<i32> {
     }
     #[cfg(windows)]
     if all_args.first().map(String::as_str) == Some("runner") {
-        return windows::run_elevated_runner(&all_args[1..]);
+        return windows::run_dedicated_user_runner(&all_args[1..]);
+    }
+    #[cfg(windows)]
+    if all_args.first().map(String::as_str) == Some("teardown") {
+        return setup::run_teardown(&all_args[1..]);
     }
     #[cfg(windows)]
     if all_args.first().map(String::as_str) == Some("cleanup") {
@@ -179,7 +183,7 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
             "--backend" => {
                 backend = match next_value("--backend", &mut args)?.as_str() {
                     "auto" => BackendMode::Auto,
-                    "elevated" => BackendMode::Elevated,
+                    "dedicated-user" | "dedicated_user" | "elevated" => BackendMode::DedicatedUser,
                     "unelevated" | "legacy" => BackendMode::Unelevated,
                     value => anyhow::bail!("unsupported Windows sandbox backend: {value}"),
                 };

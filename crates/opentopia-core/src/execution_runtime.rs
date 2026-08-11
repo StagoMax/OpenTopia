@@ -327,7 +327,8 @@ pub(crate) fn configure_command_environment(
             command.env("HOME", home);
             command.env("XDG_CONFIG_HOME", home.join(".config"));
             if !cfg!(windows)
-                || config.windows_backend == crate::sandbox::WindowsSandboxBackend::Elevated
+                || config.effective_windows_backend()
+                    == crate::sandbox::WindowsSandboxBackend::DedicatedUser
             {
                 command.env("USERPROFILE", home);
                 command.env("APPDATA", roaming);
@@ -336,7 +337,9 @@ pub(crate) fn configure_command_environment(
             command.env("TEMP", &temp);
             command.env("TMP", &temp);
             #[cfg(windows)]
-            if config.windows_backend == crate::sandbox::WindowsSandboxBackend::Elevated {
+            if config.effective_windows_backend()
+                == crate::sandbox::WindowsSandboxBackend::DedicatedUser
+            {
                 set_windows_home_parts(command, home);
             }
         }

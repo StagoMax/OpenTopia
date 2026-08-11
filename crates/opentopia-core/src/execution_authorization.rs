@@ -157,7 +157,7 @@ impl ExecutionGrant {
     ) -> anyhow::Result<Self> {
         let capabilities = SandboxBackendCapabilities::for_platform(
             OsSandboxPlatform::current(),
-            base.windows_backend,
+            base.effective_windows_backend(),
         );
         Self::resolve_with_capabilities(
             base,
