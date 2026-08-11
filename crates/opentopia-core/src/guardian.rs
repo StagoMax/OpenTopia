@@ -1,3 +1,6 @@
+use crate::model_context::{
+    ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity, ModelContextItem,
+};
 use crate::policy::{BasicPolicyEngine, PermissionMode, PolicyDecision, PolicyEngine};
 use crate::provider::{
     ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest, ModelUsage,
@@ -655,21 +658,42 @@ async fn run_review_model(
     let mut previous_response_items = Vec::new();
     let mut usage = ModelUsage::default();
     let mut tool_rounds = 0usize;
+    let guardian_prompt = guardian_policy_prompt();
+    let guardian_context = vec![
+        ModelContextItem::text(
+            ContextItemKind::BaseInstructions,
+            ContextRole::System,
+            "opentopia:guardian_policy",
+            guardian_prompt.clone(),
+            ContextCacheScope::Stable,
+            ContextSensitivity::Public,
+        ),
+        ModelContextItem::text(
+            ContextItemKind::DeveloperInstructions,
+            ContextRole::Developer,
+            "opentopia:guardian_review_contract",
+            "Perform one bounded guardian review using only the supplied read-only tools and the required structured output schema.",
+            ContextCacheScope::Stable,
+            ContextSensitivity::Public,
+        ),
+    ];
     for _ in 0..=GUARDIAN_MAX_TOOL_ROUNDS {
         let response = provider
             .complete(ModelRequest {
-                system_prompt: guardian_policy_prompt(),
+                system_prompt: guardian_prompt.clone(),
                 conversation: conversation.clone(),
                 user_message: user_message.clone(),
                 user_content: Vec::new(),
                 tool_candidates: guardian_read_only_tool_candidates(),
                 previous_tool_calls: previous_tool_calls.clone(),
                 tool_results: tool_results.clone(),
-                context_items: Vec::new(),
+                context_items: guardian_context.clone(),
                 previous_response_items: previous_response_items.clone(),
                 previous_response_id: None,
                 branch_developer_instructions: None,
                 prompt_cache_key: Some(format!("guardian-{thread_id}")),
+                prompt_cache_breakpoint_policy:
+                    crate::provider::PromptCacheBreakpointPolicy::StableOnly,
                 final_output_json_schema: Some(guardian_output_schema()),
             })
             .await?;
@@ -799,6 +823,7 @@ fn collect_guardian_transcript_entries(
             let kind = match message.role {
                 ModelConversationRole::User => GuardianTranscriptEntryKind::User,
                 ModelConversationRole::Assistant => GuardianTranscriptEntryKind::Assistant,
+                ModelConversationRole::Tool => GuardianTranscriptEntryKind::Tool,
                 ModelConversationRole::System => return None,
             };
             (!message.content.trim().is_empty()).then(|| GuardianTranscriptEntry {

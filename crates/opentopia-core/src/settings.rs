@@ -176,6 +176,35 @@ pub(crate) fn official_openai_tool_search_support(
     }
 }
 
+/// Explicit prompt-cache breakpoints and `prompt_cache_options` are an
+/// official OpenAI Responses capability starting with the GPT-5.6 family.
+/// Unknown relays stay on implicit caching until they expose a negotiated
+/// capability instead of receiving fields they may reject.
+pub(crate) fn official_openai_explicit_prompt_cache_support(
+    base_url: &str,
+    model: &str,
+) -> ProviderFeatureSupport {
+    let official_endpoint = base_url
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case("https://api.openai.com/v1");
+    let version = model.strip_prefix("gpt-").and_then(|suffix| {
+        let version = suffix
+            .split(|character: char| !character.is_ascii_digit() && character != '.')
+            .next()?;
+        let mut parts = version.split('.');
+        let major = parts.next()?.parse::<u32>().ok()?;
+        let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+        Some((major, minor))
+    });
+    if official_endpoint
+        && version.is_some_and(|(major, minor)| major > 5 || (major == 5 && minor >= 6))
+    {
+        ProviderFeatureSupport::Supported
+    } else {
+        ProviderFeatureSupport::Unknown
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelCapabilities {
@@ -1341,6 +1370,29 @@ fn env_path_list(name: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn explicit_prompt_cache_is_gated_to_official_gpt_5_6_or_later() {
+        assert_eq!(
+            official_openai_explicit_prompt_cache_support(
+                "https://api.openai.com/v1",
+                "gpt-5.6-sol"
+            ),
+            ProviderFeatureSupport::Supported
+        );
+        assert_eq!(
+            official_openai_explicit_prompt_cache_support("https://api.openai.com/v1/", "gpt-6"),
+            ProviderFeatureSupport::Supported
+        );
+        assert_eq!(
+            official_openai_explicit_prompt_cache_support("https://api.openai.com/v1", "gpt-5.4"),
+            ProviderFeatureSupport::Unknown
+        );
+        assert_eq!(
+            official_openai_explicit_prompt_cache_support("https://relay.example/v1", "gpt-5.6"),
+            ProviderFeatureSupport::Unknown
+        );
+    }
 
     #[test]
     fn enterprise_flow_is_enabled_by_default_and_can_be_disabled() {

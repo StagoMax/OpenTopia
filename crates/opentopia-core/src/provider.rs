@@ -1,12 +1,15 @@
 use crate::model::ModelContentPart;
+#[cfg(test)]
+use crate::model_context::ContextItemKind;
 use crate::model_context::{
-    estimate_tokens, CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole,
-    ModelContextItem, TokenEstimateBreakdown,
+    estimate_tokens, CompiledModelContext, ContextCacheScope, ContextRole, ModelContextItem,
+    TokenEstimateBreakdown,
 };
 use crate::settings::{
-    model_accepts_temperature, official_openai_tool_search_support, OpenAiCompatibilityReport,
-    OpenAiProtocol, PromptCachePolicy, ProviderFeatureSupport, ProviderHealthCheck, ProviderKind,
-    ProviderSettings, ProviderToolProtocolCapabilities,
+    model_accepts_temperature, official_openai_explicit_prompt_cache_support,
+    official_openai_tool_search_support, OpenAiCompatibilityReport, OpenAiProtocol,
+    PromptCachePolicy, ProviderFeatureSupport, ProviderHealthCheck, ProviderKind, ProviderSettings,
+    ProviderToolProtocolCapabilities,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -34,6 +37,7 @@ pub enum ModelConversationRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 /// Typed input content shared by user/history messages and tool results.
@@ -51,6 +55,17 @@ pub struct ModelConversationMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_parts: Vec<ModelInputContent>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheBreakpointPolicy {
+    /// One-shot/auxiliary calls may cache only the immutable instruction prefix.
+    #[default]
+    StableOnly,
+    /// Multi-turn agent calls also anchor every real user message as the
+    /// append-only ledger grows.
+    AppendOnlyUsers,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,12 +94,14 @@ pub struct ModelRequest {
     /// unknown or expired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
-    /// Branch-specific developer instructions are emitted after inherited
-    /// conversation history so sibling agents retain an identical prefix.
+    /// Legacy transport for branch-specific developer instructions. AgentCore
+    /// now materializes these in the thread lineage header before history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_output_json_schema: Option<Value>,
 }
@@ -2062,12 +2079,20 @@ impl OpenAiResponsesProvider {
             payload["prompt_cache_key"] = json!(prompt_cache_key);
         }
         match self.prompt_cache_policy {
-            Some(PromptCachePolicy::Explicit30m) => {
+            Some(PromptCachePolicy::Explicit30m)
+                if official_openai_explicit_prompt_cache_support(&self.base_url, &self.model)
+                    == ProviderFeatureSupport::Supported =>
+            {
                 payload["prompt_cache_options"] = json!({
                     "mode": "explicit",
                     "ttl": "30m",
                 });
                 add_responses_prompt_cache_breakpoint(&mut payload["input"], &request);
+            }
+            Some(PromptCachePolicy::Explicit30m) => {
+                // Older official models and unprobed compatible relays may
+                // reject explicit-only fields. Omitting them preserves the
+                // provider's implicit cache behavior without a failed call.
             }
             Some(PromptCachePolicy::LegacyInMemory) => {
                 payload["prompt_cache_retention"] = json!("in_memory");
@@ -3846,12 +3871,6 @@ fn openai_messages_with_reasoning(
 ) -> Vec<Value> {
     let mut messages = openai_instruction_messages(request);
 
-    messages.extend(request.conversation.iter().map(|message| {
-        json!({
-            "role": openai_conversation_role(message.role),
-            "content": openai_message_content(&message.content, &message.content_parts)
-        })
-    }));
     if let Some(instructions) = request
         .branch_developer_instructions
         .as_deref()
@@ -3862,6 +3881,13 @@ fn openai_messages_with_reasoning(
             "content": instructions,
         }));
     }
+
+    messages.extend(request.conversation.iter().map(|message| {
+        json!({
+            "role": openai_conversation_role(message.role),
+            "content": openai_message_content(&message.content, &message.content_parts)
+        })
+    }));
     messages.push(json!({
         "role": "user",
         "content": openai_message_content(&request.user_message, &request.user_content)
@@ -3885,12 +3911,6 @@ fn openai_compatibility_messages_with_reasoning(
         "role": "system",
         "content": &request.system_prompt
     })];
-    messages.extend(request.conversation.iter().map(|message| {
-        json!({
-            "role": openai_conversation_role(message.role),
-            "content": openai_message_content(&message.content, &message.content_parts)
-        })
-    }));
     if let Some(instructions) = request
         .branch_developer_instructions
         .as_deref()
@@ -3901,6 +3921,12 @@ fn openai_compatibility_messages_with_reasoning(
             "content": instructions,
         }));
     }
+    messages.extend(request.conversation.iter().map(|message| {
+        json!({
+            "role": openai_conversation_role(message.role),
+            "content": openai_message_content(&message.content, &message.content_parts)
+        })
+    }));
     messages.push(json!({
         "role": "user",
         "content": openai_message_content(&request.user_message, &request.user_content)
@@ -4042,7 +4068,7 @@ fn append_openai_tool_history(
 fn openai_conversation_role(role: ModelConversationRole) -> &'static str {
     match role {
         ModelConversationRole::System => "system",
-        ModelConversationRole::User => "user",
+        ModelConversationRole::User | ModelConversationRole::Tool => "user",
         ModelConversationRole::Assistant => "assistant",
     }
 }
@@ -4375,28 +4401,7 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
     let replay_full_prefix = request.previous_response_id.is_none();
     let mut input = Vec::new();
     if replay_full_prefix {
-        input.extend(
-            instruction_messages(request)
-                .into_iter()
-                .filter_map(|(role, content)| {
-                    (role == ContextRole::Developer).then(|| {
-                        json!({
-                            "role": "developer",
-                            "content": content,
-                        })
-                    })
-                }),
-        );
-        input.extend(request.conversation.iter().map(|message| {
-            json!({
-                "role": openai_conversation_role(message.role),
-                "content": responses_message_content(
-                    message.role,
-                    &message.content,
-                    &message.content_parts,
-                ),
-            })
-        }));
+        input.extend(responses_developer_messages(request, true));
         if let Some(instructions) = request
             .branch_developer_instructions
             .as_deref()
@@ -4407,6 +4412,16 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
                 "content": instructions,
             }));
         }
+        input.extend(request.conversation.iter().map(|message| {
+            json!({
+                "role": openai_conversation_role(message.role),
+                "content": responses_message_content(
+                    message.role,
+                    &message.content,
+                    &message.content_parts,
+                ),
+            })
+        }));
     }
     input.push(json!({
         "role": "user",
@@ -4416,6 +4431,11 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
             &request.user_content,
         ),
     }));
+
+    // Volatile turn/round context follows the user cache anchor. It remains
+    // visible to the model but cannot split the append-only history prefix on
+    // the next turn.
+    input.extend(responses_developer_messages(request, false));
 
     if request.previous_response_items.is_empty() {
         input.extend(request.previous_tool_calls.iter().map(|call| {
@@ -4453,6 +4473,29 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
     input
 }
 
+fn responses_developer_messages(request: &ModelRequest, lineage_prefix: bool) -> Vec<Value> {
+    if request.context_items.is_empty() {
+        return Vec::new();
+    }
+    CompiledModelContext {
+        items: request.context_items.clone(),
+        prompt_cache_key: request.prompt_cache_key.clone(),
+    }
+    .instruction_messages_with_scope()
+    .into_iter()
+    .filter_map(|(role, scope, content)| {
+        let belongs_to_prefix =
+            matches!(scope, ContextCacheScope::Stable | ContextCacheScope::Thread);
+        (role == ContextRole::Developer && belongs_to_prefix == lineage_prefix).then(|| {
+            json!({
+                "role": "developer",
+                "content": content,
+            })
+        })
+    })
+    .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponsesToolCallKind {
     Function,
@@ -4484,84 +4527,62 @@ fn add_responses_prompt_cache_breakpoint(input: &mut Value, request: &ModelReque
         return;
     }
 
-    let compiled = CompiledModelContext {
-        items: request.context_items.clone(),
-        prompt_cache_key: request.prompt_cache_key.clone(),
-    };
-    let breakpoint_index = compiled
-        .ordered_items()
-        .into_iter()
-        .filter(|item| {
-            item.role == ContextRole::Developer
-                && item.kind != ContextItemKind::Summary
-                && !item.text_content().trim().is_empty()
-        })
-        .enumerate()
-        .filter_map(|(index, item)| {
-            matches!(
-                item.cache_scope,
-                ContextCacheScope::Stable | ContextCacheScope::Thread
-            )
-            .then_some(index)
-        })
-        .last();
     let Some(items) = input.as_array_mut() else {
         return;
     };
+    let lineage_developer_count = if request.previous_response_id.is_none() {
+        responses_developer_messages(request, true).len()
+            + usize::from(
+                request
+                    .branch_developer_instructions
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+            )
+    } else {
+        0
+    };
     if request.previous_response_id.is_none() {
-        if let Some(index) = breakpoint_index {
+        if let Some(index) = lineage_developer_count.checked_sub(1) {
             if let Some(message) = items.get_mut(index) {
                 mark_responses_message_cache_breakpoint(message);
             }
         }
     }
 
+    if request.prompt_cache_breakpoint_policy == PromptCacheBreakpointPolicy::StableOnly {
+        return;
+    }
+
     let replay_full_prefix = request.previous_response_id.is_none();
-    let developer_count = if replay_full_prefix {
-        instruction_messages(request)
-            .into_iter()
-            .filter(|(role, _)| *role == ContextRole::Developer)
-            .count()
-    } else {
-        0
-    };
     let replayed_conversation_count = if replay_full_prefix {
         request.conversation.len()
     } else {
         0
     };
-    let has_branch_instructions = replay_full_prefix
-        && request
-            .branch_developer_instructions
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty());
-
-    if has_branch_instructions && replayed_conversation_count > 0 {
-        let inherited_prefix_end = developer_count + replayed_conversation_count - 1;
-        if let Some(message) = items.get_mut(inherited_prefix_end) {
-            mark_responses_message_cache_breakpoint(message);
+    if replay_full_prefix {
+        for (offset, message) in request.conversation.iter().enumerate() {
+            if message.role != ModelConversationRole::User {
+                continue;
+            }
+            if let Some(item) = items.get_mut(lineage_developer_count + offset) {
+                mark_responses_message_cache_breakpoint(item);
+            }
         }
     }
 
-    let current_user_index =
-        developer_count + replayed_conversation_count + usize::from(has_branch_instructions);
+    let current_user_index = lineage_developer_count + replayed_conversation_count;
     if let Some(message) = items.get_mut(current_user_index) {
         mark_responses_message_cache_breakpoint(message);
     }
 }
 
 fn mark_responses_message_cache_breakpoint(message: &mut Value) {
-    let content_type = if message.get("role").and_then(Value::as_str) == Some("assistant") {
-        "output_text"
-    } else {
-        "input_text"
-    };
     let Some(content) = message.get_mut("content") else {
         return;
     };
     if let Some(text) = content.as_str().map(str::to_string) {
         *content = json!([{
-            "type": content_type,
+            "type": "input_text",
             "text": text,
             "prompt_cache_breakpoint": { "mode": "explicit" },
         }]);
@@ -4573,7 +4594,7 @@ fn mark_responses_message_cache_breakpoint(message: &mut Value) {
     if let Some(part) = parts.iter_mut().rev().find(|part| {
         matches!(
             part.get("type").and_then(Value::as_str),
-            Some("input_text") | Some("output_text")
+            Some("input_text") | Some("input_image") | Some("input_file")
         )
     }) {
         part["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
@@ -6689,6 +6710,7 @@ fn codex_turn_input(
             ModelConversationRole::System => "System",
             ModelConversationRole::User => "User",
             ModelConversationRole::Assistant => "Assistant",
+            ModelConversationRole::Tool => "Tool",
         };
         let separator = if input.is_empty() { "" } else { "\n\n" };
         push_codex_input_text(
@@ -6898,6 +6920,7 @@ mod tests {
             previous_response_id: None,
             branch_developer_instructions: None,
             prompt_cache_key: None,
+            prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy::StableOnly,
             final_output_json_schema: None,
         }
     }
@@ -7132,6 +7155,7 @@ mod tests {
 
     fn layered_model_request() -> ModelRequest {
         let mut request = model_request();
+        request.prompt_cache_breakpoint_policy = PromptCacheBreakpointPolicy::AppendOnlyUsers;
         request.system_prompt = "legacy combined system and developer text".to_string();
         request.context_items = vec![
             ModelContextItem::text(
@@ -7553,19 +7577,19 @@ mod tests {
         let instructions = prepared.body["instructions"].as_str().unwrap();
         assert!(instructions.starts_with("base instructions"));
         assert!(instructions.contains(NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION));
-        assert_eq!(prepared.body["input"][0]["role"], "developer");
-        assert!(prepared.body["input"][0]["content"]
+        assert_eq!(prepared.body["input"][0]["role"], "user");
+        assert_eq!(prepared.body["input"][0]["content"], "current");
+        assert_eq!(prepared.body["input"][1]["role"], "developer");
+        assert!(prepared.body["input"][1]["content"]
             .as_str()
             .unwrap()
             .contains("developer environment"));
-        assert_eq!(prepared.body["input"][1]["role"], "user");
-        assert_eq!(prepared.body["input"][1]["content"], "current");
     }
 
     #[test]
     fn responses_explicit_cache_marks_last_reusable_developer_prefix() {
         let mut provider =
-            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.6");
         provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
         let mut request = layered_model_request();
         request.context_items.push(ModelContextItem::text(
@@ -7590,7 +7614,7 @@ mod tests {
             .unwrap()
             .contains("stable repository instructions"));
         assert_eq!(
-            prepared.body["input"][2]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            prepared.body["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
             "explicit"
         );
     }
@@ -7610,20 +7634,21 @@ mod tests {
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
 
         assert_eq!(prepared.body["previous_response_id"], "resp_parent");
-        assert_eq!(prepared.body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(prepared.body["input"].as_array().unwrap().len(), 2);
         assert!(!prepared.body["input"]
             .to_string()
             .contains("already stored"));
-        assert!(!prepared.body["input"]
+        assert!(prepared.body["input"]
             .to_string()
             .contains("developer environment"));
         assert_eq!(prepared.body["input"][0]["content"], "current");
+        assert_eq!(prepared.body["input"][1]["role"], "developer");
     }
 
     #[test]
     fn responses_branch_marks_inherited_history_as_a_shared_prefix() {
         let mut provider =
-            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.6");
         provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
         let mut request = layered_model_request();
         request.conversation = vec![ModelConversationMessage {
@@ -7635,13 +7660,22 @@ mod tests {
 
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
 
+        assert_eq!(prepared.body["input"][0]["role"], "developer");
+        assert!(prepared.body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("review this branch"));
         assert_eq!(prepared.body["input"][1]["role"], "user");
         assert_eq!(
             prepared.body["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
             "explicit"
         );
-        assert_eq!(prepared.body["input"][2]["role"], "developer");
-        assert_eq!(prepared.body["input"][3]["role"], "user");
+        assert_eq!(prepared.body["input"][2]["role"], "user");
+        assert_eq!(
+            prepared.body["input"][2]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(prepared.body["input"][3]["role"], "developer");
     }
 
     #[test]
@@ -7659,6 +7693,122 @@ mod tests {
             prepared.body["context_management"],
             json!([{"type": "compaction", "compact_threshold": 96_000}])
         );
+    }
+
+    #[test]
+    fn responses_omits_explicit_cache_fields_for_unsupported_models() {
+        let mut provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.4");
+        provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
+
+        let prepared = provider
+            .prepare(Uuid::nil(), layered_model_request())
+            .unwrap();
+
+        assert!(prepared.body.get("prompt_cache_options").is_none());
+        assert!(!prepared.body["input"]
+            .to_string()
+            .contains("prompt_cache_breakpoint"));
+    }
+
+    #[test]
+    fn responses_stable_only_policy_does_not_anchor_user_messages() {
+        let mut provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.6");
+        provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
+        let mut request = layered_model_request();
+        request.prompt_cache_breakpoint_policy = PromptCacheBreakpointPolicy::StableOnly;
+        request.context_items.push(ModelContextItem::text(
+            ContextItemKind::DeveloperInstructions,
+            ContextRole::Developer,
+            "one-shot-contract",
+            "stable one-shot contract",
+            ContextCacheScope::Stable,
+            crate::model_context::ContextSensitivity::Public,
+        ));
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        let input = prepared.body["input"].as_array().unwrap();
+        let stable = input
+            .iter()
+            .find(|item| {
+                item["content"]
+                    .to_string()
+                    .contains("stable one-shot contract")
+            })
+            .unwrap();
+        assert_eq!(
+            stable["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        let user = input.iter().find(|item| item["role"] == "user").unwrap();
+        assert!(!user["content"]
+            .to_string()
+            .contains("prompt_cache_breakpoint"));
+    }
+
+    #[test]
+    fn responses_append_only_user_prefix_survives_changing_turn_context() {
+        let mut provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.6");
+        provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
+
+        let mut first = layered_model_request();
+        first.context_items.push(ModelContextItem::text(
+            ContextItemKind::RepositoryInstructions,
+            ContextRole::Developer,
+            "AGENTS.md",
+            "lineage header",
+            ContextCacheScope::Thread,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
+        first.user_message = "U1".to_string();
+        let first = provider.prepare(Uuid::nil(), first).unwrap();
+
+        let mut second = layered_model_request();
+        second.context_items.push(ModelContextItem::text(
+            ContextItemKind::RepositoryInstructions,
+            ContextRole::Developer,
+            "AGENTS.md",
+            "lineage header",
+            ContextCacheScope::Thread,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
+        second.context_items.retain(|item| {
+            item.source != "opentopia:environment" || item.text_content() != "developer environment"
+        });
+        second.context_items.push(ModelContextItem::text(
+            ContextItemKind::Environment,
+            ContextRole::Developer,
+            "opentopia:environment",
+            "changed turn state",
+            ContextCacheScope::Turn,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
+        second.conversation = vec![
+            ModelConversationMessage {
+                role: ModelConversationRole::User,
+                content: "U1".to_string(),
+                content_parts: Vec::new(),
+            },
+            ModelConversationMessage {
+                role: ModelConversationRole::Assistant,
+                content: "A1".to_string(),
+                content_parts: Vec::new(),
+            },
+        ];
+        second.user_message = "U2".to_string();
+        let second = provider.prepare(Uuid::nil(), second).unwrap();
+
+        let first_input = first.body["input"].as_array().unwrap();
+        let second_input = second.body["input"].as_array().unwrap();
+        assert_eq!(&first_input[..=1], &second_input[..=1]);
+        assert!(first_input[2].to_string().contains("developer environment"));
+        assert!(second_input
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("changed turn state"));
     }
 
     #[test]
@@ -9520,7 +9670,7 @@ mod tests {
         assert_eq!(response.text, "replayed locally");
         assert_eq!(response.response_id.as_deref(), Some("resp_replayed"));
         assert_eq!(first["previous_response_id"], "resp_missing");
-        assert_eq!(first["input"].as_array().unwrap().len(), 1);
+        assert_eq!(first["input"].as_array().unwrap().len(), 2);
         assert!(second.get("previous_response_id").is_none());
         assert!(second["input"]
             .to_string()
@@ -10092,7 +10242,7 @@ mod tests {
     #[test]
     fn release_gate_cache_breakpoints_preserve_stable_prefix_and_user_tail() {
         let mut provider =
-            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.4");
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.6");
         provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
         let mut request = layered_model_request();
         request.context_items.push(ModelContextItem::text(
@@ -10103,11 +10253,18 @@ mod tests {
             ContextCacheScope::Stable,
             crate::model_context::ContextSensitivity::Workspace,
         ));
-        request.conversation = vec![ModelConversationMessage {
-            role: ModelConversationRole::Assistant,
-            content: "inherited answer".to_string(),
-            content_parts: Vec::new(),
-        }];
+        request.conversation = vec![
+            ModelConversationMessage {
+                role: ModelConversationRole::User,
+                content: "inherited request".to_string(),
+                content_parts: Vec::new(),
+            },
+            ModelConversationMessage {
+                role: ModelConversationRole::Assistant,
+                content: "inherited answer".to_string(),
+                content_parts: Vec::new(),
+            },
+        ];
         request.branch_developer_instructions = Some("branch instructions".to_string());
         request.user_message = "new user request".to_string();
 
@@ -10115,9 +10272,13 @@ mod tests {
             .prepare(Uuid::nil(), request)
             .expect("cache payload");
         let input = prepared.body["input"].as_array().expect("Responses input");
-        assert_eq!(input.last().unwrap()["role"], "user");
+        let current_user = input
+            .iter()
+            .find(|item| item["content"].to_string().contains("new user request"))
+            .expect("current user message");
+        assert_eq!(current_user["role"], "user");
         assert_eq!(
-            input.last().unwrap()["content"][0]["prompt_cache_breakpoint"]["mode"],
+            current_user["content"][0]["prompt_cache_breakpoint"]["mode"],
             "explicit"
         );
         assert!(input.iter().any(|item| {
@@ -10125,19 +10286,29 @@ mod tests {
                 parts.iter().any(|part| {
                     part["text"]
                         .as_str()
-                        .is_some_and(|text| text.contains("stable repository instructions"))
+                        .is_some_and(|text| text.contains("branch instructions"))
                         && part["prompt_cache_breakpoint"]["mode"] == "explicit"
                 })
             })
         }));
-        let inherited = input
+        let inherited_user = input
+            .iter()
+            .find(|item| item["content"].to_string().contains("inherited request"))
+            .expect("inherited user message");
+        assert_eq!(
+            inherited_user["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        let inherited_assistant = input
             .iter()
             .find(|item| item["role"] == "assistant")
             .expect("inherited assistant message");
-        assert_eq!(
-            inherited["content"][0]["prompt_cache_breakpoint"]["mode"],
-            "explicit"
-        );
+        assert!(inherited_assistant["content"]
+            .to_string()
+            .contains("inherited answer"));
+        assert!(!inherited_assistant["content"]
+            .to_string()
+            .contains("prompt_cache_breakpoint"));
     }
 
     #[test]

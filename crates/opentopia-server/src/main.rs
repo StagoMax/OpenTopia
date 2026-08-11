@@ -2374,6 +2374,9 @@ async fn summarize_thread_title(
         .map(|temperature| temperature.min(0.2));
     provider_settings.max_output_tokens =
         Some(provider_settings.max_output_tokens.unwrap_or(64).min(64));
+    // The title prompt is too short to justify an explicit cache write. Keep
+    // this one-shot path out of the append-only user-anchor policy.
+    provider_settings.prompt_cache_policy = None;
     let provider = configured_provider_from_settings(&provider_settings).ok_or_else(|| {
         ApiError::bad_request(format!(
             "provider '{}' has no configured API key",
@@ -2395,6 +2398,8 @@ async fn summarize_thread_title(
         previous_response_id: None,
         branch_developer_instructions: None,
         prompt_cache_key: None,
+        prompt_cache_breakpoint_policy:
+            opentopia_core::PromptCacheBreakpointPolicy::StableOnly,
         final_output_json_schema: None,
     };
     let response = timeout(Duration::from_secs(45), provider.complete(request))
@@ -8065,8 +8070,8 @@ async fn build_turn_model_context(
     let active = selected_provider;
     let agent_cache_identity = match (bound_agent_instance, bound_agent_template) {
         (Some(instance), Some(template)) => format!(
-            "{}:{}:{}:{}",
-            instance.id, template.content_hash, instance.state_revision, instance.template_version
+            "{}:{}:{}",
+            instance.id, template.content_hash, instance.template_version
         ),
         _ => "unbound".to_string(),
     };
@@ -8476,22 +8481,19 @@ fn model_conversation_message(message: &Message) -> Option<ModelConversationMess
         MessageRole::User => ModelConversationRole::User,
         MessageRole::Assistant => ModelConversationRole::Assistant,
         MessageRole::System => ModelConversationRole::System,
-        // Cross-turn tool records are observations, never instructions. The
-        // generic conversation contract has no tool role with a stable call ID,
-        // so replay them at user priority while preserving typed content below.
-        MessageRole::Tool => ModelConversationRole::User,
+        // Cross-turn tool records are observations, never user instructions.
+        // Keep the distinction in the provider-neutral ledger even when an
+        // adapter must lower the item to a provider's user-role wire shape.
+        MessageRole::Tool => ModelConversationRole::Tool,
     };
     let mut content = if message.role == MessageRole::User {
-        truncate_chars(
-            &model_user_message_with_attachment_manifest(message, ""),
-            24_000,
-        )
+        model_user_message_with_attachment_manifest(message, "")
     } else {
         message
             .parts
             .iter()
             .filter_map(|part| match part {
-                MessagePart::Text { text } => Some(truncate_chars(text, 24_000)),
+                MessagePart::Text { text } => Some(text.clone()),
                 MessagePart::ToolCall { call } => Some(format!(
                     "Tool call `{}` with input {}",
                     call.name, call.input
@@ -8501,7 +8503,7 @@ fn model_conversation_message(message: &Message) -> Option<ModelConversationMess
                         .map(|value| format!(" Artifact reference: {value}."))
                         .unwrap_or_default();
                     Some(format!(
-                        "Tool result for call {} follows as a bounded historical observation.{artifact}",
+                        "Tool result for call {} follows as its ingress-normalized historical observation.{artifact}",
                         result.call_id
                     ))
                 }
@@ -8695,7 +8697,10 @@ fn message_model_content_parts(part: &MessagePart) -> Vec<ModelContentPart> {
         MessagePart::Image {
             content_type, data, ..
         } => vec![ModelContentPart::image(content_type.clone(), data.clone())],
-        MessagePart::ToolResult { result } => bounded_historical_tool_content(result),
+        // Tool output is normalized once, before the first model sees it.
+        // Historical replay must use that immutable envelope verbatim; a
+        // second tail-bounding pass would silently create a different ledger.
+        MessagePart::ToolResult { result } => result.content_or_legacy_text(),
         MessagePart::SourceRef { source } => vec![ModelContentPart::resource(
             source.path.to_string_lossy(),
             Some(source.content_type.clone()),
@@ -8703,51 +8708,6 @@ fn message_model_content_parts(part: &MessagePart) -> Vec<ModelContentPart> {
         )],
         _ => Vec::new(),
     }
-}
-
-fn bounded_historical_tool_content(result: &ToolResult) -> Vec<ModelContentPart> {
-    const MAX_TOOL_RESULT_CHARS: usize = 8_000;
-    let mut remaining = MAX_TOOL_RESULT_CHARS;
-    let mut bounded = Vec::new();
-    for part in result.content_or_legacy_text() {
-        if remaining == 0 {
-            break;
-        }
-        match part {
-            ModelContentPart::Text { text } => {
-                let excerpt = truncate_chars(&text, remaining);
-                remaining = remaining.saturating_sub(excerpt.chars().count());
-                bounded.push(ModelContentPart::text(excerpt));
-            }
-            ModelContentPart::Json { value } => {
-                let rendered = value.to_string();
-                if rendered.chars().count() <= remaining {
-                    remaining = remaining.saturating_sub(rendered.chars().count());
-                    bounded.push(ModelContentPart::json(value));
-                } else {
-                    let excerpt = truncate_chars(&rendered, remaining);
-                    remaining = 0;
-                    bounded.push(ModelContentPart::text(format!(
-                        "Truncated JSON tool output: {excerpt}"
-                    )));
-                }
-            }
-            ModelContentPart::Image { .. } => bounded.push(ModelContentPart::text(
-                "Historical image tool output omitted; reopen the artifact if needed.",
-            )),
-            ModelContentPart::Resource {
-                uri,
-                content_type,
-                name,
-            } => bounded.push(ModelContentPart::resource(uri, content_type, name)),
-        }
-    }
-    if let Some(reference) = historical_tool_artifact_reference(&result.metadata) {
-        bounded.push(ModelContentPart::text(format!(
-            "Full output reference: {reference}"
-        )));
-    }
-    bounded
 }
 
 fn historical_tool_artifact_reference(metadata: &Value) -> Option<String> {
@@ -9383,12 +9343,16 @@ async fn generate_context_summary(
     previous_summary_override: Option<&ContextSummary>,
 ) -> Result<ContextSummary, ApiError> {
     let settings = current_settings(state);
-    let active = settings.active_provider().clone();
+    let mut active = settings.active_provider().clone();
     if active.kind == ProviderKind::Mock {
         return Err(ApiError::bad_request(
             "real context summarization requires an OpenAI-compatible provider",
         ));
     }
+    // Compaction is an exceptional one-shot boundary; the resulting
+    // checkpoint starts a new agent cache lineage instead of caching this
+    // summarizer's changing input.
+    active.prompt_cache_policy = None;
     let provider = configured_provider_from_settings(&active).ok_or_else(|| {
         ApiError::bad_request(format!(
             "provider '{}' has no configured API key",
@@ -9419,6 +9383,7 @@ async fn generate_context_summary(
         previous_response_id: None,
         branch_developer_instructions: None,
         prompt_cache_key: None,
+        prompt_cache_breakpoint_policy: opentopia_core::PromptCacheBreakpointPolicy::StableOnly,
         final_output_json_schema: Some(context_checkpoint_schema()),
     };
     let request_id = Uuid::new_v4();
@@ -12702,7 +12667,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_tail_keeps_complete_turns_and_bounds_historical_tools() {
+    fn recent_tail_keeps_complete_turns_and_replays_ingressed_tools_verbatim() {
         let thread_id = Uuid::new_v4();
         let messages = vec![
             Message::text(thread_id, MessageRole::User, "old ".repeat(200)),
@@ -12721,8 +12686,10 @@ mod tests {
             content: Vec::new(),
             metadata: json!({ "artifactId": "artifact-123" }),
         };
-        let bounded = bounded_historical_tool_content(&result);
-        let rendered = bounded
+        let replayed = message_model_content_parts(&MessagePart::ToolResult {
+            result: result.clone(),
+        });
+        let rendered = replayed
             .iter()
             .map(|part| match part {
                 ModelContentPart::Text { text } => text.clone(),
@@ -12730,8 +12697,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("artifact-123"));
-        assert!(rendered.len() < result.output.len());
+        assert_eq!(rendered, result.output);
     }
 
     #[test]
@@ -13016,7 +12982,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_tool_history_replays_as_untrusted_user_observation() {
+    fn persisted_tool_history_replays_as_untrusted_tool_observation() {
         let thread_id = Uuid::new_v4();
         let call = ToolCall::new("read_file", json!({"path": "README.md"}));
         let result = ToolResult::text(call.id, "file contents", json!({}));
@@ -13032,7 +12998,7 @@ mod tests {
         };
 
         let replay = model_conversation_message(&message).expect("tool history replays");
-        assert_eq!(replay.role, ModelConversationRole::User);
+        assert_eq!(replay.role, ModelConversationRole::Tool);
         assert!(replay.content.starts_with("Untrusted tool observation"));
         assert_eq!(replay.content_parts.len(), 1);
     }

@@ -230,9 +230,10 @@ pub use provider::{
     CodexLoginStart, IncompleteReason, MockProvider, ModelConversationMessage,
     ModelConversationRole, ModelDecision, ModelFinishReason, ModelInputContent, ModelProvider,
     ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider,
-    OpenAiResponsesProvider, PreparedProviderRequest, ProviderDriverDescriptor,
-    ProviderDriverRegistry, ProviderDriverTrust, ProviderToolCall, ProviderToolCandidate,
-    ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
+    OpenAiResponsesProvider, PreparedProviderRequest, PromptCacheBreakpointPolicy,
+    ProviderDriverDescriptor, ProviderDriverRegistry, ProviderDriverTrust, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
+    ProviderTransportEvent,
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,

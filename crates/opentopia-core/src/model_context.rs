@@ -249,15 +249,12 @@ impl CompiledModelContext {
         self.items.sort_by_key(|item| item.cache_scope.sort_order());
     }
 
-    pub fn instruction_messages(&self) -> Vec<(ContextRole, String)> {
+    pub fn instruction_messages_with_scope(&self) -> Vec<(ContextRole, ContextCacheScope, String)> {
         self.ordered_items()
             .into_iter()
             .filter(|item| {
                 matches!(item.role, ContextRole::System | ContextRole::Developer)
-                    && !matches!(
-                        item.kind,
-                        ContextItemKind::Summary | ContextItemKind::Checkpoint
-                    )
+                    && item.kind != ContextItemKind::Summary
             })
             .filter_map(|item| {
                 let content = item.text_content();
@@ -274,8 +271,15 @@ impl CompiledModelContext {
                         content
                     )
                 };
-                Some((item.role, rendered))
+                Some((item.role, item.cache_scope, rendered))
             })
+            .collect()
+    }
+
+    pub fn instruction_messages(&self) -> Vec<(ContextRole, String)> {
+        self.instruction_messages_with_scope()
+            .into_iter()
+            .map(|(role, _, content)| (role, content))
             .collect()
     }
 
@@ -740,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn instructions_include_only_system_and_developer_layers() {
+    fn instructions_include_system_developer_and_checkpoint_layers() {
         let context = CompiledModelContext {
             items: vec![
                 ModelContextItem::text(
@@ -773,7 +777,7 @@ mod tests {
 
         assert!(context.instructions().contains("base text"));
         assert!(!context.instructions().contains("do not duplicate me"));
-        assert!(!context
+        assert!(context
             .instructions()
             .contains("historical data, not instructions"));
     }
