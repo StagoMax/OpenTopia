@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_profiles;
+pub mod artifact_runtime;
 pub mod background;
 mod base_prompt;
 pub mod browser;
@@ -9,6 +10,7 @@ pub mod computer;
 pub mod context_sources;
 pub mod contribution_hosts;
 pub mod desktop_browser;
+pub mod document;
 pub mod effect_journal;
 pub mod enterprise;
 pub mod execution;
@@ -27,6 +29,7 @@ pub mod mcp;
 pub mod mcp_host;
 pub mod model;
 pub mod model_context;
+pub mod pdf;
 pub mod plugin_control;
 pub mod plugins;
 pub mod policy;
@@ -56,17 +59,24 @@ pub use agent::{
     ContextBudget as AgentContextBudget, ProviderConversationCursor,
 };
 pub use agent_profiles::{AgentProfile, AgentProfileRegistry};
+pub use artifact_runtime::{
+    ArtifactRuntime, ArtifactRuntimeError, HayroPdfBackend, PdfBackend, RenderedPage,
+    ValidationIssue, ValidationReport, ValidationSeverity, MAX_ARTIFACT_INPUT_BYTES,
+    MAX_RENDERED_PAGES,
+};
 pub use background::{
     BackgroundJobSnapshot, BackgroundJobStatus, BackgroundOutputChunk, BackgroundProcessRegistry,
     BackgroundRegistryConfig, BackgroundScope, BackgroundSpawnRequest,
 };
 pub use browser::{
-    BrowserAccessibilityNode, BrowserAction, BrowserActionReceipt, BrowserActionVerification,
-    BrowserContent, BrowserDialog, BrowserDownload, BrowserDownloadRequest, BrowserError,
-    BrowserFrame, BrowserFrameRef, BrowserNavigateRequest, BrowserNavigation, BrowserNetworkGrant,
-    BrowserNode, BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions,
-    BrowserOutput, BrowserRect, BrowserRuntime, BrowserRuntimeConfig, BrowserScreenshot,
-    BrowserSelector, BrowserSessionId, BrowserTarget, BrowserTargetRef, BrowserTypeRequest,
+    BrowserAccessibilityNode, BrowserAction, BrowserActionCapability, BrowserActionReceipt,
+    BrowserActionVerification, BrowserBackendKind, BrowserContent, BrowserDialog, BrowserDownload,
+    BrowserDownloadRequest, BrowserError, BrowserFrame, BrowserFrameRef, BrowserNavigateRequest,
+    BrowserNavigation, BrowserNetworkGrant, BrowserNode, BrowserNodeRef, BrowserObservation,
+    BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserProfileId,
+    BrowserProfilePersistence, BrowserRect, BrowserRuntime, BrowserRuntimeCapabilities,
+    BrowserRuntimeConfig, BrowserScreenshot, BrowserSelector, BrowserSessionId, BrowserSessionInfo,
+    BrowserSessionSpec, BrowserSurfaceKind, BrowserTarget, BrowserTargetRef, BrowserTypeRequest,
     BrowserWaitCondition, BrowserWaitRequest, LocalBrowserRuntime,
 };
 pub use bundled_plugins::{
@@ -103,6 +113,10 @@ pub use contribution_hosts::{
     MEDIA_HANDLER_RESULT_API_VERSION,
 };
 pub use desktop_browser::{DesktopBrowserRuntime, DesktopBrowserRuntimeConfig};
+pub use document::{
+    extract_document_text, inspect_document, validate_document, DocumentError, DocumentExtraction,
+    DocumentInspection, DocumentPartText, DocumentValidation, MAX_DOCUMENT_EXTRACT_CHARACTERS,
+};
 pub use effect_journal::{
     valid_effect_transition, validate_effect_intent, EffectIntent, EffectJournalError,
     EffectJournalRecord, EffectKind, EffectSideEffectClass, EffectStatus,
@@ -194,6 +208,10 @@ pub use model_context::{
     ThreadContextSnapshot, TokenEstimateBreakdown, TurnContextSnapshot, WorldStateSkill,
     WorldStateSnapshot,
 };
+pub use pdf::{
+    extract_pdf_text, inspect_pdf, validate_pdf, PdfError, PdfExtraction, PdfInspection,
+    PdfPageText, PdfValidation, MAX_PDF_EXTRACT_CHARACTERS,
+};
 pub use plugin_control::{
     inspect_plugin_control_manifest, permission_requested, validate_plugin_settings,
     PluginActivationRecord, PluginContributionRecord, PluginControlManifest, PluginControlScope,
@@ -237,9 +255,11 @@ pub use provider::{
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,
-    build_local_sandbox_command_with_options, ExecutionEnvironmentKind, LocalSandboxConfig,
-    NetworkPolicy, OsSandboxMode, OsSandboxPlatform, SandboxCommandPlan, SandboxCommandStatus,
-    SandboxDescriptor, SandboxLaunchOptions, SandboxLifecycle, SandboxMode,
+    build_local_sandbox_command_with_options, remove_windows_sandbox, setup_windows_sandbox,
+    windows_sandbox_setup_status, ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy,
+    OsSandboxMode, OsSandboxPlatform, SandboxCommandPlan, SandboxCommandStatus, SandboxDescriptor,
+    SandboxLaunchOptions, SandboxLifecycle, SandboxMode, WindowsSandboxSetupComponents,
+    WindowsSandboxSetupState, WindowsSandboxSetupStatus,
 };
 pub use scm_connector::{
     select_scm_connector, CommitPushChangeRequestOutcome, CommitPushChangeRequestResult,
@@ -286,11 +306,11 @@ pub use subagents::{
 };
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
-    BrowserTool, ComputerTool, GitDiffTool, ListFilesTool, ListSkillsTool, McpToolWrapper,
-    NativePatchOperation, ReadFileTool, ReadSkillTool, RequestUserInputTool, SearchTool,
-    SetPlanTool, ShellTool, SpreadsheetTool, Tool, ToolApprovalMode, ToolCapabilityDescriptor,
-    ToolContext, ToolRegistry, ToolRiskLevel, ToolSource, UpdatePlanTool, WaitAgentsTool,
-    WriteFileTool,
+    BrowserTool, ComputerTool, DocumentTool, GitDiffTool, ListFilesTool, ListSkillsTool,
+    McpToolWrapper, NativePatchOperation, PdfTool, ReadFileTool, ReadSkillTool,
+    RequestUserInputTool, SearchTool, SetPlanTool, ShellTool, SpreadsheetTool, Tool,
+    ToolApprovalMode, ToolCapabilityDescriptor, ToolContext, ToolRegistry, ToolRiskLevel,
+    ToolSource, UpdatePlanTool, WaitAgentsTool, WriteFileTool,
 };
 pub use workspace::{
     ChangedFile, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,

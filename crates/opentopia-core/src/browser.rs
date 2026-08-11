@@ -10,7 +10,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::de::{SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -77,6 +77,192 @@ impl fmt::Display for BrowserSessionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+const DEFAULT_BROWSER_PROFILE_ID: &str = "default";
+const MAX_BROWSER_PROFILE_ID_LEN: usize = 64;
+
+/// A stable, filesystem- and partition-safe browser profile identifier.
+///
+/// Profile IDs are product-level identities, not Chromium directory names. Each backend derives
+/// its own storage location from this value and must never accept a caller-provided path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct BrowserProfileId(String);
+
+impl BrowserProfileId {
+    pub fn new(value: impl Into<String>) -> Result<Self, BrowserError> {
+        let value = value.into();
+        let mut chars = value.chars();
+        let valid = value.len() <= MAX_BROWSER_PROFILE_ID_LEN
+            && chars
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+            && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+            });
+        if !valid {
+            return Err(BrowserError::InvalidProfileId(value));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for BrowserProfileId {
+    fn default() -> Self {
+        Self(DEFAULT_BROWSER_PROFILE_ID.to_string())
+    }
+}
+
+impl fmt::Display for BrowserProfileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl<'de> Deserialize<'de> for BrowserProfileId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserProfilePersistence {
+    Persistent,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserBackendKind {
+    LocalChrome,
+    Electron,
+    ChromeExtension,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserSurfaceKind {
+    Headless,
+    ExternalWindow,
+    Embedded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserActionCapability {
+    Navigate,
+    Observe,
+    SwitchTarget,
+    Click,
+    Type,
+    Select,
+    Hover,
+    Scroll,
+    Screenshot,
+    Wait,
+    Download,
+}
+
+/// Capabilities are explicit because an attached personal Chrome tab cannot honestly promise the
+/// same isolation properties as a managed Electron or local Chrome profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserRuntimeCapabilities {
+    pub protocol_version: u32,
+    pub backend: BrowserBackendKind,
+    pub surface: BrowserSurfaceKind,
+    pub profile_persistence: Vec<BrowserProfilePersistence>,
+    pub actions: Vec<BrowserActionCapability>,
+    pub hard_network_isolation: bool,
+    pub supports_user_handoff: bool,
+    pub supports_external_profile: bool,
+}
+
+impl BrowserRuntimeCapabilities {
+    pub(crate) fn managed(
+        backend: BrowserBackendKind,
+        surface: BrowserSurfaceKind,
+        supports_user_handoff: bool,
+    ) -> Self {
+        Self {
+            protocol_version: 1,
+            backend,
+            surface,
+            profile_persistence: vec![
+                BrowserProfilePersistence::Persistent,
+                BrowserProfilePersistence::Ephemeral,
+            ],
+            actions: vec![
+                BrowserActionCapability::Navigate,
+                BrowserActionCapability::Observe,
+                BrowserActionCapability::SwitchTarget,
+                BrowserActionCapability::Click,
+                BrowserActionCapability::Type,
+                BrowserActionCapability::Select,
+                BrowserActionCapability::Hover,
+                BrowserActionCapability::Scroll,
+                BrowserActionCapability::Screenshot,
+                BrowserActionCapability::Wait,
+                BrowserActionCapability::Download,
+            ],
+            hard_network_isolation: true,
+            supports_user_handoff,
+            supports_external_profile: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSessionSpec {
+    pub session_id: BrowserSessionId,
+    #[serde(default)]
+    pub profile_id: BrowserProfileId,
+    pub profile_persistence: BrowserProfilePersistence,
+}
+
+impl BrowserSessionSpec {
+    pub fn persistent(session_id: BrowserSessionId, profile_id: BrowserProfileId) -> Self {
+        Self {
+            session_id,
+            profile_id,
+            profile_persistence: BrowserProfilePersistence::Persistent,
+        }
+    }
+
+    pub fn ephemeral(session_id: BrowserSessionId) -> Self {
+        Self {
+            session_id,
+            profile_id: BrowserProfileId::new(format!("session-{session_id}"))
+                .expect("UUID-derived browser profile IDs are valid"),
+            profile_persistence: BrowserProfilePersistence::Ephemeral,
+        }
+    }
+}
+
+impl From<BrowserSessionId> for BrowserSessionSpec {
+    fn from(session_id: BrowserSessionId) -> Self {
+        Self::persistent(session_id, BrowserProfileId::default())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSessionInfo {
+    pub session_id: BrowserSessionId,
+    pub profile_id: BrowserProfileId,
+    pub profile_persistence: BrowserProfilePersistence,
+    pub backend: BrowserBackendKind,
 }
 
 /// A capability grant applied at the browser driver boundary. Hosts are exact, normalized DNS
@@ -567,6 +753,10 @@ pub enum BrowserError {
     ExecutableMissing(PathBuf),
     #[error("Browser session was not found: {0}")]
     SessionNotFound(BrowserSessionId),
+    #[error("Invalid browser profile ID: {0}")]
+    InvalidProfileId(String),
+    #[error("Browser session {session} is already bound to a different profile")]
+    SessionProfileConflict { session: BrowserSessionId },
     #[error("Invalid browser URL: {0}")]
     InvalidUrl(String),
     #[error("Invalid browser network grant: {0}")]
@@ -620,6 +810,11 @@ pub enum BrowserError {
 /// references. This trait also makes server-side policy wrappers straightforward to mock in tests.
 #[async_trait]
 pub trait BrowserRuntime: Send + Sync {
+    fn capabilities(&self) -> BrowserRuntimeCapabilities;
+    async fn create_session(
+        &self,
+        spec: BrowserSessionSpec,
+    ) -> Result<BrowserSessionInfo, BrowserError>;
     async fn grant_network_access(
         &self,
         session: BrowserSessionId,
@@ -674,8 +869,24 @@ pub trait BrowserRuntime: Send + Sync {
 pub struct LocalBrowserRuntime {
     config: Arc<BrowserRuntimeConfig>,
     sessions: Arc<Mutex<HashMap<BrowserSessionId, Arc<Mutex<LocalBrowserSession>>>>>,
+    session_specs: Arc<Mutex<HashMap<BrowserSessionId, BrowserSessionSpec>>>,
     network_grants: Arc<Mutex<HashMap<BrowserSessionId, BrowserNetworkGrant>>>,
-    process: Arc<Mutex<Option<Arc<Mutex<LocalBrowserProcess>>>>>,
+    processes: Arc<Mutex<HashMap<BrowserProfileKey, Arc<Mutex<LocalBrowserProcess>>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BrowserProfileKey {
+    profile_id: BrowserProfileId,
+    profile_persistence: BrowserProfilePersistence,
+}
+
+impl From<&BrowserSessionSpec> for BrowserProfileKey {
+    fn from(spec: &BrowserSessionSpec) -> Self {
+        Self {
+            profile_id: spec.profile_id.clone(),
+            profile_persistence: spec.profile_persistence,
+        }
+    }
 }
 
 impl LocalBrowserRuntime {
@@ -683,8 +894,9 @@ impl LocalBrowserRuntime {
         Self {
             config: Arc::new(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_specs: Arc::new(Mutex::new(HashMap::new())),
             network_grants: Arc::new(Mutex::new(HashMap::new())),
-            process: Arc::new(Mutex::new(None)),
+            processes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -705,8 +917,33 @@ impl LocalBrowserRuntime {
             sessions.remove(&session_id);
         }
 
-        let process = self.process().await?;
-        let started = LocalBrowserSession::start(self.config.clone(), process).await?;
+        let (spec, inserted_spec) = {
+            let mut specs = self.session_specs.lock().await;
+            if let Some(spec) = specs.get(&session_id) {
+                (spec.clone(), false)
+            } else {
+                let spec = BrowserSessionSpec::from(session_id);
+                specs.insert(session_id, spec.clone());
+                (spec, true)
+            }
+        };
+        let started = async {
+            let process = self.process(&spec).await?;
+            LocalBrowserSession::start(self.config.clone(), process).await
+        }
+        .await;
+        let started = match started {
+            Ok(started) => started,
+            Err(error) => {
+                if inserted_spec {
+                    let mut specs = self.session_specs.lock().await;
+                    if specs.get(&session_id) == Some(&spec) {
+                        specs.remove(&session_id);
+                    }
+                }
+                return Err(error);
+            }
+        };
         if let Some(grant) = self.network_grants.lock().await.get(&session_id).cloned() {
             started.page.grant_network_access(grant)?;
         }
@@ -715,18 +952,22 @@ impl LocalBrowserRuntime {
         Ok(session)
     }
 
-    async fn process(&self) -> Result<Arc<Mutex<LocalBrowserProcess>>, BrowserError> {
-        let mut process = self.process.lock().await;
-        if let Some(existing) = process.as_ref().cloned() {
+    async fn process(
+        &self,
+        spec: &BrowserSessionSpec,
+    ) -> Result<Arc<Mutex<LocalBrowserProcess>>, BrowserError> {
+        let profile_key = BrowserProfileKey::from(spec);
+        let mut processes = self.processes.lock().await;
+        if let Some(existing) = processes.get(&profile_key).cloned() {
             if existing.lock().await.child.try_wait()?.is_none() {
                 return Ok(existing);
             }
-            *process = None;
+            processes.remove(&profile_key);
         }
         let started = Arc::new(Mutex::new(
-            LocalBrowserProcess::start(self.config.clone()).await?,
+            LocalBrowserProcess::start(self.config.clone(), spec).await?,
         ));
-        *process = Some(started.clone());
+        processes.insert(profile_key, started.clone());
         Ok(started)
     }
 
@@ -751,6 +992,53 @@ impl LocalBrowserRuntime {
 
 #[async_trait]
 impl BrowserRuntime for LocalBrowserRuntime {
+    fn capabilities(&self) -> BrowserRuntimeCapabilities {
+        BrowserRuntimeCapabilities::managed(
+            BrowserBackendKind::LocalChrome,
+            if self.config.headless {
+                BrowserSurfaceKind::Headless
+            } else {
+                BrowserSurfaceKind::ExternalWindow
+            },
+            false,
+        )
+    }
+
+    async fn create_session(
+        &self,
+        spec: BrowserSessionSpec,
+    ) -> Result<BrowserSessionInfo, BrowserError> {
+        let mut inserted = false;
+        {
+            let mut specs = self.session_specs.lock().await;
+            if let Some(existing) = specs.get(&spec.session_id) {
+                if existing != &spec {
+                    return Err(BrowserError::SessionProfileConflict {
+                        session: spec.session_id,
+                    });
+                }
+            } else {
+                specs.insert(spec.session_id, spec.clone());
+                inserted = true;
+            }
+        }
+        if let Err(error) = self.session(spec.session_id).await {
+            if inserted {
+                let mut specs = self.session_specs.lock().await;
+                if specs.get(&spec.session_id) == Some(&spec) {
+                    specs.remove(&spec.session_id);
+                }
+            }
+            return Err(error);
+        }
+        Ok(BrowserSessionInfo {
+            session_id: spec.session_id,
+            profile_id: spec.profile_id,
+            profile_persistence: spec.profile_persistence,
+            backend: BrowserBackendKind::LocalChrome,
+        })
+    }
+
     async fn grant_network_access(
         &self,
         session: BrowserSessionId,
@@ -853,14 +1141,44 @@ impl BrowserRuntime for LocalBrowserRuntime {
         let Some(session) = session else {
             return Err(BrowserError::SessionNotFound(session_id));
         };
+        let spec = self.session_specs.lock().await.remove(&session_id);
         self.network_grants.lock().await.remove(&session_id);
 
         {
             let mut session = session.lock().await;
             session.shutdown().await?;
         }
+        if let Some(spec) =
+            spec.filter(|spec| spec.profile_persistence == BrowserProfilePersistence::Ephemeral)
+        {
+            let profile_still_used = self.session_specs.lock().await.values().any(|candidate| {
+                candidate.profile_id == spec.profile_id
+                    && candidate.profile_persistence == spec.profile_persistence
+            });
+            if !profile_still_used {
+                let process = self
+                    .processes
+                    .lock()
+                    .await
+                    .remove(&BrowserProfileKey::from(&spec));
+                if let Some(process) = process {
+                    process.lock().await.shutdown().await?;
+                }
+                let storage_root = browser_profile_storage_root(&self.config, &spec);
+                if storage_root.exists() {
+                    tokio::fs::remove_dir_all(storage_root).await?;
+                }
+            }
+        }
         if !self.config.retain_session_data && self.sessions.lock().await.is_empty() {
-            if let Some(process) = self.process.lock().await.take() {
+            let processes = self
+                .processes
+                .lock()
+                .await
+                .drain()
+                .map(|(_, process)| process)
+                .collect::<Vec<_>>();
+            for process in processes {
                 process.lock().await.shutdown().await?;
             }
             if self.config.data_root.exists() {
@@ -877,11 +1195,34 @@ struct LocalBrowserProcess {
     download_dir: PathBuf,
 }
 
+fn browser_profile_storage_root(
+    config: &BrowserRuntimeConfig,
+    spec: &BrowserSessionSpec,
+) -> PathBuf {
+    if spec.profile_id.as_str() == DEFAULT_BROWSER_PROFILE_ID
+        && spec.profile_persistence == BrowserProfilePersistence::Persistent
+    {
+        return config.data_root.clone();
+    }
+    let persistence_directory = match spec.profile_persistence {
+        BrowserProfilePersistence::Persistent => "profiles",
+        BrowserProfilePersistence::Ephemeral => "ephemeral",
+    };
+    config
+        .data_root
+        .join(persistence_directory)
+        .join(spec.profile_id.as_str())
+}
+
 impl LocalBrowserProcess {
-    async fn start(config: Arc<BrowserRuntimeConfig>) -> Result<Self, BrowserError> {
+    async fn start(
+        config: Arc<BrowserRuntimeConfig>,
+        spec: &BrowserSessionSpec,
+    ) -> Result<Self, BrowserError> {
         let executable = discover_browser_executable(config.executable.as_deref())?;
-        let profile_dir = config.data_root.join("profile");
-        let download_dir = config.data_root.join("downloads");
+        let storage_root = browser_profile_storage_root(&config, spec);
+        let profile_dir = storage_root.join("profile");
+        let download_dir = storage_root.join("downloads");
         tokio::fs::create_dir_all(&profile_dir).await?;
         tokio::fs::create_dir_all(&download_dir).await?;
 
@@ -3268,6 +3609,61 @@ mod tests {
     }
 
     #[test]
+    fn browser_profile_ids_are_safe_and_serde_validated() {
+        let profile = BrowserProfileId::new("team.release_1").unwrap();
+        assert_eq!(profile.as_str(), "team.release_1");
+        for invalid in ["", "-leading", "contains:colon", "contains/slash"] {
+            assert!(matches!(
+                BrowserProfileId::new(invalid),
+                Err(BrowserError::InvalidProfileId(_))
+            ));
+            assert!(serde_json::from_value::<BrowserProfileId>(json!(invalid)).is_err());
+        }
+        assert!(BrowserProfileId::new("a".repeat(MAX_BROWSER_PROFILE_ID_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn browser_profile_storage_preserves_legacy_default_and_isolates_named_profiles() {
+        let config = BrowserRuntimeConfig {
+            data_root: PathBuf::from("browser-data"),
+            ..BrowserRuntimeConfig::default()
+        };
+        let session = BrowserSessionId::new();
+        let default_spec = BrowserSessionSpec::from(session);
+        assert_eq!(
+            browser_profile_storage_root(&config, &default_spec),
+            PathBuf::from("browser-data")
+        );
+
+        let named = BrowserSessionSpec::persistent(session, BrowserProfileId::new("work").unwrap());
+        assert_eq!(
+            browser_profile_storage_root(&config, &named),
+            PathBuf::from("browser-data").join("profiles").join("work")
+        );
+        let ephemeral = BrowserSessionSpec {
+            profile_persistence: BrowserProfilePersistence::Ephemeral,
+            ..named
+        };
+        assert_eq!(
+            browser_profile_storage_root(&config, &ephemeral),
+            PathBuf::from("browser-data").join("ephemeral").join("work")
+        );
+    }
+
+    #[test]
+    fn local_runtime_advertises_managed_backend_guarantees() {
+        let runtime = LocalBrowserRuntime::new(BrowserRuntimeConfig::default());
+        let capabilities = runtime.capabilities();
+        assert_eq!(capabilities.backend, BrowserBackendKind::LocalChrome);
+        assert_eq!(capabilities.surface, BrowserSurfaceKind::Headless);
+        assert!(capabilities.hard_network_isolation);
+        assert!(!capabilities.supports_external_profile);
+        assert!(capabilities
+            .profile_persistence
+            .contains(&BrowserProfilePersistence::Ephemeral));
+    }
+
+    #[test]
     fn url_validation_is_scheme_bounded() {
         let runtime = LocalBrowserRuntime::new(BrowserRuntimeConfig::default());
         assert!(runtime.validate_url("https://example.com/a").is_ok());
@@ -3603,12 +3999,32 @@ mod tests {
         });
 
         let mut config = BrowserRuntimeConfig::default();
-        config.data_root =
+        let data_root =
             std::env::temp_dir().join(format!("opentopia-browser-test-{}", Uuid::new_v4()));
+        config.data_root = data_root.clone();
         config.startup_timeout = Duration::from_secs(20);
         config.max_download_bytes = 1024;
         let runtime = LocalBrowserRuntime::new(config);
         let session = BrowserSessionId::new();
+        let spec = BrowserSessionSpec {
+            session_id: session,
+            profile_id: BrowserProfileId::new("runtime-smoke").unwrap(),
+            profile_persistence: BrowserProfilePersistence::Ephemeral,
+        };
+        let ephemeral_root = data_root.join("ephemeral").join("runtime-smoke");
+        let info = runtime.create_session(spec).await.unwrap();
+        assert_eq!(
+            info.profile_persistence,
+            BrowserProfilePersistence::Ephemeral
+        );
+        let conflict = runtime
+            .create_session(BrowserSessionSpec::from(session))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            BrowserError::SessionProfileConflict { session: conflicted } if conflicted == session
+        ));
         let url = format!("http://{address}/");
 
         runtime
@@ -3824,6 +4240,7 @@ mod tests {
             .any(|dialog| { dialog.message == "fixture dialog" && dialog.handled }));
 
         runtime.close_session(session).await.unwrap();
+        assert!(!ephemeral_root.exists());
         server.abort();
     }
 }

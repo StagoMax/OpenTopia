@@ -8,6 +8,7 @@ use crate::provider::{
 };
 use crate::sandbox::LocalSandboxConfig;
 use crate::shell_analysis::analyze_shell_command;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -709,12 +710,15 @@ async fn run_review_model(
         }
         tool_rounds = tool_rounds.saturating_add(1);
         previous_response_items.extend(response.provider_items);
-        for call in response.tool_calls {
-            let result =
-                execute_guardian_read_only_tool(&call, workspace_root, sandbox_config).await;
-            previous_tool_calls.push(call);
-            tool_results.push(result);
-        }
+        let calls = response.tool_calls;
+        let results = join_all(
+            calls
+                .iter()
+                .map(|call| execute_guardian_read_only_tool(call, workspace_root, sandbox_config)),
+        )
+        .await;
+        previous_tool_calls.extend(calls);
+        tool_results.extend(results);
     }
     anyhow::bail!("guardian exceeded its read-only tool-call budget")
 }
@@ -1527,6 +1531,72 @@ mod tests {
         assert!(requests[1].tool_results[0]
             .output
             .contains("bounded evidence"));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn reviewer_returns_parallel_read_results_in_provider_order() {
+        let workspace =
+            std::env::temp_dir().join(format!("guardian-parallel-evidence-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("first.txt"), "first evidence").unwrap();
+        std::fs::write(workspace.join("second.txt"), "second evidence").unwrap();
+        let reviewer = Arc::new(ScriptedReviewer::new(vec![
+            Ok(ModelResponse {
+                text: String::new(),
+                tool_calls: vec![
+                    ProviderToolCall {
+                        id: "guardian-read-first".to_string(),
+                        name: "guardian_read_file".to_string(),
+                        arguments: json!({ "path": "first.txt" }),
+                    },
+                    ProviderToolCall {
+                        id: "guardian-read-second".to_string(),
+                        name: "guardian_read_file".to_string(),
+                        arguments: json!({ "path": "second.txt" }),
+                    },
+                ],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: crate::provider::ModelFinishReason::ToolCalls,
+            }),
+            Ok(ModelResponse::text(r#"{"outcome":"allow"}"#)),
+        ]));
+        let manager = GuardianReviewSessionManager::new(reviewer.clone());
+        let sandbox = LocalSandboxConfig::default();
+        let result = manager
+            .review(
+                &request(Uuid::new_v4()),
+                GuardianReviewContext {
+                    conversation: &[],
+                    current_user_message: "Inspect both files before deciding.",
+                    tool_calls: &[],
+                    tool_results: &[],
+                    workspace_root: &workspace,
+                    sandbox_config: &sandbox,
+                },
+                None,
+            )
+            .await;
+
+        assert_eq!(result.status, GuardianReviewStatus::Approved);
+        let requests = reviewer.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]
+                .tool_results
+                .iter()
+                .map(|result| result.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["guardian-read-first", "guardian-read-second"]
+        );
+        assert!(requests[1].tool_results[0]
+            .output
+            .contains("first evidence"));
+        assert!(requests[1].tool_results[1]
+            .output
+            .contains("second evidence"));
         let _ = std::fs::remove_dir_all(workspace);
     }
 

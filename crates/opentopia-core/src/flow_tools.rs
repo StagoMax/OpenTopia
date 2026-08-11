@@ -330,35 +330,65 @@ impl Tool for FlowTool {
     }
 
     fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
-        let draft_key = call
-            .input
-            .get("draftId")
-            .and_then(Value::as_str)
-            .unwrap_or("current");
+        let resource = |kind: &str, field: &str, fallback: &str| {
+            let value = call
+                .input
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or(fallback)
+                .trim()
+                .replace('\\', "/");
+            format!("{kind}:{value}")
+        };
         match self.action {
-            FlowToolAction::Search | FlowToolAction::Inspect | FlowToolAction::Status => {
-                ToolExecutionPolicy::read_only(vec![format!("flow:{draft_key}")])
+            FlowToolAction::Search => {
+                ToolExecutionPolicy::read_only(vec!["flows:catalog".to_string()])
+            }
+            FlowToolAction::Inspect => ToolExecutionPolicy::read_only(vec![if call
+                .input
+                .get("flowId")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                resource("flow-definition", "flowId", "current")
+            } else {
+                resource("flow-draft", "draftId", "current")
+            }]),
+            FlowToolAction::Status => {
+                ToolExecutionPolicy::read_only(vec![resource("flow-run", "runId", "current")])
             }
             FlowToolAction::Validate | FlowToolAction::Simulate => ToolExecutionPolicy {
                 read_only: false,
                 idempotent: false,
-                parallel_safe: false,
+                parallel_safe: true,
                 side_effect: ToolSideEffect::SessionMutation,
-                resource_keys: vec![format!("flow:{draft_key}")],
+                resource_keys: vec![resource("flow-draft", "draftId", "current")],
             },
-            FlowToolAction::Create
-            | FlowToolAction::Update
-            | FlowToolAction::Publish
-            | FlowToolAction::Run
-            | FlowToolAction::Pause
-            | FlowToolAction::Resume
-            | FlowToolAction::Cancel => ToolExecutionPolicy {
+            FlowToolAction::Create | FlowToolAction::Update | FlowToolAction::Publish => {
+                ToolExecutionPolicy {
+                    read_only: false,
+                    idempotent: false,
+                    parallel_safe: true,
+                    side_effect: ToolSideEffect::ControlPlane,
+                    resource_keys: vec![resource("flow-draft", "draftId", "current")],
+                }
+            }
+            FlowToolAction::Run => ToolExecutionPolicy {
                 read_only: false,
                 idempotent: false,
-                parallel_safe: false,
+                parallel_safe: true,
                 side_effect: ToolSideEffect::ControlPlane,
-                resource_keys: vec![format!("flow:{draft_key}")],
+                resource_keys: vec![resource("flow-definition", "flowId", "current")],
             },
+            FlowToolAction::Pause | FlowToolAction::Resume | FlowToolAction::Cancel => {
+                ToolExecutionPolicy {
+                    read_only: false,
+                    idempotent: false,
+                    parallel_safe: true,
+                    side_effect: ToolSideEffect::ControlPlane,
+                    resource_keys: vec![resource("flow-run", "runId", "current")],
+                }
+            }
         }
     }
 
@@ -617,4 +647,50 @@ fn run_id_schema() -> Value {
         "required": ["runId"],
         "properties": {"runId": {"type": "string", "format": "uuid"}}
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_policies_scope_mutations_to_their_draft_or_run() {
+        let first_draft = Uuid::new_v4();
+        let second_draft = Uuid::new_v4();
+        let validate = FlowTool {
+            action: FlowToolAction::Validate,
+        }
+        .execution_policy(&ToolCall::new(
+            "flow_validate",
+            json!({ "draftId": first_draft }),
+        ));
+        let simulate = FlowTool {
+            action: FlowToolAction::Simulate,
+        }
+        .execution_policy(&ToolCall::new(
+            "flow_simulate",
+            json!({ "draftId": second_draft }),
+        ));
+        assert!(validate.parallel_safe);
+        assert!(simulate.parallel_safe);
+        assert!(!validate.read_only);
+        assert_ne!(validate.resource_keys, simulate.resource_keys);
+        assert_eq!(
+            validate.resource_keys,
+            vec![format!("flow-draft:{first_draft}")]
+        );
+
+        let run_id = Uuid::new_v4();
+        let pause = FlowTool {
+            action: FlowToolAction::Pause,
+        }
+        .execution_policy(&ToolCall::new("flow_pause", json!({ "runId": run_id })));
+        let cancel = FlowTool {
+            action: FlowToolAction::Cancel,
+        }
+        .execution_policy(&ToolCall::new("flow_cancel", json!({ "runId": run_id })));
+        assert!(pause.parallel_safe);
+        assert_eq!(pause.resource_keys, cancel.resource_keys);
+        assert_eq!(pause.resource_keys, vec![format!("flow-run:{run_id}")]);
+    }
 }

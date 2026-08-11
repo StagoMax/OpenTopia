@@ -1727,6 +1727,12 @@ pub enum AgentEventPayload {
         request_id: Uuid,
         round: usize,
         attempt: usize,
+        #[serde(default)]
+        retry_kind: ProviderRetryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_limit: Option<usize>,
         reason: String,
         #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
@@ -1893,6 +1899,14 @@ pub enum ModelCallPurpose {
     GuardianReview,
     TitleGeneration,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRetryKind {
+    #[default]
+    Compatibility,
+    Network,
 }
 
 impl AgentEventPayload {

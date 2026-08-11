@@ -6,6 +6,8 @@
 
 mod browser_automation;
 mod computer_use;
+mod documents;
+mod pdf;
 mod spreadsheet;
 
 use crate::plugins::PluginError;
@@ -75,6 +77,8 @@ struct BundledPluginReceipt {
 }
 
 const PACKAGES: &[BundledPluginPackage] = &[
+    pdf::PACKAGE,
+    documents::PACKAGE,
     spreadsheet::PACKAGE,
     browser_automation::PACKAGE,
     computer_use::PACKAGE,

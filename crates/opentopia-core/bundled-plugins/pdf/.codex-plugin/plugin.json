@@ -1,0 +1,48 @@
+{
+  "name": "pdf",
+  "version": "1.0.0",
+  "description": "Inspect, extract, render, and validate PDF files through OpenTopia's native artifact runtime.",
+  "author": {
+    "name": "OpenTopia Contributors"
+  },
+  "interface": {
+    "displayName": "PDF",
+    "shortDescription": "Inspect and render PDF files safely.",
+    "longDescription": "Inspect PDF structure, extract bounded page text, render pages as PNG artifacts, and validate files through OpenTopia's protected host services.",
+    "developerName": "OpenTopia",
+    "category": "Productivity",
+    "defaultPrompt": "Use the PDF tool when the task requires deterministic PDF inspection, extraction, rendering, or validation.",
+    "capabilities": [
+      "PDF inspection",
+      "Bounded text extraction",
+      "Page rendering",
+      "Structural validation"
+    ]
+  },
+  "opentopia": {
+    "apiVersion": "1",
+    "requires": {
+      "hostCapabilities": [
+        "workspace.files.v1",
+        "artifact.runtime.v1",
+        "nativeTool.pdf.v1"
+      ]
+    },
+    "permissions": {
+      "filesystem": [
+        "workspace:read"
+      ],
+      "network": [],
+      "secrets": [],
+      "desktop": []
+    },
+    "contributes": {
+      "nativeTools": [
+        {
+          "id": "pdf",
+          "runtime": "builtin:pdf"
+        }
+      ]
+    }
+  }
+}

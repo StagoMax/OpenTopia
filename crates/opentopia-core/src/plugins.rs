@@ -1124,7 +1124,10 @@ mod tests {
     fn discovers_verified_bundled_plugins_as_native_capabilities() {
         let dir = TestDir::new();
         let outcomes = ensure_bundled_plugins_installed(&dir.0).unwrap();
-        assert_eq!(outcomes.len(), 3);
+        assert_eq!(
+            outcomes.len(),
+            crate::bundled_plugins::bundled_plugin_catalog().count()
+        );
 
         for metadata in crate::bundled_plugins::bundled_plugin_catalog() {
             let manifest = dir.0.join(metadata.name).join(MANIFEST_RELATIVE_PATH);

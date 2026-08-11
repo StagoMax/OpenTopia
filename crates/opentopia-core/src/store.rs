@@ -5542,6 +5542,9 @@ fn conversation_payload_json(
             request_id,
             round,
             attempt,
+            retry_kind,
+            retry_index,
+            retry_limit,
             reason,
             ..
         } => serde_json::json!({
@@ -5549,6 +5552,9 @@ fn conversation_payload_json(
             "request_id": request_id,
             "round": round,
             "attempt": attempt,
+            "retry_kind": retry_kind,
+            "retry_index": retry_index,
+            "retry_limit": retry_limit,
             "reason": reason,
         }),
         AgentEventPayload::ProviderResponseReceived {
@@ -6561,6 +6567,39 @@ mod tests {
             }
             payload => panic!("unexpected payload: {payload:?}"),
         }
+    }
+
+    #[test]
+    fn conversation_retry_event_preserves_reconnect_progress() {
+        let request_id = Uuid::new_v4();
+        let payload = AgentEventPayload::ProviderRequestRetried {
+            request_id,
+            round: 2,
+            attempt: 4,
+            retry_kind: crate::model::ProviderRetryKind::Network,
+            retry_index: Some(3),
+            retry_limit: Some(5),
+            reason: "connection reset".to_string(),
+            body: serde_json::json!({"secret": "removed"}),
+        };
+        let full = serde_json::to_string(&payload).expect("serialize full payload");
+        let compact = conversation_payload_json(&payload, &full)
+            .expect("project conversation payload")
+            .expect("retry event remains visible");
+        let projected: AgentEventPayload =
+            serde_json::from_str(&compact).expect("deserialize projected retry payload");
+
+        assert!(matches!(
+            projected,
+            AgentEventPayload::ProviderRequestRetried {
+                request_id: projected_request_id,
+                retry_kind: crate::model::ProviderRetryKind::Network,
+                retry_index: Some(3),
+                retry_limit: Some(5),
+                body,
+                ..
+            } if projected_request_id == request_id && body.is_null()
+        ));
     }
 
     #[test]

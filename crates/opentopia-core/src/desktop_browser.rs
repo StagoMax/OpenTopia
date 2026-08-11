@@ -5,10 +5,11 @@
 //! Electron's `WebContentsView` to operate on the same session.
 
 use crate::{
-    BrowserAction, BrowserActionReceipt, BrowserDownloadRequest, BrowserError,
+    BrowserAction, BrowserActionReceipt, BrowserBackendKind, BrowserDownloadRequest, BrowserError,
     BrowserNavigateRequest, BrowserNetworkGrant, BrowserNode, BrowserNodeRef, BrowserObservation,
-    BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserRuntime, BrowserSessionId,
-    BrowserTargetRef, BrowserWaitCondition, BrowserWaitRequest,
+    BrowserObservationId, BrowserObserveOptions, BrowserOutput, BrowserRuntime,
+    BrowserRuntimeCapabilities, BrowserSessionId, BrowserSessionInfo, BrowserSessionSpec,
+    BrowserSurfaceKind, BrowserTargetRef, BrowserWaitCondition, BrowserWaitRequest,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -193,6 +194,27 @@ impl DesktopBrowserRuntime {
 
 #[async_trait]
 impl BrowserRuntime for DesktopBrowserRuntime {
+    fn capabilities(&self) -> BrowserRuntimeCapabilities {
+        BrowserRuntimeCapabilities::managed(
+            BrowserBackendKind::Electron,
+            BrowserSurfaceKind::Embedded,
+            true,
+        )
+    }
+
+    async fn create_session(
+        &self,
+        spec: BrowserSessionSpec,
+    ) -> Result<BrowserSessionInfo, BrowserError> {
+        self.execute(BrokerCreateSessionRequest {
+            session_id: spec.session_id,
+            action: "create_session",
+            profile_id: spec.profile_id,
+            profile_persistence: spec.profile_persistence,
+        })
+        .await
+    }
+
     async fn grant_network_access(
         &self,
         session: BrowserSessionId,
@@ -437,6 +459,15 @@ enum BrokerOperation {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BrokerCreateSessionRequest {
+    session_id: BrowserSessionId,
+    action: &'static str,
+    profile_id: crate::BrowserProfileId,
+    profile_persistence: crate::BrowserProfilePersistence,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BrokerRequest {
     session_id: BrowserSessionId,
     action: BrokerAction,
@@ -671,7 +702,7 @@ fn network_blocked_host(body: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BrowserSelector;
+    use crate::{BrowserProfileId, BrowserProfilePersistence, BrowserSelector};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -769,6 +800,39 @@ mod tests {
             DesktopBrowserRuntime::new("http://user:secret@127.0.0.1:3100", "token"),
             Err(BrowserError::BrokerConfiguration(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn explicit_session_creation_binds_a_validated_profile() {
+        let session = BrowserSessionId::new();
+        let profile = BrowserProfileId::new("release-smoke").unwrap();
+        let body = serde_json::to_vec(&json!({
+            "sessionId": session,
+            "profileId": profile,
+            "profilePersistence": "ephemeral",
+            "backend": "electron"
+        }))
+        .unwrap();
+        let (base_url, captured) = spawn_broker(200, body, Duration::ZERO).await;
+        let runtime = DesktopBrowserRuntime::new(&base_url, "test-token").unwrap();
+        let spec = BrowserSessionSpec {
+            session_id: session,
+            profile_id: BrowserProfileId::new("release-smoke").unwrap(),
+            profile_persistence: BrowserProfilePersistence::Ephemeral,
+        };
+
+        let info = runtime.create_session(spec).await.unwrap();
+        assert_eq!(info.backend, BrowserBackendKind::Electron);
+        assert_eq!(info.profile_id.as_str(), "release-smoke");
+        let payload: Value = serde_json::from_slice(&captured.await.unwrap().body).unwrap();
+        assert_eq!(payload["action"], "create_session");
+        assert_eq!(payload["profileId"], "release-smoke");
+        assert_eq!(payload["profilePersistence"], "ephemeral");
+
+        let capabilities = runtime.capabilities();
+        assert_eq!(capabilities.surface, BrowserSurfaceKind::Embedded);
+        assert!(capabilities.supports_user_handoff);
+        assert!(capabilities.hard_network_isolation);
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use crate::agent_profiles::AgentProfileRegistry;
+use crate::artifact_runtime::ArtifactRuntime;
 use crate::background::{
     BackgroundProcessRegistry, BackgroundScope, BackgroundSessionSpawnRequest,
     BackgroundSpawnRequest,
@@ -93,6 +94,8 @@ pub struct ToolContext {
     pub agent_path: String,
     pub browser: Option<Arc<dyn BrowserRuntime>>,
     pub computer: Option<Arc<dyn ComputerRuntime>>,
+    /// Shared host runtime for deterministic Office parsing, conversion, and rendering.
+    pub artifact_runtime: Arc<ArtifactRuntime>,
     /// MCP tools activated for this thread. Attachment analysis may route image bytes only to
     /// this bounded set, never to an arbitrary or merely cached server.
     pub mcp_host: Option<McpExtensionHost>,
@@ -149,6 +152,7 @@ impl ToolContext {
             agent_path: "/root".to_string(),
             browser: None,
             computer: None,
+            artifact_runtime: ArtifactRuntime::shared(),
             mcp_host: None,
             mcp_tools: Vec::new(),
             model_supports_vision: true,
@@ -184,6 +188,7 @@ impl ToolContext {
             agent_path: "/root".to_string(),
             browser: None,
             computer: None,
+            artifact_runtime: ArtifactRuntime::shared(),
             mcp_host: None,
             mcp_tools: Vec::new(),
             model_supports_vision: true,
@@ -435,6 +440,9 @@ macro_rules! impl_typed_tool {
     };
 }
 
+mod office_tools;
+pub use office_tools::{DocumentTool, PdfTool};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSideEffect {
@@ -606,6 +614,8 @@ impl ToolRegistry {
                 let tool: Arc<dyn Tool> = match *capability {
                     "browser" => Arc::new(BrowserTool),
                     "computer" => Arc::new(ComputerTool),
+                    "document" => Arc::new(DocumentTool),
+                    "pdf" => Arc::new(PdfTool),
                     "spreadsheet" => Arc::new(SpreadsheetTool),
                     _ => continue,
                 };
@@ -698,7 +708,7 @@ fn tool_governance_metadata(
     match name {
         "list_files" | "read_attachment" | "read_file" | "read_files" | "search" | "git_diff"
         | "background_output" | "list_agents" | "wait_agent" | "wait_agents" | "list_skills"
-        | "read_skill" | "flow_search" | "flow_inspect" => (
+        | "read_skill" | "flow_search" | "flow_inspect" | "pdf" => (
             ToolRiskLevel::Low,
             vec![ToolSideEffect::None],
             ToolApprovalMode::PolicyControlled,
@@ -718,6 +728,12 @@ fn tool_governance_metadata(
         ),
         "shell" => (
             ToolRiskLevel::High,
+            vec![ToolSideEffect::Process],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Restricted,
+        ),
+        "document" => (
+            ToolRiskLevel::Medium,
             vec![ToolSideEffect::Process],
             ToolApprovalMode::PolicyControlled,
             DataClassification::Restricted,
@@ -821,6 +837,39 @@ impl TypedTool for SpreadsheetTool {
 
     fn description(&self) -> &str {
         "Inspect, list, read, create, or update bounded XLSX workbooks. Uses zero-based row and column coordinates; writes preserve values, formulas, sheet order, and visibility but not formatting or embedded workbook objects."
+    }
+
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        match input.action {
+            SpreadsheetToolAction::Inspect
+            | SpreadsheetToolAction::ListSheets
+            | SpreadsheetToolAction::ReadRange => {
+                ToolExecutionPolicy::read_only(vec![tool_resource_key(
+                    "file",
+                    input.path.as_deref().unwrap_or("*"),
+                )])
+            }
+            SpreadsheetToolAction::Write => {
+                let mut resource_keys = input
+                    .source_path
+                    .iter()
+                    .chain(input.output_path.iter())
+                    .map(|path| tool_resource_key("file", path))
+                    .collect::<Vec<_>>();
+                resource_keys.sort();
+                resource_keys.dedup();
+                if resource_keys.is_empty() {
+                    resource_keys.push("*".to_string());
+                }
+                ToolExecutionPolicy {
+                    read_only: false,
+                    idempotent: false,
+                    parallel_safe: true,
+                    side_effect: ToolSideEffect::WorkspaceWrite,
+                    resource_keys,
+                }
+            }
+        }
     }
 
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
@@ -2609,6 +2658,10 @@ impl TypedTool for ListSkillsTool {
         "List available capability instructions (Skills) without loading their instructions."
     }
 
+    fn execution_policy(&self, _input: &Self::Input) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec!["skills:catalog".to_string()])
+    }
+
     async fn execute_typed(
         &self,
         call_id: Uuid,
@@ -2663,6 +2716,10 @@ impl TypedTool for ReadSkillTool {
 
     fn description(&self) -> &str {
         "Read one Skill's instructions after deciding it is relevant to the current task. Returns at most 64 KB per call; when the result reports a next offset, call again with that offset to read the rest."
+    }
+
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec![tool_resource_key("skill", &input.id)])
     }
 
     async fn execute_typed(
@@ -3926,6 +3983,24 @@ impl TypedTool for SpawnAgentTool {
         "Create an independently running child agent. The harness can keep read-only work shared or prepare an isolated Git worktree for an independent writer; the parent remains responsible for selecting and integrating results."
     }
 
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        let resource_keys = if matches!(
+            input.workspace_mode,
+            SubagentWorkspaceModeInput::IsolatedWorktree
+        ) {
+            vec!["git:index-and-worktree".to_string()]
+        } else {
+            vec![tool_resource_key("agent-name", &input.task_name)]
+        };
+        ToolExecutionPolicy {
+            read_only: false,
+            idempotent: false,
+            parallel_safe: true,
+            side_effect: ToolSideEffect::ControlPlane,
+            resource_keys,
+        }
+    }
+
     async fn execute_typed(
         &self,
         call_id: Uuid,
@@ -4150,6 +4225,21 @@ struct AgentRunMessageInput {
     input: String,
 }
 
+fn agent_control_policy(target: &str) -> ToolExecutionPolicy {
+    let resource_keys = if target.trim().is_empty() {
+        vec!["*".to_string()]
+    } else {
+        vec![tool_resource_key("agent", target)]
+    };
+    ToolExecutionPolicy {
+        read_only: false,
+        idempotent: false,
+        parallel_safe: true,
+        side_effect: ToolSideEffect::ControlPlane,
+        resource_keys,
+    }
+}
+
 pub struct SendAgentMessageTool;
 
 #[async_trait]
@@ -4162,6 +4252,10 @@ impl TypedTool for SendAgentMessageTool {
 
     fn description(&self) -> &str {
         "Queue a message for any visible agent in the current task tree. This does not start a new turn when the target is idle."
+    }
+
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        agent_control_policy(&input.target)
     }
 
     async fn execute_typed(
@@ -4207,6 +4301,10 @@ impl TypedTool for FollowupAgentTaskTool {
         "Give an existing agent a follow-up task, starting a new turn when it is idle or delivering at the next boundary when it is active."
     }
 
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        agent_control_policy(&input.target)
+    }
+
     async fn execute_typed(
         &self,
         call_id: Uuid,
@@ -4244,6 +4342,10 @@ impl TypedTool for InterruptAgentTool {
         "Interrupt an agent's current turn. The agent identity remains available for a later followup_task."
     }
 
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        agent_control_policy(&input.target)
+    }
+
     async fn execute_typed(
         &self,
         call_id: Uuid,
@@ -4278,6 +4380,10 @@ impl TypedTool for ListAgentsTool {
 
     fn description(&self) -> &str {
         "List visible agents in the current root task tree with their canonical paths, profiles, status, and latest task."
+    }
+
+    fn execution_policy(&self, _input: &Self::Input) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec!["agents:tree".to_string()])
     }
 
     async fn execute_typed(
@@ -4321,6 +4427,10 @@ impl TypedTool for SendAgentInputTool {
         "Send additional input to an active child agent."
     }
 
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        agent_control_policy(&input.run_id)
+    }
+
     async fn execute_typed(
         &self,
         call_id: Uuid,
@@ -4358,6 +4468,10 @@ impl TypedTool for CancelAgentTool {
 
     fn description(&self) -> &str {
         "Cancel an active child agent."
+    }
+
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        agent_control_policy(&input.run_id)
     }
 
     async fn execute_typed(
@@ -4407,6 +4521,13 @@ impl TypedTool for WaitAgentTool {
 
     fn description(&self) -> &str {
         "Wait for agent mailbox activity. With target/runId, wait for that agent's current turn and return its messages with the terminal result; without one, return the next mailbox or terminal update in the visible task tree."
+    }
+
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        match input.target.as_deref() {
+            Some(target) => agent_control_policy(target),
+            None => agent_control_policy("mailbox"),
+        }
     }
 
     async fn execute_typed(
@@ -4502,6 +4623,26 @@ impl TypedTool for WaitAgentsTool {
 
     fn description(&self) -> &str {
         "Wait on several child agents at once and return as soon as the first one finishes, together with any other agent that is already done. Agents still working are reported in stillRunning and keep going; their results arrive on their own once they finish."
+    }
+
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        let mut resource_keys = input
+            .run_ids
+            .iter()
+            .map(|run_id| tool_resource_key("agent", run_id))
+            .collect::<Vec<_>>();
+        resource_keys.sort();
+        resource_keys.dedup();
+        if resource_keys.is_empty() {
+            resource_keys.push("*".to_string());
+        }
+        ToolExecutionPolicy {
+            read_only: false,
+            idempotent: false,
+            parallel_safe: true,
+            side_effect: ToolSideEffect::ControlPlane,
+            resource_keys,
+        }
     }
 
     async fn execute_typed(
@@ -4610,7 +4751,21 @@ impl TypedTool for WaitAgentsTool {
         let all_succeeded = runs
             .iter()
             .all(|run| run.get("success").and_then(Value::as_bool) == Some(true));
-        let messages = scheduler.drain_mailbox_scoped(&scope);
+        let mut messages = Vec::new();
+        for run_id in &run_ids {
+            let agent_path = settled
+                .get(run_id)
+                .map(|run| run.agent_path.clone())
+                .or_else(|| {
+                    scheduler
+                        .resolve_scoped(scope.clone(), &run_id.to_string())
+                        .ok()
+                        .map(|run| run.agent_path)
+                });
+            if let Some(agent_path) = agent_path {
+                messages.extend(scheduler.drain_mailbox_from_scoped(&scope, &agent_path));
+            }
+        }
         let value = json!({
             "runs": runs,
             "messages": messages,
@@ -5037,7 +5192,7 @@ impl TypedTool for ViewAttachmentTool {
         ToolExecutionPolicy {
             read_only: true,
             idempotent: true,
-            parallel_safe: false,
+            parallel_safe: true,
             side_effect: ToolSideEffect::External,
             resource_keys: vec![tool_resource_key("attachment", &input.attachment_id)],
         }
@@ -5480,28 +5635,131 @@ async fn attachment_image_bytes(
 const READ_FILE_ARTIFACT_THRESHOLD: usize = 64_000;
 const READ_FILE_WINDOW_CHARS: usize = 16_000;
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileReadInput {
     /// File path relative to workspace.
     path: String,
-    /// Character offset to start reading from. Defaults to 0 in character mode.
-    /// Cannot be combined with startLine or endLine.
+    /// Optional typed read window. Omit it to read the first character window.
     #[serde(default)]
-    offset: Option<u64>,
-    /// Maximum characters to return, capped at 16000.
-    /// Cannot be combined with startLine or endLine.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 16000))]
-    limit: Option<u64>,
-    /// One-based line number to start reading from. Enables line mode.
-    #[serde(default, alias = "start_line")]
-    #[schemars(range(min = 1))]
-    start_line: Option<u64>,
-    /// Optional inclusive one-based final line. Requires startLine.
-    #[serde(default, alias = "end_line")]
-    #[schemars(range(min = 1))]
-    end_line: Option<u64>,
+    window: Option<FileReadWindow>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+enum FileReadWindow {
+    /// Read a character window. Offset defaults to 0 and limit defaults to 16000.
+    Characters {
+        #[serde(default)]
+        offset: Option<u64>,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 16000))]
+        limit: Option<u64>,
+    },
+    /// Read an exact one-based source-line range.
+    Lines {
+        #[serde(rename = "startLine", alias = "start_line")]
+        #[schemars(range(min = 1))]
+        start_line: u64,
+        #[serde(default, rename = "endLine", alias = "end_line")]
+        #[schemars(range(min = 1))]
+        end_line: Option<u64>,
+    },
+}
+
+impl<'de> Deserialize<'de> for FileReadInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct CurrentInput {
+            path: String,
+            #[serde(default)]
+            window: Option<FileReadWindow>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct LegacyInput {
+            path: String,
+            #[serde(default)]
+            offset: Option<u64>,
+            #[serde(default)]
+            limit: Option<u64>,
+            #[serde(default, alias = "start_line")]
+            start_line: Option<u64>,
+            #[serde(default, alias = "end_line")]
+            end_line: Option<u64>,
+        }
+
+        let value = Value::deserialize(deserializer)?;
+        if value.get("window").is_some() {
+            let current = CurrentInput::deserialize(value).map_err(D::Error::custom)?;
+            return Ok(Self {
+                path: current.path,
+                window: current.window,
+            });
+        }
+
+        let legacy = LegacyInput::deserialize(value).map_err(D::Error::custom)?;
+        let line_mode = legacy.start_line.is_some() || legacy.end_line.is_some();
+        let character_mode = legacy.offset.is_some() || legacy.limit.is_some();
+        if line_mode && character_mode {
+            return Err(D::Error::custom(
+                "legacy line coordinates cannot be combined with character coordinates; use the typed window field",
+            ));
+        }
+        let window = if line_mode {
+            let start_line = legacy
+                .start_line
+                .ok_or_else(|| D::Error::custom("legacy endLine requires startLine"))?;
+            Some(FileReadWindow::Lines {
+                start_line,
+                end_line: legacy.end_line,
+            })
+        } else if character_mode {
+            Some(FileReadWindow::Characters {
+                offset: legacy.offset,
+                limit: legacy.limit,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            path: legacy.path,
+            window,
+        })
+    }
+}
+
+impl FileReadInput {
+    fn is_line_window(&self) -> bool {
+        matches!(self.window, Some(FileReadWindow::Lines { .. }))
+    }
+
+    fn character_limit(&self) -> Option<u64> {
+        match self.window {
+            Some(FileReadWindow::Characters { limit, .. }) => limit,
+            Some(FileReadWindow::Lines { .. }) | None => None,
+        }
+    }
+
+    fn set_character_limit(&mut self, limit: u64) {
+        match &mut self.window {
+            Some(FileReadWindow::Characters { limit: current, .. }) => *current = Some(limit),
+            Some(FileReadWindow::Lines { .. }) => {}
+            None => {
+                self.window = Some(FileReadWindow::Characters {
+                    offset: None,
+                    limit: Some(limit),
+                });
+            }
+        }
+    }
 }
 
 pub struct ReadFileTool;
@@ -5515,7 +5773,7 @@ impl TypedTool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a UTF-8 text file inside the workspace. Use one-based startLine/endLine to read an exact source range, or offset/limit for a character window; the two modes are mutually exclusive. Returns at most 16000 characters per call and reports nextLine or nextOffset when more content remains."
+        "Read a UTF-8 text file inside the workspace. Omit window for the first 16000 characters, or pass exactly one typed window: {mode: \"lines\", startLine, endLine?} for source lines or {mode: \"characters\", offset?, limit?} for a character range. Returns nextLine or nextOffset when more content remains."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -5544,24 +5802,6 @@ async fn execute_read_file_with_cap(
 ) -> anyhow::Result<ToolResult> {
     let relative = input.path.trim();
     anyhow::ensure!(!relative.is_empty(), "read_file requires a path");
-    let line_mode = input.start_line.is_some() || input.end_line.is_some();
-    anyhow::ensure!(
-            !(line_mode && (input.offset.is_some() || input.limit.is_some())),
-            "read_file line mode (startLine/endLine) cannot be combined with character mode (offset/limit)"
-        );
-    anyhow::ensure!(
-        input.end_line.is_none() || input.start_line.is_some(),
-        "read_file endLine requires startLine"
-    );
-    if let Some(start_line) = input.start_line {
-        anyhow::ensure!(start_line > 0, "read_file startLine must be at least 1");
-        if let Some(end_line) = input.end_line {
-            anyhow::ensure!(
-                end_line >= start_line,
-                "read_file endLine must be greater than or equal to startLine"
-            );
-        }
-    }
     let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
     enforce_read_policy(&ctx, &logical_path)?;
     let path = ctx.environment.resolve_read_path(&logical_path)?;
@@ -5576,119 +5816,134 @@ async fn execute_read_file_with_cap(
     let total_chars = contents.chars().count();
     let cap = max_chars.clamp(1, READ_FILE_WINDOW_CHARS);
 
-    let (mut output, mut metadata) = if let Some(start_line) = input.start_line {
-        let lines = contents.split_inclusive('\n').collect::<Vec<_>>();
-        let total_lines = lines.len();
-        let start = usize::try_from(start_line).context("read_file startLine is too large")?;
-        if total_lines == 0 {
-            anyhow::ensure!(start == 1, "read_file startLine {start} exceeds empty file");
-        } else {
-            anyhow::ensure!(
-                start <= total_lines,
-                "read_file startLine {start} exceeds total lines {total_lines}"
-            );
-        }
-        let requested_end = input
-            .end_line
-            .map(usize::try_from)
-            .transpose()
-            .context("read_file endLine is too large")?
-            .unwrap_or(total_lines)
-            .min(total_lines);
-        let start_index = start.saturating_sub(1);
-        let start_offset = lines[..start_index]
-            .iter()
-            .map(|line| line.chars().count())
-            .sum::<usize>();
-        let mut selected = String::new();
-        let mut actual_end = None;
-        for (index, line) in lines
-            .iter()
-            .enumerate()
-            .take(requested_end)
-            .skip(start_index)
-        {
-            let line_chars = line.chars().count();
-            anyhow::ensure!(
+    let (mut output, mut metadata) = match input.window {
+        Some(FileReadWindow::Lines {
+            start_line,
+            end_line,
+        }) => {
+            anyhow::ensure!(start_line > 0, "read_file startLine must be at least 1");
+            if let Some(end_line) = end_line {
+                anyhow::ensure!(
+                    end_line >= start_line,
+                    "read_file endLine must be greater than or equal to startLine"
+                );
+            }
+            let lines = contents.split_inclusive('\n').collect::<Vec<_>>();
+            let total_lines = lines.len();
+            let start = usize::try_from(start_line).context("read_file startLine is too large")?;
+            if total_lines == 0 {
+                anyhow::ensure!(start == 1, "read_file startLine {start} exceeds empty file");
+            } else {
+                anyhow::ensure!(
+                    start <= total_lines,
+                    "read_file startLine {start} exceeds total lines {total_lines}"
+                );
+            }
+            let requested_end = end_line
+                .map(usize::try_from)
+                .transpose()
+                .context("read_file endLine is too large")?
+                .unwrap_or(total_lines)
+                .min(total_lines);
+            let start_index = start.saturating_sub(1);
+            let start_offset = lines[..start_index]
+                .iter()
+                .map(|line| line.chars().count())
+                .sum::<usize>();
+            let mut selected = String::new();
+            let mut actual_end = None;
+            for (index, line) in lines
+                .iter()
+                .enumerate()
+                .take(requested_end)
+                .skip(start_index)
+            {
+                let line_chars = line.chars().count();
+                anyhow::ensure!(
                     !selected.is_empty() || line_chars <= cap,
                     "read_file line {} contains {line_chars} characters, exceeding the {cap}-character line-mode cap; use offset/limit character mode for this line",
                     index + 1
                 );
-            if selected.chars().count().saturating_add(line_chars) > cap {
-                break;
+                if selected.chars().count().saturating_add(line_chars) > cap {
+                    break;
+                }
+                selected.push_str(line);
+                actual_end = Some(index + 1);
             }
-            selected.push_str(line);
-            actual_end = Some(index + 1);
-        }
-        let next_line = actual_end
-            .filter(|end| *end < requested_end)
-            .map(|end| end + 1);
-        let next_offset = next_line.map(|line| {
-            lines[..line.saturating_sub(1)]
-                .iter()
-                .map(|value| value.chars().count())
-                .sum::<usize>()
-        });
-        if let Some(next) = next_line {
-            selected.push_str(&format!(
-                    "\n\n[lines {start}-{} of {total_lines}; call read_file again with startLine {next}{}]",
+            let next_line = actual_end
+                .filter(|end| *end < requested_end)
+                .map(|end| end + 1);
+            let next_offset = next_line.map(|line| {
+                lines[..line.saturating_sub(1)]
+                    .iter()
+                    .map(|value| value.chars().count())
+                    .sum::<usize>()
+            });
+            if let Some(next) = next_line {
+                selected.push_str(&format!(
+                    "\n\n[lines {start}-{} of {total_lines}; call read_file again with window {{\"mode\":\"lines\",\"startLine\":{next}{}}}]",
                     actual_end.unwrap_or(start.saturating_sub(1)),
-                    input
-                        .end_line
-                        .map(|end| format!(" and endLine {end} for the rest"))
-                        .unwrap_or_else(|| " for the rest".to_string())
+                    end_line
+                        .map(|end| format!(",\"endLine\":{end}"))
+                        .unwrap_or_default()
                 ));
+            }
+            (
+                selected,
+                json!({
+                    "path": read.path.display().to_string(),
+                    "bytes": bytes,
+                    "mode": "lines",
+                    "startLine": start,
+                    "endLine": actual_end,
+                    "requestedEndLine": end_line,
+                    "nextLine": next_line,
+                    "totalLines": total_lines,
+                    "startOffset": start_offset,
+                    "nextOffset": next_offset,
+                    "totalChars": total_chars
+                }),
+            )
         }
-        (
-            selected,
-            json!({
-                "path": read.path.display().to_string(),
-                "bytes": bytes,
-                "mode": "lines",
-                "startLine": start,
-                "endLine": actual_end,
-                "requestedEndLine": input.end_line,
-                "nextLine": next_line,
-                "totalLines": total_lines,
-                "startOffset": start_offset,
-                "nextOffset": next_offset,
-                "totalChars": total_chars
-            }),
-        )
-    } else {
-        // A window rather than a bare cap: before this, everything past the
-        // first 16000 characters of a file was simply unreachable through this
-        // tool, and the model could not tell that from a short file.
-        let offset = input
-            .offset
-            .map(usize::try_from)
-            .transpose()
-            .context("read_file offset is too large")?
-            .unwrap_or(0);
-        let limit = input.limit.map_or(cap, |value| {
-            usize::try_from(value).unwrap_or(usize::MAX).clamp(1, cap)
-        });
-        let window: String = contents.chars().skip(offset).take(limit).collect();
-        let read_to = offset.saturating_add(window.chars().count());
-        let next_offset = (read_to < total_chars).then_some(read_to);
-        let mut selected = window;
-        if let Some(next) = next_offset {
-            selected.push_str(&format!(
-                    "\n\n[characters {offset}-{} of {total_chars}; call read_file again with offset {next} for the rest]",
+        character_window => {
+            // A window rather than a bare cap: before this, everything past the
+            // first 16000 characters of a file was simply unreachable through this
+            // tool, and the model could not tell that from a short file.
+            let (requested_offset, requested_limit) = match character_window {
+                Some(FileReadWindow::Characters { offset, limit }) => (offset, limit),
+                Some(FileReadWindow::Lines { .. }) => unreachable!("line window handled above"),
+                None => (None, None),
+            };
+            let offset = requested_offset
+                .map(usize::try_from)
+                .transpose()
+                .context("read_file offset is too large")?
+                .unwrap_or(0);
+            let limit = requested_limit.map_or(cap, |value| {
+                usize::try_from(value).unwrap_or(usize::MAX).clamp(1, cap)
+            });
+            let window: String = contents.chars().skip(offset).take(limit).collect();
+            let read_to = offset.saturating_add(window.chars().count());
+            let next_offset = (read_to < total_chars).then_some(read_to);
+            let mut selected = window;
+            if let Some(next) = next_offset {
+                selected.push_str(&format!(
+                    "\n\n[characters {offset}-{} of {total_chars}; call read_file again with window {{\"mode\":\"characters\",\"offset\":{next}}} for the rest]",
                     read_to.saturating_sub(1)
                 ));
+            }
+            (
+                selected,
+                json!({
+                    "path": read.path.display().to_string(),
+                    "bytes": bytes,
+                    "mode": "characters",
+                    "offset": offset,
+                    "nextOffset": next_offset,
+                    "totalChars": total_chars
+                }),
+            )
         }
-        (
-            selected,
-            json!({
-                "path": read.path.display().to_string(),
-                "bytes": bytes,
-                "mode": "characters",
-                "offset": offset,
-                "nextOffset": next_offset,
-                "totalChars": total_chars
-            }),
-        )
     };
 
     if bytes > READ_FILE_ARTIFACT_THRESHOLD {
@@ -5754,7 +6009,7 @@ impl TypedTool for ReadFilesTool {
     }
 
     fn description(&self) -> &str {
-        "Read up to 8 independent UTF-8 files concurrently. Each item supports either one-based startLine/endLine or the mutually exclusive offset/limit character window from read_file; the combined file-content response is capped at 64000 characters."
+        "Read up to 8 independent UTF-8 files concurrently. Each item uses the same typed window contract as read_file; the combined file-content response is capped at 64000 characters."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -5794,13 +6049,13 @@ impl TypedTool for ReadFilesTool {
         let per_file_cap = (READ_FILES_TOTAL_CHARS / file_count).min(READ_FILE_WINDOW_CHARS);
         let mut pending = FuturesUnordered::new();
         for (index, mut item) in input.files.into_iter().enumerate() {
-            if item.start_line.is_none() && item.end_line.is_none() {
+            if !item.is_line_window() {
                 let requested = item
-                    .limit
+                    .character_limit()
                     .map(|value| value as usize)
                     .unwrap_or(per_file_cap)
                     .clamp(1, per_file_cap);
-                item.limit = Some(requested as u64);
+                item.set_character_limit(requested as u64);
             }
             let item_ctx = ctx.clone();
             pending.push(async move {
@@ -5959,7 +6214,7 @@ impl TypedTool for SearchTool {
     }
 
     fn description(&self) -> &str {
-        "Recursively search workspace text for candidate definitions and references with ripgrep, falling back to a literal scan. Set contextLines (0-20) to include numbered surrounding source lines and structured match locations that can be passed directly to read_file startLine/endLine. Text matches are evidence to confirm by reading code, not semantic symbol resolution."
+        "Recursively search workspace text for candidate definitions and references with ripgrep, falling back to a literal scan. Set contextLines (0-20) to include numbered surrounding source lines and structured match locations that can be passed directly to read_file's lines window. Text matches are evidence to confirm by reading code, not semantic symbol resolution."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -6127,7 +6382,11 @@ impl TypedTool for BackgroundOutputTool {
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        let key = format!("session:{}", input.job_id.as_deref().unwrap_or("*"));
+        let key = input
+            .job_id
+            .as_deref()
+            .map(|job_id| tool_resource_key("session", job_id))
+            .unwrap_or_else(|| "*".to_string());
         match input.action {
             BackgroundOutputActionInput::List => {
                 ToolExecutionPolicy::read_only(vec!["sessions:self".to_string()])
@@ -6135,7 +6394,7 @@ impl TypedTool for BackgroundOutputTool {
             BackgroundOutputActionInput::Read => ToolExecutionPolicy {
                 read_only: false,
                 idempotent: false,
-                parallel_safe: false,
+                parallel_safe: true,
                 side_effect: ToolSideEffect::SessionMutation,
                 resource_keys: vec![key],
             },
@@ -6143,7 +6402,7 @@ impl TypedTool for BackgroundOutputTool {
                 ToolExecutionPolicy {
                     read_only: false,
                     idempotent: false,
-                    parallel_safe: false,
+                    parallel_safe: true,
                     side_effect: ToolSideEffect::SessionMutation,
                     resource_keys: vec![key],
                 }
@@ -6272,9 +6531,9 @@ impl TypedTool for ShellTool {
 
     fn description(&self) -> &str {
         if cfg!(windows) {
-            "Run a Windows PowerShell 5.1 command in a workspace directory with timeout and output caps. This is not Bash or PowerShell 7: use `;` or explicit `$LASTEXITCODE` checks instead of `&&`/`||`, `Select-Object -First/-Last` instead of `head`/`tail`, and `$null` for discarded output. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
+            "Run a Windows PowerShell 5.1 command in a workspace directory with timeout and output caps. This is not Bash or PowerShell 7: use `;` or explicit `$LASTEXITCODE` checks instead of `&&`/`||`, `Select-Object -First/-Last` instead of `head`/`tail`, and `$null` for discarded output. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
         } else {
-            "Run a POSIX `sh` command in a workspace directory with timeout and output caps; do not use PowerShell cmdlets or `$env:` syntax. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
+            "Run a POSIX `sh` command in a workspace directory with timeout and output caps; do not use PowerShell cmdlets or `$env:` syntax. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
         }
     }
 
@@ -8362,6 +8621,8 @@ mod tests {
         let core = ToolRegistry::with_core_tools();
         assert!(core.get("browser").is_none());
         assert!(core.get("computer").is_none());
+        assert!(core.get("document").is_none());
+        assert!(core.get("pdf").is_none());
         assert!(core.get("spreadsheet").is_none());
 
         let defaults = ToolRegistry::with_builtins();
@@ -8375,6 +8636,18 @@ mod tests {
             defaults.source("computer"),
             Some(ToolSource::BundledPlugin {
                 plugin_name: "computer-use".to_string(),
+            })
+        );
+        assert_eq!(
+            defaults.source("document"),
+            Some(ToolSource::BundledPlugin {
+                plugin_name: "documents".to_string(),
+            })
+        );
+        assert_eq!(
+            defaults.source("pdf"),
+            Some(ToolSource::BundledPlugin {
+                plugin_name: "pdf".to_string(),
             })
         );
         assert_eq!(
@@ -8860,9 +9133,42 @@ mod tests {
         let properties = schema["properties"]
             .as_object()
             .expect("read_file schema properties");
-        assert!(properties.contains_key("startLine"));
-        assert!(properties.contains_key("endLine"));
-        assert!(Tool::description(&ReadFileTool).contains("mutually exclusive"));
+        let branches = properties["window"]["anyOf"]
+            .as_array()
+            .expect("optional typed window branches");
+        let tagged_union = branches
+            .iter()
+            .find_map(|branch| branch.get("oneOf").and_then(Value::as_array))
+            .expect("window tagged union");
+        assert_eq!(tagged_union.len(), 2);
+        assert!(tagged_union.iter().all(|branch| branch["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("mode")))));
+        assert!(!properties.contains_key("startLine"));
+        assert!(!properties.contains_key("offset"));
+        assert!(Tool::description(&ReadFileTool).contains("typed window"));
+        assert!(ReadFileTool
+            .input_error(&json!({
+                "path": "src/lib.rs",
+                "window": { "mode": "lines", "startLine": 10, "endLine": 20 }
+            }))
+            .is_none());
+        assert!(ReadFileTool
+            .input_error(&json!({
+                "path": "src/lib.rs",
+                "window": { "mode": "characters", "offset": 100, "limit": 500 }
+            }))
+            .is_none());
+        assert!(ReadFileTool
+            .input_error(&json!({
+                "path": "src/lib.rs",
+                "window": {
+                    "mode": "lines",
+                    "startLine": 10,
+                    "offset": 100
+                }
+            }))
+            .is_some());
     }
 
     #[test]
@@ -9135,7 +9441,7 @@ mod tests {
         assert_eq!(first.metadata["nextOffset"], READ_FILE_WINDOW_CHARS);
         assert_eq!(first.metadata["totalChars"], contents.chars().count());
         assert!(!first.output.contains("TAIL"));
-        assert!(first.output.contains("call read_file again with offset"));
+        assert!(first.output.contains("\"mode\":\"characters\""));
 
         let next = first.metadata["nextOffset"].as_u64().unwrap();
         let second = ReadFileTool
@@ -9177,7 +9483,10 @@ mod tests {
             .execute(
                 ToolCall::new(
                     "read_file",
-                    json!({ "path": "lines.txt", "startLine": 2, "endLine": 3 }),
+                    json!({
+                        "path": "lines.txt",
+                        "window": { "mode": "lines", "startLine": 2, "endLine": 3 }
+                    }),
                 ),
                 context,
             )
@@ -9230,8 +9539,9 @@ mod tests {
                 .execute(ToolCall::new("read_file", input), context.clone())
                 .await
                 .unwrap_err();
+            let error_chain = format!("{error:#}");
             assert!(
-                error.to_string().contains(expected),
+                error_chain.contains(expected),
                 "unexpected error: {error:#}"
             );
         }
@@ -9255,10 +9565,10 @@ mod tests {
             Uuid::new_v4(),
             FileReadInput {
                 path: "lines.txt".to_string(),
-                offset: None,
-                limit: None,
-                start_line: Some(1),
-                end_line: Some(3),
+                window: Some(FileReadWindow::Lines {
+                    start_line: 1,
+                    end_line: Some(3),
+                }),
             },
             context,
             8,
@@ -10032,6 +10342,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_agents_only_consumes_messages_from_requested_agents() {
+        let scheduler = SubagentScheduler::new(
+            SubagentSchedulerConfig {
+                max_concurrency_per_parent: 2,
+                max_threads: 6,
+                max_depth: 2,
+            },
+            Arc::new(ImmediateExecutor),
+            Arc::new(NoopSubagentObserver),
+        );
+        let thread_id = Uuid::new_v4();
+        let parent_turn_id = Uuid::new_v4();
+        let first = scheduler
+            .spawn(SpawnSubagentRequest {
+                parent_thread_id: thread_id,
+                parent_turn_id,
+                parent_agent_path: "/root".to_string(),
+                name: "first_mailbox".to_string(),
+                agent_type: "default".to_string(),
+                input: "alpha".to_string(),
+                fork_turns: "all".to_string(),
+                depth: 1,
+                initial_conversation: Vec::new(),
+                initial_model_context: None,
+            })
+            .unwrap();
+        let second = scheduler
+            .spawn(SpawnSubagentRequest {
+                parent_thread_id: thread_id,
+                parent_turn_id,
+                parent_agent_path: "/root".to_string(),
+                name: "second_mailbox".to_string(),
+                agent_type: "default".to_string(),
+                input: "beta".to_string(),
+                fork_turns: "all".to_string(),
+                depth: 1,
+                initial_conversation: Vec::new(),
+                initial_model_context: None,
+            })
+            .unwrap();
+        let scope = SubagentScope {
+            thread_id,
+            parent_turn_id,
+            depth: 0,
+            agent_path: "/root".to_string(),
+        };
+        scheduler
+            .wait_scoped(scope.clone(), first.id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        scheduler
+            .wait_scoped(scope.clone(), second.id, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let result = WaitAgentsTool
+            .execute(
+                ToolCall::new(
+                    "wait_agents",
+                    json!({
+                        "runIds": [first.id],
+                        "timeoutMs": 1_000
+                    }),
+                ),
+                tool_context(scheduler.clone(), thread_id, parent_turn_id),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&result.output).unwrap();
+        let delivered = value["messages"].as_array().unwrap();
+        assert!(delivered.iter().all(|message| {
+            message["fromAgentPath"].as_str() == Some(first.agent_path.as_str())
+        }));
+
+        let remaining = scheduler.mailbox_snapshot_scoped(&scope);
+        assert!(remaining
+            .iter()
+            .any(|message| message.from_agent_path == second.agent_path));
+        assert!(remaining
+            .iter()
+            .all(|message| message.from_agent_path != first.agent_path));
+    }
+
+    #[tokio::test]
     async fn spreadsheet_tool_round_trips_through_execution_environment() {
         let workspace_root =
             std::env::temp_dir().join(format!("opentopia-sheet-{}", Uuid::new_v4()));
@@ -10453,6 +10847,117 @@ mod tests {
             .unwrap();
         assert!(!policy.read_only);
         assert_eq!(policy.side_effect, ToolSideEffect::Process);
+    }
+
+    #[test]
+    fn structured_observation_and_control_tools_declare_scoped_parallelism() {
+        let spreadsheet_read = <SpreadsheetTool as TypedTool>::execution_policy(
+            &SpreadsheetTool,
+            &SpreadsheetToolInput {
+                action: SpreadsheetToolAction::Inspect,
+                path: Some("reports/a.xlsx".to_string()),
+                sheet: None,
+                range: None,
+                source_path: None,
+                output_path: None,
+                sheets: Vec::new(),
+            },
+        );
+        assert!(spreadsheet_read.read_only);
+        assert!(spreadsheet_read.parallel_safe);
+        assert_eq!(spreadsheet_read.resource_keys, vec!["file:reports/a.xlsx"]);
+
+        let spreadsheet_write = <SpreadsheetTool as TypedTool>::execution_policy(
+            &SpreadsheetTool,
+            &SpreadsheetToolInput {
+                action: SpreadsheetToolAction::Write,
+                path: None,
+                sheet: None,
+                range: None,
+                source_path: Some("reports/source.xlsx".to_string()),
+                output_path: Some("reports/output.xlsx".to_string()),
+                sheets: Vec::new(),
+            },
+        );
+        assert!(!spreadsheet_write.read_only);
+        assert!(spreadsheet_write.parallel_safe);
+        assert_eq!(
+            spreadsheet_write.resource_keys,
+            vec!["file:reports/output.xlsx", "file:reports/source.xlsx"]
+        );
+
+        let list_skills =
+            <ListSkillsTool as TypedTool>::execution_policy(&ListSkillsTool, &EmptyToolInput {});
+        assert!(list_skills.read_only);
+        assert_eq!(list_skills.resource_keys, vec!["skills:catalog"]);
+
+        let read_skill = <ReadSkillTool as TypedTool>::execution_policy(
+            &ReadSkillTool,
+            &ReadSkillInput {
+                id: "system/test".to_string(),
+                offset: 0,
+                limit: None,
+            },
+        );
+        assert!(read_skill.read_only);
+        assert_eq!(read_skill.resource_keys, vec!["skill:system/test"]);
+
+        let list_agents = <ListAgentsTool as TypedTool>::execution_policy(
+            &ListAgentsTool,
+            &ListAgentsInput { path_prefix: None },
+        );
+        assert!(list_agents.read_only);
+        assert_eq!(list_agents.resource_keys, vec!["agents:tree"]);
+
+        let attachment = <ViewAttachmentTool as TypedTool>::execution_policy(
+            &ViewAttachmentTool,
+            &ViewAttachmentInput {
+                attachment_id: Uuid::new_v4().to_string(),
+                focus: None,
+            },
+        );
+        assert!(attachment.read_only);
+        assert!(attachment.parallel_safe);
+
+        let job_id = Uuid::new_v4().to_string();
+        let background_read = <BackgroundOutputTool as TypedTool>::execution_policy(
+            &BackgroundOutputTool,
+            &BackgroundOutputInput {
+                action: BackgroundOutputActionInput::Read,
+                job_id: Some(job_id.clone()),
+                data: None,
+                append_newline: false,
+            },
+        );
+        assert!(!background_read.read_only);
+        assert!(background_read.parallel_safe);
+        assert_eq!(
+            background_read.resource_keys,
+            vec![format!("session:{job_id}")]
+        );
+
+        let send_agent = <SendAgentMessageTool as TypedTool>::execution_policy(
+            &SendAgentMessageTool,
+            &AgentTargetMessageInput {
+                target: "/root/reviewer".to_string(),
+                message: "check".to_string(),
+            },
+        );
+        assert!(send_agent.parallel_safe);
+        assert_eq!(send_agent.resource_keys, vec!["agent:/root/reviewer"]);
+
+        let isolated_spawn = <SpawnAgentTool as TypedTool>::execution_policy(
+            &SpawnAgentTool,
+            &SpawnAgentInput {
+                task_name: "reviewer".to_string(),
+                message: "check".to_string(),
+                fork_turns: None,
+                agent_type: "default".to_string(),
+                workspace_mode: SubagentWorkspaceModeInput::IsolatedWorktree,
+            },
+        );
+        assert!(isolated_spawn.parallel_safe);
+        assert_eq!(isolated_spawn.resource_keys, vec!["git:index-and-worktree"]);
     }
 
     #[tokio::test]

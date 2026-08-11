@@ -1,4 +1,4 @@
-use crate::model::ModelContentPart;
+use crate::model::{ModelContentPart, ProviderRetryKind};
 #[cfg(test)]
 use crate::model_context::ContextItemKind;
 use crate::model_context::{
@@ -122,19 +122,23 @@ impl ModelRequest {
                 .map(|message| estimate_tokens(&message.content))
                 .sum();
             breakdown.current_user = estimate_tokens(&self.user_message);
-            breakdown.tool_calls = estimate_serialized_slice(&self.previous_tool_calls);
-            breakdown.tool_results = estimate_serialized_slice(&self.tool_results);
         }
+
+        // Tool calls/results may also be represented by materialized context
+        // items. Re-estimate them from their typed source so image byte buffers
+        // are never counted as enormous JSON integer arrays.
+        breakdown.tool_calls = estimate_serialized_slice(&self.previous_tool_calls);
+        breakdown.tool_results = estimate_provider_tool_results(&self.tool_results);
 
         breakdown.conversation = breakdown.conversation.saturating_add(
             self.conversation
                 .iter()
-                .map(|message| estimate_serialized_slice(&message.content_parts))
+                .map(|message| estimate_model_input_content(&message.content_parts))
                 .sum(),
         );
         breakdown.current_user = breakdown
             .current_user
-            .saturating_add(estimate_serialized_slice(&self.user_content));
+            .saturating_add(estimate_model_input_content(&self.user_content));
         breakdown.developer_instructions = breakdown.developer_instructions.saturating_add(
             self.branch_developer_instructions
                 .as_deref()
@@ -230,6 +234,42 @@ fn estimate_serialized_slice(value: &[impl Serialize]) -> usize {
     } else {
         estimate_serialized_tokens(&value)
     }
+}
+
+fn estimate_model_input_content(parts: &[ModelInputContent]) -> usize {
+    parts
+        .iter()
+        .map(|part| match part {
+            ModelInputContent::Text { text } => estimate_tokens(text),
+            ModelInputContent::Json { value } => estimate_tokens(&value.to_string()),
+            // The provider receives an encoded image and bills vision input, not
+            // a JSON list of every byte. Dimensions are unavailable here, so keep
+            // the established byte-size heuristic used by server-side budgeting.
+            ModelInputContent::Image { data, .. } => (data.len() / 16).max(1_024),
+            ModelInputContent::Resource {
+                uri,
+                content_type,
+                name,
+            } => estimate_tokens(&resource_fallback_text(
+                uri,
+                content_type.as_deref(),
+                name.as_deref(),
+            )),
+        })
+        .sum()
+}
+
+fn estimate_provider_tool_results(results: &[ProviderToolResult]) -> usize {
+    results
+        .iter()
+        .map(|result| {
+            estimate_tokens(&result.name)
+                .saturating_add(estimate_tokens(&result.output))
+                .saturating_add(estimate_model_input_content(&result.content))
+                .saturating_add(estimate_serialized_tokens(&result.metadata))
+                .saturating_add(32)
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +463,9 @@ pub struct PreparedProviderRequest {
 pub enum ProviderTransportEvent {
     Retry {
         attempt: usize,
+        retry_kind: ProviderRetryKind,
+        retry_index: Option<usize>,
+        retry_limit: Option<usize>,
         reason: String,
         body: Value,
     },
@@ -436,6 +479,76 @@ pub enum ProviderTransportEvent {
 
 pub type ProviderTransportCallback<'a> =
     dyn FnMut(ProviderTransportEvent) -> anyhow::Result<()> + Send + 'a;
+
+const PROVIDER_NETWORK_RETRY_LIMIT: usize = 5;
+const PROVIDER_NETWORK_RETRY_DELAYS: [Duration; PROVIDER_NETWORK_RETRY_LIMIT] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
+
+fn retryable_provider_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || (status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED)
+}
+
+fn retryable_provider_network_error(error: &reqwest::Error) -> bool {
+    !error.is_builder() && (error.is_connect() || error.is_timeout() || error.is_request())
+}
+
+async fn send_provider_request_with_network_retries<F>(
+    mut request: F,
+    first_attempt: usize,
+    observation_body: &Value,
+    on_transport: &mut ProviderTransportCallback<'_>,
+) -> anyhow::Result<(reqwest::Response, usize)>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut attempt = first_attempt;
+    let mut retry_index = 0;
+    loop {
+        match request().send().await {
+            Ok(response)
+                if retryable_provider_status(response.status())
+                    && retry_index < PROVIDER_NETWORK_RETRY_LIMIT =>
+            {
+                retry_index += 1;
+                attempt += 1;
+                let status = response.status();
+                on_transport(ProviderTransportEvent::Retry {
+                    attempt,
+                    retry_kind: ProviderRetryKind::Network,
+                    retry_index: Some(retry_index),
+                    retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
+                    reason: format!("provider returned transient HTTP {status}; reconnecting"),
+                    body: observation_body.clone(),
+                })?;
+                tokio::time::sleep(PROVIDER_NETWORK_RETRY_DELAYS[retry_index - 1]).await;
+            }
+            Ok(response) => return Ok((response, attempt)),
+            Err(error)
+                if retryable_provider_network_error(&error)
+                    && retry_index < PROVIDER_NETWORK_RETRY_LIMIT =>
+            {
+                retry_index += 1;
+                attempt += 1;
+                on_transport(ProviderTransportEvent::Retry {
+                    attempt,
+                    retry_kind: ProviderRetryKind::Network,
+                    retry_index: Some(retry_index),
+                    retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
+                    reason: format!("provider connection failed: {error}"),
+                    body: observation_body.clone(),
+                })?;
+                tokio::time::sleep(PROVIDER_NETWORK_RETRY_DELAYS[retry_index - 1]).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -1385,7 +1498,7 @@ impl OpenAiCompatibleProvider {
         if self.reasoning_effort.is_some() {
             self.reasoning_effort = Some("low".to_string());
         }
-        self.parallel_tool_calls = false;
+        self.parallel_tool_calls = true;
         self
     }
 
@@ -1509,15 +1622,19 @@ impl OpenAiCompatibleProvider {
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
-        let mut attempt = 1;
-        let mut response = self
-            .client
-            .post(&prepared.endpoint)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&prepared.body)
-            .send()
-            .await?;
+        let (mut response, mut attempt) = send_provider_request_with_network_retries(
+            || {
+                self.client
+                    .post(&prepared.endpoint)
+                    .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&prepared.body)
+            },
+            1,
+            &prepared.observation_body,
+            on_transport,
+        )
+        .await?;
         if response.status().as_u16() == 400
             && (chat_request_has_compatibility_fallback(&prepared.logical_request)
                 || request_image_part_count(&prepared.logical_request) > 0
@@ -1525,7 +1642,7 @@ impl OpenAiCompatibleProvider {
                 || request_uses_strict_function_tools(&prepared.body))
         {
             let rejected_body = response.text().await?;
-            attempt = 2;
+            attempt += 1;
             let mut changes = Vec::new();
             let rejected_parallel_tool_calls = prepared.body.get("parallel_tool_calls").is_some()
                 && provider_rejected_parallel_tool_calls(&rejected_body);
@@ -1591,20 +1708,30 @@ impl OpenAiCompatibleProvider {
             }
             on_transport(ProviderTransportEvent::Retry {
                 attempt,
+                retry_kind: ProviderRetryKind::Compatibility,
+                retry_index: None,
+                retry_limit: None,
                 reason: truncate_observation_text(&format!(
                     "provider rejected {} with HTTP 400 (imageParts={image_parts}): {rejected_body}",
                     changes.join(" and "),
                 )),
                 body: redact_transport_value(&prepared.body),
             })?;
-            let retry = self
-                .client
-                .post(&prepared.endpoint)
-                .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&prepared.body)
-                .send()
-                .await?;
+            let retry_observation_body = redact_transport_value(&prepared.body);
+            let (retry, retry_attempt) = send_provider_request_with_network_retries(
+                || {
+                    self.client
+                        .post(&prepared.endpoint)
+                        .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                        .header(CONTENT_TYPE, "application/json")
+                        .json(&prepared.body)
+                },
+                attempt,
+                &retry_observation_body,
+                on_transport,
+            )
+            .await?;
+            attempt = retry_attempt;
             if !retry.status().is_success() {
                 let retry_status = retry.status();
                 let retry_body = retry.text().await?;
@@ -1671,18 +1798,28 @@ impl OpenAiCompatibleProvider {
                 }
                 on_transport(ProviderTransportEvent::Retry {
                     attempt,
+                    retry_kind: ProviderRetryKind::Compatibility,
+                    retry_index: None,
+                    retry_limit: None,
                     reason: "streamed tool-call arguments could not be decoded; retrying once with the non-streaming transport"
                         .to_string(),
                     body: redact_transport_value(&prepared.body),
                 })?;
-                let retry = self
-                    .client
-                    .post(&prepared.endpoint)
-                    .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-                    .header(CONTENT_TYPE, "application/json")
-                    .json(&prepared.body)
-                    .send()
-                    .await?;
+                let retry_observation_body = redact_transport_value(&prepared.body);
+                let (retry, retry_attempt) = send_provider_request_with_network_retries(
+                    || {
+                        self.client
+                            .post(&prepared.endpoint)
+                            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                            .header(CONTENT_TYPE, "application/json")
+                            .json(&prepared.body)
+                    },
+                    attempt,
+                    &retry_observation_body,
+                    on_transport,
+                )
+                .await?;
+                attempt = retry_attempt;
                 let retry_status = retry.status();
                 if !retry_status.is_success() {
                     let retry_body = retry.text().await?;
@@ -1988,7 +2125,7 @@ impl OpenAiResponsesProvider {
         if self.reasoning_effort.is_some() {
             self.reasoning_effort = Some("low".to_string());
         }
-        self.parallel_tool_calls = false;
+        self.parallel_tool_calls = true;
         self.native_web_search = false;
         self
     }
@@ -2137,14 +2274,19 @@ impl OpenAiResponsesProvider {
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
-        let response = self
-            .client
-            .post(&prepared.endpoint)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&prepared.body)
-            .send()
-            .await?;
+        let (response, attempt) = send_provider_request_with_network_retries(
+            || {
+                self.client
+                    .post(&prepared.endpoint)
+                    .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&prepared.body)
+            },
+            attempt,
+            &prepared.observation_body,
+            on_transport,
+        )
+        .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
@@ -2303,20 +2445,25 @@ impl AnthropicMessagesProvider {
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
-        let mut response = self
-            .client
-            .post(&prepared.endpoint)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header(CONTENT_TYPE, "application/json")
-            .json(&prepared.body)
-            .send()
-            .await?;
+        let (mut response, attempt) = send_provider_request_with_network_retries(
+            || {
+                self.client
+                    .post(&prepared.endpoint)
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&prepared.body)
+            },
+            1,
+            &prepared.observation_body,
+            on_transport,
+        )
+        .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
             on_transport(ProviderTransportEvent::Response {
-                attempt: 1,
+                attempt,
                 status: Some(status.as_u16()),
                 response_id: None,
                 body: json!({ "error": truncate_observation_text(&body) }),
@@ -2346,7 +2493,7 @@ impl AnthropicMessagesProvider {
         }
         let response = accumulator.finish()?;
         on_transport(ProviderTransportEvent::Response {
-            attempt: 1,
+            attempt,
             status: Some(status.as_u16()),
             response_id: response.response_id.clone(),
             body: model_response_observation(&response),
@@ -4154,6 +4301,13 @@ fn lower_openai_strict_schema_node(schema: &mut Value) -> Option<()> {
     for annotation in ["$schema", "title", "default", "examples", "deprecated"] {
         object.remove(annotation);
     }
+    if let Some(branches) = object.remove("oneOf") {
+        let branches = branches.as_array()?;
+        if discriminated_union_key(branches).is_none() {
+            return None;
+        }
+        object.insert("anyOf".to_string(), Value::Array(branches.clone()));
+    }
     if object.keys().any(|keyword| {
         matches!(
             keyword.as_str(),
@@ -4215,6 +4369,61 @@ fn lower_openai_strict_schema_node(schema: &mut Value) -> Option<()> {
     object.insert("required".to_string(), json!(property_names));
     object.insert("additionalProperties".to_string(), Value::Bool(false));
     Some(())
+}
+
+/// A tagged union whose branches require distinct constant values is already
+/// mutually exclusive. OpenAI strict tools accept `anyOf` but not `oneOf`, so
+/// this proof lets the provider adapter lower the spelling without weakening
+/// the provider-neutral contract.
+fn discriminated_union_key(branches: &[Value]) -> Option<String> {
+    let first = branches.first()?.as_object()?;
+    let first_required = first.get("required")?.as_array()?;
+    let first_properties = first.get("properties")?.as_object()?;
+
+    first_required
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|candidate| {
+            let mut seen = Vec::<Value>::new();
+            for branch in branches {
+                let Some(branch) = branch.as_object() else {
+                    return false;
+                };
+                let Some(required) = branch.get("required").and_then(Value::as_array) else {
+                    return false;
+                };
+                if !required
+                    .iter()
+                    .any(|value| value.as_str() == Some(*candidate))
+                {
+                    return false;
+                }
+                let Some(value) = branch
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .and_then(|properties| properties.get(*candidate))
+                    .and_then(schema_singleton_value)
+                else {
+                    return false;
+                };
+                if seen.contains(value) {
+                    return false;
+                }
+                seen.push(value.clone());
+            }
+            first_properties
+                .get(*candidate)
+                .and_then(schema_singleton_value)
+                .is_some()
+        })
+        .map(str::to_string)
+}
+
+fn schema_singleton_value(schema: &Value) -> Option<&Value> {
+    schema.get("const").or_else(|| {
+        let values = schema.get("enum")?.as_array()?;
+        (values.len() == 1).then(|| &values[0])
+    })
 }
 
 fn make_openai_schema_nullable(schema: &mut Value) -> Option<()> {
@@ -5693,6 +5902,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                     .prepare_responses_request(prepared.request_id, prepared.logical_request)?;
                 on_transport(ProviderTransportEvent::Retry {
                     attempt: 2,
+                    retry_kind: ProviderRetryKind::Compatibility,
+                    retry_index: None,
+                    retry_limit: None,
                     reason: "strict function tools unsupported; retrying portable schemas"
                         .to_string(),
                     body: replay.observation_body.clone(),
@@ -5714,6 +5926,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                 replay.observation_body = redact_transport_value(&replay.body);
                 on_transport(ProviderTransportEvent::Retry {
                     attempt: 2,
+                    retry_kind: ProviderRetryKind::Compatibility,
+                    retry_index: None,
+                    retry_limit: None,
                     reason: "parallel_tool_calls unsupported; retrying without the provider hint"
                         .to_string(),
                     body: replay.observation_body.clone(),
@@ -5738,6 +5953,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                     .prepare_responses_request(prepared.request_id, prepared.logical_request)?;
                 on_transport(ProviderTransportEvent::Retry {
                     attempt: 2,
+                    retry_kind: ProviderRetryKind::Compatibility,
+                    retry_index: None,
+                    retry_limit: None,
                     reason:
                         "enhanced tool representation unsupported; retrying portable function tools"
                             .to_string(),
@@ -5759,6 +5977,9 @@ impl ModelProvider for OpenAiResponsesProvider {
                 let replay = self.prepare_responses_request(prepared.request_id, replay)?;
                 on_transport(ProviderTransportEvent::Retry {
                     attempt: 2,
+                    retry_kind: ProviderRetryKind::Compatibility,
+                    retry_index: None,
+                    retry_limit: None,
                     reason: "stored response cursor unavailable; replaying canonical local context"
                         .to_string(),
                     body: replay.observation_body.clone(),
@@ -6075,6 +6296,7 @@ struct CodexAppServerSession {
     turn_id: String,
     assistant_text: String,
     received_agent_delta: bool,
+    network_retry_count: usize,
     final_message_item_ids: HashSet<String>,
     pending_tool_call: Option<CodexDynamicToolCall>,
 }
@@ -6134,6 +6356,7 @@ impl CodexAppServerProvider {
             turn_id: String::new(),
             assistant_text: String::new(),
             received_agent_delta: false,
+            network_retry_count: 0,
             final_message_item_ids: HashSet::new(),
             pending_tool_call: None,
         };
@@ -6261,6 +6484,7 @@ impl CodexAppServerProvider {
     async fn drive_session(
         &self,
         session: &mut CodexAppServerSession,
+        on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<CodexDriveResult> {
         // The bound is on silence, not on total turn length: a Codex turn may legitimately
         // run for a long time as long as it keeps emitting events, but a session that goes
@@ -6363,11 +6587,26 @@ impl CodexAppServerProvider {
                         // Older App Server builds nested this field in the error payload.
                         .or_else(|| error.get("willRetry").and_then(Value::as_bool))
                         .unwrap_or(false);
-                    if !will_retry {
-                        let detail = error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Codex App Server reported an error");
+                    let detail = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex App Server reported an error");
+                    if will_retry {
+                        if session.network_retry_count >= PROVIDER_NETWORK_RETRY_LIMIT {
+                            anyhow::bail!(
+                                "Codex App Server exceeded {PROVIDER_NETWORK_RETRY_LIMIT} reconnect attempts: {detail}"
+                            );
+                        }
+                        session.network_retry_count += 1;
+                        on_transport(ProviderTransportEvent::Retry {
+                            attempt: session.network_retry_count + 1,
+                            retry_kind: ProviderRetryKind::Network,
+                            retry_index: Some(session.network_retry_count),
+                            retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
+                            reason: detail.to_string(),
+                            body: redact_transport_value(error),
+                        })?;
+                    } else {
                         anyhow::bail!("Codex App Server error: {detail}");
                     }
                 }
@@ -6376,20 +6615,25 @@ impl CodexAppServerProvider {
         }
     }
 
-    async fn complete_request(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
+    async fn complete_request(
+        &self,
+        request: ModelRequest,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<(ModelResponse, usize)> {
         let previous_response_id = request.previous_response_id.clone();
         let mut session = match previous_response_id.as_deref() {
             Some(response_id) => self.sessions.lock().await.remove(response_id),
             None => None,
         }
         .unwrap_or(self.start_session(&request).await?);
+        session.network_retry_count = 0;
 
         let outcome = async {
             if previous_response_id.is_some() && session.pending_tool_call.is_some() {
                 self.resume_session(&mut session, &request.tool_results)
                     .await?;
             }
-            self.drive_session(&mut session).await
+            self.drive_session(&mut session, on_transport).await
         }
         .await;
 
@@ -6408,16 +6652,19 @@ impl CodexAppServerProvider {
                     provider_items: Vec::new(),
                     finish_reason: ModelFinishReason::ToolCalls,
                 };
+                let attempt = session.network_retry_count + 1;
                 session.pending_tool_call = Some(call);
                 self.sessions.lock().await.insert(session_id, session);
-                Ok(response)
+                Ok((response, attempt))
             }
             Ok(CodexDriveResult::Completed(text)) => {
                 session.cleanup().await;
                 if text.trim().is_empty() {
                     anyhow::bail!("Codex App Server completed without an assistant message");
                 }
-                Ok(ModelResponse::text(text))
+                let response = ModelResponse::text(text);
+                let attempt = session.network_retry_count + 1;
+                Ok((response, attempt))
             }
             Err(error) => {
                 session.cleanup().await;
@@ -6441,7 +6688,45 @@ impl CodexAppServerSession {
 #[async_trait]
 impl ModelProvider for CodexAppServerProvider {
     async fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
-        self.complete_request(request).await
+        self.complete_request(request, &mut |_| Ok(()))
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn stream_prepared(
+        &self,
+        prepared: PreparedProviderRequest,
+        on_delta: &mut ModelStreamCallback<'_>,
+        on_transport: &mut ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        let (response, attempt) = self
+            .complete_request(prepared.logical_request, on_transport)
+            .await?;
+        if !response.text.is_empty() {
+            on_delta(ModelStreamDelta::Text {
+                text: response.text.clone(),
+            })?;
+        }
+        for (index, call) in response.tool_calls.iter().enumerate() {
+            on_delta(ModelStreamDelta::ToolCall {
+                index,
+                id: Some(call.id.clone()),
+                name: Some(call.name.clone()),
+                arguments_delta: call.arguments.to_string(),
+            })?;
+        }
+        if let Some(usage) = &response.usage {
+            on_delta(ModelStreamDelta::Usage {
+                usage: usage.clone(),
+            })?;
+        }
+        on_transport(ProviderTransportEvent::Response {
+            attempt,
+            status: None,
+            response_id: response.response_id.clone(),
+            body: model_response_observation(&response),
+        })?;
+        Ok(response)
     }
 
     async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
@@ -6977,6 +7262,52 @@ mod tests {
     }
 
     #[test]
+    fn token_estimate_breakdown_treats_images_as_typed_inputs() {
+        let image = ModelContentPart::image("image/png", vec![0xff; 282_039]);
+        let mut request = model_request();
+        request.user_content = vec![image.clone()];
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "image_result".to_string(),
+            name: "view_image".to_string(),
+            output: "image attached".to_string(),
+            content: vec![image],
+            is_error: false,
+            metadata: json!({ "success": true }),
+        }];
+        request.context_items = vec![
+            ModelContextItem::text(
+                ContextItemKind::User,
+                ContextRole::User,
+                "current_user_message",
+                &request.user_message,
+                ContextCacheScope::Turn,
+                crate::model_context::ContextSensitivity::Workspace,
+            ),
+            ModelContextItem::text(
+                ContextItemKind::ToolResult,
+                ContextRole::Tool,
+                "tool_result:image_result",
+                serde_json::to_string(&request.tool_results[0]).unwrap(),
+                ContextCacheScope::Round,
+                crate::model_context::ContextSensitivity::Sensitive,
+            ),
+        ];
+
+        let serialized_user_content = estimate_serialized_slice(&request.user_content);
+        let breakdown = request.token_estimate_breakdown();
+
+        assert_eq!(
+            breakdown.current_user,
+            estimate_tokens(&request.user_message) + 282_039 / 16
+        );
+        assert!(
+            serialized_user_content > breakdown.current_user.saturating_mul(8),
+            "raw image bytes must not be estimated as a serialized integer array"
+        );
+        assert!(breakdown.tool_results < 20_000);
+    }
+
+    #[test]
     fn codex_turn_input_preserves_order_around_local_image_attachments() {
         let mut request = model_request();
         request.user_content = vec![
@@ -7095,6 +7426,40 @@ mod tests {
         assert_eq!(
             truncated.decision(),
             ModelDecision::Incomplete(IncompleteReason::OutputTokenLimit)
+        );
+    }
+
+    #[test]
+    fn model_decision_rejects_tool_call_finish_without_calls() {
+        let missing_call = ModelResponse {
+            text: "I will use a tool.".to_string(),
+            finish_reason: ModelFinishReason::ToolCalls,
+            ..ModelResponse::text("")
+        };
+
+        assert_eq!(
+            missing_call.decision(),
+            ModelDecision::Incomplete(IncompleteReason::ProviderProtocol(
+                "provider reported tool_calls but returned no tool call".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn chat_stream_without_terminal_event_remains_interrupted() {
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        accumulator
+            .apply(
+                &json!({ "choices": [{ "delta": { "content": "partial" } }] }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+
+        let response = accumulator.finish().unwrap();
+        assert_eq!(response.text, "partial");
+        assert_eq!(
+            response.decision(),
+            ModelDecision::Incomplete(IncompleteReason::StreamInterrupted)
         );
     }
 
@@ -7355,6 +7720,19 @@ mod tests {
         });
 
         assert!(!has_web_search);
+    }
+
+    #[test]
+    fn guardian_openai_providers_keep_parallel_tool_calls_enabled() {
+        let chat =
+            OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key", "gpt-test")
+                .for_guardian();
+        let responses =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test")
+                .for_guardian();
+
+        assert!(chat.parallel_tool_calls);
+        assert!(responses.parallel_tool_calls);
     }
 
     #[test]
@@ -8622,6 +9000,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_provider_reconnects_after_initial_network_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut first).await;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut second).await;
+            second
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"reconnected\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            second.shutdown().await.unwrap();
+        });
+
+        let provider =
+            OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+        let mut transport = Vec::new();
+        let response = provider
+            .stream_prepared(
+                provider.prepare(Uuid::new_v4(), model_request()).unwrap(),
+                &mut |_| Ok(()),
+                &mut |event| {
+                    transport.push(event);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.text, "reconnected");
+        assert!(transport.iter().any(|event| matches!(
+            event,
+            ProviderTransportEvent::Retry {
+                retry_kind: ProviderRetryKind::Network,
+                retry_index: Some(1),
+                retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
     async fn chat_provider_retries_without_unsupported_parallel_tool_hint_and_caches_it() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -9798,6 +10231,44 @@ mod tests {
         assert!(fallback[0]["parameters"].get("oneOf").is_some());
         let chat_fallback = openai_tools(&[portable_only], strict_capabilities);
         assert_eq!(chat_fallback[0]["function"]["strict"], false);
+    }
+
+    #[test]
+    fn strict_function_schema_preserves_discriminated_unions() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "window": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "mode": { "type": "string", "enum": ["characters"] },
+                                "offset": { "type": "integer" }
+                            },
+                            "required": ["mode"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "mode": { "type": "string", "enum": ["lines"] },
+                                "startLine": { "type": "integer" }
+                            },
+                            "required": ["mode", "startLine"]
+                        }
+                    ]
+                }
+            }
+        });
+
+        let lowered = openai_strict_function_schema(&schema).expect("lower tagged union");
+        let union = &lowered["properties"]["window"]["anyOf"];
+        assert!(union.is_array());
+        assert!(lowered["properties"]["window"].get("oneOf").is_none());
+        assert_eq!(
+            lowered["properties"]["window"]["anyOf"][0]["additionalProperties"],
+            false
+        );
     }
 
     #[test]

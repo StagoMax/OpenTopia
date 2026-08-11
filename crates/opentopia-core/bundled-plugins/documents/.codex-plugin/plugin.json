@@ -1,0 +1,48 @@
+{
+  "name": "documents",
+  "version": "1.0.0",
+  "description": "Inspect, extract, render, and validate DOCX files through OpenTopia's native artifact runtime.",
+  "author": {
+    "name": "OpenTopia Contributors"
+  },
+  "interface": {
+    "displayName": "Documents",
+    "shortDescription": "Inspect and render DOCX files safely.",
+    "longDescription": "Inspect OPC and WordprocessingML structure, extract bounded document text, render pages through LibreOffice, and report preservation risks without rewriting the source file.",
+    "developerName": "OpenTopia",
+    "category": "Productivity",
+    "defaultPrompt": "Use the Document tool when the task requires deterministic DOCX inspection, extraction, rendering, or validation.",
+    "capabilities": [
+      "DOCX package inspection",
+      "Bounded text extraction",
+      "LibreOffice rendering",
+      "Preservation risk validation"
+    ]
+  },
+  "opentopia": {
+    "apiVersion": "1",
+    "requires": {
+      "hostCapabilities": [
+        "workspace.files.v1",
+        "artifact.runtime.v1",
+        "nativeTool.document.v1"
+      ]
+    },
+    "permissions": {
+      "filesystem": [
+        "workspace:read"
+      ],
+      "network": [],
+      "secrets": [],
+      "desktop": []
+    },
+    "contributes": {
+      "nativeTools": [
+        {
+          "id": "document",
+          "runtime": "builtin:document"
+        }
+      ]
+    }
+  }
+}

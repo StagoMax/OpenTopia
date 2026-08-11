@@ -1354,7 +1354,9 @@ fn parse_sandbox_network(value: &str) -> Option<NetworkPolicy> {
 fn parse_windows_sandbox_backend(value: &str) -> Option<WindowsSandboxBackend> {
     match normalize_sandbox_value(value).as_str() {
         "auto" => Some(WindowsSandboxBackend::Auto),
-        "elevated" => Some(WindowsSandboxBackend::Elevated),
+        "dedicated_user" | "dedicated-user" | "elevated" => {
+            Some(WindowsSandboxBackend::DedicatedUser)
+        }
         "unelevated" | "legacy" => Some(WindowsSandboxBackend::Unelevated),
         _ => None,
     }
@@ -2040,7 +2042,7 @@ mod tests {
             network: NetworkPolicy::Inherit,
             writable_roots: vec![PathBuf::from("C:/workspace")],
             read_paths: vec![PathBuf::from("C:/reference")],
-            windows_backend: WindowsSandboxBackend::Elevated,
+            windows_backend: WindowsSandboxBackend::DedicatedUser,
         };
 
         let config = settings.to_local_sandbox_config();
@@ -2052,7 +2054,7 @@ mod tests {
         assert_eq!(config.read_paths, settings.read_paths);
         assert!(config.write_paths.is_empty());
         assert_eq!(config.sandbox_home, None);
-        assert_eq!(config.windows_backend, WindowsSandboxBackend::Elevated);
+        assert_eq!(config.windows_backend, WindowsSandboxBackend::DedicatedUser);
     }
 
     #[test]
