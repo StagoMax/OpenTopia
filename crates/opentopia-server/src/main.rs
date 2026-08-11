@@ -17,8 +17,9 @@ use opentopia_core::{
     discover_skills, ensure_bundled_plugins_installed, execute_git_workflow,
     experience_mode_module, install_plugin, isolated_subagent_worktree_request,
     load_context_source_metadata, load_plugin_mcp_servers, load_selected_skills,
-    permission_policy_module, redact_model_observation, resolve_instruction_documents,
-    uninstall_plugin, world_state_catalog_item, world_state_item, AgentContextBudget,
+    permission_policy_module, redact_model_observation, remove_windows_sandbox,
+    resolve_instruction_documents, setup_windows_sandbox, uninstall_plugin,
+    windows_sandbox_setup_status, world_state_catalog_item, world_state_item, AgentContextBudget,
     AgentContinuation, AgentCore, AgentEvent, AgentEventPayload, AgentInstanceStatusV1,
     AgentInstanceV1, AgentProfileRegistry, AgentRuntimeSettings, AgentTemplateVersionV1,
     AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus, Artifact,
@@ -53,10 +54,10 @@ use opentopia_core::{
     ThreadContextSnapshot, ThreadMcpServer, ThreadModelSelection, Tool, ToolCall, ToolContext,
     ToolPermissionDescriptor, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot,
     TurnRecord, TurnStatus, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
-    WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceFilePreview, WorkspaceTree, WorldStateSkill, WorldStateSnapshot,
-    CONTEXT_CHECKPOINT_SCHEMA_VERSION, GIT_NONINTERACTIVE_ENVIRONMENT, MAX_PREVIEW_CONTENT_BYTES,
-    MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
+    WindowsSandboxSetupStatus, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope,
+    WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree, WorldStateSkill,
+    WorldStateSnapshot, CONTEXT_CHECKPOINT_SCHEMA_VERSION, GIT_NONINTERACTIVE_ENVIRONMENT,
+    MAX_PREVIEW_CONTENT_BYTES, MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -385,6 +386,12 @@ fn build_router(state: AppState) -> Router {
         .merge(scm_api::router())
         .route("/health", get(health))
         .route("/api/settings", get(get_settings).patch(update_settings))
+        .route(
+            "/api/sandbox/windows/setup",
+            get(get_windows_sandbox_setup)
+                .post(configure_windows_sandbox)
+                .delete(remove_windows_sandbox_configuration),
+        )
         .route("/api/skills", get(list_skills))
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/install", post(install_local_plugin))
@@ -1330,6 +1337,31 @@ async fn health() -> Json<HealthResponse> {
 
 async fn get_settings(State(state): State<AppState>) -> Json<AppSettings> {
     Json(current_settings(&state))
+}
+
+async fn get_windows_sandbox_setup() -> Result<Json<WindowsSandboxSetupStatus>, ApiError> {
+    let status = tokio::task::spawn_blocking(windows_sandbox_setup_status)
+        .await
+        .map_err(|error| ApiError::internal(format!("sandbox status task failed: {error}")))?
+        .map_err(|error| ApiError::internal(format!("sandbox status failed: {error:#}")))?;
+    Ok(Json(status))
+}
+
+async fn configure_windows_sandbox() -> Result<Json<WindowsSandboxSetupStatus>, ApiError> {
+    let status = tokio::task::spawn_blocking(setup_windows_sandbox)
+        .await
+        .map_err(|error| ApiError::internal(format!("sandbox setup task failed: {error}")))?
+        .map_err(|error| ApiError::internal(format!("sandbox setup failed: {error:#}")))?;
+    Ok(Json(status))
+}
+
+async fn remove_windows_sandbox_configuration() -> Result<Json<WindowsSandboxSetupStatus>, ApiError>
+{
+    let status = tokio::task::spawn_blocking(remove_windows_sandbox)
+        .await
+        .map_err(|error| ApiError::internal(format!("sandbox removal task failed: {error}")))?
+        .map_err(|error| ApiError::internal(format!("sandbox removal failed: {error:#}")))?;
+    Ok(Json(status))
 }
 
 async fn update_settings(
@@ -9459,6 +9491,9 @@ async fn generate_context_summary(
         match observation {
             ProviderTransportEvent::Retry {
                 attempt,
+                retry_kind,
+                retry_index,
+                retry_limit,
                 reason,
                 body,
             } => publish_payload(
@@ -9469,6 +9504,9 @@ async fn generate_context_summary(
                     request_id,
                     round: 0,
                     attempt,
+                    retry_kind,
+                    retry_index,
+                    retry_limit,
                     reason,
                     body,
                 },

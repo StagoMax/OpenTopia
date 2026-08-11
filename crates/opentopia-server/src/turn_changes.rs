@@ -9,8 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 use tokio::process::Command;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
+use tracing::info;
 use uuid::Uuid;
 
 const MAX_MERGE_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -90,6 +92,12 @@ struct RepoContext {
 struct TreeEntry {
     mode: String,
     oid: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoredPathMode {
+    Skip,
+    Include,
 }
 
 #[derive(Debug)]
@@ -217,6 +225,7 @@ impl TurnChangeManager {
         turn_id: Uuid,
         changed_paths: Option<&[PathBuf]>,
     ) -> anyhow::Result<TurnChangeSet> {
+        let started = Instant::now();
         let mut change_set = self
             .store
             .get_turn_change_set(turn_id)?
@@ -233,6 +242,11 @@ impl TurnChangeManager {
             change_set.error = None;
             change_set.finalized_at = Some(Utc::now());
             self.store.upsert_turn_change_set(&change_set)?;
+            info!(
+                %turn_id,
+                elapsed_ms = elapsed_millis(started),
+                "turn change capture finalized without reported writes"
+            );
             return Ok(change_set);
         }
         let result = async {
@@ -241,14 +255,24 @@ impl TurnChangeManager {
                 .before_tree
                 .as_deref()
                 .context("before tree is unavailable")?;
+            let allowed = changed_paths
+                .map(|paths| normalized_changed_paths(&change_set, paths))
+                .unwrap_or_default();
             let reference = turn_snapshot_ref(turn_id, "after");
-            let after_tree = capture_tree(&repo, Some(&reference)).await?;
+            let after_tree = if changed_paths.is_some() {
+                capture_tree_for_paths(
+                    &repo,
+                    before_tree,
+                    &allowed,
+                    IgnoredPathMode::Skip,
+                    Some(&reference),
+                )
+                .await?
+            } else {
+                capture_tree(&repo, Some(&reference)).await?
+            };
             let mut files = diff_trees(&repo, before_tree, &after_tree).await?;
-            if let Some(changed_paths) = changed_paths {
-                let allowed = changed_paths
-                    .iter()
-                    .filter_map(|path| normalize_reported_change_path(&change_set, path))
-                    .collect::<Vec<_>>();
+            if changed_paths.is_some() {
                 files.retain(|file| {
                     file.old_path
                         .iter()
@@ -284,12 +308,32 @@ impl TurnChangeManager {
             }
         }
         self.store.upsert_turn_change_set(&change_set)?;
+        info!(
+            %turn_id,
+            elapsed_ms = elapsed_millis(started),
+            reported_paths = changed_paths.map_or(0, <[PathBuf]>::len),
+            captured_files = change_set.files.len(),
+            status = ?change_set.status,
+            "turn change capture finalized"
+        );
         Ok(change_set)
     }
 
     pub async fn preview_undo(&self, change_set: TurnChangeSet) -> anyhow::Result<TurnUndoPreview> {
-        let _guard = self.lock_workspace(&change_set.workspace_root).await;
-        Ok(self.build_undo_plan(change_set).await?.preview)
+        let started = Instant::now();
+        let turn_id = change_set.turn_id;
+        // Preview is read-only and undo rebuilds the plan under the exclusive
+        // lock, so active turns do not need to block this dialog from opening.
+        let _guard = self.lock_workspace_shared(&change_set.workspace_root).await;
+        let preview = self.build_undo_plan(change_set).await?.preview;
+        info!(
+            %turn_id,
+            elapsed_ms = elapsed_millis(started),
+            files = preview.change_set.files.len(),
+            conflicts = preview.conflicts.len(),
+            "turn undo preview built"
+        );
+        Ok(preview)
     }
 
     pub async fn preview_file_diff(
@@ -397,6 +441,8 @@ impl TurnChangeManager {
     }
 
     pub async fn undo(&self, change_set: TurnChangeSet) -> anyhow::Result<TurnUndoResult> {
+        let started = Instant::now();
+        let turn_id = change_set.turn_id;
         let _guard = self.lock_workspace(&change_set.workspace_root).await;
         let plan = self.build_undo_plan(change_set).await?;
         if !plan.preview.can_undo {
@@ -425,6 +471,12 @@ impl TurnChangeManager {
             .store
             .mark_turn_change_set_reverted(plan.preview.turn_id, Utc::now())?
             .context("turn change set disappeared after undo")?;
+        info!(
+            %turn_id,
+            elapsed_ms = elapsed_millis(started),
+            files = plan.actions.len(),
+            "turn changes undone"
+        );
         Ok(TurnUndoResult {
             applied: true,
             files_changed: plan.actions.len(),
@@ -453,15 +505,32 @@ impl TurnChangeManager {
         }
 
         let repo = repo_from_change_set(&change_set)?;
-        let current_tree = capture_tree(&repo, None).await?;
         let mut actions = Vec::new();
         let mut observed = BTreeMap::new();
 
         if conflicts.is_empty() {
+            let after_tree = change_set
+                .after_tree
+                .as_deref()
+                .context("after-turn tree is unavailable")?;
+            let workspace_paths = change_set_workspace_paths(&change_set);
+            let current_tree = capture_tree_for_paths(
+                &repo,
+                after_tree,
+                &workspace_paths,
+                IgnoredPathMode::Include,
+                None,
+            )
+            .await?;
+            let repo_paths = workspace_paths
+                .iter()
+                .map(|path| repo_path(&repo, path))
+                .collect::<Vec<_>>();
+            let current_entries = tree_entries(&repo.repo_root, &current_tree, &repo_paths).await?;
             for file in &change_set.files {
                 plan_file_undo(
                     &repo,
-                    &current_tree,
+                    &current_entries,
                     file,
                     &mut actions,
                     &mut observed,
@@ -491,7 +560,7 @@ impl TurnChangeManager {
 
 async fn plan_file_undo(
     repo: &RepoContext,
-    current_tree: &str,
+    current_entries: &BTreeMap<String, TreeEntry>,
     change: &TurnFileChange,
     actions: &mut Vec<UndoAction>,
     observed: &mut BTreeMap<String, Option<TreeEntry>>,
@@ -500,12 +569,12 @@ async fn plan_file_undo(
     let old_repo_path = change.old_path.as_ref().map(|path| repo_path(repo, path));
     let new_repo_path = change.new_path.as_ref().map(|path| repo_path(repo, path));
     let old_current = match old_repo_path.as_deref() {
-        Some(path) => Some((path, tree_entry(&repo.repo_root, current_tree, path).await?)),
+        Some(path) => Some((path, current_entries.get(path).cloned())),
         None => None,
     };
     let new_current = match new_repo_path.as_deref() {
         Some(path) if Some(path) != old_repo_path.as_deref() => {
-            Some((path, tree_entry(&repo.repo_root, current_tree, path).await?))
+            Some((path, current_entries.get(path).cloned()))
         }
         Some(path) => old_current.as_ref().map(|(_, entry)| (path, entry.clone())),
         None => None,
@@ -812,6 +881,34 @@ fn normalize_reported_change_path(change_set: &TurnChangeSet, reported: &Path) -
         .map(|relative| PathBuf::from(&reported[reported.len() - relative.len()..]))
 }
 
+fn normalized_changed_paths(change_set: &TurnChangeSet, reported: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = BTreeMap::new();
+    for path in reported {
+        let Some(path) = normalize_reported_change_path(change_set, path) else {
+            continue;
+        };
+        if validate_workspace_relative_path(&path).is_err() {
+            continue;
+        }
+        let key = comparable_path_text(&normalized_path_text(&path));
+        paths.entry(key).or_insert(path);
+    }
+    paths.into_values().collect()
+}
+
+fn change_set_workspace_paths(change_set: &TurnChangeSet) -> Vec<PathBuf> {
+    let mut paths = BTreeMap::new();
+    for path in change_set
+        .files
+        .iter()
+        .flat_map(|file| file.old_path.iter().chain(file.new_path.iter()))
+    {
+        let key = comparable_path_text(&normalized_path_text(path));
+        paths.entry(key).or_insert_with(|| path.clone());
+    }
+    paths.into_values().collect()
+}
+
 fn same_change_path(left: &Path, right: &Path) -> bool {
     comparable_path_text(&normalized_path_text(left))
         == comparable_path_text(&normalized_path_text(right))
@@ -883,6 +980,110 @@ async fn capture_tree(repo: &RepoContext, reference: Option<&str>) -> anyhow::Re
     let _ = tokio::fs::remove_file(&temp_index).await;
     let _ = tokio::fs::remove_file(temp_index.with_extension("lock")).await;
     result
+}
+
+async fn capture_tree_for_paths(
+    repo: &RepoContext,
+    base_tree: &str,
+    workspace_paths: &[PathBuf],
+    ignored_path_mode: IgnoredPathMode,
+    reference: Option<&str>,
+) -> anyhow::Result<String> {
+    let temp_index = std::env::temp_dir().join(format!("opentopia-index-{}", Uuid::new_v4()));
+    let result = async {
+        run_git_strings(
+            &repo.repo_root,
+            &["read-tree".to_string(), base_tree.to_string()],
+            Some(&temp_index),
+        )
+        .await?;
+
+        let candidates = workspace_paths
+            .iter()
+            .map(|path| {
+                validate_workspace_relative_path(path)?;
+                anyhow::Ok((path, repo_path(repo, path)))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let candidate_repo_paths = candidates
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        let base_entries = tree_entries(&repo.repo_root, base_tree, &candidate_repo_paths).await?;
+        let mut repo_paths = Vec::new();
+        for (workspace_path, repo_path) in candidates {
+            let exists =
+                match tokio::fs::symlink_metadata(repo.workspace_root.join(workspace_path)).await {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                };
+            let existed_in_base = base_entries.contains_key(&repo_path);
+            if exists
+                && !existed_in_base
+                && ignored_path_mode == IgnoredPathMode::Skip
+                && git_path_is_ignored(&repo.repo_root, &repo_path).await?
+            {
+                continue;
+            }
+            if exists || existed_in_base {
+                repo_paths.push(repo_path);
+            }
+        }
+        for paths in repo_paths.chunks(64) {
+            let mut args = vec![
+                "--literal-pathspecs".to_string(),
+                "add".to_string(),
+                "-A".to_string(),
+            ];
+            if ignored_path_mode == IgnoredPathMode::Include {
+                args.push("--force".to_string());
+            }
+            args.push("--".to_string());
+            args.extend(paths.iter().cloned());
+            run_git_strings(&repo.repo_root, &args, Some(&temp_index)).await?;
+        }
+
+        let output = git_output(&repo.repo_root, &["write-tree"], Some(&temp_index)).await?;
+        ensure_git_success(&output, "git write-tree")?;
+        let tree = String::from_utf8(output.stdout)?.trim().to_string();
+        if let Some(reference) = reference {
+            run_git_strings(
+                &repo.repo_root,
+                &[
+                    "update-ref".to_string(),
+                    reference.to_string(),
+                    tree.clone(),
+                ],
+                None,
+            )
+            .await?;
+        }
+        anyhow::Ok(tree)
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&temp_index).await;
+    let _ = tokio::fs::remove_file(temp_index.with_extension("lock")).await;
+    result
+}
+
+async fn git_path_is_ignored(repo_root: &Path, path: &str) -> anyhow::Result<bool> {
+    let args = vec![
+        "check-ignore".to_string(),
+        "--quiet".to_string(),
+        "--".to_string(),
+        path.to_string(),
+    ];
+    let output = git_output_strings(repo_root, &args, None).await?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            ensure_git_success(&output, "git check-ignore")?;
+            unreachable!("a successful git check-ignore exits with status zero")
+        }
+    }
 }
 
 async fn diff_trees(
@@ -1055,6 +1256,43 @@ async fn tree_entry(repo_root: &Path, tree: &str, path: &str) -> anyhow::Result<
     Ok(Some(TreeEntry { mode, oid }))
 }
 
+async fn tree_entries(
+    repo_root: &Path,
+    tree: &str,
+    paths: &[String],
+) -> anyhow::Result<BTreeMap<String, TreeEntry>> {
+    let mut entries = BTreeMap::new();
+    for paths in paths.chunks(64) {
+        let mut args = vec![
+            "--literal-pathspecs".to_string(),
+            "ls-tree".to_string(),
+            "-z".to_string(),
+            tree.to_string(),
+            "--".to_string(),
+        ];
+        args.extend(paths.iter().cloned());
+        let output = git_output_strings(repo_root, &args, None).await?;
+        ensure_git_success(&output, "git ls-tree")?;
+        for record in output.stdout.split(|byte| *byte == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let tab = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .context("invalid git ls-tree output")?;
+            let header = String::from_utf8(record[..tab].to_vec())?;
+            let path = String::from_utf8(record[tab + 1..].to_vec())?;
+            let mut fields = header.split_ascii_whitespace();
+            let mode = fields.next().context("tree mode missing")?.to_string();
+            let _kind = fields.next().context("tree object type missing")?;
+            let oid = fields.next().context("tree object ID missing")?.to_string();
+            entries.insert(path, TreeEntry { mode, oid });
+        }
+    }
+    Ok(entries)
+}
+
 async fn read_blob(repo_root: &Path, path: &str, oid: &str) -> anyhow::Result<Vec<u8>> {
     let filtered = git_output_strings(
         repo_root,
@@ -1122,10 +1360,26 @@ async fn merge_contents(
 }
 
 async fn verify_observed_entries(plan: &UndoPlan) -> anyhow::Result<Option<TurnUndoConflict>> {
-    let tree = capture_tree(&plan.repo, None).await?;
+    let after_tree = plan
+        .preview
+        .change_set
+        .after_tree
+        .as_deref()
+        .context("after-turn tree is unavailable")?;
+    let workspace_paths = change_set_workspace_paths(&plan.preview.change_set);
+    let tree = capture_tree_for_paths(
+        &plan.repo,
+        after_tree,
+        &workspace_paths,
+        IgnoredPathMode::Include,
+        None,
+    )
+    .await?;
+    let repo_paths = plan.observed.keys().cloned().collect::<Vec<_>>();
+    let entries = tree_entries(&plan.repo.repo_root, &tree, &repo_paths).await?;
     for (path, expected) in &plan.observed {
-        let actual = tree_entry(&plan.repo.repo_root, &tree, path).await?;
-        if &actual != expected {
+        let actual = entries.get(path);
+        if actual != expected.as_ref() {
             return Ok(Some(TurnUndoConflict {
                 path: workspace_relative_path(&plan.repo, path).ok(),
                 kind: TurnUndoConflictKind::WorkspaceChanged,
@@ -1410,6 +1664,10 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
 fn file_conflict(
     path: &Path,
     kind: TurnUndoConflictKind,
@@ -1550,6 +1808,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn undo_preview_does_not_wait_for_an_active_turn_in_the_same_workspace() {
+        let repo = TestRepo::new();
+        repo.write("sample.txt", "before\n");
+        repo.commit_all();
+        let (manager, store, thread_id) = manager(&repo);
+        let turn_id = insert_turn(&store, thread_id);
+        manager
+            .begin_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        repo.write("sample.txt", "after\n");
+        let change_set = manager.finalize_capture(turn_id).await.unwrap();
+
+        let _active_turn = manager.lock_workspace_shared(&repo.root).await;
+        let preview = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.preview_undo(change_set),
+        )
+        .await
+        .expect("a read-only undo preview should not wait for active turns")
+        .unwrap();
+        assert!(preview.can_undo, "conflicts: {:?}", preview.conflicts);
+    }
+
+    #[tokio::test]
     async fn scoped_finalize_ignores_unreported_concurrent_workspace_edits() {
         let repo = TestRepo::new();
         repo.write("owned.txt", "before\n");
@@ -1575,6 +1858,18 @@ mod tests {
             changes.files[0].new_path.as_deref(),
             Some(Path::new("owned.txt"))
         );
+        let repo_context = repo_from_change_set(&changes).unwrap();
+        let before_tree = changes.before_tree.as_deref().unwrap();
+        let after_tree = changes.after_tree.as_deref().unwrap();
+        assert_eq!(
+            tree_entry(&repo_context.repo_root, before_tree, "unrelated.txt")
+                .await
+                .unwrap(),
+            tree_entry(&repo_context.repo_root, after_tree, "unrelated.txt")
+                .await
+                .unwrap(),
+            "the scoped after snapshot must not rescan unrelated workspace edits"
+        );
     }
 
     #[tokio::test]
@@ -1598,6 +1893,63 @@ mod tests {
         assert_eq!(changes.status, TurnChangeSetStatus::Empty);
         assert!(changes.files.is_empty());
         assert_eq!(changes.before_tree, changes.after_tree);
+    }
+
+    #[tokio::test]
+    async fn scoped_finalize_skips_a_reported_ignored_file() {
+        let repo = TestRepo::new();
+        repo.write(".gitignore", "ignored.txt\n");
+        repo.commit_all();
+        let (manager, store, thread_id) = manager(&repo);
+        let turn_id = insert_turn(&store, thread_id);
+
+        manager
+            .begin_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        repo.write("ignored.txt", "generated output\n");
+
+        let changes = manager
+            .finalize_capture_for_paths(turn_id, &[PathBuf::from("ignored.txt")])
+            .await
+            .unwrap();
+        assert_eq!(
+            changes.status,
+            TurnChangeSetStatus::Empty,
+            "capture error: {:?}",
+            changes.error
+        );
+        assert!(changes.files.is_empty());
+        assert_eq!(changes.before_tree, changes.after_tree);
+        assert_eq!(repo.read("ignored.txt"), "generated output\n");
+    }
+
+    #[tokio::test]
+    async fn undo_preview_detects_an_ignored_file_occupying_a_deleted_path() {
+        let repo = TestRepo::new();
+        repo.write("sample.txt", "tracked before\n");
+        repo.commit_all();
+        repo.write(".gitignore", "sample.txt\n");
+        repo.commit_all();
+        let (manager, store, thread_id) = manager(&repo);
+        let turn_id = insert_turn(&store, thread_id);
+
+        manager
+            .begin_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        fs::remove_file(repo.root.join("sample.txt")).unwrap();
+        let change_set = manager.finalize_capture(turn_id).await.unwrap();
+        repo.write("sample.txt", "later ignored contents\n");
+
+        let preview = manager.preview_undo(change_set).await.unwrap();
+        assert!(!preview.can_undo);
+        assert_eq!(preview.conflicts.len(), 1);
+        assert_eq!(
+            preview.conflicts[0].kind,
+            TurnUndoConflictKind::PathConflict
+        );
+        assert_eq!(repo.read("sample.txt"), "later ignored contents\n");
     }
 
     #[tokio::test]

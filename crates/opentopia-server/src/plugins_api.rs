@@ -482,7 +482,10 @@ fn permission_key(permission: &PluginPermission) -> String {
 fn host_capabilities() -> Vec<String> {
     [
         "workspace.files.v1",
+        "artifact.runtime.v1",
         "artifact.preview.v1",
+        "nativeTool.pdf.v1",
+        "nativeTool.document.v1",
         "nativeTool.spreadsheet.v1",
         "browser.runtime.v1",
         "policy.network.v1",
@@ -926,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_plugins_keep_privileged_surfaces_off_and_bootstrap_spreadsheet_permissions() {
+    fn bundled_plugins_keep_privileged_surfaces_off_and_activate_authorized_office_tools() {
         let workspace = TestWorkspace::new();
         let store = SqliteSessionStore::open(":memory:").expect("open store");
         let thread = store
@@ -935,15 +938,25 @@ mod tests {
         let plugins = discover_plugins(Some(&workspace.0));
         let spreadsheet = plugins
             .iter()
-            .find(|plugin| plugin.name == "spreadsheet")
+            .find(|plugin| plugin.name == "spreadsheet" && plugin.source == PluginSource::Bundled)
             .expect("spreadsheet bundled plugin");
+        let pdf = plugins
+            .iter()
+            .find(|plugin| plugin.name == "pdf" && plugin.source == PluginSource::Bundled)
+            .expect("PDF bundled plugin");
+        let documents = plugins
+            .iter()
+            .find(|plugin| plugin.name == "documents" && plugin.source == PluginSource::Bundled)
+            .expect("Documents bundled plugin");
         let browser = plugins
             .iter()
-            .find(|plugin| plugin.name == "browser-automation")
+            .find(|plugin| {
+                plugin.name == "browser-automation" && plugin.source == PluginSource::Bundled
+            })
             .expect("browser bundled plugin");
         let computer = plugins
             .iter()
-            .find(|plugin| plugin.name == "computer-use")
+            .find(|plugin| plugin.name == "computer-use" && plugin.source == PluginSource::Bundled)
             .expect("computer bundled plugin");
 
         assert!(spreadsheet.default_enabled);
@@ -959,7 +972,7 @@ mod tests {
                     CapabilityUnavailableReason::MissingPermissions(_)
                 )
         }));
-        for plugin in [browser, computer] {
+        for plugin in [browser, computer, pdf, documents] {
             assert!(snapshot.unavailable.iter().any(|item| {
                 item.contribution.contribution.plugin_id == plugin.id
                     && matches!(item.reason, CapabilityUnavailableReason::Disabled)
@@ -983,6 +996,25 @@ mod tests {
             spreadsheet_kinds,
             BTreeSet::from([ContributionKind::NativeTool, ContributionKind::Previewer])
         );
+
+        for plugin in [pdf, documents] {
+            store
+                .set_plugin_activation(&plugin.id, &PluginControlScope::global(), true)
+                .expect("enable Office plugin");
+            set_all_permissions(&store, plugin, PluginPermissionGrantStatus::Granted);
+        }
+        let snapshot =
+            capability_snapshot_for_thread(&store, &thread).expect("Office capability snapshot");
+        for plugin in [pdf, documents] {
+            assert!(
+                snapshot.active.iter().any(|item| {
+                    item.contribution.plugin_id == plugin.id
+                        && item.contribution.kind == ContributionKind::NativeTool
+                }),
+                "authorized Office plugin {} was not active: {snapshot:#?}",
+                plugin.id
+            );
+        }
     }
 
     #[test]
