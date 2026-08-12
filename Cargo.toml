@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://example.invalid/opentopia"
+repository = "https://github.com/StagoMax/OpenTopia"
 
 [workspace.dependencies]
 anyhow = "1.0"

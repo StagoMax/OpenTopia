@@ -1,338 +1,193 @@
 # OpenTopia
 
-OpenTopia is a local-first AI Coding + Work Agent MVP.
+<div align="center">
+  <p><strong>A local-first desktop workbench for AI-assisted coding and long-running work.</strong></p>
+  <p>
+    Keep the repository, terminal, review surface, approvals, and execution policy
+    in one inspectable workspace.
+  </p>
+  <p>
+    <a href="#quick-start"><strong>Run from source</strong></a>
+    &nbsp;&middot;&nbsp;
+    <a href="docs/architecture-detailed.md">Architecture</a>
+    &nbsp;&middot;&nbsp;
+    <a href="docs/implementation-backlog.md">Roadmap</a>
+    &nbsp;&middot;&nbsp;
+    <a href="https://github.com/StagoMax/OpenTopia/issues">Issues</a>
+  </p>
+  <p>
+    <img alt="Project status: pre-release" src="https://img.shields.io/badge/status-pre--release-b7791f?style=flat-square">
+    <img alt="Platform: Windows first" src="https://img.shields.io/badge/platform-Windows%20first-2563eb?style=flat-square">
+    <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-087b52?style=flat-square"></a>
+  </p>
+</div>
 
-This repository currently contains:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/opentopia-workbench-dark.png">
+  <img src="docs/assets/opentopia-workbench-light.png" alt="OpenTopia desktop workbench showing the workspace sidebar, task surface, environment panel, and composer" width="1536">
+</picture>
 
-- Rust workspace for the agent core, local server, and CLI.
-- Electron + React desktop workbench.
-- SQLite-backed thread and event model.
-- OpenAI-compatible provider support with mock fallback.
-- Built-in deterministic tools: `list_files`, `read_file`, `write_file`, `search`, `shell`, `git_diff`, `apply_patch`.
-- Approval-needed flow for dangerous actions, with allow-once/deny UI.
-- Electron dev shell can start the Rust server automatically when Rust is installed.
-- Desktop workspace picker with recent workspaces and "open path" bridge APIs.
-- Settings persistence for provider URL/model/API-key env name/permission mode.
-- Workbench skeleton APIs and panels for files, read-only preview, git diff, MCP config, trajectory export, and local sandbox status.
-- One long-lived PTY shell per thread with xterm.js input/output, resize, close,
-  SSE replay, process-tree cleanup, and SQLite terminal history.
-- Real provider-backed context summaries that are persisted and injected into later turns.
-- OS sandbox adapters for Linux bubblewrap, macOS Seatbelt, and OpenTopia's
-  Windows dedicated-user/restricted-token dual backend. Packaged Windows builds
-  default to strict mode.
+<p align="center"><sub>Actual OpenTopia workbench in light and dark appearance.</sub></p>
 
-See `docs/source-adaptation-map.md` for the concrete source projects and modules this MVP borrows from.
+## Why OpenTopia
 
-## Development
+OpenTopia is built for work that goes beyond a single chat response:
 
-Install prerequisites:
+- **One workbench, not a pile of tabs.** Agent conversation, repository files,
+  Git changes, previews, terminal sessions, and review controls share the same
+  desktop context.
+- **Execution stays explicit.** Dangerous actions can require approval, tool
+  access can be narrowed, and commands run through an operating-system sandbox
+  instead of relying on prompt instructions alone.
+- **Long-running work remains recoverable.** Threads, events, terminal history,
+  artifacts, and context summaries are persisted locally in SQLite.
 
-- Rust stable toolchain.
-- Node.js 22+.
-- pnpm 10+.
+> [!IMPORTANT]
+> **Local-first is not the same as offline.** Workspace state and execution live
+> on your machine. When you configure a remote model provider, the prompts and
+> context required for that request are sent to the provider you selected.
 
-On Windows, the PowerShell scripts initialize the verified GNU Rust + WinLibs environment. If your execution policy blocks `.ps1` files, use the `.cmd` wrappers.
+## What is working today
+
+| Area | Current capability |
+| --- | --- |
+| Desktop workbench | Electron + React workspace with task history, repository navigation, previews, Git diff review, and an integrated PTY terminal |
+| Agent runtime | Rust agent core with bounded tool loops, persisted event replay, context compaction, plan mode, and multi-agent orchestration |
+| Controlled execution | Read-only, workspace-write, and unrestricted sandbox modes; approval policies; process-tree cleanup; and tool allowlists |
+| Provider choice | OpenAI Responses, OpenAI-compatible Chat Completions, Anthropic Messages, and a deterministic mock provider for local development |
+| Extensibility | Built-in tools plus MCP servers, skills, plugins, agent profiles, and capability projection per thread |
+| Artifacts and interaction | Text, code, image, PDF, and spreadsheet previews; browser automation; and Windows computer-use support |
+
+## Quick start
+
+OpenTopia is currently a **developer preview**. The most reliable way to try it
+is to run the desktop app from source on Windows.
+
+### Prerequisites
+
+- Rust stable toolchain
+- Node.js 22 or newer
+- pnpm 10 or newer
+
+### Run the desktop app
 
 ```powershell
-.\scripts\dev-env.ps1
-# or
-.\scripts\dev-server.cmd
-```
-
-Start the local agent server:
-
-```powershell
-cargo run -p opentopia-server
-# Windows wrapper:
-.\scripts\dev-server.cmd
-```
-
-Start the desktop UI:
-
-```powershell
+git clone https://github.com/StagoMax/OpenTopia.git
+cd OpenTopia
 pnpm install
 pnpm dev:desktop
 ```
 
-`pnpm dev:desktop` opens an isolated **OpenTopia Dev** instance backed by the
-Vite development server. Changes under `apps/desktop/src` are applied with hot
-module replacement, so rebuilding or reinstalling the desktop package is not
-required. The installed OpenTopia app may remain open at the same time.
+The Electron development shell starts the local Rust server automatically. On
+first launch, select a workspace and use the built-in mock provider, or open
+the model and API settings to add and test your own provider endpoint.
 
-Changes to `apps/desktop/electron` or the Rust crates require restarting
-`pnpm dev:desktop` so the Electron main process or local server can restart;
-they still do not require rebuilding the installer.
-The managed development server uses `target/desktop-dev` by default so it can
-run alongside other Cargo-launched OpenTopia servers.
-
-In the desktop UI, use **Open Workspace** in the left sidebar to pick a
-directory. New threads are created with the selected `workspaceRoot`; recently
-opened directories are stored in Electron user data and can be selected again
-from **Recent**.
-
-On Windows PowerShell, if `pnpm` or `npm` is blocked by execution policy, use the `.cmd` shim:
+If PowerShell blocks the `pnpm` script shim, use `pnpm.cmd` instead:
 
 ```powershell
 pnpm.cmd install
 pnpm.cmd dev:desktop
 ```
 
-Optional provider configuration:
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    Desktop["Electron + React workbench"] --> Server["Local Rust server"]
+    Server --> Store["SQLite threads, events, artifacts"]
+    Server --> Core["Agent core"]
+    Core --> Provider["Configured model provider"]
+    Core --> Policy["Tool policy + approvals"]
+    Core --> Extensions["Built-ins + MCP + plugins + skills"]
+    Policy --> Sandbox["OS sandbox + process supervision"]
+    Sandbox --> Workspace["Workspace, terminal, browser, computer"]
+```
+
+The desktop renderer never receives stored provider secrets. Electron stores an
+optional key through `safeStorage` and injects it only into the local server
+process when needed. See the [detailed architecture](docs/architecture-detailed.md),
+[sandbox design](docs/mcp-sandbox-implementation-plan.md), and
+[evaluation system](docs/evaluation-system.md) for the engineering details.
+
+## Project status
+
+OpenTopia is under active development and is not yet a stable end-user release.
+
+- The current preview is Windows-first.
+- A Windows installer can be built locally, but official signed binaries have
+  not been published yet.
+- Configuration, database, plugin, and internal API formats may still change.
+- Use a disposable workspace or version control while evaluating high-risk
+  automation.
+
+The implementation backlog and release gaps are tracked in
+[`docs/implementation-backlog.md`](docs/implementation-backlog.md). Source
+adaptations and upstream influences are documented explicitly in
+[`docs/source-adaptation-map.md`](docs/source-adaptation-map.md).
+
+## Development
+
+### Repository layout
+
+```text
+apps/desktop/                 Electron + React desktop workbench
+crates/opentopia-core/        Agent runtime, tools, policy, and persistence
+crates/opentopia-server/      Local HTTP and event-stream server
+crates/opentopia-cli/         Command-line entry point
+crates/opentopia-windows-sandbox/
+                              Windows sandbox helper
+evaluation/                   Evaluation runner, suites, and result schemas
+scripts/                      Development, packaging, and verification commands
+docs/                         Architecture notes and implementation decisions
+```
+
+### Useful commands
 
 ```powershell
-$env:OPENAI_API_KEY="sk-..."
-$env:OPENTOPIA_MODEL="gpt-4.1-mini"
+# Start the desktop development environment
+pnpm dev:desktop
+
+# Start only the local Rust server
+cargo run -p opentopia-server
+
+# Run the repository checks
+pnpm check
+
+# Build a Windows installer
+.\scripts\build-desktop.ps1
+```
+
+For an explicit model configuration, set the provider variables before starting
+the app:
+
+```powershell
+$env:OPENTOPIA_API_KEY="sk-..."
 $env:OPENTOPIA_OPENAI_BASE_URL="https://api.openai.com/v1"
-# Optional Codex-style per-Turn rollout budget. Omit to leave it disabled.
-$env:OPENTOPIA_ROLLOUT_TOKEN_LIMIT="100000"
-$env:OPENTOPIA_ROLLOUT_OUTPUT_WEIGHT="1.0"
-$env:OPENTOPIA_ROLLOUT_INPUT_WEIGHT="1.0"
-cargo run -p opentopia-server -- --permission auto
+$env:OPENTOPIA_MODEL="your-model"
+pnpm dev:desktop
 ```
 
-The enterprise Flow surface is enabled by default. A server deployment can
-explicitly disable it (it is not a writable client preference):
+Do not commit API keys, signing identities, or provider credentials. Additional
+development and release commands are documented next to the relevant subsystem
+under [`docs/`](docs/).
 
-```powershell
-$env:OPENTOPIA_ENTERPRISE_ENABLED="false"
-```
+## Engineering documentation
 
-With the gate enabled, Flow sessions expose the Agent template control plane
-in the right review rail. Template updates create a new immutable version;
-publishing records owner approval and requires an explicit capability-expansion
-decision. A published version can be instantiated more than once with isolated
-state, while the instance bound to a Flow thread deterministically narrows the
-Harness tool, Skill, plugin, MCP, workspace, resource, and model projection.
+- [Detailed architecture](docs/architecture-detailed.md)
+- [Current agent-loop architecture](docs/agent-loop-architecture-current.md)
+- [Context compaction design](docs/context-compaction-design.md)
+- [Browser and computer-use design](docs/browser-computer-use-technical-design.md)
+- [Evaluation system](docs/evaluation-system.md)
+- [Harness and plugin boundary](docs/harness-plugin-boundary-design-zh-cn.md)
+- [Source adaptation map](docs/source-adaptation-map.md)
 
-Sandbox and approval are configured independently. The desktop defaults to a
-network-enabled, workspace-write sandbox; development may explicitly fall
-back when the platform helper is unavailable, while packaged builds fail closed:
+## Contributing
 
-```powershell
-$env:OPENTOPIA_SANDBOX_MODE="workspace-write" # read-only | workspace-write | danger-full-access
-$env:OPENTOPIA_SANDBOX_ENFORCEMENT="enforce"  # disabled | best-effort | enforce
-$env:OPENTOPIA_SANDBOX_NETWORK="deny" # deny (default) | allow | inherit
-$env:OPENTOPIA_SANDBOX_WRITABLE_ROOTS="D:\shared"
-$env:OPENTOPIA_WINDOWS_SANDBOX="auto" # auto | elevated | unelevated
-```
+Issues and pull requests are welcome. Because the project is still pre-release,
+please open an issue before starting a large architectural change. Keep changes
+scoped, include proportional tests, and preserve the sandbox and approval
+boundaries described in the architecture documentation.
 
-A trusted launcher may optionally restrict one server process to a fixed tool
-surface. This is a general runtime policy and is never accepted from chat input:
+## License
 
-```powershell
-$env:OPENTOPIA_TOOL_ALLOWLIST="read_file,search"
-```
-
-Windows uses OpenTopia's first-party dual backend. `elevated` runs commands as
-dedicated offline/online local users; the offline identity is blocked by
-persistent WFP rules. `unelevated` is the restricted-token fallback and
-intentionally rejects guarantees it cannot enforce, such as an
-authoritative per-path deny-read rule or offline networking. `auto` uses the
-dedicated-user backend after setup and otherwise falls back to a
-`WRITE_RESTRICTED` token for network-enabled requests. After elevated setup,
-forcing `unelevated` is rejected so a host-identity child cannot access the
-broker's stored credentials; use `auto` or `elevated`.
-
-Run elevated setup once from the built helper (Windows will request UAC):
-
-```powershell
-target\release\opentopia-sandbox.exe setup
-```
-
-The broker stores DPAPI-protected credentials, WFP configuration, a versioned
-ACL ledger, and daily stage logs under `%LOCALAPPDATA%\OpenTopia\sandbox`.
-Persistent workspace grants avoid rewriting ACLs for every tool invocation.
-Detach a workspace and revoke the sandbox-user ACEs recorded for it with:
-
-```powershell
-target\release\opentopia-sandbox.exe cleanup --workspace J:\Project\example
-```
-
-All command sources use the same structured execution contract: resolved
-runtime roots, explicit environment/stdin policy, filesystem and network
-requirements, startup/execution/termination deadlines, Job Object process-tree
-ownership, and staged failures. Tool adapters only supply compatibility
-details (for example, headless Git or `PowerShell -NoProfile`); containment
-does not depend on recognizing a particular tool.
-
-The existing `--permission`/desktop permission control remains the approval and
-tool-policy layer. Selecting a non-interactive approval mode does not disable the
-sandbox; unrestricted execution requires the explicit `danger-full-access`
-sandbox mode.
-
-OpenTopia can also reuse the existing env file from the sibling credit-review project:
-
-```powershell
-$env:OPENTOPIA_ENV_FILE="J:\Project\信贷审核助手\.env"
-.\scripts\dev-server.cmd
-```
-
-When `OPENTOPIA_ENV_FILE` is not set, the Windows dev scripts and Electron dev shell automatically check `J:\Project\信贷审核助手\.env`. The following aliases are supported without copying secrets:
-
-- `CREDIT_REVIEW_LLM_API_KEY` -> `OPENTOPIA_API_KEY`
-- `CREDIT_REVIEW_LLM_BASE_URL` -> `OPENTOPIA_OPENAI_BASE_URL`
-- `CREDIT_REVIEW_LLM_MODEL` -> `OPENTOPIA_MODEL`
-- `AUDIT_COPILOT_LLM_API_KEY` -> `OPENTOPIA_API_KEY`
-- `AUDIT_COPILOT_LLM_BASE_URL` -> `OPENTOPIA_OPENAI_BASE_URL`
-- `AUDIT_COPILOT_LLM_MODEL` -> `OPENTOPIA_MODEL`
-
-Desktop builds can also store one provider API key through Electron
-`safeStorage`. The renderer process can list only metadata such as
-configured status, safeStorage availability, storage backend, and the
-`secrets.json` storage path under Electron `userData`; it cannot read the
-secret value. When the bundled server is spawned by Electron, the main process
-decrypts that key and injects it as `OPENTOPIA_API_KEY` only if an explicit
-environment or `.env` value has not already configured the provider key.
-
-Workspace actions are exposed as first-class UI and HTTP APIs rather than
-special messages in the agent conversation. Slash-prefixed text is rejected at
-the message API, so it cannot accidentally bypass the model/tool permission
-flow. The deterministic workspace search endpoint is
-`POST /api/threads/{thread_id}/workspace/search`; it uses the same sandboxed
-`SearchTool` as the agent and is suitable for integration checks without a
-provider request.
-
-Build a desktop installer after installing Rust:
-
-```powershell
-.\scripts\build-desktop.ps1
-# or, if PowerShell scripts are blocked:
-.\scripts\build-desktop.cmd
-```
-
-The desktop build script is the release packaging entry point for a clean
-machine:
-
-```powershell
-pnpm.cmd install --frozen-lockfile
-.\scripts\dev-env.ps1
-.\scripts\build-desktop.ps1
-```
-
-It builds `opentopia-server` and `opentopia-windows-sandbox` together, verifies
-the helper protocol handshake, and atomically publishes a hash-verified runtime
-bundle under `apps\desktop\.runtime-stage` before running `electron-builder`.
-The desktop refuses to launch a packaged server/helper pair whose manifest,
-hashes, or sandbox protocol do not match. Use `-StageOnly` to build and verify
-the runtime bundle without invoking Electron packaging.
-
-For an offline or locked-directory diagnostic build, the packaging script also
-accepts `OPENTOPIA_ELECTRON_DIST` (an already extracted Electron distribution)
-and `OPENTOPIA_DESKTOP_OUTPUT_DIR`. ASAR integrity and executable metadata remain
-enabled unless the smoke-only `OPENTOPIA_DISABLE_ASAR_INTEGRITY=true` or
-`OPENTOPIA_SKIP_EXE_EDIT=true` overrides are explicitly set.
-
-Packaged builds store SQLite under Electron `userData` rather than beside the
-installed executable, so installs under `Program Files` do not require write access.
-
-Code-signing and publish variables are intentionally placeholders until a real
-release identity is available:
-
-```powershell
-# Unsigned local build:
-$env:CSC_IDENTITY_AUTO_DISCOVERY="false"
-
-# Windows signing, when available:
-$env:CSC_LINK="C:\path\to\codesign.pfx"
-$env:CSC_KEY_PASSWORD="..."
-
-# GitHub draft release publishing:
-$env:GH_TOKEN="..."
-
-# macOS signing/notarization, from macOS runners:
-$env:APPLE_ID="..."
-$env:APPLE_APP_SPECIFIC_PASSWORD="..."
-$env:APPLE_TEAM_ID="..."
-```
-
-Do not commit signing assets, tokens, or provider keys.
-
-Run the full MVP check:
-
-```powershell
-.\scripts\check.ps1
-# or, if PowerShell scripts are blocked:
-.\scripts\check.cmd
-```
-
-Run the local server smoke test:
-
-```powershell
-.\scripts\verify-server.cmd
-```
-
-Run the integration smoke test:
-
-```powershell
-.\scripts\verify-integration.cmd
-```
-
-Run the real-provider context compaction smoke test, followed by two local
-structured-delta retention checks (this consumes provider API tokens):
-
-```powershell
-.\scripts\verify-context-summary.cmd
-```
-
-Configure the Electron development profile through `safeStorage`, probe a provider,
-or run the deterministic two-phase long-horizon evaluation without printing the key:
-
-```powershell
-.\scripts\configure-provider-safe-storage.ps1 `
-  -EnvFile "J:\Project\信贷审核助手\.env" `
-  -UserDataDir ".opentopia\preview-user-data" `
-  -Profile AUDIT_COPILOT_LLM
-
-.\scripts\probe-openai-compatible.ps1 `
-  -EnvFile "J:\Project\信贷审核助手\.env" `
-  -Profile AUDIT_COPILOT_LLM `
-  -ExpectedModel glm-5.2
-
-.\scripts\evaluate-long-horizon.ps1 `
-  -EnvFile "J:\Project\信贷审核助手\.env" `
-  -Profile AUDIT_COPILOT_LLM `
-  -ExpectedModel glm-5.2 `
-  -TaskManifest scripts\fixtures\long-horizon\task.json
-
-.\scripts\evaluate-long-horizon-suite.ps1 `
-  -EnvFile "J:\Project\信贷审核助手\.env" `
-  -Profile AUDIT_COPILOT_LLM `
-  -ExpectedModel glm-5.2 `
-  -Repetitions 1
-
-.\scripts\evaluate-opentopia-tool-suite.ps1 `
-  -EnvFile "J:\Project\信贷审核助手\.env" `
-  -Profile AUDIT_COPILOT_LLM `
-  -ExpectedModel <configured-model> `
-  -Repetitions 1
-```
-
-Run the native Windows Computer Use fixture only from a dedicated evaluation
-desktop or VM with no unrelated windows, accounts, or personal data. It launches
-a real desktop application and automatically approves only `computer` tool calls:
-
-```powershell
-.\scripts\evaluate-computer-use.ps1 `
-  -EnvFile "J:\path\to\.env" `
-  -Profile AUDIT_COPILOT_LLM `
-  -ExpectedModel glm-5.2 `
-  -IsolatedDesktop
-```
-
-This is an OpenTopia-private fixture runner, not an OSWorld result. Its task
-definitions are under `scripts/fixtures/computer-use/`.
-
-The latest methodology, closure design, and three-task result are documented in
-`docs/evaluations/glm-5.2-long-horizon-2026-07-16.md`. This local harness follows
-SWE-bench/Terminal-Bench principles but is not an official leaderboard score.
-The long-term task taxonomy, metric definitions, release gates, artifact schema,
-and evaluation workflow are specified in `docs/evaluation-system.md`.
-
-The integration smoke test covers settings, workspace tree, search, approval
-persistence, staged/unstaged hunk stage/unstage/discard, one-shot terminal
-history, persistent PTY input/resize/close/history, MCP configuration,
-per-thread MCP enablement, and sandbox status.
-
-The default Windows installer output is
-`apps/desktop/release/OpenTopia-0.1.0-x64.exe`. The unpacked build contains the
-bundled server at `apps/desktop/release/win-unpacked/resources/opentopia-server.exe`.
+OpenTopia is available under the [MIT License](LICENSE).
