@@ -2,8 +2,10 @@ use lopdf::{content, dictionary, Document, Object, Stream};
 use opentopia_core::{
     extract_document_text, extract_pdf_text, inspect_document, inspect_pdf, inspect_plugin,
     validate_document, validate_pdf, ArtifactRuntime, ArtifactRuntimeError, BasicPolicyEngine,
-    ModelContentPart, PermissionMode, ToolCall, ToolContext, ToolRegistry,
+    ContextSourceKind, ContextSourceRef, Message, MessagePart, MessageRole, ModelContentPart,
+    PermissionMode, SessionStore, SqliteSessionStore, ToolCall, ToolContext, ToolRegistry,
 };
+use rust_xlsxwriter::Workbook;
 use serde_json::json;
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -18,12 +20,22 @@ fn bundled_office_plugins_register_independent_native_tools() {
     for (plugin, tool) in [("pdf", "pdf"), ("documents", "document")] {
         let descriptor = inspect_plugin(&plugin_root.join(plugin)).expect("inspect bundled plugin");
         assert!(descriptor.is_compatible(), "{:?}", descriptor.issues);
-        assert_eq!(descriptor.capability_manifest.contributions.len(), 1);
+        assert_eq!(
+            descriptor.capability_manifest.contributions.len(),
+            if plugin == "documents" { 2 } else { 1 }
+        );
         assert!(descriptor
             .capability_manifest
             .contributions
             .iter()
             .any(|contribution| contribution.local_id == tool));
+        if plugin == "documents" {
+            assert!(descriptor
+                .capability_manifest
+                .contributions
+                .iter()
+                .any(|contribution| contribution.local_id == "docx"));
+        }
     }
     let registry = ToolRegistry::with_builtins();
     assert!(registry.get("pdf").is_some());
@@ -121,6 +133,135 @@ async fn native_tools_read_through_the_workspace_environment_and_return_typed_pn
         .expect("execute Document tool");
     assert_eq!(document.metadata["success"], true);
     assert!(document.output.contains("paragraphCount"));
+    std::fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[tokio::test]
+async fn native_office_tools_read_real_thread_attachments_by_id() {
+    let workspace =
+        std::env::temp_dir().join(format!("opentopia-office-attachments-{}", Uuid::new_v4()));
+    std::fs::create_dir(&workspace).expect("create workspace");
+    let fixtures = [
+        (
+            "uploaded.pdf",
+            "application/pdf",
+            sample_pdf("Attached PDF"),
+        ),
+        (
+            "uploaded.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            sample_docx(),
+        ),
+        (
+            "uploaded.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            sample_xlsx(),
+        ),
+    ];
+    let store: Arc<dyn SessionStore> =
+        Arc::new(SqliteSessionStore::open(":memory:").expect("open memory store"));
+    let thread = store
+        .create_thread(Some("office attachments".to_string()), workspace.clone())
+        .expect("create thread");
+    let mut attachment_ids = Vec::new();
+    let mut message = Message::text(thread.id, MessageRole::User, "inspect these files");
+    for (name, content_type, bytes) in fixtures {
+        let id = Uuid::new_v4();
+        let path = workspace.join(name);
+        std::fs::write(&path, &bytes).expect("write attachment fixture");
+        message.parts.push(MessagePart::SourceRef {
+            source: ContextSourceRef {
+                id,
+                path,
+                name: name.to_string(),
+                kind: ContextSourceKind::Document,
+                content_type: content_type.to_string(),
+                bytes: bytes.len() as u64,
+                truncated: false,
+            },
+        });
+        attachment_ids.push(id);
+    }
+    store.append_message(message).expect("persist attachments");
+
+    let policy = Arc::new(BasicPolicyEngine::new(
+        workspace.clone(),
+        PermissionMode::ReadOnly,
+    ));
+    let mut context = ToolContext::local(workspace.clone(), policy);
+    context.store = Some(store.clone());
+    context.thread_id = Some(thread.id);
+    context.artifact_runtime =
+        Arc::new(ArtifactRuntime::default().with_artifact_output_root(workspace.join("artifacts")));
+    let registry = ToolRegistry::with_builtins();
+
+    for (tool, attachment_id) in [
+        ("pdf", attachment_ids[0]),
+        ("document", attachment_ids[1]),
+        ("spreadsheet", attachment_ids[2]),
+    ] {
+        let result = registry
+            .get(tool)
+            .expect("Office tool")
+            .execute(
+                ToolCall::new(
+                    tool,
+                    json!({ "action": "inspect", "attachmentId": attachment_id }),
+                ),
+                context.clone(),
+            )
+            .await
+            .expect("execute attachment tool");
+        assert_eq!(
+            result.metadata["success"], true,
+            "{tool}: {}",
+            result.output
+        );
+        assert_eq!(result.metadata["provenance"], "user_attachment");
+        assert_eq!(result.metadata["attachmentId"], attachment_id.to_string());
+    }
+
+    let rendered = registry
+        .get("pdf")
+        .expect("PDF tool")
+        .execute(
+            ToolCall::new(
+                "pdf",
+                json!({
+                    "action": "render",
+                    "attachmentId": attachment_ids[0],
+                    "pages": [1],
+                    "dpi": 96
+                }),
+            ),
+            context.clone(),
+        )
+        .await
+        .expect("render attachment");
+    assert_eq!(rendered.metadata["success"], true);
+    assert!(rendered.metadata["artifactId"].is_string());
+    let artifacts = store.list_artifacts(thread.id).expect("list artifacts");
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].content_type, "image/png");
+    assert_eq!(artifacts[0].metadata["page"], 1);
+
+    let ambiguous = registry
+        .get("pdf")
+        .expect("PDF tool")
+        .execute(
+            ToolCall::new(
+                "pdf",
+                json!({
+                    "action": "inspect",
+                    "path": "uploaded.pdf",
+                    "attachmentId": attachment_ids[0]
+                }),
+            ),
+            context,
+        )
+        .await
+        .expect_err("ambiguous source must be rejected");
+    assert!(ambiguous.to_string().contains("exactly one"));
     std::fs::remove_dir_all(workspace).expect("remove workspace");
 }
 
@@ -234,4 +375,13 @@ fn sample_docx_with_main(main_document: &str) -> Vec<u8> {
             .expect("write DOCX part");
     }
     writer.finish().expect("finish DOCX").into_inner()
+}
+
+fn sample_xlsx() -> Vec<u8> {
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet
+        .write_string(0, 0, "Attached XLSX")
+        .expect("write spreadsheet fixture");
+    workbook.save_to_buffer().expect("save spreadsheet fixture")
 }

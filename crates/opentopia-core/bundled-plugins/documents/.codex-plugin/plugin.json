@@ -1,6 +1,6 @@
 {
   "name": "documents",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Inspect, extract, render, and validate DOCX files through OpenTopia's native artifact runtime.",
   "author": {
     "name": "OpenTopia Contributors"
@@ -25,6 +25,7 @@
       "hostCapabilities": [
         "workspace.files.v1",
         "artifact.runtime.v1",
+        "artifact.preview.v1",
         "nativeTool.document.v1"
       ]
     },
@@ -41,6 +42,18 @@
         {
           "id": "document",
           "runtime": "builtin:document"
+        }
+      ],
+      "previewers": [
+        {
+          "id": "docx",
+          "extensions": [
+            "docx"
+          ],
+          "mediaTypes": [
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          ],
+          "runtime": "builtin:document-preview"
         }
       ]
     }

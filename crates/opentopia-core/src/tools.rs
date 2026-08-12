@@ -30,9 +30,9 @@ use crate::git_workflow::isolated_subagent_worktree_request;
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    CollaborationMode, MessagePart, ModelContentPart, TaskEvidenceKind, TaskEvidenceRef, TaskPlan,
-    TaskPlanCoverage, TaskPlanStep, TaskPlanStepStatus, TaskRequirement, ToolCall, ToolResult,
-    UserInputOption, UserInputQuestion, UserInputRequest,
+    Artifact, CollaborationMode, MessagePart, ModelContentPart, TaskEvidenceKind, TaskEvidenceRef,
+    TaskPlan, TaskPlanCoverage, TaskPlanStep, TaskPlanStepStatus, TaskRequirement, ToolCall,
+    ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
 };
 use crate::model_context::CompiledModelContext;
 use crate::policy::{
@@ -808,6 +808,9 @@ struct SpreadsheetToolInput {
     /// Workspace-relative XLSX path for inspect/list/read.
     #[serde(default)]
     path: Option<String>,
+    /// Opaque user attachment ID for inspect/list/read. Provide either this or path.
+    #[serde(default)]
+    attachment_id: Option<String>,
     /// Worksheet name for read_range.
     #[serde(default)]
     sheet: Option<String>,
@@ -845,8 +848,16 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::ListSheets
             | SpreadsheetToolAction::ReadRange => {
                 ToolExecutionPolicy::read_only(vec![tool_resource_key(
-                    "file",
-                    input.path.as_deref().unwrap_or("*"),
+                    if input.attachment_id.is_some() {
+                        "attachment"
+                    } else {
+                        "file"
+                    },
+                    input
+                        .attachment_id
+                        .as_deref()
+                        .or(input.path.as_deref())
+                        .unwrap_or("*"),
                 )])
             }
             SpreadsheetToolAction::Write => {
@@ -910,23 +921,43 @@ async fn execute_spreadsheet_read(
     input: SpreadsheetToolInput,
     ctx: ToolContext,
 ) -> anyhow::Result<ToolResult> {
-    let relative = input
+    let path = input
         .path
         .as_deref()
         .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .context("spreadsheet read action requires path")?;
-    let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
-    enforce_read_policy(&ctx, &logical_path)?;
-    let resolved_path = ctx.environment.resolve_read_path(&logical_path)?;
-    ensure_xlsx_path(&resolved_path)?;
-    let read = ctx
-        .environment
-        .read_file(FileReadRequest::new(&resolved_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
-        .await?;
-    let resolved_path = read.path.clone();
+        .filter(|path| !path.is_empty());
+    let attachment_id = input
+        .attachment_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    anyhow::ensure!(
+        path.is_some() ^ attachment_id.is_some(),
+        "spreadsheet read action requires exactly one of path or attachmentId"
+    );
+    let (resolved_path, source_bytes, attachment_metadata) = if let Some(relative) = path {
+        let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
+        enforce_read_policy(&ctx, &logical_path)?;
+        let resolved_path = ctx.environment.resolve_read_path(&logical_path)?;
+        ensure_xlsx_path(&resolved_path)?;
+        let read = ctx
+            .environment
+            .read_file(
+                FileReadRequest::new(&resolved_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
+            )
+            .await?;
+        (read.path, read.bytes, None)
+    } else {
+        let attachment_id = Uuid::parse_str(attachment_id.expect("attachment id present"))
+            .context("attachmentId must be a UUID from the attachment manifest")?;
+        let attachment =
+            read_stored_attachment_file(&ctx, attachment_id, MAX_SPREADSHEET_INPUT_BYTES).await?;
+        let logical_path = attachment.logical_path("xlsx");
+        ensure_xlsx_path(&logical_path)?;
+        let metadata = attachment.metadata();
+        (logical_path, attachment.data, Some(metadata))
+    };
     let source_path = resolved_path.clone();
-    let source_bytes = read.bytes;
     let action = input.action;
     let sheet = input.sheet;
     let range = input.range;
@@ -958,10 +989,20 @@ async fn execute_spreadsheet_read(
     .context("spreadsheet worker task failed")??;
     let mut result = match outcome {
         Ok(result) => result,
-        Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
+        Err(error) => {
+            let mut result = spreadsheet_error_result(call_id, error);
+            if let Some(metadata) = attachment_metadata.as_ref() {
+                insert_attachment_provenance(&mut result.metadata, metadata);
+            }
+            return Ok(result);
+        }
     };
     remap_spreadsheet_paths(&mut result, Some(&resolved_path), None);
-    spreadsheet_success_result(call_id, result, None)
+    let mut result = spreadsheet_success_result(call_id, result, None)?;
+    if let Some(metadata) = attachment_metadata {
+        insert_attachment_provenance(&mut result.metadata, &metadata);
+    }
+    Ok(result)
 }
 
 async fn execute_spreadsheet_write(
@@ -5052,6 +5093,113 @@ async fn load_stored_context_source(
     .context("attachment read task failed")?
 }
 
+#[derive(Debug)]
+struct StoredAttachmentFile {
+    id: Uuid,
+    path: PathBuf,
+    name: String,
+    content_type: String,
+    data: Vec<u8>,
+}
+
+impl StoredAttachmentFile {
+    fn logical_path(&self, expected_extension: &str) -> PathBuf {
+        let name = PathBuf::from(&self.name);
+        if name.extension().is_some_and(|extension| {
+            extension
+                .to_str()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(expected_extension))
+        }) {
+            return name;
+        }
+        if self.path.extension().is_some_and(|extension| {
+            extension
+                .to_str()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(expected_extension))
+        }) {
+            return self.path.clone();
+        }
+        PathBuf::from(format!("attachment-{}.{}", self.id, expected_extension))
+    }
+
+    fn metadata(&self) -> Value {
+        json!({
+            "provenance": "user_attachment",
+            "attachmentId": self.id,
+            "name": self.name,
+            "contentType": self.content_type,
+            "bytes": self.data.len()
+        })
+    }
+}
+
+async fn read_stored_attachment_file(
+    ctx: &ToolContext,
+    attachment_id: Uuid,
+    max_bytes: u64,
+) -> anyhow::Result<StoredAttachmentFile> {
+    let attachment = find_stored_attachment(ctx, attachment_id)?;
+    let StoredAttachment::ContextSource {
+        id,
+        path,
+        content_type,
+        name,
+        ..
+    } = attachment
+    else {
+        anyhow::bail!("attachment {attachment_id} is an inline image, not an Office file")
+    };
+    tokio::task::spawn_blocking(move || {
+        let source_metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect attachment {}", path.display()))?;
+        anyhow::ensure!(
+            source_metadata.file_type().is_file(),
+            "attachment {} is not a regular file",
+            path.display()
+        );
+        let resolved = path
+            .canonicalize()
+            .with_context(|| format!("attachment {} is no longer available", path.display()))?;
+        let metadata = fs::symlink_metadata(&resolved)
+            .with_context(|| format!("failed to inspect attachment {}", resolved.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "attachment {} is not a regular file",
+            resolved.display()
+        );
+        anyhow::ensure!(
+            metadata.len() <= max_bytes,
+            "attachment {} is {} bytes; limit is {} bytes",
+            name,
+            metadata.len(),
+            max_bytes
+        );
+        let data = fs::read(&resolved)
+            .with_context(|| format!("failed to read attachment {}", resolved.display()))?;
+        Ok(StoredAttachmentFile {
+            id,
+            path: resolved,
+            name,
+            content_type,
+            data,
+        })
+    })
+    .await
+    .context("attachment file read task failed")?
+}
+
+fn insert_attachment_provenance(metadata: &mut Value, attachment: &Value) {
+    let Some(target) = metadata.as_object_mut() else {
+        return;
+    };
+    let Some(source) = attachment.as_object() else {
+        return;
+    };
+    for (key, value) in source {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReadAttachmentInput {
@@ -5599,6 +5747,8 @@ async fn inspect_attachment_through_mcp(
             "capability": MCP_IMAGE_INSPECTION_CAPABILITY,
             "attachmentId": attachment.id(),
             "name": attachment.name(),
+            "contentType": content_type,
+            "bytes": data.len(),
             "providerTool": descriptor.public_name,
             "serverId": descriptor.server_id,
         }),
@@ -10856,6 +11006,7 @@ mod tests {
             &SpreadsheetToolInput {
                 action: SpreadsheetToolAction::Inspect,
                 path: Some("reports/a.xlsx".to_string()),
+                attachment_id: None,
                 sheet: None,
                 range: None,
                 source_path: None,
@@ -10867,11 +11018,31 @@ mod tests {
         assert!(spreadsheet_read.parallel_safe);
         assert_eq!(spreadsheet_read.resource_keys, vec!["file:reports/a.xlsx"]);
 
+        let attachment_id = Uuid::new_v4().to_string();
+        let spreadsheet_attachment = <SpreadsheetTool as TypedTool>::execution_policy(
+            &SpreadsheetTool,
+            &SpreadsheetToolInput {
+                action: SpreadsheetToolAction::Inspect,
+                path: None,
+                attachment_id: Some(attachment_id.clone()),
+                sheet: None,
+                range: None,
+                source_path: None,
+                output_path: None,
+                sheets: Vec::new(),
+            },
+        );
+        assert_eq!(
+            spreadsheet_attachment.resource_keys,
+            vec![format!("attachment:{attachment_id}")]
+        );
+
         let spreadsheet_write = <SpreadsheetTool as TypedTool>::execution_policy(
             &SpreadsheetTool,
             &SpreadsheetToolInput {
                 action: SpreadsheetToolAction::Write,
                 path: None,
+                attachment_id: None,
                 sheet: None,
                 range: None,
                 source_path: Some("reports/source.xlsx".to_string()),

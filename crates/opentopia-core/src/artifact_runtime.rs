@@ -217,6 +217,7 @@ impl PdfBackend for HayroPdfBackend {
 pub struct ArtifactRuntime {
     pdf_backend: Arc<dyn PdfBackend>,
     libreoffice_path: Option<PathBuf>,
+    artifact_output_root: Option<PathBuf>,
     pdf_renders: Arc<Semaphore>,
     office_processes: Arc<Semaphore>,
 }
@@ -226,6 +227,7 @@ impl Default for ArtifactRuntime {
         Self {
             pdf_backend: Arc::new(HayroPdfBackend),
             libreoffice_path: discover_libreoffice(),
+            artifact_output_root: discover_artifact_output_root(),
             pdf_renders: Arc::new(Semaphore::new(1)),
             office_processes: Arc::new(Semaphore::new(1)),
         }
@@ -247,8 +249,17 @@ impl ArtifactRuntime {
         }
     }
 
+    pub fn with_artifact_output_root(mut self, artifact_output_root: PathBuf) -> Self {
+        self.artifact_output_root = Some(artifact_output_root);
+        self
+    }
+
     pub fn libreoffice_available(&self) -> bool {
         self.libreoffice_path.is_some()
+    }
+
+    pub fn artifact_output_root(&self) -> Option<&Path> {
+        self.artifact_output_root.as_deref()
     }
 
     pub async fn render_pdf(
@@ -312,6 +323,16 @@ impl ArtifactRuntime {
             .convert_docx_to_pdf(&docx_bytes, cancel.clone(), sandbox_config)
             .await?;
         self.render_pdf_with_cancel(pdf, pages, dpi, cancel).await
+    }
+
+    pub async fn convert_docx_to_pdf_bytes(
+        &self,
+        docx_bytes: &[u8],
+        cancel: Option<CancellationToken>,
+        sandbox_config: Option<LocalSandboxConfig>,
+    ) -> Result<Vec<u8>, ArtifactRuntimeError> {
+        self.convert_docx_to_pdf(docx_bytes, cancel, sandbox_config)
+            .await
     }
 
     async fn convert_docx_to_pdf(
@@ -456,6 +477,33 @@ fn discover_libreoffice() -> Option<PathBuf> {
     }));
     candidates.extend(path_candidates("libreoffice"));
     candidates.into_iter().find(|path| path.is_file())
+}
+
+fn discover_artifact_output_root() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("OPENTOPIA_ARTIFACTS_DIR") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    if cfg!(windows) {
+        return env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("OpenTopia").join("artifacts"));
+    }
+    if cfg!(target_os = "macos") {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join("Library/Application Support/OpenTopia/artifacts"));
+    }
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join(".local/share"))
+        })
+        .map(|path| path.join("opentopia").join("artifacts"))
 }
 
 fn isolated_artifact_sandbox(base: Option<LocalSandboxConfig>) -> LocalSandboxConfig {

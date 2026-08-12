@@ -20,6 +20,7 @@ pub enum PreviewKind {
     Text,
     Image,
     Pdf,
+    Document,
     Spreadsheet,
     Unsupported,
 }
@@ -546,6 +547,7 @@ fn infer_content_type(path: &Path, declared: Option<&str>) -> String {
         "ico" => "image/x-icon",
         "svg" => "image/svg+xml",
         "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         _ if is_source_extension(&extension) => "text/plain; charset=utf-8",
         _ => return declared.unwrap_or("application/octet-stream").to_string(),
@@ -560,7 +562,14 @@ fn classify_preview(content_type: &str, path: &Path) -> PreviewKind {
         .unwrap_or(content_type)
         .trim()
         .to_ascii_lowercase();
-    if media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if media_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("docx"))
+    {
+        PreviewKind::Document
+    } else if media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         || path
             .extension()
             .and_then(|value| value.to_str())
@@ -727,6 +736,30 @@ mod tests {
             PreviewTarget::Attachment {
                 attachment_id: attachment.id,
             }
+        );
+    }
+
+    #[test]
+    fn docx_attachment_uses_the_document_preview_pipeline() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("brief.docx");
+        std::fs::write(&path, b"docx fixture").expect("write attachment");
+        let attachment = ContextSourceRef {
+            id: Uuid::new_v4(),
+            path,
+            name: "brief.docx".to_string(),
+            kind: ContextSourceKind::Document,
+            content_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                .to_string(),
+            bytes: 0,
+            truncated: false,
+        };
+
+        let preview = resolve_attachment_preview(&attachment).expect("resolve DOCX preview");
+        assert_eq!(preview.descriptor.kind, PreviewKind::Document);
+        assert_eq!(
+            preview.descriptor.content_type,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         );
     }
 

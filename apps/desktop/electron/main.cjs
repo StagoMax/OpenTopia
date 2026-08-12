@@ -754,9 +754,14 @@ function createBackendEnv(repoRoot, options = {}) {
   const defaultDatabasePath = isDev
     ? path.join(repoRoot, ".opentopia", "opentopia.db")
     : path.join(app.getPath("userData"), "opentopia.db");
+  const defaultArtifactsPath = isDev
+    ? path.join(repoRoot, ".opentopia", "artifacts")
+    : path.join(app.getPath("userData"), "artifacts");
   const env = {
     ...process.env,
     OPENTOPIA_DB: process.env.OPENTOPIA_DB || defaultDatabasePath,
+    OPENTOPIA_ARTIFACTS_DIR:
+      process.env.OPENTOPIA_ARTIFACTS_DIR || defaultArtifactsPath,
     OPENTOPIA_PERMISSION: process.env.OPENTOPIA_PERMISSION || "auto",
     OPENTOPIA_API_TOKEN: backendApiToken,
   };

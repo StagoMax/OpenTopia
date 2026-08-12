@@ -23,8 +23,12 @@ enum PdfToolAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PdfToolInput {
     action: PdfToolAction,
-    /// Workspace-relative PDF path.
-    path: String,
+    /// Workspace-relative PDF path. Provide either this or attachmentId.
+    #[serde(default)]
+    path: Option<String>,
+    /// Opaque user attachment ID shown in the attachment manifest.
+    #[serde(default)]
+    attachment_id: Option<String>,
     /// One-based page numbers. Extract defaults to all pages; render defaults to page 1.
     #[serde(default)]
     #[schemars(length(max = 8), inner(range(min = 1)))]
@@ -54,7 +58,8 @@ impl TypedTool for PdfTool {
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        let file = tool_resource_key("file", &input.path);
+        let file =
+            artifact_input_resource_key(input.path.as_deref(), input.attachment_id.as_deref());
         if matches!(input.action, PdfToolAction::Render) {
             ToolExecutionPolicy::read_only(vec!["artifact-runtime:pdf".to_string(), file])
         } else {
@@ -63,7 +68,7 @@ impl TypedTool for PdfTool {
     }
 
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        ToolExecutionIntent::observation([PathBuf::from(&input.path)])
+        ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from))
     }
 
     async fn execute_typed(
@@ -72,7 +77,16 @@ impl TypedTool for PdfTool {
         input: Self::Input,
         ctx: ToolContext,
     ) -> anyhow::Result<ToolResult> {
-        let (path, bytes) = read_artifact_input(&ctx, &input.path).await?;
+        let artifact_input = read_artifact_input(
+            &ctx,
+            input.path.as_deref(),
+            input.attachment_id.as_deref(),
+            "pdf",
+        )
+        .await?;
+        let path = artifact_input.path;
+        let bytes = artifact_input.bytes;
+        let attachment_metadata = artifact_input.attachment_metadata;
         match input.action {
             PdfToolAction::Inspect => {
                 let worker_path = path.clone();
@@ -80,8 +94,14 @@ impl TypedTool for PdfTool {
                     .await
                     .context("PDF inspect worker failed")?;
                 match result {
-                    Ok(result) => structured_success(call_id, "pdf", "inspect", result),
-                    Err(error) => Ok(pdf_error_result(call_id, "inspect", error)),
+                    Ok(result) => with_attachment_metadata(
+                        structured_success(call_id, "pdf", "inspect", result),
+                        attachment_metadata.as_ref(),
+                    ),
+                    Err(error) => with_attachment_metadata(
+                        Ok(pdf_error_result(call_id, "inspect", error)),
+                        attachment_metadata.as_ref(),
+                    ),
                 }
             }
             PdfToolAction::Extract => {
@@ -94,8 +114,14 @@ impl TypedTool for PdfTool {
                 .await
                 .context("PDF extract worker failed")?;
                 match result {
-                    Ok(result) => structured_success(call_id, "pdf", "extract", result),
-                    Err(error) => Ok(pdf_error_result(call_id, "extract", error)),
+                    Ok(result) => with_attachment_metadata(
+                        structured_success(call_id, "pdf", "extract", result),
+                        attachment_metadata.as_ref(),
+                    ),
+                    Err(error) => with_attachment_metadata(
+                        Ok(pdf_error_result(call_id, "extract", error)),
+                        attachment_metadata.as_ref(),
+                    ),
                 }
             }
             PdfToolAction::Render => {
@@ -116,8 +142,14 @@ impl TypedTool for PdfTool {
                     .render_pdf_with_cancel(bytes, pages, dpi, ctx.cancel.clone())
                     .await
                 {
-                    Ok(pages) => render_success(call_id, "pdf", &path, dpi, pages),
-                    Err(error) => Ok(runtime_error_result(call_id, "pdf", "render", error)),
+                    Ok(pages) => with_attachment_metadata(
+                        render_success(call_id, "pdf", &path, dpi, pages, &ctx),
+                        attachment_metadata.as_ref(),
+                    ),
+                    Err(error) => with_attachment_metadata(
+                        Ok(runtime_error_result(call_id, "pdf", "render", error)),
+                        attachment_metadata.as_ref(),
+                    ),
                 }
             }
             PdfToolAction::Validate => {
@@ -126,7 +158,10 @@ impl TypedTool for PdfTool {
                     tokio::task::spawn_blocking(move || validate_pdf(&worker_path, &bytes))
                         .await
                         .context("PDF validate worker failed")?;
-                structured_success(call_id, "pdf", "validate", result)
+                with_attachment_metadata(
+                    structured_success(call_id, "pdf", "validate", result),
+                    attachment_metadata.as_ref(),
+                )
             }
         }
     }
@@ -147,8 +182,12 @@ enum DocumentToolAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DocumentToolInput {
     action: DocumentToolAction,
-    /// Workspace-relative DOCX path.
-    path: String,
+    /// Workspace-relative DOCX path. Provide either this or attachmentId.
+    #[serde(default)]
+    path: Option<String>,
+    /// Opaque user attachment ID shown in the attachment manifest.
+    #[serde(default)]
+    attachment_id: Option<String>,
     /// Include headers, footers, comments, footnotes, and endnotes during extraction.
     #[serde(default)]
     include_related_parts: bool,
@@ -181,7 +220,8 @@ impl TypedTool for DocumentTool {
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        let file = tool_resource_key("file", &input.path);
+        let file =
+            artifact_input_resource_key(input.path.as_deref(), input.attachment_id.as_deref());
         match input.action {
             DocumentToolAction::Render => ToolExecutionPolicy {
                 read_only: false,
@@ -195,7 +235,7 @@ impl TypedTool for DocumentTool {
     }
 
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        let intent = ToolExecutionIntent::observation([PathBuf::from(&input.path)]);
+        let intent = ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from));
         if matches!(input.action, DocumentToolAction::Render) {
             intent.with_process_lifetime(ProcessLifetime::OneShot)
         } else {
@@ -209,7 +249,16 @@ impl TypedTool for DocumentTool {
         input: Self::Input,
         ctx: ToolContext,
     ) -> anyhow::Result<ToolResult> {
-        let (path, bytes) = read_artifact_input(&ctx, &input.path).await?;
+        let artifact_input = read_artifact_input(
+            &ctx,
+            input.path.as_deref(),
+            input.attachment_id.as_deref(),
+            "docx",
+        )
+        .await?;
+        let path = artifact_input.path;
+        let bytes = artifact_input.bytes;
+        let attachment_metadata = artifact_input.attachment_metadata;
         match input.action {
             DocumentToolAction::Inspect => {
                 let worker_path = path.clone();
@@ -218,8 +267,14 @@ impl TypedTool for DocumentTool {
                         .await
                         .context("DOCX inspect worker failed")?;
                 match result {
-                    Ok(result) => structured_success(call_id, "document", "inspect", result),
-                    Err(error) => Ok(document_error_result(call_id, "inspect", error)),
+                    Ok(result) => with_attachment_metadata(
+                        structured_success(call_id, "document", "inspect", result),
+                        attachment_metadata.as_ref(),
+                    ),
+                    Err(error) => with_attachment_metadata(
+                        Ok(document_error_result(call_id, "inspect", error)),
+                        attachment_metadata.as_ref(),
+                    ),
                 }
             }
             DocumentToolAction::Extract => {
@@ -239,8 +294,14 @@ impl TypedTool for DocumentTool {
                 .await
                 .context("DOCX extract worker failed")?;
                 match result {
-                    Ok(result) => structured_success(call_id, "document", "extract", result),
-                    Err(error) => Ok(document_error_result(call_id, "extract", error)),
+                    Ok(result) => with_attachment_metadata(
+                        structured_success(call_id, "document", "extract", result),
+                        attachment_metadata.as_ref(),
+                    ),
+                    Err(error) => with_attachment_metadata(
+                        Ok(document_error_result(call_id, "extract", error)),
+                        attachment_metadata.as_ref(),
+                    ),
                 }
             }
             DocumentToolAction::Render => {
@@ -267,8 +328,14 @@ impl TypedTool for DocumentTool {
                     )
                     .await
                 {
-                    Ok(pages) => render_success(call_id, "document", &path, dpi, pages),
-                    Err(error) => Ok(runtime_error_result(call_id, "document", "render", error)),
+                    Ok(pages) => with_attachment_metadata(
+                        render_success(call_id, "document", &path, dpi, pages, &ctx),
+                        attachment_metadata.as_ref(),
+                    ),
+                    Err(error) => with_attachment_metadata(
+                        Ok(runtime_error_result(call_id, "document", "render", error)),
+                        attachment_metadata.as_ref(),
+                    ),
                 }
             }
             DocumentToolAction::Validate => {
@@ -284,7 +351,10 @@ impl TypedTool for DocumentTool {
                         json!(ctx.artifact_runtime.libreoffice_available()),
                     );
                 }
-                structured_value_success(call_id, "document", "validate", value)
+                with_attachment_metadata(
+                    structured_value_success(call_id, "document", "validate", value),
+                    attachment_metadata.as_ref(),
+                )
             }
         }
     }
@@ -292,20 +362,76 @@ impl TypedTool for DocumentTool {
 
 impl_typed_tool!(DocumentTool);
 
+struct ArtifactInput {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    attachment_metadata: Option<Value>,
+}
+
 async fn read_artifact_input(
     ctx: &ToolContext,
-    requested: &str,
-) -> anyhow::Result<(PathBuf, Vec<u8>)> {
-    let requested = requested.trim();
-    anyhow::ensure!(!requested.is_empty(), "artifact tool requires path");
-    let logical_path = normalize_workspace_path(&ctx.workspace_root, requested)?;
-    enforce_read_policy(ctx, &logical_path)?;
-    let resolved_path = ctx.environment.resolve_read_path(&logical_path)?;
-    let read = ctx
-        .environment
-        .read_file(FileReadRequest::new(&resolved_path).with_max_bytes(MAX_ARTIFACT_INPUT_BYTES))
-        .await?;
-    Ok((read.path, read.bytes))
+    requested: Option<&str>,
+    attachment_id: Option<&str>,
+    expected_extension: &str,
+) -> anyhow::Result<ArtifactInput> {
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+    let attachment_id = attachment_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    anyhow::ensure!(
+        requested.is_some() ^ attachment_id.is_some(),
+        "artifact tool requires exactly one of path or attachmentId"
+    );
+    if let Some(requested) = requested {
+        let logical_path = normalize_workspace_path(&ctx.workspace_root, requested)?;
+        enforce_read_policy(ctx, &logical_path)?;
+        let resolved_path = ctx.environment.resolve_read_path(&logical_path)?;
+        let read = ctx
+            .environment
+            .read_file(
+                FileReadRequest::new(&resolved_path).with_max_bytes(MAX_ARTIFACT_INPUT_BYTES),
+            )
+            .await?;
+        return Ok(ArtifactInput {
+            path: read.path,
+            bytes: read.bytes,
+            attachment_metadata: None,
+        });
+    }
+
+    let attachment_id = Uuid::parse_str(attachment_id.expect("attachment id present"))
+        .context("attachmentId must be a UUID from the attachment manifest")?;
+    let attachment =
+        read_stored_attachment_file(ctx, attachment_id, MAX_ARTIFACT_INPUT_BYTES).await?;
+    let path = attachment.logical_path(expected_extension);
+    let attachment_metadata = attachment.metadata();
+    Ok(ArtifactInput {
+        path,
+        bytes: attachment.data,
+        attachment_metadata: Some(attachment_metadata),
+    })
+}
+
+fn artifact_input_resource_key(path: Option<&str>, attachment_id: Option<&str>) -> String {
+    if let Some(attachment_id) = attachment_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        tool_resource_key("attachment", attachment_id)
+    } else {
+        tool_resource_key("file", path.unwrap_or("*"))
+    }
+}
+
+fn with_attachment_metadata(
+    result: anyhow::Result<ToolResult>,
+    attachment: Option<&Value>,
+) -> anyhow::Result<ToolResult> {
+    let mut result = result?;
+    if let Some(attachment) = attachment {
+        insert_attachment_provenance(&mut result.metadata, attachment);
+    }
+    Ok(result)
 }
 
 fn normalized_render_pages(pages: Vec<u32>) -> Vec<u32> {
@@ -358,22 +484,39 @@ fn render_success(
     path: &Path,
     dpi: u16,
     pages: Vec<RenderedPage>,
+    ctx: &ToolContext,
 ) -> anyhow::Result<ToolResult> {
+    let artifacts = persist_rendered_pages(tool_name, path, dpi, &pages, ctx)?;
     let summaries = pages
         .iter()
-        .map(|page| {
+        .enumerate()
+        .map(|(index, page)| {
             json!({
                 "page": page.page,
                 "width": page.width,
                 "height": page.height,
-                "pngBytes": page.png.len()
+                "pngBytes": page.png.len(),
+                "artifactId": artifacts.get(index).map(|artifact| artifact.id)
+            })
+        })
+        .collect::<Vec<_>>();
+    let persisted_artifacts = artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "id": artifact.id,
+                "kind": artifact.kind,
+                "contentType": artifact.content_type,
+                "bytes": artifact.bytes,
+                "metadata": artifact.metadata
             })
         })
         .collect::<Vec<_>>();
     let value = json!({
         "path": path,
         "dpi": dpi,
-        "pages": summaries
+        "pages": summaries,
+        "artifacts": persisted_artifacts
     });
     let mut content = vec![ModelContentPart::json(value.clone())];
     content.extend(
@@ -381,17 +524,92 @@ fn render_success(
             .into_iter()
             .map(|page| ModelContentPart::image("image/png", page.png)),
     );
+    let mut metadata = json!({
+        "toolName": tool_name,
+        "action": "render",
+        "success": true,
+        "renderedPages": summaries.len()
+    });
+    if let Some(first) = artifacts.first() {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("artifactId".to_string(), json!(first.id));
+            object.insert("artifactKind".to_string(), json!(first.kind));
+            object.insert("artifactBytes".to_string(), json!(first.bytes));
+            object.insert("artifacts".to_string(), json!(persisted_artifacts));
+        }
+    }
     Ok(ToolResult {
         call_id,
         output: serde_json::to_string_pretty(&value)?,
         content,
-        metadata: json!({
-            "toolName": tool_name,
-            "action": "render",
-            "success": true,
-            "renderedPages": summaries.len()
-        }),
+        metadata,
     })
+}
+
+fn persist_rendered_pages(
+    tool_name: &str,
+    source_path: &Path,
+    dpi: u16,
+    pages: &[RenderedPage],
+    ctx: &ToolContext,
+) -> anyhow::Result<Vec<Artifact>> {
+    let (Some(store), Some(thread_id), Some(output_root)) = (
+        ctx.store.as_ref(),
+        ctx.thread_id,
+        ctx.artifact_runtime.artifact_output_root(),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let call_root = output_root
+        .join(thread_id.to_string())
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&call_root).with_context(|| {
+        format!(
+            "failed to create artifact directory {}",
+            call_root.display()
+        )
+    })?;
+    let source_name = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(tool_name);
+    let mut artifacts = Vec::with_capacity(pages.len());
+    for page in pages {
+        let name = format!("{source_name}-page-{}.png", page.page);
+        let artifact_path = call_root.join(&name);
+        fs::write(&artifact_path, &page.png).with_context(|| {
+            format!(
+                "failed to persist rendered page {}",
+                artifact_path.display()
+            )
+        })?;
+        let artifact = Artifact::path(
+            thread_id,
+            format!("{tool_name}_rendered_page"),
+            "image/png",
+            artifact_path.clone(),
+            page.png.len() as u64,
+            json!({
+                "name": name,
+                "sourcePath": source_path,
+                "sourceTool": tool_name,
+                "action": "render",
+                "page": page.page,
+                "width": page.width,
+                "height": page.height,
+                "dpi": dpi
+            }),
+        );
+        match store.insert_artifact(artifact) {
+            Ok(artifact) => artifacts.push(artifact),
+            Err(error) => {
+                let _ = fs::remove_file(&artifact_path);
+                return Err(error);
+            }
+        }
+    }
+    Ok(artifacts)
 }
 
 fn pdf_error_result(call_id: Uuid, action: &str, error: PdfError) -> ToolResult {
