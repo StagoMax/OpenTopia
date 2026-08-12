@@ -3696,10 +3696,26 @@ async fn read_preview_content(
     .map_err(|error| ApiError::internal(format!("preview content worker failed: {error}")))?
     .map_err(preview_api_error)?;
     if document_preview {
-        let validation_path = descriptor
-            .path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(&descriptor.name));
+        // Attachment and artifact storage paths may be opaque. Prefer a
+        // declared DOCX filename, then a DOCX storage path, and finally a
+        // synthetic logical name; the bytes still come from the thread-scoped
+        // resolved preview.
+        let declared_path = PathBuf::from(&descriptor.name);
+        let validation_path = if declared_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("docx"))
+        {
+            declared_path
+        } else if descriptor.path.as_deref().is_some_and(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("docx"))
+        }) {
+            descriptor.path.clone().expect("DOCX path checked")
+        } else {
+            PathBuf::from("preview.docx")
+        };
         bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ApiError> {
             opentopia_core::inspect_document(&validation_path, &bytes).map_err(|error| {
                 ApiError::bad_request(format!("DOCX preview is unavailable: {error}"))
