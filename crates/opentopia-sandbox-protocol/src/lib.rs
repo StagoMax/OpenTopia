@@ -212,7 +212,8 @@ mod tests {
             ..Default::default()
         };
         let encoded = serde_json::to_vec(&capabilities).expect("serialize capabilities");
-        let decoded = serde_json::from_slice(&encoded).expect("deserialize capabilities");
+        let decoded: FilesystemCapabilities =
+            serde_json::from_slice(&encoded).expect("deserialize capabilities");
         assert_eq!(decoded, capabilities);
     }
 }
