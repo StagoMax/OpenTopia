@@ -32,6 +32,7 @@ use windows_sys::Win32::Security::Authorization::DENY_ACCESS;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::REVOKE_ACCESS;
+use windows_sys::Win32::Security::Authorization::SET_ACCESS;
 use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
 use windows_sys::Win32::Security::Authorization::SE_REGISTRY_KEY;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
@@ -477,11 +478,11 @@ fn suppress_process_error_ui() {
     }
 }
 
-/// Grant the session-unique logon SID access to the dedicated account's own
-/// registry hive. It is intentionally not written to any host filesystem ACL,
-/// so it can support ordinary process initialization without widening the
-/// per-launch filesystem capability.
-fn update_logon_registry_access(logon_sid: PSID, access_mode: i32) -> Result<()> {
+/// Grant a stable runtime-only SID access to the dedicated account's own
+/// registry hive. That SID is intentionally never written to a host filesystem
+/// ACL, so it can support per-user initialization without widening the
+/// per-launch filesystem capability or coupling concurrent launch sessions.
+fn ensure_runtime_registry_access(runtime_sid: PSID) -> Result<()> {
     let mut key = ptr::null_mut();
     let opened = unsafe { RegOpenCurrentUser(KEY_READ | WRITE_DAC, &mut key) };
     if opened != 0 || key.is_null() {
@@ -509,18 +510,14 @@ fn update_logon_registry_access(logon_sid: PSID, access_mode: i32) -> Result<()>
 
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: KEY_ALL_ACCESS,
-        grfAccessMode: access_mode,
-        grfInheritance: if access_mode == REVOKE_ACCESS {
-            0
-        } else {
-            SUB_CONTAINERS_ONLY_INHERIT
-        },
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: SUB_CONTAINERS_ONLY_INHERIT,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: ptr::null_mut(),
             MultipleTrusteeOperation: 0,
             TrusteeForm: TRUSTEE_IS_SID,
             TrusteeType: TRUSTEE_IS_UNKNOWN_VALUE,
-            ptstrName: logon_sid.cast(),
+            ptstrName: runtime_sid.cast(),
         },
     };
     let mut new_dacl = ptr::null_mut();
@@ -1466,19 +1463,20 @@ impl Drop for RunDirectory {
 
 struct RestrictedToken {
     handle: HANDLE,
-    registry_logon_sid: Option<SidBuffer>,
 }
 
 impl RestrictedToken {
     fn for_capability(capability_sid: PSID) -> Result<Self> {
-        Self::create(capability_sid, false)
+        Self::create(capability_sid, None)
     }
 
     fn for_dedicated_capability(capability_sid: PSID) -> Result<Self> {
-        Self::create(capability_sid, true)
+        let mut runtime_sid = SidBuffer::opentopia_runtime();
+        ensure_runtime_registry_access(runtime_sid.as_ptr())?;
+        Self::create(capability_sid, Some(runtime_sid.as_ptr()))
     }
 
-    fn create(capability_sid: PSID, dedicated: bool) -> Result<Self> {
+    fn create(capability_sid: PSID, runtime_sid: Option<PSID>) -> Result<Self> {
         let mut base_token = ptr::null_mut();
         let opened = unsafe {
             OpenProcessToken(
@@ -1510,12 +1508,8 @@ impl RestrictedToken {
         let mut everyone_sid = SidBuffer::well_known(WIN_WORLD_SID)?;
         let mut restricting_sids = [unsafe { std::mem::zeroed::<SID_AND_ATTRIBUTES>() }; 3];
         restricting_sids[0].Sid = capability_sid;
-        let restricting_sid_count = if dedicated {
-            if let Err(error) = update_logon_registry_access(logon_sid.as_ptr(), GRANT_ACCESS) {
-                unsafe { CloseHandle(base_token) };
-                return Err(error);
-            }
-            restricting_sids[1].Sid = logon_sid.as_ptr();
+        let restricting_sid_count = if let Some(runtime_sid) = runtime_sid {
+            restricting_sids[1].Sid = runtime_sid;
             2
         } else {
             restricting_sids[1].Sid = logon_sid.as_ptr();
@@ -1538,37 +1532,25 @@ impl RestrictedToken {
         };
         unsafe { CloseHandle(base_token) };
         if created == 0 || restricted.is_null() {
-            if dedicated {
-                let _ = update_logon_registry_access(logon_sid.as_ptr(), REVOKE_ACCESS);
-            }
             return Err(last_error("CreateRestrictedToken"));
         }
         let mut default_dacl_sids = vec![capability_sid];
-        if dedicated {
-            default_dacl_sids.push(logon_sid.as_ptr());
+        if let Some(runtime_sid) = runtime_sid {
+            default_dacl_sids.push(runtime_sid);
         } else {
             default_dacl_sids.extend([logon_sid.as_ptr(), everyone_sid.as_ptr()]);
         }
         if let Err(error) = set_default_dacl(restricted, &default_dacl_sids) {
             unsafe { CloseHandle(restricted) };
-            if dedicated {
-                let _ = update_logon_registry_access(logon_sid.as_ptr(), REVOKE_ACCESS);
-            }
             return Err(error);
         }
-        Ok(Self {
-            handle: restricted,
-            registry_logon_sid: dedicated.then_some(logon_sid),
-        })
+        Ok(Self { handle: restricted })
     }
 }
 
 impl Drop for RestrictedToken {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.handle) };
-        if let Some(sid) = self.registry_logon_sid.as_mut() {
-            let _ = update_logon_registry_access(sid.as_ptr(), REVOKE_ACCESS);
-        }
     }
 }
 
@@ -1643,6 +1625,10 @@ impl SidBuffer {
 
     fn legacy_opentopia_capability() -> Self {
         Self::opentopia_capability(Uuid::from_bytes(*b"OpenTopiaSandbox"))
+    }
+
+    fn opentopia_runtime() -> Self {
+        Self::opentopia_capability(Uuid::from_bytes(*b"OpenTopiaRuntime"))
     }
 
     fn well_known(kind: i32) -> Result<Self> {
@@ -2187,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_restricted_token_uses_scope_and_session_sids_only() {
+    fn dedicated_restricted_token_uses_scope_and_runtime_sids_only() {
         let source = include_str!("windows.rs");
         let function = source
             .split("impl RestrictedToken")
@@ -2197,8 +2183,8 @@ mod tests {
             .next()
             .expect("restricted token boundary");
         assert!(function.contains("restricting_sids[0].Sid = capability_sid"));
-        assert!(function.contains("restricting_sids[1].Sid = logon_sid.as_ptr()"));
-        assert!(function.contains("ensure_logon_registry_access"));
+        assert!(function.contains("restricting_sids[1].Sid = runtime_sid"));
+        assert!(function.contains("ensure_runtime_registry_access"));
         assert!(!function.contains("current_user_sid"));
     }
 
