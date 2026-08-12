@@ -4,9 +4,13 @@ const { validateProtocol } = require("./runtime-bundle.cjs");
 
 const current = {
   schema: "ai.opentopia.sandbox.protocol",
-  protocolVersion: 1,
+  protocolVersion: 2,
   helperVersion: "0.1.0",
-  features: ["run.backend", "run.runtime_roots"],
+  features: [
+    "run.backend",
+    "run.runtime_roots",
+    "run.filesystem_capabilities.v1",
+  ],
 };
 
 test("accepts a helper matching the runtime bundle protocol", () => {
@@ -15,18 +19,18 @@ test("accepts a helper matching the runtime bundle protocol", () => {
 
 test("rejects a stale helper protocol before backend startup", () => {
   assert.throws(
-    () => validateProtocol({ ...current, protocolVersion: 2 }, current),
+    () =>
+      validateProtocol(
+        { ...current, protocolVersion: current.protocolVersion - 1 },
+        current,
+      ),
     /does not match runtime bundle protocol/,
   );
 });
 
 test("rejects a helper missing a required bundle feature", () => {
   assert.throws(
-    () =>
-      validateProtocol(
-        { ...current, features: ["run.backend"] },
-        current,
-      ),
+    () => validateProtocol({ ...current, features: ["run.backend"] }, current),
     /missing runtime bundle features: run.runtime_roots/,
   );
 });

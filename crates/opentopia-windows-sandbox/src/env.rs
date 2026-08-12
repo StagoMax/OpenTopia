@@ -80,10 +80,18 @@ pub(crate) fn current_environment_block(
     if let Some(home) = profile_home {
         insert_value(&mut values, "USERPROFILE", home.as_os_str());
         insert_value(&mut values, "HOME", home.as_os_str());
+        insert_value(
+            &mut values,
+            "XDG_CONFIG_HOME",
+            home.join(".config").as_os_str(),
+        );
         let roaming = home.join("AppData").join("Roaming");
         let local = home.join("AppData").join("Local");
+        let temporary = home.join("tmp");
         insert_value(&mut values, "APPDATA", roaming.as_os_str());
         insert_value(&mut values, "LOCALAPPDATA", local.as_os_str());
+        insert_value(&mut values, "TEMP", temporary.as_os_str());
+        insert_value(&mut values, "TMP", temporary.as_os_str());
         let display = home.as_os_str().to_string_lossy();
         if display.as_bytes().get(1) == Some(&b':') {
             insert_value(&mut values, "HOMEDRIVE", OsStr::new(&display[..2]));

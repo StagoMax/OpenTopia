@@ -4,6 +4,7 @@ use super::SandboxRequest;
 use crate::process_env::current_environment_block;
 use anyhow::Context;
 use anyhow::Result;
+use opentopia_sandbox_protocol::ReadProvisioning;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -21,29 +22,44 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+use windows_sys::Win32::Security::AccessCheck;
 use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
 use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::DENY_ACCESS;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::REVOKE_ACCESS;
 use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
+use windows_sys::Win32::Security::Authorization::SE_REGISTRY_KEY;
+use windows_sys::Win32::Security::Authorization::SET_ACCESS;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_UNKNOWN;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::CopySid;
 use windows_sys::Win32::Security::CreateRestrictedToken;
 use windows_sys::Win32::Security::CreateWellKnownSid;
+use windows_sys::Win32::Security::DuplicateToken;
 use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::GetTokenInformation;
+use windows_sys::Win32::Security::LogonUserW;
 use windows_sys::Win32::Security::LookupAccountNameW;
+use windows_sys::Win32::Security::MapGenericMask;
+use windows_sys::Win32::Security::SecurityImpersonation;
 use windows_sys::Win32::Security::SetTokenInformation;
 use windows_sys::Win32::Security::TokenDefaultDacl;
 use windows_sys::Win32::Security::TokenGroups;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::DISABLE_MAX_PRIVILEGE;
+use windows_sys::Win32::Security::GENERIC_MAPPING;
+use windows_sys::Win32::Security::GROUP_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::LOGON32_LOGON_INTERACTIVE;
+use windows_sys::Win32::Security::LOGON32_PROVIDER_DEFAULT;
 use windows_sys::Win32::Security::LUA_TOKEN;
+use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::PRIVILEGE_SET;
 use windows_sys::Win32::Security::PSID;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::Security::SUB_CONTAINERS_AND_OBJECTS_INHERIT;
@@ -56,16 +72,25 @@ use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::Security::WRITE_RESTRICTED;
 use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
+use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
+use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
+use windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS;
+use windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX;
+use windows_sys::Win32::System::Diagnostics::Debug::SEM_NOOPENFILEERRORBOX;
+use windows_sys::Win32::System::ErrorReporting::WerSetFlags;
+use windows_sys::Win32::System::ErrorReporting::WER_FAULT_REPORTING_NO_UI;
 use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
 use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
 use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
@@ -74,9 +99,12 @@ use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_JOB_MEMORY;
 use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_JOB_TIME;
 use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+use windows_sys::Win32::System::Registry::RegCloseKey;
+use windows_sys::Win32::System::Registry::RegOpenCurrentUser;
+use windows_sys::Win32::System::Registry::KEY_READ;
+use windows_sys::Win32::System::Registry::KEY_WRITE;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
-use windows_sys::Win32::System::Threading::CreateProcessW;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -115,6 +143,7 @@ struct TokenDefaultDaclInfo {
 }
 
 pub(super) fn run(request: SandboxRequest) -> Result<i32> {
+    suppress_process_error_ui();
     crate::logging::event(
         "backend_select",
         format!(
@@ -132,7 +161,7 @@ pub(super) fn run(request: SandboxRequest) -> Result<i32> {
         BackendMode::Unelevated if crate::setup::credentials_present() => anyhow::bail!(
             "stage=validate_policy unelevated execution is disabled while dedicated-user credentials are installed because it shares the host identity; use auto/dedicated-user, or remove the dedicated-user sandbox first"
         ),
-        BackendMode::Unelevated if !request.denied_read_paths.is_empty() => anyhow::bail!(
+        BackendMode::Unelevated if !request.filesystem.deny_read.is_empty() => anyhow::bail!(
             "stage=validate_policy unelevated backend cannot enforce deny-read requirements"
         ),
         BackendMode::Unelevated => run_unelevated(request),
@@ -157,11 +186,6 @@ fn run_unelevated(request: SandboxRequest) -> Result<i32> {
     let capability_sid = capability.as_ptr();
     ensure_persistent_capability_permissions(&request, &capability_principal, capability_sid)
         .context("stage=apply_acl ensure capability permissions")?;
-    let _protected_write_lock = (!request.allowed_protected_roots.is_empty())
-        .then(NamedAclMutex::acquire)
-        .transpose()?;
-    let _protected_write_window =
-        ProtectedWriteWindow::open(request.allowed_protected_roots.clone(), capability_sid)?;
 
     let restricted_token = RestrictedToken::for_capability(capability_sid)
         .context("stage=prepare_sandbox create restricted token")?;
@@ -174,7 +198,7 @@ fn run_unelevated(request: SandboxRequest) -> Result<i32> {
                 .first()
                 .map(String::as_str)
                 .unwrap_or("<missing>"),
-            request.write_roots.len(),
+            request.filesystem.write.len(),
             std::env::var("USERPROFILE").unwrap_or_default(),
             std::env::var("HOME").unwrap_or_default(),
             std::env::var("TEMP").unwrap_or_default(),
@@ -191,10 +215,12 @@ struct DedicatedUserRunnerResult {
     error: Option<String>,
 }
 
-const DEDICATED_USER_RUNNER_PROTOCOL_VERSION: u32 = 1;
-const LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL: &str = "opentopia:unelevated-capability:v1";
-const UNELEVATED_CAPABILITY_PRINCIPAL_PREFIX: &str = "opentopia:unelevated-capability:v2:";
-const UNELEVATED_CAPABILITY_NAMESPACE: u128 = 0xa678_2ac1_8754_5ef2_99b0_b62a_15c7_c90e;
+const DEDICATED_USER_RUNNER_PROTOCOL_VERSION: u32 = 2;
+const LEGACY_CAPABILITY_PRINCIPAL: &str = "opentopia:unelevated-capability:v1";
+const LEGACY_SCOPED_CAPABILITY_PRINCIPAL_PREFIX: &str =
+    "opentopia:unelevated-capability:v2:";
+const CAPABILITY_PRINCIPAL_PREFIX: &str = "opentopia:filesystem-capability:v3:";
+const CAPABILITY_NAMESPACE: u128 = 0xa678_2ac1_8754_5ef2_99b0_b62a_15c7_c90e;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DedicatedUserRunnerRequestEnvelope {
@@ -229,12 +255,15 @@ fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
         "prepare_sandbox",
         format!("resolved dedicated-user SID for {username}"),
     );
-    ensure_persistent_user_permissions(&request, username, user_sid.as_ptr())?;
-    let _protected_write_lock = (!request.allowed_protected_roots.is_empty())
-        .then(NamedAclMutex::acquire)
-        .transpose()?;
-    let _protected_write_window =
-        ProtectedWriteWindow::open(request.allowed_protected_roots.clone(), user_sid.as_ptr())?;
+    let logon_token = LoggedOnToken::new(username, password)
+        .context("stage=prepare_sandbox log on dedicated-user identity")?;
+    migrate_legacy_dedicated_user_acls(&request, username)?;
+    ensure_persistent_user_permissions(&request, username, user_sid.as_ptr(), logon_token.handle)?;
+    let capability_principal = capability_principal(&request);
+    let mut capability = acl_principal_sid(&capability_principal)?;
+    let capability_sid = capability.as_ptr();
+    ensure_persistent_capability_permissions(&request, &capability_principal, capability_sid)
+        .context("stage=apply_acl ensure dedicated-user capability permissions")?;
 
     let run_root = std::env::temp_dir().join(format!(
         "opentopia-dedicated-user-run-{}",
@@ -286,8 +315,12 @@ fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
     let username_w = wide(OsStr::new(username));
     let domain_w = wide(OsStr::new("."));
     let password_w = wide(OsStr::new(password));
-    let cwd_w = wide(request.cwd.as_os_str());
+    let cwd_w = wide(native_path(&request.cwd).as_os_str());
     let environment = current_environment_block(Some(&request.cwd), None, true);
+    crate::logging::event(
+        "spawn",
+        format!("starting dedicated-user runner user={username}"),
+    );
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -319,6 +352,9 @@ fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
         .min(u32::MAX as u64) as u32;
     let waited = unsafe { WaitForSingleObject(process.hProcess, broker_timeout) };
     if waited == WAIT_TIMEOUT {
+        if let Ok(trace) = std::fs::read_to_string(run_root.join("runner.log")) {
+            crate::logging::event("runner_trace", trace);
+        }
         unsafe {
             TerminateProcess(process.hProcess, 124);
             WaitForSingleObject(
@@ -357,7 +393,7 @@ fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
 }
 
 pub(super) fn run_dedicated_user_runner(args: &[String]) -> Result<i32> {
-    crate::logging::event("runner", "dedicated-user runner started");
+    suppress_process_error_ui();
     let mut request_path = None;
     let mut result_path = None;
     let mut stdout_path = None;
@@ -382,8 +418,12 @@ pub(super) fn run_dedicated_user_runner(args: &[String]) -> Result<i32> {
     let result_path = result_path.context("missing --result")?;
     let stdout_path = stdout_path.context("missing --stdout")?;
     let stderr_path = stderr_path.context("missing --stderr")?;
+    let runner_log_path = request_path
+        .parent()
+        .map(|parent| parent.join("runner.log"));
+    runner_trace(&runner_log_path, "dedicated-user runner started");
     let envelope: DedicatedUserRunnerRequestEnvelope =
-        serde_json::from_slice(&std::fs::read(request_path)?)?;
+        serde_json::from_slice(&std::fs::read(&request_path)?)?;
     if envelope.protocol_version != DEDICATED_USER_RUNNER_PROTOCOL_VERSION {
         anyhow::bail!(
             "stage=prepare_sandbox dedicated-user runner protocol mismatch: expected {} got {}",
@@ -391,6 +431,18 @@ pub(super) fn run_dedicated_user_runner(args: &[String]) -> Result<i32> {
             envelope.protocol_version
         )
     }
+    runner_trace(
+        &runner_log_path,
+        &format!(
+            "launching target program={}",
+            envelope
+                .request
+                .command
+                .first()
+                .map(String::as_str)
+                .unwrap_or("<missing>")
+        ),
+    );
     let result = match launch_dedicated_user_target(&envelope.request, &stdout_path, &stderr_path) {
         Ok(exit_code) => DedicatedUserRunnerResult {
             exit_code,
@@ -411,11 +463,140 @@ pub(super) fn run_dedicated_user_runner(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+fn runner_trace(path: &Option<std::path::PathBuf>, message: &str) {
+    if let Some(path) = path {
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{message}"));
+    }
+}
+
+fn suppress_process_error_ui() {
+    unsafe {
+        SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX,
+        );
+        let _ = WerSetFlags(WER_FAULT_REPORTING_NO_UI);
+    }
+}
+
+/// The per-launch filesystem SID must remain the only restricting principal
+/// that has host-file grants. A separate stable SID is granted solely inside
+/// the dedicated account's HKCU hive so normal per-user registry initialization
+/// can succeed without making any historical workspace ACE usable by a later
+/// launch.
+fn ensure_runtime_registry_capability(runtime_sid: PSID) -> Result<()> {
+    let mut key = ptr::null_mut();
+    let opened = unsafe {
+        RegOpenCurrentUser(
+            KEY_READ | KEY_WRITE | READ_CONTROL | WRITE_DAC,
+            &mut key,
+        )
+    };
+    if opened != 0 || key.is_null() {
+        anyhow::bail!("RegOpenCurrentUser for runtime capability failed: {opened}")
+    }
+
+    let result = update_handle_dacl(
+        key.cast(),
+        SE_REGISTRY_KEY,
+        runtime_sid,
+        SET_ACCESS,
+        true,
+        KEY_READ | KEY_WRITE,
+    );
+    unsafe { RegCloseKey(key) };
+    result
+}
+
+fn update_handle_dacl(
+    handle: HANDLE,
+    object_type: i32,
+    sid: PSID,
+    access_mode: i32,
+    inherit: bool,
+    permissions: u32,
+) -> Result<()> {
+    let mut old_dacl = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    let get_result = unsafe {
+        GetSecurityInfo(
+            handle,
+            object_type,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut old_dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if get_result != 0 {
+        anyhow::bail!("GetSecurityInfo failed: {get_result}")
+    }
+
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: permissions,
+        grfAccessMode: access_mode,
+        grfInheritance: if inherit {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        } else {
+            0
+        },
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN_VALUE,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut new_dacl = ptr::null_mut();
+    let entries_result = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
+    if !descriptor.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
+    }
+    if entries_result != 0 {
+        anyhow::bail!("SetEntriesInAclW failed: {entries_result}")
+    }
+    let set_result = unsafe {
+        SetSecurityInfo(
+            handle,
+            object_type,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_dacl,
+            ptr::null_mut(),
+        )
+    };
+    if !new_dacl.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(new_dacl.cast()) };
+    }
+    if set_result != 0 {
+        anyhow::bail!("SetSecurityInfo failed: {set_result}")
+    }
+    Ok(())
+}
+
 fn launch_dedicated_user_target(
     request: &SandboxRequest,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<i32> {
+    let capability_principal = capability_principal(request);
+    let mut capability = acl_principal_sid(&capability_principal)?;
+    let mut runtime = SidBuffer::opentopia_runtime();
+    ensure_runtime_registry_capability(runtime.as_ptr())
+        .context("stage=prepare_sandbox grant runtime registry capability")?;
+    let restricted_token = RestrictedToken::for_dedicated_capability(
+        capability.as_ptr(),
+        runtime.as_ptr(),
+    )
+        .context("stage=prepare_sandbox create dedicated-user restricted token")?;
+    crate::logging::event("runner", "created dedicated-user restricted token");
     let stdin = File::open("NUL").context("stage=spawn open NUL stdin")?;
     let stdout = OpenOptions::new()
         .create(true)
@@ -462,12 +643,19 @@ fn launch_dedicated_user_target(
     startup.StartupInfo.hStdError = handles[2];
     startup.lpAttributeList = attributes.as_mut_ptr();
     let mut command_line = wide(argv_to_command_line(&request.command));
-    let cwd = wide(request.cwd.as_os_str());
-    let profile_home = current_profile_home()?;
+    let cwd = wide(native_path(&request.cwd).as_os_str());
+    let profile_home = request
+        .filesystem
+        .runtime_home
+        .clone()
+        .context(
+            "stage=validate_policy dedicated-user launches require a managed runtime home",
+        )?;
     let environment = current_environment_block(Some(&request.cwd), Some(&profile_home), false);
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let created = unsafe {
-        CreateProcessW(
+        CreateProcessAsUserW(
+            restricted_token.handle,
             ptr::null(),
             command_line.as_mut_ptr(),
             ptr::null(),
@@ -482,8 +670,12 @@ fn launch_dedicated_user_target(
     };
     if created == 0 {
         unsafe { CloseHandle(job) };
-        return Err(last_error("stage=spawn CreateProcessW"));
+        return Err(last_error("stage=spawn CreateProcessAsUserW"));
     }
+    crate::logging::event(
+        "runner",
+        format!("target created pid={}", process.dwProcessId),
+    );
     unsafe { CloseHandle(process.hThread) };
     let started = std::time::Instant::now();
     let stop_reason = loop {
@@ -579,6 +771,112 @@ fn captured_output_bytes(stdout_path: &Path, stderr_path: &Path) -> Result<u64> 
     Ok(stdout.saturating_add(stderr))
 }
 
+struct LoggedOnToken {
+    handle: HANDLE,
+}
+
+impl LoggedOnToken {
+    fn new(username: &str, password: &str) -> Result<Self> {
+        let username = wide(OsStr::new(username));
+        let domain = wide(OsStr::new("."));
+        let password = wide(OsStr::new(password));
+        let mut handle = ptr::null_mut();
+        let logged_on = unsafe {
+            LogonUserW(
+                username.as_ptr(),
+                domain.as_ptr(),
+                password.as_ptr(),
+                LOGON32_LOGON_INTERACTIVE,
+                LOGON32_PROVIDER_DEFAULT,
+                &mut handle,
+            )
+        };
+        if logged_on == 0 || handle.is_null() {
+            return Err(last_error("LogonUserW"));
+        }
+        Ok(Self { handle })
+    }
+}
+
+impl Drop for LoggedOnToken {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+/// Evaluate a filesystem DACL using the complete dedicated-user token. This is
+/// intentionally an authorization check rather than a path-location heuristic:
+/// group membership, explicit denies, ownership, and inherited ACEs all
+/// participate in the result exactly as they will for the launched process.
+fn effective_file_access(token: HANDLE, path: &Path, desired_access: u32) -> Result<bool> {
+    let name = wide(path.as_os_str());
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    let security_result = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if security_result != 0 {
+        anyhow::bail!(
+            "stage=access_check GetNamedSecurityInfoW failed for {}: {security_result}",
+            path.display()
+        )
+    }
+
+    let mut impersonation_token = ptr::null_mut();
+    let duplicated =
+        unsafe { DuplicateToken(token, SecurityImpersonation, &mut impersonation_token) };
+    if duplicated == 0 || impersonation_token.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
+        return Err(last_error("stage=access_check DuplicateToken"));
+    }
+
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+    let mut mapped_access = desired_access;
+    unsafe { MapGenericMask(&mut mapped_access, &mapping) };
+    // File access checks do not normally consume privileges, but AccessCheck
+    // requires caller-provided storage and reports the exact size it used.
+    let mut privilege_bytes = vec![0_u8; 1024];
+    let mut privilege_bytes_len = privilege_bytes.len() as u32;
+    let mut granted_access = 0;
+    let mut access_status = 0;
+    let checked = unsafe {
+        AccessCheck(
+            descriptor,
+            impersonation_token,
+            mapped_access,
+            &mapping,
+            privilege_bytes.as_mut_ptr().cast::<PRIVILEGE_SET>(),
+            &mut privilege_bytes_len,
+            &mut granted_access,
+            &mut access_status,
+        )
+    };
+    unsafe {
+        CloseHandle(impersonation_token);
+        windows_sys::Win32::Foundation::LocalFree(descriptor.cast());
+    }
+    if checked == 0 {
+        return Err(last_error("stage=access_check AccessCheck"));
+    }
+    Ok(access_status != 0 && granted_access & mapped_access == mapped_access)
+}
+
 const ACL_LEDGER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -670,56 +968,102 @@ fn ensure_persistent_user_permissions(
     request: &SandboxRequest,
     account: &str,
     sid: PSID,
+    token: HANDLE,
 ) -> Result<()> {
+    let ledger = load_acl_ledger()?;
+    let mut desired = Vec::new();
+    for path in request
+        .filesystem
+        .deny_read
+        .iter()
+        .filter(|path| path.exists())
+    {
+        let deny_entry_installed = ledger.entries.iter().any(|entry| {
+            entry.account.eq_ignore_ascii_case(account)
+                && entry.path == *path
+                && entry.kind == PersistentAclKind::DenyRead
+        });
+        if !deny_entry_installed
+            && effective_file_access(token, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
+        {
+            desired.push((path.clone(), PersistentAclKind::DenyRead));
+        }
+    }
+
+    let mut inaccessible_external = Vec::new();
+    let managed_read_roots = request
+        .filesystem
+        .read_execute
+        .iter()
+        .filter(|capability| capability.provisioning == ReadProvisioning::Managed)
+        .map(|capability| &capability.path)
+        .collect::<Vec<_>>();
+    for capability in &request.filesystem.read_execute {
+        if request
+            .filesystem
+            .write
+            .iter()
+            .any(|write_root| path_starts_with(&capability.path, write_root))
+        {
+            continue;
+        }
+        if effective_file_access(
+            token,
+            &capability.path,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )? {
+            crate::logging::event(
+                "access_check",
+                format!(
+                    "satisfied account={account} intent=read_execute path={}",
+                    capability.path.display()
+                ),
+            );
+            continue;
+        }
+        let provisioning = if managed_read_roots
+            .iter()
+            .any(|managed| path_starts_with(&capability.path, managed))
+        {
+            ReadProvisioning::Managed
+        } else {
+            capability.provisioning
+        };
+        match provisioning {
+            ReadProvisioning::Managed => {
+                desired.push((capability.path.clone(), PersistentAclKind::Read))
+            }
+            ReadProvisioning::ExistingOnly => inaccessible_external.push(capability.path.clone()),
+        }
+    }
+    if !inaccessible_external.is_empty() {
+        let paths = inaccessible_external
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "stage=resolve_runtime runtime_not_accessible sandbox account '{account}' cannot read/execute external runtime roots: {paths}. OpenTopia did not rewrite their host ACLs; provision the runtime for normal-user read access or place it in an OpenTopia-managed runtime location"
+        )
+    }
+
+    for path in &request.filesystem.write {
+        if !effective_file_access(token, path, WORKSPACE_WRITE_PERMISSIONS)? {
+            desired.push((path.clone(), PersistentAclKind::Write));
+        }
+    }
+    if desired.is_empty() {
+        crate::logging::event(
+            "access_check",
+            format!("all filesystem access already satisfied for {account}; no ACL mutation"),
+        );
+        return Ok(());
+    }
+
     let _guard = NamedAclMutex::acquire()?;
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
     let sid_bytes = SidBuffer::copy_from_sid(sid)?.0;
-    let mut desired = Vec::new();
-    desired.extend(
-        request
-            .denied_read_paths
-            .iter()
-            .filter(|path| path.exists())
-            .cloned()
-            .map(|path| (path, PersistentAclKind::DenyRead)),
-    );
-    desired.extend(
-        request
-            .read_roots
-            .iter()
-            .filter(|path| {
-                !request
-                    .write_roots
-                    .iter()
-                    .any(|write_root| path_starts_with(path, write_root))
-            })
-            .cloned()
-            .map(|path| (path, PersistentAclKind::Read)),
-    );
-    desired.extend(
-        request
-            .runtime_roots
-            .iter()
-            .filter(|root| needs_explicit_runtime_acl(root, request))
-            .cloned()
-            .map(|path| (path, PersistentAclKind::Read)),
-    );
-    desired.extend(
-        request
-            .write_roots
-            .iter()
-            .cloned()
-            .map(|path| (path, PersistentAclKind::Write)),
-    );
-    desired.extend(
-        request
-            .protected_paths
-            .iter()
-            .filter(|path| path.exists())
-            .cloned()
-            .map(|path| (path, PersistentAclKind::DenyWrite)),
-    );
 
     for (path, kind) in desired {
         let entry = PersistentAclEntry {
@@ -751,7 +1095,7 @@ fn ensure_persistent_user_permissions(
             PersistentAclKind::DenyRead => {
                 transaction.deny(&path, sid, true, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
             }
-            PersistentAclKind::DenyWrite => transaction.deny_write(&path, sid, true)?,
+            PersistentAclKind::DenyWrite => unreachable!(),
         }
         ledger.entries.retain(|existing| {
             existing.account != entry.account
@@ -765,19 +1109,81 @@ fn ensure_persistent_user_permissions(
     Ok(())
 }
 
+/// Version 2 expressed protected paths with identity-wide deny ACEs. Those
+/// denies cannot represent one approval scope, so remove them before switching
+/// to capability-scoped deny ACEs. Dedicated-user write ACEs remain the normal
+/// side of WRITE_RESTRICTED's two access checks; the capability SID supplies
+/// the independent restricted side and prevents ambient writes from widening
+/// the target process policy.
+fn migrate_legacy_dedicated_user_acls(request: &SandboxRequest, account: &str) -> Result<()> {
+    let ledger = load_acl_ledger()?;
+    let stale = ledger
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.account.eq_ignore_ascii_case(account)
+                && entry.kind == PersistentAclKind::DenyWrite
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    let _guard = NamedAclMutex::acquire()?;
+    let mut ledger = load_acl_ledger()?;
+    let mut revoked = BTreeSet::new();
+    for entry in &stale {
+        let mut sid = acl_entry_sid(entry)?;
+        let key = (entry.path.clone(), sid.0.clone());
+        if revoked.insert(key) {
+            update_dacl(&entry.path, sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
+        }
+    }
+    ledger.entries.retain(|entry| {
+        !entry.account.eq_ignore_ascii_case(account) || entry.kind != PersistentAclKind::DenyWrite
+    });
+    save_acl_ledger(&ledger)?;
+    crate::logging::event(
+        "migrate_acl",
+        format!(
+            "removed {} identity-wide protected-path deny ACL entries for {account}; capability_scope={}",
+            stale.len(),
+            capability_principal(request)
+        ),
+    );
+    Ok(())
+}
+
 fn ensure_persistent_capability_permissions(
     request: &SandboxRequest,
     principal: &str,
     sid: PSID,
 ) -> Result<()> {
+    let desired_entries = capability_acl_entries(request, principal, sid)?;
+    if desired_entries.is_empty() {
+        return Ok(());
+    }
+    if !desired_entries.is_empty() {
+        let ledger = load_acl_ledger()?;
+        if desired_entries
+            .iter()
+            .all(|entry| ledger.entries.contains(entry))
+        {
+            crate::logging::event(
+                "access_check",
+                format!("capability ACL already provisioned for {principal}"),
+            );
+            return Ok(());
+        }
+    }
     let _guard = NamedAclMutex::acquire()?;
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
-    let sid_bytes = SidBuffer::copy_from_sid(sid)?.0;
     let legacy_entries = ledger
         .entries
         .iter()
-        .filter(|entry| entry.account == LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL)
+        .filter(|entry| entry.account == LEGACY_CAPABILITY_PRINCIPAL)
         .cloned()
         .collect::<Vec<_>>();
     if !legacy_entries.is_empty() {
@@ -787,30 +1193,11 @@ fn ensure_persistent_capability_permissions(
         }
         ledger
             .entries
-            .retain(|entry| entry.account != LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL);
+            .retain(|entry| entry.account != LEGACY_CAPABILITY_PRINCIPAL);
     }
-    let desired = request
-        .write_roots
-        .iter()
-        .cloned()
-        .map(|path| (path, PersistentAclKind::Write))
-        .chain(
-            request
-                .protected_paths
-                .iter()
-                .filter(|path| path.exists())
-                .cloned()
-                .map(|path| (path, PersistentAclKind::DenyWrite)),
-        );
-
-    for (path, kind) in desired {
-        let entry = PersistentAclEntry {
-            account: principal.to_string(),
-            path: path.clone(),
-            kind: kind.clone(),
-            sid: sid_bytes.clone(),
-            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
-        };
+    for entry in desired_entries {
+        let path = entry.path.clone();
+        let kind = entry.kind.clone();
         revoke_replaced_acl_principals(&ledger, &entry)?;
         if ledger.entries.contains(&entry) {
             continue;
@@ -832,6 +1219,44 @@ fn ensure_persistent_capability_permissions(
     save_acl_ledger(&ledger)?;
     transaction.commit();
     Ok(())
+}
+
+fn capability_acl_entries(
+    request: &SandboxRequest,
+    principal: &str,
+    sid: PSID,
+) -> Result<Vec<PersistentAclEntry>> {
+    let sid_bytes = SidBuffer::copy_from_sid(sid)?.0;
+    let approved = &request.filesystem.allow_protected_write;
+    Ok(request
+        .filesystem
+        .write
+        .iter()
+        .cloned()
+        .map(|path| (path, PersistentAclKind::Write))
+        .chain(
+            request
+                .filesystem
+                .deny_write
+                .iter()
+                .filter(|path| path.exists())
+                .filter(|path| {
+                    !approved.iter().any(|approved_root| {
+                        path_starts_with(path, approved_root)
+                            || path_starts_with(approved_root, path)
+                    })
+                })
+                .cloned()
+                .map(|path| (path, PersistentAclKind::DenyWrite)),
+        )
+        .map(|(path, kind)| PersistentAclEntry {
+            account: principal.to_string(),
+            path,
+            kind,
+            sid: sid_bytes.clone(),
+            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+        })
+        .collect())
 }
 
 fn revoke_replaced_acl_principals(
@@ -936,32 +1361,6 @@ pub(super) fn cleanup_workspace_acl(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-/// Windows system and installed-program directories already grant normal users
-/// execute/read access. Rewriting those
-/// machine ACLs is both unnecessary and likely to require elevation. Runtime
-/// roots outside that baseline receive an explicit grant only when they are not
-/// already covered by the request's content roots.
-fn needs_explicit_runtime_acl(root: &Path, request: &SandboxRequest) -> bool {
-    let covered = request
-        .read_roots
-        .iter()
-        .chain(request.write_roots.iter())
-        .any(|candidate| path_starts_with(root, candidate));
-    !covered && !platform_runtime_roots().any(|candidate| path_starts_with(root, &candidate))
-}
-
-fn platform_runtime_roots() -> impl Iterator<Item = std::path::PathBuf> {
-    [
-        std::env::var_os("SystemRoot").map(std::path::PathBuf::from),
-        std::env::var_os("ProgramFiles").map(std::path::PathBuf::from),
-        std::env::var_os("ProgramFiles(x86)").map(std::path::PathBuf::from),
-        std::env::var_os("ProgramData").map(std::path::PathBuf::from),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|path| path.canonicalize().unwrap_or(path))
-}
-
 fn path_starts_with(path: &Path, root: &Path) -> bool {
     let path = path
         .to_string_lossy()
@@ -978,34 +1377,6 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
         || path
             .strip_prefix(root)
             .is_some_and(|suffix| suffix.starts_with('\\'))
-}
-
-struct ProtectedWriteWindow {
-    paths: Vec<std::path::PathBuf>,
-    sid: PSID,
-}
-
-impl ProtectedWriteWindow {
-    fn open(paths: Vec<std::path::PathBuf>, sid: PSID) -> Result<Self> {
-        for path in &paths {
-            update_dacl(path, sid, REVOKE_ACCESS, true, 0)?;
-        }
-        Ok(Self { paths, sid })
-    }
-}
-
-impl Drop for ProtectedWriteWindow {
-    fn drop(&mut self) {
-        for path in &self.paths {
-            let _ = update_dacl(
-                path,
-                self.sid,
-                DENY_ACCESS,
-                true,
-                WRITE_RESTRICTION_PERMISSIONS,
-            );
-        }
-    }
 }
 
 fn account_sid(account: &str) -> Result<SidBuffer> {
@@ -1048,9 +1419,12 @@ fn account_sid(account: &str) -> Result<SidBuffer> {
 }
 
 fn acl_principal_sid(principal: &str) -> Result<SidBuffer> {
-    if principal == LEGACY_UNELEVATED_CAPABILITY_PRINCIPAL {
+    if principal == LEGACY_CAPABILITY_PRINCIPAL {
         Ok(SidBuffer::legacy_opentopia_capability())
-    } else if let Some(value) = principal.strip_prefix(UNELEVATED_CAPABILITY_PRINCIPAL_PREFIX) {
+    } else if let Some(value) = principal
+        .strip_prefix(CAPABILITY_PRINCIPAL_PREFIX)
+        .or_else(|| principal.strip_prefix(LEGACY_SCOPED_CAPABILITY_PRINCIPAL_PREFIX))
+    {
         let id = Uuid::parse_str(value).context("parse scoped capability principal")?;
         Ok(SidBuffer::opentopia_capability(id))
     } else {
@@ -1060,19 +1434,34 @@ fn acl_principal_sid(principal: &str) -> Result<SidBuffer> {
 
 fn capability_principal(request: &SandboxRequest) -> String {
     let mut roots = request
-        .write_roots
+        .filesystem
+        .write
         .iter()
         .map(|path| normalized_capability_path(path))
         .collect::<Vec<_>>();
     if roots.is_empty() {
         roots.push(normalized_capability_path(&request.cwd));
     }
+    roots.extend(
+        request
+            .filesystem
+            .allow_protected_write
+            .iter()
+            .map(|path| format!("allow:{}", normalized_capability_path(path))),
+    );
+    roots.extend(
+        request
+            .filesystem
+            .deny_write
+            .iter()
+            .map(|path| format!("deny:{}", normalized_capability_path(path))),
+    );
     roots.sort_unstable();
     roots.dedup();
     let scope = roots.join("\0");
-    let namespace = Uuid::from_u128(UNELEVATED_CAPABILITY_NAMESPACE);
+    let namespace = Uuid::from_u128(CAPABILITY_NAMESPACE);
     let id = Uuid::new_v5(&namespace, scope.as_bytes());
-    format!("{UNELEVATED_CAPABILITY_PRINCIPAL_PREFIX}{}", id.simple())
+    format!("{CAPABILITY_PRINCIPAL_PREFIX}{}", id.simple())
 }
 
 fn normalized_capability_path(path: &Path) -> String {
@@ -1148,6 +1537,14 @@ struct RestrictedToken {
 
 impl RestrictedToken {
     fn for_capability(capability_sid: PSID) -> Result<Self> {
+        Self::create(capability_sid, None)
+    }
+
+    fn for_dedicated_capability(capability_sid: PSID, runtime_sid: PSID) -> Result<Self> {
+        Self::create(capability_sid, Some(runtime_sid))
+    }
+
+    fn create(capability_sid: PSID, runtime_sid: Option<PSID>) -> Result<Self> {
         let mut base_token = ptr::null_mut();
         let opened = unsafe {
             OpenProcessToken(
@@ -1179,8 +1576,14 @@ impl RestrictedToken {
         let mut everyone_sid = SidBuffer::well_known(WIN_WORLD_SID)?;
         let mut restricting_sids = [unsafe { std::mem::zeroed::<SID_AND_ATTRIBUTES>() }; 3];
         restricting_sids[0].Sid = capability_sid;
-        restricting_sids[1] = logon_sid.as_sid_and_attributes();
-        restricting_sids[2] = everyone_sid.as_sid_and_attributes();
+        let restricting_sid_count = if let Some(runtime_sid) = runtime_sid {
+            restricting_sids[1].Sid = runtime_sid;
+            2
+        } else {
+            restricting_sids[1].Sid = logon_sid.as_ptr();
+            restricting_sids[2].Sid = everyone_sid.as_ptr();
+            3
+        };
         let mut restricted = ptr::null_mut();
         let created = unsafe {
             CreateRestrictedToken(
@@ -1190,7 +1593,7 @@ impl RestrictedToken {
                 ptr::null(),
                 0,
                 ptr::null(),
-                restricting_sids.len() as u32,
+                restricting_sid_count,
                 restricting_sids.as_ptr(),
                 &mut restricted,
             )
@@ -1199,10 +1602,13 @@ impl RestrictedToken {
         if created == 0 || restricted.is_null() {
             return Err(last_error("CreateRestrictedToken"));
         }
-        if let Err(error) = set_default_dacl(
-            restricted,
-            &[capability_sid, logon_sid.as_ptr(), everyone_sid.as_ptr()],
-        ) {
+        let mut default_dacl_sids = vec![capability_sid];
+        if let Some(runtime_sid) = runtime_sid {
+            default_dacl_sids.push(runtime_sid);
+        } else {
+            default_dacl_sids.extend([logon_sid.as_ptr(), everyone_sid.as_ptr()]);
+        }
+        if let Err(error) = set_default_dacl(restricted, &default_dacl_sids) {
             unsafe { CloseHandle(restricted) };
             return Err(error);
         }
@@ -1289,6 +1695,10 @@ impl SidBuffer {
         Self::opentopia_capability(Uuid::from_bytes(*b"OpenTopiaSandbox"))
     }
 
+    fn opentopia_runtime() -> Self {
+        Self::opentopia_capability(Uuid::from_bytes(*b"OpenTopiaRuntime"))
+    }
+
     fn well_known(kind: i32) -> Result<Self> {
         let mut bytes = vec![0; 68];
         let mut size = bytes.len() as u32;
@@ -1317,13 +1727,6 @@ impl SidBuffer {
 
     fn as_ptr(&mut self) -> PSID {
         self.0.as_mut_ptr().cast()
-    }
-
-    fn as_sid_and_attributes(&mut self) -> SID_AND_ATTRIBUTES {
-        SID_AND_ATTRIBUTES {
-            Sid: self.as_ptr(),
-            Attributes: 0,
-        }
     }
 }
 
@@ -1414,7 +1817,6 @@ fn update_dacl(
     inherit: bool,
     permissions: u32,
 ) -> Result<()> {
-    let _acl_guard = NamedAclMutex::acquire()?;
     let name = wide(path.as_os_str());
     let mut old_dacl = ptr::null_mut();
     let mut descriptor = ptr::null_mut();
@@ -1815,12 +2217,7 @@ mod tests {
         let request = SandboxRequest {
             interactive: false,
             cwd: Path::new(r"C:\workspace").to_path_buf(),
-            read_roots: Vec::new(),
-            runtime_roots: Vec::new(),
-            write_roots: Vec::new(),
-            protected_paths: Vec::new(),
-            denied_read_paths: Vec::new(),
-            allowed_protected_roots: Vec::new(),
+            filesystem: Default::default(),
             network: NetworkMode::Deny,
             timeout_ms: Some(1_000),
             termination_timeout_ms: 500,
@@ -1844,7 +2241,32 @@ mod tests {
     }
 
     #[test]
-    fn unelevated_capability_principal_is_stable_and_scope_specific() {
+    fn broad_host_principals_are_not_write_restricting_sids() {
+        let source = include_str!("windows.rs");
+        let function = source
+            .split("fn for_capability")
+            .nth(1)
+            .expect("restricted token implementation")
+            .split("impl Drop for RestrictedToken")
+            .next()
+            .expect("restricted token boundary");
+        assert!(function.contains("restricting_sids[0].Sid = capability_sid"));
+        assert!(function.contains("include_user_compatibility_sid"));
+        assert!(function.contains("restricting_sids[1].Sid = user_sid.as_ptr()"));
+        assert!(function.contains("restricting_sid_count"));
+    }
+
+    #[test]
+    fn runtime_capabilities_default_to_external_existing_access() {
+        let capability = opentopia_sandbox_protocol::ReadExecuteCapability {
+            path: Path::new(r"J:\Python311").to_path_buf(),
+            provisioning: ReadProvisioning::ExistingOnly,
+        };
+        assert_eq!(capability.provisioning, ReadProvisioning::ExistingOnly);
+    }
+
+    #[test]
+    fn filesystem_capability_principal_is_stable_and_scope_specific() {
         let request = capability_request(&[r"C:\workspace", r"C:\sandbox-home"]);
         let reordered = capability_request(&[r"C:\sandbox-home", r"C:\workspace"]);
         let other = capability_request(&[r"C:\other-workspace", r"C:\sandbox-home"]);
@@ -1862,12 +2284,10 @@ mod tests {
         SandboxRequest {
             interactive: false,
             cwd: Path::new(r"C:\workspace").to_path_buf(),
-            read_roots: Vec::new(),
-            runtime_roots: Vec::new(),
-            write_roots: write_roots.iter().map(std::path::PathBuf::from).collect(),
-            protected_paths: Vec::new(),
-            denied_read_paths: Vec::new(),
-            allowed_protected_roots: Vec::new(),
+            filesystem: opentopia_sandbox_protocol::FilesystemCapabilities {
+                write: write_roots.iter().map(std::path::PathBuf::from).collect(),
+                ..Default::default()
+            },
             network: NetworkMode::Internet,
             timeout_ms: Some(1_000),
             termination_timeout_ms: 500,

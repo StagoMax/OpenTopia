@@ -11617,10 +11617,8 @@ mod tests {
             provider_items: Vec::new(),
             finish_reason: ModelFinishReason::Stop,
         }]));
-        let mut sandbox = LocalSandboxConfig::best_effort();
-        sandbox.network = crate::sandbox::NetworkPolicy::Allow;
-        let agent =
-            AgentCore::new(provider, ToolRegistry::with_builtins()).with_sandbox_config(sandbox);
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins())
+            .with_sandbox_config(LocalSandboxConfig::danger_full_access());
         let workspace_for_turn = workspace.clone();
         let cancellation_for_turn = cancellation.clone();
         let task = tokio::spawn(async move {

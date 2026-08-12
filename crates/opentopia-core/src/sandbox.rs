@@ -1050,6 +1050,15 @@ fn build_windows_sandbox_command_with_binary(
             path_to_string(&absolute_path(root)),
         ]);
     }
+    if let Some(home) = config
+        .effective_sandbox_home(&workspace_root)
+        .filter(|path| path.exists())
+    {
+        sandbox_args.extend([
+            "--runtime-home".to_string(),
+            path_to_string(&absolute_path(home)),
+        ]);
+    }
     let (protected, approved_protected): (Vec<_>, Vec<_>) =
         protected_paths(&workspace_root, config)
             .into_iter()

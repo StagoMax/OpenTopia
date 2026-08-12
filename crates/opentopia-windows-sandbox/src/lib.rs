@@ -8,6 +8,7 @@
 
 use anyhow::Context;
 use anyhow::Result;
+use opentopia_sandbox_protocol::{FilesystemCapabilities, ReadExecuteCapability, ReadProvisioning};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -36,12 +37,7 @@ enum BackendMode {
 struct SandboxRequest {
     interactive: bool,
     cwd: PathBuf,
-    read_roots: Vec<PathBuf>,
-    runtime_roots: Vec<PathBuf>,
-    write_roots: Vec<PathBuf>,
-    protected_paths: Vec<PathBuf>,
-    denied_read_paths: Vec<PathBuf>,
-    allowed_protected_roots: Vec<PathBuf>,
+    filesystem: FilesystemCapabilities,
     network: NetworkMode,
     timeout_ms: Option<u64>,
     termination_timeout_ms: u64,
@@ -112,7 +108,7 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
             std::process::exit(0);
         }
         _ => anyhow::bail!(
-            "usage: opentopia-sandbox run --cwd <absolute-path> [--interactive] [--read-root <absolute-path>] [--runtime-root <absolute-path>] [--write-root <absolute-path>] [--protect <absolute-path>] [--timeout-ms <milliseconds>] [--termination-timeout-ms <milliseconds>] --network <deny|internet> -- <program> [args...]"
+            "usage: opentopia-sandbox run --cwd <absolute-path> [--interactive] [--read-root <absolute-path>] [--runtime-root <absolute-path>] [--write-root <absolute-path>] [--runtime-home <absolute-path>] [--protect <absolute-path>] [--timeout-ms <milliseconds>] [--termination-timeout-ms <milliseconds>] --network <deny|internet> -- <program> [args...]"
         ),
     }
 
@@ -121,6 +117,7 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
     let mut read_roots = Vec::new();
     let mut runtime_roots = Vec::new();
     let mut write_roots = Vec::new();
+    let mut runtime_home = None;
     let mut protected_paths = Vec::new();
     let mut denied_read_paths = Vec::new();
     let mut allowed_protected_roots = Vec::new();
@@ -147,6 +144,9 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
             }
             "--write-root" => {
                 write_roots.push(absolute_path(next_value("--write-root", &mut args)?)?)
+            }
+            "--runtime-home" => {
+                runtime_home = Some(absolute_path(next_value("--runtime-home", &mut args)?)?)
             }
             "--protect" => {
                 protected_paths.push(absolute_path(next_value("--protect", &mut args)?)?)
@@ -196,15 +196,32 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
     if command.is_empty() {
         anyhow::bail!("missing sandboxed program after --")
     }
+    if let Some(home) = runtime_home.as_ref() {
+        if !write_roots.iter().any(|root| root == home) {
+            write_roots.push(home.clone());
+        }
+    }
     Ok(SandboxRequest {
         interactive,
         cwd,
-        read_roots,
-        runtime_roots,
-        write_roots,
-        protected_paths,
-        denied_read_paths,
-        allowed_protected_roots,
+        filesystem: FilesystemCapabilities {
+            read_execute: read_roots
+                .into_iter()
+                .map(|path| ReadExecuteCapability {
+                    path,
+                    provisioning: ReadProvisioning::Managed,
+                })
+                .chain(runtime_roots.into_iter().map(|path| ReadExecuteCapability {
+                    path,
+                    provisioning: ReadProvisioning::ExistingOnly,
+                }))
+                .collect(),
+            write: write_roots,
+            deny_read: denied_read_paths,
+            deny_write: protected_paths,
+            allow_protected_write: allowed_protected_roots,
+            runtime_home,
+        },
         network: network.context("missing required --network")?,
         timeout_ms,
         termination_timeout_ms,
@@ -286,6 +303,8 @@ mod tests {
                 &cwd,
                 "--write-root",
                 &cwd,
+                "--runtime-home",
+                &cwd,
                 "--runtime-root",
                 &cwd,
                 "--protect",
@@ -320,8 +339,20 @@ mod tests {
         assert_eq!(request.network, NetworkMode::Deny);
         assert!(request.interactive);
         assert_eq!(request.timeout_ms, Some(2_500));
-        assert_eq!(request.runtime_roots.len(), 1);
-        assert_eq!(request.denied_read_paths.len(), 1);
+        assert_eq!(
+            request
+                .filesystem
+                .read_execute
+                .iter()
+                .filter(|capability| {
+                    capability.provisioning
+                        == opentopia_sandbox_protocol::ReadProvisioning::ExistingOnly
+                })
+                .count(),
+            1
+        );
+        assert_eq!(request.filesystem.deny_read.len(), 1);
+        assert_eq!(request.filesystem.runtime_home.as_deref(), Some(cwd.as_ref()));
         assert_eq!(request.termination_timeout_ms, 7_000);
         assert_eq!(request.max_memory_bytes, Some(1_048_576));
         assert_eq!(request.max_cpu_time_ms, Some(9_000));
