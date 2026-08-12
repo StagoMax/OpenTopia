@@ -121,7 +121,7 @@ type PreviewDescriptorResponse = {
   source: "workspace" | "artifact" | "attachment";
   path?: string | null;
   name: string;
-  kind: "text" | "image" | "pdf" | "spreadsheet" | "unsupported";
+  kind: "text" | "image" | "pdf" | "document" | "spreadsheet" | "unsupported";
   contentType: string;
   bytes: number;
   readonly: boolean;
@@ -1316,7 +1316,9 @@ export class ApiClient {
         renderer:
           response.kind === "text"
             ? previewRenderer(response.name, response.contentType)
-            : response.kind,
+            : response.kind === "document"
+              ? "pdf"
+              : response.kind,
         title: response.name,
         contentType: response.contentType,
         bytes: response.bytes,

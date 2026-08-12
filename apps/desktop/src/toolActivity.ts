@@ -19,8 +19,12 @@ export type ToolActivityKind =
   | "agent"
   | "plan"
   | "skill"
+  | "attachment"
   | "mcp"
   | "tool";
+
+export type ToolActivityIconKind =
+  ToolActivityKind | "image" | "document" | "code" | "archive";
 
 export type ShellCommandKind =
   | "read"
@@ -93,6 +97,8 @@ export type ToolActivityChip = {
 
 export type ToolActivityView = {
   kind: ToolActivityKind;
+  /** More specific icon when one activity kind can contain several resources. */
+  iconKind?: ToolActivityIconKind;
   /** Single-line headline, e.g. "读取 prompt_v3.txt". */
   title: string;
   /** Secondary detail shown after the title, e.g. a search path. */
@@ -112,6 +118,7 @@ export type ToolActivityGroup =
   | "agent"
   | "plan"
   | "skill"
+  | "attachment"
   | "mcp"
   | "tool";
 
@@ -132,6 +139,7 @@ export function classifyToolCall(call: ToolCall): ToolActivityKind {
       parseShellCommand(stringField(input, "command")).kind,
     );
   }
+
   if (call.name === "git_diff") return "diff";
   if (call.name === "read_file") return "read";
   if (call.name === "list_files") return "list";
@@ -139,7 +147,11 @@ export function classifyToolCall(call: ToolCall): ToolActivityKind {
   if (call.name === "write_file" || call.name === "apply_patch") return "edit";
   if (call.name === "browser") return "browser";
   if (call.name === "computer") return "computer";
+  if (call.name === "document" || call.name === "pdf") return "attachment";
   if (call.name === "spreadsheet") return "spreadsheet";
+  if (call.name === "view_attachment" || call.name === "read_attachment") {
+    return "attachment";
+  }
   if (
     [
       "spawn_agent",
@@ -204,7 +216,11 @@ function buildToolActivityView(
   const input = asRecord(call.input) ?? {};
   const metadata = asRecord(result?.metadata) ?? {};
   const failed = toolResultFailed(result);
-  const output = stripArtifactMarker(result?.output ?? "");
+  const rawOutput = stripArtifactMarker(result?.output ?? "");
+  const output =
+    call.name === "view_attachment" || call.name === "read_attachment"
+      ? stripAttachmentBoundary(rawOutput)
+      : rawOutput;
 
   if (call.name === "shell") {
     const streams = parseShellStreams(
@@ -228,6 +244,49 @@ function buildToolActivityView(
       title: "查看 Git 变更",
       chips: [],
       body: result ? patchBody(output) : { type: "pending" },
+      failed,
+    };
+  }
+
+  if (
+    call.name === "document" ||
+    call.name === "pdf" ||
+    call.name === "view_attachment" ||
+    call.name === "read_attachment"
+  ) {
+    const name = stringField(metadata, "name") || stringField(input, "path");
+    const contentType =
+      stringField(metadata, "contentType") ||
+      (call.name === "pdf"
+        ? "application/pdf"
+        : call.name === "document"
+          ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          : "");
+    const action = stringField(input, "action");
+    const attachment = attachmentPresentation(
+      call.name,
+      name,
+      contentType,
+      Boolean(result),
+    );
+    const chips: ToolActivityChip[] = [];
+    if (attachment.format) {
+      chips.push({
+        label: attachment.format,
+        title: contentType || undefined,
+      });
+    }
+    chips.push(...bytesChip(numberField(metadata, "bytes")));
+    return {
+      kind,
+      iconKind: attachment.iconKind,
+      title:
+        call.name === "pdf" || call.name === "document"
+          ? officeActivityTitle(call.name, action, Boolean(result))
+          : attachment.title,
+      detail: name || undefined,
+      chips,
+      body: bodyFromFields(input, output, result, ["attachmentId", "action"]),
       failed,
     };
   }
@@ -424,6 +483,254 @@ function buildToolActivityView(
     body: bodyFromFields(input, output, result),
     failed,
   };
+}
+
+function officeActivityTitle(
+  toolName: "pdf" | "document",
+  action: string,
+  complete: boolean,
+) {
+  const subject = toolName === "pdf" ? "PDF" : "Word 文档";
+  const labels: Record<string, [string, string]> = {
+    inspect: [`检查 ${subject}`, `检查了 ${subject}`],
+    extract: [`提取 ${subject}内容`, `提取了 ${subject}内容`],
+    render: [`渲染 ${subject}`, `渲染了 ${subject}`],
+    validate: [`验证 ${subject}`, `验证了 ${subject}`],
+  };
+  const [pending, completed] = labels[action] ?? [
+    `读取 ${subject}`,
+    `读取了 ${subject}`,
+  ];
+  return complete ? completed : pending;
+}
+
+type AttachmentPresentation = {
+  iconKind: ToolActivityIconKind;
+  title: string;
+  format?: string;
+};
+
+function attachmentPresentation(
+  toolName: string,
+  name: string,
+  contentType: string,
+  complete: boolean,
+): AttachmentPresentation {
+  const mime = contentType.toLowerCase().split(";", 1)[0].trim();
+  const extension = fileExtension(name);
+  const format = attachmentFormat(mime, extension);
+
+  if (
+    toolName === "view_attachment" ||
+    mime.startsWith("image/") ||
+    imageExtensions.has(extension)
+  ) {
+    return {
+      iconKind: "image",
+      title: complete ? "查看了一张图片" : "查看图片",
+      format,
+    };
+  }
+
+  if (spreadsheetMimes.has(mime) || spreadsheetExtensions.has(extension)) {
+    return {
+      iconKind: "spreadsheet",
+      title: complete ? "读取了一个表格文件" : "读取表格文件",
+      format,
+    };
+  }
+
+  if (archiveMimes.has(mime) || archiveExtensions.has(extension)) {
+    return {
+      iconKind: "archive",
+      title: complete ? "读取了一个压缩文件" : "读取压缩文件",
+      format,
+    };
+  }
+
+  if (dataMimes.has(mime) || dataExtensions.has(extension)) {
+    return {
+      iconKind: "code",
+      title: complete ? "读取了一个数据文件" : "读取数据文件",
+      format,
+    };
+  }
+
+  if (codeExtensions.has(extension)) {
+    return {
+      iconKind: "code",
+      title: complete ? "读取了一个代码文件" : "读取代码文件",
+      format,
+    };
+  }
+
+  if (documentMimes.has(mime) || documentExtensions.has(extension)) {
+    return {
+      iconKind: "document",
+      title:
+        format === "PDF"
+          ? complete
+            ? "读取了一个 PDF 文档"
+            : "读取 PDF 文档"
+          : complete
+            ? "读取了一个文档"
+            : "读取文档",
+      format,
+    };
+  }
+
+  if (mime.startsWith("text/") || textExtensions.has(extension)) {
+    return {
+      iconKind: "document",
+      title: complete ? "读取了一个文本文件" : "读取文本文件",
+      format,
+    };
+  }
+
+  return {
+    iconKind: "attachment",
+    title: complete ? "读取了一个附件" : "读取附件",
+    format,
+  };
+}
+
+const mimeFormatLabels = new Map<string, string>([
+  ["image/jpeg", "JPEG"],
+  ["image/png", "PNG"],
+  ["image/gif", "GIF"],
+  ["image/avif", "AVIF"],
+  ["image/webp", "WEBP"],
+  ["image/svg+xml", "SVG"],
+  ["image/bmp", "BMP"],
+  ["image/tiff", "TIFF"],
+  ["application/pdf", "PDF"],
+  ["application/json", "JSON"],
+  ["application/xml", "XML"],
+  ["application/yaml", "YAML"],
+  ["text/yaml", "YAML"],
+  ["text/csv", "CSV"],
+  ["text/tab-separated-values", "TSV"],
+  ["text/markdown", "MD"],
+  ["text/plain", "TXT"],
+  ["application/zip", "ZIP"],
+  ["application/x-7z-compressed", "7Z"],
+  ["application/vnd.rar", "RAR"],
+  ["application/x-rar-compressed", "RAR"],
+  ["application/msword", "DOC"],
+  [
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "DOCX",
+  ],
+  ["application/vnd.ms-excel", "XLS"],
+  ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "XLSX"],
+]);
+
+const imageExtensions = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "avif",
+  "svg",
+  "bmp",
+  "tif",
+  "tiff",
+]);
+const spreadsheetExtensions = new Set(["csv", "tsv", "xls", "xlsx", "ods"]);
+const spreadsheetMimes = new Set([
+  "text/csv",
+  "text/tab-separated-values",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.oasis.opendocument.spreadsheet",
+]);
+const archiveExtensions = new Set([
+  "zip",
+  "7z",
+  "rar",
+  "tar",
+  "gz",
+  "bz2",
+  "xz",
+]);
+const archiveMimes = new Set([
+  "application/zip",
+  "application/x-7z-compressed",
+  "application/vnd.rar",
+  "application/x-rar-compressed",
+  "application/x-tar",
+  "application/gzip",
+]);
+const dataExtensions = new Set(["json", "jsonl", "yaml", "yml", "xml", "toml"]);
+const dataMimes = new Set([
+  "application/json",
+  "application/x-ndjson",
+  "application/xml",
+  "application/yaml",
+  "text/yaml",
+]);
+const codeExtensions = new Set([
+  "c",
+  "cc",
+  "cpp",
+  "cs",
+  "css",
+  "go",
+  "h",
+  "hpp",
+  "html",
+  "java",
+  "js",
+  "jsx",
+  "kt",
+  "mjs",
+  "php",
+  "py",
+  "rb",
+  "rs",
+  "sh",
+  "sql",
+  "swift",
+  "ts",
+  "tsx",
+  "vue",
+]);
+const documentExtensions = new Set(["pdf", "doc", "docx", "odt", "rtf"]);
+const documentMimes = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/rtf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.oasis.opendocument.text",
+]);
+const textExtensions = new Set(["txt", "md", "mdx", "log"]);
+
+function fileExtension(name: string) {
+  const basename = name.replace(/\\/g, "/").split("/").pop() ?? "";
+  const dot = basename.lastIndexOf(".");
+  return dot > 0 && dot < basename.length - 1
+    ? basename.slice(dot + 1).toLowerCase()
+    : "";
+}
+
+const knownAttachmentExtensions = new Set([
+  ...imageExtensions,
+  ...spreadsheetExtensions,
+  ...archiveExtensions,
+  ...dataExtensions,
+  ...codeExtensions,
+  ...documentExtensions,
+  ...textExtensions,
+]);
+
+function attachmentFormat(mime: string, extension: string) {
+  return (
+    mimeFormatLabels.get(mime) ??
+    (knownAttachmentExtensions.has(extension)
+      ? extension.toUpperCase()
+      : undefined)
+  );
 }
 
 /**
@@ -989,6 +1296,10 @@ function cleanDiffPath(value: string) {
 
 function stripArtifactMarker(output: string) {
   return output.replace(/\n\n\[Artifact: [^\]]+\]\s*$/, "");
+}
+
+function stripAttachmentBoundary(output: string) {
+  return output.replace(/^Attachment content:\s*/i, "");
 }
 
 function splitLines(value: string) {

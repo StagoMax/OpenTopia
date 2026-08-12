@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   composerContentText,
+  composerTextLength,
   composerUndoEntries,
   composerVisibleText,
   normalizeComposerContentParts,
@@ -10,6 +11,12 @@ import {
 } from "./composerContent.ts";
 
 const imageId = "11111111-1111-4111-8111-111111111111";
+
+test("counts composer graphemes without splitting common text into arrays", () => {
+  assert.equal(composerTextLength("plain text"), 10);
+  assert.equal(composerTextLength("输入框"), 3);
+  assert.equal(composerTextLength("👨‍👩‍👧‍👦"), 1);
+});
 
 test("keeps repeated image references while identifying one unique attachment", () => {
   const parts = normalizeComposerContentParts([
@@ -67,6 +74,33 @@ test("splits a multi-character IME commit into one undo entry per character", ()
     { parts: [], caretOffset: 0 },
     { parts: [{ type: "text", text: "你" }], caretOffset: 1 },
   ]);
+});
+
+test("keeps plain-text undo offsets correct when IME inserts before a suffix", () => {
+  const entries = composerUndoEntries(
+    { parts: [{ type: "text", text: "前后" }], caretOffset: 1 },
+    { parts: [{ type: "text", text: "前你好后" }], caretOffset: 3 },
+    true,
+  );
+
+  assert.deepEqual(entries, [
+    { parts: [{ type: "text", text: "前后" }], caretOffset: 1 },
+    { parts: [{ type: "text", text: "前你后" }], caretOffset: 2 },
+  ]);
+});
+
+test("records a plain-text deletion as one undo operation", () => {
+  const before = {
+    parts: [{ type: "text" as const, text: "需要删除" }],
+    caretOffset: 4,
+  };
+  const entries = composerUndoEntries(
+    before,
+    { parts: [{ type: "text", text: "需要删" }], caretOffset: 3 },
+    false,
+  );
+
+  assert.deepEqual(entries, [before]);
 });
 
 test("keeps a pasted phrase as one undo operation", () => {

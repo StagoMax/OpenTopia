@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  activeTurnIdFromEvents,
   hasPendingProviderRequest,
   inactiveTurnIdsFromEvents,
   resolveActiveTurnId,
@@ -109,6 +110,37 @@ test("keeps thinking while any provider request remains unanswered", () => {
       providerResponse(4, "request-2"),
     ]),
     false,
+  );
+});
+
+test("restores the latest active turn from cached lifecycle events", () => {
+  assert.equal(
+    activeTurnIdFromEvents([
+      {
+        ...event(1, {
+          type: "turn_started",
+          user_message_id: "message-older",
+        }),
+        turnId: "turn-older",
+      },
+      {
+        ...event(2, { type: "turn_finished", summary: "done" }),
+        turnId: "turn-older",
+      },
+      event(3, { type: "turn_started", user_message_id: "message-1" }),
+      providerRequest(4, "request-1"),
+    ]),
+    "turn-1",
+  );
+});
+
+test("does not restore a cached turn after its stopping boundary", () => {
+  assert.equal(
+    activeTurnIdFromEvents([
+      event(1, { type: "turn_started", user_message_id: "message-1" }),
+      event(2, { type: "turn_cancelled", reason: "cancelled" }),
+    ]),
+    null,
   );
 });
 

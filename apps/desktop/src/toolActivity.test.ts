@@ -176,6 +176,124 @@ test("builds a terminal body for shell calls", () => {
   }
 });
 
+test("presents image attachments with their file format and size", () => {
+  const pending = buildToolActivity(
+    call("view_attachment", { attachmentId: "attachment-1" }),
+  );
+  assert.equal(pending.kind, "attachment");
+  assert.equal(pending.iconKind, "image");
+  assert.equal(pending.title, "查看图片");
+
+  const view = buildToolActivity(
+    call("view_attachment", { attachmentId: "attachment-1" }),
+    result("Image attachment follows as typed image data.", {
+      success: true,
+      name: "screenshot.png",
+      contentType: "image/png",
+      bytes: 701_997,
+    }),
+  );
+
+  assert.equal(view.kind, "attachment");
+  assert.equal(view.iconKind, "image");
+  assert.equal(view.title, "查看了一张图片");
+  assert.equal(view.detail, "screenshot.png");
+  assert.deepEqual(
+    view.chips.map((chip) => chip.label),
+    ["PNG", "686 KB"],
+  );
+});
+
+test("distinguishes common document attachment formats", () => {
+  const pdf = buildToolActivity(
+    call("read_attachment", { attachmentId: "attachment-2" }),
+    result("document", {
+      name: "requirements.pdf",
+      contentType: "application/pdf",
+      bytes: 2_048,
+    }),
+  );
+  assert.equal(pdf.iconKind, "document");
+  assert.equal(pdf.title, "读取了一个 PDF 文档");
+  assert.equal(pdf.detail, "requirements.pdf");
+  assert.deepEqual(
+    pdf.chips.map((chip) => chip.label),
+    ["PDF", "2 KB"],
+  );
+
+  const spreadsheet = buildToolActivity(
+    call("read_attachment", { attachmentId: "attachment-3" }),
+    result("rows", {
+      name: "orders.xlsx",
+      contentType: "application/octet-stream",
+    }),
+  );
+  assert.equal(spreadsheet.iconKind, "spreadsheet");
+  assert.equal(spreadsheet.title, "读取了一个表格文件");
+  assert.deepEqual(
+    spreadsheet.chips.map((chip) => chip.label),
+    ["XLSX"],
+  );
+
+  const unknown = buildToolActivity(
+    call("read_attachment", { attachmentId: "attachment-4" }),
+    result("resource", {
+      name: "payload.bin",
+      contentType: "application/octet-stream",
+    }),
+  );
+  assert.equal(unknown.iconKind, "attachment");
+  assert.equal(unknown.title, "读取了一个附件");
+  assert.deepEqual(unknown.chips, []);
+});
+
+test("presents native Office observation tools as attachment activity", () => {
+  const pending = buildToolActivity(
+    call("document", {
+      action: "extract",
+      attachmentId: "attachment-docx",
+    }),
+  );
+  assert.equal(pending.kind, "attachment");
+  assert.equal(pending.iconKind, "document");
+  assert.equal(pending.title, "提取 Word 文档内容");
+
+  const rendered = buildToolActivity(
+    call("pdf", {
+      action: "render",
+      attachmentId: "attachment-pdf",
+    }),
+    result("rendered", {
+      success: true,
+      name: "spec.pdf",
+      contentType: "application/pdf",
+      bytes: 4_096,
+    }),
+  );
+  assert.equal(rendered.kind, "attachment");
+  assert.equal(rendered.iconKind, "document");
+  assert.equal(rendered.title, "渲染了 PDF");
+  assert.equal(rendered.detail, "spec.pdf");
+  assert.deepEqual(
+    rendered.chips.map((chip) => chip.label),
+    ["PDF", "4 KB"],
+  );
+});
+
+test("hides the model-facing attachment boundary from the activity body", () => {
+  const view = buildToolActivity(
+    call("view_attachment", { attachmentId: "attachment-5" }),
+    result("Attachment content:\nimage observation", {
+      name: "photo.jpg",
+      contentType: "image/jpeg",
+    }),
+  );
+  assert.equal(view.body.type, "text");
+  if (view.body.type === "text") {
+    assert.equal(view.body.text, "image observation");
+  }
+});
+
 test("marks a non-zero exit as failed and labels it as failed", () => {
   const view = buildToolActivity(
     call("shell", { command: "wc -l" }),

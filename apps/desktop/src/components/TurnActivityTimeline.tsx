@@ -47,7 +47,7 @@ import {
   toolResultFailed,
   truncateText,
   type ToolActivityGroup as ToolGroupKey,
-  type ToolActivityKind,
+  type ToolActivityIconKind,
 } from "../toolActivity";
 import {
   rendererTraceTime,
@@ -1204,10 +1204,10 @@ function ToolActivityGroup({
         onClick={() => setExpanded((current) => !current)}
       >
         <span className="activity-group-icon" aria-hidden="true">
-          {toolActivityIcon(toolGroupIconKind(group), 13)}
+          {toolActivityIcon(toolGroupIconKind(group, executions), 13)}
         </span>
         <span>
-          {toolGroupTitle(group, executions.length)}
+          {toolGroupTitle(group, executions)}
           {timing ? ` · ${timing}` : ""}
         </span>
         <ActivityResultIcon running={running} failed={failed} />
@@ -2424,7 +2424,8 @@ function subagentStatusLabel(status: SubagentRun["status"]) {
   return labels[status];
 }
 
-function toolGroupTitle(group: ToolGroupKey, count: number) {
+function toolGroupTitle(group: ToolGroupKey, executions: ToolExecution[]) {
+  const count = executions.length;
   if (group === "explore") return `探索了 ${count} 处`;
   if (group === "shell") return `运行了 ${count} 个命令`;
   if (group === "edit") return `修改了 ${count} 次文件`;
@@ -2434,13 +2435,31 @@ function toolGroupTitle(group: ToolGroupKey, count: number) {
   if (group === "agent") return `进行了 ${count} 个子智能体操作`;
   if (group === "plan") return `更新了 ${count} 次执行计划`;
   if (group === "skill") return `进行了 ${count} 次 Skill 操作`;
+  if (group === "attachment") {
+    if (executions.every(({ call }) => call.name === "view_attachment")) {
+      return `查看了 ${count} 张图片`;
+    }
+    if (executions.every(({ call }) => call.name === "read_attachment")) {
+      return `读取了 ${count} 个附件`;
+    }
+    return `处理了 ${count} 个附件`;
+  }
   if (group === "mcp") return `调用了 ${count} 个 MCP 工具`;
   return `调用了 ${count} 个工具`;
 }
 
-function toolGroupIconKind(group: ToolGroupKey): ToolActivityKind {
+function toolGroupIconKind(
+  group: ToolGroupKey,
+  executions: ToolExecution[],
+): ToolActivityIconKind {
   if (group === "explore") return "search";
   if (group === "shell") return "shell";
   if (group === "edit") return "edit";
+  if (
+    group === "attachment" &&
+    executions.every(({ call }) => call.name === "view_attachment")
+  ) {
+    return "image";
+  }
   return group;
 }

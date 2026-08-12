@@ -140,6 +140,7 @@ import {
   composerContentText,
   composerExternalValueSyncAction,
   composerInputCommitPending,
+  composerTextLength,
   composerUndoEntries,
   composerVisibleText,
   normalizeComposerContentParts,
@@ -223,6 +224,7 @@ import {
   writePersonalizationSettings,
 } from "./personalization";
 import {
+  activeTurnIdFromEvents,
   hasPendingProviderRequest,
   inactiveTurnIdFromEvent,
   inactiveTurnIdsFromEvents,
@@ -843,8 +845,8 @@ export function App() {
     };
   }, [client, isWindows]);
 
-  const setupWindowsSandbox = useCallback(
-    async (): Promise<WindowsSandboxSetupStatus> => {
+  const setupWindowsSandbox =
+    useCallback(async (): Promise<WindowsSandboxSetupStatus> => {
       if (!client) throw new Error("后端尚未连接");
       setWindowsSandboxSetupBusy(true);
       setWindowsSandboxSetupError(null);
@@ -867,11 +869,9 @@ export function App() {
       } finally {
         setWindowsSandboxSetupBusy(false);
       }
-    },
-    [client],
-  );
-  const removeWindowsSandbox = useCallback(
-    async (): Promise<WindowsSandboxSetupStatus> => {
+    }, [client]);
+  const removeWindowsSandbox =
+    useCallback(async (): Promise<WindowsSandboxSetupStatus> => {
       if (!client) throw new Error("后端尚未连接");
       setWindowsSandboxSetupBusy(true);
       setWindowsSandboxSetupError(null);
@@ -886,9 +886,7 @@ export function App() {
       } finally {
         setWindowsSandboxSetupBusy(false);
       }
-    },
-    [client],
-  );
+    }, [client]);
   const [providerTest, setProviderTest] = useState<{
     providerId: string;
     status: "testing" | "complete";
@@ -977,11 +975,13 @@ export function App() {
     >(),
   );
   const activeThreadIdRef = useRef<string | null>(null);
+  const threadActivityStatusesRef = useRef(threadActivityStatuses);
   const threadActivityReadAtRef = useRef<ThreadActivityReadAt>(
     readThreadActivityReadAt(),
   );
 
   activeThreadIdRef.current = activeThreadId;
+  threadActivityStatusesRef.current = threadActivityStatuses;
 
   const setThreadActivityStatus = useCallback(
     (threadId: string, status: ThreadActivityStatus | null) => {
@@ -2040,11 +2040,11 @@ export function App() {
     setPendingUserInput([]);
     setSubmittingUserInputId(null);
     setUserInputError(null);
-    setActiveTurnId(null);
     setCancellingTurnId(null);
     inactiveTurnIdsRef.current = new Set();
     setGoalSnapshot(null);
     if (!client || !activeThreadId) {
+      setActiveTurnId(null);
       setMessages([]);
       setEvents([]);
       setConversationLoadState({
@@ -2065,6 +2065,11 @@ export function App() {
     const cached = conversationCacheRef.current.get(threadId) ?? null;
     inactiveTurnIdsRef.current = inactiveTurnIdsFromEvents(
       cached?.events ?? [],
+    );
+    setActiveTurnId(
+      isThreadActivityProcessing(threadActivityStatusesRef.current[threadId])
+        ? activeTurnIdFromEvents(cached?.events ?? [])
+        : null,
     );
     if (cached) {
       cacheConversation(conversationCacheRef.current, threadId, cached);
@@ -2095,10 +2100,13 @@ export function App() {
           loadedEvents,
         );
         const inactiveTurnIds = inactiveTurnIdsFromEvents(nextEvents);
+        const restoredActiveTurnId = activeTurnIdFromEvents(nextEvents);
         inactiveTurnIdsRef.current = inactiveTurnIds;
         setEvents(nextEvents);
-        setActiveTurnId((current) =>
-          current && inactiveTurnIds.has(current) ? null : current,
+        setActiveTurnId(
+          (current) =>
+            restoredActiveTurnId ??
+            (current && !inactiveTurnIds.has(current) ? current : null),
         );
         setCancellingTurnId((current) =>
           current && inactiveTurnIds.has(current) ? null : current,
@@ -2317,9 +2325,24 @@ export function App() {
 
   function selectThread(threadId: string) {
     const thread = threads.find((item) => item.id === threadId);
+    const cached =
+      conversationCacheClientRef.current === client
+        ? (conversationCacheRef.current.get(threadId) ?? null)
+        : null;
+    const cachedActiveTurnId = isThreadActivityProcessing(
+      threadActivityStatusesRef.current[threadId],
+    )
+      ? activeTurnIdFromEvents(cached?.events ?? [])
+      : null;
     markThreadActivityRead(threadId);
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
+    setActiveTurnId(cachedActiveTurnId);
+    if (cached) {
+      setMessages(cached.messages);
+      setEvents(cached.events);
+      setConversationLoadState({ threadId, status: "ready", error: null });
+    }
     if (thread) setExperienceMode(thread.experienceMode);
     setDraftProjectId(null);
     if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
@@ -5764,7 +5787,11 @@ function WindowsSandboxSetupDialog({
               disabled={busy || !status.helperAvailable}
               onClick={onSetup}
             >
-              {busy ? "正在等待 Windows 授权…" : degraded ? "修复配置" : "继续配置"}
+              {busy
+                ? "正在等待 Windows 授权…"
+                : degraded
+                  ? "修复配置"
+                  : "继续配置"}
             </Button>
           )}
         </div>
@@ -6864,6 +6891,11 @@ function Sidebar({
             <FileText size={15} />
             <span>新建任务</span>
           </button>
+          <button disabled title="拉取请求 · 未实现">
+            <GitPullRequest size={15} />
+            <span>拉取请求</span>
+            <small>未实现</small>
+          </button>
           <button disabled title="已安排 · 未实现">
             <Clock3 size={15} />
             <span>已安排</span>
@@ -6873,11 +6905,6 @@ function Sidebar({
             <Plug size={15} />
             <span>插件</span>
             <small>插件</small>
-          </button>
-          <button disabled title="拉取请求 · 未实现">
-            <GitPullRequest size={15} />
-            <span>拉取请求</span>
-            <small>未实现</small>
           </button>
         </nav>
 
@@ -8919,6 +8946,7 @@ function ComposerPlanStepIcon({
 const MAX_COMPOSER_IMAGES = 10;
 const MAX_COMPOSER_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_COMPOSER_HISTORY_ENTRIES = 200;
+const COMPOSER_DRAFT_PUBLISH_DELAY_MS = 300;
 const COMPOSER_IMAGE_EXTENSIONS = new Set([
   "bmp",
   "gif",
@@ -8983,7 +9011,7 @@ function readComposerContent(
   const appendText = (text: string) => {
     const normalized = text.replaceAll("\u200b", "");
     pushComposerText(parts, normalized);
-    contentOffset += splitComposerText(normalized).length;
+    contentOffset += composerTextLength(normalized);
   };
   const captureElementOffset = (element: HTMLElement, offset: number) => {
     if (caretPoint?.node === element && caretPoint.offset === offset) {
@@ -8995,8 +9023,7 @@ function readComposerContent(
       const text = node.textContent ?? "";
       if (caretPoint?.node === node) {
         caretOffset =
-          contentOffset +
-          splitComposerText(text.slice(0, caretPoint.offset)).length;
+          contentOffset + composerTextLength(text.slice(0, caretPoint.offset));
       }
       appendText(text);
       return;
@@ -9159,6 +9186,16 @@ function rangeBelongsToEditor(
       ? range.commonAncestorContainer.parentNode
       : range.commonAncestorContainer;
   return Boolean(container && editor.contains(container));
+}
+
+function composerRangesEqual(left: Range | null, right: Range): boolean {
+  return Boolean(
+    left &&
+    left.startContainer === right.startContainer &&
+    left.startOffset === right.startOffset &&
+    left.endContainer === right.endContainer &&
+    left.endOffset === right.endOffset,
+  );
 }
 
 function endOfComposerRange(editor: HTMLElement): Range {
@@ -9357,7 +9394,8 @@ function Composer({
     setOpenMenu(null);
   };
   const popoverRef = useDismissiblePopover(Boolean(openMenu), closeMenus);
-  const [draft, setDraft] = useState(value);
+  const draftRef = useRef(value);
+  const [hasDraftText, setHasDraftText] = useState(Boolean(value.trim()));
   const [imageAttachments, setImageAttachments] = useState<
     ComposerImageAttachment[]
   >([]);
@@ -9394,7 +9432,7 @@ function Composer({
   const lastLocallyPublishedValueRef = useRef<string | null>(null);
   const deferredExternalValueRef = useRef<{ value: string } | null>(null);
   const pendingComposerPublishRef = useRef<string | null>(null);
-  const composerPublishFrameRef = useRef<number | null>(null);
+  const composerPublishTimerRef = useRef<number | null>(null);
   const lastExternalComposerValueRef = useRef(value);
 
   useEffect(() => {
@@ -9402,9 +9440,9 @@ function Composer({
   }, [imageAttachments]);
 
   function cancelPendingComposerPublish() {
-    if (composerPublishFrameRef.current !== null) {
-      window.cancelAnimationFrame(composerPublishFrameRef.current);
-      composerPublishFrameRef.current = null;
+    if (composerPublishTimerRef.current !== null) {
+      window.clearTimeout(composerPublishTimerRef.current);
+      composerPublishTimerRef.current = null;
     }
     pendingComposerPublishRef.current = null;
   }
@@ -9417,19 +9455,21 @@ function Composer({
 
   function scheduleComposerPublish(text: string) {
     pendingComposerPublishRef.current = text;
-    if (composerPublishFrameRef.current !== null) return;
-    composerPublishFrameRef.current = window.requestAnimationFrame(() => {
-      composerPublishFrameRef.current = null;
+    if (composerPublishTimerRef.current !== null) {
+      window.clearTimeout(composerPublishTimerRef.current);
+    }
+    composerPublishTimerRef.current = window.setTimeout(() => {
+      composerPublishTimerRef.current = null;
       const nextText = pendingComposerPublishRef.current;
       pendingComposerPublishRef.current = null;
       if (nextText === null) return;
       onChange(nextText);
-    });
+    }, COMPOSER_DRAFT_PUBLISH_DELAY_MS);
   }
 
   useEffect(
     () => () => {
-      cancelPendingComposerPublish();
+      flushPendingComposerPublish();
     },
     [],
   );
@@ -9469,7 +9509,8 @@ function Composer({
     currentComposerSnapshotRef.current = next;
     composerUndoHistoryRef.current = [];
     composerRedoHistoryRef.current = [];
-    setDraft(nextValue);
+    draftRef.current = nextValue;
+    setHasDraftText(Boolean(nextValue.trim()));
   }
 
   useLayoutEffect(() => {
@@ -9505,6 +9546,7 @@ function Composer({
       if (!editor || !selection || selection.rangeCount === 0) return;
       const range = selection.getRangeAt(0);
       if (rangeBelongsToEditor(editor, range)) {
+        if (composerRangesEqual(savedComposerRangeRef.current, range)) return;
         savedComposerRangeRef.current = range.cloneRange();
         if (!isComposingRef.current && currentComposerSnapshotRef.current) {
           currentComposerSnapshotRef.current = {
@@ -9567,7 +9609,8 @@ function Composer({
         current === null ? undefined : currentAttachments[current];
       return attachment && !usedIds.has(attachment.id) ? null : current;
     });
-    setDraft(text);
+    draftRef.current = text;
+    setHasDraftText(Boolean(text.trim()));
     lastLocallyPublishedValueRef.current = text;
     scheduleComposerPublish(text);
   }
@@ -9620,6 +9663,13 @@ function Composer({
       composerRedoHistoryRef.current = [];
     }
     currentComposerSnapshotRef.current = cloneComposerHistorySnapshot(after);
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount > 0) {
+      const range = selection.getRangeAt(0);
+      if (rangeBelongsToEditor(editor, range)) {
+        savedComposerRangeRef.current = range.cloneRange();
+      }
+    }
     publishComposerSnapshot(after);
   }
 
@@ -9769,7 +9819,7 @@ function Composer({
     const submittedValue =
       submittedAttachments.length > 0
         ? composerContentText(parts, submittedAttachments)
-        : draft;
+        : draftRef.current;
     const accepted = await onSubmit(
       submittedValue,
       submittedAttachments,
@@ -9793,7 +9843,8 @@ function Composer({
     compositionStartSnapshotRef.current = null;
     pendingBeforeInputSnapshotRef.current = null;
     deferredExternalValueRef.current = null;
-    setDraft("");
+    draftRef.current = "";
+    setHasDraftText(false);
     lastLocallyPublishedValueRef.current = "";
     onChange("");
   };
@@ -9867,7 +9918,7 @@ function Composer({
   }
 
   const hasSendableContent = Boolean(
-    draft.trim() ||
+    hasDraftText ||
     hasInlineImageReferences ||
     contextSources.length > 0 ||
     selectedSkillIds.length > 0,
@@ -10173,18 +10224,28 @@ function Composer({
               !compositionStartSnapshotRef.current
             ) {
               const editor = editorRef.current;
-              pendingBeforeInputSnapshotRef.current = editor
-                ? composerSnapshotAtSelection(editor)
-                : currentComposerSnapshotRef.current;
+              pendingBeforeInputSnapshotRef.current =
+                currentComposerSnapshotRef.current
+                  ? cloneComposerHistorySnapshot(
+                      currentComposerSnapshotRef.current,
+                    )
+                  : editor
+                    ? composerSnapshotAtSelection(editor)
+                    : null;
             }
           }}
           onCompositionStart={() => {
             const editor = editorRef.current;
             isComposingRef.current = true;
             pendingBeforeInputSnapshotRef.current = null;
-            compositionStartSnapshotRef.current = editor
-              ? composerSnapshotAtSelection(editor)
-              : currentComposerSnapshotRef.current;
+            compositionStartSnapshotRef.current =
+              currentComposerSnapshotRef.current
+                ? cloneComposerHistorySnapshot(
+                    currentComposerSnapshotRef.current,
+                  )
+                : editor
+                  ? composerSnapshotAtSelection(editor)
+                  : null;
           }}
           onCompositionEnd={() => {
             isComposingRef.current = false;
@@ -12330,7 +12391,9 @@ function OfflineState({
 type ArtifactReference = {
   id: string;
   kind?: string;
+  contentType?: string;
   bytes?: number;
+  metadata?: unknown;
 };
 
 type LegacyLocalProject = {
@@ -12587,6 +12650,7 @@ function artifactReferencesFromMetadata(
     refs.push({
       id: artifactId,
       kind: readString(metadata.artifactKind),
+      contentType: readString(metadata.artifactContentType),
       bytes: readNumber(metadata.artifactBytes),
     });
   }
@@ -12596,7 +12660,23 @@ function artifactReferencesFromMetadata(
       refs.push({
         id: nestedId,
         kind: readString(metadata.artifact.kind),
+        contentType: readString(metadata.artifact.contentType),
         bytes: readNumber(metadata.artifact.bytes),
+        metadata: metadata.artifact.metadata,
+      });
+    }
+  }
+  if (Array.isArray(metadata.artifacts)) {
+    for (const artifact of metadata.artifacts) {
+      if (!isRecord(artifact)) continue;
+      const id = readString(artifact.id);
+      if (!id) continue;
+      refs.push({
+        id,
+        kind: readString(artifact.kind),
+        contentType: readString(artifact.contentType),
+        bytes: readNumber(artifact.bytes),
+        metadata: artifact.metadata,
       });
     }
   }
@@ -12638,9 +12718,10 @@ function mergeArtifactDescriptors(
         id: ref.id,
         threadId: event.threadId,
         kind: ref.kind ?? "tool_output",
-        contentType: "text/plain; charset=utf-8",
+        contentType: ref.contentType ?? "text/plain; charset=utf-8",
         bytes: ref.bytes ?? 0,
         createdAt: event.createdAt,
+        metadata: ref.metadata,
       },
     ];
   }

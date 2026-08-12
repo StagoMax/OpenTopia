@@ -3,25 +3,29 @@ import {
   Bot,
   ChevronDown,
   ChevronRight,
+  FileArchive,
+  FileCode,
   FilePen,
+  FileSpreadsheet,
   FileText,
   FolderTree,
   GitCompare,
   Globe2,
+  Image as ImageIcon,
   ListChecks,
   Monitor,
+  Paperclip,
   Plug,
   Search,
   SquareTerminal,
   Sparkles,
-  Table2,
   Wrench,
 } from "lucide-react";
 import type { ToolCall, ToolResult } from "../types";
 import {
   buildToolActivity,
   type ToolActivityBody,
-  type ToolActivityKind,
+  type ToolActivityIconKind,
   type ToolActivityView,
 } from "../toolActivity";
 import "./ToolActivityCard.css";
@@ -74,7 +78,7 @@ export function ToolActivityCard({
         onClick={() => setExpanded((current) => !current)}
       >
         <span className="tool-activity-icon" aria-hidden="true">
-          {toolActivityIcon(view.kind)}
+          {toolActivityIcon(view.iconKind ?? view.kind)}
         </span>
         <span
           className={`tool-activity-title${running ? " conversation-status-shimmer" : ""}`}
@@ -120,7 +124,7 @@ export function ToolActivityCard({
   );
 }
 
-export function toolActivityIcon(kind: ToolActivityKind, size = 14) {
+export function toolActivityIcon(kind: ToolActivityIconKind, size = 14) {
   if (kind === "shell") return <SquareTerminal size={size} />;
   if (kind === "read") return <FileText size={size} />;
   if (kind === "list") return <FolderTree size={size} />;
@@ -129,7 +133,12 @@ export function toolActivityIcon(kind: ToolActivityKind, size = 14) {
   if (kind === "diff") return <GitCompare size={size} />;
   if (kind === "browser") return <Globe2 size={size} />;
   if (kind === "computer") return <Monitor size={size} />;
-  if (kind === "spreadsheet") return <Table2 size={size} />;
+  if (kind === "image") return <ImageIcon size={size} />;
+  if (kind === "document") return <FileText size={size} />;
+  if (kind === "code") return <FileCode size={size} />;
+  if (kind === "archive") return <FileArchive size={size} />;
+  if (kind === "attachment") return <Paperclip size={size} />;
+  if (kind === "spreadsheet") return <FileSpreadsheet size={size} />;
   if (kind === "agent") return <Bot size={size} />;
   if (kind === "plan") return <ListChecks size={size} />;
   if (kind === "skill") return <Sparkles size={size} />;

@@ -20,9 +20,9 @@ export function composerExternalValueSyncAction({
   lastLocallyPublishedValue: string | null;
   compositionPending: boolean;
   /**
-   * The composer publishes its local text on the next animation frame. While
-   * that work is queued, React can re-render with the last prop value; that is
-   * not an external reset and must not overwrite the browser's live edit.
+   * The composer publishes its local text after a short idle delay. While that
+   * work is queued, React can re-render with the last prop value; that is not
+   * an external reset and must not overwrite the browser's live edit.
    */
   pendingLocalPublish?: boolean;
   lastExternalValue?: string;
@@ -53,6 +53,13 @@ const graphemeSegmenter = new Intl.Segmenter(undefined, {
 
 export function splitComposerText(text: string): string[] {
   return Array.from(graphemeSegmenter.segment(text), (part) => part.segment);
+}
+
+export function composerTextLength(text: string): number {
+  if (/^[\x00-\x7f]*$/.test(text)) return text.length;
+  let length = 0;
+  for (const _part of graphemeSegmenter.segment(text)) length += 1;
+  return length;
 }
 
 function composerContentTokens(
@@ -121,6 +128,10 @@ export function normalizeComposerImageDeletionSnapshot(
   before: ComposerHistorySnapshot,
   after: ComposerHistorySnapshot,
 ): ComposerHistorySnapshot {
+  // Plain-text deletion cannot produce the Chromium artifact handled below.
+  // Avoid segmenting the entire draft on the overwhelmingly common path.
+  if (!before.parts.some((part) => part.type === "image_ref")) return after;
+
   const beforeTokens = composerContentTokens(before.parts);
   const afterTokens = composerContentTokens(after.parts);
   let prefixLength = 0;
@@ -176,6 +187,64 @@ export function composerUndoEntries(
   after: ComposerHistorySnapshot,
   splitInsertedContent: boolean,
 ): ComposerHistorySnapshot[] {
+  const beforeText = composerPlainText(before.parts);
+  const afterText = composerPlainText(after.parts);
+  if (beforeText !== null && afterText !== null) {
+    if (beforeText === afterText) return [];
+    if (!splitInsertedContent) return [cloneComposerSnapshot(before)];
+
+    let prefixLength = 0;
+    while (
+      prefixLength < beforeText.length &&
+      prefixLength < afterText.length &&
+      beforeText[prefixLength] === afterText[prefixLength]
+    ) {
+      prefixLength += 1;
+    }
+
+    let suffixLength = 0;
+    while (
+      suffixLength < beforeText.length - prefixLength &&
+      suffixLength < afterText.length - prefixLength &&
+      beforeText[beforeText.length - 1 - suffixLength] ===
+        afterText[afterText.length - 1 - suffixLength]
+    ) {
+      suffixLength += 1;
+    }
+
+    const removedCount = beforeText.length - prefixLength - suffixLength;
+    const insertedText = afterText.slice(
+      prefixLength,
+      afterText.length - suffixLength,
+    );
+    if (removedCount > 0 || !insertedText) {
+      return [cloneComposerSnapshot(before)];
+    }
+
+    const insertedGraphemes = splitComposerText(insertedText);
+    if (insertedGraphemes.length <= 1) {
+      return [cloneComposerSnapshot(before)];
+    }
+
+    const prefix = afterText.slice(0, prefixLength);
+    const suffix = afterText.slice(afterText.length - suffixLength);
+    const prefixCaretOffset = splitComposerText(prefix).length;
+    return Array.from({ length: insertedGraphemes.length }, (_, index) =>
+      index === 0
+        ? cloneComposerSnapshot(before)
+        : {
+            parts: [
+              {
+                type: "text" as const,
+                text:
+                  prefix + insertedGraphemes.slice(0, index).join("") + suffix,
+              },
+            ],
+            caretOffset: prefixCaretOffset + index,
+          },
+    );
+  }
+
   const beforeTokens = composerContentTokens(before.parts);
   const afterTokens = composerContentTokens(after.parts);
   let prefixLength = 0;
@@ -223,6 +292,15 @@ export function composerUndoEntries(
           caretOffset: prefixLength + index,
         },
   );
+}
+
+function composerPlainText(parts: InlineMessageContentPart[]): string | null {
+  let text = "";
+  for (const part of normalizeComposerContentParts(parts)) {
+    if (part.type === "image_ref") return null;
+    text += part.text;
+  }
+  return text;
 }
 
 export function normalizeComposerContentParts(

@@ -28,6 +28,26 @@ export function inactiveTurnIdsFromEvents(
   return inactiveTurnIds;
 }
 
+export function activeTurnIdFromEvents(events: AgentEvent[]): string | null {
+  const inactiveTurnIds = inactiveTurnIdsFromEvents(events);
+  let activeTurnId: string | null = null;
+  let activeTurnStartedSeq = -1;
+
+  for (const event of events) {
+    if (
+      event.turnId &&
+      event.payload.type === "turn_started" &&
+      !inactiveTurnIds.has(event.turnId) &&
+      event.seq > activeTurnStartedSeq
+    ) {
+      activeTurnId = event.turnId;
+      activeTurnStartedSeq = event.seq;
+    }
+  }
+
+  return activeTurnId;
+}
+
 export function resolveActiveTurnId(
   turnStatus: TurnStatus | null,
   inactiveTurnIds: ReadonlySet<string>,

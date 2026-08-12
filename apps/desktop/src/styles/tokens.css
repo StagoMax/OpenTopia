@@ -107,11 +107,11 @@
     var(--solar-phase-to-4) var(--solar-phase-progress)
   );
   --chrome-gradient: linear-gradient(
-    125deg,
+    155deg,
     var(--solar-chrome-1) 0%,
-    var(--solar-chrome-2) 32%,
-    var(--solar-chrome-3) 68%,
-    var(--solar-chrome-4) 100%
+    var(--solar-chrome-2) 24%,
+    var(--solar-chrome-3) 50%,
+    var(--solar-chrome-4) 74%
   );
   --topbar-gradient: var(--chrome-gradient);
   --sidebar-gradient: var(--chrome-gradient);
@@ -121,11 +121,11 @@
     transparent
   );
   --chrome-translucent-gradient: linear-gradient(
-    125deg,
+    155deg,
     color-mix(in srgb, var(--solar-chrome-1) 78%, transparent) 0%,
-    color-mix(in srgb, var(--solar-chrome-2) 78%, transparent) 32%,
-    color-mix(in srgb, var(--solar-chrome-3) 78%, transparent) 68%,
-    color-mix(in srgb, var(--solar-chrome-4) 78%, transparent) 100%
+    color-mix(in srgb, var(--solar-chrome-2) 78%, transparent) 24%,
+    color-mix(in srgb, var(--solar-chrome-3) 78%, transparent) 50%,
+    color-mix(in srgb, var(--solar-chrome-4) 78%, transparent) 74%
   );
   --chrome-backdrop-blur: 18px;
   --sidebar-item-hover: color-mix(in srgb, var(--text) 8%, transparent);
