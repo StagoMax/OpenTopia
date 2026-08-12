@@ -392,7 +392,7 @@ fn output_contract_instruction(surface: RuntimeSurface) -> String {
     };
     let media_rule = match surface {
         RuntimeSurface::Desktop => {
-            "Images render only from http or https URLs. The renderer strips a filesystem path, drive-letter path, or file:// URI out of an image target and the reader is left with the alt text alone, so never point image syntax at a workspace file; reference the file as a link and let the reader open it. Mermaid is not rendered on this surface either: a ```mermaid fence appears as a code block, so carry the diagram with a table, a tree, or a compact ASCII layout instead."
+            "Images render only from http or https URLs. The renderer strips a filesystem path, drive-letter path, or file:// URI out of an image target and the reader is left with the alt text alone, so never point image syntax at a workspace file; reference the file as a link and let the reader open it. Mermaid fences render as diagrams and expose their source for copying, so use a ```mermaid fence when a flow or relationship is materially clearer as a diagram."
         }
         RuntimeSurface::Cli | RuntimeSurface::Core => {
             "Images and diagram markup do not render on this surface. Give the artifact's path and describe what it shows instead of emitting image syntax or a Mermaid fence."
@@ -471,7 +471,7 @@ fn output_contract_instruction_compact(surface: RuntimeSurface) -> String {
         RuntimeSurface::Desktop => (
             "Responses render as GitHub-flavored Markdown; leave a blank line before lists and after headings.",
             "Use workspace-relative Markdown links for local files; never use absolute, drive-letter, file://, or vscode:// targets.",
-            "Images render only from http(s) URLs; reference local images as links. Mermaid is shown as code, so use a table or compact text instead.",
+            "Images render only from http(s) URLs; reference local images as links. Mermaid fences render as diagrams whose source can be copied.",
         ),
         RuntimeSurface::Cli => (
             "Responses have limited Markdown rendering; prefer concise paragraphs and plain punctuation.",
@@ -599,13 +599,13 @@ mod tests {
         assert_eq!(output.metadata["settingValue"], "desktop");
         assert!(output.text_content().contains("workspace-relative"));
         assert!(output.text_content().contains("never use absolute"));
-        // The renderer only accepts http(s) image targets and has no mermaid
-        // plugin, so both rules have to say what actually happens instead of
-        // copying a contract written for another renderer.
+        // These rules describe the desktop renderer's actual media support.
         assert!(output
             .text_content()
             .contains("Images render only from http(s) URLs"));
-        assert!(output.text_content().contains("Mermaid is shown as code"));
+        assert!(output
+            .text_content()
+            .contains("Mermaid fences render as diagrams"));
 
         assert!(!desktop
             .iter()

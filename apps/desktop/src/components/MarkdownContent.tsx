@@ -1,5 +1,7 @@
 import {
+  Children,
   createContext,
+  isValidElement,
   memo,
   useContext,
   useEffect,
@@ -8,7 +10,9 @@ import {
   useRef,
   useState,
   type AnchorHTMLAttributes,
+  type HTMLAttributes,
   type ImgHTMLAttributes,
+  type ReactNode,
 } from "react";
 import ReactMarkdown, {
   defaultUrlTransform,
@@ -34,6 +38,7 @@ import {
 } from "../markdownLinks";
 import { recordConversationRenderTrace } from "../platform";
 import { FileLinkContextMenu } from "./FileLinkContextMenu";
+import { MermaidDiagram } from "./MermaidDiagram";
 import {
   useWorkspaceAbsolutePath,
   useWorkspaceFileTextReader,
@@ -57,7 +62,7 @@ const pathLinkPlugins: RemarkPlugins = [remarkGfm, remarkFilePathLinks];
 
 type MarkdownLinkContextValue = Pick<
   MarkdownContentProps,
-  "baseWorkspacePath" | "onOpenLink"
+  "baseWorkspacePath" | "onOpenLink" | "streaming"
 >;
 
 const MarkdownLinkContext = createContext<MarkdownLinkContextValue>({});
@@ -65,6 +70,7 @@ const MarkdownLinkContext = createContext<MarkdownLinkContextValue>({});
 const markdownComponents: Components = {
   a: MarkdownAnchor,
   img: MarkdownImage,
+  pre: MarkdownPre,
 };
 
 export function MarkdownContent({
@@ -79,7 +85,9 @@ export function MarkdownContent({
   useConversationMarkdownTrace(renderedText, renderTrace);
   const instanceId = useId().replaceAll(":", "");
   return (
-    <MarkdownLinkContext.Provider value={{ baseWorkspacePath, onOpenLink }}>
+    <MarkdownLinkContext.Provider
+      value={{ baseWorkspacePath, onOpenLink, streaming }}
+    >
       <MemoizedMarkdown
         className={`markdown-content ${className}`.trim()}
         clobberPrefix={`opentopia-${instanceId}-`}
@@ -121,6 +129,50 @@ function markdownUrlTransform(url: string): string {
     return url;
   }
   return defaultUrlTransform(url);
+}
+
+function MarkdownPre({ children, ...props }: HTMLAttributes<HTMLPreElement>) {
+  const { streaming } = useContext(MarkdownLinkContext);
+  const mermaidSource = markdownMermaidSource(children);
+
+  // Rendering a still-streaming diagram causes repeated parse failures and
+  // expensive redraws. Keep showing its ordinary code block until the turn is
+  // complete, then replace it with the finished diagram.
+  if (!streaming && mermaidSource !== null) {
+    return <MermaidDiagram source={mermaidSource} />;
+  }
+
+  return <pre {...props}>{children}</pre>;
+}
+
+function markdownMermaidSource(children: ReactNode): string | null {
+  const childItems = Children.toArray(children);
+  if (childItems.length !== 1) return null;
+  const code = childItems[0];
+  if (
+    !isValidElement<{
+      children?: ReactNode;
+      className?: string;
+    }>(code) ||
+    !/(?:^|\s)language-mermaid(?:\s|$)/.test(code.props.className ?? "")
+  ) {
+    return null;
+  }
+
+  const source = markdownCodeText(code.props.children);
+  return source?.replace(/\n$/, "") ?? null;
+}
+
+function markdownCodeText(value: ReactNode): string | null {
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+  if (!Array.isArray(value)) return null;
+
+  const parts = value.map(markdownCodeText);
+  return parts.every((part): part is string => part !== null)
+    ? parts.join("")
+    : null;
 }
 
 function MarkdownAnchor({
