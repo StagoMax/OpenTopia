@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 export type ButtonVariant = "primary" | "secondary" | "quiet" | "danger";
 export type ButtonSize = "compact" | "default";
@@ -9,26 +9,31 @@ export type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: ButtonVariant;
 };
 
-export function Button({
-  children,
-  className,
-  size = "default",
-  type = "button",
-  variant = "secondary",
-  ...props
-}: ButtonProps) {
-  const classes = [
-    "ot-button",
-    `ot-button--${variant}`,
-    size === "compact" ? "ot-button--compact" : "",
-    className ?? "",
-  ]
-    .filter(Boolean)
-    .join(" ");
+export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
+  function Button(
+    {
+      children,
+      className,
+      size = "default",
+      type = "button",
+      variant = "secondary",
+      ...props
+    },
+    ref,
+  ) {
+    const classes = [
+      "ot-button",
+      `ot-button--${variant}`,
+      size === "compact" ? "ot-button--compact" : "",
+      className ?? "",
+    ]
+      .filter(Boolean)
+      .join(" ");
 
-  return (
-    <button className={classes} type={type} {...props}>
-      {children}
-    </button>
-  );
-}
+    return (
+      <button ref={ref} className={classes} type={type} {...props}>
+        {children}
+      </button>
+    );
+  },
+);

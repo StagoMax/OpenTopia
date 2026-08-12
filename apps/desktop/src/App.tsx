@@ -211,6 +211,7 @@ import {
   threadActivityStatusLabel,
   type ThreadActivityStatus,
 } from "./threadActivityStatus";
+import { shouldPromptForWindowsSandboxSetup } from "./windowsSandboxSetup";
 import {
   applyAppearance,
   readAppearanceSettings,
@@ -820,7 +821,7 @@ export function App() {
   const isWindows = platform?.os === "win32" || platform?.os === "windows";
 
   useEffect(() => {
-    if (!client || !isWindows) {
+    if (!client || !isWindows || serverStatus !== "online") {
       setWindowsSandboxSetup(null);
       setWindowsSandboxSetupError(null);
       return;
@@ -843,7 +844,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [client, isWindows]);
+  }, [client, isWindows, serverStatus]);
 
   const setupWindowsSandbox =
     useCallback(async (): Promise<WindowsSandboxSetupStatus> => {
@@ -4318,6 +4319,12 @@ export function App() {
 
   const closeTaskSearch = useCallback(() => setTaskSearchOpen(false), []);
 
+  const showWindowsSandboxSetupPrompt = shouldPromptForWindowsSandboxSetup({
+    isWindows,
+    status: windowsSandboxSetup,
+    dismissedForLaunch: windowsSandboxPromptDismissed,
+  });
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing) return;
@@ -4341,6 +4348,7 @@ export function App() {
         return;
       }
       if (
+        showWindowsSandboxSetupPrompt ||
         settingsOpen ||
         keyboardShortcutsOpen ||
         aboutOpen ||
@@ -4398,14 +4406,6 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
-  const showWindowsSandboxSetupPrompt =
-    isWindows &&
-    settings?.sandbox.enforcement === "enforce" &&
-    settings.sandbox.sandboxMode !== "danger-full-access" &&
-    windowsSandboxSetup !== null &&
-    windowsSandboxSetup.state !== "ready" &&
-    !windowsSandboxPromptDismissed;
-
   return (
     <WorkspacePathIndexContext.Provider value={workspacePathIndex}>
       <div className="app-shell">
@@ -4424,7 +4424,11 @@ export function App() {
           onShowKeyboardShortcuts={() => setKeyboardShortcutsOpen(true)}
           onShowAbout={() => setAboutOpen(true)}
           menuSuppressed={
-            settingsOpen || keyboardShortcutsOpen || aboutOpen || taskSearchOpen
+            showWindowsSandboxSetupPrompt ||
+            settingsOpen ||
+            keyboardShortcutsOpen ||
+            aboutOpen ||
+            taskSearchOpen
           }
         />
         {actionError && (
@@ -4958,7 +4962,7 @@ export function App() {
             onClose={closeSettings}
           />
         )}
-        {showWindowsSandboxSetupPrompt ? (
+        {showWindowsSandboxSetupPrompt && windowsSandboxSetup ? (
           <WindowsSandboxSetupDialog
             status={windowsSandboxSetup}
             busy={windowsSandboxSetupBusy}
@@ -5720,15 +5724,60 @@ function WindowsSandboxSetupDialog({
   onOpenSettings(): void;
   onLater(): void;
 }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const primaryActionRef = useRef<HTMLButtonElement>(null);
+  const laterActionRef = useRef<HTMLButtonElement>(null);
+  const busyRef = useRef(busy);
+  const onLaterRef = useRef(onLater);
+
   useEffect(() => {
-    const deferOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || busy) return;
-      event.preventDefault();
-      onLater();
-    };
-    window.addEventListener("keydown", deferOnEscape);
-    return () => window.removeEventListener("keydown", deferOnEscape);
+    busyRef.current = busy;
+    onLaterRef.current = onLater;
   }, [busy, onLater]);
+
+  useEffect(() => {
+    const previousFocus =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const focusInitialAction = () => {
+      const primary = primaryActionRef.current;
+      if (primary && !primary.disabled) {
+        primary.focus();
+      } else {
+        laterActionRef.current?.focus();
+      }
+    };
+    focusInitialAction();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busyRef.current) {
+        event.preventDefault();
+        onLaterRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
+        'button:not([disabled]):not([tabindex="-1"]), [href], [tabindex]:not([tabindex="-1"])',
+      );
+      if (!focusable?.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, []);
 
   const unavailable = status.state === "unavailable";
   const degraded = status.state === "degraded";
@@ -5736,15 +5785,17 @@ function WindowsSandboxSetupDialog({
   return (
     <div className="modal-backdrop chrome-dialog-backdrop" role="presentation">
       <section
+        ref={dialogRef}
         className="chrome-dialog chrome-about-dialog sandbox-setup-dialog"
         role="dialog"
         aria-modal="true"
+        aria-busy={busy}
         aria-labelledby="windows-sandbox-setup-title"
         aria-describedby="windows-sandbox-setup-description"
       >
         <header>
           <h2 id="windows-sandbox-setup-title">
-            {degraded ? "修复 Windows 安全沙箱" : "配置 Windows 安全沙箱"}
+            {degraded ? "修复 Windows 安全沙箱" : "安装 Windows 安全沙箱"}
           </h2>
           <ShieldCheck size={20} aria-hidden="true" />
         </header>
@@ -5753,7 +5804,7 @@ function WindowsSandboxSetupDialog({
             ? "OpenTopia 默认使用强制沙箱，但当前安装中没有可用的 Windows 沙箱组件。"
             : degraded
               ? "检测到专用账户、凭据或离线网络规则不完整，需要修复后才能安全运行工具。"
-              : "OpenTopia 默认使用强制沙箱。首次配置会创建两个隔离的普通用户，并安装离线网络规则。"}
+              : "未检测到 OpenTopia Windows 安全沙箱。安装后，工具会在两个隔离的普通用户中运行，并由离线网络规则保护。"}
         </p>
         {!unavailable ? (
           <p>
@@ -5774,24 +5825,41 @@ function WindowsSandboxSetupDialog({
           </div>
         ) : null}
         <div className="sandbox-setup-dialog__actions">
-          <Button variant="quiet" disabled={busy} onClick={onLater}>
+          <Button
+            ref={laterActionRef}
+            variant="quiet"
+            disabled={busy}
+            onClick={onLater}
+          >
             稍后
           </Button>
           {unavailable ? (
-            <Button variant="primary" onClick={onOpenSettings}>
+            <Button
+              ref={primaryActionRef}
+              variant="primary"
+              onClick={onOpenSettings}
+            >
               打开权限设置
             </Button>
           ) : (
             <Button
+              ref={primaryActionRef}
               variant="primary"
               disabled={busy || !status.helperAvailable}
               onClick={onSetup}
             >
+              {busy ? (
+                <Loader2 className="spin" size={16} aria-hidden="true" />
+              ) : null}
               {busy
                 ? "正在等待 Windows 授权…"
-                : degraded
-                  ? "修复配置"
-                  : "继续配置"}
+                : error
+                  ? degraded
+                    ? "重试修复"
+                    : "重试安装"
+                  : degraded
+                    ? "修复配置"
+                    : "安装沙箱"}
             </Button>
           )}
         </div>
