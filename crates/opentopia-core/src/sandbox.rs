@@ -1868,10 +1868,13 @@ mod tests {
             std::env::temp_dir().join(format!("opentopia-windows-plan-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
         let shared = root.join("shared");
+        let runtime_home = root.join("runtime-home");
         std::fs::create_dir_all(workspace.join(".git")).expect("create workspace");
         std::fs::create_dir_all(&shared).expect("create shared root");
+        std::fs::create_dir_all(&runtime_home).expect("create runtime home");
 
         let mut config = LocalSandboxConfig::enforce();
+        config.sandbox_home = Some(runtime_home.clone());
         config.writable_roots = vec![shared.clone()];
         config.grant_read_path(root.join("read-only.txt"));
         let plan = build_windows_sandbox_command_with_binary(
@@ -1900,6 +1903,9 @@ mod tests {
             .args
             .windows(2)
             .any(|args| args[0] == "--write-root" && args[1] == shared_path));
+        assert!(plan.args.windows(2).any(|args| {
+            args[0] == "--runtime-home" && args[1] == path_to_string(&absolute_path(&runtime_home))
+        }));
         assert!(plan
             .args
             .windows(2)
