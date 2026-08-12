@@ -1,2 +1,4 @@
 packages:
   - "apps/*"
+  - "!apps/agent-loop-explorer"
+  - "!apps/agent-loop-explorer-copy"
