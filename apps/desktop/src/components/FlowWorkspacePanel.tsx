@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  BookOpen,
   Bot,
+  Cable,
   CheckCircle2,
   CircleDot,
   Clock3,
+  ContactRound,
+  Database,
   GitBranch,
   Library,
   MessageSquareText,
@@ -13,10 +17,10 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
-  Search,
   Send,
   ShieldCheck,
   Square,
+  Workflow,
   Wrench,
   XCircle,
 } from "lucide-react";
@@ -32,33 +36,58 @@ import type {
   FlowTranscriptEntry,
 } from "../types";
 import { AgentTemplatePanel } from "./AgentTemplatePanel";
-import { Badge, Button, Panel, Select, TextField } from "./ui";
+import { Badge, Button, IconButton, Panel, Select, TextField } from "./ui";
 import "../styles/flow-workspace-panel.css";
 
-type FlowWorkspacePanelProps = {
+export type FlowLibraryConnectorKind = "knowledge" | "database" | "crm";
+
+export type FlowLibraryConnector = {
+  id: string;
+  kind: FlowLibraryConnectorKind;
+  name: string;
+  provider?: string;
+  description?: string;
+  status: "connected" | "syncing" | "attention" | "disabled";
+};
+
+export type FlowWorkspacePanelProps = {
   client: ApiClient | null;
   threadId: string | null;
   workspaceRoot: string | null;
   settings: AppSettings | null;
+  libraryConnectors?: readonly FlowLibraryConnector[];
+  onAddLibraryConnector?(kind: FlowLibraryConnectorKind): void;
+  onManageLibraryConnector?(connector: FlowLibraryConnector): void;
 };
 
-type PanelTab = "flows" | "agents";
+type PanelTab = "flows" | "agents" | "library";
 
 export function FlowWorkspacePanel({
   client,
   threadId,
   workspaceRoot,
   settings,
+  libraryConnectors = [],
+  onAddLibraryConnector,
+  onManageLibraryConnector,
 }: FlowWorkspacePanelProps) {
   const [tab, setTab] = useState<PanelTab>("flows");
 
   return (
     <div className="flow-workspace-panel">
-      <div
-        className="flow-workspace-panel__tabs"
-        role="tablist"
-        aria-label="Flow workspace"
-      >
+      <header className="flow-workspace-panel__header">
+        <div className="flow-workspace-panel__title">
+          <Workflow aria-hidden="true" size={18} />
+          <span>
+            <strong>Flow 工作台</strong>
+            <small>设计、运行与治理</small>
+          </span>
+        </div>
+        <div
+          className="flow-workspace-panel__tabs"
+          role="tablist"
+          aria-label="Flow 工作台"
+        >
         <button
           aria-selected={tab === "flows"}
           className={tab === "flows" ? "is-active" : ""}
@@ -79,15 +108,36 @@ export function FlowWorkspacePanel({
           <Bot aria-hidden="true" size={16} />
           Agents
         </button>
-      </div>
+          <button
+            aria-selected={tab === "library"}
+            className={tab === "library" ? "is-active" : ""}
+            onClick={() => setTab("library")}
+            role="tab"
+            type="button"
+          >
+            <Library aria-hidden="true" size={16} />
+            Library
+          </button>
+        </div>
+      </header>
       {tab === "flows" ? (
-        <FlowReviewPanel client={client} threadId={threadId} />
-      ) : (
+        <FlowReviewPanel
+          client={client}
+          onOpenLibrary={() => setTab("library")}
+          threadId={threadId}
+        />
+      ) : tab === "agents" ? (
         <AgentTemplatePanel
           client={client}
           threadId={threadId}
           workspaceRoot={workspaceRoot}
           settings={settings}
+        />
+      ) : (
+        <FlowLibraryPanel
+          connectors={libraryConnectors}
+          onAddConnector={onAddLibraryConnector}
+          onManageConnector={onManageLibraryConnector}
         />
       )}
     </div>
@@ -97,7 +147,10 @@ export function FlowWorkspacePanel({
 function FlowReviewPanel({
   client,
   threadId,
-}: Pick<FlowWorkspacePanelProps, "client" | "threadId">) {
+  onOpenLibrary,
+}: Pick<FlowWorkspacePanelProps, "client" | "threadId"> & {
+  onOpenLibrary(): void;
+}) {
   const [drafts, setDrafts] = useState<FlowDraftView[]>([]);
   const [library, setLibrary] = useState<FlowDefinition[]>([]);
   const [runs, setRuns] = useState<FlowRun[]>([]);
@@ -283,41 +336,63 @@ function FlowReviewPanel({
   }
 
   const validation = selected?.draft.lastValidation ?? null;
+  const activeRunCount = runs.filter(
+    (run) => !isTerminalRunStatus(run.status),
+  ).length;
+  const approvalCount = runs.filter(
+    (run) => run.status === "waiting_approval",
+  ).length;
+  const successCount = runs.filter((run) => run.status === "succeeded").length;
+
+  function selectPublishedFlow(flow: FlowDefinition) {
+    setRunDefinitionKey(`${flow.flowId}@${flow.version}`);
+    const relatedDraft = drafts.find(
+      (view) => view.draft.spec.flowId === flow.flowId,
+    );
+    if (relatedDraft) {
+      setSelectedId(relatedDraft.draft.id);
+      setEditing(false);
+    }
+  }
 
   return (
     <div className="flow-review-panel">
-      <Panel
-        title="Flow Registry"
-        actions={
+      <aside className="flow-review-panel__registry" aria-label="Flow 目录">
+        <header className="flow-review-panel__registry-header">
+          <span>
+            <strong>Flows</strong>
+            <small>{drafts.length} 个草稿</small>
+          </span>
           <div className="flow-review-panel__actions">
-            <Button
-              aria-label="刷新 Flow Registry"
+            <IconButton
+              aria-label="刷新 Flow 目录"
               disabled={busy !== null}
               onClick={() => void refresh()}
               size="compact"
-              variant="quiet"
             >
               <RefreshCw aria-hidden="true" size={14} />
-            </Button>
-            <Button
+            </IconButton>
+            <IconButton
+              aria-label="新建 Flow"
               disabled={!client || !threadId || busy !== null}
               onClick={() => void createStarter()}
               size="compact"
               variant="primary"
             >
-              <Plus aria-hidden="true" size={14} /> 新建
-            </Button>
+              <Plus aria-hidden="true" size={14} />
+            </IconButton>
           </div>
-        }
-      >
+        </header>
         <TextField
-          label="搜索已发布 Flow"
+          label="搜索 Flow"
           onChange={(event) => setQuery(event.target.value)}
           placeholder="名称、ID 或负责人"
           type="search"
           value={query}
+          wrapperClassName="flow-review-panel__search"
         />
-        <div className="flow-review-panel__drafts" aria-label="Flow 草稿列表">
+        <nav className="flow-review-panel__drafts" aria-label="Flow 草稿列表">
+          <span className="flow-review-panel__nav-label">草稿</span>
           {drafts.map((view) => (
             <button
               className={
@@ -346,56 +421,101 @@ function FlowReviewPanel({
               生成草稿；也可先创建空白草稿。
             </p>
           ) : null}
-        </div>
-        {library.length > 0 ? (
-          <details className="flow-review-panel__library">
-            <summary>
-              <Library aria-hidden="true" size={14} /> 已发布（{library.length}
-              ）
-            </summary>
-            <ul>
-              {library.map((flow) => (
-                <li key={`${flow.flowId}@${flow.version}`}>
-                  <span>{flow.name}</span>
-                  <code>
-                    {flow.flowId}@{flow.version}
-                  </code>
-                </li>
-              ))}
-            </ul>
-          </details>
+          {library.length > 0 ? (
+            <>
+              <span className="flow-review-panel__nav-label">已发布</span>
+              {library.map((flow) => {
+                const key = `${flow.flowId}@${flow.version}`;
+                return (
+                  <button
+                    className={key === runDefinitionKey ? "is-active" : ""}
+                    key={key}
+                    onClick={() => selectPublishedFlow(flow)}
+                    type="button"
+                  >
+                    <Library aria-hidden="true" size={16} />
+                    <span>
+                      <strong>{flow.name}</strong>
+                      <small>{flow.flowId} · v{flow.version}</small>
+                    </span>
+                    <Badge variant="success">live</Badge>
+                  </button>
+                );
+              })}
+            </>
+          ) : null}
+        </nav>
+        <button
+          className="flow-review-panel__library-link"
+          onClick={onOpenLibrary}
+          type="button"
+        >
+          <BookOpen aria-hidden="true" size={16} />
+          <span>
+            <strong>Library & Connectors</strong>
+            <small>RAG、数据库与 CRM</small>
+          </span>
+        </button>
+      </aside>
+
+      <main className="flow-review-panel__main">
+        <header className="flow-review-panel__main-header">
+          <span>
+            <small>Operations</small>
+            <strong>{selected?.draft.spec.name ?? "Flow Runtime"}</strong>
+          </span>
+          {selected ? <StatusBadge status={selected.draft.status} /> : null}
+        </header>
+
+        <section className="flow-review-panel__metrics" aria-label="运行概览">
+          <article>
+            <span>全部运行</span>
+            <strong>{runs.length}</strong>
+            <small>{activeRunCount} 个进行中</small>
+          </article>
+          <article>
+            <span>等待审批</span>
+            <strong>{approvalCount}</strong>
+            <small>{approvalCount ? "需要人工处理" : "当前无阻塞"}</small>
+          </article>
+          <article>
+            <span>成功完成</span>
+            <strong>{successCount}</strong>
+            <small>{runs.length ? `${Math.round((successCount / runs.length) * 100)}% 通过率` : "尚无数据"}</small>
+          </article>
+        </section>
+
+        {error ? (
+          <p className="flow-review-panel__message is-error" role="alert">
+            {error}
+          </p>
         ) : null}
-      </Panel>
+        {notice ? (
+          <p className="flow-review-panel__message is-success" role="status">
+            {notice}
+          </p>
+        ) : null}
 
-      <FlowRuntimePanel
-        busy={busy}
-        client={client}
-        library={library}
-        onControl={(name, action, message) =>
-          void controlRuntime(name, action, message)
-        }
-        onDefinitionChange={setRunDefinitionKey}
-        onInputChange={setRunInputText}
-        onRun={() => void startRuntime()}
-        onSelectRun={setSelectedRunId}
-        runDefinitionKey={runDefinitionKey}
-        runInputText={runInputText}
-        runs={runs}
-        selectedRun={selectedRun}
-      />
+        <FlowRuntimePanel
+          busy={busy}
+          client={client}
+          library={library}
+          onControl={(name, action, message) =>
+            void controlRuntime(name, action, message)
+          }
+          onDefinitionChange={setRunDefinitionKey}
+          onInputChange={setRunInputText}
+          onRun={() => void startRuntime()}
+          onSelectRun={setSelectedRunId}
+          runDefinitionKey={runDefinitionKey}
+          runInputText={runInputText}
+          runs={runs}
+          selectedRun={selectedRun}
+        />
+      </main>
 
-      {error ? (
-        <p className="flow-review-panel__message is-error" role="alert">
-          {error}
-        </p>
-      ) : null}
-      {notice ? (
-        <p className="flow-review-panel__message is-success" role="status">
-          {notice}
-        </p>
-      ) : null}
-
-      {selected ? (
+      <aside className="flow-review-panel__inspector" aria-label="Flow 配置与治理">
+        {selected ? (
         <Panel
           title={selected.draft.spec.name}
           actions={<StatusBadge status={selected.draft.status} />}
@@ -411,7 +531,7 @@ function FlowReviewPanel({
             </div>
             <div>
               <dt>Risk</dt>
-              <dd>{selected.draft.spec.riskClass}</dd>
+              <dd><Badge variant={riskBadgeVariant(selected.draft.spec.riskClass)}>{selected.draft.spec.riskClass}</Badge></dd>
             </div>
             <div>
               <dt>Hash</dt>
@@ -564,7 +684,7 @@ function FlowReviewPanel({
             value={publisher}
           />
           <Button
-            disabled={busy !== null || publisher.trim().length === 0}
+            disabled={!client || busy !== null || publisher.trim().length === 0}
             onClick={() =>
               void runAction(
                 "publish",
@@ -578,9 +698,185 @@ function FlowReviewPanel({
             <Send aria-hidden="true" size={14} /> 发布 Flow
           </Button>
         </Panel>
-      ) : null}
+        ) : (
+          <div className="flow-review-panel__inspector-empty">
+            <GitBranch aria-hidden="true" size={20} />
+            <strong>选择一个 Flow</strong>
+            <span>查看图结构、权限、验证结果与发布控制。</span>
+          </div>
+        )}
+        <Panel
+          className="flow-review-panel__connections"
+          title="Business Context"
+          actions={<Badge>接口预留</Badge>}
+        >
+          <p>将 Flow 连接到知识库、业务数据库与 CRM。连接器配置会在 Library 中集中管理。</p>
+          <Button onClick={onOpenLibrary} size="compact" variant="quiet">
+            <Cable aria-hidden="true" size={14} /> 打开 Library
+          </Button>
+        </Panel>
+      </aside>
     </div>
   );
+}
+
+type FlowLibraryPanelProps = {
+  connectors: readonly FlowLibraryConnector[];
+  onAddConnector?: (kind: FlowLibraryConnectorKind) => void;
+  onManageConnector?: (connector: FlowLibraryConnector) => void;
+};
+
+const FLOW_LIBRARY_KINDS: ReadonlyArray<{
+  kind: FlowLibraryConnectorKind;
+  title: string;
+  description: string;
+}> = [
+  {
+    kind: "knowledge",
+    title: "知识库 / RAG",
+    description: "接入文档、网页与向量索引，为 Flow 提供可追溯的检索上下文。",
+  },
+  {
+    kind: "database",
+    title: "业务数据库",
+    description: "连接 SQL、数据仓库或内部数据服务，并按身份授予读写范围。",
+  },
+  {
+    kind: "crm",
+    title: "CRM",
+    description: "连接客户、销售线索与机会数据，供业务 Flow 查询或更新。",
+  },
+];
+
+function FlowLibraryPanel({
+  connectors,
+  onAddConnector,
+  onManageConnector,
+}: FlowLibraryPanelProps) {
+  return (
+    <div className="flow-library-panel">
+      <header className="flow-library-panel__hero">
+        <span className="flow-library-panel__hero-icon">
+          <Library aria-hidden="true" size={20} />
+        </span>
+        <span>
+          <small>Business Context</small>
+          <h2>Library & Connectors</h2>
+          <p>
+            为 Flow 和 Agent 提供统一的企业知识与系统连接。此处已预留稳定的前端接口，后续可直接接入 RAG、数据库和 CRM 管理流程。
+          </p>
+        </span>
+        <Badge variant="info">API ready</Badge>
+      </header>
+
+      <section className="flow-library-panel__catalog" aria-labelledby="connector-catalog-title">
+        <header>
+          <span>
+            <h3 id="connector-catalog-title">添加连接</h3>
+            <p>选择上下文来源；连接、鉴权与同步逻辑由后续实现注入。</p>
+          </span>
+        </header>
+        <div className="flow-library-panel__cards">
+          {FLOW_LIBRARY_KINDS.map((item) => (
+            <article key={item.kind}>
+              <span className="flow-library-panel__card-icon">
+                {connectorKindIcon(item.kind)}
+              </span>
+              <span>
+                <strong>{item.title}</strong>
+                <small>{item.description}</small>
+              </span>
+              <Button
+                disabled={!onAddConnector}
+                onClick={() => onAddConnector?.(item.kind)}
+                size="compact"
+                title={
+                  onAddConnector
+                    ? `添加${item.title}`
+                    : "连接器接口已预留，等待后端接入"
+                }
+                variant="quiet"
+              >
+                <Plus aria-hidden="true" size={14} /> 添加
+              </Button>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="flow-library-panel__connected" aria-labelledby="connected-sources-title">
+        <header>
+          <span>
+            <h3 id="connected-sources-title">已连接来源</h3>
+            <p>连接状态、同步与权限会集中显示在这里。</p>
+          </span>
+          <Badge>{connectors.length}</Badge>
+        </header>
+        {connectors.length ? (
+          <div className="flow-library-panel__source-list">
+            {connectors.map((connector) => (
+              <article key={connector.id}>
+                <span className="flow-library-panel__source-icon">
+                  {connectorKindIcon(connector.kind)}
+                </span>
+                <span>
+                  <strong>{connector.name}</strong>
+                  <small>
+                    {[connector.provider, connector.description]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </small>
+                </span>
+                <ConnectorStatusBadge status={connector.status} />
+                <Button
+                  disabled={!onManageConnector}
+                  onClick={() => onManageConnector?.(connector)}
+                  size="compact"
+                  variant="quiet"
+                >
+                  管理
+                </Button>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="flow-library-panel__empty">
+            <Cable aria-hidden="true" size={20} />
+            <strong>尚未连接外部来源</strong>
+            <span>接入后，Flow 可以在明确的身份和权限边界内读取业务上下文。</span>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function connectorKindIcon(kind: FlowLibraryConnectorKind) {
+  if (kind === "knowledge") return <BookOpen aria-hidden="true" size={18} />;
+  if (kind === "database") return <Database aria-hidden="true" size={18} />;
+  return <ContactRound aria-hidden="true" size={18} />;
+}
+
+function ConnectorStatusBadge({
+  status,
+}: {
+  status: FlowLibraryConnector["status"];
+}) {
+  const variant =
+    status === "connected"
+      ? "success"
+      : status === "syncing"
+        ? "info"
+        : status === "attention"
+          ? "warning"
+          : "neutral";
+  const label = {
+    connected: "已连接",
+    syncing: "同步中",
+    attention: "需处理",
+    disabled: "已停用",
+  }[status];
+  return <Badge variant={variant}>{label}</Badge>;
 }
 
 function GraphInspector({ spec }: { spec: FlowSpec }) {
@@ -665,6 +961,7 @@ function FlowRuntimePanel({
 
   return (
     <Panel
+      className="flow-runtime-panel"
       title="Runtime & Trace"
       actions={
         selectedRun ? <RunStatusBadge status={selectedRun.status} /> : undefined
@@ -990,6 +1287,14 @@ function StatusBadge({ status }: { status: FlowDraftView["draft"]["status"] }) {
         ? "info"
         : "neutral";
   return <Badge variant={variant}>{status.replaceAll("_", " ")}</Badge>;
+}
+
+function riskBadgeVariant(
+  risk: FlowSpec["riskClass"],
+): "neutral" | "warning" | "danger" {
+  if (risk === "critical") return "danger";
+  if (risk === "high") return "warning";
+  return "neutral";
 }
 
 function RunStatusBadge({ status }: { status: FlowRunStatus }) {
