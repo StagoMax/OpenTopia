@@ -27,6 +27,12 @@ const GlideSpreadsheetGrid = lazy(() =>
   })),
 );
 
+const DocxPreview = lazy(() =>
+  import("./DocxPreview").then(({ DocxPreview }) => ({
+    default: DocxPreview,
+  })),
+);
+
 type LoadState<T> =
   | { status: "loading" }
   | { status: "ready"; value: T }
@@ -186,6 +192,14 @@ function PreviewRenderer({
       return <ImagePreview client={client} descriptor={descriptor} />;
     case "pdf":
       return <PdfPreview client={client} descriptor={descriptor} />;
+    case "document":
+      return (
+        <Suspense
+          fallback={<PreviewStatus icon="loading" title="Loading document" />}
+        >
+          <DocxPreview client={client} descriptor={descriptor} />
+        </Suspense>
+      );
     case "spreadsheet":
       return (
         <Suspense

@@ -1316,9 +1316,7 @@ export class ApiClient {
         renderer:
           response.kind === "text"
             ? previewRenderer(response.name, response.contentType)
-            : response.kind === "document"
-              ? "pdf"
-              : response.kind,
+            : response.kind,
         title: response.name,
         contentType: response.contentType,
         bytes: response.bytes,
@@ -1785,6 +1783,12 @@ function previewRenderer(
   const extension = path.split(".").at(-1)?.toLocaleLowerCase() ?? "";
   if (contentType.startsWith("image/")) return "image";
   if (contentType === "application/pdf" || extension === "pdf") return "pdf";
+  if (
+    contentType ===
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    extension === "docx"
+  )
+    return "document";
   if (["xlsx", "xlsm", "xltx"].includes(extension)) return "spreadsheet";
   if (
     [

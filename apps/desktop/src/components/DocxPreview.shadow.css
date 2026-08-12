@@ -1,0 +1,21 @@
+:host {
+  display: block;
+  min-width: max-content;
+  min-height: 100%;
+}
+
+.opentopia-docx-wrapper {
+  min-height: 100%;
+  background: var(--surface-subtle);
+  padding: var(--space-12);
+}
+
+.opentopia-docx-wrapper > section.opentopia-docx {
+  margin-bottom: var(--space-12);
+  box-shadow: var(--shadow-float);
+}
+
+a {
+  cursor: default;
+  pointer-events: none;
+}

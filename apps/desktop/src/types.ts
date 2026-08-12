@@ -1111,7 +1111,14 @@ export type ArtifactContent = {
 };
 
 export type PreviewRenderer =
-  "text" | "code" | "image" | "pdf" | "spreadsheet" | "web" | "unsupported";
+  | "text"
+  | "code"
+  | "image"
+  | "pdf"
+  | "document"
+  | "spreadsheet"
+  | "web"
+  | "unsupported";
 
 export type PreviewTarget =
   | { type: "workspace"; path: string }

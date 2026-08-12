@@ -1,23 +1,14 @@
-use crate::execution::{
-    ExecRequest, ExecutionContext, ExecutionEnvironment, ExecutionRequirements,
-    LocalExecutionEnvironment, ResourceLimit,
-};
-use crate::sandbox::{
-    LocalSandboxConfig, NetworkPolicy, OsSandboxMode, SandboxMode, WindowsSandboxBackend,
-};
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{render, RenderCache, RenderSettings};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 pub const MAX_ARTIFACT_INPUT_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_RENDERED_PAGES: usize = 8;
@@ -72,8 +63,6 @@ pub struct RenderedPage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactRuntimeError {
-    #[error("artifact staging failed: {0}")]
-    Staging(String),
     #[error("PDF rendering failed: {0}")]
     PdfRender(String),
     #[error("requested page {page} is outside the PDF page range 1..={page_count}")]
@@ -86,10 +75,6 @@ pub enum ArtifactRuntimeError {
     Cancelled,
     #[error("PDF rendering exceeded the {seconds} second timeout")]
     PdfRenderTimeout { seconds: u64 },
-    #[error("LibreOffice is not available; set OPENTOPIA_LIBREOFFICE_PATH or install LibreOffice")]
-    LibreOfficeUnavailable,
-    #[error("LibreOffice conversion failed: {0}")]
-    LibreOffice(String),
 }
 
 pub trait PdfBackend: Send + Sync {
@@ -216,20 +201,16 @@ impl PdfBackend for HayroPdfBackend {
 #[derive(Clone)]
 pub struct ArtifactRuntime {
     pdf_backend: Arc<dyn PdfBackend>,
-    libreoffice_path: Option<PathBuf>,
     artifact_output_root: Option<PathBuf>,
     pdf_renders: Arc<Semaphore>,
-    office_processes: Arc<Semaphore>,
 }
 
 impl Default for ArtifactRuntime {
     fn default() -> Self {
         Self {
             pdf_backend: Arc::new(HayroPdfBackend),
-            libreoffice_path: discover_libreoffice(),
             artifact_output_root: discover_artifact_output_root(),
             pdf_renders: Arc::new(Semaphore::new(1)),
-            office_processes: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -252,10 +233,6 @@ impl ArtifactRuntime {
     pub fn with_artifact_output_root(mut self, artifact_output_root: PathBuf) -> Self {
         self.artifact_output_root = Some(artifact_output_root);
         self
-    }
-
-    pub fn libreoffice_available(&self) -> bool {
-        self.libreoffice_path.is_some()
     }
 
     pub fn artifact_output_root(&self) -> Option<&Path> {
@@ -310,173 +287,6 @@ impl ArtifactRuntime {
             },
         }
     }
-
-    pub async fn render_docx(
-        &self,
-        docx_bytes: Vec<u8>,
-        pages: Vec<u32>,
-        dpi: u16,
-        cancel: Option<CancellationToken>,
-        sandbox_config: Option<LocalSandboxConfig>,
-    ) -> Result<Vec<RenderedPage>, ArtifactRuntimeError> {
-        let pdf = self
-            .convert_docx_to_pdf(&docx_bytes, cancel.clone(), sandbox_config)
-            .await?;
-        self.render_pdf_with_cancel(pdf, pages, dpi, cancel).await
-    }
-
-    pub async fn convert_docx_to_pdf_bytes(
-        &self,
-        docx_bytes: &[u8],
-        cancel: Option<CancellationToken>,
-        sandbox_config: Option<LocalSandboxConfig>,
-    ) -> Result<Vec<u8>, ArtifactRuntimeError> {
-        self.convert_docx_to_pdf(docx_bytes, cancel, sandbox_config)
-            .await
-    }
-
-    async fn convert_docx_to_pdf(
-        &self,
-        docx_bytes: &[u8],
-        cancel: Option<CancellationToken>,
-        sandbox_config: Option<LocalSandboxConfig>,
-    ) -> Result<Vec<u8>, ArtifactRuntimeError> {
-        let executable = self
-            .libreoffice_path
-            .as_ref()
-            .ok_or(ArtifactRuntimeError::LibreOfficeUnavailable)?;
-        let cancel = cancel.unwrap_or_default();
-        let _permit = tokio::select! {
-            permit = self.office_processes.acquire() => permit
-                .map_err(|error| ArtifactRuntimeError::LibreOffice(error.to_string()))?,
-            _ = cancel.cancelled() => return Err(ArtifactRuntimeError::Cancelled),
-        };
-        let staging = ArtifactSession::new()?;
-        let input = staging.root.join("input.docx");
-        let output_dir = staging.root.join("output");
-        let profile = staging.root.join("profile");
-        fs::create_dir(&output_dir)
-            .and_then(|_| fs::create_dir(&profile))
-            .and_then(|_| fs::write(&input, docx_bytes))
-            .map_err(|error| ArtifactRuntimeError::Staging(error.to_string()))?;
-
-        let runtime_root = executable
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let request = ExecRequest::new(executable.to_string_lossy())
-            .args([
-                "--headless".to_string(),
-                "--nologo".to_string(),
-                "--nodefault".to_string(),
-                "--nofirststartwizard".to_string(),
-                format!("-env:UserInstallation={}", file_url(&profile)),
-                "--convert-to".to_string(),
-                "pdf".to_string(),
-                "--outdir".to_string(),
-                output_dir.to_string_lossy().to_string(),
-                input.to_string_lossy().to_string(),
-            ])
-            .cwd(&staging.root)
-            .runtime("libreoffice", vec![runtime_root])
-            .requirements(ExecutionRequirements {
-                read_paths: vec![input.clone()],
-                write_paths: vec![output_dir.clone(), profile],
-                network: Some(NetworkPolicy::Deny),
-                ..Default::default()
-            });
-        let mut context = ExecutionContext::with_timeout(Duration::from_secs(90))
-            .with_resource_limits(ResourceLimit {
-                max_memory_bytes: Some(1024 * 1024 * 1024),
-                max_output_bytes: Some(64 * 1024),
-                ..Default::default()
-            });
-        context = context.with_cancel(cancel);
-        let environment = LocalExecutionEnvironment::with_sandbox_config(
-            &staging.root,
-            isolated_artifact_sandbox(sandbox_config),
-        );
-        let result = environment
-            .exec(request, context)
-            .await
-            .map_err(|error| ArtifactRuntimeError::LibreOffice(format!("{error:#}")))?;
-        if !result.success {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            return Err(ArtifactRuntimeError::LibreOffice(format!(
-                "process exited with {:?}: {}",
-                result.exit_code,
-                stderr.trim()
-            )));
-        }
-        let pdf_path = output_dir.join("input.pdf");
-        let pdf_metadata = fs::symlink_metadata(&pdf_path).map_err(|error| {
-            ArtifactRuntimeError::LibreOffice(format!(
-                "conversion did not produce {}: {error}",
-                pdf_path.display()
-            ))
-        })?;
-        if !pdf_metadata.file_type().is_file() {
-            return Err(ArtifactRuntimeError::LibreOffice(format!(
-                "conversion output {} is not a regular file",
-                pdf_path.display()
-            )));
-        }
-        let pdf_size = pdf_metadata.len();
-        if pdf_size > MAX_ARTIFACT_INPUT_BYTES {
-            return Err(ArtifactRuntimeError::LibreOffice(format!(
-                "converted PDF is {pdf_size} bytes; limit is {MAX_ARTIFACT_INPUT_BYTES} bytes"
-            )));
-        }
-        fs::read(&pdf_path).map_err(|error| {
-            ArtifactRuntimeError::LibreOffice(format!(
-                "conversion did not produce {}: {error}",
-                pdf_path.display()
-            ))
-        })
-    }
-}
-
-struct ArtifactSession {
-    root: PathBuf,
-}
-
-impl ArtifactSession {
-    fn new() -> Result<Self, ArtifactRuntimeError> {
-        let root = env::temp_dir().join(format!("opentopia-artifact-{}", Uuid::new_v4()));
-        fs::create_dir(&root).map_err(|error| ArtifactRuntimeError::Staging(error.to_string()))?;
-        Ok(Self { root })
-    }
-}
-
-impl Drop for ArtifactSession {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.root) {
-            tracing::warn!(path = %self.root.display(), %error, "failed to remove artifact staging directory");
-        }
-    }
-}
-
-fn discover_libreoffice() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("OPENTOPIA_LIBREOFFICE_PATH") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let mut candidates = Vec::new();
-    if cfg!(windows) {
-        candidates.extend([
-            PathBuf::from(r"C:\Program Files\LibreOffice\program\soffice.exe"),
-            PathBuf::from(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
-        ]);
-    }
-    candidates.extend(path_candidates(if cfg!(windows) {
-        "soffice.exe"
-    } else {
-        "soffice"
-    }));
-    candidates.extend(path_candidates("libreoffice"));
-    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn discover_artifact_output_root() -> Option<PathBuf> {
@@ -506,45 +316,6 @@ fn discover_artifact_output_root() -> Option<PathBuf> {
         .map(|path| path.join("opentopia").join("artifacts"))
 }
 
-fn isolated_artifact_sandbox(base: Option<LocalSandboxConfig>) -> LocalSandboxConfig {
-    let mut config = base.unwrap_or_else(LocalSandboxConfig::from_env);
-    config.enabled = true;
-    config.mode = OsSandboxMode::Enforce;
-    config.sandbox_mode = SandboxMode::WorkspaceWrite;
-    config.network = NetworkPolicy::Deny;
-    config.windows_backend = WindowsSandboxBackend::DedicatedUser;
-    config.read_paths.clear();
-    config.write_paths.clear();
-    config.writable_roots.clear();
-    config.approved_read_paths.clear();
-    config.approved_write_paths.clear();
-    config.sandbox_home = None;
-    config
-}
-
-fn path_candidates(name: &str) -> Vec<PathBuf> {
-    env::var_os("PATH")
-        .map(|value| {
-            env::split_paths(&value)
-                .map(|root| root.join(name))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn file_url(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let escaped = normalized
-        .replace('%', "%25")
-        .replace(' ', "%20")
-        .replace('#', "%23");
-    if escaped.starts_with('/') {
-        format!("file://{escaped}")
-    } else {
-        format!("file:///{escaped}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,21 +334,5 @@ mod tests {
             ..warning
         };
         assert!(!ValidationReport::from_issues(vec![error]).valid);
-    }
-
-    #[test]
-    fn file_url_is_stable_for_libreoffice_profiles() {
-        let url = file_url(Path::new(r"C:\Temp\Open Topia#1"));
-        assert_eq!(url, "file:///C:/Temp/Open%20Topia%231");
-    }
-
-    #[test]
-    fn artifact_sandbox_is_fail_closed_even_from_unrestricted_sessions() {
-        let config = isolated_artifact_sandbox(Some(LocalSandboxConfig::danger_full_access()));
-        assert!(config.enabled);
-        assert_eq!(config.mode, OsSandboxMode::Enforce);
-        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
-        assert_eq!(config.network, NetworkPolicy::Deny);
-        assert_eq!(config.windows_backend, WindowsSandboxBackend::DedicatedUser);
     }
 }

@@ -23,7 +23,7 @@ use opentopia_core::{
     AgentContinuation, AgentCore, AgentEvent, AgentEventPayload, AgentInstanceStatusV1,
     AgentInstanceV1, AgentProfileRegistry, AgentRuntimeSettings, AgentTemplateVersionV1,
     AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus, Artifact,
-    ArtifactMetadata, ArtifactRuntime, BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction,
+    ArtifactMetadata, BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction,
     BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
     BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
     BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserTargetRef,
@@ -3670,7 +3670,8 @@ async fn read_preview_content(
 ) -> Result<Response, ApiError> {
     let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
     let descriptor = preview.descriptor.clone();
-    if descriptor.kind == PreviewKind::Document {
+    let document_preview = descriptor.kind == PreviewKind::Document;
+    if document_preview {
         require_bundled_plugin_for_thread(&state.store, thread_id, "documents")?;
     }
     let etag = format!("\"{}\"", descriptor.revision);
@@ -3688,29 +3689,30 @@ async fn read_preview_content(
         return Ok(response);
     }
 
-    let document_preview = descriptor.kind == PreviewKind::Document;
-    let bytes = tokio::task::spawn_blocking(move || {
+    let mut bytes = tokio::task::spawn_blocking(move || {
         opentopia_core::read_preview_content(&preview, MAX_PREVIEW_CONTENT_BYTES)
     })
     .await
     .map_err(|error| ApiError::internal(format!("preview content worker failed: {error}")))?
     .map_err(preview_api_error)?;
-
-    let (bytes, response_content_type) = if document_preview {
-        let converted = ArtifactRuntime::shared()
-            .convert_docx_to_pdf_bytes(&bytes, None, None)
-            .await
-            .map_err(|error| {
+    if document_preview {
+        let validation_path = descriptor
+            .path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&descriptor.name));
+        bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ApiError> {
+            opentopia_core::inspect_document(&validation_path, &bytes).map_err(|error| {
                 ApiError::bad_request(format!("DOCX preview is unavailable: {error}"))
             })?;
-        (converted, "application/pdf")
-    } else {
-        (bytes, descriptor.content_type.as_str())
-    };
+            Ok(bytes)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("DOCX preview worker failed: {error}")))??;
+    }
 
     let content_length = bytes.len();
     let mut response = Response::new(Body::from(bytes));
-    let content_type = HeaderValue::from_str(response_content_type)
+    let content_type = HeaderValue::from_str(&descriptor.content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     response
         .headers_mut()

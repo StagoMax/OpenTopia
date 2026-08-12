@@ -1,21 +1,21 @@
 {
   "name": "documents",
-  "version": "1.1.0",
-  "description": "Inspect, extract, render, and validate DOCX files through OpenTopia's native artifact runtime.",
+  "version": "1.2.0",
+  "description": "Inspect, extract, validate, and preview DOCX files without an external Office installation.",
   "author": {
     "name": "OpenTopia Contributors"
   },
   "interface": {
     "displayName": "Documents",
-    "shortDescription": "Inspect and render DOCX files safely.",
-    "longDescription": "Inspect OPC and WordprocessingML structure, extract bounded document text, render pages through LibreOffice, and report preservation risks without rewriting the source file.",
+    "shortDescription": "Read and preview DOCX files safely.",
+    "longDescription": "Inspect OPC and WordprocessingML structure, extract bounded document text, preview documents in the desktop app, and report preservation risks without rewriting the source file.",
     "developerName": "OpenTopia",
     "category": "Productivity",
-    "defaultPrompt": "Use the Document tool when the task requires deterministic DOCX inspection, extraction, rendering, or validation.",
+    "defaultPrompt": "Use the Document tool when the task requires deterministic DOCX inspection, extraction, or validation. User preview is provided separately by the desktop renderer.",
     "capabilities": [
       "DOCX package inspection",
       "Bounded text extraction",
-      "LibreOffice rendering",
+      "Lightweight desktop preview",
       "Preservation risk validation"
     ]
   },
@@ -24,7 +24,6 @@
     "requires": {
       "hostCapabilities": [
         "workspace.files.v1",
-        "artifact.runtime.v1",
         "artifact.preview.v1",
         "nativeTool.document.v1"
       ]

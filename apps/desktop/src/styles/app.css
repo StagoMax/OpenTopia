@@ -8711,10 +8711,22 @@ button:disabled {
 .preview-code,
 .image-preview,
 .pdf-preview,
+.docx-preview,
 .spreadsheet-preview {
   min-width: 0;
   min-height: 0;
   height: 100%;
+}
+
+.docx-preview {
+  position: relative;
+  overflow: auto;
+  background: var(--surface-subtle);
+}
+
+.docx-preview-content {
+  min-width: max-content;
+  min-height: 100%;
 }
 
 .preview-surface {

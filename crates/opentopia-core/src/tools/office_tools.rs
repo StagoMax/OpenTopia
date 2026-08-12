@@ -174,7 +174,6 @@ impl_typed_tool!(PdfTool);
 enum DocumentToolAction {
     Inspect,
     Extract,
-    Render,
     Validate,
 }
 
@@ -195,14 +194,6 @@ pub struct DocumentToolInput {
     #[serde(default)]
     #[schemars(range(min = 1, max = 200000))]
     max_characters: Option<usize>,
-    /// One-based pages to render after LibreOffice conversion; defaults to page 1.
-    #[serde(default)]
-    #[schemars(length(max = 8), inner(range(min = 1)))]
-    pages: Vec<u32>,
-    /// Render resolution in dots per inch.
-    #[serde(default)]
-    #[schemars(range(min = 36, max = 288))]
-    dpi: Option<u16>,
 }
 
 pub struct DocumentTool;
@@ -216,31 +207,17 @@ impl TypedTool for DocumentTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect DOCX package structure, extract bounded WordprocessingML text, render selected pages through LibreOffice as typed PNG images, or validate package integrity and preservation risks. This tool never rewrites the source file."
+        "Inspect DOCX package structure, extract bounded WordprocessingML text, or validate package integrity and preservation risks. This tool never rewrites the source file; user-facing DOCX preview is handled independently by the desktop renderer."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
         let file =
             artifact_input_resource_key(input.path.as_deref(), input.attachment_id.as_deref());
-        match input.action {
-            DocumentToolAction::Render => ToolExecutionPolicy {
-                read_only: false,
-                idempotent: true,
-                parallel_safe: true,
-                side_effect: ToolSideEffect::Process,
-                resource_keys: vec!["artifact-runtime:libreoffice".to_string(), file],
-            },
-            _ => ToolExecutionPolicy::read_only(vec![file]),
-        }
+        ToolExecutionPolicy::read_only(vec![file])
     }
 
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        let intent = ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from));
-        if matches!(input.action, DocumentToolAction::Render) {
-            intent.with_process_lifetime(ProcessLifetime::OneShot)
-        } else {
-            intent
-        }
+        ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from))
     }
 
     async fn execute_typed(
@@ -304,53 +281,13 @@ impl TypedTool for DocumentTool {
                     ),
                 }
             }
-            DocumentToolAction::Render => {
-                let dpi = checked_dpi(input.dpi, call_id, "document")?;
-                let pages = normalized_render_pages(input.pages);
-                let worker_path = path.clone();
-                let validation_bytes = bytes.clone();
-                let parsed = tokio::task::spawn_blocking(move || {
-                    inspect_document(&worker_path, &validation_bytes)
-                })
-                .await
-                .context("DOCX render validation worker failed")?;
-                if let Err(error) = parsed {
-                    return Ok(document_error_result(call_id, "render", error));
-                }
-                match ctx
-                    .artifact_runtime
-                    .render_docx(
-                        bytes,
-                        pages,
-                        dpi,
-                        ctx.cancel.clone(),
-                        ctx.sandbox_config.clone(),
-                    )
-                    .await
-                {
-                    Ok(pages) => with_attachment_metadata(
-                        render_success(call_id, "document", &path, dpi, pages, &ctx),
-                        attachment_metadata.as_ref(),
-                    ),
-                    Err(error) => with_attachment_metadata(
-                        Ok(runtime_error_result(call_id, "document", "render", error)),
-                        attachment_metadata.as_ref(),
-                    ),
-                }
-            }
             DocumentToolAction::Validate => {
                 let worker_path = path.clone();
                 let result =
                     tokio::task::spawn_blocking(move || validate_document(&worker_path, &bytes))
                         .await
                         .context("DOCX validate worker failed")?;
-                let mut value = serde_json::to_value(result)?;
-                if let Some(object) = value.as_object_mut() {
-                    object.insert(
-                        "libreOfficeAvailable".to_string(),
-                        json!(ctx.artifact_runtime.libreoffice_available()),
-                    );
-                }
+                let value = serde_json::to_value(result)?;
                 with_attachment_metadata(
                     structured_value_success(call_id, "document", "validate", value),
                     attachment_metadata.as_ref(),
@@ -633,7 +570,6 @@ fn runtime_error_result(
     error: ArtifactRuntimeError,
 ) -> ToolResult {
     let code = match &error {
-        ArtifactRuntimeError::LibreOfficeUnavailable => "dependency_unavailable",
         ArtifactRuntimeError::Cancelled => "cancelled",
         ArtifactRuntimeError::PdfRenderTimeout { .. } => "render_timeout",
         _ => "render_error",
