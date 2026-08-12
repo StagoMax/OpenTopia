@@ -83,6 +83,11 @@ const MAX_TOOL_SEARCH_RESULTS: usize = 12;
 const PROMPT_CACHE_LINEAGE_VERSION: &str = "responses-lineage-v2";
 const AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD: usize = 24;
 const AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD: usize = 12_000;
+const ATTACHMENT_PROJECTED_BUNDLED_TOOLS: [(&str, &str); 3] = [
+    ("document", "documents"),
+    ("pdf", "pdf"),
+    ("spreadsheet", "spreadsheet"),
+];
 const ROLLOUT_CHECKPOINT_TOOL_NAME: &str = "runtime_rollout_checkpoint";
 const BACKGROUND_COMMAND_REMINDER_STAGE: &str = "background_command";
 const BACKGROUND_COMPLETION_TOOL_NAME: &str = "runtime_background_completion";
@@ -92,8 +97,9 @@ const MAX_ROLLOUT_MODEL_ROUNDS: usize = 270;
 /// Controls how much of the executable tool catalog is sent to the model.
 ///
 /// This is a harness policy, not a user-facing model setting. `Automatic` keeps
-/// ordinary catalogs unchanged and defers MCP schemas only when the catalog has
-/// grown large enough to create meaningful selection noise.
+/// ordinary catalogs unchanged, defers attachment-oriented bundled schemas until
+/// a matching attachment appears, and defers the whole external catalog when it
+/// has grown large enough to create meaningful selection noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolExposurePolicy {
     Eager,
@@ -508,6 +514,7 @@ pub struct AgentCore {
     denied_tools: HashSet<String>,
     tool_exposure_policy: ToolExposurePolicy,
     enabled_bundled_plugins: HashSet<String>,
+    attachment_preloaded_tools: HashSet<String>,
     rollout_budget_settings: Option<RolloutBudgetSettings>,
     agent_runtime_settings: AgentRuntimeSettings,
     collaboration_mode: CollaborationMode,
@@ -550,6 +557,7 @@ impl Default for AgentCore {
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
+            attachment_preloaded_tools: HashSet::new(),
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
@@ -593,6 +601,7 @@ impl AgentCore {
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
+            attachment_preloaded_tools: HashSet::new(),
             rollout_budget_settings: provider_settings.rollout_budget.clone(),
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
@@ -630,6 +639,7 @@ impl AgentCore {
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
+            attachment_preloaded_tools: HashSet::new(),
             rollout_budget_settings: active.rollout_budget.clone(),
             agent_runtime_settings: settings.agent_runtime.clone(),
             collaboration_mode: CollaborationMode::Default,
@@ -664,6 +674,7 @@ impl AgentCore {
             denied_tools: HashSet::new(),
             tool_exposure_policy: ToolExposurePolicy::default(),
             enabled_bundled_plugins: default_enabled_bundled_plugins(),
+            attachment_preloaded_tools: HashSet::new(),
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
             collaboration_mode: CollaborationMode::Default,
@@ -741,6 +752,25 @@ impl AgentCore {
 
     pub fn bundled_plugin_enabled(&self, plugin_name: &str) -> bool {
         self.enabled_bundled_plugins.contains(plugin_name)
+    }
+
+    /// Marks attachment-oriented bundled tools whose schemas should be sent
+    /// directly on providers without native deferred loading. This is only an
+    /// exposure hint: normal plugin activation, capability, and tool permission
+    /// checks remain authoritative.
+    pub fn set_attachment_preloaded_tools<I, S>(&mut self, tools: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.attachment_preloaded_tools = tools
+            .into_iter()
+            .filter_map(|name| {
+                let name = name.as_ref();
+                self.is_attachment_projected_bundled_tool(name)
+                    .then(|| name.to_string())
+            })
+            .collect();
     }
 
     pub fn disable_all_bundled_plugins(&mut self) {
@@ -3481,6 +3511,33 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         }
     }
 
+    fn is_attachment_projected_bundled_tool(&self, name: &str) -> bool {
+        let Some((_, expected_plugin)) = ATTACHMENT_PROJECTED_BUNDLED_TOOLS
+            .iter()
+            .find(|(tool_name, _)| *tool_name == name)
+        else {
+            return false;
+        };
+        matches!(
+            self.tools.source(name),
+            Some(ToolSource::BundledPlugin { plugin_name }) if plugin_name == *expected_plugin
+        )
+    }
+
+    fn client_deferred_tool_candidate(
+        &self,
+        candidate: &ProviderToolCandidate,
+        defer_all_external: bool,
+    ) -> bool {
+        if self.tools.source(&candidate.name) == Some(ToolSource::Core) {
+            return false;
+        }
+        if self.attachment_preloaded_tools.contains(&candidate.name) {
+            return false;
+        }
+        defer_all_external || self.is_attachment_projected_bundled_tool(&candidate.name)
+    }
+
     fn deferred_namespace_catalog(&self, eligible: &[ProviderToolCandidate]) -> String {
         let namespaces = eligible
             .iter()
@@ -3521,17 +3578,30 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             }
             return eligible;
         }
-        if !self.progressive_tool_disclosure_active(&eligible) {
+        if self.tool_exposure_policy == ToolExposurePolicy::Eager {
             return eligible;
         }
 
+        let defer_all_external = self.progressive_tool_disclosure_active(&eligible);
+        let has_deferred_tools = eligible
+            .iter()
+            .any(|candidate| self.client_deferred_tool_candidate(candidate, defer_all_external));
+        if !has_deferred_tools {
+            return eligible;
+        }
+
+        let deferred = eligible
+            .iter()
+            .filter(|candidate| self.client_deferred_tool_candidate(candidate, defer_all_external))
+            .cloned()
+            .collect::<Vec<_>>();
         let search_description = format!(
             "Search the deferred tool catalog by capability. Matching tools are made available on the next model round; use the returned names rather than guessing an unloaded tool schema.{}",
-            self.deferred_namespace_catalog(&eligible)
+            self.deferred_namespace_catalog(&deferred)
         );
         let mut exposed = eligible
             .into_iter()
-            .filter(|candidate| self.tools.source(&candidate.name) == Some(ToolSource::Core))
+            .filter(|candidate| !self.client_deferred_tool_candidate(candidate, defer_all_external))
             .collect::<Vec<_>>();
         exposed.push(ProviderToolCandidate::direct(
             TOOL_SEARCH_NAME,
@@ -3568,10 +3638,11 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             return Vec::new();
         }
 
-        let mut matches = self
-            .eligible_provider_tool_candidates()
+        let eligible = self.eligible_provider_tool_candidates();
+        let defer_all_external = self.progressive_tool_disclosure_active(&eligible);
+        let mut matches = eligible
             .into_iter()
-            .filter(|candidate| self.tools.source(&candidate.name) != Some(ToolSource::Core))
+            .filter(|candidate| self.client_deferred_tool_candidate(candidate, defer_all_external))
             .filter_map(|candidate| {
                 let name = candidate.name.to_lowercase();
                 let description = candidate.description.to_lowercase();
@@ -6416,7 +6487,8 @@ mod tests {
                 description: "Look up issue tracker records".to_string(),
             }),
         );
-        let agent = AgentCore::new(Arc::new(MockProvider), registry);
+        let mut agent = AgentCore::new(Arc::new(MockProvider), registry);
+        agent.disable_all_bundled_plugins();
 
         let catalog = agent.provider_tool_catalog();
         assert!(catalog
@@ -6425,6 +6497,80 @@ mod tests {
         assert!(!catalog
             .iter()
             .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
+    }
+
+    #[test]
+    fn automatic_tool_disclosure_projects_office_schemas_from_attachment_hints() {
+        let mut agent = AgentCore::default();
+        agent.set_bundled_plugin_activations(&HashMap::from([
+            ("documents".to_string(), true),
+            ("pdf".to_string(), true),
+            ("spreadsheet".to_string(), true),
+        ]));
+
+        let unloaded = agent.provider_tool_catalog();
+        assert!(unloaded
+            .iter()
+            .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
+        for tool in ["document", "pdf", "spreadsheet"] {
+            assert!(!unloaded.iter().any(|candidate| candidate.name == tool));
+        }
+
+        agent.set_attachment_preloaded_tools(["pdf", "spreadsheet"]);
+        let projected = agent.provider_tool_catalog();
+        assert!(projected.iter().any(|candidate| candidate.name == "pdf"));
+        assert!(projected
+            .iter()
+            .any(|candidate| candidate.name == "spreadsheet"));
+        assert!(!projected
+            .iter()
+            .any(|candidate| candidate.name == "document"));
+        assert!(projected
+            .iter()
+            .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
+        let still_deferred = agent
+            .search_deferred_tools("document pdf spreadsheet", MAX_TOOL_SEARCH_RESULTS)
+            .into_iter()
+            .map(|candidate| candidate.name)
+            .collect::<HashSet<_>>();
+        assert_eq!(still_deferred, HashSet::from(["document".to_string()]));
+    }
+
+    #[test]
+    fn attachment_projection_cannot_enable_a_disabled_bundled_plugin() {
+        let mut agent = AgentCore::default();
+        agent.set_bundled_plugin_activations(&HashMap::from([
+            ("pdf".to_string(), false),
+            ("spreadsheet".to_string(), true),
+        ]));
+        agent.set_attachment_preloaded_tools(["pdf"]);
+
+        assert!(!agent
+            .provider_tool_catalog()
+            .iter()
+            .any(|candidate| candidate.name == "pdf"));
+        assert!(!agent.tool_is_allowed("pdf"));
+    }
+
+    #[test]
+    fn native_deferred_loading_keeps_attachment_projected_tools_deferred() {
+        let mut agent = AgentCore::default();
+        agent.set_bundled_plugin_activations(&HashMap::from([("pdf".to_string(), true)]));
+        agent.set_attachment_preloaded_tools(["pdf"]);
+        agent.provider_tool_protocol = ProviderToolProtocolCapabilities {
+            function_tools: ProviderFeatureSupport::Supported,
+            deferred_tool_loading: ProviderFeatureSupport::Supported,
+            namespace_tools: ProviderFeatureSupport::Supported,
+            hosted_tool_search: ProviderFeatureSupport::Supported,
+            ..ProviderToolProtocolCapabilities::default()
+        };
+
+        let pdf = agent
+            .provider_tool_catalog()
+            .into_iter()
+            .find(|candidate| candidate.name == "pdf")
+            .expect("eligible PDF tool descriptor");
+        assert_eq!(pdf.disclosure, ProviderToolDisclosure::DeferredNamespace);
     }
 
     #[test]
@@ -6827,7 +6973,14 @@ mod tests {
         ] {
             assert!(tools.contains(expected), "missing Flow tool: {expected}");
         }
-        assert!(tools.contains("spreadsheet"));
+        assert!(tools.contains(TOOL_SEARCH_NAME));
+        assert!(!tools.contains("spreadsheet"));
+
+        agent.set_attachment_preloaded_tools(["spreadsheet"]);
+        assert!(agent
+            .provider_tool_catalog()
+            .iter()
+            .any(|tool| tool.name == "spreadsheet"));
     }
 
     #[test]
@@ -11827,13 +11980,13 @@ mod tests {
         }]));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
             .with_sandbox_config(sandbox.clone());
-        let model_context = default_agent_model_context(&workspace, &sandbox);
-        let compatibility_hash = provider_compatibility_hash(
-            &model_context,
-            None,
-            &agent.provider_tool_candidates(),
-            None,
-        );
+        let mut model_context = default_agent_model_context(&workspace, &sandbox);
+        let tool_candidates = agent.provider_tool_candidates();
+        if let Some(module) = tool_search_runtime_module(&tool_candidates) {
+            model_context.items.push(module);
+        }
+        let compatibility_hash =
+            provider_compatibility_hash(&model_context, None, &tool_candidates, None);
 
         let result = agent
             .run_turn_detailed_streaming(
@@ -11931,13 +12084,13 @@ mod tests {
         }]));
         let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
             .with_sandbox_config(sandbox.clone());
-        let model_context = default_agent_model_context(&workspace, &sandbox);
-        let compatibility_hash = provider_compatibility_hash(
-            &model_context,
-            None,
-            &agent.provider_tool_candidates(),
-            None,
-        );
+        let mut model_context = default_agent_model_context(&workspace, &sandbox);
+        let tool_candidates = agent.provider_tool_candidates();
+        if let Some(module) = tool_search_runtime_module(&tool_candidates) {
+            model_context.items.push(module);
+        }
+        let compatibility_hash =
+            provider_compatibility_hash(&model_context, None, &tool_candidates, None);
         let previous_item = json!({
             "type": "compaction",
             "id": "cmp_previous",

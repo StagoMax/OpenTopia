@@ -809,6 +809,7 @@ impl SubagentExecutor for ServerSubagentExecutor {
             agent.set_mcp_host(self.mcp_host.clone());
             agent.set_subagent_identity(run.id, run.depth, run.agent_path.clone());
             sync_thread_bundled_plugin_activations(&self.store, run.parent_thread_id, &mut agent);
+            sync_thread_attachment_tool_preloads(&self.store, run.parent_thread_id, &mut agent);
             sync_thread_mcp_tools(
                 &self.store,
                 &self.mcp_host,
@@ -6215,6 +6216,65 @@ fn sync_thread_bundled_plugin_activations(
     agent.set_bundled_plugin_activations(&activations);
 }
 
+fn attachment_preloaded_tools(messages: &[Message]) -> BTreeSet<&'static str> {
+    const PDF: &str = "application/pdf";
+    const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+    let mut tools = BTreeSet::new();
+    for source in messages.iter().rev().flat_map(|message| {
+        message.parts.iter().filter_map(|part| match part {
+            MessagePart::SourceRef { source } => Some(source),
+            _ => None,
+        })
+    }) {
+        let content_type = source
+            .content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let extension = source
+            .path
+            .extension()
+            .or_else(|| FsPath::new(&source.name).extension())
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match (content_type.as_str(), extension.as_str()) {
+            (PDF, _) | (_, "pdf") => {
+                tools.insert("pdf");
+            }
+            (DOCX, _) | (_, "docx") => {
+                tools.insert("document");
+            }
+            (XLSX, _) | (_, "xlsx") => {
+                tools.insert("spreadsheet");
+            }
+            _ => {}
+        }
+        if tools.len() == 3 {
+            break;
+        }
+    }
+    tools
+}
+
+fn sync_thread_attachment_tool_preloads(
+    store: &SqliteSessionStore,
+    thread_id: Uuid,
+    agent: &mut AgentCore,
+) {
+    match store.list_messages(thread_id) {
+        Ok(messages) => agent.set_attachment_preloaded_tools(attachment_preloaded_tools(&messages)),
+        Err(err) => {
+            error!(?err, %thread_id, "failed to load attachment tool projection");
+            agent.set_attachment_preloaded_tools(std::iter::empty::<&str>());
+        }
+    }
+}
+
 fn ensure_plugin_skills_enabled(
     store: &SqliteSessionStore,
     thread: &opentopia_core::Thread,
@@ -6679,6 +6739,7 @@ async fn run_new_agent_turn(
     } else {
         agent.disable_all_bundled_plugins();
     }
+    sync_thread_attachment_tool_preloads(&state.store, thread_id, &mut agent);
     if agent.capability_projection().allow_all_mcp_servers
         || !agent.capability_projection().mcp_servers.is_empty()
     {
@@ -7027,6 +7088,7 @@ async fn run_resumed_agent_turn(
     agent.set_mcp_host(state.mcp_host.clone());
     agent.set_subagent_context(turn_id, 0);
     sync_thread_bundled_plugin_activations(&state.store, thread_id, &mut agent);
+    sync_thread_attachment_tool_preloads(&state.store, thread_id, &mut agent);
     sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let resolved_approval_id = match &resume {
@@ -11837,6 +11899,73 @@ mod tests {
             .into_iter()
             .map(|entry| (entry.id, entry.context_window, entry.supports_vision))
             .collect()
+    }
+
+    fn source_message(thread_id: Uuid, name: &str, content_type: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            thread_id,
+            role: MessageRole::User,
+            parts: vec![MessagePart::SourceRef {
+                source: ContextSourceRef {
+                    id: Uuid::new_v4(),
+                    path: PathBuf::from(name),
+                    name: name.to_string(),
+                    kind: opentopia_core::ContextSourceKind::Document,
+                    content_type: content_type.to_string(),
+                    bytes: 1,
+                    truncated: false,
+                },
+            }],
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn attachment_tool_projection_accumulates_supported_office_formats() {
+        let thread_id = Uuid::new_v4();
+        let messages = vec![
+            source_message(thread_id, "analysis.xlsx", "application/octet-stream"),
+            source_message(thread_id, "brief.bin", "application/pdf; version=1.7"),
+            source_message(
+                thread_id,
+                "proposal.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            source_message(thread_id, "legacy.xls", "application/vnd.ms-excel"),
+            source_message(thread_id, "notes.txt", "text/plain"),
+        ];
+
+        assert_eq!(
+            attachment_preloaded_tools(&messages),
+            BTreeSet::from(["document", "pdf", "spreadsheet"])
+        );
+    }
+
+    #[test]
+    fn thread_attachment_projection_is_monotonic_across_later_text_turns() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let workspace = std::env::current_dir().expect("cwd");
+        let thread = store.create_thread(None, workspace).expect("create thread");
+        store
+            .append_message(source_message(thread.id, "brief.pdf", "application/pdf"))
+            .expect("store attachment turn");
+        store
+            .append_message(Message::text(
+                thread.id,
+                MessageRole::User,
+                "Continue without another attachment.",
+            ))
+            .expect("store later text turn");
+
+        let mut agent = AgentCore::default();
+        agent.set_bundled_plugin_activations(&HashMap::from([("pdf".to_string(), true)]));
+        sync_thread_attachment_tool_preloads(&store, thread.id, &mut agent);
+
+        assert!(agent
+            .provider_tool_catalog()
+            .iter()
+            .any(|candidate| candidate.name == "pdf"));
     }
 
     #[test]
