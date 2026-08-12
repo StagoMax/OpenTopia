@@ -88,26 +88,26 @@ export function FlowWorkspacePanel({
           role="tablist"
           aria-label="Flow 工作台"
         >
-        <button
-          aria-selected={tab === "flows"}
-          className={tab === "flows" ? "is-active" : ""}
-          onClick={() => setTab("flows")}
-          role="tab"
-          type="button"
-        >
-          <GitBranch aria-hidden="true" size={16} />
-          Flows
-        </button>
-        <button
-          aria-selected={tab === "agents"}
-          className={tab === "agents" ? "is-active" : ""}
-          onClick={() => setTab("agents")}
-          role="tab"
-          type="button"
-        >
-          <Bot aria-hidden="true" size={16} />
-          Agents
-        </button>
+          <button
+            aria-selected={tab === "flows"}
+            className={tab === "flows" ? "is-active" : ""}
+            onClick={() => setTab("flows")}
+            role="tab"
+            type="button"
+          >
+            <GitBranch aria-hidden="true" size={16} />
+            Flows
+          </button>
+          <button
+            aria-selected={tab === "agents"}
+            className={tab === "agents" ? "is-active" : ""}
+            onClick={() => setTab("agents")}
+            role="tab"
+            type="button"
+          >
+            <Bot aria-hidden="true" size={16} />
+            Agents
+          </button>
           <button
             aria-selected={tab === "library"}
             className={tab === "library" ? "is-active" : ""}
@@ -436,7 +436,9 @@ function FlowReviewPanel({
                     <Library aria-hidden="true" size={16} />
                     <span>
                       <strong>{flow.name}</strong>
-                      <small>{flow.flowId} · v{flow.version}</small>
+                      <small>
+                        {flow.flowId} · v{flow.version}
+                      </small>
                     </span>
                     <Badge variant="success">live</Badge>
                   </button>
@@ -481,7 +483,11 @@ function FlowReviewPanel({
           <article>
             <span>成功完成</span>
             <strong>{successCount}</strong>
-            <small>{runs.length ? `${Math.round((successCount / runs.length) * 100)}% 通过率` : "尚无数据"}</small>
+            <small>
+              {runs.length
+                ? `${Math.round((successCount / runs.length) * 100)}% 通过率`
+                : "尚无数据"}
+            </small>
           </article>
         </section>
 
@@ -514,190 +520,204 @@ function FlowReviewPanel({
         />
       </main>
 
-      <aside className="flow-review-panel__inspector" aria-label="Flow 配置与治理">
+      <aside
+        className="flow-review-panel__inspector"
+        aria-label="Flow 配置与治理"
+      >
         {selected ? (
-        <Panel
-          title={selected.draft.spec.name}
-          actions={<StatusBadge status={selected.draft.status} />}
-        >
-          <dl className="flow-review-panel__facts">
-            <div>
-              <dt>Owner</dt>
-              <dd>{selected.draft.spec.owner}</dd>
-            </div>
-            <div>
-              <dt>Source</dt>
-              <dd>{sourceLabel(selected.draft.spec)}</dd>
-            </div>
-            <div>
-              <dt>Risk</dt>
-              <dd><Badge variant={riskBadgeVariant(selected.draft.spec.riskClass)}>{selected.draft.spec.riskClass}</Badge></dd>
-            </div>
-            <div>
-              <dt>Hash</dt>
-              <dd>
-                <code>{selected.draft.contentHash}</code>
-              </dd>
-            </div>
-            <div>
-              <dt>Tools</dt>
-              <dd>
-                {selected.draft.effectiveCapabilities.allowAllTools
-                  ? "all visible tools"
-                  : selected.draft.effectiveCapabilities.tools.join(", ") ||
-                    "none"}
-              </dd>
-            </div>
-            <div>
-              <dt>Skills</dt>
-              <dd>
-                {selected.draft.effectiveCapabilities.allowAllSkills
-                  ? "all visible Skills"
-                  : selected.draft.effectiveCapabilities.skills.join(", ") ||
-                    "none"}
-              </dd>
-            </div>
-          </dl>
+          <Panel
+            title={selected.draft.spec.name}
+            actions={<StatusBadge status={selected.draft.status} />}
+          >
+            <dl className="flow-review-panel__facts">
+              <div>
+                <dt>Owner</dt>
+                <dd>{selected.draft.spec.owner}</dd>
+              </div>
+              <div>
+                <dt>Source</dt>
+                <dd>{sourceLabel(selected.draft.spec)}</dd>
+              </div>
+              <div>
+                <dt>Risk</dt>
+                <dd>
+                  <Badge
+                    variant={riskBadgeVariant(selected.draft.spec.riskClass)}
+                  >
+                    {selected.draft.spec.riskClass}
+                  </Badge>
+                </dd>
+              </div>
+              <div>
+                <dt>Hash</dt>
+                <dd>
+                  <code>{selected.draft.contentHash}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>Tools</dt>
+                <dd>
+                  {selected.draft.effectiveCapabilities.allowAllTools
+                    ? "all visible tools"
+                    : selected.draft.effectiveCapabilities.tools.join(", ") ||
+                      "none"}
+                </dd>
+              </div>
+              <div>
+                <dt>Skills</dt>
+                <dd>
+                  {selected.draft.effectiveCapabilities.allowAllSkills
+                    ? "all visible Skills"
+                    : selected.draft.effectiveCapabilities.skills.join(", ") ||
+                      "none"}
+                </dd>
+              </div>
+            </dl>
 
-          <div className="flow-review-panel__section-heading">
-            <span>
-              <GitBranch aria-hidden="true" size={15} /> Graph
-            </span>
-            <Button
-              onClick={() => setEditing((value) => !value)}
-              size="compact"
-              variant="quiet"
-            >
-              {editing ? "取消编辑" : "编辑 Spec"}
-            </Button>
-          </div>
-
-          {editing ? (
-            <label className="flow-review-panel__editor">
-              <span>Flow spec JSON</span>
-              <textarea
-                aria-label="Flow spec JSON"
-                onChange={(event) => setSpecText(event.target.value)}
-                spellCheck={false}
-                value={specText}
-              />
+            <div className="flow-review-panel__section-heading">
+              <span>
+                <GitBranch aria-hidden="true" size={15} /> Graph
+              </span>
               <Button
-                disabled={busy !== null}
-                onClick={() => void saveSpec()}
-                variant="primary"
+                onClick={() => setEditing((value) => !value)}
+                size="compact"
+                variant="quiet"
               >
-                <Save aria-hidden="true" size={14} /> 保存 revision
+                {editing ? "取消编辑" : "编辑 Spec"}
               </Button>
-            </label>
-          ) : (
-            <GraphInspector spec={selected.draft.spec} />
-          )}
+            </div>
 
-          <div className="flow-review-panel__section-heading">
-            <span>
-              <ShieldCheck aria-hidden="true" size={15} /> Validation
-            </span>
-            <Badge
-              variant={
-                validation?.valid
-                  ? "success"
-                  : validation
-                    ? "danger"
-                    : "neutral"
-              }
-            >
-              {validation
-                ? validation.valid
-                  ? "passed"
-                  : `${validation.issues.length} issues`
-                : "not run"}
-            </Badge>
-          </div>
-          {validation?.issues.length ? (
-            <ul className="flow-review-panel__issues">
-              {validation.issues.map((issue, index) => (
-                <li key={`${issue.code}-${index}`}>
-                  <strong>{issue.code}</strong>
-                  <span>{issue.message}</span>
-                  <small>{issue.remediation}</small>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="flow-review-panel__empty">尚无校验问题。</p>
-          )}
+            {editing ? (
+              <label className="flow-review-panel__editor">
+                <span>Flow spec JSON</span>
+                <textarea
+                  aria-label="Flow spec JSON"
+                  onChange={(event) => setSpecText(event.target.value)}
+                  spellCheck={false}
+                  value={specText}
+                />
+                <Button
+                  disabled={busy !== null}
+                  onClick={() => void saveSpec()}
+                  variant="primary"
+                >
+                  <Save aria-hidden="true" size={14} /> 保存 revision
+                </Button>
+              </label>
+            ) : (
+              <GraphInspector spec={selected.draft.spec} />
+            )}
 
-          <div className="flow-review-panel__action-grid">
-            <Button
-              disabled={busy !== null}
-              onClick={() =>
-                void runAction(
-                  "validate",
-                  () => client!.validateFlowDraft(selected.draft.id),
-                  "静态验证已完成。",
-                )
-              }
-            >
-              <CheckCircle2 aria-hidden="true" size={14} /> 验证
-            </Button>
-            <Button
-              disabled={busy !== null}
-              onClick={() =>
-                void runAction(
-                  "simulate",
-                  () => client!.simulateFlowDraft(selected.draft.id),
-                  "Harness 模拟已记录。",
-                )
-              }
-            >
-              <Play aria-hidden="true" size={14} /> 模拟
-            </Button>
-          </div>
-
-          {selected.trials[0] ? (
-            <details className="flow-review-panel__trial">
-              <summary>
-                <strong>最近模拟：{selected.trials[0].status}</strong>
-                <span>
-                  {selected.trials[0].steps.length} 个 Harness 节点 · revision{" "}
-                  {selected.trials[0].draftRevision}
-                </span>
-              </summary>
-              <ol>
-                {selected.trials[0].steps.map((step) => (
-                  <li key={`${step.order}-${step.nodeId}`}>
-                    <code>
-                      {step.order + 1}. {step.nodeId} → {step.harnessTarget}
-                      {step.boundedBy ? ` · max ${step.boundedBy}` : ""}
-                    </code>
+            <div className="flow-review-panel__section-heading">
+              <span>
+                <ShieldCheck aria-hidden="true" size={15} /> Validation
+              </span>
+              <Badge
+                variant={
+                  validation?.valid
+                    ? "success"
+                    : validation
+                      ? "danger"
+                      : "neutral"
+                }
+              >
+                {validation
+                  ? validation.valid
+                    ? "passed"
+                    : `${validation.issues.length} issues`
+                  : "not run"}
+              </Badge>
+            </div>
+            {validation?.issues.length ? (
+              <ul className="flow-review-panel__issues">
+                {validation.issues.map((issue, index) => (
+                  <li key={`${issue.code}-${index}`}>
+                    <strong>{issue.code}</strong>
+                    <span>{issue.message}</span>
+                    <small>{issue.remediation}</small>
                   </li>
                 ))}
-              </ol>
-            </details>
-          ) : null}
+              </ul>
+            ) : (
+              <p className="flow-review-panel__empty">尚无校验问题。</p>
+            )}
 
-          <TextField
-            hint="高风险 Flow 必须由 owner 之外的人发布。"
-            label="发布审批人"
-            onChange={(event) => setPublisher(event.target.value)}
-            placeholder="姓名或企业身份 ID"
-            value={publisher}
-          />
-          <Button
-            disabled={!client || busy !== null || publisher.trim().length === 0}
-            onClick={() =>
-              void runAction(
-                "publish",
-                () =>
-                  client!.publishFlowDraft(selected.draft.id, publisher.trim()),
-                "已发布不可变 Flow 版本。",
-              )
-            }
-            variant="primary"
-          >
-            <Send aria-hidden="true" size={14} /> 发布 Flow
-          </Button>
-        </Panel>
+            <div className="flow-review-panel__action-grid">
+              <Button
+                disabled={busy !== null}
+                onClick={() =>
+                  void runAction(
+                    "validate",
+                    () => client!.validateFlowDraft(selected.draft.id),
+                    "静态验证已完成。",
+                  )
+                }
+              >
+                <CheckCircle2 aria-hidden="true" size={14} /> 验证
+              </Button>
+              <Button
+                disabled={busy !== null}
+                onClick={() =>
+                  void runAction(
+                    "simulate",
+                    () => client!.simulateFlowDraft(selected.draft.id),
+                    "Harness 模拟已记录。",
+                  )
+                }
+              >
+                <Play aria-hidden="true" size={14} /> 模拟
+              </Button>
+            </div>
+
+            {selected.trials[0] ? (
+              <details className="flow-review-panel__trial">
+                <summary>
+                  <strong>最近模拟：{selected.trials[0].status}</strong>
+                  <span>
+                    {selected.trials[0].steps.length} 个 Harness 节点 · revision{" "}
+                    {selected.trials[0].draftRevision}
+                  </span>
+                </summary>
+                <ol>
+                  {selected.trials[0].steps.map((step) => (
+                    <li key={`${step.order}-${step.nodeId}`}>
+                      <code>
+                        {step.order + 1}. {step.nodeId} → {step.harnessTarget}
+                        {step.boundedBy ? ` · max ${step.boundedBy}` : ""}
+                      </code>
+                    </li>
+                  ))}
+                </ol>
+              </details>
+            ) : null}
+
+            <TextField
+              hint="高风险 Flow 必须由 owner 之外的人发布。"
+              label="发布审批人"
+              onChange={(event) => setPublisher(event.target.value)}
+              placeholder="姓名或企业身份 ID"
+              value={publisher}
+            />
+            <Button
+              disabled={
+                !client || busy !== null || publisher.trim().length === 0
+              }
+              onClick={() =>
+                void runAction(
+                  "publish",
+                  () =>
+                    client!.publishFlowDraft(
+                      selected.draft.id,
+                      publisher.trim(),
+                    ),
+                  "已发布不可变 Flow 版本。",
+                )
+              }
+              variant="primary"
+            >
+              <Send aria-hidden="true" size={14} /> 发布 Flow
+            </Button>
+          </Panel>
         ) : (
           <div className="flow-review-panel__inspector-empty">
             <GitBranch aria-hidden="true" size={20} />
@@ -710,7 +730,10 @@ function FlowReviewPanel({
           title="Business Context"
           actions={<Badge>接口预留</Badge>}
         >
-          <p>将 Flow 连接到知识库、业务数据库与 CRM。连接器配置会在 Library 中集中管理。</p>
+          <p>
+            将 Flow 连接到知识库、业务数据库与 CRM。连接器配置会在 Library
+            中集中管理。
+          </p>
           <Button onClick={onOpenLibrary} size="compact" variant="quiet">
             <Cable aria-hidden="true" size={14} /> 打开 Library
           </Button>
@@ -763,13 +786,18 @@ function FlowLibraryPanel({
           <small>Business Context</small>
           <h2>Library & Connectors</h2>
           <p>
-            为 Flow 和 Agent 提供统一的企业知识与系统连接。此处已预留稳定的前端接口，后续可直接接入 RAG、数据库和 CRM 管理流程。
+            为 Flow 和 Agent
+            提供统一的企业知识与系统连接。此处已预留稳定的前端接口，后续可直接接入
+            RAG、数据库和 CRM 管理流程。
           </p>
         </span>
         <Badge variant="info">API ready</Badge>
       </header>
 
-      <section className="flow-library-panel__catalog" aria-labelledby="connector-catalog-title">
+      <section
+        className="flow-library-panel__catalog"
+        aria-labelledby="connector-catalog-title"
+      >
         <header>
           <span>
             <h3 id="connector-catalog-title">添加连接</h3>
@@ -804,7 +832,10 @@ function FlowLibraryPanel({
         </div>
       </section>
 
-      <section className="flow-library-panel__connected" aria-labelledby="connected-sources-title">
+      <section
+        className="flow-library-panel__connected"
+        aria-labelledby="connected-sources-title"
+      >
         <header>
           <span>
             <h3 id="connected-sources-title">已连接来源</h3>
@@ -843,7 +874,9 @@ function FlowLibraryPanel({
           <div className="flow-library-panel__empty">
             <Cable aria-hidden="true" size={20} />
             <strong>尚未连接外部来源</strong>
-            <span>接入后，Flow 可以在明确的身份和权限边界内读取业务上下文。</span>
+            <span>
+              接入后，Flow 可以在明确的身份和权限边界内读取业务上下文。
+            </span>
           </div>
         )}
       </section>
