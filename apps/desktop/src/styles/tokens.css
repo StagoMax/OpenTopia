@@ -129,7 +129,7 @@
   );
   --chrome-backdrop-blur: 18px;
   --sidebar-item-hover: color-mix(in srgb, var(--text) 8%, transparent);
-  --sidebar-item-active: color-mix(in srgb, var(--text) 14%, transparent);
+  --sidebar-item-active: color-mix(in srgb, var(--text) 8%, transparent);
   --surface: #ffffff;
   --surface-subtle: #f8f9fb;
   --surface-chrome: #f4f7fa;
