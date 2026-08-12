@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr;
@@ -34,7 +34,6 @@ use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::REVOKE_ACCESS;
 use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
 use windows_sys::Win32::Security::Authorization::SE_REGISTRY_KEY;
-use windows_sys::Win32::Security::Authorization::SET_ACCESS;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_UNKNOWN;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
@@ -63,6 +62,7 @@ use windows_sys::Win32::Security::PRIVILEGE_SET;
 use windows_sys::Win32::Security::PSID;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::Security::SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+use windows_sys::Win32::Security::SUB_CONTAINERS_ONLY_INHERIT;
 use windows_sys::Win32::Security::TOKEN_ADJUST_DEFAULT;
 use windows_sys::Win32::Security::TOKEN_ADJUST_PRIVILEGES;
 use windows_sys::Win32::Security::TOKEN_ADJUST_SESSIONID;
@@ -79,7 +79,6 @@ use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
-use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
@@ -101,8 +100,8 @@ use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_JOB_TIME;
 use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 use windows_sys::Win32::System::Registry::RegCloseKey;
 use windows_sys::Win32::System::Registry::RegOpenCurrentUser;
+use windows_sys::Win32::System::Registry::KEY_ALL_ACCESS;
 use windows_sys::Win32::System::Registry::KEY_READ;
-use windows_sys::Win32::System::Registry::KEY_WRITE;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
@@ -127,7 +126,6 @@ use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_JOB_LIST;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
-use windows_sys::Win32::UI::Shell::GetUserProfileDirectoryW;
 const TRUSTEE_IS_UNKNOWN_VALUE: i32 = TRUSTEE_IS_UNKNOWN;
 const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 const WIN_WORLD_SID: i32 = 1;
@@ -217,8 +215,7 @@ struct DedicatedUserRunnerResult {
 
 const DEDICATED_USER_RUNNER_PROTOCOL_VERSION: u32 = 2;
 const LEGACY_CAPABILITY_PRINCIPAL: &str = "opentopia:unelevated-capability:v1";
-const LEGACY_SCOPED_CAPABILITY_PRINCIPAL_PREFIX: &str =
-    "opentopia:unelevated-capability:v2:";
+const LEGACY_SCOPED_CAPABILITY_PRINCIPAL_PREFIX: &str = "opentopia:unelevated-capability:v2:";
 const CAPABILITY_PRINCIPAL_PREFIX: &str = "opentopia:filesystem-capability:v3:";
 const CAPABILITY_NAMESPACE: u128 = 0xa678_2ac1_8754_5ef2_99b0_b62a_15c7_c90e;
 
@@ -475,56 +472,28 @@ fn runner_trace(path: &Option<std::path::PathBuf>, message: &str) {
 
 fn suppress_process_error_ui() {
     unsafe {
-        SetErrorMode(
-            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX,
-        );
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
         let _ = WerSetFlags(WER_FAULT_REPORTING_NO_UI);
     }
 }
 
-/// The per-launch filesystem SID must remain the only restricting principal
-/// that has host-file grants. A separate stable SID is granted solely inside
-/// the dedicated account's HKCU hive so normal per-user registry initialization
-/// can succeed without making any historical workspace ACE usable by a later
-/// launch.
-fn ensure_runtime_registry_capability(runtime_sid: PSID) -> Result<()> {
+/// Grant the session-unique logon SID access to the dedicated account's own
+/// registry hive. It is intentionally not written to any host filesystem ACL,
+/// so it can support ordinary process initialization without widening the
+/// per-launch filesystem capability.
+fn update_logon_registry_access(logon_sid: PSID, access_mode: i32) -> Result<()> {
     let mut key = ptr::null_mut();
-    let opened = unsafe {
-        RegOpenCurrentUser(
-            KEY_READ | KEY_WRITE | READ_CONTROL | WRITE_DAC,
-            &mut key,
-        )
-    };
+    let opened = unsafe { RegOpenCurrentUser(KEY_READ | WRITE_DAC, &mut key) };
     if opened != 0 || key.is_null() {
-        anyhow::bail!("RegOpenCurrentUser for runtime capability failed: {opened}")
+        anyhow::bail!("RegOpenCurrentUser for logon SID failed: {opened}")
     }
 
-    let result = update_handle_dacl(
-        key.cast(),
-        SE_REGISTRY_KEY,
-        runtime_sid,
-        SET_ACCESS,
-        true,
-        KEY_READ | KEY_WRITE,
-    );
-    unsafe { RegCloseKey(key) };
-    result
-}
-
-fn update_handle_dacl(
-    handle: HANDLE,
-    object_type: i32,
-    sid: PSID,
-    access_mode: i32,
-    inherit: bool,
-    permissions: u32,
-) -> Result<()> {
     let mut old_dacl = ptr::null_mut();
     let mut descriptor = ptr::null_mut();
     let get_result = unsafe {
         GetSecurityInfo(
-            handle,
-            object_type,
+            key.cast(),
+            SE_REGISTRY_KEY,
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -534,23 +503,24 @@ fn update_handle_dacl(
         )
     };
     if get_result != 0 {
-        anyhow::bail!("GetSecurityInfo failed: {get_result}")
+        unsafe { RegCloseKey(key) };
+        anyhow::bail!("GetSecurityInfo(HKCU) failed: {get_result}")
     }
 
     let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: permissions,
+        grfAccessPermissions: KEY_ALL_ACCESS,
         grfAccessMode: access_mode,
-        grfInheritance: if inherit {
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT
-        } else {
+        grfInheritance: if access_mode == REVOKE_ACCESS {
             0
+        } else {
+            SUB_CONTAINERS_ONLY_INHERIT
         },
         Trustee: TRUSTEE_W {
             pMultipleTrustee: ptr::null_mut(),
             MultipleTrusteeOperation: 0,
             TrusteeForm: TRUSTEE_IS_SID,
             TrusteeType: TRUSTEE_IS_UNKNOWN_VALUE,
-            ptstrName: sid.cast(),
+            ptstrName: logon_sid.cast(),
         },
     };
     let mut new_dacl = ptr::null_mut();
@@ -559,12 +529,13 @@ fn update_handle_dacl(
         unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
     }
     if entries_result != 0 {
-        anyhow::bail!("SetEntriesInAclW failed: {entries_result}")
+        unsafe { RegCloseKey(key) };
+        anyhow::bail!("SetEntriesInAclW(HKCU) failed: {entries_result}")
     }
     let set_result = unsafe {
         SetSecurityInfo(
-            handle,
-            object_type,
+            key.cast(),
+            SE_REGISTRY_KEY,
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -575,8 +546,9 @@ fn update_handle_dacl(
     if !new_dacl.is_null() {
         unsafe { windows_sys::Win32::Foundation::LocalFree(new_dacl.cast()) };
     }
+    unsafe { RegCloseKey(key) };
     if set_result != 0 {
-        anyhow::bail!("SetSecurityInfo failed: {set_result}")
+        anyhow::bail!("SetSecurityInfo(HKCU) failed: {set_result}")
     }
     Ok(())
 }
@@ -588,13 +560,7 @@ fn launch_dedicated_user_target(
 ) -> Result<i32> {
     let capability_principal = capability_principal(request);
     let mut capability = acl_principal_sid(&capability_principal)?;
-    let mut runtime = SidBuffer::opentopia_runtime();
-    ensure_runtime_registry_capability(runtime.as_ptr())
-        .context("stage=prepare_sandbox grant runtime registry capability")?;
-    let restricted_token = RestrictedToken::for_dedicated_capability(
-        capability.as_ptr(),
-        runtime.as_ptr(),
-    )
+    let restricted_token = RestrictedToken::for_dedicated_capability(capability.as_ptr())
         .context("stage=prepare_sandbox create dedicated-user restricted token")?;
     crate::logging::event("runner", "created dedicated-user restricted token");
     let stdin = File::open("NUL").context("stage=spawn open NUL stdin")?;
@@ -644,11 +610,8 @@ fn launch_dedicated_user_target(
     startup.lpAttributeList = attributes.as_mut_ptr();
     let mut command_line = wide(argv_to_command_line(&request.command));
     let cwd = wide(native_path(&request.cwd).as_os_str());
-    let profile_home = request
-        .filesystem
-        .runtime_home
-        .clone()
-        .context(
+    let profile_home =
+        request.filesystem.runtime_home.clone().context(
             "stage=validate_policy dedicated-user launches require a managed runtime home",
         )?;
     let environment = current_environment_block(Some(&request.cwd), Some(&profile_home), false);
@@ -1476,36 +1439,6 @@ fn normalized_capability_path(path: &Path) -> String {
         .to_string()
 }
 
-fn current_profile_home() -> Result<std::path::PathBuf> {
-    let mut token = ptr::null_mut();
-    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
-    if opened == 0 {
-        return Err(last_error(
-            "stage=prepare_sandbox OpenProcessToken(profile)",
-        ));
-    }
-    let mut size = 0;
-    unsafe { GetUserProfileDirectoryW(token, ptr::null_mut(), &mut size) };
-    if size == 0 {
-        unsafe { CloseHandle(token) };
-        return Err(last_error(
-            "stage=prepare_sandbox GetUserProfileDirectoryW(size)",
-        ));
-    }
-    let mut value = vec![0_u16; size as usize];
-    let queried = unsafe { GetUserProfileDirectoryW(token, value.as_mut_ptr(), &mut size) };
-    unsafe { CloseHandle(token) };
-    if queried == 0 {
-        return Err(last_error("stage=prepare_sandbox GetUserProfileDirectoryW"));
-    }
-    if value.last() == Some(&0) {
-        value.pop();
-    }
-    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
-        &value,
-    )))
-}
-
 fn forward_file(path: &Path, mut writer: impl Write) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -1533,18 +1466,19 @@ impl Drop for RunDirectory {
 
 struct RestrictedToken {
     handle: HANDLE,
+    registry_logon_sid: Option<SidBuffer>,
 }
 
 impl RestrictedToken {
     fn for_capability(capability_sid: PSID) -> Result<Self> {
-        Self::create(capability_sid, None)
+        Self::create(capability_sid, false)
     }
 
-    fn for_dedicated_capability(capability_sid: PSID, runtime_sid: PSID) -> Result<Self> {
-        Self::create(capability_sid, Some(runtime_sid))
+    fn for_dedicated_capability(capability_sid: PSID) -> Result<Self> {
+        Self::create(capability_sid, true)
     }
 
-    fn create(capability_sid: PSID, runtime_sid: Option<PSID>) -> Result<Self> {
+    fn create(capability_sid: PSID, dedicated: bool) -> Result<Self> {
         let mut base_token = ptr::null_mut();
         let opened = unsafe {
             OpenProcessToken(
@@ -1576,8 +1510,12 @@ impl RestrictedToken {
         let mut everyone_sid = SidBuffer::well_known(WIN_WORLD_SID)?;
         let mut restricting_sids = [unsafe { std::mem::zeroed::<SID_AND_ATTRIBUTES>() }; 3];
         restricting_sids[0].Sid = capability_sid;
-        let restricting_sid_count = if let Some(runtime_sid) = runtime_sid {
-            restricting_sids[1].Sid = runtime_sid;
+        let restricting_sid_count = if dedicated {
+            if let Err(error) = update_logon_registry_access(logon_sid.as_ptr(), GRANT_ACCESS) {
+                unsafe { CloseHandle(base_token) };
+                return Err(error);
+            }
+            restricting_sids[1].Sid = logon_sid.as_ptr();
             2
         } else {
             restricting_sids[1].Sid = logon_sid.as_ptr();
@@ -1600,25 +1538,37 @@ impl RestrictedToken {
         };
         unsafe { CloseHandle(base_token) };
         if created == 0 || restricted.is_null() {
+            if dedicated {
+                let _ = update_logon_registry_access(logon_sid.as_ptr(), REVOKE_ACCESS);
+            }
             return Err(last_error("CreateRestrictedToken"));
         }
         let mut default_dacl_sids = vec![capability_sid];
-        if let Some(runtime_sid) = runtime_sid {
-            default_dacl_sids.push(runtime_sid);
+        if dedicated {
+            default_dacl_sids.push(logon_sid.as_ptr());
         } else {
             default_dacl_sids.extend([logon_sid.as_ptr(), everyone_sid.as_ptr()]);
         }
         if let Err(error) = set_default_dacl(restricted, &default_dacl_sids) {
             unsafe { CloseHandle(restricted) };
+            if dedicated {
+                let _ = update_logon_registry_access(logon_sid.as_ptr(), REVOKE_ACCESS);
+            }
             return Err(error);
         }
-        Ok(Self { handle: restricted })
+        Ok(Self {
+            handle: restricted,
+            registry_logon_sid: dedicated.then_some(logon_sid),
+        })
     }
 }
 
 impl Drop for RestrictedToken {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.handle) };
+        if let Some(sid) = self.registry_logon_sid.as_mut() {
+            let _ = update_logon_registry_access(sid.as_ptr(), REVOKE_ACCESS);
+        }
     }
 }
 
@@ -1693,10 +1643,6 @@ impl SidBuffer {
 
     fn legacy_opentopia_capability() -> Self {
         Self::opentopia_capability(Uuid::from_bytes(*b"OpenTopiaSandbox"))
-    }
-
-    fn opentopia_runtime() -> Self {
-        Self::opentopia_capability(Uuid::from_bytes(*b"OpenTopiaRuntime"))
     }
 
     fn well_known(kind: i32) -> Result<Self> {
@@ -2241,19 +2187,19 @@ mod tests {
     }
 
     #[test]
-    fn broad_host_principals_are_not_write_restricting_sids() {
+    fn dedicated_restricted_token_uses_scope_and_session_sids_only() {
         let source = include_str!("windows.rs");
         let function = source
-            .split("fn for_capability")
+            .split("impl RestrictedToken")
             .nth(1)
             .expect("restricted token implementation")
             .split("impl Drop for RestrictedToken")
             .next()
             .expect("restricted token boundary");
         assert!(function.contains("restricting_sids[0].Sid = capability_sid"));
-        assert!(function.contains("include_user_compatibility_sid"));
-        assert!(function.contains("restricting_sids[1].Sid = user_sid.as_ptr()"));
-        assert!(function.contains("restricting_sid_count"));
+        assert!(function.contains("restricting_sids[1].Sid = logon_sid.as_ptr()"));
+        assert!(function.contains("ensure_logon_registry_access"));
+        assert!(!function.contains("current_user_sid"));
     }
 
     #[test]
@@ -2278,6 +2224,29 @@ mod tests {
         let second = acl_principal_sid(&capability_principal(&request))
             .expect("resolve stable capability principal");
         assert_eq!(first.0, second.0);
+    }
+
+    #[test]
+    fn legacy_scoped_capability_principals_remain_resolvable_for_cleanup() {
+        let id = Uuid::new_v4();
+        let old = format!("{LEGACY_SCOPED_CAPABILITY_PRINCIPAL_PREFIX}{}", id.simple());
+        let new = format!("{CAPABILITY_PRINCIPAL_PREFIX}{}", id.simple());
+        assert_eq!(
+            acl_principal_sid(&old).expect("legacy SID").0,
+            acl_principal_sid(&new).expect("current SID").0
+        );
+    }
+
+    #[test]
+    fn native_path_removes_win32_extended_prefixes_for_process_creation() {
+        assert_eq!(
+            native_path(Path::new(r"\\?\J:\workspace")),
+            Path::new(r"J:\workspace")
+        );
+        assert_eq!(
+            native_path(Path::new(r"\\?\UNC\server\share\workspace")),
+            Path::new(r"\\server\share\workspace")
+        );
     }
 
     fn capability_request(write_roots: &[&str]) -> SandboxRequest {

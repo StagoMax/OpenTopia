@@ -352,7 +352,10 @@ mod tests {
             1
         );
         assert_eq!(request.filesystem.deny_read.len(), 1);
-        assert_eq!(request.filesystem.runtime_home.as_deref(), Some(cwd.as_ref()));
+        assert_eq!(
+            request.filesystem.runtime_home.as_deref(),
+            Some(request.cwd.as_path())
+        );
         assert_eq!(request.termination_timeout_ms, 7_000);
         assert_eq!(request.max_memory_bytes, Some(1_048_576));
         assert_eq!(request.max_cpu_time_ms, Some(9_000));
