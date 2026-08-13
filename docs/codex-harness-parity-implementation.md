@@ -17,7 +17,7 @@
 
 1. OpenTopia 基础 agent 指令。
 2. 工作区、权限、沙箱和体验模式。
-3. 用户级、工作区级和嵌套目录的 `AGENTS.md`。
+3. OpenTopia 应用级、工作区级和嵌套目录的 `AGENTS.md`。
 4. 可缓存的 Skill 目录摘要。
 5. 本轮选中的 Skill 正文。
 6. 动态 world state，包括 Git、日期、平台以及 Skill/工具数量；目录正文不在每轮状态里重复。
@@ -26,7 +26,6 @@
 
 `AGENTS.md` 解析位于 `crates/opentopia-core/src/instructions.rs`。解析顺序是：
 
-- `~/.codex/AGENTS.md`
 - `~/.opentopia/AGENTS.md`
 - 工作区根目录到当前目录的 `AGENTS.md`
 

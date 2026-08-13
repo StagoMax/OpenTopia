@@ -89,6 +89,31 @@ pnpm.cmd install
 pnpm.cmd dev:desktop
 ```
 
+### Connect the SAG library
+
+The Flow-mode **Library** surface connects to SAG through the local OpenTopia
+server. In the desktop app, opening Library asks Electron to ensure the service
+is ready. It reuses an existing service first, then starts a trusted local
+runtime when one is configured or discovered:
+
+```powershell
+# Optional explicit source project for development
+$env:OPENTOPIA_SAG_PROJECT_ROOT="J:\path\to\sag-project"
+
+# Or connect to an externally managed service
+$env:OPENTOPIA_SAG_URL="http://127.0.0.1:8765"
+pnpm dev:desktop
+```
+
+During development, an adjacent project is discovered by its
+`enterprise-sag-panel` entry in `pyproject.toml`, so its directory name is not
+part of the integration contract. A packaged build can instead provide
+`OPENTOPIA_SAG_EXECUTABLE` or ship `resources/sag/enterprise-sag-panel` as a
+sidecar. Remote endpoints are never launched by OpenTopia.
+
+This integration is review-only: it manages sources and builds draft Context
+Packs, but does not inject them into prompts or change the Agent Loop.
+
 ## Architecture at a glance
 
 ```mermaid
