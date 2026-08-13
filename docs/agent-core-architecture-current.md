@@ -1,6 +1,6 @@
 # OpenTopia AgentCore 当前架构详解
 
-> 基于当前 `crates/opentopia-core/src/agent.rs` 及其直接依赖重新梳理，更新时间：2026-08-13。
+> 基于当前 `crates/opentopia-core/src/agent.rs` 及其直接依赖重新梳理，更新时间：2026-08-14。
 > 本文解释 AgentCore（智能体核心）的内部结构、状态机、模块关系和设计边界，不是公开接口清单。
 > Tool Runtime（工具运行时）继续保持为 Black Box（黑盒），只描述 AgentCore 如何调度它。
 
@@ -414,16 +414,20 @@ flowchart LR
 
 ### 5.3 Planning Tools 为什么不是一个独立控制器
 
+本节的完整独立说明见 [`planning-tools-architecture-current.md`](planning-tools-architecture-current.md)，包括工具可见模式、计划数据模型、修订冲突、步骤状态、需求覆盖、工具调用证据和收尾校验流程。
+
 规划相关能力在代码中确实存在，但它不是 AgentCore 内部一个会“自动推进任务”的 `Planner Controller（规划控制器）`。真实关系是：主模型通过普通工具调用读写一份外部化、可验证的 `TaskPlan（任务计划）`；AgentCore 只负责把计划结果投影成事件、在后续调用中提供当前计划，并在客观边界处读取它。
 
 ```mermaid
 flowchart LR
     MODEL["Main Model<br/>主模型"]
     ROUTER["Decision Router + Pending Queue<br/>决策路由 + 待执行队列"]
-    subgraph PLAN_TOOLS["Planning Tool Family<br/>规划工具族"]
-        SET["set_plan<br/>设置计划"]
+    subgraph TASK_TOOLS["Task Tool Bundle<br/>任务执行工具包 · Default / Goal 共享"]
         UPDATE["update_plan<br/>更新计划"]
         COMPLETE["complete_task<br/>声明任务完成"]
+    end
+    subgraph GOAL_TOOLS["Goal Tool Bundle<br/>目标专属工具包"]
+        SET["set_plan<br/>设置完整目标计划"]
     end
     RESULT["Tool Result metadata.taskPlan<br/>工具结果中的计划元数据"]
     COMPLETION["Tool Result metadata.taskCompletion<br/>工具结果中的完成声明"]
@@ -433,7 +437,9 @@ flowchart LR
     CHECKPOINT["Rollout Checkpoint<br/>长轮次检查点"]
     GUARD["Finalization Guard<br/>收尾守卫"]
 
-    MODEL -->|"calls · 调用"| ROUTER --> PLAN_TOOLS
+    MODEL -->|"calls · 调用"| ROUTER
+    ROUTER --> TASK_TOOLS
+    ROUTER --> GOAL_TOOLS
     SET --> RESULT
     UPDATE --> RESULT
     COMPLETE --> COMPLETION
@@ -452,9 +458,9 @@ flowchart LR
 
 三类任务状态工具的职责不同：
 
-- `set_plan（设置计划）`：创建或替换带目标、需求、步骤、依赖和验收标准的完整计划；
-- `update_plan（更新计划）`：用 revision（修订号）保护的增量操作修改步骤、状态、需求覆盖和工具证据，并可用 `currentScopeComplete（当前范围已完成）`标记本次范围是否已经完整闭合；
-- `complete_task（声明任务完成）`：它不修改 `TaskPlan`，而是返回 `metadata.taskCompletion`中的摘要、验证和剩余工作；其中 `remainingWork（剩余工作）`参与最终 `Completed / Partial`分类。它在 Plan Mode 不可用，Goal Mode 下还要求计划已经没有 Pending / In Progress Step。
+- `set_plan（设置计划）`：Goal Mode 专属，使用服务器分配的 Goal UUID 创建或替换带目标、需求、步骤、依赖和验收标准的完整计划；
+- `update_plan（更新计划）`：Default / Goal 共享，用 revision（修订号）保护的增量操作创建或修改步骤、状态、需求覆盖和工具证据，并可用 `currentScopeComplete（当前范围已完成）`标记本次范围是否已经完整闭合；
+- `complete_task（声明任务完成）`：Default / Goal 共享。它不修改 `TaskPlan`，而是返回 `metadata.taskCompletion`中的摘要、验证和剩余工作；其中 `remainingWork（剩余工作）`参与最终 `Completed / Partial`分类。Goal Mode 下还会额外要求计划已经没有 Pending / In Progress Step。
 
 `set_plan / update_plan`返回的 Tool Result（工具结果）在 `metadata.taskPlan`携带新计划。AgentCore 识别该字段并产生 `PlanUpdated（计划已更新）`事件；服务端再把事件投影到持久 Goal / Plan 状态。后续工具执行前，AgentCore 会从本 Turn 最新事件或 Store（存储）读取当前计划放入 `ToolContext（工具上下文）`。
 
@@ -658,7 +664,10 @@ flowchart TD
     CANDIDATE["Model Final candidate<br/>模型完成候选"]
     PENDING{"Pending calls?<br/>仍有待执行调用？"}
     APPROVAL{"Pending approvals in Store?<br/>存储中仍有待审批项？"}
-    PLAN{"Required plan missing or actionable?<br/>必需计划缺失或仍可行动？"}
+    MODE{"Collaboration Mode?<br/>当前协作模式？"}
+    MISSING{"Goal Mode and no plan?<br/>目标模式且没有计划？"}
+    HASPLAN{"Runtime TaskPlan exists?<br/>存在运行时任务计划？"}
+    PLAN{"Pending / InProgress steps?<br/>存在待处理 / 进行中步骤？"}
     COVERAGE{"Coverage / evidence valid?<br/>需求覆盖 / 证据有效？"}
     CHILDREN{"Active descendants or mailbox?<br/>仍有活跃后代或邮箱消息？"}
     BLOCKERS{"Any blockers collected?<br/>收集到任何阻塞项？"}
@@ -672,7 +681,17 @@ flowchart TD
     RETURN["Return terminal AgentTurnResult<br/>返回终态轮次结果"]
     FAIL["Return error<br/>返回错误"]
 
-    CANDIDATE --> PENDING --> APPROVAL --> PLAN --> COVERAGE --> CHILDREN --> BLOCKERS
+    CANDIDATE --> PENDING --> APPROVAL --> MODE
+    MODE -->|"Plan Mode · 规划模式"| CHILDREN
+    MODE -->|"Goal Mode · 目标模式"| MISSING
+    MODE -->|"Default Mode · 默认模式"| HASPLAN
+    MISSING -->|"yes · 是"| BLOCKERS
+    MISSING -->|"no · 否"| HASPLAN
+    HASPLAN -->|"no · 否"| CHILDREN
+    HASPLAN -->|"yes · 是"| PLAN
+    PLAN -->|"yes · 是"| BLOCKERS
+    PLAN -->|"no · 否"| COVERAGE
+    COVERAGE --> CHILDREN --> BLOCKERS
     BLOCKERS -->|"no · 否"| OUTCOME --> FINALIZE --> RETURN
     BLOCKERS -->|"yes · 是"| COUNT
     COUNT -->|"yes · 是"| FAIL
@@ -691,6 +710,12 @@ Finalization Guard 检查事实，不评价最终文本写得是否好。每次�
 6. 若计划带 Coverage（覆盖信息），逐项验证需求是否映射到步骤、证据 revision 是否为当前版本、证据引用的步骤是否已完成、引用的 Provider Tool Call 是否有成功结果；
 7. 每个需求必须同时有 fulfillment evidence（实现或观察证据）和 verification evidence（验证证据）；
 8. 查询当前作用域的后代智能体和 mailbox；仍有运行中的后代或未交付消息时加入 `descendant_agents_unresolved`。
+
+这里的计划状态与模式工具面是两层：Default Mode 与 Goal Mode 都能消费 `PlanUpdated（计划已更新）`，也都能通过共享 Task Bundle（任务执行工具包）的 `update_plan / complete_task`写入执行状态；Goal Mode 额外拥有需要服务器 Goal UUID 的 `set_plan`，并要求完成前计划必须存在。Plan Mode 的交付物是方案文本，不暴露执行计划工具。
+
+Default 的复杂任务闭环由三部分组成：Base Prompt（基础提示词）要求非简单多步骤任务使用计划机制作为 Durable External Memory（持久外部记忆）；主模型根据语义判断任务复杂度，通过首个 `append_step（追加步骤）`创建 Runtime TaskPlan，随后选择普通工具工作，并反复调用 `update_step（更新步骤）`将步骤从 Pending / InProgress 推到 Completed；Finalization Guard 在仍有未完成步骤时阻止收尾。`nextRunnableStep（下一可运行步骤）`只提供依赖提示，不代替主模型调度。
+
+证据检查也是 Referential Validation（引用校验），不是语义审判。主模型负责把抽象需求拆成 Requirement、Step 和 Acceptance Criteria；代码只检查需求覆盖集合、当前修订号、Completed Step 和成功 Tool Call ID 之间的关系。它不会执行自然语言验收标准，也不会重新阅读成功工具结果来判断内容是否真的支持证据摘要。完整细节见 [Planning Tools 当前架构与完整流程](./planning-tools-architecture-current.md)。
 
 若没有任何阻塞项，守卫返回 Ready（可收尾），但还没有决定一定是 Completed。接着 `finalization_outcome（终态分类）`按最新结构化事实区分：
 
