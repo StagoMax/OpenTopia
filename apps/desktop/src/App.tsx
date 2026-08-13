@@ -229,6 +229,7 @@ import {
 } from "./personalization";
 import {
   activeTurnIdFromEvents,
+  canCancelTurn,
   hasPendingProviderRequest,
   inactiveTurnIdFromEvent,
   inactiveTurnIdsFromEvents,
@@ -749,7 +750,10 @@ export function App() {
     Record<string, ThreadActivityStatus>
   >({});
   const [queuedMessageCount, setQueuedMessageCount] = useState(0);
-  const [cancellingTurnId, setCancellingTurnId] = useState<string | null>(null);
+  const [cancellingThreadIds, setCancellingThreadIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
+  const requestedTurnCancellationThreadIdsRef = useRef(new Set<string>());
   const [pendingApprovalIds, setPendingApprovalIds] = useState<string[]>([]);
   const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(
     null,
@@ -982,12 +986,14 @@ export function App() {
     >(),
   );
   const activeThreadIdRef = useRef<string | null>(null);
+  const sendingThreadIdsRef = useRef(sendingThreadIds);
   const threadActivityStatusesRef = useRef(threadActivityStatuses);
   const threadActivityReadAtRef = useRef<ThreadActivityReadAt>(
     readThreadActivityReadAt(),
   );
 
   activeThreadIdRef.current = activeThreadId;
+  sendingThreadIdsRef.current = sendingThreadIds;
   threadActivityStatusesRef.current = threadActivityStatuses;
 
   const setThreadActivityStatus = useCallback(
@@ -1125,6 +1131,50 @@ export function App() {
     [],
   );
 
+  const clearTurnCancellationRequest = useCallback((threadId: string) => {
+    requestedTurnCancellationThreadIdsRef.current.delete(threadId);
+    setCancellingThreadIds((current) => {
+      if (!current.has(threadId)) return current;
+      const next = new Set(current);
+      next.delete(threadId);
+      return next;
+    });
+  }, []);
+
+  const markTurnCancellationRequested = useCallback((threadId: string) => {
+    requestedTurnCancellationThreadIdsRef.current.add(threadId);
+    setCancellingThreadIds((current) =>
+      current.has(threadId) ? current : new Set([...current, threadId]),
+    );
+  }, []);
+
+  const cancelResolvedTurnIfRequested = useCallback(
+    async (threadId: string, turnId: string | null) => {
+      if (
+        !client ||
+        !turnId ||
+        !requestedTurnCancellationThreadIdsRef.current.has(threadId)
+      ) {
+        return;
+      }
+      try {
+        const result = await client.cancelTurn(threadId, turnId);
+        if (!result.cancelled) {
+          const turnStatus = await client.getTurnStatus(threadId);
+          if (!resolveActiveTurnId(turnStatus, inactiveTurnIdsRef.current)) {
+            clearTurnCancellationRequest(threadId);
+          }
+        }
+      } catch (error) {
+        clearTurnCancellationRequest(threadId);
+        if (activeThreadIdRef.current === threadId) {
+          setActionError(`中断执行失败：${errorMessage(error)}`);
+        }
+      }
+    },
+    [clearTurnCancellationRequest, client],
+  );
+
   const mergeMessagesForThread = useCallback(
     (threadId: string, incoming: Message[]) => {
       const cached = conversationCacheRef.current.get(threadId);
@@ -1175,6 +1225,14 @@ export function App() {
     isConversationReady && pendingTurnFeedback?.threadId === activeThreadId
       ? pendingTurnFeedback
       : null;
+  const conversationTurnCanBeCancelled = canCancelTurn(
+    conversationActiveTurnId,
+    isSending || pendingTurnFeedback?.threadId === activeThreadId,
+    activeThreadId !== null &&
+      isThreadActivityProcessing(threadActivityStatuses[activeThreadId]),
+  );
+  const conversationTurnIsCancelling =
+    activeThreadId !== null && cancellingThreadIds.has(activeThreadId);
   const draftProject = useMemo(
     () => projects.find((project) => project.id === draftProjectId) ?? null,
     [draftProjectId, projects],
@@ -1197,11 +1255,9 @@ export function App() {
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
   );
-  const activeToolRequiresFullWorkspace =
-    activeToolTab?.kind === "extensions";
+  const activeToolRequiresFullWorkspace = activeToolTab?.kind === "extensions";
   const toolStageCoversConversation =
-    toolStageOpen &&
-    (conversationCollapsed || activeToolRequiresFullWorkspace);
+    toolStageOpen && (conversationCollapsed || activeToolRequiresFullWorkspace);
   const terminalToolActive =
     toolStageOpen && activeToolTab?.kind === "terminal";
   const pendingApprovalQueue = useMemo(
@@ -1641,7 +1697,11 @@ export function App() {
         setThreadActivityStatus(event.threadId, "processing");
         markThreadActivityRead(event.threadId);
         setActiveTurnId(event.turnId);
-        setCancellingTurnId(null);
+        if (
+          !requestedTurnCancellationThreadIdsRef.current.has(event.threadId)
+        ) {
+          clearTurnCancellationRequest(event.threadId);
+        }
         setQueuedMessageCount((current) => Math.max(0, current - 1));
       } else if (event.payload.type === "turn_finished") {
         // This task is already open, so its completion has been seen.
@@ -1650,9 +1710,7 @@ export function App() {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
-        setCancellingTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
+        clearTurnCancellationRequest(event.threadId);
         setCollaborationMode((current) =>
           current === "plan" ? "default" : current,
         );
@@ -1662,24 +1720,18 @@ export function App() {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
-        setCancellingTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
+        clearTurnCancellationRequest(event.threadId);
       } else if (event.payload.type === "browser_handoff_required") {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
-        setCancellingTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
+        clearTurnCancellationRequest(event.threadId);
       } else if (event.payload.type === "turn_cancelled") {
         setThreadActivityStatus(event.threadId, null);
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
-        setCancellingTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
+        clearTurnCancellationRequest(event.threadId);
       } else if (
         event.payload.type === "turn_awaiting_input" ||
         event.payload.type === "error"
@@ -1690,9 +1742,7 @@ export function App() {
         setActiveTurnId((current) =>
           !event.turnId || current === event.turnId ? null : current,
         );
-        setCancellingTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
+        clearTurnCancellationRequest(event.threadId);
       }
 
       if (event.payload.type === "turn_finished") {
@@ -1792,6 +1842,7 @@ export function App() {
       }
     },
     [
+      clearTurnCancellationRequest,
       deliverTaskCompletionNotification,
       markThreadActivityRead,
       mergeMessagesForThread,
@@ -2059,7 +2110,12 @@ export function App() {
     setPendingUserInput([]);
     setSubmittingUserInputId(null);
     setUserInputError(null);
-    setCancellingTurnId(null);
+    if (
+      activeThreadId &&
+      requestedTurnCancellationThreadIdsRef.current.has(activeThreadId)
+    ) {
+      markTurnCancellationRequested(activeThreadId);
+    }
     inactiveTurnIdsRef.current = new Set();
     setGoalSnapshot(null);
     if (!client || !activeThreadId) {
@@ -2085,10 +2141,15 @@ export function App() {
     inactiveTurnIdsRef.current = inactiveTurnIdsFromEvents(
       cached?.events ?? [],
     );
+    // The cached lifecycle is available synchronously and is the best source
+    // for the first paint when returning to a task. The turn-status request
+    // below still reconciles stale caches, but it must not gate the visible
+    // running state behind a network round trip.
+    const cachedActivityStatus = threadActivityStatusesRef.current[threadId];
     setActiveTurnId(
-      isThreadActivityProcessing(threadActivityStatusesRef.current[threadId])
-        ? activeTurnIdFromEvents(cached?.events ?? [])
-        : null,
+      cachedActivityStatus && !isThreadActivityProcessing(cachedActivityStatus)
+        ? null
+        : activeTurnIdFromEvents(cached?.events ?? []),
     );
     if (cached) {
       cacheConversation(conversationCacheRef.current, threadId, cached);
@@ -2127,9 +2188,6 @@ export function App() {
             restoredActiveTurnId ??
             (current && !inactiveTurnIds.has(current) ? current : null),
         );
-        setCancellingTurnId((current) =>
-          current && inactiveTurnIds.has(current) ? null : current,
-        );
         setConversationLoadState({ threadId, status: "ready", error: null });
         source = client.openEventStream(
           threadId,
@@ -2166,9 +2224,19 @@ export function App() {
           loadedGoal,
         ]) => {
           if (cancelled) return;
-          setActiveTurnId(
-            resolveActiveTurnId(turnStatus, inactiveTurnIdsRef.current),
+          const resolvedActiveTurnId = resolveActiveTurnId(
+            turnStatus,
+            inactiveTurnIdsRef.current,
           );
+          setActiveTurnId(resolvedActiveTurnId);
+          if (turnStatus?.status === "cancelling") {
+            markTurnCancellationRequested(threadId);
+          } else if (
+            !resolvedActiveTurnId &&
+            !sendingThreadIdsRef.current.has(threadId)
+          ) {
+            clearTurnCancellationRequest(threadId);
+          }
           const activityStatus =
             pendingApprovals.length > 0
               ? "approval"
@@ -2200,9 +2268,11 @@ export function App() {
   }, [
     activeThreadId,
     client,
+    clearTurnCancellationRequest,
     conversationLoadAttempt,
     ingestEvent,
     markThreadActivityRead,
+    markTurnCancellationRequested,
     setThreadActivityStatus,
   ]);
 
@@ -2348,11 +2418,11 @@ export function App() {
       conversationCacheClientRef.current === client
         ? (conversationCacheRef.current.get(threadId) ?? null)
         : null;
-    const cachedActiveTurnId = isThreadActivityProcessing(
-      threadActivityStatusesRef.current[threadId],
-    )
-      ? activeTurnIdFromEvents(cached?.events ?? [])
-      : null;
+    const cachedActivityStatus = threadActivityStatusesRef.current[threadId];
+    const cachedActiveTurnId =
+      cachedActivityStatus && !isThreadActivityProcessing(cachedActivityStatus)
+        ? null
+        : activeTurnIdFromEvents(cached?.events ?? []);
     markThreadActivityRead(threadId);
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
@@ -3335,9 +3405,14 @@ export function App() {
         );
         mergeMessagesForThread(thread.id, [message]);
         markThreadActivityRead(thread.id);
-        if (turnId && activeThreadIdRef.current === thread.id) {
+        if (
+          turnId &&
+          activeThreadIdRef.current === thread.id &&
+          !inactiveTurnIdsRef.current.has(turnId)
+        ) {
           setActiveTurnId(turnId);
         }
+        await cancelResolvedTurnIfRequested(thread.id, turnId);
         updatePendingTurnFeedback(thread.id, (current) =>
           current?.startedAt === pendingFeedbackStartedAt
             ? { ...current, turnId }
@@ -3351,7 +3426,10 @@ export function App() {
       }
       return activeThreadIdRef.current === thread.id;
     } catch (error) {
-      if (createdThreadId) setThreadActivityStatus(createdThreadId, null);
+      if (createdThreadId) {
+        setThreadActivityStatus(createdThreadId, null);
+        clearTurnCancellationRequest(createdThreadId);
+      }
       if (pendingFeedbackStartedAt && createdThreadId) {
         updatePendingTurnFeedback(createdThreadId, (current) =>
           current?.startedAt === pendingFeedbackStartedAt ? null : current,
@@ -3499,9 +3577,14 @@ export function App() {
       );
       mergeMessagesForThread(threadId, [message]);
       markThreadActivityRead(threadId);
-      if (turnId && activeThreadIdRef.current === threadId) {
+      if (
+        turnId &&
+        activeThreadIdRef.current === threadId &&
+        !inactiveTurnIdsRef.current.has(turnId)
+      ) {
         setActiveTurnId(turnId);
       }
+      await cancelResolvedTurnIfRequested(threadId, turnId);
       updatePendingTurnFeedback(threadId, (current) =>
         current?.startedAt === pendingFeedbackStartedAt
           ? {
@@ -3529,6 +3612,7 @@ export function App() {
       return activeThreadIdRef.current === threadId;
     } catch (error) {
       setThreadActivityStatus(threadId, null);
+      clearTurnCancellationRequest(threadId);
       if (pendingFeedbackStartedAt) {
         updatePendingTurnFeedback(threadId, (current) =>
           current?.startedAt === pendingFeedbackStartedAt ? null : current,
@@ -3544,23 +3628,18 @@ export function App() {
   }
 
   async function cancelTurn() {
-    if (
-      !client ||
-      !activeThread ||
-      !activeTurnId ||
-      cancellingTurnId === activeTurnId
-    )
-      return;
+    if (!client || !activeThread || !conversationTurnCanBeCancelled) return;
+    const threadId = activeThread.id;
+    if (requestedTurnCancellationThreadIdsRef.current.has(threadId)) return;
     const turnId = activeTurnId;
-    setCancellingTurnId(turnId);
+    markTurnCancellationRequested(threadId);
     setActionError(null);
     try {
-      const result = await client.cancelTurn(activeThread.id, turnId);
+      const result = await client.cancelTurn(threadId, turnId ?? undefined);
       if (!result.cancelled) {
-        setCancellingTurnId(null);
         let reconciledTurnId: string | null = turnId;
         try {
-          const turnStatus = await client.getTurnStatus(activeThread.id);
+          const turnStatus = await client.getTurnStatus(threadId);
           reconciledTurnId = resolveActiveTurnId(
             turnStatus,
             inactiveTurnIdsRef.current,
@@ -3568,13 +3647,16 @@ export function App() {
         } catch {
           // Keep the original cancellation response when status reconciliation fails.
         }
-        if (activeThreadIdRef.current === activeThread.id) {
+        if (!reconciledTurnId && !sendingThreadIdsRef.current.has(threadId)) {
+          clearTurnCancellationRequest(threadId);
+        }
+        if (activeThreadIdRef.current === threadId) {
           setActiveTurnId(reconciledTurnId);
-          if (reconciledTurnId) setActionError(result.message);
+          if (reconciledTurnId && turnId) setActionError(result.message);
         }
       }
     } catch (error) {
-      setCancellingTurnId(null);
+      clearTurnCancellationRequest(threadId);
       setActionError(`中断执行失败：${errorMessage(error)}`);
     }
   }
@@ -4735,11 +4817,8 @@ export function App() {
                     value={composer}
                     taskPlan={composerTaskPlan}
                     isSending={isSending}
-                    isRunning={Boolean(conversationActiveTurnId)}
-                    isCancelling={
-                      Boolean(conversationActiveTurnId) &&
-                      cancellingTurnId === conversationActiveTurnId
-                    }
+                    isRunning={conversationTurnCanBeCancelled}
+                    isCancelling={conversationTurnIsCancelling}
                     queuedMessageCount={
                       isConversationReady ? queuedMessageCount : 0
                     }
@@ -10007,6 +10086,12 @@ function Composer({
     contextSources.length > 0 ||
     selectedSkillIds.length > 0,
   );
+  const activePermissionMode = normalizedPermissionMode(permissionMode);
+  const activePermissionOption =
+    permissionModeOptions.find(
+      (option) => option.value === activePermissionMode,
+    ) ?? permissionModeOptions[1];
+  const ActivePermissionIcon = activePermissionOption.icon;
 
   return (
     <div className="composer-shell">
@@ -10464,7 +10549,7 @@ function Composer({
           </div>
           <div className="composer-menu-wrap">
             <button
-              className="composer-mode"
+              className={`composer-mode is-${activePermissionMode.replace("_", "-")}`}
               type="button"
               aria-expanded={openMenu === "permission"}
               onClick={() =>
@@ -10473,7 +10558,8 @@ function Composer({
                 )
               }
             >
-              {permissionModeLabel(permissionMode)}
+              <ActivePermissionIcon size={14} aria-hidden="true" />
+              <span>{activePermissionOption.label}</span>
             </button>
             {openMenu === "permission" && (
               <div className="tool-popover permission-popover" role="menu">
@@ -10489,7 +10575,7 @@ function Composer({
                     normalizedPermissionMode(permissionMode) === option.value;
                   return (
                     <button
-                      className={`permission-option ${selected ? "active" : ""} ${option.value === "full_access" ? "is-danger" : ""}`}
+                      className={`permission-option is-${option.value.replace("_", "-")} ${selected ? "active" : ""}`}
                       disabled={isRunning || isSending}
                       key={option.value}
                       role="menuitemradio"
@@ -10946,17 +11032,6 @@ function sandboxModeLabel(mode: AppSettings["sandbox"]["sandboxMode"]): string {
   return (
     sandboxModeOptions.find((option) => option.value === mode)?.label ?? mode
   );
-}
-
-function permissionModeLabel(mode: AppSettings["permissionMode"]): string {
-  switch (normalizedPermissionMode(mode)) {
-    case "full_access":
-      return "完全访问权限";
-    case "approve":
-      return "请求批准";
-    default:
-      return "替我审批";
-  }
 }
 
 function normalizedPermissionMode(

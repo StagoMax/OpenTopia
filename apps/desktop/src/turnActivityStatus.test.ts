@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   activeTurnIdFromEvents,
+  canCancelTurn,
   hasPendingProviderRequest,
   inactiveTurnIdsFromEvents,
   resolveActiveTurnId,
@@ -57,6 +58,13 @@ function turnStatus(
     updatedAt: "2026-07-30T10:00:01.000Z",
   };
 }
+
+test("offers cancellation throughout submission and persisted processing", () => {
+  assert.equal(canCancelTurn(null, true), true);
+  assert.equal(canCancelTurn("turn-1", false), true);
+  assert.equal(canCancelTurn(null, false, true), true);
+  assert.equal(canCancelTurn(null, false, false), false);
+});
 
 test("derives thinking from an unanswered provider request", () => {
   assert.equal(hasPendingProviderRequest([]), false);

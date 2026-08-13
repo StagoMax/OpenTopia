@@ -2,6 +2,16 @@ import type { AgentEvent, TurnStatus } from "./types";
 
 export type ActiveTurnPhase = "thinking" | "processing";
 
+export function canCancelTurn(
+  activeTurnId: string | null,
+  hasPendingTurnFeedback: boolean,
+  activityIsProcessing = false,
+): boolean {
+  return (
+    activeTurnId !== null || hasPendingTurnFeedback || activityIsProcessing
+  );
+}
+
 const inactiveTurnEventTypes = new Set<AgentEvent["payload"]["type"]>([
   "turn_finished",
   "turn_suspended",

@@ -3656,8 +3656,19 @@ button:disabled {
 }
 
 .composer-mode {
-  color: var(--danger);
-  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.composer-mode.is-auto {
+  color: var(--permission-auto);
+}
+
+.composer-mode.is-full-access {
+  color: var(--warning);
 }
 
 .composer-meta {
@@ -5107,10 +5118,15 @@ button:disabled {
   line-height: 1.35;
 }
 
-.permission-popover button.permission-option.is-danger,
-.permission-popover button.permission-option.is-danger strong,
-.permission-popover button.permission-option.is-danger small {
-  color: var(--danger);
+.permission-popover button.permission-option.is-auto,
+.permission-popover button.permission-option.is-auto strong {
+  color: var(--permission-auto);
+}
+
+.permission-popover button.permission-option.is-full-access,
+.permission-popover button.permission-option.is-full-access strong,
+.permission-popover button.permission-option.is-full-access small {
+  color: var(--warning);
 }
 
 .model-popover {
@@ -6073,8 +6089,19 @@ button:disabled {
 }
 
 .composer-mode {
-  color: var(--danger);
-  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.composer-mode.is-auto {
+  color: var(--permission-auto);
+}
+
+.composer-mode.is-full-access {
+  color: var(--warning);
 }
 
 .composer-meta {
@@ -7524,10 +7551,15 @@ button:disabled {
   line-height: 1.35;
 }
 
-.permission-popover button.permission-option.is-danger,
-.permission-popover button.permission-option.is-danger strong,
-.permission-popover button.permission-option.is-danger small {
-  color: var(--danger);
+.permission-popover button.permission-option.is-auto,
+.permission-popover button.permission-option.is-auto strong {
+  color: var(--permission-auto);
+}
+
+.permission-popover button.permission-option.is-full-access,
+.permission-popover button.permission-option.is-full-access strong,
+.permission-popover button.permission-option.is-full-access small {
+  color: var(--warning);
 }
 
 .model-popover {

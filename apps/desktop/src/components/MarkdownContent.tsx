@@ -38,6 +38,7 @@ import {
   remarkFilePathLinks,
 } from "../filePathLinks";
 import {
+  markdownFileLinkDisplayState,
   markdownStreamInterval,
   resolveMarkdownFileLink,
 } from "../markdownLinks";
@@ -231,6 +232,10 @@ function MarkdownAnchor({
     ? resolveMarkdownFileLink(href, baseWorkspacePath)
     : null;
   const pathStatus = useWorkspacePathStatus(linkInfo?.path ?? null);
+  const fileLinkDisplayState = markdownFileLinkDisplayState(
+    detectedLinkInfo !== null,
+    pathStatus,
+  );
   const absolutePath = useWorkspaceAbsolutePath(linkInfo?.path ?? null);
   const readFileText = useWorkspaceFileTextReader(linkInfo?.path ?? null);
   const anchorRef = useRef<HTMLAnchorElement>(null);
@@ -245,10 +250,7 @@ function MarkdownAnchor({
         {...props}
         href={href}
         title={attachment.name}
-        className={[
-          props.className,
-          "markdown-attachment-link",
-        ]
+        className={[props.className, "markdown-attachment-link"]
           .filter(Boolean)
           .join(" ")}
         onClick={(event) => {
@@ -268,12 +270,21 @@ function MarkdownAnchor({
     );
   }
 
-  // Both automatically detected paths and explicit Markdown file links use a
-  // filename-only label after the target is confirmed in the workspace.
-  if (linkInfo && pathStatus === "known") {
+  // Keep the visible label stable while the workspace index verifies whether
+  // the target exists. Verification controls interactivity, not presentation,
+  // so an asynchronous directory lookup never flashes the raw full path.
+  if (linkInfo && fileLinkDisplayState !== "fallback") {
     const targetTitle = linkInfo.fragment
       ? `${linkInfo.path}#${linkInfo.fragment}`
       : linkInfo.path;
+
+    if (fileLinkDisplayState === "label") {
+      return (
+        <span className="markdown-file-link-label" title={targetTitle}>
+          {linkInfo.fileName}
+        </span>
+      );
+    }
 
     const line = markdownLineNumber(linkInfo.fragment);
 

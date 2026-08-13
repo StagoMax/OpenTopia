@@ -95,6 +95,12 @@
   font-weight: inherit;
 }
 
+.markdown-content .markdown-file-link-label {
+  font-family: var(--font-mono);
+  font-weight: var(--font-weight-medium);
+  line-height: inherit;
+}
+
 .markdown-content a.markdown-attachment-link {
   display: inline-flex;
   align-items: center;

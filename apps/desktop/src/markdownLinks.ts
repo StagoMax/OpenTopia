@@ -13,6 +13,8 @@ export type MarkdownFileLinkTarget = {
   fileName: string;
 };
 
+export type MarkdownFileLinkDisplayState = "fallback" | "label" | "link";
+
 const explicitSchemePattern = /^[a-z][a-z0-9+.-]*:/i;
 
 export function resolveMarkdownLink(
@@ -87,6 +89,19 @@ export function resolveMarkdownFileLink(
     fragment: target.fragment,
     fileName: segments.at(-1) ?? target.path,
   };
+}
+
+/**
+ * Keeps an automatically detected path's filename stable while its workspace
+ * lookup is pending. Explicit Markdown links keep their authored children
+ * until they are known to point at a workspace file.
+ */
+export function markdownFileLinkDisplayState(
+  automaticallyDetected: boolean,
+  pathStatus: "known" | "missing" | "unknown",
+): MarkdownFileLinkDisplayState {
+  if (pathStatus === "known") return "link";
+  return automaticallyDetected ? "label" : "fallback";
 }
 
 /**

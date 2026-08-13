@@ -7,8 +7,12 @@ const markdownLinks: typeof MarkdownLinksModule = await import(
   "./markdownLinks" + ".ts"
 );
 
-const { markdownStreamInterval, resolveMarkdownFileLink, resolveMarkdownLink } =
-  markdownLinks;
+const {
+  markdownFileLinkDisplayState,
+  markdownStreamInterval,
+  resolveMarkdownFileLink,
+  resolveMarkdownLink,
+} = markdownLinks;
 
 test("routes HTTP and HTTPS links to the internal browser", () => {
   assert.deepEqual(resolveMarkdownLink("https://example.com/docs?q=1"), {
@@ -90,6 +94,13 @@ test("derives a filename label from explicit local file links", () => {
     },
   );
   assert.equal(resolveMarkdownFileLink("https://example.com/app.css"), null);
+});
+
+test("keeps detected file labels stable while workspace lookup settles", () => {
+  assert.equal(markdownFileLinkDisplayState(true, "unknown"), "label");
+  assert.equal(markdownFileLinkDisplayState(true, "missing"), "label");
+  assert.equal(markdownFileLinkDisplayState(true, "known"), "link");
+  assert.equal(markdownFileLinkDisplayState(false, "unknown"), "fallback");
 });
 
 test("blocks unsafe protocols and workspace traversal", () => {
