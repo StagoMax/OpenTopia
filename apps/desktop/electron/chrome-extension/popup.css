@@ -1,0 +1,78 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+}
+
+body {
+  width: 280px;
+  margin: 0;
+}
+
+main {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+header,
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+header {
+  justify-content: space-between;
+}
+
+header span,
+label {
+  color: GrayText;
+  font-size: 12px;
+}
+
+form {
+  display: grid;
+  gap: 6px;
+}
+
+input,
+button {
+  min-height: 32px;
+  box-sizing: border-box;
+  border: 1px solid ButtonBorder;
+  border-radius: 6px;
+  font: inherit;
+}
+
+input {
+  min-width: 0;
+  flex: 1;
+  padding: 0 8px;
+  letter-spacing: 0.12em;
+}
+
+button {
+  padding: 0 12px;
+  background: #0b6fd3;
+  color: white;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+button.quiet {
+  background: transparent;
+  color: inherit;
+}
+
+#error {
+  min-height: 1.4em;
+  margin: 0;
+  color: #c23d42;
+  font-size: 12px;
+}

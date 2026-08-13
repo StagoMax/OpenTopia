@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "OpenTopia Chrome Bridge",
+  "version": "0.1.0",
+  "description": "Connects a user-approved Chrome tab to OpenTopia.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAloeAg27Bt/Kcq8ld4Txoe9uoLtrp0cJ+Qe3TC62rdEiB8BWPeaQ54Zse/zsG+HxQvshTjkdrtWIxeeHDV5qSZ6Ovjy5c13HT80uQINi4HuWosDlVPlLrNyhEWmKg87P0W5nW89JFREA3t4w6M6IbETZHteHdPFIql9auIWuN2FMEUskqGVM0JyJRNOecskb/HHBXmAU+GKEzKP87jaze2zEnYkZeJSvMAeacEOYJjhlN8GZdeEUMjcXspKcNGkgNeR6EXp1mSqyZuhOjg9tWUB38FcbseYM5mHUTTKbiWy5AFX8aptjElKhh3rDHgNDAp0v433+v0ksG0yzXMPeQEQIDAQAB",
+  "permissions": ["activeTab", "alarms", "debugger", "storage", "tabs"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "action": {
+    "default_title": "Connect to OpenTopia",
+    "default_popup": "popup.html"
+  },
+  "minimum_chrome_version": "116"
+}

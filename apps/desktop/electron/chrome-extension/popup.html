@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenTopia Chrome Bridge</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <strong>OpenTopia</strong>
+        <span id="status">Not paired</span>
+      </header>
+      <form id="pair-form">
+        <label for="pair-code">Pairing code</label>
+        <div class="row">
+          <input id="pair-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required />
+          <button type="submit">Pair</button>
+        </div>
+      </form>
+      <button id="attach" type="button" disabled>Attach this tab</button>
+      <button id="detach" type="button" class="quiet" hidden>Disconnect</button>
+      <p id="error" role="alert"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

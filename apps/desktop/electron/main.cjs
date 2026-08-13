@@ -18,6 +18,11 @@ const fs = require("node:fs");
 const net = require("node:net");
 const updater = require("./updater.cjs");
 const { createDesktopBrowserHost } = require("./browser-host.cjs");
+const { createChromeBridge } = require("./chrome-bridge.cjs");
+const {
+  DEFAULT_SAG_URL,
+  createSagServiceManager,
+} = require("./sag-service.cjs");
 const {
   inspectSandboxProtocol,
   loadRuntimeBundle,
@@ -66,6 +71,9 @@ let crashLogsDirPath = null;
 let nextOpenRequestId = 1;
 let desktopBrowserHost = null;
 let desktopBrowserBroker = null;
+let chromeBridge = null;
+let chromeBridgeBackend = null;
+let sagServiceManager = null;
 let packagedRuntimeBundle = null;
 let packagedRuntimeBundleError = null;
 
@@ -775,6 +783,11 @@ function createBackendEnv(repoRoot, options = {}) {
   if (desktopBrowserBroker) {
     env.OPENTOPIA_DESKTOP_BROWSER_BROKER_URL = desktopBrowserBroker.url;
     env.OPENTOPIA_DESKTOP_BROWSER_BROKER_TOKEN = desktopBrowserBroker.token;
+  }
+
+  if (chromeBridgeBackend) {
+    env.OPENTOPIA_CHROME_BRIDGE_URL = chromeBridgeBackend.url;
+    env.OPENTOPIA_CHROME_BRIDGE_TOKEN = chromeBridgeBackend.token;
   }
 
   if (isDev) {
@@ -1837,6 +1850,22 @@ function resolveRepoRoot() {
   return path.resolve(__dirname, "..", "..", "..");
 }
 
+function getSagServiceManager() {
+  if (sagServiceManager) return sagServiceManager;
+  const repoRoot = resolveRepoRoot();
+  const runtimeEnv = { ...process.env };
+  importEnvFile(runtimeEnv, resolveOpenTopiaEnvFile(repoRoot));
+  sagServiceManager = createSagServiceManager({
+    endpoint: runtimeEnv.OPENTOPIA_SAG_URL || DEFAULT_SAG_URL,
+    env: runtimeEnv,
+    isPackaged: app.isPackaged,
+    repoRoot,
+    resourcesPath: process.resourcesPath,
+    logger: (level, event, metadata) => logConsole(level, event, metadata),
+  });
+  return sagServiceManager;
+}
+
 function listSecretSources() {
   const backendEnv = createBackendEnv(resolveRepoRoot(), {
     includeKeyring: false,
@@ -1949,10 +1978,40 @@ function registerIpc() {
   ipcMain.handle("platform:new-window", (event) => {
     const owner = BrowserWindow.fromWebContents(event.sender);
     if (!owner || !appWindows.has(owner)) {
-      throw new Error("New windows can be opened only by an application window");
+      throw new Error(
+        "New windows can be opened only by an application window",
+      );
     }
     createMainWindow();
     return true;
+  });
+
+  const assertMainRenderer = (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (
+      !owner ||
+      !appWindows.has(owner) ||
+      event.senderFrame !== event.sender.mainFrame
+    ) {
+      throw new Error(
+        "This IPC action is restricted to an application main frame.",
+      );
+    }
+  };
+  ipcMain.handle("chrome-bridge:start-pairing", (event, sessionId) => {
+    assertMainRenderer(event);
+    if (!chromeBridge) throw new Error("Chrome bridge is unavailable.");
+    return chromeBridge.startPairing(sessionId);
+  });
+  ipcMain.handle("chrome-bridge:get-status", (event, sessionId) => {
+    assertMainRenderer(event);
+    if (!chromeBridge) throw new Error("Chrome bridge is unavailable.");
+    return chromeBridge.getStatus(sessionId);
+  });
+  ipcMain.handle("chrome-bridge:disconnect", (event, sessionId) => {
+    assertMainRenderer(event);
+    if (!chromeBridge) throw new Error("Chrome bridge is unavailable.");
+    return chromeBridge.disconnect(sessionId);
   });
 
   ipcMain.handle("platform:close-window", (event) => {
@@ -1991,6 +2050,11 @@ function registerIpc() {
       registered: protocolClientRegistered,
     },
   }));
+
+  ipcMain.handle("library:sag:ensure-ready", (event) => {
+    assertMainRenderer(event);
+    return getSagServiceManager().ensureReady();
+  });
 
   ipcMain.handle("platform:get-open-requests", () =>
     openRequestHistory.map((request) => ({ ...request })),
@@ -2455,10 +2519,27 @@ if (!singleInstance) {
       getMainWindow: () => mainWindow,
       logger: (level, event, metadata) => logConsole(level, event, metadata),
     });
+    chromeBridge = createChromeBridge({
+      logger: (level, event, metadata) => logConsole(level, event, metadata),
+      onStateChanged: (state) => {
+        if (
+          mainWindow &&
+          !mainWindow.isDestroyed() &&
+          !mainWindow.webContents.isDestroyed()
+        ) {
+          mainWindow.webContents.send("chrome-bridge:state", state);
+        }
+      },
+    });
     try {
       desktopBrowserBroker = await desktopBrowserHost.startBroker();
     } catch (error) {
       logConsole("error", "browser.broker.start.failed", { error });
+    }
+    try {
+      chromeBridgeBackend = await chromeBridge.start();
+    } catch (error) {
+      logConsole("error", "chrome.bridge.start.failed", { error });
     }
     registerIpc();
     desktopBrowserHost.registerIpc(ipcMain);
@@ -2483,5 +2564,9 @@ app.on("before-quit", () => {
   void desktopBrowserHost?.close().catch((error) => {
     logConsole("warn", "browser.host.close.failed", { error });
   });
+  void chromeBridge?.close().catch((error) => {
+    logConsole("warn", "chrome.bridge.close.failed", { error });
+  });
+  sagServiceManager?.stopSync();
   killBackendProcessTree();
 });

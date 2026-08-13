@@ -37,11 +37,29 @@ const browserHost = Object.freeze({
   },
 });
 
+const chromeBridge = Object.freeze({
+  startPairing: (sessionId) =>
+    ipcRenderer.invoke("chrome-bridge:start-pairing", sessionId),
+  getStatus: (sessionId) =>
+    ipcRenderer.invoke("chrome-bridge:get-status", sessionId),
+  disconnect: (sessionId) =>
+    ipcRenderer.invoke("chrome-bridge:disconnect", sessionId),
+  onStateChanged: (listener) => {
+    if (typeof listener !== "function") {
+      throw new TypeError("Chrome bridge state listener must be a function.");
+    }
+    const wrapped = (_event, state) => listener(state);
+    ipcRenderer.on("chrome-bridge:state", wrapped);
+    return () => ipcRenderer.removeListener("chrome-bridge:state", wrapped);
+  },
+});
+
 contextBridge.exposeInMainWorld("opentopia", {
   newWindow: () => ipcRenderer.invoke("platform:new-window"),
   closeWindow: () => ipcRenderer.invoke("platform:close-window"),
   quit: () => ipcRenderer.invoke("platform:quit"),
   getPlatformInfo: () => ipcRenderer.invoke("platform:get-info"),
+  ensureSagLibraryService: () => ipcRenderer.invoke("library:sag:ensure-ready"),
   getOpenRequests: () => ipcRenderer.invoke("platform:get-open-requests"),
   onOpenRequest: (listener) => {
     if (typeof listener !== "function") {
@@ -94,4 +112,5 @@ contextBridge.exposeInMainWorld("opentopia", {
   recordConversationRenderTrace: (trace) =>
     ipcRenderer.send("logs:conversation-render-trace", trace),
   browserHost,
+  chromeBridge,
 });

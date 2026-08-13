@@ -16,6 +16,7 @@
     "dist": "pnpm build && electron-builder",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"src/**/*.test.ts\"",
+    "test:electron": "node --test \"electron/*.test.cjs\"",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"electron/**/*.cjs\""
   },
   "build": {
@@ -37,7 +38,9 @@
           "opentopia-runtime-manifest.json",
           "opentopia-server",
           "opentopia-server.exe",
-          "opentopia-sandbox/opentopia-sandbox.exe"
+          "opentopia-sandbox/opentopia-sandbox.exe",
+          "sag/enterprise-sag-panel",
+          "sag/enterprise-sag-panel.exe"
         ]
       }
     ],
