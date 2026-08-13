@@ -2,8 +2,8 @@ use crate::model::{ModelContentPart, ProviderRetryKind};
 #[cfg(test)]
 use crate::model_context::ContextItemKind;
 use crate::model_context::{
-    estimate_tokens, CompiledModelContext, ContextCacheScope, ContextRole, ModelContextItem,
-    TokenEstimateBreakdown,
+    content_fingerprint, estimate_tokens, CompiledModelContext, ContextCacheScope, ContextRole,
+    ModelContextItem, TokenEstimateBreakdown,
 };
 use crate::settings::{
     model_accepts_temperature, official_openai_explicit_prompt_cache_support,
@@ -1786,10 +1786,10 @@ impl OpenAiCompatibleProvider {
                     attempt,
                     status: Some(status.as_u16()),
                     response_id: None,
-                    body: json!({
-                        "providerProtocolError": error.to_string(),
-                        "recovery": "retry_non_streaming_once",
-                    }),
+                    body: tool_call_protocol_error_observation(
+                        &error,
+                        Some("retry_non_streaming_once"),
+                    ),
                 })?;
                 attempt += 1;
                 prepared.body["stream"] = json!(false);
@@ -1844,13 +1844,14 @@ impl OpenAiCompatibleProvider {
                             attempt,
                             status: Some(retry_status.as_u16()),
                             response_id: None,
-                            body: json!({
-                                "providerProtocolError": recovery_error.to_string(),
-                                "recovery": "non_streaming_failed",
-                            }),
+                            body: tool_call_protocol_error_observation(
+                                &recovery_error,
+                                Some("non_streaming_failed"),
+                            ),
                         })?;
+                        let recovery_summary = recovery_error.to_string();
                         return Err(recovery_error.context(format!(
-                            "provider returned an invalid tool call over both streaming and non-streaming transports; first error: {error}"
+                            "provider returned an invalid tool call over both streaming and non-streaming transports; first error: {error}; non-streaming error: {recovery_summary}"
                         )));
                     }
                 }
@@ -1860,7 +1861,7 @@ impl OpenAiCompatibleProvider {
                     attempt,
                     status: Some(status.as_u16()),
                     response_id: None,
-                    body: json!({ "providerProtocolError": error.to_string() }),
+                    body: tool_call_protocol_error_observation(&error, None),
                 })?;
                 return Err(error);
             }
@@ -3048,13 +3049,15 @@ impl OpenAiStreamAccumulator {
                         call.name
                     );
                 }
+                let arguments = parse_required_tool_arguments(
+                    Some(&Value::String(call.arguments)),
+                    "streamed function.arguments",
+                    Some(&call.name),
+                )?;
                 Ok(ProviderToolCall {
                     id,
                     name: call.name,
-                    arguments: parse_required_tool_arguments(
-                        Some(&Value::String(call.arguments)),
-                        "streamed function.arguments",
-                    )?,
+                    arguments,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -3327,14 +3330,20 @@ impl ResponsesStreamAccumulator {
                 if call.name.is_empty() {
                     anyhow::bail!("Responses tool call {index} was missing a function name");
                 }
+                let id = if call.id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    call.id
+                };
+                let arguments = parse_recoverable_tool_arguments(
+                    Some(&Value::String(call.arguments)),
+                    "streamed Responses function_call.arguments",
+                    Some(&call.name),
+                )?;
                 Ok(ProviderToolCall {
-                    id: if call.id.is_empty() {
-                        format!("call_{index}")
-                    } else {
-                        call.id
-                    },
+                    id,
                     name: call.name,
-                    arguments: parse_tool_arguments(Some(&Value::String(call.arguments)))?,
+                    arguments,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -5419,7 +5428,11 @@ fn parse_chat_tool_call(value: &Value, index: usize) -> anyhow::Result<ProviderT
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("tool call missing function name: {value}"))?;
-    let arguments = parse_required_tool_arguments(function.get("arguments"), "function.arguments")?;
+    let arguments = parse_recoverable_tool_arguments(
+        function.get("arguments"),
+        "function.arguments",
+        Some(name),
+    )?;
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -5441,9 +5454,10 @@ fn parse_legacy_function_call(value: &Value, index: usize) -> anyhow::Result<Pro
     Ok(ProviderToolCall {
         id: format!("call_{index}"),
         name: name.to_string(),
-        arguments: parse_required_tool_arguments(
+        arguments: parse_recoverable_tool_arguments(
             value.get("arguments"),
             "legacy function_call.arguments",
+            Some(name),
         )?,
     })
 }
@@ -5463,9 +5477,10 @@ fn parse_responses_function_call(value: &Value, index: usize) -> anyhow::Result<
     Ok(ProviderToolCall {
         id,
         name: name.to_string(),
-        arguments: parse_required_tool_arguments(
+        arguments: parse_recoverable_tool_arguments(
             value.get("arguments"),
             "Responses function_call.arguments",
+            Some(name),
         )?,
     })
 }
@@ -5544,7 +5559,11 @@ fn parse_tool_arguments(value: Option<&Value>) -> anyhow::Result<Value> {
     }
 }
 
-fn parse_required_tool_arguments(value: Option<&Value>, field: &str) -> anyhow::Result<Value> {
+fn parse_required_tool_arguments(
+    value: Option<&Value>,
+    field: &str,
+    tool_name: Option<&str>,
+) -> anyhow::Result<Value> {
     match value {
         None | Some(Value::Null) => {
             anyhow::bail!("provider tool-call protocol error: {field} is missing")
@@ -5552,11 +5571,222 @@ fn parse_required_tool_arguments(value: Option<&Value>, field: &str) -> anyhow::
         Some(Value::String(arguments)) if arguments.trim().is_empty() => {
             anyhow::bail!("provider tool-call protocol error: {field} is empty")
         }
-        Some(Value::String(arguments)) => serde_json::from_str(arguments).map_err(|err| {
-            anyhow::anyhow!("provider tool-call protocol error: {field} is not valid JSON: {err}")
+        Some(Value::String(arguments)) => serde_json::from_str(arguments).map_err(|source| {
+            anyhow::Error::new(InvalidToolArgumentsJson::new(
+                field, tool_name, arguments, source,
+            ))
         }),
         Some(value) => Ok(value.clone()),
     }
+}
+
+const INVALID_TOOL_ARGUMENTS_JSON_KEY: &str = "$opentopiaInvalidToolArguments";
+
+fn parse_recoverable_tool_arguments(
+    value: Option<&Value>,
+    field: &str,
+    tool_name: Option<&str>,
+) -> anyhow::Result<Value> {
+    match parse_required_tool_arguments(value, field, tool_name) {
+        Ok(arguments) => Ok(arguments),
+        Err(error) => invalid_tool_arguments_placeholder(&error).ok_or(error),
+    }
+}
+
+fn invalid_tool_arguments_placeholder(error: &anyhow::Error) -> Option<Value> {
+    let details = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<InvalidToolArgumentsJson>())?;
+    Some(json!({
+        INVALID_TOOL_ARGUMENTS_JSON_KEY: details.observation(),
+    }))
+}
+
+pub(crate) fn invalid_tool_arguments_json_details(arguments: &Value) -> Option<&Value> {
+    arguments
+        .as_object()?
+        .get(INVALID_TOOL_ARGUMENTS_JSON_KEY)
+        .filter(|details| details.is_object())
+}
+
+const INVALID_TOOL_ARGUMENTS_EXCERPT_RADIUS: usize = 32;
+
+#[derive(Debug)]
+struct InvalidToolArgumentsJson {
+    field: String,
+    tool_name: Option<String>,
+    source: serde_json::Error,
+    argument_bytes: usize,
+    fingerprint: String,
+    error_offset: usize,
+    redacted_excerpt: String,
+}
+
+impl InvalidToolArgumentsJson {
+    fn new(
+        field: &str,
+        tool_name: Option<&str>,
+        arguments: &str,
+        source: serde_json::Error,
+    ) -> Self {
+        let error_offset = json_error_offset(arguments, source.line(), source.column());
+        Self {
+            field: field.to_string(),
+            tool_name: tool_name.map(str::to_string),
+            argument_bytes: arguments.len(),
+            fingerprint: content_fingerprint(arguments.as_bytes()),
+            redacted_excerpt: redacted_json_error_excerpt(arguments, error_offset),
+            error_offset,
+            source,
+        }
+    }
+
+    fn observation(&self) -> Value {
+        json!({
+            "field": &self.field,
+            "toolName": self.tool_name.as_deref(),
+            "reason": self.source.to_string(),
+            "argumentBytes": self.argument_bytes,
+            "fingerprint": &self.fingerprint,
+            "errorLine": self.source.line(),
+            "errorColumn": self.source.column(),
+            "errorOffset": self.error_offset,
+            "redactedExcerpt": &self.redacted_excerpt,
+        })
+    }
+}
+
+impl std::fmt::Display for InvalidToolArgumentsJson {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider tool-call protocol error: {} is not valid JSON: {} (tool={}, argumentBytes={}, fingerprint={}, errorOffset={}, redactedExcerpt={})",
+            self.field,
+            self.source,
+            self.tool_name.as_deref().unwrap_or("unknown"),
+            self.argument_bytes,
+            self.fingerprint,
+            self.error_offset,
+            serde_json::to_string(&self.redacted_excerpt)
+                .unwrap_or_else(|_| "\"<unavailable>\"".to_string())
+        )
+    }
+}
+
+impl std::error::Error for InvalidToolArgumentsJson {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn tool_call_protocol_error_observation(error: &anyhow::Error, recovery: Option<&str>) -> Value {
+    let mut observation = json!({ "providerProtocolError": error.to_string() });
+    if let Some(details) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<InvalidToolArgumentsJson>())
+    {
+        observation["invalidToolArguments"] = details.observation();
+    }
+    if let Some(recovery) = recovery {
+        observation["recovery"] = json!(recovery);
+    }
+    observation
+}
+
+fn json_error_offset(input: &str, line: usize, column: usize) -> usize {
+    let target_line = line.max(1);
+    let target_column = column.max(1);
+    let mut current_line = 1usize;
+    let mut current_column = 1usize;
+    for (offset, character) in input.char_indices() {
+        if current_line == target_line && current_column == target_column {
+            return offset;
+        }
+        if character == '\n' {
+            current_line += 1;
+            current_column = 1;
+        } else {
+            current_column += 1;
+        }
+    }
+    input.len()
+}
+
+fn redacted_json_error_excerpt(input: &str, error_offset: usize) -> String {
+    let start = input
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .filter(|offset| *offset <= error_offset)
+        .rev()
+        .nth(INVALID_TOOL_ARGUMENTS_EXCERPT_RADIUS)
+        .unwrap_or(0);
+    let end = input
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .find(|offset| {
+            *offset >= error_offset.saturating_add(INVALID_TOOL_ARGUMENTS_EXCERPT_RADIUS)
+        })
+        .unwrap_or(input.len());
+    let excerpt = &input[start..end];
+    let mut redacted = String::with_capacity(excerpt.len());
+    let (mut in_string, mut escaped) =
+        input[..start]
+            .chars()
+            .fold((false, false), |(in_string, escaped), character| {
+                if !in_string {
+                    (character == '"', false)
+                } else if escaped {
+                    (true, false)
+                } else if character == '\\' {
+                    (true, true)
+                } else {
+                    (character != '"', false)
+                }
+            });
+    let mut characters = excerpt.chars().peekable();
+    while let Some(character) = characters.next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                redacted.push('*');
+            } else if character == '\\' {
+                escaped = true;
+                redacted.push('*');
+            } else if character == '"' {
+                in_string = false;
+                redacted.push('"');
+            } else {
+                redacted.push('*');
+            }
+        } else if character == '"' {
+            in_string = true;
+            redacted.push('"');
+        } else if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+            let mut token = String::from(character);
+            while characters.peek().is_some_and(|next| {
+                next.is_ascii_alphanumeric() || matches!(next, '_' | '-' | '.' | '+')
+            }) {
+                token.push(characters.next().expect("peeked token character"));
+            }
+            if matches!(token.as_str(), "true" | "false" | "null" | "none" | "all") {
+                redacted.push_str(&token);
+            } else {
+                redacted.extend(std::iter::repeat('*').take(token.chars().count()));
+            }
+        } else if character.is_whitespace()
+            || matches!(character, '{' | '}' | '[' | ']' | ':' | ',')
+        {
+            redacted.push(character);
+        } else {
+            redacted.push('*');
+        }
+    }
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        redacted,
+        if end < input.len() { "…" } else { "" }
+    )
 }
 
 fn json_value_matches_schema_type(value: &Value, kind: &str) -> bool {
@@ -7211,6 +7441,39 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tool_arguments_observation_is_structured_and_redacted() {
+        let arguments =
+            r#"{"agent_type":"sk-secret-value","fork_turns":none,"message":"password=hunter2"}"#;
+        let error = parse_required_tool_arguments(
+            Some(&Value::String(arguments.to_string())),
+            "function.arguments",
+            Some("spawn_agent"),
+        )
+        .unwrap_err();
+
+        let observation =
+            tool_call_protocol_error_observation(&error, Some("non_streaming_failed"));
+        let details = &observation["invalidToolArguments"];
+        assert_eq!(details["field"], "function.arguments");
+        assert_eq!(details["toolName"], "spawn_agent");
+        assert_eq!(details["argumentBytes"], arguments.len());
+        assert_eq!(
+            details["fingerprint"],
+            content_fingerprint(arguments.as_bytes())
+        );
+        assert_eq!(details["errorLine"], 1);
+        assert!(details["errorColumn"].as_u64().unwrap() > 0);
+        assert!(details["errorOffset"].as_u64().unwrap() > 0);
+        assert_eq!(observation["recovery"], "non_streaming_failed");
+
+        let rendered = observation.to_string();
+        assert!(rendered.contains("none"));
+        assert!(!rendered.contains("sk-secret-value"));
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("password="));
+    }
+
+    #[test]
     fn token_estimate_breakdown_attributes_materialized_context_and_schemas() {
         let mut request = model_request();
         request.system_prompt = "must not be counted twice".to_string();
@@ -7846,6 +8109,56 @@ mod tests {
     }
 
     #[test]
+    fn responses_replay_correlates_malformed_arguments_with_a_tool_error() {
+        let body = json!({
+            "id": "resp_malformed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_malformed",
+                "name": "spawn_agent",
+                "arguments": "{\"agent_type\":\"default\",\"fork_turns\":none,\"message\":\"review\"}"
+            }]
+        });
+        let response =
+            parse_model_response_body(&body).expect("malformed arguments are recoverable");
+        let details = invalid_tool_arguments_json_details(&response.tool_calls[0].arguments)
+            .expect("invalid argument details");
+        assert_eq!(details["toolName"], "spawn_agent");
+        assert!(details["redactedExcerpt"]
+            .as_str()
+            .unwrap()
+            .contains("none"));
+
+        let mut request = model_request();
+        request.previous_tool_calls = response.tool_calls;
+        request.previous_response_items = response.provider_items;
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "call_malformed".to_string(),
+            name: "spawn_agent".to_string(),
+            output: "Tool `spawn_agent` was not executed because function.arguments was invalid JSON. Retry with valid JSON.".to_string(),
+            content: Vec::new(),
+            is_error: true,
+            metadata: json!({ "invalidToolArgumentsJson": true }),
+        }];
+
+        let input = responses_input(&request);
+        let result = input
+            .iter()
+            .find(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "call_malformed"
+            })
+            .expect("correlated function_call_output");
+        assert!(result["output"]
+            .as_str()
+            .unwrap()
+            .contains("was not executed"));
+        assert!(result["output"]
+            .as_str()
+            .unwrap()
+            .contains("Retry with valid JSON"));
+    }
+
+    #[test]
     fn responses_web_search_citations_become_clickable_markdown_links() {
         let body = json!({
             "output": [{
@@ -7921,6 +8234,55 @@ mod tests {
         assert_eq!(messages[4]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[5]["role"], "tool");
         assert_eq!(messages[5]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn chat_messages_return_malformed_argument_diagnostics_as_a_tool_error() {
+        let mut request = model_request();
+        request.previous_tool_calls = vec![ProviderToolCall {
+            id: "call_malformed".to_string(),
+            name: "spawn_agent".to_string(),
+            arguments: json!({
+                INVALID_TOOL_ARGUMENTS_JSON_KEY: {
+                    "reason": "expected value at line 1 column 47",
+                    "errorLine": 1,
+                    "errorColumn": 47,
+                    "redactedExcerpt": "\"**********\":none"
+                }
+            }),
+        }];
+        request.tool_results = vec![ProviderToolResult {
+            call_id: "call_malformed".to_string(),
+            name: "spawn_agent".to_string(),
+            output: "Tool `spawn_agent` was not executed because function.arguments was invalid JSON at line 1, column 47. Retry with valid JSON.".to_string(),
+            content: Vec::new(),
+            is_error: true,
+            metadata: json!({
+                "invalidToolArgumentsJson": true,
+                "executed": false,
+                "retryable": true,
+            }),
+        }];
+
+        let messages = openai_messages(&request);
+        let assistant = &messages[messages.len() - 2];
+        let result = &messages[messages.len() - 1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_malformed");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"],
+            "spawn_agent"
+        );
+        assert_eq!(result["role"], "tool");
+        assert_eq!(result["tool_call_id"], "call_malformed");
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("was not executed"));
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("Retry with valid JSON"));
     }
 
     #[test]
@@ -9289,6 +9651,122 @@ mod tests {
         let cached = provider.prepare(Uuid::new_v4(), request).unwrap();
         assert_eq!(cached.body["stream"], false);
         assert!(cached.body.get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_provider_returns_recoverable_tool_error_when_nonstream_recovery_is_also_invalid()
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_http_request(&mut first).await;
+            assert!(first_request.contains(r#""stream":true"#));
+            first
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_spawn\",\"function\":{\"name\":\"spawn_agent\",\"arguments\":\"{\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first.shutdown().await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let second_request = read_http_request(&mut second).await;
+            assert!(second_request.contains(r#""stream":false"#));
+            let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_spawn_nonstream","type":"function","function":{"name":"spawn_agent","arguments":"{\"agent_type\":\"sk-secret-value\",\"fork_turns\":none,\"message\":\"password=hunter2\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+            second
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            second.shutdown().await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1"),
+            "test-key",
+            "tool-recovery-model",
+        );
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate {
+            name: "spawn_agent".to_string(),
+            description: "Spawn an agent".to_string(),
+            input_schema: json!({"type": "object"}),
+            ..Default::default()
+        }];
+        let mut transport = Vec::new();
+        let response = provider
+            .stream_prepared(
+                provider.prepare(Uuid::new_v4(), request).unwrap(),
+                &mut |_| Ok(()),
+                &mut |event| {
+                    transport.push(event);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("non-streaming malformed arguments become a recoverable tool result");
+        server.await.unwrap();
+
+        assert_eq!(response.tool_calls.len(), 1);
+        let invalid = invalid_tool_arguments_json_details(&response.tool_calls[0].arguments)
+            .expect("recoverable invalid arguments marker");
+        assert_eq!(invalid["toolName"], "spawn_agent");
+        assert_eq!(invalid["errorLine"], 1);
+        assert!(invalid["redactedExcerpt"]
+            .as_str()
+            .unwrap()
+            .contains("none"));
+        assert_eq!(
+            transport
+                .iter()
+                .filter(|event| matches!(event, ProviderTransportEvent::Retry { .. }))
+                .count(),
+            1
+        );
+        let failure = transport
+            .iter()
+            .find_map(|event| match event {
+                ProviderTransportEvent::Response { body, .. }
+                    if body["recovery"] == "retry_non_streaming_once" =>
+                {
+                    Some(body)
+                }
+                _ => None,
+            })
+            .expect("streaming failure observation");
+        assert_eq!(failure["invalidToolArguments"]["toolName"], "spawn_agent");
+        assert!(
+            failure["invalidToolArguments"]["errorColumn"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(!failure["invalidToolArguments"]["redactedExcerpt"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        let rendered = failure.to_string();
+        assert!(!rendered.contains("sk-secret-value"));
+        assert!(!rendered.contains("hunter2"));
+        let response_observation = transport.last().expect("response observation");
+        assert!(matches!(
+            response_observation,
+            ProviderTransportEvent::Response { body, .. }
+                if body["toolCalls"][0]["name"] == "spawn_agent"
+        ));
     }
 
     #[tokio::test]

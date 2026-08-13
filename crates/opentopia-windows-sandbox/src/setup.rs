@@ -139,6 +139,8 @@ fn perform_setup() -> Result<i32> {
     save_credentials(&credentials)?;
     crate::wfp::install_offline_filters(&credentials.offline_username)
         .context("install offline-user WFP filters")?;
+    crate::windows::prepare_setup_canaries()
+        .context("prepare dedicated-user execution canaries")?;
     let status = provisioning_status();
     anyhow::ensure!(
         status.is_ready(),
@@ -463,6 +465,13 @@ pub(crate) fn provisioning_status() -> SandboxSetupStatus {
             }),
         offline_network_policy: network_policy,
     };
+    if components.credentials
+        && components.offline_identity
+        && components.online_identity
+        && components.offline_network_policy
+    {
+        issues.extend(crate::windows::verify_setup_canaries());
+    }
     if any_artifact {
         if !components.credentials && !credential_file_present {
             issues.push("sandbox credentials are missing".into());
@@ -495,6 +504,7 @@ fn setup_state(
         && components.offline_identity
         && components.online_identity
         && components.offline_network_policy
+        && issues.is_empty()
     {
         SandboxSetupState::Ready
     } else if any_artifact || !issues.is_empty() {

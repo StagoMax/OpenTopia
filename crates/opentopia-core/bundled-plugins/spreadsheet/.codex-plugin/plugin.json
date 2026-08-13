@@ -1,22 +1,21 @@
 {
   "name": "spreadsheet",
-  "version": "1.0.0",
-  "description": "Inspect, read, create, update, and preview bounded XLSX workbooks.",
+  "version": "1.1.0",
+  "description": "Inspect, read, create, and update bounded XLSX workbooks through the model tool.",
   "author": {
     "name": "OpenTopia Contributors"
   },
   "interface": {
     "displayName": "Spreadsheet",
     "shortDescription": "Work with XLSX files in the current workspace.",
-    "longDescription": "Inspect sheets, read bounded ranges, create or update XLSX workbooks, and render workbook previews through OpenTopia's protected host services.",
+    "longDescription": "Give the model bounded XLSX inspection, range reading, creation, and update capabilities. Desktop workbook preview is an independent application capability.",
     "developerName": "OpenTopia",
     "category": "Productivity",
-    "defaultPrompt": "Use the spreadsheet capability when the task requires inspecting, reading, creating, updating, or previewing an XLSX workbook.",
+    "defaultPrompt": "Use the spreadsheet capability when the task requires inspecting, reading, creating, or updating an XLSX workbook.",
     "capabilities": [
       "XLSX inspection",
       "Bounded range reading",
-      "Workbook creation and update",
-      "XLSX preview"
+      "Workbook creation and update"
     ]
   },
   "opentopia": {
@@ -24,7 +23,6 @@
     "requires": {
       "hostCapabilities": [
         "workspace.files.v1",
-        "artifact.preview.v1",
         "nativeTool.spreadsheet.v1"
       ]
     },
@@ -42,18 +40,6 @@
         {
           "id": "spreadsheet",
           "runtime": "builtin:spreadsheet"
-        }
-      ],
-      "previewers": [
-        {
-          "id": "xlsx",
-          "extensions": [
-            "xlsx"
-          ],
-          "mediaTypes": [
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-          ],
-          "runtime": "builtin:spreadsheet-preview"
         }
       ]
     },

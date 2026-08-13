@@ -19,7 +19,7 @@ const FILES: &[BundledPluginFile] = &[
 pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
     metadata: BundledPluginMetadata {
         name: "spreadsheet",
-        version: "1.0.0",
+        version: "1.1.0",
         trust: BundledPluginTrust::Official,
         default_enabled: true,
         native_capabilities: &["spreadsheet"],
@@ -49,7 +49,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_registers_the_existing_tool_and_xlsx_previewer() {
+    fn manifest_registers_the_model_tool_without_owning_desktop_preview() {
         let manifest: Value = serde_json::from_slice(MANIFEST).expect("valid plugin manifest");
         let opentopia = &manifest["opentopia"];
         let tool = SpreadsheetTool;
@@ -63,10 +63,7 @@ mod tests {
             tool.schema()["properties"]["action"]["enum"],
             serde_json::json!(["inspect", "list_sheets", "read_range", "write"])
         );
-        assert_eq!(
-            opentopia["contributes"]["previewers"][0]["mediaTypes"][0],
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        );
+        assert!(opentopia["contributes"].get("previewers").is_none());
         assert_eq!(
             opentopia["configuration"]["schema"],
             "./configuration.schema.json"

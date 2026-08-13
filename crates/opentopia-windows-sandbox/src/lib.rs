@@ -72,12 +72,33 @@ pub fn run_from_env() -> Result<i32> {
         return windows::run_dedicated_user_runner(&all_args[1..]);
     }
     #[cfg(windows)]
+    if all_args.first().map(String::as_str) == Some("registry-provision") {
+        return windows::provision_runtime_registry(&all_args[1..]);
+    }
+    #[cfg(windows)]
+    if all_args.first().map(String::as_str) == Some("canary") {
+        return windows::run_setup_canary(&all_args[1..]);
+    }
+    #[cfg(windows)]
     if all_args.first().map(String::as_str) == Some("teardown") {
         return setup::run_teardown(&all_args[1..]);
     }
     #[cfg(windows)]
     if all_args.first().map(String::as_str) == Some("cleanup") {
         return windows::cleanup_workspace_acl(&all_args[1..]);
+    }
+    #[cfg(windows)]
+    if all_args.first().map(String::as_str) == Some("provision") {
+        let mut provision_args = all_args;
+        provision_args[0] = "run".to_string();
+        provision_args.extend([
+            "--".to_string(),
+            "cmd.exe".to_string(),
+            "/d".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ]);
+        return windows::provision(parse_request(provision_args)?);
     }
     let request = parse_request(all_args)?;
     #[cfg(windows)]
@@ -201,21 +222,47 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
             write_roots.push(home.clone());
         }
     }
+    let mut read_execute = Vec::<ReadExecuteCapability>::new();
+    for (path, provisioning) in read_roots
+        .into_iter()
+        .map(|path| (path, ReadProvisioning::Managed))
+        .chain(
+            runtime_roots
+                .into_iter()
+                .map(|path| (path, ReadProvisioning::ExistingOnly)),
+        )
+    {
+        if let Some(existing) = read_execute
+            .iter_mut()
+            .find(|capability| capability.path == path)
+        {
+            if provisioning == ReadProvisioning::ExistingOnly {
+                existing.provisioning = ReadProvisioning::ExistingOnly;
+            }
+        } else {
+            read_execute.push(ReadExecuteCapability { path, provisioning });
+        }
+    }
+    for managed in read_execute
+        .iter()
+        .filter(|capability| capability.provisioning == ReadProvisioning::Managed)
+    {
+        if let Some(external) = read_execute.iter().find(|capability| {
+            capability.provisioning == ReadProvisioning::ExistingOnly
+                && path_is_within(&capability.path, &managed.path)
+        }) {
+            anyhow::bail!(
+                "managed read root {} contains immutable external runtime {}; classify the runtime as managed or narrow the managed root",
+                managed.path.display(),
+                external.path.display()
+            )
+        }
+    }
     Ok(SandboxRequest {
         interactive,
         cwd,
         filesystem: FilesystemCapabilities {
-            read_execute: read_roots
-                .into_iter()
-                .map(|path| ReadExecuteCapability {
-                    path,
-                    provisioning: ReadProvisioning::Managed,
-                })
-                .chain(runtime_roots.into_iter().map(|path| ReadExecuteCapability {
-                    path,
-                    provisioning: ReadProvisioning::ExistingOnly,
-                }))
-                .collect(),
+            read_execute,
             write: write_roots,
             deny_read: denied_read_paths,
             deny_write: protected_paths,
@@ -263,6 +310,10 @@ fn absolute_path(value: String) -> Result<PathBuf> {
     }
     path.canonicalize()
         .with_context(|| format!("sandbox path must exist: {}", path.display()))
+}
+
+fn path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 #[cfg(windows)]
@@ -351,6 +402,7 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(request.filesystem.read_execute.len(), 1);
         assert_eq!(request.filesystem.deny_read.len(), 1);
         assert_eq!(
             request.filesystem.runtime_home.as_deref(),

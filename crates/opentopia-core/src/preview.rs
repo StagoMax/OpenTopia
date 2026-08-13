@@ -1,18 +1,20 @@
 use crate::model::{Artifact, ArtifactStorage, ContextSourceRef};
 use crate::spreadsheet::{
     inspect_workbook, read_range, CellAddress, CellRange, InspectWorkbookRequest, ReadRangeRequest,
-    SheetKind, SheetVisibility, SpreadsheetCell, SpreadsheetError, EXCEL_MAX_COLUMNS,
-    EXCEL_MAX_ROWS,
+    SheetKind, SheetVisibility, SpreadsheetCell, SpreadsheetCellValue, SpreadsheetError,
+    EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, MAX_READ_CELLS, MAX_READ_COLUMNS, MAX_READ_ROWS,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const MAX_PREVIEW_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
+const DELIMITED_PREVIEW_SHEET: &str = "Data";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -128,7 +130,7 @@ pub enum PreviewError {
     ArtifactThreadMismatch { artifact_id: Uuid, thread_id: Uuid },
     #[error("preview content is {actual_bytes} bytes; limit is {limit_bytes} bytes")]
     ContentTooLarge { actual_bytes: u64, limit_bytes: u64 },
-    #[error("preview {0} is not an XLSX spreadsheet")]
+    #[error("preview {0} is not a supported spreadsheet")]
     NotSpreadsheet(String),
     #[error("inline spreadsheet previews are not supported")]
     InlineSpreadsheetUnsupported,
@@ -139,6 +141,12 @@ pub enum PreviewError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("failed to parse delimited preview file {path}: {source}")]
+    Delimited {
+        path: PathBuf,
+        #[source]
+        source: csv::Error,
     },
     #[error(transparent)]
     Spreadsheet(#[from] SpreadsheetError),
@@ -293,12 +301,13 @@ pub fn resolve_artifact_preview(
             )
         }
     };
+    let kind = classify_preview(&content_type, Path::new(&name));
     let descriptor = PreviewDescriptor {
         id: encode_preview_id(&target),
         source: PreviewSource::Artifact,
         path,
         name,
-        kind: classify_preview(&content_type, descriptor_path(&content)),
+        kind,
         content_type,
         bytes,
         readonly: true,
@@ -334,7 +343,7 @@ pub fn resolve_attachment_preview(
         source: PreviewSource::Attachment,
         path: Some(resolved.clone()),
         name: attachment.name.clone(),
-        kind: classify_preview(&content_type, &resolved),
+        kind: classify_preview(&content_type, Path::new(&attachment.name)),
         content_type,
         bytes: metadata.len(),
         readonly: true,
@@ -376,6 +385,9 @@ pub fn read_preview_content(
 }
 
 pub fn preview_workbook(preview: &ResolvedPreview) -> Result<PreviewWorkbook, PreviewError> {
+    if let Some(delimiter) = delimited_preview_delimiter(preview) {
+        return preview_delimited_workbook(preview, delimiter);
+    }
     let path = spreadsheet_path(preview)?;
     let result = inspect_workbook(&InspectWorkbookRequest {
         path: path.to_path_buf(),
@@ -432,10 +444,21 @@ pub fn preview_spreadsheet_range(
         .ok_or(PreviewError::InvalidRange("column range overflow"))?;
     if end_row >= EXCEL_MAX_ROWS || end_column >= EXCEL_MAX_COLUMNS {
         return Err(PreviewError::InvalidRange(
-            "range exceeds XLSX row or column bounds",
+            "range exceeds spreadsheet row or column bounds",
+        ));
+    }
+    if u64::from(request.row_count) > MAX_READ_ROWS
+        || u64::from(request.column_count) > MAX_READ_COLUMNS
+        || u64::from(request.row_count) * u64::from(request.column_count) > MAX_READ_CELLS
+    {
+        return Err(PreviewError::InvalidRange(
+            "range exceeds spreadsheet preview limits",
         ));
     }
 
+    if let Some(delimiter) = delimited_preview_delimiter(preview) {
+        return preview_delimited_range(preview, delimiter, request);
+    }
     let path = spreadsheet_path(preview)?;
     let range = CellRange {
         start: CellAddress {
@@ -458,6 +481,189 @@ pub fn preview_spreadsheet_range(
         range: result.range,
         rows: result.rows,
     })
+}
+
+fn preview_delimited_workbook(
+    preview: &ResolvedPreview,
+    delimiter: u8,
+) -> Result<PreviewWorkbook, PreviewError> {
+    ensure_delimited_preview_size(preview)?;
+    let mut reader = delimited_reader(preview, delimiter)?;
+    let error_path = preview_error_path(preview);
+    let mut row_count = 0_u32;
+    let mut column_count = 0_u32;
+    for record in reader.byte_records() {
+        let record = record.map_err(|source| PreviewError::Delimited {
+            path: error_path.clone(),
+            source,
+        })?;
+        row_count = row_count.checked_add(1).ok_or(PreviewError::InvalidRange(
+            "delimited file has too many rows",
+        ))?;
+        column_count = column_count.max(
+            u32::try_from(record.len())
+                .map_err(|_| PreviewError::InvalidRange("delimited file has too many columns"))?,
+        );
+        if row_count > EXCEL_MAX_ROWS || column_count > EXCEL_MAX_COLUMNS {
+            return Err(PreviewError::InvalidRange(
+                "delimited file exceeds spreadsheet preview bounds",
+            ));
+        }
+    }
+    Ok(PreviewWorkbook {
+        preview_id: preview.descriptor.id.clone(),
+        bytes: preview.descriptor.bytes,
+        sheets: vec![PreviewSheet {
+            name: DELIMITED_PREVIEW_SHEET.to_string(),
+            kind: SheetKind::Worksheet,
+            visibility: SheetVisibility::Visible,
+            row_count: row_count.max(1),
+            column_count: column_count.max(1),
+        }],
+    })
+}
+
+fn preview_delimited_range(
+    preview: &ResolvedPreview,
+    delimiter: u8,
+    request: PreviewRangeRequest,
+) -> Result<PreviewRange, PreviewError> {
+    if request.sheet != DELIMITED_PREVIEW_SHEET {
+        return Err(PreviewError::InvalidRange(
+            "delimited preview sheet was not found",
+        ));
+    }
+    ensure_delimited_preview_size(preview)?;
+    let range = CellRange {
+        start: CellAddress {
+            row: request.start_row,
+            column: request.start_column,
+        },
+        end: CellAddress {
+            row: request.start_row + request.row_count - 1,
+            column: request.start_column + request.column_count - 1,
+        },
+    };
+    let mut reader = delimited_reader(preview, delimiter)?;
+    let error_path = preview_error_path(preview);
+    let mut rows = Vec::with_capacity(request.row_count as usize);
+    for (row_index, record) in reader.byte_records().enumerate() {
+        let row_index = u32::try_from(row_index)
+            .map_err(|_| PreviewError::InvalidRange("delimited file has too many rows"))?;
+        if row_index < request.start_row {
+            continue;
+        }
+        if row_index > range.end.row {
+            break;
+        }
+        let record = record.map_err(|source| PreviewError::Delimited {
+            path: error_path.clone(),
+            source,
+        })?;
+        let mut cells = Vec::with_capacity(request.column_count as usize);
+        for column in request.start_column..=range.end.column {
+            let value = record
+                .get(column as usize)
+                .map(|field| delimited_cell_value(field, row_index, column))
+                .unwrap_or(SpreadsheetCellValue::Empty);
+            cells.push(SpreadsheetCell {
+                value,
+                formula: None,
+            });
+        }
+        rows.push(cells);
+    }
+    while rows.len() < request.row_count as usize {
+        rows.push(
+            (0..request.column_count)
+                .map(|_| SpreadsheetCell {
+                    value: SpreadsheetCellValue::Empty,
+                    formula: None,
+                })
+                .collect(),
+        );
+    }
+    Ok(PreviewRange {
+        preview_id: preview.descriptor.id.clone(),
+        sheet: DELIMITED_PREVIEW_SHEET.to_string(),
+        range,
+        rows,
+    })
+}
+
+fn delimited_reader<'a>(
+    preview: &'a ResolvedPreview,
+    delimiter: u8,
+) -> Result<csv::Reader<Box<dyn Read + 'a>>, PreviewError> {
+    let source: Box<dyn Read + 'a> = match &preview.content {
+        PreviewContentSource::Path(path) => Box::new(std::fs::File::open(path).map_err(
+            |source| PreviewError::Io {
+                path: path.clone(),
+                source,
+            },
+        )?),
+        PreviewContentSource::Inline(bytes) => Box::new(Cursor::new(bytes.as_slice())),
+    };
+    Ok(csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(source))
+}
+
+fn delimited_cell_value(field: &[u8], row: u32, column: u32) -> SpreadsheetCellValue {
+    let field = if row == 0 && column == 0 {
+        field.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(field)
+    } else {
+        field
+    };
+    if field.is_empty() {
+        SpreadsheetCellValue::Empty
+    } else {
+        SpreadsheetCellValue::String(String::from_utf8_lossy(field).into_owned())
+    }
+}
+
+fn ensure_delimited_preview_size(preview: &ResolvedPreview) -> Result<(), PreviewError> {
+    let bytes = preview.descriptor.bytes;
+    if bytes > MAX_PREVIEW_CONTENT_BYTES {
+        return Err(PreviewError::ContentTooLarge {
+            actual_bytes: bytes,
+            limit_bytes: MAX_PREVIEW_CONTENT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn preview_error_path(preview: &ResolvedPreview) -> PathBuf {
+    preview
+        .descriptor
+        .path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&preview.descriptor.name))
+}
+
+fn delimited_preview_delimiter(preview: &ResolvedPreview) -> Option<u8> {
+    let media_type = preview
+        .descriptor
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or(&preview.descriptor.content_type)
+        .trim()
+        .to_ascii_lowercase();
+    let extension = Path::new(&preview.descriptor.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if media_type == "text/tab-separated-values" || extension == "tsv" {
+        Some(b'\t')
+    } else if media_type == "text/csv" || extension == "csv" {
+        Some(b',')
+    } else {
+        None
+    }
 }
 
 fn spreadsheet_path(preview: &ResolvedPreview) -> Result<&Path, PreviewError> {
@@ -503,13 +709,6 @@ fn artifact_display_name(artifact: &Artifact, path: Option<&Path>) -> String {
         .unwrap_or_else(|| format!("artifact-{}", artifact.id))
 }
 
-fn descriptor_path(content: &PreviewContentSource) -> &Path {
-    match content {
-        PreviewContentSource::Path(path) => path,
-        PreviewContentSource::Inline(_) => Path::new(""),
-    }
-}
-
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -539,6 +738,7 @@ fn infer_content_type(path: &Path, declared: Option<&str>) -> String {
         "js" | "mjs" | "cjs" => "text/javascript; charset=utf-8",
         "xml" => "application/xml; charset=utf-8",
         "csv" => "text/csv; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
@@ -570,10 +770,16 @@ fn classify_preview(content_type: &str, path: &Path) -> PreviewKind {
     {
         PreviewKind::Document
     } else if media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        || matches!(
+            media_type.as_str(),
+            "text/csv" | "text/tab-separated-values"
+        )
         || path
             .extension()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("xlsx"))
+            .is_some_and(|value| {
+                matches!(value.to_ascii_lowercase().as_str(), "csv" | "tsv" | "xlsx")
+            })
     {
         PreviewKind::Spreadsheet
     } else if media_type == "application/pdf" {
@@ -806,6 +1012,109 @@ mod tests {
             range.rows[0][0].value,
             crate::spreadsheet::SpreadsheetCellValue::String("OpenTopia".to_string())
         );
+    }
+
+    #[test]
+    fn csv_preview_uses_virtualized_workbook_ranges() {
+        let directory = TestDirectory::new();
+        let csv_path = directory.path().join("orders.csv");
+        std::fs::write(
+            &csv_path,
+            "order_id,customer,note\n1001,Alice,first line\n1002,Bob,\"contains, comma\"\n",
+        )
+        .expect("write CSV fixture");
+
+        let preview = resolve_workspace_preview(directory.path(), Path::new("orders.csv"))
+            .expect("resolve CSV preview");
+        assert_eq!(preview.descriptor.kind, PreviewKind::Spreadsheet);
+
+        let workbook = preview_workbook(&preview).expect("read CSV metadata");
+        assert_eq!(workbook.sheets.len(), 1);
+        assert_eq!(workbook.sheets[0].name, DELIMITED_PREVIEW_SHEET);
+        assert_eq!(workbook.sheets[0].row_count, 3);
+        assert_eq!(workbook.sheets[0].column_count, 3);
+
+        let range = preview_spreadsheet_range(
+            &preview,
+            PreviewRangeRequest {
+                sheet: DELIMITED_PREVIEW_SHEET.to_string(),
+                start_row: 1,
+                start_column: 1,
+                row_count: 2,
+                column_count: 2,
+            },
+        )
+        .expect("read CSV range");
+        assert_eq!(range.rows.len(), 2);
+        assert_eq!(
+            range.rows[0][0].value,
+            SpreadsheetCellValue::String("Alice".to_string())
+        );
+        assert_eq!(
+            range.rows[1][1].value,
+            SpreadsheetCellValue::String("contains, comma".to_string())
+        );
+    }
+
+    #[test]
+    fn tsv_attachment_is_classified_by_its_name_when_stored_as_a_temp_file() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("upload.bin");
+        std::fs::write(&path, "name\tvalue\nalpha\t1\n").expect("write TSV fixture");
+        let attachment = ContextSourceRef {
+            id: Uuid::new_v4(),
+            path,
+            name: "metrics.tsv".to_string(),
+            kind: ContextSourceKind::Document,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            bytes: 0,
+            truncated: false,
+        };
+
+        let preview = resolve_attachment_preview(&attachment).expect("resolve TSV preview");
+        assert_eq!(preview.descriptor.kind, PreviewKind::Spreadsheet);
+        let workbook = preview_workbook(&preview).expect("read TSV metadata");
+        assert_eq!(workbook.sheets[0].row_count, 2);
+        assert_eq!(workbook.sheets[0].column_count, 2);
+    }
+
+    #[test]
+    fn csv_attachment_is_classified_from_mime_with_charset_parameters() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("upload.bin");
+        std::fs::write(&path, "name,value\nalpha,1\n").expect("write CSV fixture");
+        let attachment = ContextSourceRef {
+            id: Uuid::new_v4(),
+            path,
+            name: "orders.csv".to_string(),
+            kind: ContextSourceKind::Document,
+            content_type: "text/csv; charset=utf-8".to_string(),
+            bytes: 0,
+            truncated: false,
+        };
+
+        let preview = resolve_attachment_preview(&attachment).expect("resolve CSV preview");
+        assert_eq!(preview.descriptor.kind, PreviewKind::Spreadsheet);
+    }
+
+    #[test]
+    fn inline_csv_artifact_can_be_previewed_as_a_spreadsheet() {
+        let directory = TestDirectory::new();
+        let thread_id = Uuid::new_v4();
+        let artifact = Artifact::inline(
+            thread_id,
+            "spreadsheet",
+            "text/csv; charset=utf-8",
+            "name,value\nalpha,1\n",
+            json!({"name": "metrics.csv"}),
+        );
+
+        let preview = resolve_artifact_preview(thread_id, directory.path(), &artifact)
+            .expect("resolve inline CSV artifact");
+        assert_eq!(preview.descriptor.kind, PreviewKind::Spreadsheet);
+        let workbook = preview_workbook(&preview).expect("read inline CSV metadata");
+        assert_eq!(workbook.sheets[0].row_count, 2);
+        assert_eq!(workbook.sheets[0].column_count, 2);
     }
 
     #[test]

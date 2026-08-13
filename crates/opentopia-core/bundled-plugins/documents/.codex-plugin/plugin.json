@@ -1,21 +1,20 @@
 {
   "name": "documents",
-  "version": "1.2.0",
-  "description": "Inspect, extract, validate, and preview DOCX files without an external Office installation.",
+  "version": "1.3.0",
+  "description": "Inspect, extract, and validate DOCX files through OpenTopia's native document tool.",
   "author": {
     "name": "OpenTopia Contributors"
   },
   "interface": {
     "displayName": "Documents",
-    "shortDescription": "Read and preview DOCX files safely.",
-    "longDescription": "Inspect OPC and WordprocessingML structure, extract bounded document text, preview documents in the desktop app, and report preservation risks without rewriting the source file.",
+    "shortDescription": "Read DOCX files safely for the model.",
+    "longDescription": "Give the model bounded DOCX inspection, extraction, and validation without rewriting the source file. Desktop file preview is an independent application capability.",
     "developerName": "OpenTopia",
     "category": "Productivity",
-    "defaultPrompt": "Use the Document tool when the task requires deterministic DOCX inspection, extraction, or validation. User preview is provided separately by the desktop renderer.",
+    "defaultPrompt": "Use the Document tool when the task requires deterministic DOCX inspection, extraction, or validation.",
     "capabilities": [
       "DOCX package inspection",
       "Bounded text extraction",
-      "Lightweight desktop preview",
       "Preservation risk validation"
     ]
   },
@@ -24,7 +23,6 @@
     "requires": {
       "hostCapabilities": [
         "workspace.files.v1",
-        "artifact.preview.v1",
         "nativeTool.document.v1"
       ]
     },
@@ -41,18 +39,6 @@
         {
           "id": "document",
           "runtime": "builtin:document"
-        }
-      ],
-      "previewers": [
-        {
-          "id": "docx",
-          "extensions": [
-            "docx"
-          ],
-          "mediaTypes": [
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-          ],
-          "runtime": "builtin:document-preview"
         }
       ]
     }

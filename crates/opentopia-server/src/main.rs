@@ -12,13 +12,12 @@ use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    agent_model_context_with_runtime, browser_handoff_for_node, bundled_plugin_metadata,
-    bundled_plugins_path, configured_provider_from_settings, content_fingerprint, discover_plugins,
-    discover_skills, ensure_bundled_plugins_installed, execute_git_workflow,
-    experience_mode_module, install_plugin, isolated_subagent_worktree_request,
-    load_context_source_metadata, load_plugin_mcp_servers, load_selected_skills,
-    permission_policy_module, redact_model_observation, remove_windows_sandbox,
-    resolve_instruction_documents, setup_windows_sandbox, uninstall_plugin,
+    agent_model_context_with_runtime, browser_handoff_for_node, bundled_plugins_path,
+    configured_provider_from_settings, content_fingerprint, discover_plugins, discover_skills,
+    ensure_bundled_plugins_installed, execute_git_workflow, experience_mode_module, install_plugin,
+    isolated_subagent_worktree_request, load_context_source_metadata, load_plugin_mcp_servers,
+    load_selected_skills, permission_policy_module, redact_model_observation,
+    remove_windows_sandbox, resolve_instruction_documents, setup_windows_sandbox, uninstall_plugin,
     windows_sandbox_setup_status, world_state_catalog_item, world_state_item, AgentContextBudget,
     AgentContinuation, AgentCore, AgentEvent, AgentEventPayload, AgentInstanceStatusV1,
     AgentInstanceV1, AgentProfileRegistry, AgentRuntimeSettings, AgentTemplateVersionV1,
@@ -26,20 +25,22 @@ use opentopia_core::{
     ArtifactMetadata, BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction,
     BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
     BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
-    BrowserRuntime, BrowserRuntimeConfig, BrowserSelector, BrowserSessionId, BrowserTargetRef,
-    BrowserWaitCondition, BrowserWaitRequest, ChangedFile, CodexAccountManager, CodexAccountStatus,
-    CodexLoginStart, CollaborationMode, CompiledModelContext, ComputerRuntime,
-    ComputerRuntimeConfig, ComputerSessionId, ContextCacheScope, ContextCheckpoint,
-    ContextCheckpointArtifact, ContextCheckpointCommand, ContextCheckpointCoverage,
-    ContextCheckpointFact, ContextCheckpointInteraction, ContextCheckpointMode,
-    ContextCheckpointStep, ContextCheckpointWorkspace, ContextCompactionDetails,
-    ContextCompactionMetrics, ContextFactStatus, ContextItemKind, ContextProjection, ContextRole,
-    ContextSensitivity, ContextSourcePolicy, ContextSourceRef, ContextSummary, ContributionKind,
-    DesktopBrowserRuntime, ExecutionContext, ExperienceMode, ExperienceSurfaceProfile,
-    GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill,
-    LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment, LocalSandboxConfig,
-    McpCallResult, McpServerConfig, McpServerStatus, McpToolDescriptor, MediaHandlerSelection,
-    Message, MessagePart, MessageRole, ModelCallPurpose, ModelContentPart, ModelContextItem,
+    BrowserRuntime, BrowserRuntimeConfig, BrowserRuntimeRoute, BrowserRuntimeRouter,
+    BrowserSelector, BrowserSessionId, BrowserSessionSpec, BrowserTargetRef, BrowserWaitCondition,
+    BrowserWaitRequest, ChangedFile, ChromeExtensionBrowserRuntime,
+    ChromeExtensionBrowserRuntimeConfig, CodexAccountManager, CodexAccountStatus, CodexLoginStart,
+    CollaborationMode, CompiledModelContext, ComputerRuntime, ComputerRuntimeConfig,
+    ComputerSessionId, ContextCacheScope, ContextCheckpoint, ContextCheckpointArtifact,
+    ContextCheckpointCommand, ContextCheckpointCoverage, ContextCheckpointFact,
+    ContextCheckpointInteraction, ContextCheckpointMode, ContextCheckpointStep,
+    ContextCheckpointWorkspace, ContextCompactionDetails, ContextCompactionMetrics,
+    ContextFactStatus, ContextItemKind, ContextProjection, ContextRole, ContextSensitivity,
+    ContextSourcePolicy, ContextSourceRef, ContextSummary, ContributionKind, DesktopBrowserRuntime,
+    ExecutionContext, ExperienceMode, ExperienceSurfaceProfile, GitWorkflowAction,
+    GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill, LocalBrowserRuntime,
+    LocalComputerRuntime, LocalExecutionEnvironment, LocalSandboxConfig, McpCallResult,
+    McpServerConfig, McpServerStatus, McpToolDescriptor, MediaHandlerSelection, Message,
+    MessagePart, MessageRole, ModelCallPurpose, ModelContentPart, ModelContextItem,
     ModelConversationMessage, ModelConversationRole, ModelRequest, ModelStreamDelta,
     ObserveOptions, OpenAiCompatibleProvider, OpenAiProtocol, PermissionMode, PluginControlScope,
     PluginDescriptor, PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError,
@@ -85,6 +86,7 @@ mod agent_templates_api;
 mod auth;
 mod contributions_api;
 mod flows_api;
+mod library_api;
 mod plugins_api;
 mod scm_api;
 mod turn_changes;
@@ -128,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let store = Arc::new(SqliteSessionStore::open(&args.db)?);
-    plugins_api::ensure_default_spreadsheet_permissions(&store)?;
+    plugins_api::ensure_default_bundled_plugin_permissions(&store)?;
     let indeterminate_effects = store.mark_running_effects_indeterminate()?;
     if indeterminate_effects > 0 {
         warn!(
@@ -170,13 +172,14 @@ async fn main() -> anyhow::Result<()> {
     }
     restore_enabled_mcp_servers(store.clone(), mcp_host.clone());
     let browser = initialize_browser_runtime().await;
+    let browser_runtime: Arc<dyn BrowserRuntime> = browser.clone();
     let computer: Arc<dyn ComputerRuntime> =
         Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default()));
     // One registry for the whole process: a command left running in one turn has to
     // still be readable in the next one, and rebuilding the agent must not orphan it.
     let background = BackgroundProcessRegistry::default();
     let mut initial_agent = AgentCore::from_settings(&loaded_settings);
-    initial_agent.set_browser_runtime(browser.clone());
+    initial_agent.set_browser_runtime(browser_runtime.clone());
     initial_agent.set_computer_runtime(computer.clone());
     initial_agent.set_background_processes(background.clone());
     apply_process_tool_policy(&mut initial_agent);
@@ -211,7 +214,8 @@ async fn main() -> anyhow::Result<()> {
         events: EventBus::default(),
         terminals: TerminalBus::default(),
         ptys: PtyManager::default(),
-        browser,
+        browser: browser_runtime,
+        browser_router: browser,
         computer,
         mcp_host,
         auth,
@@ -221,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         subagents,
         background,
         app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
+        sag_library: Arc::new(library_api::SagLibraryGateway::from_env()?),
     };
 
     let queue_state = state.clone();
@@ -307,7 +312,7 @@ async fn recv_broadcast_after_lag<T: Clone>(
     }
 }
 
-async fn initialize_browser_runtime() -> Arc<dyn BrowserRuntime> {
+async fn initialize_browser_runtime() -> Arc<BrowserRuntimeRouter> {
     let broker_url = std::env::var("OPENTOPIA_DESKTOP_BROWSER_BROKER_URL")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -320,7 +325,11 @@ async fn initialize_browser_runtime() -> Arc<dyn BrowserRuntime> {
             Ok(runtime) => match runtime.health_check().await {
                 Ok(()) => {
                     info!("using the Electron desktop browser broker");
-                    return Arc::new(runtime);
+                    let managed: Arc<dyn BrowserRuntime> = Arc::new(runtime);
+                    return Arc::new(BrowserRuntimeRouter::new(
+                        managed,
+                        initialize_chrome_browser_runtime().await,
+                    ));
                 }
                 Err(error) => {
                     warn!(%error, "desktop browser broker health check failed; using local browser runtime");
@@ -347,7 +356,44 @@ async fn initialize_browser_runtime() -> Arc<dyn BrowserRuntime> {
         config.data_root = PathBuf::from(data_root);
         info!(path = %config.data_root.display(), "using configured local browser data root");
     }
-    Arc::new(LocalBrowserRuntime::new(config))
+    Arc::new(BrowserRuntimeRouter::new(
+        Arc::new(LocalBrowserRuntime::new(config)),
+        initialize_chrome_browser_runtime().await,
+    ))
+}
+
+async fn initialize_chrome_browser_runtime() -> Option<Arc<dyn BrowserRuntime>> {
+    let url = std::env::var("OPENTOPIA_CHROME_BRIDGE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let token = std::env::var("OPENTOPIA_CHROME_BRIDGE_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let (Some(url), Some(token)) = (url, token) else {
+        info!("Chrome extension bridge is not configured");
+        return None;
+    };
+    let runtime = match ChromeExtensionBrowserRuntime::new(ChromeExtensionBrowserRuntimeConfig {
+        bridge_url: url,
+        bridge_token: token,
+        browser: BrowserRuntimeConfig::default(),
+    }) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            warn!(%error, "Chrome extension browser configuration is invalid");
+            return None;
+        }
+    };
+    match runtime.health_check().await {
+        Ok(()) => {
+            info!("Chrome extension browser bridge is available");
+            Some(Arc::new(runtime))
+        }
+        Err(error) => {
+            warn!(%error, "Chrome extension browser bridge health check failed");
+            None
+        }
+    }
 }
 
 /// Applies a process-wide tool allowlist supplied by the trusted launcher. The
@@ -382,6 +428,7 @@ fn build_router(state: AppState) -> Router {
         .merge(agent_templates_api::router())
         .merge(contributions_api::router())
         .merge(flows_api::router())
+        .merge(library_api::router())
         .merge(plugins_api::router())
         .merge(scm_api::router())
         .route("/health", get(health))
@@ -529,6 +576,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/threads/:thread_id/sandbox", get(get_sandbox))
         .route("/api/threads/:thread_id/browser", post(run_browser_command))
         .route(
+            "/api/threads/:thread_id/browser/runtime",
+            get(get_browser_runtime).post(bind_browser_runtime),
+        )
+        .route(
             "/api/threads/:thread_id/computer/windows",
             get(list_computer_windows),
         )
@@ -619,6 +670,7 @@ struct AppState {
     terminals: TerminalBus,
     ptys: PtyManager,
     browser: Arc<dyn BrowserRuntime>,
+    browser_router: Arc<BrowserRuntimeRouter>,
     computer: Arc<dyn ComputerRuntime>,
     mcp_host: McpExtensionHost,
     auth: ApiAuth,
@@ -628,6 +680,7 @@ struct AppState {
     subagents: SubagentScheduler,
     background: BackgroundProcessRegistry,
     app_views: Arc<Mutex<opentopia_core::AppViewHost>>,
+    sag_library: Arc<library_api::SagLibraryGateway>,
 }
 
 struct StoreSubagentObserver {
@@ -3641,6 +3694,13 @@ async fn resolve_preview(
     let thread = ensure_thread(&state, thread_id)?;
     let preview = resolve_preview_target(&state.store, &thread, &target)?;
     let mut descriptor = preview.descriptor;
+    if descriptor.kind != PreviewKind::Unsupported {
+        return Ok(Json(descriptor));
+    }
+
+    // Host-owned file renderers are part of the desktop application and do
+    // not depend on model-tool plugin activation. Plugin previewers extend
+    // formats the host does not understand; they do not gate built-in ones.
     let handlers = contributions_api::handler_registry_for_thread(&state, &thread)?;
     match handlers.select_previewer(descriptor.path.as_deref(), Some(&descriptor.content_type)) {
         MediaHandlerSelection::Selected { handler } => {
@@ -3651,12 +3711,6 @@ async fn resolve_preview(
                 "multiple preview handlers have equal priority: {}",
                 contribution_ids.join(", ")
             )));
-        }
-        MediaHandlerSelection::None if descriptor.kind == PreviewKind::Spreadsheet => {
-            descriptor.kind = PreviewKind::Unsupported;
-        }
-        MediaHandlerSelection::None if descriptor.kind == PreviewKind::Document => {
-            descriptor.kind = PreviewKind::Unsupported;
         }
         MediaHandlerSelection::None => {}
     }
@@ -3671,9 +3725,6 @@ async fn read_preview_content(
     let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
     let descriptor = preview.descriptor.clone();
     let document_preview = descriptor.kind == PreviewKind::Document;
-    if document_preview {
-        require_bundled_plugin_for_thread(&state.store, thread_id, "documents")?;
-    }
     let etag = format!("\"{}\"", descriptor.revision);
     if headers
         .get(header::IF_NONE_MATCH)
@@ -3763,7 +3814,6 @@ async fn get_preview_workbook(
     State(state): State<AppState>,
     Path((thread_id, preview_id)): Path<(Uuid, String)>,
 ) -> Result<Json<PreviewWorkbook>, ApiError> {
-    require_bundled_plugin_for_thread(&state.store, thread_id, "spreadsheet")?;
     let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
     let workbook = tokio::task::spawn_blocking(move || opentopia_core::preview_workbook(&preview))
         .await
@@ -3777,7 +3827,6 @@ async fn read_preview_range(
     Path((thread_id, preview_id)): Path<(Uuid, String)>,
     Query(query): Query<PreviewRangeQuery>,
 ) -> Result<Json<PreviewRange>, ApiError> {
-    require_bundled_plugin_for_thread(&state.store, thread_id, "spreadsheet")?;
     let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
     let request = PreviewRangeRequest {
         sheet: query.sheet,
@@ -3801,22 +3850,6 @@ fn bundled_plugin_enabled_for_thread(
     thread_id: Uuid,
     plugin_name: &str,
 ) -> Result<bool, ApiError> {
-    bundled_plugin_contribution_enabled_for_thread(
-        store,
-        thread_id,
-        plugin_name,
-        ContributionKind::NativeTool,
-    )
-}
-
-fn bundled_plugin_contribution_enabled_for_thread(
-    store: &SqliteSessionStore,
-    thread_id: Uuid,
-    plugin_name: &str,
-    kind: ContributionKind,
-) -> Result<bool, ApiError> {
-    bundled_plugin_metadata(plugin_name)
-        .ok_or_else(|| ApiError::internal(format!("unknown bundled plugin: {plugin_name}")))?;
     let thread = store
         .get_thread(thread_id)?
         .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
@@ -3828,28 +3861,9 @@ fn bundled_plugin_contribution_enabled_for_thread(
     };
     let contributions = plugins_api::active_contributions_for_thread(store, &thread)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    Ok(contributions
-        .iter()
-        .any(|contribution| contribution.plugin_id == plugin.id && contribution.kind == kind))
-}
-
-fn require_bundled_plugin_for_thread(
-    store: &SqliteSessionStore,
-    thread_id: Uuid,
-    plugin_name: &str,
-) -> Result<(), ApiError> {
-    if bundled_plugin_contribution_enabled_for_thread(
-        store,
-        thread_id,
-        plugin_name,
-        ContributionKind::Previewer,
-    )? {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(format!(
-            "bundled plugin {plugin_name} is disabled for this thread"
-        )))
-    }
+    Ok(contributions.iter().any(|contribution| {
+        contribution.plugin_id == plugin.id && contribution.kind == ContributionKind::NativeTool
+    }))
 }
 
 fn resolve_preview_id_for_thread(
@@ -3915,6 +3929,7 @@ fn preview_api_error(error: PreviewError) -> ApiError {
             StatusCode::NOT_FOUND
         }
         PreviewError::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        PreviewError::Delimited { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         PreviewError::InvalidPreviewId(_)
         | PreviewError::ParentDirectoryNotAllowed
         | PreviewError::OutsideWorkspace(_)
@@ -4698,6 +4713,49 @@ async fn run_browser_command(
     }
     .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(Json(result))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRuntimeStatus {
+    route: BrowserRuntimeRoute,
+    chrome_available: bool,
+}
+
+async fn get_browser_runtime(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+) -> Result<Json<BrowserRuntimeStatus>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let session = BrowserSessionId::from_thread(thread_id);
+    Ok(Json(BrowserRuntimeStatus {
+        route: state.browser_router.route_for(session).await,
+        chrome_available: state.browser_router.chrome_available(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BindBrowserRuntimeRequest {
+    route: BrowserRuntimeRoute,
+}
+
+async fn bind_browser_runtime(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Json(request): Json<BindBrowserRuntimeRequest>,
+) -> Result<Json<BrowserRuntimeStatus>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let session = BrowserSessionId::from_thread(thread_id);
+    state
+        .browser_router
+        .bind(BrowserSessionSpec::from(session), request.route)
+        .await
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    Ok(Json(BrowserRuntimeStatus {
+        route: request.route,
+        chrome_available: state.browser_router.chrome_available(),
+    }))
 }
 
 fn browser_required<'a>(value: &'a Option<String>, field: &str) -> Result<&'a str, ApiError> {
@@ -6242,15 +6300,55 @@ fn sync_thread_bundled_plugin_activations(
             BTreeSet::new()
         }
     };
-    let activations = discover_plugins(Some(&thread.workspace_root))
-        .into_iter()
+    let plugins = discover_plugins(Some(&thread.workspace_root));
+    let activations = plugins
+        .iter()
         .filter(|plugin| !plugin.native_capabilities.is_empty())
         .map(|plugin| {
             let enabled = active_native_plugins.contains(&plugin.id);
-            (plugin.name, enabled)
+            (plugin.name.clone(), enabled)
         })
         .collect::<HashMap<_, _>>();
     agent.set_bundled_plugin_activations(&activations);
+
+    let allowed_applications = plugins
+        .iter()
+        .find(|plugin| plugin.name == "computer-use")
+        .filter(|plugin| active_native_plugins.contains(&plugin.id))
+        .map(|plugin| {
+            store
+                .effective_plugin_settings(&plugin.id, &thread.workspace_root, thread_id)
+                .and_then(|settings| computer_allowed_applications(&settings))
+        })
+        .transpose();
+    match allowed_applications {
+        Ok(Some(applications)) => agent.set_computer_allowed_applications(applications),
+        Ok(None) => agent.set_computer_allowed_applications(Vec::<String>::new()),
+        Err(err) => {
+            error!(?err, %thread_id, "failed to resolve Computer Use application allowlist");
+            agent.set_computer_allowed_applications(Vec::<String>::new());
+        }
+    }
+}
+
+fn computer_allowed_applications(settings: &Value) -> anyhow::Result<Vec<String>> {
+    let Some(value) = settings.get("allowedApplications") else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .context("computer-use allowedApplications must be an array")?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .context("computer-use allowedApplications entries must be non-empty strings")
+        })
+        .collect()
 }
 
 fn attachment_preloaded_tools(messages: &[Message]) -> BTreeSet<&'static str> {
@@ -12006,7 +12104,44 @@ mod tests {
     }
 
     #[test]
-    fn bundled_plugin_requires_permission_grants_and_honors_thread_disable() {
+    fn default_office_plugins_project_uploaded_pdf_and_document_tools() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        plugins_api::ensure_default_bundled_plugin_permissions(&store)
+            .expect("bootstrap default Office permissions");
+        let workspace = std::env::current_dir().expect("cwd");
+        let thread = store.create_thread(None, workspace).expect("create thread");
+        store
+            .append_message(source_message(thread.id, "brief.pdf", "application/pdf"))
+            .expect("store PDF attachment");
+        store
+            .append_message(source_message(
+                thread.id,
+                "guide.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ))
+            .expect("store DOCX attachment");
+
+        let mut agent = AgentCore::default();
+        sync_thread_bundled_plugin_activations(&store, thread.id, &mut agent);
+        sync_thread_attachment_tool_preloads(&store, thread.id, &mut agent);
+
+        let exposed = agent
+            .provider_tool_catalog()
+            .into_iter()
+            .map(|candidate| candidate.name)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            exposed.contains("pdf"),
+            "PDF tool was not exposed: {exposed:?}"
+        );
+        assert!(
+            exposed.contains("document"),
+            "Document tool was not exposed: {exposed:?}"
+        );
+    }
+
+    #[test]
+    fn model_plugin_requires_permission_grants_and_honors_thread_disable() {
         let store = SqliteSessionStore::open(":memory:").expect("open store");
         let workspace = std::env::current_dir().expect("cwd");
         let thread = store
@@ -12033,9 +12168,28 @@ mod tests {
             !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
                 .expect("persisted activation")
         );
-        let error = require_bundled_plugin_for_thread(&store, thread.id, "spreadsheet")
-            .expect_err("disabled preview capability must be rejected");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn computer_application_allowlist_parsing_is_strict() {
+        assert_eq!(
+            computer_allowed_applications(&json!({
+                "allowedApplications": ["OpenTopia.exe", " chrome.exe "]
+            }))
+            .expect("valid allowlist"),
+            vec!["OpenTopia.exe", "chrome.exe"]
+        );
+        assert!(computer_allowed_applications(&json!({
+            "allowedApplications": "OpenTopia.exe"
+        }))
+        .is_err());
+        assert!(computer_allowed_applications(&json!({
+            "allowedApplications": [""]
+        }))
+        .is_err());
+        assert!(computer_allowed_applications(&json!({}))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -3,7 +3,9 @@ use crate::background::{BackgroundProcessRegistry, BackgroundScope};
 use crate::base_prompt::{base_agent_prompt, base_prompt_module_ids};
 use crate::browser::{BrowserRuntime, BrowserRuntimeConfig, LocalBrowserRuntime};
 use crate::bundled_plugins::bundled_plugin_catalog;
-use crate::computer::{ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime};
+use crate::computer::{
+    ComputerAccessPolicy, ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime,
+};
 use crate::effect_journal::{EffectIntent, EffectKind, EffectSideEffectClass, EffectStatus};
 use crate::enterprise::CapabilityProjection;
 use crate::execution::{ExecutionFailure, ExecutionStage, ShellDialect};
@@ -38,12 +40,13 @@ use crate::prompt_runtime::{
     PromptRuntimeCapabilities, RuntimeSurface,
 };
 use crate::provider::{
-    estimate_provider_tool_surface_tokens, guardian_provider_from_settings, provider_from_settings,
-    redact_model_observation, tool_input_schema_error, IncompleteReason, MockProvider,
-    ModelConversationMessage, ModelConversationRole, ModelDecision, ModelProvider, ModelRequest,
-    ModelResponse, ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider,
-    PromptCacheBreakpointPolicy, ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure,
-    ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
+    estimate_provider_tool_surface_tokens, guardian_provider_from_settings,
+    invalid_tool_arguments_json_details, provider_from_settings, redact_model_observation,
+    tool_input_schema_error, IncompleteReason, MockProvider, ModelConversationMessage,
+    ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
+    ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider, PromptCacheBreakpointPolicy,
+    ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace,
+    ProviderToolResult, ProviderTransportEvent,
 };
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::settings::{
@@ -120,6 +123,7 @@ const REPEATED_TOOL_CALL_REPORT_THRESHOLD: usize = 3;
 /// Invalid calls are never useful polling. Stop the turn once a provider repeats
 /// the exact same schema-invalid call instead of spending the rollout budget on it.
 const INVALID_TOOL_CALL_REPEAT_LIMIT: usize = 3;
+const INVALID_TOOL_ARGUMENT_JSON_ROUND_LIMIT: usize = 3;
 /// Keep independent tool work bounded so a provider cannot fan out an
 /// unbounded number of processes, writes, or external calls in one model round.
 const MAX_PARALLEL_TOOL_CALLS: usize = 8;
@@ -291,10 +295,24 @@ pub struct TurnRuntimeState {
     /// Empty outside a suspended approval boundary.
     #[serde(default)]
     pending_batch_approval_call_ids: Vec<String>,
+    /// Consecutive model rounds containing at least one syntactically invalid
+    /// tool-arguments JSON payload. The first two are returned to the model as
+    /// non-executed tool errors; the third stops the loop.
+    #[serde(default)]
+    invalid_tool_argument_json_rounds: usize,
 }
 
 impl TurnRuntimeState {
     fn record_tool_calls(&mut self, calls: &[ProviderToolCall]) {
+        if calls
+            .iter()
+            .any(|call| invalid_tool_arguments_json_details(&call.arguments).is_some())
+        {
+            self.invalid_tool_argument_json_rounds =
+                self.invalid_tool_argument_json_rounds.saturating_add(1);
+        } else {
+            self.invalid_tool_argument_json_rounds = 0;
+        }
         for call in calls {
             self.tool_call_signatures.push(format!(
                 "{}:{}",
@@ -502,6 +520,7 @@ pub struct AgentCore {
     sandbox_config: LocalSandboxConfig,
     browser: Arc<dyn BrowserRuntime>,
     computer: Arc<dyn ComputerRuntime>,
+    computer_access_policy: ComputerAccessPolicy,
     subagents: Option<SubagentScheduler>,
     /// Commands started detached by this agent tree.
     background: BackgroundProcessRegistry,
@@ -546,6 +565,7 @@ impl Default for AgentCore {
             sandbox_config: LocalSandboxConfig::from_env(),
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             computer: Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default())),
+            computer_access_policy: ComputerAccessPolicy::default(),
             subagents: None,
             background: BackgroundProcessRegistry::default(),
             subagent_depth: 0,
@@ -590,6 +610,7 @@ impl AgentCore {
             sandbox_config: LocalSandboxConfig::from_env(),
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             computer: Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default())),
+            computer_access_policy: ComputerAccessPolicy::default(),
             subagents: None,
             background: BackgroundProcessRegistry::default(),
             subagent_depth: 0,
@@ -628,6 +649,7 @@ impl AgentCore {
             sandbox_config: settings.sandbox.to_local_sandbox_config(),
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             computer: Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default())),
+            computer_access_policy: ComputerAccessPolicy::default(),
             subagents: None,
             background: BackgroundProcessRegistry::default(),
             subagent_depth: 0,
@@ -663,6 +685,7 @@ impl AgentCore {
             sandbox_config: LocalSandboxConfig::from_env(),
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             computer: Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default())),
+            computer_access_policy: ComputerAccessPolicy::default(),
             subagents: None,
             background: BackgroundProcessRegistry::default(),
             subagent_depth: 0,
@@ -738,6 +761,14 @@ impl AgentCore {
         self.computer = computer;
     }
 
+    pub fn set_computer_allowed_applications<I, S>(&mut self, applications: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.computer_access_policy = ComputerAccessPolicy::new(applications);
+    }
+
     pub fn set_bundled_plugin_activations(&mut self, activations: &HashMap<String, bool>) {
         self.enabled_bundled_plugins = activations
             .iter()
@@ -775,6 +806,7 @@ impl AgentCore {
 
     pub fn disable_all_bundled_plugins(&mut self) {
         self.enabled_bundled_plugins.clear();
+        self.computer_access_policy = ComputerAccessPolicy::default();
     }
 
     /// Shares one background job registry across an agent tree so a parent can see
@@ -985,6 +1017,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         context.agent_path = self.agent_path.clone();
         context.browser = Some(self.browser.clone());
         context.computer = Some(self.computer.clone());
+        context.computer_access_policy = self.computer_access_policy.clone();
         context.mcp_host = self.mcp_host.clone();
         context.mcp_tools = self.active_mcp_tools.clone();
         context.model_supports_vision = self.model_supports_vision;
@@ -1778,6 +1811,14 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             );
         }
         let tool_candidates = self.provider_tool_candidates();
+        if tool_candidates
+            .iter()
+            .any(|candidate| candidate.name == "computer")
+        {
+            model_context
+                .items
+                .push(computer_use_runtime_module(&self.computer_access_policy));
+        }
         if let Some(module) = tool_search_runtime_module(&tool_candidates) {
             model_context.items.push(module);
         }
@@ -3464,6 +3505,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                     self.collaboration_mode,
                 )
             })
+            .filter(|name| self.model_supports_vision || name != "computer")
             .filter(|name| self.tool_is_allowed(name))
             // MCP tools bound as attachment-inspection backends are implementation
             // details of view_attachment, not a competing model-visible route.
@@ -3980,6 +4022,57 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         ctx: ToolContext,
         events: &mut TurnEvents,
     ) -> anyhow::Result<ProviderToolResult> {
+        if let Some(details) = invalid_tool_arguments_json_details(&provider_call.arguments) {
+            let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
+            let reason = details
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid JSON syntax");
+            let line = details
+                .get("errorLine")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let column = details
+                .get("errorColumn")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let excerpt = details
+                .get("redactedExcerpt")
+                .and_then(Value::as_str)
+                .unwrap_or("<unavailable>");
+            let output = format!(
+                "Tool `{}` was not executed because its `function.arguments` payload was not valid JSON: {reason} at line {line}, column {column}. Redacted excerpt: {excerpt}. Submit a new tool call with one valid JSON object that matches the tool schema; quote every string value (for example, use `\"fork_turns\":\"none\"`). Do not repeat the malformed call unchanged.",
+                provider_call.name
+            );
+            let mut metadata = json!({
+                "toolName": &provider_call.name,
+                "providerToolCallId": &provider_call.id,
+                "success": false,
+                "invalidToolArguments": true,
+                "invalidToolArgumentsJson": true,
+                "retryable": true,
+                "providerArgumentDiagnostics": details,
+            });
+            insert_tool_error_record(
+                &mut metadata,
+                "invalid_tool_arguments_json",
+                "provider_protocol_validation",
+                false,
+                true,
+                &output,
+            );
+            self.insert_tool_source_metadata(&provider_call.name, &mut metadata);
+            let result = ProviderToolResult {
+                call_id: provider_call.id.clone(),
+                name: provider_call.name.clone(),
+                output: output.clone(),
+                content: vec![ModelContentPart::text(output)],
+                is_error: true,
+                metadata,
+            };
+            record_provider_tool_result_event(events, call, &result);
+            return Ok(result);
+        }
         if let Some(validation_error) = self.provider_tool_input_error(provider_call) {
             let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
             let output = format!(
@@ -5244,6 +5337,31 @@ fn tool_search_runtime_module(
     )
 }
 
+fn computer_use_runtime_module(policy: &ComputerAccessPolicy) -> ModelContextItem {
+    let allowed = policy.allowed_applications();
+    let instructions = if allowed.is_empty() {
+        "Computer Use is enabled, but no application executables are allowlisted. Do not attempt desktop observation or control until the user configures allowedApplications for the computer-use plugin.".to_string()
+    } else {
+        format!(
+            "Computer Use may access only these application executables: {}. After implementing or changing visible UI, use the computer tool when a running allowlisted application is available and visual inspection would materially verify the result. Prefer read-only observation to inspect layout, overflow, overlap, focus visibility, loading/error states, and relevant viewport sizes. Do not interact unless interaction is necessary for the requested verification; input actions remain separately approval-gated.",
+            allowed.join(", ")
+        )
+    };
+    ModelContextItem::text(
+        ContextItemKind::DeveloperInstructions,
+        ContextRole::Developer,
+        "opentopia:computer_use",
+        instructions,
+        ContextCacheScope::Thread,
+        ContextSensitivity::Workspace,
+    )
+    .with_metadata(json!({
+        "assemblyClass": "conditional",
+        "promptModuleId": "computer_use",
+        "selectedBy": ["computerUsePlugin", "allowedApplications"],
+    }))
+}
+
 fn canonical_json_string(value: &Value) -> String {
     fn canonicalize(value: &Value) -> Value {
         match value {
@@ -5267,6 +5385,19 @@ fn repeated_invalid_tool_call_error(
     calls: &[ProviderToolCall],
     candidates: &[ProviderToolCandidate],
 ) -> Option<String> {
+    if calls
+        .iter()
+        .any(|call| invalid_tool_arguments_json_details(&call.arguments).is_some())
+        && runtime_state
+            .invalid_tool_argument_json_rounds
+            .saturating_add(1)
+            >= INVALID_TOOL_ARGUMENT_JSON_ROUND_LIMIT
+    {
+        return Some(format!(
+            "Stopped after the provider returned syntactically invalid tool-arguments JSON in {INVALID_TOOL_ARGUMENT_JSON_ROUND_LIMIT} consecutive model rounds. The malformed calls were not executed. This indicates a provider tool-call generation compatibility problem."
+        ));
+    }
+
     let mut signature_counts = BTreeMap::<String, usize>::new();
     for signature in &runtime_state.tool_call_signatures {
         *signature_counts.entry(signature.clone()).or_default() += 1;
@@ -7018,6 +7149,44 @@ mod tests {
         agent.insert_tool_source_metadata("computer", &mut metadata);
         assert_eq!(metadata["toolSource"], "bundled_plugin");
         assert_eq!(metadata["pluginName"], "computer-use");
+    }
+
+    #[test]
+    fn computer_tool_requires_vision_and_adds_visual_verification_guidance() {
+        let mut agent = AgentCore::default();
+        agent.set_tool_exposure_policy(ToolExposurePolicy::Eager);
+        agent.set_bundled_plugin_activations(&HashMap::from([("computer-use".to_string(), true)]));
+        agent.set_computer_allowed_applications(["OpenTopia.exe", "chrome.exe"]);
+
+        let tools = agent.provider_tool_catalog();
+        assert!(tools.iter().any(|tool| tool.name == "computer"));
+        let module = computer_use_runtime_module(&agent.computer_access_policy);
+        assert_eq!(module.metadata["promptModuleId"], "computer_use");
+        let instructions = module
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ModelContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(instructions.contains("visible UI"));
+        assert!(instructions.contains("chrome.exe, opentopia.exe"));
+
+        agent.model_supports_vision = false;
+        assert!(!agent
+            .provider_tool_catalog()
+            .iter()
+            .any(|tool| tool.name == "computer"));
+    }
+
+    #[test]
+    fn disabling_bundled_plugins_clears_computer_application_authority() {
+        let mut agent = AgentCore::default();
+        agent.set_computer_allowed_applications(["OpenTopia.exe"]);
+        assert!(!agent.computer_access_policy.is_empty());
+        agent.disable_all_bundled_plugins();
+        assert!(agent.computer_access_policy.is_empty());
     }
 
     #[test]
@@ -8832,6 +9001,170 @@ mod tests {
         assert!(result.output.contains("Do not retry this call unchanged"));
 
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn malformed_provider_arguments_are_returned_to_the_model_as_an_unexecuted_tool_error() {
+        let workspace = test_workspace("malformed-provider-tool-json");
+        let malformed = json!({
+            "$opentopiaInvalidToolArguments": {
+                "field": "function.arguments",
+                "toolName": "spawn_agent",
+                "reason": "expected value at line 1 column 47",
+                "argumentBytes": 96,
+                "fingerprint": "fnv1a64:test",
+                "errorLine": 1,
+                "errorColumn": 47,
+                "errorOffset": 46,
+                "redactedExcerpt": "…\"**********\":none,\"*******\":\"********\"…"
+            }
+        });
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_malformed_spawn".to_string(),
+                    name: "spawn_agent".to_string(),
+                    arguments: malformed,
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            },
+            ModelResponse::text("I corrected the malformed tool call."),
+        ]));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let result = agent
+            .run_turn(AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Delegate the review.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            })
+            .await
+            .expect("the model can recover from malformed tool JSON");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].previous_tool_calls[0].id,
+            "call_malformed_spawn"
+        );
+        let tool_result = &requests[1].tool_results[0];
+        assert_eq!(tool_result.call_id, "call_malformed_spawn");
+        assert!(tool_result.is_error);
+        assert_eq!(tool_result.metadata["invalidToolArgumentsJson"], true);
+        assert_eq!(tool_result.metadata["retryable"], true);
+        assert_eq!(tool_result.metadata["errorRecord"]["executed"], false);
+        assert_eq!(tool_result.metadata["errorRecord"]["retryable"], true);
+        assert!(tool_result.output.contains("was not executed"));
+        assert!(tool_result.output.contains("line 1, column 47"));
+        assert!(tool_result.output.contains(r#""fork_turns":"none""#));
+        assert!(result.iter().any(|event| matches!(
+            event,
+            AgentEventPayload::ToolCallFinished { result }
+                if result.metadata["invalidToolArgumentsJson"] == true
+        )));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn repeated_malformed_provider_argument_rounds_trip_the_circuit_breaker() {
+        let workspace = test_workspace("malformed-provider-tool-json-loop");
+        let responses = (1..=INVALID_TOOL_ARGUMENT_JSON_ROUND_LIMIT)
+            .map(|index| ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ProviderToolCall {
+                    id: format!("call_malformed_{index}"),
+                    name: "spawn_agent".to_string(),
+                    arguments: json!({
+                        "$opentopiaInvalidToolArguments": {
+                            "reason": "expected value at line 1 column 47",
+                            "errorLine": 1,
+                            "errorColumn": 47,
+                            "redactedExcerpt": "\"**********\":none"
+                        }
+                    }),
+                }],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            })
+            .collect::<Vec<_>>();
+        let provider = Arc::new(ScriptedProvider::new(responses));
+        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+        let error = agent
+            .run_turn(AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Delegate the review.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            })
+            .await
+            .expect_err("the third malformed-JSON round must stop the turn");
+
+        assert!(error
+            .to_string()
+            .contains("syntactically invalid tool-arguments JSON in 3 consecutive model rounds"));
+        assert_eq!(
+            provider.requests().len(),
+            INVALID_TOOL_ARGUMENT_JSON_ROUND_LIMIT
+        );
+        assert_eq!(provider.requests()[2].tool_results.len(), 2);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn valid_tool_round_resets_the_malformed_argument_circuit_breaker() {
+        let malformed = ProviderToolCall {
+            id: "call_malformed".to_string(),
+            name: "spawn_agent".to_string(),
+            arguments: json!({
+                "$opentopiaInvalidToolArguments": {
+                    "reason": "expected value",
+                    "errorLine": 1,
+                    "errorColumn": 47,
+                }
+            }),
+        };
+        let valid = ProviderToolCall {
+            id: "call_valid".to_string(),
+            name: "list_files".to_string(),
+            arguments: json!({ "path": "." }),
+        };
+        let mut runtime = TurnRuntimeState::default();
+
+        runtime.record_tool_calls(std::slice::from_ref(&malformed));
+        runtime.record_tool_calls(std::slice::from_ref(&malformed));
+        assert_eq!(runtime.invalid_tool_argument_json_rounds, 2);
+        runtime.record_tool_calls(std::slice::from_ref(&valid));
+        assert_eq!(runtime.invalid_tool_argument_json_rounds, 0);
+        assert!(
+            repeated_invalid_tool_call_error(&runtime, std::slice::from_ref(&malformed), &[])
+                .is_none()
+        );
     }
 
     #[tokio::test]

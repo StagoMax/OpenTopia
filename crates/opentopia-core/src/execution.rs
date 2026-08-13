@@ -14,12 +14,12 @@ use crate::sandbox::{
     build_local_sandbox_command_with_options, is_protected_metadata_path,
     sandbox_permission_profile, ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy,
     OsSandboxPlatform, SandboxBackendCapabilities, SandboxCommandStatus, SandboxLaunchOptions,
-    SandboxMode,
+    SandboxMode, SandboxPreparationPlan,
 };
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -344,6 +344,8 @@ pub struct LocalExecutionEnvironment {
     workspace_root: PathBuf,
     sandbox_config: LocalSandboxConfig,
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    prepared_sandbox_scopes: Arc<Mutex<HashSet<String>>>,
+    sandbox_preparation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl LocalExecutionEnvironment {
@@ -353,6 +355,8 @@ impl LocalExecutionEnvironment {
             workspace_root: workspace_root.into(),
             sandbox_config: LocalSandboxConfig::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
+            prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
+            sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -362,6 +366,8 @@ impl LocalExecutionEnvironment {
             workspace_root: workspace_root.into(),
             sandbox_config: LocalSandboxConfig::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
+            prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
+            sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -374,6 +380,8 @@ impl LocalExecutionEnvironment {
             workspace_root: workspace_root.into(),
             sandbox_config,
             running: Arc::new(Mutex::new(HashMap::new())),
+            prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
+            sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -387,6 +395,8 @@ impl LocalExecutionEnvironment {
             workspace_root: workspace_root.into(),
             sandbox_config,
             running: Arc::new(Mutex::new(HashMap::new())),
+            prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
+            sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -499,6 +509,90 @@ impl LocalExecutionEnvironment {
 
     fn unregister_process(&self, request_id: &str) {
         self.running.lock().unwrap().remove(request_id);
+    }
+
+    async fn prepare_sandbox_scope(
+        &self,
+        preparation: Option<&SandboxPreparationPlan>,
+        cwd: &Path,
+        startup_timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let Some(preparation) = preparation else {
+            return Ok(());
+        };
+        if self
+            .prepared_sandbox_scopes
+            .lock()
+            .unwrap()
+            .contains(&preparation.key)
+        {
+            return Ok(());
+        }
+        let scope_lock = self
+            .sandbox_preparation_locks
+            .lock()
+            .unwrap()
+            .entry(preparation.key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _scope_guard = scope_lock.lock().await;
+        if self
+            .prepared_sandbox_scopes
+            .lock()
+            .unwrap()
+            .contains(&preparation.key)
+        {
+            return Ok(());
+        }
+
+        let mut command = Command::new(&preparation.program);
+        command
+            .args(&preparation.args)
+            .envs(preparation.env.iter().cloned())
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let timeout = startup_timeout.max(Duration::from_secs(120));
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| {
+                ExecutionFailure::without_os_error(
+                    ExecutionStage::PrepareSandbox,
+                    format!(
+                        "sandbox ACL preparation timed out after {timeout:?}; no target command was started"
+                    ),
+                )
+            })?
+            .with_context(|| {
+                format!(
+                    "failed to start sandbox preparation helper {}",
+                    preparation.program
+                )
+            })?;
+        if !output.status.success() {
+            let expected_nonce = preparation
+                .env
+                .iter()
+                .find(|(key, _)| key == SANDBOX_ERROR_NONCE_ENV)
+                .map(|(_, value)| value.as_str());
+            let message = sandbox_infrastructure_error(&output.stderr, expected_nonce)
+                .unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_string());
+            return Err(ExecutionFailure::without_os_error(
+                ExecutionStage::PrepareSandbox,
+                if message.is_empty() {
+                    format!("sandbox ACL preparation exited with {}", output.status)
+                } else {
+                    message
+                },
+            )
+            .into());
+        }
+        self.prepared_sandbox_scopes
+            .lock()
+            .unwrap()
+            .insert(preparation.key.clone());
+        Ok(())
     }
 
     fn validate_execution_requirements(&self, request: &ExecRequest) -> anyhow::Result<()> {
@@ -656,6 +750,13 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
                 "local sandbox best_effort is running without OS-level isolation"
             );
         }
+
+        self.prepare_sandbox_scope(
+            command_plan.preparation.as_ref(),
+            &cwd,
+            context.startup_timeout,
+        )
+        .await?;
 
         let mut process = Command::new(&command_plan.program);
         configure_command_environment(&mut process, &request, &runtime, &effective_config);
@@ -928,6 +1029,12 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             context.timeout,
             context.termination_timeout,
         );
+        self.prepare_sandbox_scope(
+            command_plan.preparation.as_ref(),
+            &cwd,
+            context.startup_timeout,
+        )
+        .await?;
         let mut process = Command::new(&command_plan.program);
         configure_command_environment(&mut process, &request, &runtime, &self.sandbox_config);
         process

@@ -61,7 +61,7 @@ pub fn resolve_instruction_documents(workspace_root: &Path, cwd: &Path) -> Instr
     let mut remaining = MAX_TOTAL_INSTRUCTION_BYTES;
     let mut seen = HashSet::new();
 
-    for path in user_instruction_candidates() {
+    if let Some(path) = opentopia_instruction_path() {
         load_candidate(
             &path,
             InstructionScope::User,
@@ -153,14 +153,8 @@ fn load_candidate(
     });
 }
 
-fn user_instruction_candidates() -> Vec<PathBuf> {
-    let Some(home) = home_dir() else {
-        return Vec::new();
-    };
-    vec![
-        home.join(".codex").join("AGENTS.md"),
-        home.join(".opentopia").join("AGENTS.md"),
-    ]
+fn opentopia_instruction_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".opentopia").join("AGENTS.md"))
 }
 
 fn home_dir() -> Option<PathBuf> {

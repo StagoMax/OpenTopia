@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -20,6 +20,61 @@ pub const MAX_COMPUTER_WINDOWS: usize = 128;
 pub const MAX_COMPUTER_SCREENSHOT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_COMPUTER_IMAGE_EDGE: u32 = 1_440;
 const OBSERVATION_TTL_SECONDS: i64 = 120;
+
+/// Thread-scoped application allowlist for model-driven desktop access.
+/// An empty policy deliberately grants access to no windows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComputerAccessPolicy {
+    allowed_applications: HashSet<String>,
+}
+
+impl ComputerAccessPolicy {
+    pub fn new<I, S>(allowed_applications: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self {
+            allowed_applications: allowed_applications
+                .into_iter()
+                .filter_map(|value| normalize_application_name(value.as_ref()))
+                .collect(),
+        }
+    }
+
+    pub fn allows(&self, target: &WindowTarget) -> bool {
+        target
+            .executable
+            .as_deref()
+            .and_then(normalize_application_name)
+            .is_some_and(|name| self.allowed_applications.contains(&name))
+    }
+
+    pub fn allowed_applications(&self) -> Vec<&str> {
+        let mut applications = self
+            .allowed_applications
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        applications.sort_unstable();
+        applications
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allowed_applications.is_empty()
+    }
+}
+
+fn normalize_application_name(value: &str) -> Option<String> {
+    let name = value
+        .trim()
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    (!name.is_empty()).then_some(name)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1083,6 +1138,42 @@ fn platform_perform_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(executable: Option<&str>) -> WindowTarget {
+        WindowTarget {
+            window_id: "window-1".to_string(),
+            process_id: 42,
+            title: "Preview".to_string(),
+            executable: executable.map(str::to_string),
+            bounds: ScreenRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            is_foreground: true,
+        }
+    }
+
+    #[test]
+    fn application_policy_is_fail_closed_and_matches_executable_names() {
+        let empty = ComputerAccessPolicy::default();
+        assert!(!empty.allows(&window(Some("OpenTopia.exe"))));
+
+        let policy = ComputerAccessPolicy::new([
+            " OpenTopia.exe ",
+            r"C:\\Program Files\\Browser\\chrome.exe",
+            "",
+        ]);
+        assert!(policy.allows(&window(Some(r"C:\\build\\OPENTOPIA.EXE"))));
+        assert!(policy.allows(&window(Some("chrome.exe"))));
+        assert!(!policy.allows(&window(Some("powershell.exe"))));
+        assert!(!policy.allows(&window(None)));
+        assert_eq!(
+            policy.allowed_applications(),
+            vec!["chrome.exe", "opentopia.exe"]
+        );
+    }
 
     #[test]
     fn sensitive_input_is_never_forwarded_to_the_runtime() {

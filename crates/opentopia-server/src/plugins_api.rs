@@ -400,33 +400,30 @@ pub(crate) fn active_contributions_for_thread(
         .collect())
 }
 
-pub(crate) fn ensure_default_spreadsheet_permissions(
+pub(crate) fn ensure_default_bundled_plugin_permissions(
     store: &SqliteSessionStore,
 ) -> anyhow::Result<()> {
-    let Some(plugin) = discover_plugins(None).into_iter().find(|plugin| {
-        plugin.name == "spreadsheet"
-            && plugin.source == PluginSource::Bundled
-            && plugin.default_enabled
-    }) else {
-        return Ok(());
-    };
+    for plugin in discover_plugins(None)
+        .into_iter()
+        .filter(|plugin| plugin.source == PluginSource::Bundled && plugin.default_enabled)
+    {
+        // Bootstrap each official default exactly once. Any existing grant or
+        // revocation is an explicit user decision and remains authoritative.
+        if !store.list_plugin_permission_grants(&plugin.id)?.is_empty() {
+            continue;
+        }
 
-    // Bootstrap the official default exactly once. Any existing grant or
-    // revocation is an explicit user decision and must remain authoritative.
-    if !store.list_plugin_permission_grants(&plugin.id)?.is_empty() {
-        return Ok(());
-    }
-
-    let manifest = inspect_plugin_control_manifest(&plugin)?;
-    for request in &manifest.permission_requests {
-        store.set_manifest_plugin_permission_grant(
-            &plugin.id,
-            &manifest,
-            &PluginControlScope::global(),
-            &request.permission,
-            &Value::Null,
-            PluginPermissionGrantStatus::Granted,
-        )?;
+        let manifest = inspect_plugin_control_manifest(&plugin)?;
+        for request in &manifest.permission_requests {
+            store.set_manifest_plugin_permission_grant(
+                &plugin.id,
+                &manifest,
+                &PluginControlScope::global(),
+                &request.permission,
+                &Value::Null,
+                PluginPermissionGrantStatus::Granted,
+            )?;
+        }
     }
     Ok(())
 }
@@ -960,30 +957,35 @@ mod tests {
             .expect("computer bundled plugin");
 
         assert!(spreadsheet.default_enabled);
+        assert!(pdf.default_enabled);
+        assert!(documents.default_enabled);
         assert!(!browser.default_enabled);
         assert!(!computer.default_enabled);
 
         let snapshot =
             capability_snapshot_for_thread(&store, &thread).expect("capability snapshot");
-        assert!(snapshot.unavailable.iter().any(|item| {
-            item.contribution.contribution.plugin_id == spreadsheet.id
-                && matches!(
-                    item.reason,
-                    CapabilityUnavailableReason::MissingPermissions(_)
-                )
-        }));
-        for plugin in [browser, computer, pdf, documents] {
+        for plugin in [spreadsheet, pdf, documents] {
             assert!(snapshot.unavailable.iter().any(|item| {
                 item.contribution.contribution.plugin_id == plugin.id
-                    && matches!(item.reason, CapabilityUnavailableReason::Disabled)
+                    && matches!(
+                        item.reason,
+                        CapabilityUnavailableReason::MissingPermissions(_)
+                    )
             }));
             assert!(!snapshot
                 .active
                 .iter()
                 .any(|item| item.contribution.plugin_id == plugin.id));
         }
+        for plugin in [browser, computer] {
+            assert!(snapshot.unavailable.iter().any(|item| {
+                item.contribution.contribution.plugin_id == plugin.id
+                    && matches!(item.reason, CapabilityUnavailableReason::Disabled)
+            }));
+        }
 
-        ensure_default_spreadsheet_permissions(&store).expect("bootstrap spreadsheet permissions");
+        ensure_default_bundled_plugin_permissions(&store)
+            .expect("bootstrap default bundled plugin permissions");
         let snapshot = capability_snapshot_for_thread(&store, &thread)
             .expect("authorized capability snapshot");
         let spreadsheet_kinds = snapshot
@@ -994,31 +996,30 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             spreadsheet_kinds,
-            BTreeSet::from([ContributionKind::NativeTool, ContributionKind::Previewer])
+            BTreeSet::from([ContributionKind::NativeTool])
         );
 
-        for plugin in [pdf, documents] {
-            store
-                .set_plugin_activation(&plugin.id, &PluginControlScope::global(), true)
-                .expect("enable Office plugin");
-            set_all_permissions(&store, plugin, PluginPermissionGrantStatus::Granted);
-        }
-        let snapshot =
-            capability_snapshot_for_thread(&store, &thread).expect("Office capability snapshot");
-        for plugin in [pdf, documents] {
-            assert!(
-                snapshot.active.iter().any(|item| {
-                    item.contribution.plugin_id == plugin.id
-                        && item.contribution.kind == ContributionKind::NativeTool
-                }),
-                "authorized Office plugin {} was not active: {snapshot:#?}",
-                plugin.id
-            );
-        }
+        let pdf_kinds = snapshot
+            .active
+            .iter()
+            .filter(|item| item.contribution.plugin_id == pdf.id)
+            .map(|item| item.contribution.kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(pdf_kinds, BTreeSet::from([ContributionKind::NativeTool]));
+        let document_kinds = snapshot
+            .active
+            .iter()
+            .filter(|item| item.contribution.plugin_id == documents.id)
+            .map(|item| item.contribution.kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            document_kinds,
+            BTreeSet::from([ContributionKind::NativeTool])
+        );
     }
 
     #[test]
-    fn spreadsheet_permission_bootstrap_preserves_explicit_revocation() {
+    fn default_permission_bootstrap_preserves_explicit_revocation() {
         let workspace = TestWorkspace::new();
         let store = SqliteSessionStore::open(":memory:").expect("open store");
         let thread = store
@@ -1030,7 +1031,7 @@ mod tests {
             .expect("spreadsheet bundled plugin");
 
         set_all_permissions(&store, &spreadsheet, PluginPermissionGrantStatus::Revoked);
-        ensure_default_spreadsheet_permissions(&store).expect("preserve spreadsheet revocation");
+        ensure_default_bundled_plugin_permissions(&store).expect("preserve spreadsheet revocation");
 
         let snapshot =
             capability_snapshot_for_thread(&store, &thread).expect("revoked capability snapshot");

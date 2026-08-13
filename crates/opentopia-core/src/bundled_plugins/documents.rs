@@ -10,10 +10,10 @@ const FILES: &[BundledPluginFile] = &[BundledPluginFile {
 pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
     metadata: BundledPluginMetadata {
         name: "documents",
-        version: "1.2.0",
+        version: "1.3.0",
         trust: BundledPluginTrust::Official,
-        default_enabled: false,
-        native_capabilities: &["document", "document-preview"],
+        default_enabled: true,
+        native_capabilities: &["document"],
     },
     files: FILES,
 };
@@ -31,11 +31,8 @@ mod tests {
         assert_eq!(PACKAGE.metadata.name, manifest["name"]);
         assert_eq!(PACKAGE.metadata.version, manifest["version"]);
         assert_eq!(PACKAGE.metadata.trust, BundledPluginTrust::Official);
-        assert!(!PACKAGE.metadata.default_enabled);
-        assert_eq!(
-            PACKAGE.metadata.native_capabilities,
-            &["document", "document-preview"]
-        );
+        assert!(PACKAGE.metadata.default_enabled);
+        assert_eq!(PACKAGE.metadata.native_capabilities, &["document"]);
         assert_eq!(
             manifest["opentopia"]["contributes"]["nativeTools"][0]["id"],
             tool.name()
@@ -45,17 +42,12 @@ mod tests {
             "builtin:document"
         );
         assert_eq!(
-            manifest["opentopia"]["contributes"]["previewers"][0]["runtime"],
-            "builtin:document-preview"
-        );
-        assert_eq!(
             manifest["opentopia"]["requires"]["hostCapabilities"],
-            serde_json::json!([
-                "workspace.files.v1",
-                "artifact.preview.v1",
-                "nativeTool.document.v1"
-            ])
+            serde_json::json!(["workspace.files.v1", "nativeTool.document.v1"])
         );
+        assert!(manifest["opentopia"]["contributes"]
+            .get("previewers")
+            .is_none());
         assert_eq!(
             manifest["opentopia"]["permissions"]["filesystem"],
             serde_json::json!(["workspace:read"])

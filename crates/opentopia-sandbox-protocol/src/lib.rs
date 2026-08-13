@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const SANDBOX_PROTOCOL_SCHEMA: &str = "ai.opentopia.sandbox.protocol";
-pub const SANDBOX_PROTOCOL_VERSION: u32 = 2;
+pub const SANDBOX_PROTOCOL_VERSION: u32 = 3;
 pub const SANDBOX_SETUP_STATUS_SCHEMA: &str = "ai.opentopia.sandbox.setup-status";
 pub const SANDBOX_SETUP_STATUS_VERSION: u32 = 2;
 pub const REQUIRED_SANDBOX_FEATURES: &[&str] = &[
@@ -14,6 +14,7 @@ pub const REQUIRED_SANDBOX_FEATURES: &[&str] = &[
     "run.protected_roots",
     "run.resource_limits",
     "run.runtime_roots",
+    "run.explicit_acl_provisioning.v1",
     "setup.lifecycle.v1",
 ];
 

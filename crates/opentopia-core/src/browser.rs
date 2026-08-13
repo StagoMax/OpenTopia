@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Cursor;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +46,7 @@ const MAX_NETWORK_HOSTS: usize = 256;
 const OBSERVATION_TTL: Duration = Duration::from_secs(120);
 const MAX_OBSERVATIONS_PER_SESSION: usize = 12;
 const MAX_NODE_POSITION_DRIFT: f64 = 24.0;
+const MAX_CHROME_BRIDGE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// An opaque ID that should normally be derived from a thread ID. A session owns one initial tab
 /// plus any popups it creates; all sessions share the browser profile, cookie jar, cache, and
@@ -1325,7 +1327,7 @@ impl Drop for LocalBrowserProcess {
     }
 }
 
-struct LocalBrowserSession {
+pub(crate) struct LocalBrowserSession {
     page: CdpPage,
     download_dir: PathBuf,
     command_timeout: Duration,
@@ -1336,6 +1338,8 @@ struct LocalBrowserSession {
     targets: HashMap<String, LocalBrowserTarget>,
     frame_refs: HashMap<(String, String), BrowserFrameRef>,
     dialogs: Vec<BrowserDialog>,
+    owns_targets: bool,
+    supports_downloads: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1469,10 +1473,79 @@ impl LocalBrowserSession {
             targets,
             frame_refs: HashMap::new(),
             dialogs: Vec::new(),
+            owns_targets: true,
+            supports_downloads: true,
         })
     }
 
-    async fn navigate(
+    pub(crate) async fn start_external(
+        config: Arc<BrowserRuntimeConfig>,
+        bridge_url: &str,
+        bridge_token: &str,
+        session_id: BrowserSessionId,
+    ) -> Result<Self, BrowserError> {
+        let download_dir = config.data_root.join("external-downloads");
+        let mut page = CdpPage::connect_chrome_bridge(
+            bridge_url,
+            bridge_token,
+            session_id,
+            config.command_timeout,
+        )
+        .await?;
+        page.initialize_external_page_domains().await?;
+        page.enable_target_discovery().await?;
+        let target_id = page.target_id.clone().ok_or_else(|| {
+            BrowserError::Protocol("Chrome bridge returned no target ID".to_string())
+        })?;
+        let target_session_id = page.session_id.clone().ok_or_else(|| {
+            BrowserError::Protocol("Chrome bridge returned no target session".to_string())
+        })?;
+        let state = page
+            .command(
+                "Runtime.evaluate",
+                json!({
+                    "expression": "({ url: document.location.href, title: document.title })",
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
+        let value = state.pointer("/result/value").unwrap_or(&Value::Null);
+        let mut targets = HashMap::new();
+        targets.insert(
+            target_id,
+            LocalBrowserTarget {
+                target_ref: BrowserTargetRef::new(),
+                session_id: target_session_id,
+                opener_target_id: None,
+                url: value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                title: value
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+        );
+        Ok(Self {
+            page,
+            download_dir,
+            command_timeout: config.command_timeout,
+            max_snapshot_bytes: config.max_snapshot_bytes,
+            max_screenshot_bytes: config.max_screenshot_bytes,
+            max_download_bytes: config.max_download_bytes,
+            observations: HashMap::new(),
+            targets,
+            frame_refs: HashMap::new(),
+            dialogs: Vec::new(),
+            owns_targets: false,
+            supports_downloads: false,
+        })
+    }
+
+    pub(crate) async fn navigate(
         &mut self,
         request: BrowserNavigateRequest,
     ) -> Result<BrowserOutput, BrowserError> {
@@ -1778,7 +1851,7 @@ impl LocalBrowserSession {
         Ok(())
     }
 
-    async fn switch_target(
+    pub(crate) async fn switch_target(
         &mut self,
         target_ref: BrowserTargetRef,
     ) -> Result<BrowserOutput, BrowserError> {
@@ -1795,7 +1868,7 @@ impl LocalBrowserSession {
             .await
     }
 
-    async fn observe(
+    pub(crate) async fn observe(
         &mut self,
         options: BrowserObserveOptions,
     ) -> Result<BrowserObservation, BrowserError> {
@@ -1884,7 +1957,7 @@ impl LocalBrowserSession {
         })
     }
 
-    async fn screenshot(&mut self) -> Result<BrowserOutput, BrowserError> {
+    pub(crate) async fn screenshot(&mut self) -> Result<BrowserOutput, BrowserError> {
         let (bytes, capture_backend) = self.screenshot_bytes().await?;
         Ok(BrowserOutput {
             url: Some(self.current_url().await?),
@@ -2028,7 +2101,7 @@ impl LocalBrowserSession {
         Ok(())
     }
 
-    async fn observation_node(
+    pub(crate) async fn observation_node(
         &mut self,
         observation_id: BrowserObservationId,
         node_ref: BrowserNodeRef,
@@ -2036,7 +2109,7 @@ impl LocalBrowserSession {
         Ok(self.observed_node(observation_id, node_ref)?.node)
     }
 
-    async fn perform(
+    pub(crate) async fn perform(
         &mut self,
         observation_id: BrowserObservationId,
         node_ref: BrowserNodeRef,
@@ -2401,7 +2474,10 @@ impl LocalBrowserSession {
         Ok(output)
     }
 
-    async fn wait(&mut self, request: BrowserWaitRequest) -> Result<BrowserOutput, BrowserError> {
+    pub(crate) async fn wait(
+        &mut self,
+        request: BrowserWaitRequest,
+    ) -> Result<BrowserOutput, BrowserError> {
         let timeout = request.timeout.unwrap_or(self.command_timeout);
         let poll_interval = if request.poll_interval.is_zero() {
             DEFAULT_WAIT_POLL_INTERVAL
@@ -2450,10 +2526,15 @@ impl LocalBrowserSession {
         }
     }
 
-    async fn download(
+    pub(crate) async fn download(
         &mut self,
         request: BrowserDownloadRequest,
     ) -> Result<BrowserOutput, BrowserError> {
+        if !self.supports_downloads {
+            return Err(BrowserError::Protocol(
+                "Downloads are not supported for an attached personal Chrome tab".to_string(),
+            ));
+        }
         let before = list_downloads(&self.download_dir).await?;
         self.page.discard_events();
         self.page
@@ -2558,7 +2639,11 @@ impl LocalBrowserSession {
             .unwrap_or(Value::Null))
     }
 
-    async fn shutdown(&mut self) -> Result<(), BrowserError> {
+    pub(crate) async fn shutdown(&mut self) -> Result<(), BrowserError> {
+        if !self.owns_targets {
+            let _ = self.page.root_command("OpenTopia.detach", json!({})).await;
+            return Ok(());
+        }
         let target_ids = self.targets.keys().cloned().collect::<Vec<_>>();
         for target_id in target_ids {
             let _ = self
@@ -2692,6 +2777,84 @@ impl CdpPage {
         })
     }
 
+    async fn connect_chrome_bridge(
+        bridge_url: &str,
+        bridge_token: &str,
+        browser_session_id: BrowserSessionId,
+        command_timeout: Duration,
+    ) -> Result<Self, BrowserError> {
+        let base_url = validate_chrome_bridge_url(bridge_url)?;
+        let authorization =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", bridge_token.trim()))
+                .map_err(|_| {
+                    BrowserError::BrokerConfiguration("Chrome bridge token is invalid".to_string())
+                })?;
+        if bridge_token.trim().is_empty() {
+            return Err(BrowserError::BrokerConfiguration(
+                "Chrome bridge token is empty".to_string(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(command_timeout.min(Duration::from_secs(5)))
+            .build()?;
+        let session_url = base_url
+            .join(&format!("v1/backend/sessions/{browser_session_id}"))
+            .map_err(|_| BrowserError::Protocol("Invalid Chrome session endpoint".to_string()))?;
+        let response = client
+            .get(session_url)
+            .header(reqwest::header::AUTHORIZATION, authorization.clone())
+            .send()
+            .await
+            .map_err(map_chrome_bridge_transport_error)?;
+        let status = response.status();
+        let metadata = read_chrome_bridge_json(response).await?;
+        if !status.is_success() {
+            return Err(chrome_bridge_rejected(status.as_u16(), &metadata));
+        }
+        let target_id = metadata
+            .get("targetId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                BrowserError::Protocol("Chrome bridge returned no target ID".to_string())
+            })?
+            .to_string();
+
+        let (commands, command_rx) = mpsc::channel(64);
+        let (event_tx, events) = broadcast::channel(512);
+        let network_policy = Arc::new(StdRwLock::new(None));
+        let connected = Arc::new(AtomicBool::new(true));
+        tokio::spawn(run_chrome_bridge_commands(
+            client.clone(),
+            base_url.clone(),
+            authorization.clone(),
+            browser_session_id,
+            command_timeout,
+            command_rx,
+            connected.clone(),
+        ));
+        tokio::spawn(run_chrome_bridge_events(
+            client,
+            base_url,
+            authorization,
+            browser_session_id,
+            event_tx,
+            connected.clone(),
+        ));
+        Ok(Self {
+            commands,
+            events,
+            buffered_events: Vec::new(),
+            command_timeout,
+            session_id: Some("root".to_string()),
+            target_id: Some(target_id),
+            next_client_id: Arc::new(AtomicU64::new(0)),
+            network_policy,
+            connected,
+        })
+    }
+
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
     }
@@ -2744,6 +2907,26 @@ impl CdpPage {
             BrowserError::Protocol("No active CDP page session is attached".to_string())
         })?;
         self.initialize_page_domains_for_session(&session_id).await
+    }
+
+    async fn initialize_external_page_domains(&mut self) -> Result<(), BrowserError> {
+        let session_id = self.session_id.clone().ok_or_else(|| {
+            BrowserError::Protocol("No active Chrome page session is attached".to_string())
+        })?;
+        let session_id = Some(session_id);
+        self.command_for_session("Page.enable", json!({}), session_id.clone())
+            .await?;
+        self.command_for_session("Runtime.enable", json!({}), session_id.clone())
+            .await?;
+        self.command_for_session("Network.enable", json!({}), session_id.clone())
+            .await?;
+        self.command_for_session(
+            "Page.setLifecycleEventsEnabled",
+            json!({ "enabled": true }),
+            session_id,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn initialize_page_domains_for_session(
@@ -3107,6 +3290,198 @@ async fn run_cdp_connection(
     connected.store(false, Ordering::Release);
     for (_, (_, _, response)) in pending {
         let _ = response.send(Err(BrowserError::Disconnected(disconnect_reason.clone())));
+    }
+}
+
+async fn run_chrome_bridge_commands(
+    client: reqwest::Client,
+    base_url: reqwest::Url,
+    authorization: reqwest::header::HeaderValue,
+    browser_session_id: BrowserSessionId,
+    command_timeout: Duration,
+    mut commands: mpsc::Receiver<CdpCommand>,
+    connected: Arc<AtomicBool>,
+) {
+    let endpoint = match base_url.join("v1/backend/command") {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            connected.store(false, Ordering::Release);
+            return;
+        }
+    };
+    while let Some(command) = commands.recv().await {
+        match command {
+            CdpCommand::Cancel { .. } => {}
+            CdpCommand::Execute {
+                method,
+                params,
+                session_id,
+                response,
+                ..
+            } => {
+                let target_session_id = session_id.unwrap_or_else(|| "root".to_string());
+                let request = client
+                    .post(endpoint.clone())
+                    .header(reqwest::header::AUTHORIZATION, authorization.clone())
+                    .json(&json!({
+                        "sessionId": browser_session_id,
+                        "targetSessionId": target_session_id,
+                        "method": method,
+                        "params": params,
+                    }));
+                let result = match tokio::time::timeout(command_timeout, request.send()).await {
+                    Err(_) => Err(BrowserError::Timeout(method)),
+                    Ok(Err(error)) => Err(map_chrome_bridge_transport_error(error)),
+                    Ok(Ok(http_response)) => {
+                        let status = http_response.status();
+                        match read_chrome_bridge_json(http_response).await {
+                            Ok(value) if status.is_success() => {
+                                Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                            }
+                            Ok(value) => Err(chrome_bridge_rejected(status.as_u16(), &value)),
+                            Err(error) => Err(error),
+                        }
+                    }
+                };
+                if matches!(result, Err(BrowserError::BrokerUnavailable)) {
+                    connected.store(false, Ordering::Release);
+                }
+                let _ = response.send(result);
+            }
+        }
+    }
+    connected.store(false, Ordering::Release);
+}
+
+async fn run_chrome_bridge_events(
+    client: reqwest::Client,
+    base_url: reqwest::Url,
+    authorization: reqwest::header::HeaderValue,
+    browser_session_id: BrowserSessionId,
+    events: broadcast::Sender<CdpEvent>,
+    connected: Arc<AtomicBool>,
+) {
+    let endpoint = match base_url.join(&format!("v1/backend/events/{browser_session_id}")) {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            connected.store(false, Ordering::Release);
+            return;
+        }
+    };
+    let mut after = 0_u64;
+    while connected.load(Ordering::Acquire) {
+        let response = client
+            .get(endpoint.clone())
+            .header(reqwest::header::AUTHORIZATION, authorization.clone())
+            .query(&[
+                ("after", after.to_string()),
+                ("waitMs", "25000".to_string()),
+            ])
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                connected.store(false, Ordering::Release);
+                break;
+            }
+        };
+        let status = response.status();
+        let payload = match read_chrome_bridge_json(response).await {
+            Ok(payload) if status.is_success() => payload,
+            _ => {
+                connected.store(false, Ordering::Release);
+                break;
+            }
+        };
+        if payload.get("attached").and_then(Value::as_bool) == Some(false) {
+            connected.store(false, Ordering::Release);
+            break;
+        }
+        for event in payload
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(sequence) = event.get("seq").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(method) = event.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            after = after.max(sequence);
+            let _ = events.send(CdpEvent {
+                method: method.to_string(),
+                params: event.get("params").cloned().unwrap_or(Value::Null),
+                session_id: event
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+    }
+}
+
+fn validate_chrome_bridge_url(raw: &str) -> Result<reqwest::Url, BrowserError> {
+    let mut url = reqwest::Url::parse(raw.trim()).map_err(|_| {
+        BrowserError::BrokerConfiguration("Chrome bridge URL is invalid".to_string())
+    })?;
+    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
+        return Err(BrowserError::BrokerConfiguration(
+            "Chrome bridge URL must be credential-free HTTP".to_string(),
+        ));
+    }
+    let loopback = url
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    if !loopback || url.query().is_some() || url.fragment().is_some() {
+        return Err(BrowserError::BrokerConfiguration(
+            "Chrome bridge URL must use a numeric loopback address".to_string(),
+        ));
+    }
+    url.set_path(&format!("{}/", url.path().trim_end_matches('/')));
+    Ok(url)
+}
+
+async fn read_chrome_bridge_json(response: reqwest::Response) -> Result<Value, BrowserError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CHROME_BRIDGE_RESPONSE_BYTES as u64)
+    {
+        return Err(BrowserError::BrokerResponseTooLarge {
+            actual: response.content_length().unwrap_or_default() as usize,
+            maximum: MAX_CHROME_BRIDGE_RESPONSE_BYTES,
+        });
+    }
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CHROME_BRIDGE_RESPONSE_BYTES {
+        return Err(BrowserError::BrokerResponseTooLarge {
+            actual: bytes.len(),
+            maximum: MAX_CHROME_BRIDGE_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| BrowserError::Protocol("Chrome bridge returned invalid JSON".to_string()))
+}
+
+fn chrome_bridge_rejected(status: u16, body: &Value) -> BrowserError {
+    let message = body
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("Chrome bridge rejected the request")
+        .chars()
+        .take(512)
+        .collect();
+    BrowserError::BrokerRejected { status, message }
+}
+
+fn map_chrome_bridge_transport_error(error: reqwest::Error) -> BrowserError {
+    if error.is_timeout() {
+        BrowserError::Timeout("Chrome bridge response".to_string())
+    } else {
+        BrowserError::BrokerUnavailable
     }
 }
 

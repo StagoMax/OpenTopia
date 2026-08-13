@@ -24,6 +24,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -199,12 +200,22 @@ struct Job {
     started_at: DateTime<Utc>,
     cancel: CancellationToken,
     finished: CancellationToken,
+    /// Monotonic notification used by blocking readers. Unlike a one-shot
+    /// completion token, this also wakes an interactive reader when new output
+    /// arrives without requiring the model to poll snapshots.
+    changes: watch::Sender<u64>,
     max_buffered_bytes: usize,
     session: Option<InteractiveSession>,
     state: Mutex<JobState>,
 }
 
 impl Job {
+    fn signal_change(&self) {
+        self.changes.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, JobState> {
         self.state
             .lock()
@@ -248,6 +259,8 @@ impl BackgroundOutputSink for JobSink {
             OutputStream::Stdout => state.stdout.push(chunk, max),
             OutputStream::Stderr => state.stderr.push(chunk, max),
         }
+        drop(state);
+        self.job.signal_change();
     }
 }
 
@@ -331,6 +344,7 @@ impl BackgroundProcessRegistry {
 
         let cancel = CancellationToken::new();
         let finished = CancellationToken::new();
+        let (changes, _) = watch::channel(0_u64);
         let job = Arc::new(Job {
             id: Uuid::new_v4(),
             scope,
@@ -338,6 +352,7 @@ impl BackgroundProcessRegistry {
             started_at: Utc::now(),
             cancel: cancel.clone(),
             finished: finished.clone(),
+            changes,
             max_buffered_bytes: self.inner.config.max_buffered_bytes,
             session: None,
             state: Mutex::new(JobState {
@@ -436,6 +451,7 @@ impl BackgroundProcessRegistry {
                 }
             }
             drop(state);
+            job.signal_change();
             finished.cancel();
         });
 
@@ -485,6 +501,7 @@ impl BackgroundProcessRegistry {
                 }
             }
             drop(state);
+            job.signal_change();
             finished.cancel();
         });
         Ok(snapshot)
@@ -526,6 +543,7 @@ impl BackgroundProcessRegistry {
         let cancel = CancellationToken::new();
         let session_done = CancellationToken::new();
         let finished = CancellationToken::new();
+        let (changes, _) = watch::channel(0_u64);
         if let Some(turn_cancel) = context.cancel.take() {
             let session_cancel = cancel.clone();
             let session_finished = session_done.clone();
@@ -551,6 +569,7 @@ impl BackgroundProcessRegistry {
             started_at: Utc::now(),
             cancel: cancel.clone(),
             finished: finished.clone(),
+            changes,
             max_buffered_bytes: self.inner.config.max_buffered_bytes,
             session: Some(InteractiveSession {
                 inner: session.clone(),
@@ -578,15 +597,20 @@ impl BackgroundProcessRegistry {
             loop {
                 match stdout_session.read_stdout().await {
                     Ok(bytes) if bytes.is_empty() => break,
-                    Ok(bytes) => stdout_job
-                        .lock()
-                        .stdout
-                        .push(&bytes, stdout_job.max_buffered_bytes),
+                    Ok(bytes) => {
+                        stdout_job
+                            .lock()
+                            .stdout
+                            .push(&bytes, stdout_job.max_buffered_bytes);
+                        stdout_job.signal_change();
+                    }
                     Err(error) => {
                         let mut state = stdout_job.lock();
                         if state.error.is_none() {
                             state.error = Some(format!("failed to read session stdout: {error}"));
                         }
+                        drop(state);
+                        stdout_job.signal_change();
                         break;
                     }
                 }
@@ -598,15 +622,20 @@ impl BackgroundProcessRegistry {
             loop {
                 match stderr_session.read_stderr().await {
                     Ok(bytes) if bytes.is_empty() => break,
-                    Ok(bytes) => stderr_job
-                        .lock()
-                        .stderr
-                        .push(&bytes, stderr_job.max_buffered_bytes),
+                    Ok(bytes) => {
+                        stderr_job
+                            .lock()
+                            .stderr
+                            .push(&bytes, stderr_job.max_buffered_bytes);
+                        stderr_job.signal_change();
+                    }
                     Err(error) => {
                         let mut state = stderr_job.lock();
                         if state.error.is_none() {
                             state.error = Some(format!("failed to read session stderr: {error}"));
                         }
+                        drop(state);
+                        stderr_job.signal_change();
                         break;
                     }
                 }
@@ -667,6 +696,7 @@ impl BackgroundProcessRegistry {
                 }
             }
             drop(state);
+            job.signal_change();
             finished.cancel();
         });
 
@@ -741,6 +771,46 @@ impl BackgroundProcessRegistry {
             }
         }
         self.read_output(scope, job_id).map(Some)
+    }
+
+    /// Waits for a useful read instead of returning an unchanged running
+    /// snapshot. Ordinary detached commands wait for completion; interactive
+    /// sessions also wake as soon as either stream has unread output. `None`
+    /// means the deadline elapsed without the requested state change.
+    pub async fn wait_for_readable_output(
+        &self,
+        scope: &BackgroundScope,
+        job_id: Uuid,
+        wait: Duration,
+    ) -> anyhow::Result<Option<BackgroundOutputChunk>> {
+        let job = self.visible(scope, job_id)?;
+        let mut changes = job.changes.subscribe();
+        let deadline = tokio::time::Instant::now() + wait;
+        // Detached commands already push their terminal result into the next
+        // model round, so exposing every compiler/log chunk would merely invite
+        // another polling loop. Interactive sessions are different: their
+        // output may be a prompt the model must answer before the process can
+        // terminate.
+        let terminal_only = job.session.is_none();
+
+        loop {
+            let ready = {
+                let state = job.lock();
+                state.status.is_terminal()
+                    || (!terminal_only
+                        && (!state.stdout.unread.is_empty() || !state.stderr.unread.is_empty()))
+            };
+            if ready {
+                return self.read_output(scope, job_id).map(Some);
+            }
+
+            if tokio::time::timeout_at(deadline, changes.changed())
+                .await
+                .is_err()
+            {
+                return Ok(None);
+            }
+        }
     }
 
     pub fn list(&self, scope: &BackgroundScope) -> Vec<BackgroundJobSnapshot> {
@@ -982,6 +1052,127 @@ mod tests {
         registry
             .stop(&scope, snapshot.job_id)
             .expect("stop succeeds");
+        wait_until_terminal(&registry, &scope, snapshot.job_id).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_read_wait_does_not_return_an_unchanged_running_snapshot() {
+        let root = workspace("read-waits-for-terminal");
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let command = if cfg!(windows) {
+            "Write-Output early; Start-Sleep -Milliseconds 350; Write-Output done"
+        } else {
+            "echo early; sleep 0.35; echo done"
+        };
+        let snapshot = registry
+            .spawn(
+                environment(&root),
+                BackgroundSpawnRequest {
+                    scope: scope.clone(),
+                    command: command.to_string(),
+                    request: ExecRequest::shell(command).cwd(&root),
+                    context: ExecutionContext::with_timeout(Duration::from_secs(30)),
+                },
+            )
+            .expect("spawn succeeds");
+
+        let started = std::time::Instant::now();
+        let output = registry
+            .wait_for_readable_output(&scope, snapshot.job_id, Duration::from_secs(5))
+            .await
+            .expect("wait succeeds")
+            .expect("command reaches a useful state");
+
+        assert!(output.job.status.is_terminal());
+        assert!(output.stdout.contains("early"));
+        assert!(output.stdout.contains("done"));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(registry.pending_completions(&scope).is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_read_wait_can_time_out_without_consuming_an_unchanged_job() {
+        let root = workspace("read-wait-timeout");
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        let snapshot = registry
+            .spawn(
+                environment(&root),
+                BackgroundSpawnRequest {
+                    scope: scope.clone(),
+                    command: command.to_string(),
+                    request: ExecRequest::shell(command).cwd(&root),
+                    context: ExecutionContext::with_timeout(Duration::from_secs(30)),
+                },
+            )
+            .expect("spawn succeeds");
+
+        let output = registry
+            .wait_for_readable_output(&scope, snapshot.job_id, Duration::from_millis(50))
+            .await
+            .expect("wait succeeds");
+        assert!(output.is_none());
+        assert_eq!(
+            registry
+                .list(&scope)
+                .into_iter()
+                .find(|job| job.job_id == snapshot.job_id)
+                .expect("job remains visible")
+                .status,
+            BackgroundJobStatus::Running
+        );
+
+        registry
+            .stop(&scope, snapshot.job_id)
+            .expect("stop succeeds");
+        wait_until_terminal(&registry, &scope, snapshot.job_id).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_read_wait_wakes_on_interactive_output_before_exit() {
+        let root = workspace("read-waits-for-interactive-output");
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let command = if cfg!(windows) {
+            "Write-Output prompt; $line = [Console]::In.ReadLine(); Write-Output \"got:$line\""
+        } else {
+            "printf 'prompt\\n'; read line; echo got:$line"
+        };
+        let snapshot = registry
+            .spawn_session(
+                environment(&root),
+                BackgroundSessionSpawnRequest {
+                    scope: scope.clone(),
+                    command: command.to_string(),
+                    request: ExecRequest::shell(command).cwd(&root),
+                    context: ExecutionContext::with_timeout(Duration::from_secs(30)),
+                },
+            )
+            .await
+            .expect("session starts");
+
+        let output = registry
+            .wait_for_readable_output(&scope, snapshot.job_id, Duration::from_secs(5))
+            .await
+            .expect("wait succeeds")
+            .expect("interactive output arrives");
+        assert_eq!(output.job.status, BackgroundJobStatus::Running);
+        assert!(output.stdout.to_ascii_lowercase().contains("prompt"));
+
+        registry
+            .write_stdin(&scope, snapshot.job_id, b"hello\n")
+            .await
+            .expect("stdin write succeeds");
         wait_until_terminal(&registry, &scope, snapshot.job_id).await;
         let _ = std::fs::remove_dir_all(root);
     }

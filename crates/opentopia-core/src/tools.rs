@@ -12,8 +12,8 @@ use crate::browser::{
 };
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::computer::{
-    ComputerAction, ComputerMouseButton, ComputerPolicyContext, ComputerRuntime, ComputerSessionId,
-    ObserveOptions,
+    ComputerAccessPolicy, ComputerAction, ComputerMouseButton, ComputerPolicyContext,
+    ComputerRuntime, ComputerSessionId, ObserveOptions, WindowTarget,
 };
 use crate::context_sources::{
     load_context_sources, ContextSourceKind, ContextSourcePolicy, LoadedContextSource,
@@ -67,6 +67,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,6 +95,8 @@ pub struct ToolContext {
     pub agent_path: String,
     pub browser: Option<Arc<dyn BrowserRuntime>>,
     pub computer: Option<Arc<dyn ComputerRuntime>>,
+    /// Application executables explicitly approved for model-driven desktop access.
+    pub computer_access_policy: ComputerAccessPolicy,
     /// Shared host runtime for deterministic Office parsing, conversion, and rendering.
     pub artifact_runtime: Arc<ArtifactRuntime>,
     /// MCP tools activated for this thread. Attachment analysis may route image bytes only to
@@ -152,6 +155,7 @@ impl ToolContext {
             agent_path: "/root".to_string(),
             browser: None,
             computer: None,
+            computer_access_policy: ComputerAccessPolicy::default(),
             artifact_runtime: ArtifactRuntime::shared(),
             mcp_host: None,
             mcp_tools: Vec::new(),
@@ -188,6 +192,7 @@ impl ToolContext {
             agent_path: "/root".to_string(),
             browser: None,
             computer: None,
+            computer_access_policy: ComputerAccessPolicy::default(),
             artifact_runtime: ArtifactRuntime::shared(),
             mcp_host: None,
             mcp_tools: Vec::new(),
@@ -3368,7 +3373,7 @@ impl TypedTool for BrowserTool {
                             "startedAt": job.started_at,
                             "autoDetached": true,
                             "yieldTimeMs": yield_time_ms,
-                            "note": "The download is still running. Completion is delivered automatically; background_output checks its status or cancels the tracked wait."
+                            "note": "The download is still running. Carry on with independent work; completion is delivered automatically. Use background_output only to stop it or to wait when no independent work remains."
                         });
                         return Ok(ToolResult {
                             call_id,
@@ -3535,7 +3540,16 @@ impl TypedTool for ComputerTool {
     }
 
     fn description(&self) -> &str {
-        "Observe and operate a user-approved desktop window. First list windows, then observe one window. Every input action must use the latest observationId and requires explicit approval. Never use this tool for passwords, secrets, payments, publishing, deletion, UAC, or the entire desktop."
+        "Observe and operate an application window from the user's executable allowlist. First list windows, then observe one window. Read-only listing and observation do not grant input control. Every input action must use the latest observationId and requires explicit approval. Never use this tool for passwords, secrets, payments, publishing, deletion, UAC, or the entire desktop."
+    }
+
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        match input.action {
+            ComputerActionInput::ListWindows | ComputerActionInput::Observe => {
+                ToolExecutionPolicy::read_only(vec!["computer:windows".to_string()])
+            }
+            _ => ToolExecutionPolicy::conservative(),
+        }
     }
 
     async fn execute_typed(
@@ -3557,15 +3571,17 @@ impl TypedTool for ComputerTool {
 
         match input.action {
             ComputerActionInput::ListWindows => {
-                require_computer_approval(
-                    &ctx,
-                    "Listing desktop window titles requires approval.",
-                )?;
-                let windows = runtime.list_windows(session).await?;
+                let windows = allowed_computer_windows(
+                    runtime.as_ref(),
+                    session,
+                    &ctx.computer_access_policy,
+                )
+                .await?;
                 let value = json!({
                     "sessionId": session,
                     "windows": windows,
                     "truncated": false,
+                    "allowlistConfigured": !ctx.computer_access_policy.is_empty(),
                 });
                 return Ok(computer_tool_result(
                     call_id,
@@ -3576,17 +3592,16 @@ impl TypedTool for ComputerTool {
                 ));
             }
             ComputerActionInput::Observe => {
-                require_computer_approval(
-                    &ctx,
-                    "Capturing a desktop window requires approval. The grant applies only to this requested window observation.",
-                )?;
                 let window_id = required_typed_string(input.window_id.as_deref(), "windowId")?;
-                let target = runtime
-                    .list_windows(session)
-                    .await?
-                    .into_iter()
-                    .find(|target| target.window_id == window_id)
-                    .context("windowId is not a visible controllable desktop window")?;
+                let target = allowed_computer_windows(
+                    runtime.as_ref(),
+                    session,
+                    &ctx.computer_access_policy,
+                )
+                .await?
+                .into_iter()
+                .find(|target| target.window_id == window_id)
+                .context("windowId is not an allowlisted visible desktop window")?;
                 let observation = runtime
                     .observe(session, target, ObserveOptions::default())
                     .await?;
@@ -3617,6 +3632,7 @@ impl TypedTool for ComputerTool {
         let target = runtime
             .target_for_observation(session, action.observation_id())
             .await?;
+        ensure_computer_target_allowed(&ctx.computer_access_policy, &target)?;
         enforce_policy_decision(
             ctx.policy.inspect_computer_action(
                 &target,
@@ -3648,11 +3664,31 @@ impl TypedTool for ComputerTool {
 
 impl_typed_tool!(ComputerTool);
 
-fn require_computer_approval(ctx: &ToolContext, reason: &str) -> anyhow::Result<()> {
-    if ctx.approval_granted {
-        return Ok(());
+async fn allowed_computer_windows(
+    runtime: &dyn ComputerRuntime,
+    session: ComputerSessionId,
+    policy: &ComputerAccessPolicy,
+) -> anyhow::Result<Vec<WindowTarget>> {
+    Ok(runtime
+        .list_windows(session)
+        .await?
+        .into_iter()
+        .filter(|target| policy.allows(target))
+        .collect())
+}
+
+fn ensure_computer_target_allowed(
+    policy: &ComputerAccessPolicy,
+    target: &WindowTarget,
+) -> anyhow::Result<()> {
+    if policy.allows(target) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "desktop application `{}` is not in the Computer Use allowlist",
+            target.executable.as_deref().unwrap_or("unknown")
+        )
     }
-    Err(ApprovalRequired::new(reason).into())
 }
 
 fn parse_computer_action(input: ComputerInput) -> anyhow::Result<ComputerAction> {
@@ -3950,16 +3986,32 @@ fn browser_observation_to_tool_result(
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ForkTurnsLabel {
+    None,
+    All,
+}
+
+impl ForkTurnsLabel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum ForkTurnsInput {
-    Label(String),
-    Count(u64),
+    Label(ForkTurnsLabel),
+    Count(NonZeroU64),
 }
 
 impl ForkTurnsInput {
     fn into_string(self) -> String {
         match self {
-            Self::Label(value) => value,
+            Self::Label(value) => value.as_str().to_string(),
             Self::Count(value) => value.to_string(),
         }
     }
@@ -6478,7 +6530,7 @@ const MAX_BACKGROUND_TIMEOUT_SECONDS: u64 = 21_600;
 const DEFAULT_BACKGROUND_TIMEOUT_SECONDS: u64 = 3_600;
 /// Keep ordinary commands feeling synchronous, then yield the model instead of
 /// letting one slow process hold an entire parallel tool batch hostage.
-const DEFAULT_FOREGROUND_YIELD_MILLISECONDS: u64 = 10_000;
+const DEFAULT_FOREGROUND_YIELD_MILLISECONDS: u64 = 30_000;
 const MAX_FOREGROUND_YIELD_MILLISECONDS: u64 = 60_000;
 
 fn background_scope(ctx: &ToolContext) -> anyhow::Result<BackgroundScope> {
@@ -6517,6 +6569,11 @@ struct BackgroundOutputInput {
     /// Append a newline to data. Defaults to false.
     #[serde(default)]
     append_newline: bool,
+    /// Maximum time a read waits for useful output or completion. Defaults to
+    /// one hour. Zero requests an immediate snapshot.
+    #[serde(default, alias = "timeoutMs")]
+    #[schemars(range(min = 0, max = 3600000))]
+    timeout_ms: Option<u64>,
 }
 
 #[async_trait]
@@ -6528,7 +6585,7 @@ impl TypedTool for BackgroundOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Control background jobs and persistent stdio sessions you started: list them, read new output, write input to an interactive session, or stop one. You do not need to poll for completion; a finished job reports itself."
+        "Control background jobs and persistent stdio sessions you started: list them, read, write input, or stop one. Read is a cancellable wait, not a polling snapshot: for ordinary commands it waits for terminal completion, and for interactive sessions it also returns on new output. It defaults to one hour; set timeoutMs to 0 only when an immediate snapshot is genuinely needed."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -6618,12 +6675,34 @@ impl TypedTool for BackgroundOutputTool {
             }
             BackgroundOutputActionInput::Read => {
                 let job_id = job_id.context("background_output read requires jobId")?;
-                let chunk = registry.read_output(&scope, job_id)?;
+                let timeout_ms = input
+                    .timeout_ms
+                    .unwrap_or(MAX_WAIT_TIMEOUT_MS)
+                    .min(MAX_WAIT_TIMEOUT_MS);
+                let chunk = if timeout_ms == 0 {
+                    registry.read_output(&scope, job_id)?
+                } else {
+                    match await_cancellable(
+                        ctx.cancel.as_ref(),
+                        registry.wait_for_readable_output(
+                            &scope,
+                            job_id,
+                            Duration::from_millis(timeout_ms),
+                        ),
+                    )
+                    .await??
+                    {
+                        Some(chunk) => chunk,
+                        None => registry.read_output(&scope, job_id)?,
+                    }
+                };
                 let metadata = json!({
                     "jobId": job_id,
                     "status": chunk.job.status.as_str(),
                     "terminal": chunk.job.status.is_terminal(),
                     "exitCode": chunk.job.exit_code,
+                    "waited": timeout_ms > 0,
+                    "timeoutMs": timeout_ms,
                     "success": true
                 });
                 (serde_json::to_value(&chunk)?, metadata)
@@ -6919,9 +6998,9 @@ fn shell_background_result(
     yield_time_ms: Option<u64>,
 ) -> anyhow::Result<ToolResult> {
     let note = if auto_detached {
-        "The command exceeded the foreground wait and is still running. Carry on with independent work: completion is delivered automatically, and background_output reads progress or stops it."
+        "The command exceeded the foreground wait and is still running. Carry on with independent work; completion is delivered automatically. Use background_output only to stop it, interact with it, or wait when no independent work remains."
     } else {
-        "The command is running detached. Carry on with other work: completion is delivered automatically, and background_output reads progress or stops it."
+        "The command is running detached. Carry on with independent work; completion is delivered automatically. Use background_output only to stop it, interact with it, or wait when no independent work remains."
     };
     let value = json!({
         "jobId": job.job_id,
@@ -8697,6 +8776,9 @@ fn decode_mcp_base64(value: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::computer::{
+        ComputerActionReceipt, ComputerError, ComputerObservation, ComputerScreenshot, ScreenRect,
+    };
     use crate::model::{ContextSourceRef, Message, MessageRole};
     use crate::policy::{BasicPolicyEngine, PermissionMode};
     use crate::store::SqliteSessionStore;
@@ -8704,6 +8786,217 @@ mod tests {
         NoopSubagentObserver, SubagentExecutor, SubagentRun, SubagentSchedulerConfig,
     };
     use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct ComputerRuntimeFixture {
+        windows: Vec<WindowTarget>,
+    }
+
+    impl ComputerRuntimeFixture {
+        fn window(window_id: &str, executable: &str) -> WindowTarget {
+            WindowTarget {
+                window_id: window_id.to_string(),
+                process_id: 42,
+                title: format!("{executable} preview"),
+                executable: Some(executable.to_string()),
+                bounds: ScreenRect {
+                    x: 10,
+                    y: 20,
+                    width: 800,
+                    height: 600,
+                },
+                is_foreground: true,
+            }
+        }
+
+        fn observation(session: ComputerSessionId, target: WindowTarget) -> ComputerObservation {
+            ComputerObservation {
+                observation_id: "obs_fixture".to_string(),
+                session_id: session,
+                capture_rect: target.bounds,
+                target,
+                image_width: 800,
+                image_height: 600,
+                screenshot: Some(ComputerScreenshot {
+                    mime_type: "image/png".to_string(),
+                    bytes: vec![0x89, b'P', b'N', b'G'],
+                }),
+                accessibility_tree: None,
+                unstable: false,
+                captured_at: chrono::Utc::now(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ComputerRuntime for ComputerRuntimeFixture {
+        async fn list_windows(
+            &self,
+            _session: ComputerSessionId,
+        ) -> Result<Vec<WindowTarget>, ComputerError> {
+            Ok(self.windows.clone())
+        }
+
+        async fn observe(
+            &self,
+            session: ComputerSessionId,
+            target: WindowTarget,
+            _options: ObserveOptions,
+        ) -> Result<ComputerObservation, ComputerError> {
+            Ok(Self::observation(session, target))
+        }
+
+        async fn target_for_observation(
+            &self,
+            _session: ComputerSessionId,
+            _observation_id: &str,
+        ) -> Result<WindowTarget, ComputerError> {
+            self.windows
+                .first()
+                .cloned()
+                .ok_or(ComputerError::WindowNotFound)
+        }
+
+        async fn perform(
+            &self,
+            session: ComputerSessionId,
+            action: ComputerAction,
+        ) -> Result<ComputerActionReceipt, ComputerError> {
+            let target = self
+                .windows
+                .first()
+                .cloned()
+                .ok_or(ComputerError::WindowNotFound)?;
+            Ok(ComputerActionReceipt {
+                session_id: session,
+                observation_id: action.observation_id().to_string(),
+                target,
+                action: action.kind().to_string(),
+                sequence: 1,
+                status: "executed".to_string(),
+                input_redacted: None,
+            })
+        }
+
+        async fn close_session(&self, _session: ComputerSessionId) -> Result<(), ComputerError> {
+            Ok(())
+        }
+    }
+
+    fn computer_tool_context(
+        runtime: ComputerRuntimeFixture,
+        allowed_applications: &[&str],
+    ) -> ToolContext {
+        let workspace = std::env::current_dir().expect("current directory");
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut context = ToolContext::local(workspace, policy);
+        context.thread_id = Some(Uuid::new_v4());
+        context.computer = Some(Arc::new(runtime));
+        context.computer_access_policy = ComputerAccessPolicy::new(allowed_applications);
+        context
+    }
+
+    #[tokio::test]
+    async fn computer_listing_is_fail_closed_and_filters_disallowed_apps() {
+        let runtime = ComputerRuntimeFixture {
+            windows: vec![
+                ComputerRuntimeFixture::window("allowed", "OpenTopia.exe"),
+                ComputerRuntimeFixture::window("blocked", "powershell.exe"),
+            ],
+        };
+        let empty = ComputerTool
+            .execute_typed(
+                Uuid::new_v4(),
+                ComputerInput {
+                    action: ComputerActionInput::ListWindows,
+                    window_id: None,
+                    observation_id: None,
+                    x: None,
+                    y: None,
+                    end_x: None,
+                    end_y: None,
+                    button: ComputerMouseButtonInput::Left,
+                    text: None,
+                    key: None,
+                    delta_y: None,
+                    duration_ms: None,
+                },
+                computer_tool_context(runtime.clone(), &[]),
+            )
+            .await
+            .expect("empty allowlist returns an empty catalog");
+        assert_eq!(empty.metadata["computer"]["windows"], json!([]));
+        assert_eq!(empty.metadata["computer"]["allowlistConfigured"], false);
+
+        let filtered = ComputerTool
+            .execute_typed(
+                Uuid::new_v4(),
+                ComputerInput {
+                    action: ComputerActionInput::ListWindows,
+                    window_id: None,
+                    observation_id: None,
+                    x: None,
+                    y: None,
+                    end_x: None,
+                    end_y: None,
+                    button: ComputerMouseButtonInput::Left,
+                    text: None,
+                    key: None,
+                    delta_y: None,
+                    duration_ms: None,
+                },
+                computer_tool_context(runtime, &["opentopia.exe"]),
+            )
+            .await
+            .expect("filter allowlisted windows");
+        let windows = filtered.metadata["computer"]["windows"]
+            .as_array()
+            .expect("window array");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0]["windowId"], "allowed");
+    }
+
+    #[tokio::test]
+    async fn computer_observation_returns_native_image_content_without_input_approval() {
+        let result = ComputerTool
+            .execute_typed(
+                Uuid::new_v4(),
+                ComputerInput {
+                    action: ComputerActionInput::Observe,
+                    window_id: Some("allowed".to_string()),
+                    observation_id: None,
+                    x: None,
+                    y: None,
+                    end_x: None,
+                    end_y: None,
+                    button: ComputerMouseButtonInput::Left,
+                    text: None,
+                    key: None,
+                    delta_y: None,
+                    duration_ms: None,
+                },
+                computer_tool_context(
+                    ComputerRuntimeFixture {
+                        windows: vec![ComputerRuntimeFixture::window("allowed", "OpenTopia.exe")],
+                    },
+                    &["OpenTopia.exe"],
+                ),
+            )
+            .await
+            .expect("observe allowlisted window");
+
+        assert!(matches!(
+            result.content.as_slice(),
+            [
+                ModelContentPart::Json { .. },
+                ModelContentPart::Image { content_type, data }
+            ] if content_type == "image/png" && data == &[0x89, b'P', b'N', b'G']
+        ));
+        assert_eq!(result.metadata["computer"]["screenshotBytes"], 4);
+    }
 
     fn mcp_policy_fixture(annotations: Value, permission_labels: Vec<&str>) -> McpToolWrapper {
         McpToolWrapper::new(
@@ -9117,6 +9410,65 @@ mod tests {
         }
     }
 
+    fn schema_contains_object_matching(
+        value: &Value,
+        predicate: &impl Fn(&serde_json::Map<String, Value>) -> bool,
+    ) -> bool {
+        match value {
+            Value::Object(object) => {
+                predicate(object)
+                    || object
+                        .values()
+                        .any(|value| schema_contains_object_matching(value, predicate))
+            }
+            Value::Array(values) => values
+                .iter()
+                .any(|value| schema_contains_object_matching(value, predicate)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn spawn_agent_fork_turns_schema_only_allows_labels_or_positive_counts() {
+        let schema = Tool::schema(&SpawnAgentTool);
+        let fork_turns = &schema["properties"]["fork_turns"];
+
+        assert!(schema_contains_object_matching(fork_turns, &|object| {
+            object.get("type") == Some(&json!("string"))
+                && object.get("enum") == Some(&json!(["none", "all"]))
+        }));
+        assert!(schema_contains_object_matching(fork_turns, &|object| {
+            object.get("type") == Some(&json!("integer"))
+                && object.get("minimum").and_then(Value::as_f64) == Some(1.0)
+        }));
+        assert!(schema_contains_object_matching(fork_turns, &|object| {
+            object.get("type") == Some(&json!("null"))
+        }));
+
+        for fork_turns in [
+            json!("none"),
+            json!("all"),
+            json!(1),
+            json!(12),
+            Value::Null,
+        ] {
+            assert!(serde_json::from_value::<SpawnAgentInput>(json!({
+                "task_name": "reviewer",
+                "message": "review this change",
+                "fork_turns": fork_turns,
+            }))
+            .is_ok());
+        }
+        for fork_turns in [json!("recent"), json!("0"), json!(0), json!(-1), json!(1.5)] {
+            assert!(serde_json::from_value::<SpawnAgentInput>(json!({
+                "task_name": "reviewer",
+                "message": "review this change",
+                "fork_turns": fork_turns,
+            }))
+            .is_err());
+        }
+    }
+
     #[test]
     fn derived_schema_and_typed_decoder_reject_the_same_invalid_shapes() {
         assert_eq!(
@@ -9275,6 +9627,15 @@ mod tests {
         assert_eq!(properties["contextLines"]["minimum"].as_f64(), Some(0.0));
         assert_eq!(properties["contextLines"]["maximum"].as_f64(), Some(20.0));
         assert!(Tool::description(&SearchTool).contains("not semantic symbol resolution"));
+    }
+
+    #[test]
+    fn background_read_schema_exposes_a_bounded_wait() {
+        let schema = BackgroundOutputTool.schema();
+        let timeout = &schema["properties"]["timeoutMs"];
+        assert_eq!(timeout["minimum"].as_f64(), Some(0.0));
+        assert_eq!(timeout["maximum"].as_f64(), Some(3_600_000.0));
+        assert!(Tool::description(&BackgroundOutputTool).contains("cancellable wait"));
     }
 
     #[test]
@@ -11098,6 +11459,7 @@ mod tests {
                 job_id: Some(job_id.clone()),
                 data: None,
                 append_newline: false,
+                timeout_ms: None,
             },
         );
         assert!(!background_read.read_only);

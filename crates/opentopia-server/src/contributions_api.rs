@@ -1098,6 +1098,10 @@ mod tests {
         );
         let (turn_queue, _turn_queue_rx) = mpsc::unbounded_channel();
         let browser = Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default()));
+        let browser_router = Arc::new(opentopia_core::BrowserRuntimeRouter::new(
+            browser.clone(),
+            None,
+        ));
         let computer: Arc<dyn ComputerRuntime> =
             Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default()));
         AppState {
@@ -1109,6 +1113,7 @@ mod tests {
             terminals: TerminalBus::default(),
             ptys: PtyManager::default(),
             browser,
+            browser_router,
             computer,
             mcp_host,
             auth: ApiAuth::for_tests(),
@@ -1118,6 +1123,7 @@ mod tests {
             subagents,
             background,
             app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
+            sag_library: Arc::new(crate::library_api::SagLibraryGateway::for_tests()),
         }
     }
 

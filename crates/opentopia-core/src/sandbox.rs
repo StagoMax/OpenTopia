@@ -77,7 +77,12 @@ impl SandboxBackendCapabilities {
                     // Windows still has machine paths readable by all Users.
                     // Do not advertise a complete read allowlist.
                     recursive_read_allowlist: false,
-                    recursive_write_allowlist: true,
+                    // Windows runtime initialization needs broad compatibility
+                    // SIDs in the restricted-token check. The dedicated user
+                    // still isolates host-private locations and supports
+                    // explicit protected-root denies, but is not a complete
+                    // host-wide write allowlist.
+                    recursive_write_allowlist: false,
                     deny_read: true,
                     deny_write: true,
                     network_offline: true,
@@ -571,7 +576,18 @@ pub struct SandboxCommandPlan {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    #[serde(default)]
+    pub preparation: Option<SandboxPreparationPlan>,
     pub status: SandboxCommandStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxPreparationPlan {
+    pub key: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -594,6 +610,7 @@ impl SandboxCommandPlan {
             program: program.to_string(),
             args: args.to_vec(),
             env: Vec::new(),
+            preparation: None,
             status: SandboxCommandStatus::Disabled,
         }
     }
@@ -603,6 +620,7 @@ impl SandboxCommandPlan {
             program: program.to_string(),
             args: args.to_vec(),
             env: Vec::new(),
+            preparation: None,
             status: SandboxCommandStatus::Unrestricted,
         }
     }
@@ -893,6 +911,7 @@ fn build_bubblewrap_command(
         program: path_to_string(&backend),
         args,
         env: Vec::new(),
+        preparation: None,
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Linux,
             backend: "bubblewrap".to_string(),
@@ -924,6 +943,7 @@ fn build_sandbox_exec_command(
         program: path_to_string(&backend),
         args,
         env: Vec::new(),
+        preparation: None,
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Macos,
             backend: "seatbelt".to_string(),
@@ -1018,15 +1038,14 @@ fn build_windows_sandbox_command_with_binary(
     if let Some(bytes) = options.max_output_bytes {
         sandbox_args.extend(["--max-output-bytes".to_string(), bytes.to_string()]);
     }
-    for root in config
+    let managed_read_roots = config
         .effective_command_readable_roots(&workspace_root)
         .into_iter()
         .filter(|root| root.exists())
-    {
-        sandbox_args.extend([
-            "--read-root".to_string(),
-            path_to_string(&absolute_path(root)),
-        ]);
+        .map(|root| absolute_path(root))
+        .collect::<Vec<_>>();
+    for root in &managed_read_roots {
+        sandbox_args.extend(["--read-root".to_string(), path_to_string(root)]);
     }
     for root in options
         .runtime_read_roots
@@ -1034,11 +1053,14 @@ fn build_windows_sandbox_command_with_binary(
         .cloned()
         .chain(windows_minimal_runtime_roots())
         .filter(|root| root.exists())
+        .map(|root| absolute_path(root))
+        .filter(|runtime| {
+            !managed_read_roots
+                .iter()
+                .any(|managed| windows_path_starts_with(runtime, managed))
+        })
     {
-        sandbox_args.extend([
-            "--runtime-root".to_string(),
-            path_to_string(&absolute_path(root)),
-        ]);
+        sandbox_args.extend(["--runtime-root".to_string(), path_to_string(&root)]);
     }
     for root in config
         .effective_command_writable_roots(&workspace_root)
@@ -1097,31 +1119,42 @@ fn build_windows_sandbox_command_with_binary(
         }
         .to_string(),
     ]);
+    let mut preparation_args = sandbox_args.clone();
+    preparation_args[0] = "provision".to_string();
+    let preparation_key = preparation_args.join("\u{0}");
     sandbox_args.push("--".to_string());
     sandbox_args.push(program.to_string());
     sandbox_args.extend(args.iter().cloned());
 
+    let sandbox_program = path_to_string(&sandbox);
+    let env = {
+        let mut env = opentopia_sandbox_state_dir()
+            .map(|path| {
+                vec![(
+                    "OPENTOPIA_SANDBOX_STATE_DIR".to_string(),
+                    path_to_string(&path),
+                )]
+            })
+            .unwrap_or_default();
+        let mut keys = windows_sandbox_environment_keys();
+        keys.extend(options.environment_keys.iter().cloned());
+        keys.push("OPENTOPIA_SANDBOX_STATE_DIR".to_string());
+        keys.sort_by_key(|key| key.to_ascii_uppercase());
+        keys.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        env.push(("OPENTOPIA_SANDBOX_ENV_KEYS".to_string(), keys.join(";")));
+        env.push((ERROR_NONCE_ENV.to_string(), error_nonce));
+        env
+    };
     Ok(SandboxCommandPlan {
-        program: path_to_string(&sandbox),
+        program: sandbox_program.clone(),
         args: sandbox_args,
-        env: {
-            let mut env = opentopia_sandbox_state_dir()
-                .map(|path| {
-                    vec![(
-                        "OPENTOPIA_SANDBOX_STATE_DIR".to_string(),
-                        path_to_string(&path),
-                    )]
-                })
-                .unwrap_or_default();
-            let mut keys = windows_sandbox_environment_keys();
-            keys.extend(options.environment_keys.iter().cloned());
-            keys.push("OPENTOPIA_SANDBOX_STATE_DIR".to_string());
-            keys.sort_by_key(|key| key.to_ascii_uppercase());
-            keys.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-            env.push(("OPENTOPIA_SANDBOX_ENV_KEYS".to_string(), keys.join(";")));
-            env.push((ERROR_NONCE_ENV.to_string(), error_nonce));
-            env
-        },
+        env: env.clone(),
+        preparation: Some(SandboxPreparationPlan {
+            key: preparation_key,
+            program: sandbox_program,
+            args: preparation_args,
+            env,
+        }),
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Windows,
             backend: match backend {
@@ -1132,6 +1165,18 @@ fn build_windows_sandbox_command_with_binary(
             .to_string(),
         },
     })
+}
+
+fn windows_path_starts_with(path: &Path, root: &Path) -> bool {
+    let path = path_to_string(path).replace('/', "\\").to_ascii_lowercase();
+    let root = path_to_string(root)
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    path == root
+        || path
+            .strip_prefix(&root)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
 }
 
 fn windows_sandbox_environment_keys() -> Vec<String> {
@@ -1208,6 +1253,7 @@ fn build_unsupported_sandbox_command(
             program: program.to_string(),
             args: args.to_vec(),
             env: Vec::new(),
+            preparation: None,
             status: SandboxCommandStatus::BestEffortPassthrough { platform, reason },
         }),
         OsSandboxMode::Enforce => anyhow::bail!("{reason}"),
@@ -1229,6 +1275,7 @@ fn unavailable_backend(
         program: program.to_string(),
         args: args.to_vec(),
         env: Vec::new(),
+        preparation: None,
         status: SandboxCommandStatus::BestEffortPassthrough { platform, reason },
     })
 }
@@ -1938,7 +1985,40 @@ mod tests {
             .env
             .iter()
             .any(|(key, value)| key == "OPENTOPIA_SANDBOX_ERROR_NONCE" && !value.is_empty()));
+        let preparation = plan
+            .preparation
+            .as_ref()
+            .expect("Windows sandbox plan has an explicit ACL preparation phase");
+        assert_eq!(
+            preparation.args.first().map(String::as_str),
+            Some("provision")
+        );
+        assert!(!preparation.args.iter().any(|arg| arg == "powershell.exe"));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_runtime_inside_managed_workspace_is_not_classified_external() {
+        let root = std::env::temp_dir().join(format!("opentopia-runtime-plan-{}", Uuid::new_v4()));
+        let runtime = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&runtime).expect("create workspace runtime");
+        let plan = build_windows_sandbox_command_with_binary(
+            std::env::current_exe().expect("current executable"),
+            "node.exe",
+            &sample_args(),
+            &root,
+            &root,
+            &LocalSandboxConfig::enforce(),
+            &SandboxLaunchOptions {
+                runtime_read_roots: vec![runtime.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("build Windows sandbox plan");
+        assert!(!plan.args.windows(2).any(|args| {
+            args[0] == "--runtime-root" && windows_path_starts_with(Path::new(&args[1]), &runtime)
+        }));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2013,6 +2093,13 @@ mod tests {
                 WindowsSandboxBackend::Unelevated,
             )
             .native_subprocess_ipc
+        );
+        assert!(
+            !SandboxBackendCapabilities::for_platform(
+                OsSandboxPlatform::Windows,
+                WindowsSandboxBackend::DedicatedUser,
+            )
+            .recursive_write_allowlist
         );
     }
 

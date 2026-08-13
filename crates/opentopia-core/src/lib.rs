@@ -4,8 +4,10 @@ pub mod artifact_runtime;
 pub mod background;
 mod base_prompt;
 pub mod browser;
+pub mod browser_router;
 pub mod bundled_plugins;
 pub mod capabilities;
+pub mod chrome_extension_browser;
 pub mod computer;
 pub mod context_sources;
 pub mod contribution_hosts;
@@ -79,6 +81,7 @@ pub use browser::{
     BrowserSessionSpec, BrowserSurfaceKind, BrowserTarget, BrowserTargetRef, BrowserTypeRequest,
     BrowserWaitCondition, BrowserWaitRequest, LocalBrowserRuntime,
 };
+pub use browser_router::{BrowserRuntimeRoute, BrowserRuntimeRouter};
 pub use bundled_plugins::{
     bundled_plugin_catalog, bundled_plugin_metadata, ensure_bundled_plugins_installed,
     BundledPluginInstallOutcome, BundledPluginInstallStatus, BundledPluginMetadata,
@@ -93,11 +96,15 @@ pub use capabilities::{
     PluginContribution, PluginPermission, PluginPermissionKind, PluginPermissions,
     RegisteredPluginCapabilities, UnavailableContribution, OPENTOPIA_MANIFEST_API_VERSION,
 };
+pub use chrome_extension_browser::{
+    ChromeExtensionBrowserRuntime, ChromeExtensionBrowserRuntimeConfig,
+};
 pub use computer::{
-    ComputerAction, ComputerActionReceipt, ComputerError, ComputerMouseButton, ComputerObservation,
-    ComputerPolicyContext, ComputerRuntime, ComputerRuntimeConfig, ComputerScreenshot,
-    ComputerSessionId, LocalComputerRuntime, ObserveOptions, ScreenRect, WindowTarget,
-    MAX_COMPUTER_IMAGE_EDGE, MAX_COMPUTER_SCREENSHOT_BYTES, MAX_COMPUTER_WINDOWS,
+    ComputerAccessPolicy, ComputerAction, ComputerActionReceipt, ComputerError,
+    ComputerMouseButton, ComputerObservation, ComputerPolicyContext, ComputerRuntime,
+    ComputerRuntimeConfig, ComputerScreenshot, ComputerSessionId, LocalComputerRuntime,
+    ObserveOptions, ScreenRect, WindowTarget, MAX_COMPUTER_IMAGE_EDGE,
+    MAX_COMPUTER_SCREENSHOT_BYTES, MAX_COMPUTER_WINDOWS,
 };
 pub use context_sources::{
     load_context_source_metadata, load_context_sources, ContextSourceError, ContextSourceKind,

@@ -12,7 +12,7 @@ pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
         name: "pdf",
         version: "1.0.0",
         trust: BundledPluginTrust::Official,
-        default_enabled: false,
+        default_enabled: true,
         native_capabilities: &["pdf"],
     },
     files: FILES,
@@ -31,7 +31,7 @@ mod tests {
         assert_eq!(PACKAGE.metadata.name, manifest["name"]);
         assert_eq!(PACKAGE.metadata.version, manifest["version"]);
         assert_eq!(PACKAGE.metadata.trust, BundledPluginTrust::Official);
-        assert!(!PACKAGE.metadata.default_enabled);
+        assert!(PACKAGE.metadata.default_enabled);
         assert_eq!(PACKAGE.metadata.native_capabilities, &["pdf"]);
         assert_eq!(
             manifest["opentopia"]["contributes"]["nativeTools"][0]["id"],

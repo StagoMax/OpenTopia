@@ -4,7 +4,7 @@ use super::SandboxRequest;
 use crate::process_env::current_environment_block;
 use anyhow::Context;
 use anyhow::Result;
-use opentopia_sandbox_protocol::ReadProvisioning;
+use opentopia_sandbox_protocol::{FilesystemCapabilities, ReadExecuteCapability, ReadProvisioning};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -170,6 +170,341 @@ pub(super) fn run(request: SandboxRequest) -> Result<i32> {
     }
 }
 
+/// Persist the ACLs for one policy scope before it is used. This command is
+/// deliberately separate from `run`: command startup only verifies policy and
+/// never rewrites ACLs on workspace or external runtime paths.
+pub(super) fn provision(request: SandboxRequest) -> Result<i32> {
+    suppress_process_error_ui();
+    validate_managed_runtime_home(&request)?;
+    recover_acl_transactions().context("stage=apply_acl recover interrupted ACL transaction")?;
+    match request.backend {
+        BackendMode::DedicatedUser if request.interactive => anyhow::bail!(
+            "stage=validate_policy interactive PTY sessions currently require the unelevated Windows sandbox backend"
+        ),
+        BackendMode::Auto if request.interactive && crate::setup::credentials_present() => anyhow::bail!(
+            "stage=validate_policy interactive PTY sessions currently require the unelevated Windows sandbox backend"
+        ),
+        BackendMode::Unelevated if crate::setup::credentials_present() => anyhow::bail!(
+            "stage=validate_policy unelevated execution is disabled while dedicated-user credentials are installed because it shares the host identity; use auto/dedicated-user, or remove the dedicated-user sandbox first"
+        ),
+        BackendMode::Unelevated => {
+            let principal = capability_principal(&request);
+            let mut capability = acl_principal_sid(&principal)?;
+            ensure_persistent_capability_permissions(&request, &principal, capability.as_ptr())
+                .context("stage=apply_acl provision capability permissions")?;
+            Ok(0)
+        }
+        BackendMode::Auto if !crate::setup::credentials_present() => {
+            let principal = capability_principal(&request);
+            let mut capability = acl_principal_sid(&principal)?;
+            ensure_persistent_capability_permissions(&request, &principal, capability.as_ptr())
+                .context("stage=apply_acl provision capability permissions")?;
+            Ok(0)
+        }
+        BackendMode::DedicatedUser | BackendMode::Auto => {
+            provision_dedicated_user(&request)?;
+            Ok(0)
+        }
+    }
+}
+
+fn validate_managed_runtime_home(request: &SandboxRequest) -> Result<()> {
+    let Some(runtime_home) = request.filesystem.runtime_home.as_deref() else {
+        if matches!(request.backend, BackendMode::DedicatedUser)
+            || matches!(request.backend, BackendMode::Auto) && crate::setup::credentials_present()
+        {
+            anyhow::bail!(
+                "stage=validate_policy dedicated-user launches require a managed runtime home"
+            )
+        }
+        return Ok(());
+    };
+    let state_dir = crate::setup::state_dir();
+    let workspace_managed = request
+        .filesystem
+        .read_execute
+        .iter()
+        .filter(|capability| capability.provisioning == ReadProvisioning::Managed)
+        .any(|capability| path_starts_with(runtime_home, &capability.path));
+    let state_managed = path_starts_with(runtime_home, &state_dir);
+    anyhow::ensure!(
+        workspace_managed || state_managed,
+        "stage=validate_policy runtime home {} is outside OpenTopia-managed workspace/state roots; refusing broad ACL provisioning",
+        runtime_home.display()
+    );
+    anyhow::ensure!(
+        runtime_home.parent().is_some() && runtime_home.components().count() > 2,
+        "stage=validate_policy runtime home {} is too broad for recursive ACL provisioning",
+        runtime_home.display()
+    );
+    Ok(())
+}
+
+pub(super) fn prepare_setup_canaries() -> Result<()> {
+    for network in [NetworkMode::Deny, NetworkMode::Internet] {
+        let request = setup_canary_request(network)?;
+        provision_dedicated_user(&request)
+            .with_context(|| format!("provision {:?} dedicated-user execution canary", network))?;
+    }
+    Ok(())
+}
+
+pub(super) fn verify_setup_canaries() -> Vec<String> {
+    [
+        (NetworkMode::Deny, "offline"),
+        (NetworkMode::Internet, "online"),
+    ]
+    .into_iter()
+    .filter_map(|(network, label)| {
+        let executable = std::env::current_exe();
+        let output = executable.and_then(|executable| {
+            std::process::Command::new(executable)
+                .args([
+                    "canary",
+                    "--network",
+                    match network {
+                        NetworkMode::Deny => "deny",
+                        NetworkMode::Internet => "internet",
+                    },
+                ])
+                .output()
+        });
+        match output {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => Some(format!(
+                "{label} sandbox execution canary failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => Some(format!("{label} sandbox execution canary failed: {error}")),
+        }
+    })
+    .collect()
+}
+
+pub(super) fn run_setup_canary(args: &[String]) -> Result<i32> {
+    let network = match args {
+        [flag, value] if flag == "--network" && value == "deny" => NetworkMode::Deny,
+        [flag, value] if flag == "--network" && value == "internet" => NetworkMode::Internet,
+        _ => anyhow::bail!("usage: opentopia-sandbox canary --network <deny|internet>"),
+    };
+    run_dedicated_user(setup_canary_request(network)?)
+}
+
+fn setup_canary_request(network: NetworkMode) -> Result<SandboxRequest> {
+    let root = crate::setup::state_dir().join("canary");
+    let workspace_path = root.join("workspace");
+    let home_path = root.join(match network {
+        NetworkMode::Deny => "offline-home",
+        NetworkMode::Internet => "online-home",
+    });
+    std::fs::create_dir_all(&workspace_path).with_context(|| {
+        format!(
+            "create sandbox canary workspace {}",
+            workspace_path.display()
+        )
+    })?;
+    std::fs::create_dir_all(&home_path)
+        .with_context(|| format!("create sandbox canary home {}", home_path.display()))?;
+    let workspace = workspace_path
+        .canonicalize()
+        .context("canonicalize sandbox canary workspace")?;
+    let home = home_path
+        .canonicalize()
+        .context("canonicalize sandbox canary home")?;
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .context("SystemRoot is unavailable for sandbox canary")?
+        .canonicalize()
+        .context("canonicalize SystemRoot for sandbox canary")?;
+    let command = system_root
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    anyhow::ensure!(
+        command.is_file(),
+        "PowerShell execution canary is unavailable at {}",
+        command.display()
+    );
+    Ok(SandboxRequest {
+        interactive: false,
+        cwd: workspace.clone(),
+        filesystem: FilesystemCapabilities {
+            read_execute: vec![
+                ReadExecuteCapability {
+                    path: workspace.clone(),
+                    provisioning: ReadProvisioning::Managed,
+                },
+                ReadExecuteCapability {
+                    path: system_root,
+                    provisioning: ReadProvisioning::ExistingOnly,
+                },
+            ],
+            write: vec![workspace, home.clone()],
+            runtime_home: Some(home),
+            ..Default::default()
+        },
+        network,
+        timeout_ms: Some(10_000),
+        termination_timeout_ms: 5_000,
+        max_memory_bytes: None,
+        max_cpu_time_ms: None,
+        max_output_bytes: Some(64 * 1024),
+        backend: BackendMode::DedicatedUser,
+        command: vec![
+            native_path(&command).to_string_lossy().into_owned(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Write-Output opentopia-sandbox-canary".to_string(),
+        ],
+    })
+}
+
+fn provision_dedicated_user(request: &SandboxRequest) -> Result<()> {
+    let credentials = crate::setup::load_credentials().map_err(|error| {
+        anyhow::anyhow!("stage=prepare_sandbox dedicated-user backend unavailable: {error:#}")
+    })?;
+    let (username, password) = match request.network {
+        NetworkMode::Deny => (
+            credentials.offline_username.as_str(),
+            credentials.offline_password.as_str(),
+        ),
+        NetworkMode::Internet => (
+            credentials.online_username.as_str(),
+            credentials.online_password.as_str(),
+        ),
+    };
+    let mut user_sid = account_sid(username)?;
+    let logon_token = LoggedOnToken::new(username, password)
+        .context("stage=prepare_sandbox log on dedicated-user identity")?;
+    provision_runtime_registry_as_user(username, password)?;
+    ensure_broker_exchange_permissions(username, user_sid.as_ptr(), logon_token.handle)?;
+    migrate_legacy_dedicated_user_acls(request, username)?;
+    ensure_persistent_user_permissions(request, username, user_sid.as_ptr(), logon_token.handle)?;
+    let capability_principal = capability_principal(request);
+    let mut capability = acl_principal_sid(&capability_principal)?;
+    ensure_persistent_capability_permissions(request, &capability_principal, capability.as_ptr())
+        .context("stage=apply_acl provision dedicated-user capability permissions")
+}
+
+fn broker_exchange_root(account: &str) -> std::path::PathBuf {
+    crate::setup::state_dir()
+        .join("broker-exchange")
+        .join(account.to_ascii_lowercase())
+}
+
+pub(super) fn provision_runtime_registry(args: &[String]) -> Result<i32> {
+    anyhow::ensure!(
+        args.is_empty(),
+        "usage: opentopia-sandbox registry-provision"
+    );
+    let mut runtime_sid = SidBuffer::opentopia_runtime();
+    ensure_runtime_registry_access(runtime_sid.as_ptr())
+        .context("stage=apply_acl provision dedicated-user runtime registry access")?;
+    Ok(0)
+}
+
+fn provision_runtime_registry_as_user(username: &str, password: &str) -> Result<()> {
+    let executable =
+        std::env::current_exe().context("stage=apply_acl resolve runtime registry provisioner")?;
+    let command = vec![
+        native_path(&executable).to_string_lossy().into_owned(),
+        "registry-provision".to_string(),
+    ];
+    let mut command_line = wide(argv_to_command_line(&command));
+    let executable_w = wide(native_path(&executable).as_os_str());
+    let username_w = wide(OsStr::new(username));
+    let domain_w = wide(OsStr::new("."));
+    let password_w = wide(OsStr::new(password));
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .context("SystemRoot is unavailable for runtime registry preparation")?;
+    let cwd_w = wide(system_root.as_os_str());
+    let environment = current_environment_block(None, None, true);
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let created = unsafe {
+        CreateProcessWithLogonW(
+            username_w.as_ptr(),
+            domain_w.as_ptr(),
+            password_w.as_ptr(),
+            LOGON_WITH_PROFILE,
+            executable_w.as_ptr(),
+            command_line.as_mut_ptr(),
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
+            cwd_w.as_ptr(),
+            &startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(last_error(
+            "stage=apply_acl CreateProcessWithLogonW runtime registry provisioner",
+        ));
+    }
+    unsafe { CloseHandle(process.hThread) };
+    let waited = unsafe { WaitForSingleObject(process.hProcess, 30_000) };
+    if waited == WAIT_TIMEOUT {
+        unsafe {
+            TerminateProcess(process.hProcess, crate::SANDBOX_ERROR_EXIT_CODE as u32);
+            CloseHandle(process.hProcess);
+        }
+        anyhow::bail!("stage=apply_acl runtime registry provisioner timed out after 30000ms")
+    }
+    if waited == u32::MAX {
+        unsafe { CloseHandle(process.hProcess) };
+        return Err(last_error(
+            "stage=apply_acl wait for runtime registry provisioner",
+        ));
+    }
+    let mut exit_code = 1_u32;
+    let read = unsafe { GetExitCodeProcess(process.hProcess, &mut exit_code) };
+    unsafe { CloseHandle(process.hProcess) };
+    if read == 0 {
+        return Err(last_error(
+            "stage=apply_acl read runtime registry provisioner exit code",
+        ));
+    }
+    anyhow::ensure!(
+        exit_code == 0,
+        "stage=apply_acl runtime registry provisioner exited with code {exit_code}"
+    );
+    Ok(())
+}
+
+fn ensure_broker_exchange_permissions(account: &str, sid: PSID, token: HANDLE) -> Result<()> {
+    let path = broker_exchange_root(account);
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("create broker exchange root {}", path.display()))?;
+    if effective_file_access(token, &path, WORKSPACE_WRITE_PERMISSIONS)? {
+        return Ok(());
+    }
+    let _guards = NamedAclMutex::acquire_paths([path.as_path()])?;
+    let mut transaction = AclTransaction::default();
+    transaction.grant(&path, sid, true, WORKSPACE_WRITE_PERMISSIONS)?;
+    let entry = PersistentAclEntry {
+        account: account.to_string(),
+        path,
+        kind: PersistentAclKind::Write,
+        sid: SidBuffer::copy_from_sid(sid)?.0,
+        permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+    };
+    let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+    let mut ledger = load_acl_ledger()?;
+    ledger.entries.retain(|existing| {
+        existing.account != entry.account
+            || existing.path != entry.path
+            || existing.kind != entry.kind
+    });
+    ledger.entries.push(entry);
+    save_acl_ledger(&ledger)?;
+    transaction.commit();
+    Ok(())
+}
+
 fn run_unelevated(request: SandboxRequest) -> Result<i32> {
     crate::logging::event(
         "prepare_sandbox",
@@ -183,8 +518,8 @@ fn run_unelevated(request: SandboxRequest) -> Result<i32> {
     let capability_principal = capability_principal(&request);
     let mut capability = acl_principal_sid(&capability_principal)?;
     let capability_sid = capability.as_ptr();
-    ensure_persistent_capability_permissions(&request, &capability_principal, capability_sid)
-        .context("stage=apply_acl ensure capability permissions")?;
+    verify_persistent_capability_permissions(&request, &capability_principal, capability_sid)
+        .context("stage=verify_acl verify capability permissions")?;
 
     let restricted_token = RestrictedToken::for_capability(capability_sid)
         .context("stage=prepare_sandbox create restricted token")?;
@@ -233,6 +568,7 @@ struct DedicatedUserRunnerResultEnvelope {
 }
 
 fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
+    validate_managed_runtime_home(&request)?;
     crate::logging::event("prepare_sandbox", "starting dedicated-user backend");
     let credentials = crate::setup::load_credentials().map_err(|error| {
         anyhow::anyhow!("stage=prepare_sandbox dedicated-user backend unavailable: {error:#}")
@@ -248,25 +584,36 @@ fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
             credentials.online_password.as_str(),
         ),
     };
-    let mut user_sid = account_sid(username)?;
+    let _user_sid = account_sid(username)?;
     crate::logging::event(
         "prepare_sandbox",
         format!("resolved dedicated-user SID for {username}"),
     );
     let logon_token = LoggedOnToken::new(username, password)
         .context("stage=prepare_sandbox log on dedicated-user identity")?;
-    migrate_legacy_dedicated_user_acls(&request, username)?;
-    ensure_persistent_user_permissions(&request, username, user_sid.as_ptr(), logon_token.handle)?;
+    verify_persistent_user_permissions(&request, username, logon_token.handle)?;
     let capability_principal = capability_principal(&request);
     let mut capability = acl_principal_sid(&capability_principal)?;
     let capability_sid = capability.as_ptr();
-    ensure_persistent_capability_permissions(&request, &capability_principal, capability_sid)
-        .context("stage=apply_acl ensure dedicated-user capability permissions")?;
+    verify_persistent_capability_permissions(&request, &capability_principal, capability_sid)
+        .context("stage=verify_acl verify dedicated-user capability permissions")?;
 
-    let run_root = std::env::temp_dir().join(format!(
-        "opentopia-dedicated-user-run-{}",
-        Uuid::new_v4().simple()
-    ));
+    let exchange_root = broker_exchange_root(username);
+    anyhow::ensure!(
+        exchange_root.is_dir(),
+        "stage=provision_acl broker exchange root is not prepared for {username}: {}",
+        exchange_root.display()
+    );
+    anyhow::ensure!(
+        effective_file_access(
+            logon_token.handle,
+            &exchange_root,
+            WORKSPACE_WRITE_PERMISSIONS
+        )?,
+        "stage=provision_acl broker exchange root is not prepared for {username}: {}",
+        exchange_root.display()
+    );
+    let run_root = exchange_root.join(Uuid::new_v4().simple().to_string());
     std::fs::create_dir_all(&run_root).with_context(|| {
         format!(
             "stage=prepare_sandbox create dedicated-user run directory {}",
@@ -274,13 +621,6 @@ fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
         )
     })?;
     let _cleanup = RunDirectory(run_root.clone());
-    update_dacl(
-        &run_root,
-        user_sid.as_ptr(),
-        GRANT_ACCESS,
-        true,
-        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE,
-    )?;
 
     let request_path = run_root.join("request.json");
     let result_path = run_root.join("result.json");
@@ -924,6 +1264,78 @@ fn save_acl_ledger(ledger: &PersistentAclLedger) -> Result<()> {
     Ok(())
 }
 
+fn verify_persistent_user_permissions(
+    request: &SandboxRequest,
+    account: &str,
+    token: HANDLE,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    for path in request
+        .filesystem
+        .deny_read
+        .iter()
+        .filter(|path| path.exists())
+    {
+        if effective_file_access(token, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)? {
+            missing.push(format!("deny_read:{}", path.display()));
+        }
+    }
+    for capability in &request.filesystem.read_execute {
+        if request
+            .filesystem
+            .write
+            .iter()
+            .any(|write_root| path_starts_with(&capability.path, write_root))
+        {
+            continue;
+        }
+        if !effective_file_access(
+            token,
+            &capability.path,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )? {
+            let kind = match capability.provisioning {
+                ReadProvisioning::Managed => "managed_read",
+                ReadProvisioning::ExistingOnly => "external_runtime",
+            };
+            missing.push(format!("{kind}:{}", capability.path.display()));
+        }
+    }
+    for path in &request.filesystem.write {
+        if !effective_file_access(token, path, WORKSPACE_WRITE_PERMISSIONS)? {
+            missing.push(format!("managed_write:{}", path.display()));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "stage=provision_acl sandbox account '{account}' is not prepared for this policy scope: {}. Run `opentopia-sandbox provision` for managed roots; external_runtime roots are immutable and must already allow normal-user read/execute access",
+        missing.join(", ")
+    )
+}
+
+fn verify_persistent_capability_permissions(
+    request: &SandboxRequest,
+    principal: &str,
+    sid: PSID,
+) -> Result<()> {
+    let desired = capability_acl_entries(request, principal, sid)?;
+    let ledger = load_acl_ledger()?;
+    let missing = desired
+        .iter()
+        .filter(|entry| !ledger.entries.contains(entry))
+        .map(|entry| format!("{:?}:{}", entry.kind, entry.path.display()))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "stage=provision_acl capability scope '{principal}' is not prepared: {}. Run `opentopia-sandbox provision` before command startup",
+        missing.join(", ")
+    )
+}
+
 fn ensure_persistent_user_permissions(
     request: &SandboxRequest,
     account: &str,
@@ -951,13 +1363,6 @@ fn ensure_persistent_user_permissions(
     }
 
     let mut inaccessible_external = Vec::new();
-    let managed_read_roots = request
-        .filesystem
-        .read_execute
-        .iter()
-        .filter(|capability| capability.provisioning == ReadProvisioning::Managed)
-        .map(|capability| &capability.path)
-        .collect::<Vec<_>>();
     for capability in &request.filesystem.read_execute {
         if request
             .filesystem
@@ -981,15 +1386,10 @@ fn ensure_persistent_user_permissions(
             );
             continue;
         }
-        let provisioning = if managed_read_roots
-            .iter()
-            .any(|managed| path_starts_with(&capability.path, managed))
-        {
-            ReadProvisioning::Managed
-        } else {
-            capability.provisioning
-        };
-        match provisioning {
+        // ExistingOnly is an immutable boundary even when a broad managed
+        // root happens to contain it. External SDK/runtime ACLs are never
+        // rewritten by OpenTopia.
+        match capability.provisioning {
             ReadProvisioning::Managed => {
                 desired.push((capability.path.clone(), PersistentAclKind::Read))
             }
@@ -1020,10 +1420,11 @@ fn ensure_persistent_user_permissions(
         return Ok(());
     }
 
-    let _guard = NamedAclMutex::acquire()?;
+    let _guards = NamedAclMutex::acquire_paths(desired.iter().map(|(path, _)| path.as_path()))?;
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
     let sid_bytes = SidBuffer::copy_from_sid(sid)?.0;
+    let mut applied_entries = Vec::new();
 
     for (path, kind) in desired {
         let entry = PersistentAclEntry {
@@ -1062,9 +1463,22 @@ fn ensure_persistent_user_permissions(
                 || existing.path != entry.path
                 || existing.kind != entry.kind
         });
-        ledger.entries.push(entry);
+        ledger.entries.push(entry.clone());
+        applied_entries.push(entry);
     }
-    save_acl_ledger(&ledger)?;
+    if !applied_entries.is_empty() {
+        let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+        let mut latest = load_acl_ledger()?;
+        for entry in applied_entries {
+            latest.entries.retain(|existing| {
+                existing.account != entry.account
+                    || existing.path != entry.path
+                    || existing.kind != entry.kind
+            });
+            latest.entries.push(entry);
+        }
+        save_acl_ledger(&latest)?;
+    }
     transaction.commit();
     Ok(())
 }
@@ -1090,7 +1504,7 @@ fn migrate_legacy_dedicated_user_acls(request: &SandboxRequest, account: &str) -
         return Ok(());
     }
 
-    let _guard = NamedAclMutex::acquire()?;
+    let _guards = NamedAclMutex::acquire_paths(stale.iter().map(|entry| entry.path.as_path()))?;
     let mut ledger = load_acl_ledger()?;
     let mut revoked = BTreeSet::new();
     for entry in &stale {
@@ -1103,7 +1517,10 @@ fn migrate_legacy_dedicated_user_acls(request: &SandboxRequest, account: &str) -
     ledger.entries.retain(|entry| {
         !entry.account.eq_ignore_ascii_case(account) || entry.kind != PersistentAclKind::DenyWrite
     });
-    save_acl_ledger(&ledger)?;
+    let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+    let mut latest = load_acl_ledger()?;
+    latest.entries.retain(|entry| !stale.contains(entry));
+    save_acl_ledger(&latest)?;
     crate::logging::event(
         "migrate_acl",
         format!(
@@ -1137,9 +1554,22 @@ fn ensure_persistent_capability_permissions(
             return Ok(());
         }
     }
-    let _guard = NamedAclMutex::acquire()?;
+    let preliminary_ledger = load_acl_ledger()?;
+    let legacy_paths = preliminary_ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.account == LEGACY_CAPABILITY_PRINCIPAL)
+        .map(|entry| entry.path.as_path())
+        .collect::<Vec<_>>();
+    let _guards = NamedAclMutex::acquire_paths(
+        desired_entries
+            .iter()
+            .map(|entry| entry.path.as_path())
+            .chain(legacy_paths),
+    )?;
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
+    let mut applied_entries = Vec::new();
     let legacy_entries = ledger
         .entries
         .iter()
@@ -1174,9 +1604,25 @@ fn ensure_persistent_capability_permissions(
                 || existing.path != entry.path
                 || existing.kind != entry.kind
         });
-        ledger.entries.push(entry);
+        ledger.entries.push(entry.clone());
+        applied_entries.push(entry);
     }
-    save_acl_ledger(&ledger)?;
+    if !legacy_entries.is_empty() || !applied_entries.is_empty() {
+        let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+        let mut latest = load_acl_ledger()?;
+        latest
+            .entries
+            .retain(|entry| entry.account != LEGACY_CAPABILITY_PRINCIPAL);
+        for entry in applied_entries {
+            latest.entries.retain(|existing| {
+                existing.account != entry.account
+                    || existing.path != entry.path
+                    || existing.kind != entry.kind
+            });
+            latest.entries.push(entry);
+        }
+        save_acl_ledger(&latest)?;
+    }
     transaction.commit();
     Ok(())
 }
@@ -1248,26 +1694,34 @@ pub(super) fn has_dedicated_user_permissions(accounts: &[&str]) -> Result<bool> 
 }
 
 pub(super) fn revoke_dedicated_user_permissions(accounts: &[&str]) -> Result<()> {
-    let _guard = NamedAclMutex::acquire()?;
-    let mut ledger = load_acl_ledger()?;
+    let ledger = load_acl_ledger()?;
+    let targets = ledger
+        .entries
+        .iter()
+        .filter(|entry| {
+            accounts
+                .iter()
+                .any(|account| entry.account.eq_ignore_ascii_case(account))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let _guards = NamedAclMutex::acquire_paths(targets.iter().map(|entry| entry.path.as_path()))?;
     let mut revoked = BTreeSet::new();
-    for entry in ledger.entries.iter().filter(|entry| {
-        accounts
-            .iter()
-            .any(|account| entry.account.eq_ignore_ascii_case(account))
-    }) {
+    for entry in &targets {
         let mut sid = acl_entry_sid(entry)?;
         let key = (entry.path.clone(), sid.0.clone());
         if revoked.insert(key) {
             update_dacl(&entry.path, sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
         }
     }
-    ledger.entries.retain(|entry| {
+    let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+    let mut latest = load_acl_ledger()?;
+    latest.entries.retain(|entry| {
         !accounts
             .iter()
             .any(|account| entry.account.eq_ignore_ascii_case(account))
     });
-    save_acl_ledger(&ledger)?;
+    save_acl_ledger(&latest)?;
     Ok(())
 }
 
@@ -1291,20 +1745,28 @@ pub(super) fn cleanup_workspace_acl(args: &[String]) -> Result<i32> {
         }
         _ => anyhow::bail!("usage: opentopia-sandbox cleanup --workspace <absolute-path>"),
     };
-    let _guard = NamedAclMutex::acquire()?;
-    let mut ledger = load_acl_ledger()?;
+    let ledger = load_acl_ledger()?;
+    let targets = ledger
+        .entries
+        .iter()
+        .filter(|entry| path_starts_with(&entry.path, &workspace))
+        .cloned()
+        .collect::<Vec<_>>();
+    let _guards = NamedAclMutex::acquire_paths(targets.iter().map(|entry| entry.path.as_path()))?;
     let mut revoked = BTreeSet::new();
-    for entry in ledger.entries.iter().filter(|entry| {
-        path_starts_with(&entry.path, &workspace)
-            && revoked.insert((entry.account.clone(), entry.path.clone()))
-    }) {
+    for entry in targets
+        .iter()
+        .filter(|entry| revoked.insert((entry.account.clone(), entry.path.clone())))
+    {
         let mut sid = acl_entry_sid(entry)?;
         update_dacl(&entry.path, sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
     }
-    ledger
+    let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+    let mut latest = load_acl_ledger()?;
+    latest
         .entries
         .retain(|entry| !path_starts_with(&entry.path, &workspace));
-    save_acl_ledger(&ledger)?;
+    save_acl_ledger(&latest)?;
     crate::logging::event(
         "cleanup_acl",
         format!(
@@ -1472,7 +1934,6 @@ impl RestrictedToken {
 
     fn for_dedicated_capability(capability_sid: PSID) -> Result<Self> {
         let mut runtime_sid = SidBuffer::opentopia_runtime();
-        ensure_runtime_registry_access(runtime_sid.as_ptr())?;
         Self::create(capability_sid, Some(runtime_sid.as_ptr()))
     }
 
@@ -1506,21 +1967,34 @@ impl RestrictedToken {
             }
         };
         let mut everyone_sid = SidBuffer::well_known(WIN_WORLD_SID)?;
-        let mut restricting_sids = [unsafe { std::mem::zeroed::<SID_AND_ATTRIBUTES>() }; 3];
+        let mut restricting_sids = [unsafe { std::mem::zeroed::<SID_AND_ATTRIBUTES>() }; 4];
         restricting_sids[0].Sid = capability_sid;
         let restricting_sid_count = if let Some(runtime_sid) = runtime_sid {
             restricting_sids[1].Sid = runtime_sid;
-            2
+            restricting_sids[2].Sid = logon_sid.as_ptr();
+            restricting_sids[3].Sid = everyone_sid.as_ptr();
+            4
         } else {
             restricting_sids[1].Sid = logon_sid.as_ptr();
             restricting_sids[2].Sid = everyone_sid.as_ptr();
             3
         };
+        // The dedicated account is already a non-administrator. Preserve its
+        // standard SeChangeNotifyPrivilege so runtimes can traverse parent
+        // directories on the way to explicitly granted roots. Removing every
+        // privilege causes CLR, Git, Python, and Node loaders to terminate with
+        // STATUS_DLL_INIT_FAILED before main. WRITE_RESTRICTED remains the
+        // independent filesystem-write boundary.
+        let flags = if runtime_sid.is_some() {
+            WRITE_RESTRICTED
+        } else {
+            DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED
+        };
         let mut restricted = ptr::null_mut();
         let created = unsafe {
             CreateRestrictedToken(
                 base_token,
-                DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+                flags,
                 0,
                 ptr::null(),
                 0,
@@ -1534,15 +2008,29 @@ impl RestrictedToken {
         if created == 0 || restricted.is_null() {
             return Err(last_error("CreateRestrictedToken"));
         }
-        let mut default_dacl_sids = vec![capability_sid];
+        // Dedicated runtimes need the logon and world compatibility SIDs for
+        // session kernel objects and Windows pseudo devices. This means the
+        // dedicated backend is not a complete host-wide write allowlist; the
+        // per-scope SID still makes explicit protected-root deny ACEs effective.
         if let Some(runtime_sid) = runtime_sid {
-            default_dacl_sids.push(runtime_sid);
+            if let Err(error) = augment_default_dacl(
+                restricted,
+                &[
+                    capability_sid,
+                    runtime_sid,
+                    logon_sid.as_ptr(),
+                    everyone_sid.as_ptr(),
+                ],
+            ) {
+                unsafe { CloseHandle(restricted) };
+                return Err(error);
+            }
         } else {
-            default_dacl_sids.extend([logon_sid.as_ptr(), everyone_sid.as_ptr()]);
-        }
-        if let Err(error) = set_default_dacl(restricted, &default_dacl_sids) {
-            unsafe { CloseHandle(restricted) };
-            return Err(error);
+            let default_dacl_sids = [capability_sid, logon_sid.as_ptr(), everyone_sid.as_ptr()];
+            if let Err(error) = set_default_dacl(restricted, &default_dacl_sids) {
+                unsafe { CloseHandle(restricted) };
+                return Err(error);
+            }
         }
         Ok(Self { handle: restricted })
     }
@@ -1552,6 +2040,78 @@ impl Drop for RestrictedToken {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.handle) };
     }
+}
+
+fn augment_default_dacl(token: HANDLE, sids: &[PSID]) -> Result<()> {
+    let mut needed = 0_u32;
+    unsafe { GetTokenInformation(token, TokenDefaultDacl, ptr::null_mut(), 0, &mut needed) };
+    anyhow::ensure!(
+        needed as usize >= std::mem::size_of::<TokenDefaultDaclInfo>(),
+        "GetTokenInformation(TokenDefaultDacl) returned an invalid size"
+    );
+    let mut buffer = vec![0_u8; needed as usize];
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenDefaultDacl,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if queried == 0 {
+        return Err(last_error("GetTokenInformation(TokenDefaultDacl)"));
+    }
+    let existing = unsafe {
+        std::ptr::read_unaligned(buffer.as_ptr().cast::<TokenDefaultDaclInfo>()).default_dacl
+    };
+    let entries = sids
+        .iter()
+        .map(|sid| EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: 0,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: ptr::null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN_VALUE,
+                ptstrName: sid.cast(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut augmented = ptr::null_mut();
+    let assembled = unsafe {
+        SetEntriesInAclW(
+            entries.len() as u32,
+            entries.as_ptr(),
+            existing,
+            &mut augmented,
+        )
+    };
+    if assembled != 0 {
+        anyhow::bail!("SetEntriesInAclW for augmented token DACL failed: {assembled}")
+    }
+    let mut info = TokenDefaultDaclInfo {
+        default_dacl: augmented,
+    };
+    let applied = unsafe {
+        SetTokenInformation(
+            token,
+            TokenDefaultDacl,
+            (&mut info as *mut TokenDefaultDaclInfo).cast(),
+            std::mem::size_of::<TokenDefaultDaclInfo>() as u32,
+        )
+    };
+    if !augmented.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(augmented.cast()) };
+    }
+    if applied == 0 {
+        return Err(last_error(
+            "SetTokenInformation(augmented TokenDefaultDacl)",
+        ));
+    }
+    Ok(())
 }
 
 fn set_default_dacl(token: HANDLE, sids: &[PSID]) -> Result<()> {
@@ -1696,23 +2256,36 @@ fn current_logon_sid(token: HANDLE) -> Result<SidBuffer> {
     anyhow::bail!("TokenGroups did not include a logon SID")
 }
 
-#[derive(Default)]
 struct AclTransaction {
     changes: Vec<AclChange>,
+    journal_path: std::path::PathBuf,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct AclChange {
     path: std::path::PathBuf,
-    sid: PSID,
+    sid: Vec<u8>,
+}
+
+impl Default for AclTransaction {
+    fn default() -> Self {
+        Self {
+            changes: Vec::new(),
+            journal_path: crate::setup::state_dir()
+                .join("acl-transactions")
+                .join(format!("{}.json", Uuid::new_v4().simple())),
+        }
+    }
 }
 
 impl AclTransaction {
     fn grant(&mut self, path: &Path, sid: PSID, inherit: bool, permissions: u32) -> Result<()> {
-        update_dacl(path, sid, GRANT_ACCESS, inherit, permissions)?;
         self.changes.push(AclChange {
             path: path.to_path_buf(),
-            sid,
+            sid: SidBuffer::copy_from_sid(sid)?.0,
         });
+        self.persist()?;
+        apply_dacl_change(path, sid, GRANT_ACCESS, inherit, permissions)?;
         Ok(())
     }
 
@@ -1721,23 +2294,129 @@ impl AclTransaction {
     }
 
     fn deny(&mut self, path: &Path, sid: PSID, inherit: bool, permissions: u32) -> Result<()> {
-        update_dacl(path, sid, DENY_ACCESS, inherit, permissions)?;
         self.changes.push(AclChange {
             path: path.to_path_buf(),
-            sid,
+            sid: SidBuffer::copy_from_sid(sid)?.0,
         });
+        self.persist()?;
+        apply_dacl_change(path, sid, DENY_ACCESS, inherit, permissions)?;
         Ok(())
     }
 
     fn commit(mut self) {
         self.changes.clear();
+        let _ = std::fs::remove_file(&self.journal_path);
+    }
+
+    fn persist(&self) -> Result<()> {
+        crate::setup::ensure_parent(&self.journal_path)?;
+        std::fs::write(
+            &self.journal_path,
+            serde_json::to_vec_pretty(&self.changes)?,
+        )
+        .with_context(|| format!("write ACL recovery journal {}", self.journal_path.display()))
     }
 }
 
 impl Drop for AclTransaction {
     fn drop(&mut self) {
+        let mut recovered = true;
         for change in self.changes.iter().rev() {
-            let _ = update_dacl(&change.path, change.sid, REVOKE_ACCESS, false, 0);
+            let mut sid = SidBuffer(change.sid.clone());
+            recovered &= update_dacl(&change.path, sid.as_ptr(), REVOKE_ACCESS, false, 0).is_ok();
+        }
+        if recovered {
+            let _ = std::fs::remove_file(&self.journal_path);
+        }
+    }
+}
+
+fn recover_acl_transactions() -> Result<()> {
+    let directory = crate::setup::state_dir().join("acl-transactions");
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&directory)
+        .with_context(|| format!("read ACL transaction directory {}", directory.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let changes: Vec<AclChange> = serde_json::from_slice(
+            &std::fs::read(&path)
+                .with_context(|| format!("read ACL recovery journal {}", path.display()))?,
+        )
+        .with_context(|| format!("parse ACL recovery journal {}", path.display()))?;
+        let _guards =
+            NamedAclMutex::acquire_paths(changes.iter().map(|change| change.path.as_path()))?;
+        for change in changes.iter().rev() {
+            let mut sid = SidBuffer(change.sid.clone());
+            apply_dacl_change(&change.path, sid.as_ptr(), REVOKE_ACCESS, false, 0).with_context(
+                || format!("recover interrupted ACL transaction {}", path.display()),
+            )?;
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove recovered ACL journal {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AclFailureCacheEntry {
+    recorded_at_ms: u128,
+    message: String,
+}
+
+fn apply_dacl_change(
+    path: &Path,
+    sid: PSID,
+    access_mode: i32,
+    inherit: bool,
+    permissions: u32,
+) -> Result<()> {
+    const FAILURE_TTL_MS: u128 = 5 * 60 * 1_000;
+    const FAILURE_NAMESPACE: u128 = 0xf023_7719_ae79_5a4f_ba15_73e0_3820_d3fd;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let id = Uuid::new_v5(
+        &Uuid::from_u128(FAILURE_NAMESPACE),
+        normalized_capability_path(path).as_bytes(),
+    );
+    let cache_path = crate::setup::state_dir()
+        .join("acl-failures")
+        .join(format!("{}.json", id.simple()));
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        if let Ok(cached) = serde_json::from_slice::<AclFailureCacheEntry>(&bytes) {
+            if now.saturating_sub(cached.recorded_at_ms) < FAILURE_TTL_MS {
+                anyhow::bail!(
+                    "stage=apply_acl cached deterministic ACL failure for {}: {}",
+                    path.display(),
+                    cached.message
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&cache_path);
+    }
+    match update_dacl(path, sid, access_mode, inherit, permissions) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&cache_path);
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            if message.contains(": 5") {
+                crate::setup::ensure_parent(&cache_path)?;
+                let cached = AclFailureCacheEntry {
+                    recorded_at_ms: now,
+                    message: message.clone(),
+                };
+                std::fs::write(&cache_path, serde_json::to_vec_pretty(&cached)?)
+                    .with_context(|| format!("write ACL failure cache {}", cache_path.display()))?;
+            }
+            Err(error)
         }
     }
 }
@@ -1823,22 +2502,71 @@ fn update_dacl(
 struct NamedAclMutex(HANDLE);
 
 impl NamedAclMutex {
-    fn acquire() -> Result<Self> {
-        let name = wide(OsStr::new("Local\\OpenTopiaSandboxAcl"));
+    fn acquire_named(name: &str, timeout_ms: u32, purpose: &str) -> Result<Self> {
+        let name = wide(OsStr::new(name));
         let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return Err(last_error("stage=apply_acl CreateMutexW"));
         }
-        let waited = unsafe { WaitForSingleObject(handle, 30_000) };
+        let waited = unsafe { WaitForSingleObject(handle, timeout_ms) };
         if waited == WAIT_TIMEOUT {
             unsafe { CloseHandle(handle) };
-            anyhow::bail!("stage=apply_acl timed out waiting for the ACL transaction lock")
+            anyhow::bail!(
+                "stage=apply_acl timed out waiting for the {purpose} lock after {timeout_ms}ms"
+            )
         }
         if waited == u32::MAX {
             unsafe { CloseHandle(handle) };
             return Err(last_error("stage=apply_acl WaitForSingleObject"));
         }
         Ok(Self(handle))
+    }
+
+    fn acquire_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Vec<Self>> {
+        const ACL_LOCK_NAMESPACE: u128 = 0x342a_f2f8_a5e0_5920_99f1_ec1b_c7c5_74e0;
+        let namespace = Uuid::from_u128(ACL_LOCK_NAMESPACE);
+        let mut names = paths
+            .into_iter()
+            .map(acl_authorization_domain)
+            .map(|domain| {
+                let id = Uuid::new_v5(&namespace, domain.as_bytes());
+                format!("Local\\OpenTopiaSandboxAclScope-{}", id.simple())
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+            .iter()
+            .map(|name| Self::acquire_named(name, 120_000, "ACL authorization-domain"))
+            .collect()
+    }
+
+    fn acquire_metadata() -> Result<Self> {
+        Self::acquire_named(
+            "Local\\OpenTopiaSandboxAclLedger",
+            5_000,
+            "ACL ledger transaction",
+        )
+    }
+}
+
+fn acl_authorization_domain(path: &Path) -> String {
+    let normalized = normalized_capability_path(path);
+    let parts = normalized
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if normalized.starts_with("\\\\") {
+        return format!(
+            "\\\\{}\\{}",
+            parts.first().copied().unwrap_or_default(),
+            parts.get(1).copied().unwrap_or_default()
+        );
+    }
+    match (parts.first(), parts.get(1)) {
+        (Some(volume), Some(top_level)) => format!("{volume}\\{top_level}"),
+        (Some(volume), None) => (*volume).to_string(),
+        _ => normalized,
     }
 }
 
@@ -2173,7 +2901,7 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_restricted_token_uses_scope_and_runtime_sids_only() {
+    fn dedicated_restricted_token_keeps_runtime_compatibility_sids_explicit() {
         let source = include_str!("windows.rs");
         let function = source
             .split("impl RestrictedToken")
@@ -2184,7 +2912,10 @@ mod tests {
             .expect("restricted token boundary");
         assert!(function.contains("restricting_sids[0].Sid = capability_sid"));
         assert!(function.contains("restricting_sids[1].Sid = runtime_sid"));
-        assert!(function.contains("ensure_runtime_registry_access"));
+        assert!(function.contains("restricting_sids[2].Sid = logon_sid.as_ptr()"));
+        assert!(function.contains("restricting_sids[3].Sid = everyone_sid.as_ptr()"));
+        assert!(!function.contains("ensure_runtime_registry_access"));
+        assert!(function.contains("augment_default_dacl"));
         assert!(!function.contains("current_user_sid"));
     }
 
@@ -2195,6 +2926,38 @@ mod tests {
             provisioning: ReadProvisioning::ExistingOnly,
         };
         assert_eq!(capability.provisioning, ReadProvisioning::ExistingOnly);
+    }
+
+    #[test]
+    fn acl_locks_are_sharded_by_authorization_domain() {
+        assert_eq!(
+            acl_authorization_domain(Path::new(r"J:\Project\OpenTopia")),
+            r"j:\project"
+        );
+        assert_eq!(
+            acl_authorization_domain(Path::new(r"J:\Python311")),
+            r"j:\python311"
+        );
+        assert_ne!(
+            acl_authorization_domain(Path::new(r"J:\Project\OpenTopia")),
+            acl_authorization_domain(Path::new(r"J:\Python311"))
+        );
+    }
+
+    #[test]
+    fn run_path_only_verifies_persistent_acl_state() {
+        let source = include_str!("windows.rs");
+        let dedicated = source
+            .split("fn run_dedicated_user(request")
+            .nth(1)
+            .expect("dedicated run")
+            .split("pub(super) fn run_dedicated_user_runner")
+            .next()
+            .expect("dedicated run boundary");
+        assert!(dedicated.contains("verify_persistent_user_permissions"));
+        assert!(dedicated.contains("verify_persistent_capability_permissions"));
+        assert!(!dedicated.contains("ensure_persistent_user_permissions"));
+        assert!(!dedicated.contains("ensure_persistent_capability_permissions"));
     }
 
     #[test]
