@@ -3497,6 +3497,11 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             .filter(|name| name != "write_file")
             .filter(|name| subagents_available || !is_subagent_tool(name))
             .filter(|name| structured_input_available || name.as_str() != "request_user_input")
+            // The root agent owns the shared task plan. Children report results
+            // to the parent instead of mutating the parent's plan namespace.
+            .filter(|name| {
+                self.subagent_depth == 0 || !matches!(name.as_str(), "set_plan" | "update_plan")
+            })
             .filter(|name| {
                 let source = self.tools.source(name).unwrap_or(ToolSource::Core);
                 bundle_is_visible(
@@ -6765,7 +6770,7 @@ mod tests {
     }
 
     #[test]
-    fn release_gate_mode_bundles_add_only_flow_plan_or_goal_tools() {
+    fn release_gate_mode_bundles_project_flow_plan_task_and_goal_tools() {
         let names = |agent: &AgentCore| {
             agent
                 .provider_tool_catalog()
@@ -6780,6 +6785,15 @@ mod tests {
         assert!(!code_names.iter().any(|name| name.starts_with("flow_")));
         assert!(!code_names.contains("request_user_input"));
         assert!(!code_names.contains("set_plan"));
+        assert!(code_names.contains("update_plan"));
+        assert!(code_names.contains("complete_task"));
+
+        let mut child = AgentCore::default();
+        child.set_subagent_context(Uuid::new_v4(), 1);
+        let child_names = names(&child);
+        assert!(!child_names.contains("set_plan"));
+        assert!(!child_names.contains("update_plan"));
+        assert!(child_names.contains("complete_task"));
 
         let mut work = AgentCore::default();
         work.apply_experience_mode(ExperienceMode::Work);
@@ -6795,6 +6809,8 @@ mod tests {
         let plan_names = names(&plan);
         assert!(plan_names.contains("request_user_input"));
         assert!(!plan_names.contains("set_plan"));
+        assert!(!plan_names.contains("update_plan"));
+        assert!(!plan_names.contains("complete_task"));
 
         let thread_id = Uuid::new_v4();
         let goal = GoalRecord::new(
