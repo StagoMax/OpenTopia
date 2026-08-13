@@ -1,0 +1,80 @@
+.file-type-icon {
+  --file-type-color: var(--file-type-generic);
+  position: relative;
+  display: inline-grid;
+  inline-size: var(--file-type-icon-size);
+  block-size: var(--file-type-icon-size);
+  flex: 0 0 var(--file-type-icon-size);
+  place-items: center;
+  color: var(--file-type-color);
+  vertical-align: text-bottom;
+}
+
+.file-type-icon[data-file-kind="pdf"] {
+  --file-type-color: var(--file-type-pdf);
+}
+
+.file-type-icon[data-file-kind="word"] {
+  --file-type-color: var(--file-type-word);
+}
+
+.file-type-icon[data-file-kind="spreadsheet"] {
+  --file-type-color: var(--file-type-spreadsheet);
+}
+
+.file-type-icon[data-file-kind="presentation"] {
+  --file-type-color: var(--file-type-presentation);
+}
+
+.file-type-icon[data-file-kind="image"] {
+  --file-type-color: var(--file-type-image);
+}
+
+.file-type-icon[data-file-kind="audio"] {
+  --file-type-color: var(--file-type-audio);
+}
+
+.file-type-icon[data-file-kind="video"] {
+  --file-type-color: var(--file-type-video);
+}
+
+.file-type-icon[data-file-kind="archive"] {
+  --file-type-color: var(--file-type-archive);
+}
+
+.file-type-icon[data-file-kind="data"] {
+  --file-type-color: var(--file-type-data);
+}
+
+.file-type-icon[data-file-kind="code"] {
+  --file-type-color: var(--file-type-code);
+}
+
+.file-type-icon[data-file-kind="text"] {
+  --file-type-color: var(--file-type-text);
+}
+
+.file-type-icon__outline {
+  inline-size: 100%;
+  block-size: 100%;
+  stroke-width: 1.8;
+}
+
+.file-type-icon__mark {
+  position: absolute;
+  inset-inline-end: calc(var(--space-1) * -1);
+  inset-block-end: var(--space-0);
+  max-inline-size: calc(var(--file-type-icon-size) + var(--space-2));
+  overflow: hidden;
+  border: 1px solid var(--surface);
+  border-radius: var(--radius-sm);
+  background: var(--file-type-color);
+  color: var(--file-type-on-color);
+  padding-inline: var(--space-1);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-file-mark);
+  font-weight: var(--font-weight-semibold);
+  line-height: 1;
+  text-overflow: clip;
+  white-space: nowrap;
+}

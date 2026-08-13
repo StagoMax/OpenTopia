@@ -17,6 +17,15 @@ export type PlatformInfo = {
   };
 };
 
+export type SagServiceRuntimeStatus = {
+  state: "ready" | "unavailable";
+  endpoint: string;
+  managed: boolean;
+  canStart: boolean;
+  source: string | null;
+  message?: string;
+};
+
 export type SystemNotificationOptions = {
   title: string;
   body: string;
@@ -324,6 +333,142 @@ export type WindowsSandboxSetupStatus = {
     offlineNetworkPolicy: boolean;
   };
   issues: string[];
+};
+
+export type SagLibraryStatus = {
+  provider: "SAG";
+  endpoint: string;
+  status: {
+    status: string;
+    database?: string | null;
+    indexVersion?: string | null;
+    embeddingBackend?: string | null;
+    embeddingDimensions?: number | null;
+    stats: Record<string, number>;
+    integrityCheck?: string | null;
+    modelLoaded: boolean;
+    deepseekConfigured: boolean;
+    agentLoopIntegration: boolean;
+    promptInjection: boolean;
+  };
+};
+
+export type SagSource = {
+  assetId: string;
+  sourceKey: string;
+  namespace: string;
+  origin: string;
+  versionId: string;
+  versionNumber: number;
+  sourceId: string;
+  title: string;
+  originalFilename: string;
+  contentHash: string;
+  storedPath: string;
+  metadata: Record<string, unknown>;
+  evidenceUnits: number;
+  events: number;
+  createdAt: string;
+};
+
+export type SagSearchRequest = {
+  query: string;
+  purpose?: string;
+  topK?: number;
+  maximumTokens?: number;
+  useDeepseek?: boolean;
+  subjectRefs?: string[];
+  namespaces?: string[];
+};
+
+export type SagEvidenceNeed = {
+  needId: string;
+  description: string;
+  query: string;
+  facets: string[];
+  subjectRefs: string[];
+  timeMode?: string | null;
+  required: boolean;
+  weight: number;
+};
+
+export type SagNeedCoverage = {
+  needId: string;
+  required: boolean;
+  status: "covered" | "uncovered" | string;
+  selectedEventIds: string[];
+  reason: string;
+};
+
+export type SagContextPackItem = {
+  eventId: string;
+  evidenceId: string;
+  content: string;
+  eventSummary: string;
+  sourcePath: string;
+  title: string;
+  sectionPath: string[];
+  anchors: string[];
+  score: number;
+  selectionReason: string;
+  matchedNeedIds: string[];
+  estimatedTokens: number;
+};
+
+export type SagSearchResponse = {
+  pack: {
+    packId?: string | null;
+    status: "draft" | "approved" | "rejected" | string;
+    purpose?: string | null;
+    query?: string | null;
+    plan: {
+      requestId?: string | null;
+      originalQuery?: string | null;
+      purpose?: string | null;
+      planner: string;
+      needs: SagEvidenceNeed[];
+      createdAt?: string | null;
+    };
+    coverage: SagNeedCoverage[];
+    indexVersion?: string | null;
+    retrievalEngine?: string | null;
+    items: SagContextPackItem[];
+    excludedItems: unknown[];
+    estimatedTokens: number;
+    maximumTokens: number;
+    createdAt?: string | null;
+  };
+  diagnostics: {
+    elapsedSeconds: number;
+    routeCandidates: Record<string, number>;
+    llmRequests: number;
+    embeddingBackend?: string | null;
+    deepseekEnabled: boolean;
+    agentLoopIntegration: boolean;
+    promptInjection: boolean;
+  };
+};
+
+export type SagIngestionResult = {
+  jobId: string;
+  status: "published" | "unchanged" | string;
+  assetId: string;
+  versionId: string;
+  previousVersionId?: string | null;
+  versionNumber: number;
+  sourceId: string;
+  contentHash: string;
+  namespace: string;
+  title: string;
+  storedPath: string;
+  indexVersion: string;
+  pipelineSignature: string;
+  reusedProjection: boolean;
+  evidenceUnits: number;
+  events: number;
+  entities: number;
+  llmRequests: number;
+  createdAt: string;
 };
 
 export type ReasoningEffort =
@@ -2524,6 +2669,7 @@ declare global {
       closeWindow(): Promise<boolean>;
       quit(): Promise<boolean>;
       getPlatformInfo(): Promise<PlatformInfo>;
+      ensureSagLibraryService(): Promise<SagServiceRuntimeStatus>;
       getOpenRequests(): Promise<PlatformOpenRequest[]>;
       onOpenRequest(
         listener: (request: PlatformOpenRequest) => void,

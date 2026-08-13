@@ -28,6 +28,7 @@ import {
   type ToolActivityIconKind,
   type ToolActivityView,
 } from "../toolActivity";
+import { FileTypeIcon } from "./FileTypeIcon";
 import "./ToolActivityCard.css";
 
 export type ToolSandboxState = {
@@ -78,7 +79,12 @@ export function ToolActivityCard({
         onClick={() => setExpanded((current) => !current)}
       >
         <span className="tool-activity-icon" aria-hidden="true">
-          {toolActivityIcon(view.iconKind ?? view.kind)}
+          {view.detail &&
+          (view.kind === "attachment" || view.kind === "spreadsheet") ? (
+            <FileTypeIcon name={view.detail} size={14} />
+          ) : (
+            toolActivityIcon(view.iconKind ?? view.kind)
+          )}
         </span>
         <span
           className={`tool-activity-title${running ? " conversation-status-shimmer" : ""}`}

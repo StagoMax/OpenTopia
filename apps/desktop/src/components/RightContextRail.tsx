@@ -7,10 +7,8 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
+  File,
   FileCode2,
-  FileImage,
-  FileText,
-  Folder,
   GitBranch,
   GitCommitHorizontal,
   Laptop,
@@ -24,6 +22,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import type { ApiClient } from "../api/client";
 import { formatPathForDisplay } from "../pathDisplay";
+import { FileTypeIcon, fileTypeIcon } from "./FileTypeIcon";
 import type {
   AgentEvent,
   ArtifactDescriptor,
@@ -62,6 +61,7 @@ export type RightContextRailProps = {
 
 type RailRowProps = {
   icon: LucideIcon;
+  leading?: ReactNode;
   label: string;
   value?: ReactNode;
   title?: string;
@@ -91,6 +91,7 @@ type SourceItem = {
   title: string;
   createdAt: string;
   icon: LucideIcon;
+  file?: { name: string; contentType: string };
   dedupeKey: string;
   previewTarget?: PreviewTarget;
 };
@@ -399,6 +400,15 @@ export function RightContextRail({
             <RailRow
               key={source.id}
               icon={source.icon}
+              leading={
+                source.file ? (
+                  <FileTypeIcon
+                    name={source.file.name}
+                    contentType={source.file.contentType}
+                    size={14}
+                  />
+                ) : undefined
+              }
               label={source.label}
               title={source.title}
               onClick={
@@ -646,6 +656,7 @@ function RailSection({
 
 function RailRow({
   icon: Icon,
+  leading,
   label,
   value,
   title,
@@ -655,7 +666,7 @@ function RailRow({
 }: RailRowProps) {
   const content = (
     <>
-      <Icon size={14} aria-hidden="true" />
+      {leading ?? <Icon size={14} aria-hidden="true" />}
       <span className="right-context-rail__row-label">{label}</span>
       {value}
     </>
@@ -866,6 +877,7 @@ function collectSources(
           title: `${source.path}\n${source.contentType}\n${formatSourceBytes(source.bytes)}${source.truncated ? " · 已截断" : ""}`,
           createdAt: message.createdAt,
           icon: sourceIcon(source.name, source.contentType),
+          file: { name: source.name, contentType: source.contentType },
           dedupeKey: `path:${normalizePath(source.path)}`,
           previewTarget: {
             type: "attachment",
@@ -967,20 +979,11 @@ function pathFromMetadata(metadata: unknown): string | null {
 }
 
 function sourceIcon(label: string, contentType: string): LucideIcon {
+  const icon = fileTypeIcon(label, contentType);
+  if (icon !== File) return icon;
   const value = `${label} ${contentType}`.toLocaleLowerCase();
-  if (/image|\.png\b|\.jpe?g\b|\.gif\b|\.webp\b/.test(value)) {
-    return FileImage;
-  }
-  if (
-    /json|javascript|typescript|rust|python|\.tsx?\b|\.jsx?\b|\.rs\b|\.py\b/.test(
-      value,
-    )
-  ) {
-    return FileCode2;
-  }
-  if (/text|markdown|\.md\b|\.txt\b|\.log\b/.test(value)) return FileText;
   if (/artifact|output|package/.test(value)) return Package;
-  return Folder;
+  return File;
 }
 
 function isSubagentTool(name: string): boolean {

@@ -1,14 +1,20 @@
-import { useMemo, useState } from "react";
-import { CircleHelp, Loader2 } from "lucide-react";
-import type {
-  UserInputAnswer,
-  UserInputRequest,
-  UserInputResponse,
-} from "../types";
-import { Button } from "./ui";
+import { useEffect, useRef, useState } from "react";
+import {
+  ArrowLeft,
+  ChevronRight,
+  CircleHelp,
+  Loader2,
+  PencilLine,
+} from "lucide-react";
+import type { UserInputRequest, UserInputResponse } from "../types";
+import {
+  buildPlanChoiceResponse,
+  CUSTOM_OPTION_ID,
+  type PlanChoiceCustomAnswers,
+  type PlanChoiceSelections,
+} from "./planChoiceFlow";
+import { Badge, Button, IconButton } from "./ui";
 import "./PlanChoiceCard.css";
-
-const CUSTOM_OPTION_ID = "__custom__";
 
 type PlanChoiceCardProps = {
   request: UserInputRequest;
@@ -18,9 +24,6 @@ type PlanChoiceCardProps = {
   onSkip(): void;
 };
 
-type Selections = Record<string, string>;
-type CustomAnswers = Record<string, string>;
-
 export function PlanChoiceCard({
   request,
   isSubmitting,
@@ -28,152 +31,223 @@ export function PlanChoiceCard({
   onSubmit,
   onSkip,
 }: PlanChoiceCardProps) {
-  const [selections, setSelections] = useState<Selections>({});
-  const [customAnswers, setCustomAnswers] = useState<CustomAnswers>({});
-
-  const complete = useMemo(
-    () =>
-      request.questions.every((question) => {
-        const selection = selections[question.id];
-        if (!selection) return false;
-        return (
-          selection !== CUSTOM_OPTION_ID ||
-          Boolean(customAnswers[question.id]?.trim())
-        );
-      }),
-    [customAnswers, request.questions, selections],
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [selections, setSelections] = useState<PlanChoiceSelections>({});
+  const [customAnswers, setCustomAnswers] = useState<PlanChoiceCustomAnswers>(
+    {},
   );
+  const questionTitleRef = useRef<HTMLHeadingElement>(null);
+  const customInputRef = useRef<HTMLTextAreaElement>(null);
 
-  function submit() {
-    if (!complete || isSubmitting) return;
-    const answers: UserInputAnswer[] = request.questions.map((question) => {
-      const selection = selections[question.id];
-      return selection === CUSTOM_OPTION_ID
-        ? {
-            questionId: question.id,
-            customText: customAnswers[question.id].trim(),
-          }
-        : { questionId: question.id, optionId: selection };
-    });
-    onSubmit({ answers });
+  const question = request.questions[currentQuestionIndex];
+  const questionCount = request.questions.length;
+  const isLastQuestion = currentQuestionIndex === questionCount - 1;
+  const selectedOption = question ? selections[question.id] : undefined;
+  const isCustomSelected = selectedOption === CUSTOM_OPTION_ID;
+
+  useEffect(() => {
+    if (isCustomSelected) {
+      customInputRef.current?.focus();
+      return;
+    }
+    questionTitleRef.current?.focus();
+  }, [currentQuestionIndex, isCustomSelected, request.requestId]);
+
+  if (!question) return null;
+
+  const customText = customAnswers[question.id] ?? "";
+  const questionTitleId = `${request.requestId}-${question.id}-title`;
+  const customInputId = `${request.requestId}-${question.id}-custom-text`;
+  const progress = (currentQuestionIndex + 1) / questionCount;
+
+  function submitWith(
+    nextSelections: PlanChoiceSelections,
+    nextCustomAnswers: PlanChoiceCustomAnswers,
+  ) {
+    const response = buildPlanChoiceResponse(
+      request,
+      nextSelections,
+      nextCustomAnswers,
+    );
+    if (response) onSubmit(response);
+  }
+
+  function chooseOption(optionId: string) {
+    if (isSubmitting) return;
+
+    const nextSelections = { ...selections, [question.id]: optionId };
+    setSelections(nextSelections);
+
+    if (isLastQuestion) {
+      submitWith(nextSelections, customAnswers);
+      return;
+    }
+    setCurrentQuestionIndex((current) => current + 1);
+  }
+
+  function chooseCustom() {
+    if (isSubmitting) return;
+    setSelections((current) => ({
+      ...current,
+      [question.id]: CUSTOM_OPTION_ID,
+    }));
+  }
+
+  function continueWithCustomAnswer() {
+    if (!customText.trim() || isSubmitting) return;
+
+    if (isLastQuestion) {
+      submitWith(selections, customAnswers);
+      return;
+    }
+    setCurrentQuestionIndex((current) => current + 1);
   }
 
   return (
     <aside
       className="plan-choice-card"
       role="region"
-      aria-live="polite"
-      aria-labelledby="plan-choice-title"
+      aria-labelledby={questionTitleId}
     >
       <header className="plan-choice-header">
-        <span className="plan-choice-icon" aria-hidden="true">
-          <CircleHelp size={17} />
-        </span>
-        <div>
-          <h2 id="plan-choice-title">需要你的选择</h2>
-          <p>确认关键决策后继续生成计划。</p>
+        <div className="plan-choice-leading">
+          {currentQuestionIndex > 0 ? (
+            <IconButton
+              className="plan-choice-back"
+              size="compact"
+              aria-label="返回上一题"
+              disabled={isSubmitting}
+              onClick={() =>
+                setCurrentQuestionIndex((current) => Math.max(0, current - 1))
+              }
+            >
+              <ArrowLeft size={16} aria-hidden="true" />
+            </IconButton>
+          ) : (
+            <span className="plan-choice-icon" aria-hidden="true">
+              <CircleHelp size={18} />
+            </span>
+          )}
         </div>
-        {request.questions.length > 1 ? (
-          <span className="plan-choice-count">
-            {request.questions.length} 项
-          </span>
+
+        <div className="plan-choice-heading">
+          <span className="plan-choice-eyebrow">{question.header}</span>
+          <h2 id={questionTitleId} ref={questionTitleRef} tabIndex={-1}>
+            {question.question}
+          </h2>
+          <p>
+            {questionCount > 1
+              ? "选择后自动进入下一题。"
+              : "选择后将继续生成计划。"}
+          </p>
+        </div>
+
+        {questionCount > 1 ? (
+          <Badge
+            className="plan-choice-count"
+            aria-label={`第 ${currentQuestionIndex + 1} 题，共 ${questionCount} 题`}
+          >
+            {currentQuestionIndex + 1} / {questionCount}
+          </Badge>
         ) : null}
       </header>
 
-      <div className="plan-choice-scroll">
-        <div className="plan-choice-questions">
-          {request.questions.map((question, questionIndex) => (
-            <fieldset className="plan-choice-question" key={question.id}>
-              <legend>
-                <span>{question.header}</span>
-                <strong>{question.question}</strong>
-              </legend>
-              <div className="plan-choice-options">
-                {question.options.map((option) => {
-                  const inputId = `${request.requestId}-${question.id}-${option.id}`;
-                  const selected = selections[question.id] === option.id;
-                  return (
-                    <label
-                      className={`plan-choice-option ${selected ? "selected" : ""}`}
-                      htmlFor={inputId}
-                      key={option.id}
-                    >
-                      <input
-                        checked={selected}
-                        id={inputId}
-                        name={`${request.requestId}-${question.id}`}
-                        type="radio"
-                        value={option.id}
-                        onChange={() =>
-                          setSelections((current) => ({
-                            ...current,
-                            [question.id]: option.id,
-                          }))
-                        }
-                      />
-                      <span className="plan-choice-option-copy">
-                        <span className="plan-choice-option-title">
-                          <strong>{option.label}</strong>
-                          {option.recommended ? <em>推荐</em> : null}
-                        </span>
-                        <span>{option.description}</span>
-                      </span>
-                    </label>
-                  );
-                })}
+      {questionCount > 1 ? (
+        <div
+          className="plan-choice-progress"
+          role="progressbar"
+          aria-label="问题进度"
+          aria-valuemin={1}
+          aria-valuemax={questionCount}
+          aria-valuenow={currentQuestionIndex + 1}
+        >
+          <span style={{ transform: `scaleX(${progress})` }} />
+        </div>
+      ) : null}
 
-                {question.allowCustom ? (
-                  <div
-                    className={`plan-choice-custom ${
-                      selections[question.id] === CUSTOM_OPTION_ID
-                        ? "selected"
-                        : ""
-                    }`}
-                  >
-                    <label
-                      className="plan-choice-option plan-choice-custom-trigger"
-                      htmlFor={`${request.requestId}-${question.id}-custom`}
-                    >
-                      <input
-                        checked={selections[question.id] === CUSTOM_OPTION_ID}
-                        id={`${request.requestId}-${question.id}-custom`}
-                        name={`${request.requestId}-${question.id}`}
-                        type="radio"
-                        value={CUSTOM_OPTION_ID}
-                        onChange={() =>
-                          setSelections((current) => ({
-                            ...current,
-                            [question.id]: CUSTOM_OPTION_ID,
-                          }))
-                        }
-                      />
-                      <span className="plan-choice-option-copy">
-                        <strong>其他方案</strong>
-                        <span>补充你希望采用的方向。</span>
-                      </span>
-                    </label>
-                    {selections[question.id] === CUSTOM_OPTION_ID ? (
-                      <textarea
-                        autoFocus={questionIndex === 0}
-                        aria-label={`${question.header}的其他方案`}
-                        maxLength={1000}
-                        placeholder="输入你的选择或约束"
-                        rows={2}
-                        value={customAnswers[question.id] ?? ""}
-                        onChange={(event) =>
-                          setCustomAnswers((current) => ({
-                            ...current,
-                            [question.id]: event.target.value,
-                          }))
-                        }
-                      />
-                    ) : null}
+      <div className="plan-choice-scroll">
+        <fieldset className="plan-choice-question" key={question.id}>
+          <legend className="ot-sr-only">{question.header}的可选方案</legend>
+          <div className="plan-choice-options">
+            {question.options.map((option, optionIndex) => {
+              const selected = selectedOption === option.id;
+              return (
+                <button
+                  className={`plan-choice-option ${selected ? "selected" : ""}`}
+                  type="button"
+                  aria-pressed={selected}
+                  disabled={isSubmitting}
+                  key={option.id}
+                  onClick={() => chooseOption(option.id)}
+                >
+                  <span className="plan-choice-option-index" aria-hidden="true">
+                    {optionIndex + 1}
+                  </span>
+                  <span className="plan-choice-option-copy">
+                    <span className="plan-choice-option-title">
+                      <strong>{option.label}</strong>
+                      {option.recommended ? <Badge>推荐</Badge> : null}
+                    </span>
+                    <span>{option.description}</span>
+                  </span>
+                  <ChevronRight
+                    className="plan-choice-option-arrow"
+                    size={16}
+                    aria-hidden="true"
+                  />
+                </button>
+              );
+            })}
+
+            {question.allowCustom ? (
+              <div
+                className={`plan-choice-custom ${isCustomSelected ? "selected" : ""}`}
+              >
+                <button
+                  className="plan-choice-option plan-choice-custom-trigger"
+                  type="button"
+                  aria-expanded={isCustomSelected}
+                  aria-controls={customInputId}
+                  disabled={isSubmitting}
+                  onClick={chooseCustom}
+                >
+                  <span className="plan-choice-option-index" aria-hidden="true">
+                    <PencilLine size={14} />
+                  </span>
+                  <span className="plan-choice-option-copy">
+                    <strong>其他方案</strong>
+                    <span>补充你希望采用的方向。</span>
+                  </span>
+                  <ChevronRight
+                    className="plan-choice-option-arrow"
+                    size={16}
+                    aria-hidden="true"
+                  />
+                </button>
+
+                {isCustomSelected ? (
+                  <div className="plan-choice-custom-fields">
+                    <label htmlFor={customInputId}>补充你的选择</label>
+                    <textarea
+                      id={customInputId}
+                      ref={customInputRef}
+                      maxLength={1000}
+                      placeholder="输入你的选择或约束"
+                      rows={2}
+                      value={customText}
+                      onChange={(event) =>
+                        setCustomAnswers((current) => ({
+                          ...current,
+                          [question.id]: event.target.value,
+                        }))
+                      }
+                    />
                   </div>
                 ) : null}
               </div>
-            </fieldset>
-          ))}
-        </div>
+            ) : null}
+          </div>
+        </fieldset>
 
         {error ? (
           <p className="plan-choice-error" role="alert">
@@ -183,11 +257,21 @@ export function PlanChoiceCard({
       </div>
 
       <footer className="plan-choice-actions">
-        <span>
-          {complete
-            ? "选择已完整"
-            : `还需选择 ${request.questions.filter((question) => !selections[question.id] || (selections[question.id] === CUSTOM_OPTION_ID && !customAnswers[question.id]?.trim())).length} 项`}
+        <span className="plan-choice-status" aria-live="polite">
+          {isSubmitting ? (
+            <>
+              <Loader2 className="plan-choice-spinner" size={14} />
+              正在提交答案
+            </>
+          ) : isCustomSelected ? (
+            "填写后继续"
+          ) : isLastQuestion ? (
+            "选择一项后完成"
+          ) : (
+            "选择一项后进入下一题"
+          )}
         </span>
+
         <div className="plan-choice-action-buttons">
           <Button
             className="plan-choice-skip"
@@ -197,21 +281,19 @@ export function PlanChoiceCard({
           >
             跳过
           </Button>
-          <Button
-            className="plan-choice-submit"
-            variant="primary"
-            disabled={!complete || isSubmitting}
-            onClick={submit}
-          >
-            {isSubmitting ? (
-              <>
-                <Loader2 className="plan-choice-spinner" size={15} />
-                正在提交
-              </>
-            ) : (
-              "继续规划"
-            )}
-          </Button>
+          {isCustomSelected ? (
+            <Button
+              className="plan-choice-custom-next"
+              variant="primary"
+              disabled={!customText.trim() || isSubmitting}
+              onClick={continueWithCustomAnswer}
+            >
+              {isLastQuestion ? "完成" : "下一题"}
+              {!isSubmitting ? (
+                <ChevronRight size={15} aria-hidden="true" />
+              ) : null}
+            </Button>
+          ) : null}
         </div>
       </footer>
     </aside>

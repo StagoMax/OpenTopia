@@ -2791,6 +2791,11 @@ button:disabled {
   color: var(--text);
 }
 
+.primary-nav .flow-library-nav-item[aria-current="page"] {
+  background: var(--surface-active);
+  color: var(--text);
+}
+
 .primary-nav button:disabled {
   color: var(--text-muted);
 }
@@ -4051,7 +4056,7 @@ button:disabled {
   font-size: 11px;
 }
 
-.message-source-reference span {
+.message-source-reference > span:not(.file-type-icon) {
   overflow: hidden;
   max-width: 240px;
   text-overflow: ellipsis;
@@ -4869,7 +4874,7 @@ button:disabled {
   font-size: 10px;
 }
 
-.composer-source > span {
+.composer-source > span:not(.file-type-icon) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6468,7 +6473,7 @@ button:disabled {
   font-size: 11px;
 }
 
-.message-source-reference span {
+.message-source-reference > span:not(.file-type-icon) {
   overflow: hidden;
   max-width: 240px;
   text-overflow: ellipsis;
@@ -7286,7 +7291,7 @@ button:disabled {
   font-size: 10px;
 }
 
-.composer-source > span {
+.composer-source > span:not(.file-type-icon) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -8115,7 +8120,7 @@ button:disabled {
   font-size: 11px;
 }
 
-.tool-tab-main span {
+.tool-tab-main > span:not(.file-type-icon) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -8690,7 +8695,7 @@ button:disabled {
   white-space: nowrap;
 }
 
-.preview-heading > span:not(.preview-warning-pill),
+.preview-heading > span:not(.preview-warning-pill):not(.file-type-icon),
 .preview-zoom-value,
 .pdf-page-control {
   color: var(--text-muted);
@@ -13241,6 +13246,7 @@ button:disabled {
 
 .message-content > .message-body {
   max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .message-actions {

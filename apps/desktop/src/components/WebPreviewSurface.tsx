@@ -15,6 +15,7 @@ import type {
   WebPreviewState,
 } from "../types";
 import { activeBrowserHandoff, type BrowserHandoff } from "../browserHandoff";
+import { resolveAddressBarInput } from "../browserNavigation";
 import { BrowserPanel } from "./BrowserPanel";
 
 export function WebPreviewSurface({
@@ -208,7 +209,7 @@ function NativeWebPreview({
 
   async function navigate() {
     try {
-      const url = normalizeWebUrl(address);
+      const url = resolveAddressBarInput(address);
       setError(null);
       setAddress(url);
       await api.navigateFromAddressBar(sessionId, url);
@@ -310,17 +311,6 @@ function NativeWebPreview({
       ) : null}
     </section>
   );
-}
-
-function normalizeWebUrl(value: string): string {
-  const candidate = /^https?:\/\//i.test(value.trim())
-    ? value.trim()
-    : `https://${value.trim()}`;
-  const parsed = new URL(candidate);
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("Only HTTP and HTTPS URLs can be previewed.");
-  }
-  return parsed.toString();
 }
 
 function errorMessage(cause: unknown): string {

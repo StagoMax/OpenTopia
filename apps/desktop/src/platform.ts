@@ -8,6 +8,7 @@ import type {
   PlatformInfo,
   PluginDirectoryPickResult,
   RecentWorkspace,
+  SagServiceRuntimeStatus,
   SecretSources,
   SystemNotificationOptions,
   WorkspacePickResult,
@@ -37,6 +38,11 @@ export async function loadPlatformInfo(): Promise<PlatformInfo> {
       };
   loadedApiToken = info.apiToken;
   return info as PlatformInfo;
+}
+
+export async function ensureSagLibraryService(): Promise<SagServiceRuntimeStatus | null> {
+  if (!window.opentopia?.ensureSagLibraryService) return null;
+  return window.opentopia.ensureSagLibraryService();
 }
 
 export function getLoadedApiToken(): string {

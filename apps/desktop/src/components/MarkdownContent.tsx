@@ -21,6 +21,11 @@ import ReactMarkdown, {
 } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  decodeAttachmentLink,
+  ATTACHMENT_LINK_SCHEME,
+  remarkAttachmentLinks,
+} from "../attachmentLinks";
+import {
   renderedTextChange,
   rendererTraceTime,
   type ConversationMarkdownTraceContext,
@@ -37,7 +42,9 @@ import {
   resolveMarkdownFileLink,
 } from "../markdownLinks";
 import { recordConversationRenderTrace } from "../platform";
+import type { ContextSourceRef } from "../types";
 import { FileLinkContextMenu } from "./FileLinkContextMenu";
+import { FileTypeIcon } from "./FileTypeIcon";
 import { MermaidDiagram } from "./MermaidDiagram";
 import {
   useWorkspaceAbsolutePath,
@@ -52,17 +59,20 @@ export type MarkdownContentProps = {
   streaming?: boolean;
   baseWorkspacePath?: string | null;
   onOpenLink?(href: string): void;
+  attachmentSources?: readonly ContextSourceRef[];
+  onOpenAttachment?(source: ContextSourceRef): void;
   renderTrace?: ConversationMarkdownTraceContext;
 };
 
 type RemarkPlugins = Options["remarkPlugins"];
 
-const basePlugins: RemarkPlugins = [remarkGfm];
-const pathLinkPlugins: RemarkPlugins = [remarkGfm, remarkFilePathLinks];
-
 type MarkdownLinkContextValue = Pick<
   MarkdownContentProps,
-  "baseWorkspacePath" | "onOpenLink" | "streaming"
+  | "attachmentSources"
+  | "baseWorkspacePath"
+  | "onOpenAttachment"
+  | "onOpenLink"
+  | "streaming"
 >;
 
 const MarkdownLinkContext = createContext<MarkdownLinkContextValue>({});
@@ -79,18 +89,31 @@ export function MarkdownContent({
   streaming = false,
   baseWorkspacePath,
   onOpenLink,
+  attachmentSources = [],
+  onOpenAttachment,
   renderTrace,
 }: MarkdownContentProps) {
   const renderedText = useThrottledMarkdown(text, streaming);
   useConversationMarkdownTrace(renderedText, renderTrace);
   const instanceId = useId().replaceAll(":", "");
+  const linkifyAttachments = Boolean(
+    onOpenAttachment && attachmentSources.length,
+  );
   return (
     <MarkdownLinkContext.Provider
-      value={{ baseWorkspacePath, onOpenLink, streaming }}
+      value={{
+        attachmentSources,
+        baseWorkspacePath,
+        onOpenAttachment,
+        onOpenLink,
+        streaming,
+      }}
     >
       <MemoizedMarkdown
+        attachmentSources={attachmentSources}
         className={`markdown-content ${className}`.trim()}
         clobberPrefix={`opentopia-${instanceId}-`}
+        linkifyAttachments={linkifyAttachments}
         linkifyPaths={Boolean(onOpenLink)}
         text={renderedText}
       />
@@ -99,21 +122,30 @@ export function MarkdownContent({
 }
 
 const MemoizedMarkdown = memo(function MemoizedMarkdown({
+  attachmentSources,
   className,
   clobberPrefix,
+  linkifyAttachments,
   linkifyPaths,
   text,
 }: {
+  attachmentSources: readonly ContextSourceRef[];
   className: string;
   clobberPrefix: string;
+  linkifyAttachments: boolean;
   linkifyPaths: boolean;
   text: string;
 }) {
+  const remarkPlugins: RemarkPlugins = [remarkGfm];
+  if (linkifyAttachments) {
+    remarkPlugins.push([remarkAttachmentLinks, { sources: attachmentSources }]);
+  }
+  if (linkifyPaths) remarkPlugins.push(remarkFilePathLinks);
   return (
     <div className={className}>
       <ReactMarkdown
         components={markdownComponents}
-        remarkPlugins={linkifyPaths ? pathLinkPlugins : basePlugins}
+        remarkPlugins={remarkPlugins}
         remarkRehypeOptions={{ clobberPrefix }}
         skipHtml
         urlTransform={markdownUrlTransform}
@@ -125,7 +157,11 @@ const MemoizedMarkdown = memo(function MemoizedMarkdown({
 });
 
 function markdownUrlTransform(url: string): string {
-  if (url.startsWith(FILE_PATH_LINK_SCHEME) || isWindowsDrivePath(url)) {
+  if (
+    url.startsWith(ATTACHMENT_LINK_SCHEME) ||
+    url.startsWith(FILE_PATH_LINK_SCHEME) ||
+    isWindowsDrivePath(url)
+  ) {
     return url;
   }
   return defaultUrlTransform(url);
@@ -180,7 +216,16 @@ function MarkdownAnchor({
   children,
   ...props
 }: AnchorHTMLAttributes<HTMLAnchorElement>) {
-  const { baseWorkspacePath, onOpenLink } = useContext(MarkdownLinkContext);
+  const {
+    attachmentSources = [],
+    baseWorkspacePath,
+    onOpenAttachment,
+    onOpenLink,
+  } = useContext(MarkdownLinkContext);
+  const attachmentId = href ? decodeAttachmentLink(href) : null;
+  const attachment = attachmentId
+    ? attachmentSources.find((source) => source.id === attachmentId)
+    : undefined;
   const detectedLinkInfo = href ? decodeFilePathHref(href) : null;
   const linkInfo = href
     ? resolveMarkdownFileLink(href, baseWorkspacePath)
@@ -193,6 +238,35 @@ function MarkdownAnchor({
     x: number;
     y: number;
   } | null>(null);
+
+  if (attachment) {
+    return (
+      <a
+        {...props}
+        href={href}
+        title={attachment.name}
+        className={[
+          props.className,
+          "markdown-attachment-link",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+        onClick={(event) => {
+          props.onClick?.(event);
+          if (event.defaultPrevented || !onOpenAttachment) return;
+          event.preventDefault();
+          onOpenAttachment(attachment);
+        }}
+      >
+        <FileTypeIcon
+          name={attachment.name}
+          contentType={attachment.contentType}
+          size={14}
+        />
+        {children}
+      </a>
+    );
+  }
 
   // Both automatically detected paths and explicit Markdown file links use a
   // filename-only label after the target is confirmed in the workspace.

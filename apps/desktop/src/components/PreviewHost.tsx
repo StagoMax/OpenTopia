@@ -18,6 +18,7 @@ import type {
   PreviewDescriptor,
   PreviewTarget,
 } from "../types";
+import { FileTypeIcon } from "./FileTypeIcon";
 import { detectLanguage, MonacoEditor } from "./MonacoEditor";
 import { MarkdownContent } from "./MarkdownContent";
 
@@ -126,6 +127,13 @@ export function PreviewHost({
     >
       <header className="preview-header">
         <div className="preview-heading">
+          {target.type === "attachment" ? (
+            <FileTypeIcon
+              name={descriptor.title}
+              contentType={descriptor.contentType}
+              size={18}
+            />
+          ) : null}
           <strong title={descriptor.title}>{descriptor.title}</strong>
           <span title={descriptor.contentType}>{descriptor.contentType}</span>
           {descriptor.bytes != null && (

@@ -64,6 +64,11 @@ import type {
   ProviderModelSyncResult,
   ProviderSettings,
   SandboxDescriptor,
+  SagIngestionResult,
+  SagLibraryStatus,
+  SagSearchRequest,
+  SagSearchResponse,
+  SagSource,
   ScmRemoteConnectorResponse,
   SkillDescriptor,
   SpreadsheetPreview,
@@ -195,6 +200,56 @@ export class ApiClient {
 
   async getWindowsSandboxSetup(): Promise<WindowsSandboxSetupStatus> {
     return this.get("/api/sandbox/windows/setup");
+  }
+
+  async getSagLibraryStatus(signal?: AbortSignal): Promise<SagLibraryStatus> {
+    return this.get("/api/library/sag/status", signal);
+  }
+
+  async listSagSources(signal?: AbortSignal): Promise<SagSource[]> {
+    return this.get("/api/library/sag/sources", signal);
+  }
+
+  async searchSag(input: SagSearchRequest): Promise<SagSearchResponse> {
+    return this.post("/api/library/sag/search", input);
+  }
+
+  async ingestSagText(input: {
+    content: string;
+    filename?: string;
+    assetId?: string;
+    sourceKey?: string;
+    namespace?: string;
+    title?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<SagIngestionResult> {
+    return this.post("/api/library/sag/ingestions/text", input);
+  }
+
+  async uploadSagSource(input: {
+    file: File;
+    assetId?: string;
+    sourceKey?: string;
+    namespace?: string;
+    title?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<SagIngestionResult> {
+    const form = new FormData();
+    form.set("file", input.file, input.file.name);
+    if (input.assetId) form.set("asset_id", input.assetId);
+    if (input.sourceKey) form.set("source_key", input.sourceKey);
+    form.set("namespace", input.namespace || "enterprise_knowledge");
+    if (input.title) form.set("title", input.title);
+    form.set("metadata_json", JSON.stringify(input.metadata ?? {}));
+    const response = await fetch(
+      `${this.baseUrl}/api/library/sag/ingestions/upload`,
+      {
+        method: "POST",
+        headers: this.authHeaders(),
+        body: form,
+      },
+    );
+    return parseResponse<SagIngestionResult>(response);
   }
 
   async setupWindowsSandbox(): Promise<WindowsSandboxSetupStatus> {
@@ -1781,15 +1836,20 @@ function previewRenderer(
   contentType: string,
 ): PreviewDescriptor["renderer"] {
   const extension = path.split(".").at(-1)?.toLocaleLowerCase() ?? "";
-  if (contentType.startsWith("image/")) return "image";
-  if (contentType === "application/pdf" || extension === "pdf") return "pdf";
+  const mediaType = contentType.split(";", 1)[0]?.trim().toLocaleLowerCase();
+  if (mediaType.startsWith("image/")) return "image";
+  if (mediaType === "application/pdf" || extension === "pdf") return "pdf";
   if (
-    contentType ===
+    mediaType ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
     extension === "docx"
   )
     return "document";
-  if (["xlsx", "xlsm", "xltx"].includes(extension)) return "spreadsheet";
+  if (
+    ["csv", "tsv", "xlsx", "xlsm", "xltx"].includes(extension) ||
+    ["text/csv", "text/tab-separated-values"].includes(mediaType)
+  )
+    return "spreadsheet";
   if (
     [
       "c",
@@ -1817,7 +1877,7 @@ function previewRenderer(
   ) {
     return "code";
   }
-  if (contentType.startsWith("text/")) return "text";
+  if (mediaType.startsWith("text/")) return "text";
   return "unsupported";
 }
 
@@ -1838,6 +1898,7 @@ function previewContentType(path: string): string {
     png: "image/png",
     svg: "image/svg+xml",
     ts: "text/typescript",
+    tsv: "text/tab-separated-values",
     txt: "text/plain",
     webp: "image/webp",
     xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",

@@ -12,6 +12,7 @@ import {
   type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -39,10 +40,8 @@ import {
   Copy,
   Download,
   ExternalLink,
-  File,
   FileCode2,
   FileImage,
-  FileJson,
   FileText,
   Folder,
   FolderOpen,
@@ -52,6 +51,7 @@ import {
   Globe2,
   Hand,
   Laptop,
+  Library,
   ListTodo,
   Loader2,
   Maximize2,
@@ -98,6 +98,7 @@ import type {
 } from "./components/DiffReviewPanel";
 import { LogViewer } from "./components/LogViewer";
 import { MarkdownContent } from "./components/MarkdownContent";
+import { FileTypeIcon } from "./components/FileTypeIcon";
 import { ModelSelector } from "./components/ModelSelector";
 import {
   ApprovalDialog,
@@ -110,6 +111,7 @@ import {
   PreviewHost,
 } from "./components/PreviewHost";
 import { FlowWorkspacePanel } from "./components/FlowWorkspacePanel";
+import { SagLibraryPanel } from "./components/SagLibraryPanel";
 import { RightContextRail } from "./components/RightContextRail";
 import {
   SettingsPanel as RedesignedSettingsPanel,
@@ -135,6 +137,7 @@ import {
   conversationMessageCopyText,
   formatConversationMessageTimestamp,
 } from "./conversationMessageMeta";
+import { attachmentsByAssistantMessage } from "./conversationAttachmentReferences";
 import { formatPathForDisplay } from "./pathDisplay";
 import {
   composerContentText,
@@ -683,6 +686,9 @@ export function App() {
     useState<ThreadModelSelection | null>(readDraftModelSelection);
   const [experienceMode, setExperienceMode] =
     useState<ExperienceMode>(readExperienceMode);
+  const [flowPrimaryView, setFlowPrimaryView] = useState<
+    "conversation" | "library"
+  >("conversation");
   const [collaborationMode, setCollaborationMode] = useState<CollaborationMode>(
     readCollaborationMode,
   );
@@ -1191,6 +1197,11 @@ export function App() {
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
   );
+  const activeToolRequiresFullWorkspace =
+    activeToolTab?.kind === "extensions";
+  const toolStageCoversConversation =
+    toolStageOpen &&
+    (conversationCollapsed || activeToolRequiresFullWorkspace);
   const terminalToolActive =
     toolStageOpen && activeToolTab?.kind === "terminal";
   const pendingApprovalQueue = useMemo(
@@ -1283,11 +1294,11 @@ export function App() {
         workspaceLayoutPreferences,
         workspaceWidth,
         toolStageOpen,
-        conversationCollapsed,
+        toolStageCoversConversation,
       ),
     [
-      conversationCollapsed,
       toolStageOpen,
+      toolStageCoversConversation,
       workspaceLayoutPreferences,
       workspaceWidth,
     ],
@@ -1579,6 +1590,13 @@ export function App() {
         setPendingApprovalIds((current) =>
           current.includes(approvalId) ? current : [...current, approvalId],
         );
+      }
+
+      if (
+        event.payload.type === "tool_call_started" &&
+        event.payload.call.name === "computer"
+      ) {
+        openToolTab("computer");
       }
 
       if (event.payload.type === "browser_handoff_required") {
@@ -2338,6 +2356,7 @@ export function App() {
     markThreadActivityRead(threadId);
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
+    setFlowPrimaryView("conversation");
     setActiveTurnId(cachedActiveTurnId);
     if (cached) {
       setMessages(cached.messages);
@@ -2365,6 +2384,7 @@ export function App() {
         markThreadActivityRead(thread.id);
         activeThreadIdRef.current = thread.id;
         setActiveThreadId(thread.id);
+        setFlowPrimaryView("conversation");
         setExperienceMode(thread.experienceMode);
         setDraftProjectId(null);
         setSelectedWorkspaceRoot(thread.workspaceRoot);
@@ -2398,6 +2418,7 @@ export function App() {
   ) {
     activeThreadIdRef.current = null;
     setActiveThreadId(null);
+    setFlowPrimaryView("conversation");
     setMessages([]);
     setEvents([]);
     setNewTaskLaunchMode("local");
@@ -4446,7 +4467,7 @@ export function App() {
         )}
         <main
           ref={workspaceRef}
-          className={`workspace ${settingsOpen ? "is-settings-hidden" : ""} ${toolStageOpen ? "with-tool-stage" : ""} ${conversationCollapsed ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
+          className={`workspace ${settingsOpen ? "is-settings-hidden" : ""} ${toolStageOpen ? "with-tool-stage" : ""} ${toolStageCoversConversation ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
           style={workspaceStyle}
         >
           <Sidebar
@@ -4459,7 +4480,14 @@ export function App() {
             isPickingWorkspace={isPickingWorkspace}
             experienceMode={experienceMode}
             flowModeEnabled={settings?.enterprise.enabled ?? false}
+            flowLibraryOpen={
+              experienceMode === "flow" && flowPrimaryView === "library"
+            }
             onExperienceModeChange={changeExperienceMode}
+            onOpenFlowLibrary={() => {
+              setFlowPrimaryView("library");
+              setConversationCollapsed(false);
+            }}
             onSelect={selectThread}
             onNew={beginNewThread}
             onPickWorkspace={() => void chooseWorkspace()}
@@ -4530,7 +4558,24 @@ export function App() {
             id="workspace-center-pane"
           >
             <ThreadHeader
-              thread={activeThread}
+              thread={
+                experienceMode === "flow" && flowPrimaryView === "library"
+                  ? null
+                  : activeThread
+              }
+              headingIcon={
+                experienceMode === "flow" && flowPrimaryView === "library" ? (
+                  <Library aria-hidden="true" size={15} />
+                ) : undefined
+              }
+              title={
+                experienceMode === "flow" && flowPrimaryView === "library"
+                  ? "Library"
+                  : undefined
+              }
+              showThreadControls={
+                !(experienceMode === "flow" && flowPrimaryView === "library")
+              }
               toolStageOpen={toolStageOpen}
               contextRailOpen={contextRailVisible}
               onOpenLocation={() =>
@@ -4571,7 +4616,9 @@ export function App() {
               }
               onArchive={() => activeThread && void archiveThread(activeThread)}
             />
-            {serverStatus === "offline" ? (
+            {experienceMode === "flow" && flowPrimaryView === "library" ? (
+              <SagLibraryPanel client={client} />
+            ) : serverStatus === "offline" ? (
               <OfflineState
                 backendUrl={platform?.backendUrl}
                 error={serverError}
@@ -4790,6 +4837,7 @@ export function App() {
             activeToolTab={activeToolTab}
             toolStageOpen={toolStageOpen}
             conversationCollapsed={conversationCollapsed}
+            activeToolRequiresFullWorkspace={activeToolRequiresFullWorkspace}
             contextRailOpen={contextRailVisible}
             contextRailAutoVisible={contextRailAutoVisible}
             thread={activeThread}
@@ -6757,7 +6805,9 @@ function Sidebar({
   isPickingWorkspace,
   experienceMode,
   flowModeEnabled,
+  flowLibraryOpen,
   onExperienceModeChange,
+  onOpenFlowLibrary,
   onSelect,
   onNew,
   onPickWorkspace,
@@ -6784,7 +6834,9 @@ function Sidebar({
   isPickingWorkspace: boolean;
   experienceMode: ExperienceMode;
   flowModeEnabled: boolean;
+  flowLibraryOpen: boolean;
   onExperienceModeChange(mode: ExperienceMode): void;
+  onOpenFlowLibrary(): void;
   onSelect(id: string): void;
   onNew(): void;
   onPickWorkspace(): void;
@@ -6959,6 +7011,17 @@ function Sidebar({
             <FileText size={15} />
             <span>新建任务</span>
           </button>
+          {experienceMode === "flow" ? (
+            <button
+              aria-current={flowLibraryOpen ? "page" : undefined}
+              className="flow-library-nav-item"
+              onClick={onOpenFlowLibrary}
+            >
+              <Library aria-hidden="true" size={15} />
+              <span>Library</span>
+              <small>RAG / 数据 / CRM</small>
+            </button>
+          ) : null}
           <button disabled title="拉取请求 · 未实现">
             <GitPullRequest size={15} />
             <span>拉取请求</span>
@@ -7638,6 +7701,9 @@ function SidebarThreadRow({
 
 function ThreadHeader({
   thread,
+  title,
+  headingIcon,
+  showThreadControls = true,
   toolStageOpen,
   contextRailOpen,
   onOpenLocation,
@@ -7648,6 +7714,9 @@ function ThreadHeader({
   onArchive,
 }: {
   thread: Thread | null;
+  title?: string;
+  headingIcon?: ReactNode;
+  showThreadControls?: boolean;
   toolStageOpen: boolean;
   contextRailOpen: boolean;
   onOpenLocation(): void;
@@ -7664,6 +7733,12 @@ function ThreadHeader({
     setTaskMenuOpen(false),
   );
 
+  useEffect(() => {
+    if (showThreadControls) return;
+    setMenuOpen(false);
+    setTaskMenuOpen(false);
+  }, [showThreadControls]);
+
   function selectTool(kind: ToolTabKind) {
     onOpenTool(kind);
     setMenuOpen(false);
@@ -7672,149 +7747,153 @@ function ThreadHeader({
   return (
     <div className="thread-header">
       <div className="thread-heading">
-        <Folder size={15} />
-        <h1>{thread?.title ?? "新任务"}</h1>
-        <div className="thread-heading-menu-wrap" ref={taskMenuRef}>
-          <button
-            className="thread-more"
-            disabled={!thread}
-            aria-label="任务菜单"
-            aria-expanded={taskMenuOpen}
-            onClick={() => {
-              setTaskMenuOpen((current) => !current);
-              setMenuOpen(false);
-            }}
-          >
-            <MoreHorizontal size={15} />
-          </button>
-          {taskMenuOpen && thread && (
-            <div className="tool-popover thread-heading-popover" role="menu">
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onOpenLocation();
-                  setTaskMenuOpen(false);
-                }}
-              >
-                <FolderOpen size={14} />
-                <span>在文件管理器中打开</span>
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onRename();
-                  setTaskMenuOpen(false);
-                }}
-              >
-                <Pencil size={14} />
-                <span>重命名任务</span>
-              </button>
-              <button disabled title="Git 工作树管理尚未实现">
-                <GitFork size={14} />
-                <span>创建工作树</span>
-                <small>未实现</small>
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onArchive();
-                  setTaskMenuOpen(false);
-                }}
-              >
-                <Archive size={14} />
-                <span>归档任务</span>
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
-      <div className="thread-actions">
-        <div className="thread-tool-menu-wrap" ref={menuRef}>
-          <button
-            className="thread-tool-button"
-            disabled={!thread}
-            aria-expanded={menuOpen}
-            aria-haspopup="menu"
-            onClick={() => {
-              setMenuOpen((current) => !current);
-              setTaskMenuOpen(false);
-            }}
-          >
-            <PanelRight size={14} />
-            <span>打开位置</span>
-            <ChevronDown size={12} />
-          </button>
-          {menuOpen && thread && (
-            <div className="tool-popover thread-tool-popover" role="menu">
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onOpenLocation();
-                  setMenuOpen(false);
-                }}
-              >
-                <FolderOpen size={14} />
-                <span>文件管理器</span>
-              </button>
-              <button role="menuitem" onClick={() => selectTool("terminal")}>
-                <TerminalSquare size={14} />
-                <span>终端</span>
-              </button>
-              <button disabled title="VS Code 启动集成尚未实现">
-                <FileCode2 size={14} />
-                <span>VS Code</span>
-                <small>未实现</small>
-              </button>
-              <button disabled title="Git Bash 启动集成尚未实现">
-                <GitBranch size={14} />
-                <span>Git Bash</span>
-                <small>未实现</small>
-              </button>
-              <button disabled title="WSL 启动集成尚未实现">
-                <Cloud size={14} />
-                <span>WSL</span>
-                <small>未实现</small>
-              </button>
-              <div className="tool-popover-separator" />
-              <button role="menuitem" onClick={() => selectTool("files")}>
-                <Folder size={14} />
-                <span>文件工具</span>
-              </button>
-              <button role="menuitem" onClick={() => selectTool("diff")}>
-                <GitBranch size={14} />
-                <span>审查变更</span>
-              </button>
-            </div>
-          )}
-        </div>
-        <IconButton
-          className={`context-rail-toggle ${contextRailOpen ? "is-active" : ""}`}
-          size="compact"
-          variant="quiet"
-          aria-label={contextRailOpen ? "折叠环境信息" : "展开环境信息"}
-          aria-controls="workspace-context-rail"
-          aria-expanded={contextRailOpen}
-          disabled={!thread}
-          title={contextRailOpen ? "折叠环境信息" : "展开环境信息"}
-          onClick={onToggleContextRail}
-        >
-          <SlidersHorizontal size={15} aria-hidden="true" />
-        </IconButton>
-        {!toolStageOpen ? (
-          <IconButton
-            className="tool-stage-toggle"
-            size="compact"
-            variant="quiet"
-            aria-label="展开工具窗口"
-            aria-controls="workspace-right-panel"
-            aria-expanded={false}
-            title="展开工具窗口"
-            onClick={onToggleToolStage}
-          >
-            <PanelRightOpen size={15} aria-hidden="true" />
-          </IconButton>
+        {headingIcon ?? <Folder size={15} />}
+        <h1>{title ?? thread?.title ?? "新任务"}</h1>
+        {showThreadControls ? (
+          <div className="thread-heading-menu-wrap" ref={taskMenuRef}>
+            <button
+              className="thread-more"
+              disabled={!thread}
+              aria-label="任务菜单"
+              aria-expanded={taskMenuOpen}
+              onClick={() => {
+                setTaskMenuOpen((current) => !current);
+                setMenuOpen(false);
+              }}
+            >
+              <MoreHorizontal size={15} />
+            </button>
+            {taskMenuOpen && thread && (
+              <div className="tool-popover thread-heading-popover" role="menu">
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onOpenLocation();
+                    setTaskMenuOpen(false);
+                  }}
+                >
+                  <FolderOpen size={14} />
+                  <span>在文件管理器中打开</span>
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onRename();
+                    setTaskMenuOpen(false);
+                  }}
+                >
+                  <Pencil size={14} />
+                  <span>重命名任务</span>
+                </button>
+                <button disabled title="Git 工作树管理尚未实现">
+                  <GitFork size={14} />
+                  <span>创建工作树</span>
+                  <small>未实现</small>
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onArchive();
+                    setTaskMenuOpen(false);
+                  }}
+                >
+                  <Archive size={14} />
+                  <span>归档任务</span>
+                </button>
+              </div>
+            )}
+          </div>
         ) : null}
       </div>
+      {showThreadControls ? (
+        <div className="thread-actions">
+          <div className="thread-tool-menu-wrap" ref={menuRef}>
+            <button
+              className="thread-tool-button"
+              disabled={!thread}
+              aria-expanded={menuOpen}
+              aria-haspopup="menu"
+              onClick={() => {
+                setMenuOpen((current) => !current);
+                setTaskMenuOpen(false);
+              }}
+            >
+              <PanelRight size={14} />
+              <span>打开位置</span>
+              <ChevronDown size={12} />
+            </button>
+            {menuOpen && thread && (
+              <div className="tool-popover thread-tool-popover" role="menu">
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onOpenLocation();
+                    setMenuOpen(false);
+                  }}
+                >
+                  <FolderOpen size={14} />
+                  <span>文件管理器</span>
+                </button>
+                <button role="menuitem" onClick={() => selectTool("terminal")}>
+                  <TerminalSquare size={14} />
+                  <span>终端</span>
+                </button>
+                <button disabled title="VS Code 启动集成尚未实现">
+                  <FileCode2 size={14} />
+                  <span>VS Code</span>
+                  <small>未实现</small>
+                </button>
+                <button disabled title="Git Bash 启动集成尚未实现">
+                  <GitBranch size={14} />
+                  <span>Git Bash</span>
+                  <small>未实现</small>
+                </button>
+                <button disabled title="WSL 启动集成尚未实现">
+                  <Cloud size={14} />
+                  <span>WSL</span>
+                  <small>未实现</small>
+                </button>
+                <div className="tool-popover-separator" />
+                <button role="menuitem" onClick={() => selectTool("files")}>
+                  <Folder size={14} />
+                  <span>文件工具</span>
+                </button>
+                <button role="menuitem" onClick={() => selectTool("diff")}>
+                  <GitBranch size={14} />
+                  <span>审查变更</span>
+                </button>
+              </div>
+            )}
+          </div>
+          <IconButton
+            className={`context-rail-toggle ${contextRailOpen ? "is-active" : ""}`}
+            size="compact"
+            variant="quiet"
+            aria-label={contextRailOpen ? "折叠环境信息" : "展开环境信息"}
+            aria-controls="workspace-context-rail"
+            aria-expanded={contextRailOpen}
+            disabled={!thread}
+            title={contextRailOpen ? "折叠环境信息" : "展开环境信息"}
+            onClick={onToggleContextRail}
+          >
+            <SlidersHorizontal size={15} aria-hidden="true" />
+          </IconButton>
+          {!toolStageOpen ? (
+            <IconButton
+              className="tool-stage-toggle"
+              size="compact"
+              variant="quiet"
+              aria-label="展开工具窗口"
+              aria-controls="workspace-right-panel"
+              aria-expanded={false}
+              title="展开工具窗口"
+              onClick={onToggleToolStage}
+            >
+              <PanelRightOpen size={15} aria-hidden="true" />
+            </IconButton>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -8070,6 +8149,10 @@ function MessageList({
       ),
     [messages],
   );
+  const attachmentSourcesByAssistantMessage = useMemo(
+    () => attachmentsByAssistantMessage(messages, events),
+    [events, messages],
+  );
   const [renderedMessageCount, setRenderedMessageCount] = useState(
     initialRenderedMessageCount,
   );
@@ -8290,6 +8373,9 @@ function MessageList({
               return (
                 <Fragment key={message.id}>
                   <MessageBubble
+                    attachmentSources={
+                      attachmentSourcesByAssistantMessage.get(message.id) ?? []
+                    }
                     message={message}
                     threadId={threadId}
                     artifacts={artifacts}
@@ -8379,6 +8465,7 @@ function trimCopiedSelection(event: ReactClipboardEvent<HTMLDivElement>) {
 }
 
 const MessageBubble = memo(function MessageBubble({
+  attachmentSources,
   message,
   threadId,
   artifacts,
@@ -8387,6 +8474,7 @@ const MessageBubble = memo(function MessageBubble({
   onOpenAttachmentPreview,
   onOpenMarkdownLink,
 }: {
+  attachmentSources: ContextSourceRef[];
   message: Message;
   threadId: string;
   artifacts: ArtifactDescriptor[];
@@ -8487,6 +8575,7 @@ const MessageBubble = memo(function MessageBubble({
           {renderedParts.map(
             ({ part, referencedImage, previewImage, previewIndex }, index) => (
               <MessagePartView
+                attachmentSources={attachmentSources}
                 key={index}
                 messageId={message.id}
                 part={part}
@@ -8578,6 +8667,7 @@ const MessageBubble = memo(function MessageBubble({
 });
 
 function MessagePartView({
+  attachmentSources,
   messageId,
   part,
   referencedImage,
@@ -8590,6 +8680,7 @@ function MessagePartView({
   onOpenAttachmentPreview,
   onOpenMarkdownLink,
 }: {
+  attachmentSources: ContextSourceRef[];
   messageId: string;
   part: MessagePart;
   referencedImage?: Extract<MessagePart, { type: "image" }>;
@@ -8629,7 +8720,9 @@ function MessagePartView({
       <>
         {role === "assistant" ? (
           <MarkdownContent
+            attachmentSources={attachmentSources}
             className="message-markdown"
+            onOpenAttachment={onOpenAttachmentPreview}
             onOpenLink={onOpenMarkdownLink}
             renderTrace={{
               channel: "assistant",
@@ -8661,7 +8754,10 @@ function MessagePartView({
         title={`在右侧预览 ${part.source.name}`}
         onClick={() => onOpenAttachmentPreview(part.source)}
       >
-        <ContextSourceIcon extension={fileExtension(part.source.name)} />
+        <FileTypeIcon
+          name={part.source.name}
+          contentType={part.source.contentType}
+        />
         <span>{part.source.name}</span>
         <small>{formatBytes(part.source.bytes)}</small>
       </button>
@@ -9298,86 +9394,6 @@ function fileExtension(name: string): string {
   const baseName = name.split(/[\\/]/).pop() ?? name;
   const dotIndex = baseName.lastIndexOf(".");
   return dotIndex > 0 ? baseName.slice(dotIndex + 1) : "";
-}
-
-function ContextSourceIcon({ extension }: { extension: string }) {
-  const value = extension.replace(/^\./, "").toLocaleLowerCase();
-  if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(value)) {
-    return <FileImage size={12} aria-hidden="true" />;
-  }
-  if (["csv", "tsv", "xls", "xlsx", "xlsm", "xlsb", "ods"].includes(value)) {
-    return <Table2 size={12} aria-hidden="true" />;
-  }
-  if (["ppt", "pptx", "pps", "ppsx", "pot", "potx", "odp"].includes(value)) {
-    return <Presentation size={12} aria-hidden="true" />;
-  }
-  if (["json", "jsonc", "jsonl"].includes(value)) {
-    return <FileJson size={12} aria-hidden="true" />;
-  }
-  if (
-    [
-      "rs",
-      "ts",
-      "tsx",
-      "js",
-      "jsx",
-      "mjs",
-      "cjs",
-      "c",
-      "h",
-      "cc",
-      "cpp",
-      "hpp",
-      "py",
-      "go",
-      "java",
-      "kt",
-      "swift",
-      "rb",
-      "php",
-      "sh",
-      "ps1",
-      "bat",
-      "cmd",
-      "sql",
-      "graphql",
-      "gql",
-      "proto",
-      "diff",
-      "patch",
-      "xml",
-      "html",
-      "htm",
-      "css",
-      "scss",
-      "less",
-      "yaml",
-      "yml",
-      "toml",
-    ].includes(value)
-  ) {
-    return <FileCode2 size={12} aria-hidden="true" />;
-  }
-  if (
-    [
-      "pdf",
-      "doc",
-      "docx",
-      "odt",
-      "rtf",
-      "md",
-      "mdx",
-      "txt",
-      "log",
-      "ini",
-      "conf",
-      "config",
-      "properties",
-    ].includes(value)
-  ) {
-    return <FileText size={12} aria-hidden="true" />;
-  }
-  return <File size={12} aria-hidden="true" />;
 }
 
 function Composer({
@@ -10215,7 +10231,7 @@ function Composer({
                 key={source.path}
                 title={source.path}
               >
-                <ContextSourceIcon extension={source.extension} />
+                <FileTypeIcon name={source.name || source.extension} />
                 <span>{source.name}</span>
                 <small>{formatBytes(source.bytes)}</small>
                 <button
@@ -11613,6 +11629,7 @@ function RightPanel({
   activeToolTab,
   toolStageOpen,
   conversationCollapsed,
+  activeToolRequiresFullWorkspace,
   contextRailOpen,
   contextRailAutoVisible,
   thread,
@@ -11696,6 +11713,7 @@ function RightPanel({
   activeToolTab: ToolTab | null;
   toolStageOpen: boolean;
   conversationCollapsed: boolean;
+  activeToolRequiresFullWorkspace: boolean;
   contextRailOpen: boolean;
   contextRailAutoVisible: boolean;
   thread: Thread | null;
@@ -11868,6 +11886,7 @@ function RightPanel({
           onOpenSideTask={onOpenSideTask}
           canOpenSideTask={Boolean(thread)}
           conversationCollapsed={conversationCollapsed}
+          conversationToggleAvailable={!activeToolRequiresFullWorkspace}
           onToggleConversation={onToggleConversation}
           onHide={onHideToolStage}
         />
@@ -11930,7 +11949,11 @@ function RightPanel({
               navigationRequest={activeToolTab.browserNavigation ?? null}
             />
           ) : activeToolTab.kind === "computer" ? (
-            <ComputerPanel client={client} threadId={thread?.id ?? null} />
+            <ComputerPanel
+              client={client}
+              threadId={thread?.id ?? null}
+              events={events}
+            />
           ) : activeToolTab.kind === "usage" ? (
             thread ? (
               <UsageLogDashboard
@@ -12039,6 +12062,7 @@ function ToolTabStrip({
   onOpenSideTask,
   canOpenSideTask,
   conversationCollapsed,
+  conversationToggleAvailable,
   onToggleConversation,
   onHide,
 }: {
@@ -12052,6 +12076,7 @@ function ToolTabStrip({
   onOpenSideTask(): void;
   canOpenSideTask: boolean;
   conversationCollapsed: boolean;
+  conversationToggleAvailable: boolean;
   onToggleConversation(): void;
   onHide(): void;
 }) {
@@ -12082,7 +12107,12 @@ function ToolTabStrip({
                 title={title}
                 onClick={() => onActivate(tab.id)}
               >
-                <Icon size={13} />
+                {tab.kind === "preview" &&
+                tab.previewTarget?.type === "attachment" ? (
+                  <FileTypeIcon name={title} size={14} />
+                ) : (
+                  <Icon size={13} />
+                )}
                 <span>{title}</span>
               </button>
               <button
@@ -12155,23 +12185,25 @@ function ToolTabStrip({
         </Popover>
       </div>
       <div className="tool-tab-actions">
-        <IconButton
-          className="tool-tab-action"
-          size="compact"
-          variant="quiet"
-          title={conversationCollapsed ? "还原工具工作区" : "扩展工具工作区"}
-          aria-label={
-            conversationCollapsed ? "还原工具工作区" : "扩展工具工作区"
-          }
-          aria-pressed={conversationCollapsed}
-          onClick={onToggleConversation}
-        >
-          {conversationCollapsed ? (
-            <Minimize2 size={14} aria-hidden="true" />
-          ) : (
-            <Maximize2 size={14} aria-hidden="true" />
-          )}
-        </IconButton>
+        {conversationToggleAvailable ? (
+          <IconButton
+            className="tool-tab-action"
+            size="compact"
+            variant="quiet"
+            title={conversationCollapsed ? "还原工具工作区" : "扩展工具工作区"}
+            aria-label={
+              conversationCollapsed ? "还原工具工作区" : "扩展工具工作区"
+            }
+            aria-pressed={conversationCollapsed}
+            onClick={onToggleConversation}
+          >
+            {conversationCollapsed ? (
+              <Minimize2 size={14} aria-hidden="true" />
+            ) : (
+              <Maximize2 size={14} aria-hidden="true" />
+            )}
+          </IconButton>
+        ) : null}
         <IconButton
           className="tool-tab-action"
           size="compact"
@@ -12823,12 +12855,13 @@ function formatBytes(value: number): string {
 }
 
 const toolTabMenuItems: Array<{
-  kind: "flow" | "terminal" | "browser" | "files";
+  kind: "flow" | "terminal" | "browser" | "computer" | "files";
   shortcut: string | null;
 }> = [
   { kind: "flow", shortcut: null },
   { kind: "terminal", shortcut: null },
   { kind: "browser", shortcut: "Ctrl+T" },
+  { kind: "computer", shortcut: null },
   { kind: "files", shortcut: "Ctrl+P" },
 ];
 
@@ -12840,6 +12873,7 @@ const toolStageLauncherKinds: Array<{
   { kind: "diff", label: "代码审阅" },
   { kind: "terminal", label: "终端" },
   { kind: "browser", label: "浏览器" },
+  { kind: "computer", label: "桌面观察" },
   { kind: "files", label: "文件" },
 ];
 
@@ -12920,7 +12954,7 @@ function markdownLinkTitle(path: string): string {
 }
 
 function usesFormatAwarePreview(path: string): boolean {
-  return /\.(?:avif|bmp|gif|ico|jpe?g|pdf|png|svg|webp|xlsm?|xlsx|xltx)$/i.test(
+  return /\.(?:avif|bmp|csv|gif|ico|jpe?g|pdf|png|svg|tsv|webp|xlsm?|xlsx|xltx)$/i.test(
     path,
   );
 }

@@ -1,14 +1,22 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Camera, Monitor, RefreshCw, Square } from "lucide-react";
 import type { ApiClient } from "../api/client";
-import type { ComputerObservation, ComputerWindowTarget } from "../types";
+import type {
+  AgentEvent,
+  ComputerObservation,
+  ComputerScreenshot,
+  ComputerWindowTarget,
+  ModelContentPart,
+} from "../types";
 
 export function ComputerPanel({
   client,
   threadId,
+  events,
 }: {
   client: ApiClient | null;
   threadId: string | null;
+  events?: AgentEvent[];
 }) {
   const [windows, setWindows] = useState<ComputerWindowTarget[]>([]);
   const [selectedWindowId, setSelectedWindowId] = useState("");
@@ -24,6 +32,51 @@ export function ComputerPanel({
       windows.find((window) => window.windowId === selectedWindowId) ?? null,
     [selectedWindowId, windows],
   );
+  const latestAgentObservation = useMemo<{
+    screenshot: ComputerScreenshot;
+    capturedAt: string;
+  } | null>(() => {
+    for (const event of [...(events ?? [])].reverse()) {
+      if (event.payload.type !== "tool_call_finished") continue;
+      const result = event.payload.result;
+      if (!isComputerResult(result.metadata)) continue;
+      const image = result.content?.find(
+        (part): part is Extract<ModelContentPart, { type: "image" }> =>
+          part.type === "image",
+      );
+      if (image) {
+        return {
+          screenshot: { mimeType: image.content_type, bytes: image.data },
+          capturedAt: event.createdAt,
+        };
+      }
+    }
+    return null;
+  }, [events]);
+  const visibleObservation = useMemo(() => {
+    if (
+      observation?.screenshot &&
+      (!latestAgentObservation ||
+        Date.parse(observation.capturedAt) >=
+          Date.parse(latestAgentObservation.capturedAt))
+    ) {
+      return {
+        screenshot: observation.screenshot,
+        title: observation.target.title,
+        detail: observation.target.executable ?? observation.target.title,
+        observationId: observation.observationId,
+      };
+    }
+    if (latestAgentObservation) {
+      return {
+        screenshot: latestAgentObservation.screenshot,
+        title: "Agent observation",
+        detail: "Screenshot returned by the computer tool",
+        observationId: "latest",
+      };
+    }
+    return null;
+  }, [latestAgentObservation, observation]);
 
   const refresh = useCallback(async () => {
     if (!client || !threadId) return;
@@ -136,22 +189,20 @@ export function ComputerPanel({
         <div className="computer-status" role="alert">
           {error}
         </div>
-      ) : observation?.screenshot ? (
+      ) : visibleObservation ? (
         <div className="computer-observation">
           <img
-            alt={`Current observation of ${observation.target.title}`}
+            alt={`Latest computer observation of ${visibleObservation.title}`}
             src={imageUrl(
-              observation.screenshot.mimeType,
-              observation.screenshot.bytes,
+              visibleObservation.screenshot.mimeType,
+              visibleObservation.screenshot.bytes,
             )}
           />
           <footer>
-            <span
-              title={observation.target.executable ?? observation.target.title}
-            >
-              {observation.target.title}
+            <span title={visibleObservation.detail}>
+              {visibleObservation.title}
             </span>
-            <code>{observation.observationId}</code>
+            <code>{visibleObservation.observationId}</code>
           </footer>
         </div>
       ) : (
@@ -163,6 +214,12 @@ export function ComputerPanel({
       )}
     </section>
   );
+}
+
+function isComputerResult(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== "object") return false;
+  const value = metadata as { toolName?: unknown; computer?: unknown };
+  return value.toolName === "computer" && Boolean(value.computer);
 }
 
 function imageUrl(mimeType: string, bytes: number[]): string {
