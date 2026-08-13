@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-http-multi-agent-visible",
+  "description": "Connects the evaluation harness to the real OpenTopia server and preserves created threads in the desktop database.",
+  "command": "node",
+  "args": ["{targetDir}/../../adapters/opentopia-http.mjs"],
+  "cwd": "{targetDir}",
+  "env": {
+    "OPENTOPIA_EVAL_BASE_URL": "http://127.0.0.1:8812",
+    "OPENTOPIA_EVAL_APPROVAL_MODE": "deny",
+    "OPENTOPIA_EVAL_TIMEOUT_MS": "420000",
+    "OPENTOPIA_EVAL_TITLE_PREFIX": "多 Agent 实测"
+  },
+  "passEnvironment": ["OPENTOPIA_API_TOKEN"],
+  "inheritEnvironment": false,
+  "promptTransport": "stdin",
+  "eventTransport": "jsonl-file"
+}

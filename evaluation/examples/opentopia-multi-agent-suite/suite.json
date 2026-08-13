@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-multi-agent-visible",
+  "version": "1.0.0",
+  "title": "OpenTopia Multi-Agent Visible Evaluation Suite",
+  "description": "Exercises parallel delegation, explicit inter-agent messaging, and follow-up reuse through the real OpenTopia runtime. Every run is designed to remain visible as a task in the desktop application.",
+  "evaluationClass": "conformance",
+  "visibility": "public",
+  "repetitions": 1,
+  "tasks": [
+    "tasks/parallel-synthesis/task.json",
+    "tasks/message-review/task.json",
+    "tasks/followup-reuse/task.json"
+  ]
+}

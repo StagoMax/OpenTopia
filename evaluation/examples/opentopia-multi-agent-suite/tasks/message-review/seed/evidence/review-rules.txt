@@ -1,0 +1,3 @@
+ACCEPT only when the evidence directly supports the claim.
+REVISE when the claim is broader than the evidence.
+Always name one remaining limitation even when the verdict is ACCEPT.

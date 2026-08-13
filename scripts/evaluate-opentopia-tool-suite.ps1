@@ -406,7 +406,9 @@ function New-RuntimeTarget {
   if ($ProviderId -and $ModelId) {
     $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_PROVIDER_ID" -NotePropertyValue $ProviderId -Force
     $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_MODEL_ID" -NotePropertyValue $ModelId -Force
-    $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_TITLE_PREFIX" -NotePropertyValue "Kimi-k3 Architecture Eval" -Force
+    if (-not $target.env.PSObject.Properties["OPENTOPIA_EVAL_TITLE_PREFIX"]) {
+      $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_TITLE_PREFIX" -NotePropertyValue "OpenTopia Eval"
+    }
     if ($ReasoningEffort) {
       $target.env | Add-Member -NotePropertyName "OPENTOPIA_EVAL_REASONING_EFFORT" -NotePropertyValue $ReasoningEffort -Force
     }
@@ -444,6 +446,37 @@ function Set-EvaluationProviderSettings {
     activeProviderId = $activeProviderId
   } | Out-Null
   return Invoke-EvalApi "Get" "/api/settings"
+}
+
+function Get-ProviderApiKeySource {
+  param(
+    [Parameter(Mandatory = $true)][string]$DatabasePath,
+    [Parameter(Mandatory = $true)][string]$ProviderId
+  )
+
+  if (-not (Test-Path -LiteralPath $DatabasePath -PathType Leaf)) {
+    return $null
+  }
+  $python = Get-Command python -ErrorAction SilentlyContinue
+  if (-not $python) {
+    return $null
+  }
+  $pythonSource = @'
+import json, sqlite3, sys
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+row = connection.execute("SELECT settings_json FROM app_settings WHERE id = 1").fetchone()
+connection.close()
+if row:
+    settings = json.loads(row[0])
+    provider = next((item for item in settings.get("providers", []) if item.get("id") == sys.argv[2]), None)
+    if provider and provider.get("apiKeySource"):
+        print(provider["apiKeySource"], end="")
+'@
+  $source = $pythonSource | & $python.Source - $DatabasePath $ProviderId
+  if ($LASTEXITCODE -ne 0) {
+    return $null
+  }
+  return ([string]$source).Trim()
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -555,6 +588,16 @@ $script:Secrets = @($apiKey, $evaluationToken)
 [Environment]::SetEnvironmentVariable("OPENTOPIA_SANDBOX_NETWORK", "deny", "Process")
 $sandboxBinary = Join-Path $repoRoot ".opentopia\verify-target\debug\opentopia-sandbox.exe"
 [Environment]::SetEnvironmentVariable("OPENTOPIA_WINDOWS_SANDBOX_BIN", $sandboxBinary, "Process")
+$desktopDatabasePath = Join-Path $repoRoot ".opentopia\opentopia.db"
+if ($VisibleInDesktop -and $ProviderId) {
+  $providerApiKeySource = Get-ProviderApiKeySource $desktopDatabasePath $ProviderId
+  if ($providerApiKeySource) {
+    [Environment]::SetEnvironmentVariable($providerApiKeySource, $apiKey, "Process")
+    if (-not $savedEnvironment.ContainsKey($providerApiKeySource)) {
+      $savedEnvironment[$providerApiKeySource] = $null
+    }
+  }
+}
 $script:ApiHeaders = @{ Authorization = "Bearer $evaluationToken" }
 
 $runId = "$safeSuiteId-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")

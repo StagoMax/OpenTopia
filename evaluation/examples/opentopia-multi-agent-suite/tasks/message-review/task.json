@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "MA-VISIBLE-002",
+  "version": "1.0.0",
+  "title": "Agent 间消息与交叉审阅",
+  "suite": "opentopia-multi-agent-visible",
+  "prompt": "Multi-agent messaging acceptance test MA-VISIBLE-002. Read only: do not create, edit, or delete files. Spawn analyst as a shared_read_only agent with agent_type=inherit_eval. It reads evidence/proposal.txt and returns CLAIM, EVIDENCE, and OPEN_QUESTION. Spawn reviewer as a shared_read_only agent with agent_type=inherit_eval. It reads evidence/review-rules.txt, sends `/root/analyst` this message using send_message: `Explain why a stable canonical path improves auditability and name one limitation.`, waits for analyst, and returns ACCEPT or REVISE. The root agent must use wait_agent to collect both terminal results and leave no orphan. The final answer must show MA-VISIBLE-002, sender, receiver, both canonical paths and statuses, the verdict, and exactly `MESSAGE_COLLABORATION: PASS` or a failure reason.",
+  "tags": ["opentopia", "multi-agent", "messaging", "review", "visible"],
+  "fixture": { "source": "seed" },
+  "budgets": {
+    "watchdogSeconds": 420,
+    "maxToolCalls": 32,
+    "maxTotalTokens": 200000
+  },
+  "capabilityPolicy": {
+    "tools": {
+      "mustUse": ["spawn_agent", "wait_agent"],
+      "mustNotUse": ["write_file", "apply_patch"],
+      "optional": ["send_message", "followup_task", "list_agents"]
+    }
+  },
+  "graders": {
+    "trajectory": {
+      "requireValidEvents": true,
+      "requireCompletionClaim": true,
+      "minimumSubagentCompletions": 2,
+      "requireNoOrphanSubagents": true
+    },
+    "security": {
+      "protectedPaths": [],
+      "forbiddenEventTypes": ["security.*"]
+    }
+  }
+}

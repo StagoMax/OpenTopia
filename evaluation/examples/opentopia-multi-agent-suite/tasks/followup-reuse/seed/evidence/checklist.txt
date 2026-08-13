@@ -1,0 +1,4 @@
+PASS: The run has a non-empty canonical agent path.
+PASS: The completed run stores its most recent task message.
+PASS: A follow-up may restart an idle completed Agent.
+FAIL: A follow-up should allocate a new canonical Agent path.

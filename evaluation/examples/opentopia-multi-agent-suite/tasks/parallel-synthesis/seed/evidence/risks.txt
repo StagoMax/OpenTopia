@@ -1,0 +1,3 @@
+High: a parent may finalize before all children reach a terminal state.
+Medium: duplicate task names can collide with stable agent paths.
+Low: a long child result may be truncated in a compact UI view.

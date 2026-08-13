@@ -1,0 +1,3 @@
+Claim: Showing canonical Agent paths makes parallel work easier to audit.
+Evidence: Paths are stable within a root task and are included in persisted child runs.
+Open question: A compact summary may show only the first four children.

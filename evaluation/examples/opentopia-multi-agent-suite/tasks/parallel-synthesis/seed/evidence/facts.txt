@@ -1,0 +1,3 @@
+OpenTopia persists every child run with a stable canonical agent path.
+The desktop receives subagent_updated events from the server event stream.
+The parent Agent remains responsible for integrating child results.

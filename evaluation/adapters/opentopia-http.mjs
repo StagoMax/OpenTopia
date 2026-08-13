@@ -374,15 +374,38 @@ function normalizeProductEvent(event) {
   if (type === "error") return { type: "application.error", payload };
   if (type === "subagent_updated") {
     const status = payload.run?.status;
-    if (["queued", "running"].includes(status))
+    if (status === "queued")
       return {
         type: "subagent.spawned",
-        payload: { agentId: payload.run?.id, status },
+        payload: {
+          agentId: payload.run?.id,
+          agentPath: payload.run?.agentPath,
+          parentAgentPath: payload.run?.parentAgentPath,
+          name: payload.run?.name,
+          status,
+        },
       };
-    if (["completed", "failed", "cancelled"].includes(status))
+    if (status === "running")
       return {
-        type: `subagent.${status}`,
-        payload: { agentId: payload.run?.id, status },
+        type: "subagent.running",
+        payload: {
+          agentId: payload.run?.id,
+          agentPath: payload.run?.agentPath,
+          parentAgentPath: payload.run?.parentAgentPath,
+          name: payload.run?.name,
+          status,
+        },
+      };
+    if (["completed", "failed", "cancelled", "timed_out"].includes(status))
+      return {
+        type: status === "timed_out" ? "subagent.failed" : `subagent.${status}`,
+        payload: {
+          agentId: payload.run?.id,
+          agentPath: payload.run?.agentPath,
+          parentAgentPath: payload.run?.parentAgentPath,
+          name: payload.run?.name,
+          status,
+        },
       };
   }
   if (compactEvents) return null;
