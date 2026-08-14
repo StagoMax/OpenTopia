@@ -1,9 +1,9 @@
 use super::{
     ApplyPatchTool, BackgroundOutputTool, BrowserTool, CancelAgentTool, CompleteTaskTool,
     ComputerTool, CreateSkillTool, DocumentTool, FollowupAgentTaskTool, GitDiffTool,
-    InterruptAgentTool, ListAgentsTool, ListFilesTool, ListSkillsTool, PdfTool, ReadAttachmentTool,
-    ReadFileTool, ReadFilesTool, ReadSkillTool, RequestUserInputTool, SearchTool,
-    SendAgentInputTool, SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool,
+    InterruptAgentTool, ListAgentsTool, ListFilesTool, ListSkillsTool, PdfTool, ReadArtifactTool,
+    ReadAttachmentTool, ReadFileTool, ReadFilesTool, ReadSkillTool, RequestUserInputTool,
+    SearchTool, SendAgentInputTool, SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool,
     SpreadsheetTool, Tool, ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy,
     ToolRiskLevel, ToolSideEffect, UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
     WaitAgentsTool, WriteFileTool,
@@ -47,6 +47,7 @@ impl ToolRegistry {
         tools.insert("read_attachment".to_string(), Arc::new(ReadAttachmentTool));
         tools.insert("view_attachment".to_string(), Arc::new(ViewAttachmentTool));
         tools.insert("read_file".to_string(), Arc::new(ReadFileTool));
+        tools.insert("read_artifact".to_string(), Arc::new(ReadArtifactTool));
         tools.insert("read_files".to_string(), Arc::new(ReadFilesTool));
         tools.insert("write_file".to_string(), Arc::new(WriteFileTool));
         tools.insert("search".to_string(), Arc::new(SearchTool));
@@ -124,6 +125,26 @@ impl ToolRegistry {
         self.insert_with_source(name, tool, ToolSource::Mcp);
     }
 
+    /// Atomically removes the previously synchronized MCP surface while
+    /// preserving core and bundled tools. AgentCore calls this before replacing
+    /// the enabled server set so stale wrappers cannot remain model-visible.
+    pub fn clear_mcp(&mut self) {
+        let mcp_names = self
+            .sources
+            .iter()
+            .filter_map(|(name, source)| matches!(source, &ToolSource::Mcp).then(|| name.clone()))
+            .collect::<Vec<_>>();
+        if mcp_names.is_empty() {
+            return;
+        }
+        let tools = Arc::make_mut(&mut self.tools);
+        let sources = Arc::make_mut(&mut self.sources);
+        for name in mcp_names {
+            tools.remove(&name);
+            sources.remove(&name);
+        }
+    }
+
     fn insert_with_source(&mut self, name: String, tool: Arc<dyn Tool>, source: ToolSource) {
         Arc::make_mut(&mut self.tools).insert(name.clone(), tool);
         Arc::make_mut(&mut self.sources).insert(name, source);
@@ -187,14 +208,16 @@ fn tool_governance_metadata(
         );
     }
     match name {
-        "list_files" | "read_attachment" | "read_file" | "read_files" | "search" | "git_diff"
-        | "background_output" | "list_agents" | "wait_agent" | "wait_agents" | "list_skills"
-        | "read_skill" | "flow_search" | "flow_inspect" | "pdf" => (
-            ToolRiskLevel::Low,
-            vec![ToolSideEffect::None],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Restricted,
-        ),
+        "list_files" | "read_attachment" | "read_file" | "read_artifact" | "read_files"
+        | "search" | "git_diff" | "background_output" | "list_agents" | "wait_agent"
+        | "wait_agents" | "list_skills" | "read_skill" | "flow_search" | "flow_inspect" | "pdf" => {
+            (
+                ToolRiskLevel::Low,
+                vec![ToolSideEffect::None],
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            )
+        }
         "view_attachment" => (
             ToolRiskLevel::High,
             vec![ToolSideEffect::External],

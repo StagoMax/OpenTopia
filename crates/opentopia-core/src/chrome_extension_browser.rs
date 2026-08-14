@@ -1,10 +1,11 @@
 use crate::browser::{
-    BrowserAction, BrowserActionCapability, BrowserActionReceipt, BrowserBackendKind,
-    BrowserDownloadRequest, BrowserError, BrowserNavigateRequest, BrowserNetworkGrant, BrowserNode,
-    BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
-    BrowserProfilePersistence, BrowserRuntime, BrowserRuntimeCapabilities, BrowserRuntimeConfig,
-    BrowserSessionId, BrowserSessionInfo, BrowserSessionSpec, BrowserSurfaceKind, BrowserTargetRef,
-    BrowserWaitRequest, LocalBrowserSession,
+    validate_chrome_bridge_url, BrowserAction, BrowserActionCapability, BrowserActionReceipt,
+    BrowserBackendKind, BrowserDownloadRequest, BrowserError, BrowserNavigateRequest,
+    BrowserNetworkGrant, BrowserNode, BrowserNodeRef, BrowserObservation, BrowserObservationId,
+    BrowserObserveOptions, BrowserOutput, BrowserProfilePersistence, BrowserRuntime,
+    BrowserRuntimeCapabilities, BrowserRuntimeConfig, BrowserSessionId, BrowserSessionInfo,
+    BrowserSessionSpec, BrowserSurfaceKind, BrowserTargetRef, BrowserWaitRequest,
+    LocalBrowserSession,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -26,12 +27,16 @@ pub struct ChromeExtensionBrowserRuntime {
 }
 
 impl ChromeExtensionBrowserRuntime {
-    pub fn new(config: ChromeExtensionBrowserRuntimeConfig) -> Result<Self, BrowserError> {
-        if config.bridge_url.trim().is_empty() || config.bridge_token.trim().is_empty() {
+    pub fn new(mut config: ChromeExtensionBrowserRuntimeConfig) -> Result<Self, BrowserError> {
+        if config.bridge_token.trim().is_empty() {
             return Err(BrowserError::BrokerConfiguration(
                 "Chrome bridge URL and token are required".to_string(),
             ));
         }
+        config.bridge_url = validate_chrome_bridge_url(&config.bridge_url)?
+            .as_str()
+            .trim_end_matches('/')
+            .to_string();
         Ok(Self {
             config: Arc::new(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -46,6 +51,8 @@ impl ChromeExtensionBrowserRuntime {
         );
         let response = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(self.config.browser.startup_timeout)
+            .timeout(self.config.browser.startup_timeout)
             .build()?
             .get(endpoint)
             .bearer_auth(self.config.bridge_token.trim())
@@ -119,22 +126,20 @@ impl BrowserRuntime for ChromeExtensionBrowserRuntime {
                 "Attached Chrome profiles are persistent and cannot be ephemeral".to_string(),
             ));
         }
-        {
-            let specs = self.specs.lock().await;
-            if let Some(existing) = specs.get(&spec.session_id) {
-                if existing != &spec {
-                    return Err(BrowserError::SessionProfileConflict {
-                        session: spec.session_id,
-                    });
-                }
-                if self.sessions.lock().await.contains_key(&spec.session_id) {
-                    return Ok(BrowserSessionInfo {
-                        session_id: spec.session_id,
-                        profile_id: spec.profile_id,
-                        profile_persistence: spec.profile_persistence,
-                        backend: BrowserBackendKind::ChromeExtension,
-                    });
-                }
+        let existing = self.specs.lock().await.get(&spec.session_id).cloned();
+        if let Some(existing) = existing {
+            if existing != spec {
+                return Err(BrowserError::SessionProfileConflict {
+                    session: spec.session_id,
+                });
+            }
+            if self.sessions.lock().await.contains_key(&spec.session_id) {
+                return Ok(BrowserSessionInfo {
+                    session_id: spec.session_id,
+                    profile_id: spec.profile_id,
+                    profile_persistence: spec.profile_persistence,
+                    backend: BrowserBackendKind::ChromeExtension,
+                });
             }
         }
         let runtime = LocalBrowserSession::start_external(
@@ -300,5 +305,19 @@ mod tests {
         assert!(!capabilities
             .actions
             .contains(&BrowserActionCapability::Download));
+    }
+
+    #[test]
+    fn rejects_non_loopback_bridge_before_it_can_receive_the_token() {
+        let error = match ChromeExtensionBrowserRuntime::new(ChromeExtensionBrowserRuntimeConfig {
+            bridge_url: "https://example.com".to_string(),
+            bridge_token: "must-not-leak".to_string(),
+            browser: BrowserRuntimeConfig::default(),
+        }) {
+            Ok(_) => panic!("remote Chrome bridges must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, BrowserError::BrokerConfiguration(_)));
     }
 }

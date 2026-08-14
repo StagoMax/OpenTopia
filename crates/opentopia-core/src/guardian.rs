@@ -555,11 +555,15 @@ impl GuardianReviewSessionManager {
                 role: ModelConversationRole::User,
                 content: retry_prompt,
                 content_parts: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
             });
             state.reviewer_conversation.push(ModelConversationMessage {
                 role: ModelConversationRole::Assistant,
                 content: response.text,
                 content_parts: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
             });
             state.prior_review_count += 1;
             state.last_parent_transcript = transcript;
@@ -1354,6 +1358,8 @@ mod tests {
             role: ModelConversationRole::User,
             content: "Clean the generated temp directory.".to_string(),
             content_parts: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
         }];
         manager
             .review(

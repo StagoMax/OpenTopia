@@ -16,6 +16,10 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(windows)]
+#[path = "computer/windows_capture.rs"]
+mod windows_capture;
+
 pub const MAX_COMPUTER_WINDOWS: usize = 128;
 pub const MAX_COMPUTER_SCREENSHOT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_COMPUTER_IMAGE_EDGE: u32 = 1_440;
@@ -804,12 +808,38 @@ mod windows {
         max_screenshot_bytes: usize,
     ) -> Result<CapturedWindow, ComputerError> {
         let hwnd = parse_window_id(&target.window_id)?;
-        let width = target.bounds.width;
-        let height = target.bounds.height;
-        if width == 0 || height == 0 {
+        let fallback_width = target.bounds.width;
+        let fallback_height = target.bounds.height;
+        if fallback_width == 0 || fallback_height == 0 {
             return Err(ComputerError::WindowNotFound);
         }
-        let mut pixels = unsafe { capture_rgba(hwnd, width, height)? };
+
+        let mut capture_failures = Vec::new();
+        let (mut pixels, width, height) =
+            match super::windows_capture::capture_window(hwnd as isize) {
+                Ok(frame) if !is_blank_frame(&frame.pixels) => {
+                    (frame.pixels, frame.width, frame.height)
+                }
+                Ok(_) => {
+                    capture_failures
+                        .push("Windows Graphics Capture returned a blank frame".to_string());
+                    capture_gdi_fallback(
+                        hwnd,
+                        fallback_width,
+                        fallback_height,
+                        &mut capture_failures,
+                    )?
+                }
+                Err(error) => {
+                    capture_failures.push(format!("Windows Graphics Capture failed: {error}"));
+                    capture_gdi_fallback(
+                        hwnd,
+                        fallback_width,
+                        fallback_height,
+                        &mut capture_failures,
+                    )?
+                }
+            };
         let (image_width, image_height) =
             resize_to_limit(&mut pixels, width, height, max_image_edge);
         let png = encode_png(&pixels, image_width, image_height)?;
@@ -826,7 +856,37 @@ mod windows {
         })
     }
 
-    unsafe fn capture_rgba(hwnd: HWND, width: u32, height: u32) -> Result<Vec<u8>, ComputerError> {
+    fn capture_gdi_fallback(
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        capture_failures: &mut Vec<String>,
+    ) -> Result<(Vec<u8>, u32, u32), ComputerError> {
+        match unsafe { capture_rgba_gdi(hwnd, width, height) } {
+            Ok(pixels) if !is_blank_frame(&pixels) => Ok((pixels, width, height)),
+            Ok(_) => {
+                capture_failures.push("GDI fallback returned a blank frame".to_string());
+                Err(ComputerError::Platform(capture_failures.join("; ")))
+            }
+            Err(error) => {
+                capture_failures.push(format!("GDI fallback failed: {error}"));
+                Err(ComputerError::Platform(capture_failures.join("; ")))
+            }
+        }
+    }
+
+    pub(super) fn is_blank_frame(pixels: &[u8]) -> bool {
+        pixels.is_empty()
+            || pixels
+                .chunks_exact(4)
+                .all(|pixel| pixel[3] == 0 || (pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0))
+    }
+
+    unsafe fn capture_rgba_gdi(
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ComputerError> {
         let source = GetWindowDC(hwnd);
         if source.is_null() {
             return Err(ComputerError::Platform("GetWindowDC failed".to_string()));
@@ -1199,5 +1259,45 @@ mod tests {
         };
         assert!(rect.contains_image_point(799, 599, 800, 600));
         assert!(!rect.contains_image_point(800, 599, 800, 600));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blank_capture_detection_rejects_transparent_and_black_frames() {
+        assert!(windows::is_blank_frame(&[]));
+        assert!(windows::is_blank_frame(&[0, 0, 0, 255, 0, 0, 0, 255]));
+        assert!(windows::is_blank_frame(&[12, 24, 48, 0]));
+        assert!(!windows::is_blank_frame(&[0, 0, 0, 255, 12, 24, 48, 255]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Windows desktop with a background File Explorer window"]
+    fn captures_background_window_with_windows_graphics_capture() {
+        let target = windows::list_windows(MAX_COMPUTER_WINDOWS)
+            .expect("window enumeration should succeed")
+            .into_iter()
+            .find(|window| {
+                !window.is_foreground
+                    && window.executable.as_deref().is_some_and(|executable| {
+                        executable
+                            .rsplit(['\\', '/'])
+                            .next()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
+                    })
+            })
+            .expect("a background File Explorer window is required for this smoke test");
+        let captured = windows::capture_window(
+            &target,
+            MAX_COMPUTER_IMAGE_EDGE,
+            MAX_COMPUTER_SCREENSHOT_BYTES,
+        )
+        .expect("background window capture should produce a usable frame");
+
+        assert!(captured.width > 0);
+        assert!(captured.height > 0);
+        assert!(captured
+            .png
+            .starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]));
     }
 }

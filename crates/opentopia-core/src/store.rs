@@ -469,6 +469,7 @@ pub struct ContextBudget {
 pub enum ProviderContextStateKind {
     StoredResponse,
     CompactionItems,
+    TranscriptItems,
     Hybrid,
 }
 
@@ -483,6 +484,7 @@ impl ProviderContextStateKind {
         match self {
             Self::StoredResponse => "stored_response",
             Self::CompactionItems => "compaction_items",
+            Self::TranscriptItems => "transcript_items",
             Self::Hybrid => "hybrid",
         }
     }
@@ -491,6 +493,7 @@ impl ProviderContextStateKind {
         match value {
             "stored_response" => Ok(Self::StoredResponse),
             "compaction_items" => Ok(Self::CompactionItems),
+            "transcript_items" => Ok(Self::TranscriptItems),
             "hybrid" => Ok(Self::Hybrid),
             other => anyhow::bail!("unknown provider context state kind: {other}"),
         }
@@ -504,6 +507,8 @@ pub struct ProviderConversationState {
     pub agent_path: String,
     pub provider_id: String,
     pub model: String,
+    #[serde(default)]
+    pub adapter_identity: String,
     pub response_id: String,
     pub compatibility_hash: String,
     #[serde(default)]
@@ -871,6 +876,7 @@ impl SqliteSessionStore {
                 agent_path TEXT NOT NULL,
                 provider_id TEXT NOT NULL,
                 model TEXT NOT NULL,
+                adapter_identity TEXT NOT NULL DEFAULT '',
                 response_id TEXT NOT NULL,
                 compatibility_hash TEXT NOT NULL,
                 response_items_json TEXT NOT NULL DEFAULT '[]',
@@ -1128,6 +1134,7 @@ impl SqliteSessionStore {
             conn.execute("ALTER TABLE threads ADD COLUMN model_selection TEXT", [])?;
         }
         for (column, definition) in [
+            ("adapter_identity", "TEXT NOT NULL DEFAULT ''"),
             ("response_items_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("state_kind", "TEXT NOT NULL DEFAULT 'stored_response'"),
             ("compaction_item_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -3450,7 +3457,7 @@ impl SessionStore for SqliteSessionStore {
             SELECT id, thread_id, role, parts_json, created_at
             FROM messages
             WHERE thread_id = ?1
-            ORDER BY created_at ASC
+            ORDER BY created_at ASC, rowid ASC
             "#,
         )?;
         let rows = stmt.query_map(params![thread_id.to_string()], map_message)?;
@@ -4292,13 +4299,14 @@ impl SessionStore for SqliteSessionStore {
         conn.execute(
             r#"
             INSERT INTO provider_conversation_states (
-                thread_id, agent_path, provider_id, model, response_id,
+                thread_id, agent_path, provider_id, model, adapter_identity, response_id,
                 compatibility_hash, response_items_json, state_kind,
                 compaction_item_count, checkpoint_id, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(thread_id, agent_path) DO UPDATE SET
                 provider_id = excluded.provider_id,
                 model = excluded.model,
+                adapter_identity = excluded.adapter_identity,
                 response_id = excluded.response_id,
                 compatibility_hash = excluded.compatibility_hash,
                 response_items_json = excluded.response_items_json,
@@ -4312,6 +4320,7 @@ impl SessionStore for SqliteSessionStore {
                 &state.agent_path,
                 &state.provider_id,
                 &state.model,
+                &state.adapter_identity,
                 &state.response_id,
                 &state.compatibility_hash,
                 response_items_json,
@@ -5964,7 +5973,7 @@ fn load_provider_conversation_state(
     Ok(conn
         .query_row(
             r#"
-            SELECT provider_id, model, response_id, compatibility_hash,
+            SELECT provider_id, model, adapter_identity, response_id, compatibility_hash,
                    response_items_json, state_kind, compaction_item_count,
                    checkpoint_id, updated_at
             FROM provider_conversation_states
@@ -5972,36 +5981,37 @@ fn load_provider_conversation_state(
             "#,
             params![thread_id.to_string(), agent_path],
             |row| {
-                let response_items_json = row.get::<_, String>(4)?;
+                let response_items_json = row.get::<_, String>(5)?;
                 let response_items =
                     serde_json::from_str(&response_items_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error))
+                        rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(error))
                     })?;
-                let state_kind_text = row.get::<_, String>(5)?;
+                let state_kind_text = row.get::<_, String>(6)?;
                 let state_kind =
                     ProviderContextStateKind::from_str(&state_kind_text).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            5,
+                            6,
                             Type::Text,
                             error.into_boxed_dyn_error(),
                         )
                     })?;
                 let checkpoint_id = row
-                    .get::<_, Option<String>>(7)?
-                    .map(|value| parse_uuid(value, 7))
+                    .get::<_, Option<String>>(8)?
+                    .map(|value| parse_uuid(value, 8))
                     .transpose()?;
                 Ok(ProviderConversationState {
                     thread_id,
                     agent_path: agent_path.to_string(),
                     provider_id: row.get(0)?,
                     model: row.get(1)?,
-                    response_id: row.get(2)?,
-                    compatibility_hash: row.get(3)?,
+                    adapter_identity: row.get(2)?,
+                    response_id: row.get(3)?,
+                    compatibility_hash: row.get(4)?,
                     response_items,
                     state_kind,
-                    compaction_item_count: row.get::<_, i64>(6)?.max(0) as usize,
+                    compaction_item_count: row.get::<_, i64>(7)?.max(0) as usize,
                     checkpoint_id,
-                    updated_at: parse_datetime(row.get::<_, String>(8)?, 8)?,
+                    updated_at: parse_datetime(row.get::<_, String>(9)?, 9)?,
                 })
             },
         )
@@ -7542,6 +7552,8 @@ mod tests {
             role: crate::provider::ModelConversationRole::User,
             content: "continue".to_string(),
             content_parts: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
         }];
         store
             .save_subagent_conversation(run.id, &conversation)
@@ -7573,6 +7585,7 @@ mod tests {
             agent_path: "/root".to_string(),
             provider_id: "openai".to_string(),
             model: "gpt-test".to_string(),
+            adapter_identity: "openai_responses".to_string(),
             response_id: "resp_123".to_string(),
             compatibility_hash: "compatible".to_string(),
             response_items: vec![serde_json::json!({ "type": "compaction", "id": "cmp_123" })],

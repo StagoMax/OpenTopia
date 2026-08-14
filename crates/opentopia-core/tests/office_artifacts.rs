@@ -20,22 +20,12 @@ fn bundled_office_plugins_register_independent_native_tools() {
     for (plugin, tool) in [("pdf", "pdf"), ("documents", "document")] {
         let descriptor = inspect_plugin(&plugin_root.join(plugin)).expect("inspect bundled plugin");
         assert!(descriptor.is_compatible(), "{:?}", descriptor.issues);
-        assert_eq!(
-            descriptor.capability_manifest.contributions.len(),
-            if plugin == "documents" { 2 } else { 1 }
-        );
+        assert_eq!(descriptor.capability_manifest.contributions.len(), 1);
         assert!(descriptor
             .capability_manifest
             .contributions
             .iter()
             .any(|contribution| contribution.local_id == tool));
-        if plugin == "documents" {
-            assert!(descriptor
-                .capability_manifest
-                .contributions
-                .iter()
-                .any(|contribution| contribution.local_id == "docx"));
-        }
     }
     let registry = ToolRegistry::with_builtins();
     assert!(registry.get("pdf").is_some());

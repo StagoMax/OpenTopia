@@ -1340,6 +1340,7 @@ pub(crate) struct LocalBrowserSession {
     dialogs: Vec<BrowserDialog>,
     owns_targets: bool,
     supports_downloads: bool,
+    intercepts_network: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1475,6 +1476,7 @@ impl LocalBrowserSession {
             dialogs: Vec::new(),
             owns_targets: true,
             supports_downloads: true,
+            intercepts_network: true,
         })
     }
 
@@ -1493,7 +1495,7 @@ impl LocalBrowserSession {
         )
         .await?;
         page.initialize_external_page_domains().await?;
-        page.enable_target_discovery().await?;
+        page.enable_target_auto_attach().await?;
         let target_id = page.target_id.clone().ok_or_else(|| {
             BrowserError::Protocol("Chrome bridge returned no target ID".to_string())
         })?;
@@ -1542,6 +1544,7 @@ impl LocalBrowserSession {
             dialogs: Vec::new(),
             owns_targets: false,
             supports_downloads: false,
+            intercepts_network: false,
         })
     }
 
@@ -1737,9 +1740,15 @@ impl LocalBrowserSession {
                             .await;
                         continue;
                     }
-                    self.page
-                        .initialize_page_domains_for_session(session_id)
-                        .await?;
+                    if self.intercepts_network {
+                        self.page
+                            .initialize_page_domains_for_session(session_id)
+                            .await?;
+                    } else {
+                        self.page
+                            .initialize_external_page_domains_for_session(session_id)
+                            .await?;
+                    }
                     self.targets.insert(
                         target_id.to_string(),
                         LocalBrowserTarget {
@@ -2801,12 +2810,16 @@ impl CdpPage {
         let session_url = base_url
             .join(&format!("v1/backend/sessions/{browser_session_id}"))
             .map_err(|_| BrowserError::Protocol("Invalid Chrome session endpoint".to_string()))?;
-        let response = client
-            .get(session_url)
-            .header(reqwest::header::AUTHORIZATION, authorization.clone())
-            .send()
-            .await
-            .map_err(map_chrome_bridge_transport_error)?;
+        let response = tokio::time::timeout(
+            command_timeout,
+            client
+                .get(session_url)
+                .header(reqwest::header::AUTHORIZATION, authorization.clone())
+                .send(),
+        )
+        .await
+        .map_err(|_| BrowserError::Timeout("Chrome session attach".to_string()))?
+        .map_err(map_chrome_bridge_transport_error)?;
         let status = response.status();
         let metadata = read_chrome_bridge_json(response).await?;
         if !status.is_success() {
@@ -2913,7 +2926,15 @@ impl CdpPage {
         let session_id = self.session_id.clone().ok_or_else(|| {
             BrowserError::Protocol("No active Chrome page session is attached".to_string())
         })?;
-        let session_id = Some(session_id);
+        self.initialize_external_page_domains_for_session(&session_id)
+            .await
+    }
+
+    async fn initialize_external_page_domains_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), BrowserError> {
+        let session_id = Some(session_id.to_string());
         self.command_for_session("Page.enable", json!({}), session_id.clone())
             .await?;
         self.command_for_session("Runtime.enable", json!({}), session_id.clone())
@@ -2970,6 +2991,10 @@ impl CdpPage {
     async fn enable_target_discovery(&self) -> Result<(), BrowserError> {
         self.root_command("Target.setDiscoverTargets", json!({ "discover": true }))
             .await?;
+        self.enable_target_auto_attach().await
+    }
+
+    async fn enable_target_auto_attach(&self) -> Result<(), BrowserError> {
         self.root_command(
             "Target.setAutoAttach",
             json!({
@@ -3423,7 +3448,7 @@ async fn run_chrome_bridge_events(
     }
 }
 
-fn validate_chrome_bridge_url(raw: &str) -> Result<reqwest::Url, BrowserError> {
+pub(crate) fn validate_chrome_bridge_url(raw: &str) -> Result<reqwest::Url, BrowserError> {
     let mut url = reqwest::Url::parse(raw.trim()).map_err(|_| {
         BrowserError::BrokerConfiguration("Chrome bridge URL is invalid".to_string())
     })?;
@@ -3446,21 +3471,25 @@ fn validate_chrome_bridge_url(raw: &str) -> Result<reqwest::Url, BrowserError> {
 }
 
 async fn read_chrome_bridge_json(response: reqwest::Response) -> Result<Value, BrowserError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_CHROME_BRIDGE_RESPONSE_BYTES as u64)
-    {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|length| length > MAX_CHROME_BRIDGE_RESPONSE_BYTES as u64) {
         return Err(BrowserError::BrokerResponseTooLarge {
-            actual: response.content_length().unwrap_or_default() as usize,
+            actual: content_length.unwrap_or_default() as usize,
             maximum: MAX_CHROME_BRIDGE_RESPONSE_BYTES,
         });
     }
-    let bytes = response.bytes().await?;
-    if bytes.len() > MAX_CHROME_BRIDGE_RESPONSE_BYTES {
-        return Err(BrowserError::BrokerResponseTooLarge {
-            actual: bytes.len(),
-            maximum: MAX_CHROME_BRIDGE_RESPONSE_BYTES,
-        });
+    let mut bytes = Vec::with_capacity(content_length.unwrap_or_default() as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(map_chrome_bridge_transport_error)?;
+        let actual = bytes.len().saturating_add(chunk.len());
+        if actual > MAX_CHROME_BRIDGE_RESPONSE_BYTES {
+            return Err(BrowserError::BrokerResponseTooLarge {
+                actual,
+                maximum: MAX_CHROME_BRIDGE_RESPONSE_BYTES,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes)
         .map_err(|_| BrowserError::Protocol("Chrome bridge returned invalid JSON".to_string()))

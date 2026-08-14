@@ -439,9 +439,13 @@ impl LocalExecutionEnvironment {
         }
         let readable_roots = self.canonical_roots(
             self.sandbox_config
-                .effective_readable_roots(&self.workspace_root),
+                .configured_readable_roots(&self.workspace_root),
         );
-        if !readable_roots.iter().any(|root| resolved.starts_with(root)) {
+        let approved = self.sandbox_config.is_within_approved_read_scope(&resolved)
+            || self
+                .sandbox_config
+                .is_within_approved_write_scope(&resolved);
+        if !approved && !readable_roots.iter().any(|root| resolved.starts_with(root)) {
             anyhow::bail!(
                 "path is outside the workspace and no readable root authorized it: {}",
                 path.display()
@@ -472,21 +476,21 @@ impl LocalExecutionEnvironment {
         if self.sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess {
             return Ok(candidate);
         }
+        let approved = self
+            .sandbox_config
+            .is_within_approved_write_scope(&resolved_candidate);
         let writable_roots = self.canonical_roots(
             self.sandbox_config
-                .effective_writable_roots(&self.workspace_root),
+                .configured_writable_roots(&self.workspace_root),
         );
-        let Some(root) = writable_roots
+        let configured_root = writable_roots
             .iter()
-            .find(|root| resolved_ancestor.starts_with(root.as_path()))
-        else {
+            .find(|root| resolved_ancestor.starts_with(root.as_path()));
+        if configured_root.is_none() && !approved {
             anyhow::bail!("write path escapes workspace: {}", path.display());
-        };
-        if is_protected_metadata_path(&resolved_candidate, root)
-            && !self
-                .sandbox_config
-                .is_approved_write_path(&resolved_candidate)
-        {
+        }
+        let root = configured_root.unwrap_or(&resolved_ancestor);
+        if is_protected_metadata_path(&resolved_candidate, root) && !approved {
             return Err(ApprovalRequired::new(format!(
                 "Write to protected workspace metadata: {}",
                 path.display()
@@ -1724,6 +1728,34 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
         assert!(extra.join("allowed.txt").exists());
         std::fs::remove_dir_all(root).expect("remove temp workspace");
         std::fs::remove_dir_all(extra).expect("remove extra writable root");
+    }
+
+    #[tokio::test]
+    async fn approved_external_write_path_does_not_authorize_siblings() {
+        let id = Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("opentopia-core-lease-root-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-core-lease-outside-{id}"));
+        std::fs::create_dir_all(&root).expect("create lease workspace");
+        std::fs::create_dir_all(&outside).expect("create lease outside root");
+        let approved = outside.join("approved.txt");
+        let sibling = outside.join("sibling.txt");
+        let mut config = LocalSandboxConfig::default();
+        config.grant_write_path(approved.clone());
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
+
+        env.write_file(FileWriteRequest::new(&approved, b"allowed".to_vec()))
+            .await
+            .expect("write exact approved path");
+        let error = env
+            .write_file(FileWriteRequest::new(&sibling, b"blocked".to_vec()))
+            .await
+            .expect_err("sibling must remain outside the lease");
+
+        assert!(error.to_string().contains("escapes workspace"));
+        assert_eq!(std::fs::read_to_string(approved).unwrap(), "allowed");
+        assert!(!sibling.exists());
+        std::fs::remove_dir_all(root).expect("remove lease workspace");
+        std::fs::remove_dir_all(outside).expect("remove lease outside root");
     }
 
     #[tokio::test]

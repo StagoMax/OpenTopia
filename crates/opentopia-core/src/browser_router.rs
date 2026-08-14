@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +23,7 @@ pub struct BrowserRuntimeRouter {
     managed: Arc<dyn BrowserRuntime>,
     chrome: Option<Arc<dyn BrowserRuntime>>,
     bindings: Arc<Mutex<HashMap<BrowserSessionId, BrowserRuntimeRoute>>>,
+    session_gates: Arc<Mutex<HashMap<BrowserSessionId, Arc<Mutex<()>>>>>,
 }
 
 impl BrowserRuntimeRouter {
@@ -31,6 +32,7 @@ impl BrowserRuntimeRouter {
             managed,
             chrome,
             bindings: Arc::new(Mutex::new(HashMap::new())),
+            session_gates: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -52,17 +54,33 @@ impl BrowserRuntimeRouter {
         spec: BrowserSessionSpec,
         route: BrowserRuntimeRoute,
     ) -> Result<BrowserSessionInfo, BrowserError> {
+        let gate = self.session_gate(spec.session_id).await;
+        let _guard = gate.lock().await;
+        // Resolve the destination before disturbing the active route. In
+        // particular, an unavailable Chrome bridge must not tear down a
+        // healthy managed session.
+        let runtime = self.runtime(route)?.clone();
         let current = self.route_for(spec.session_id).await;
-        if current != route {
-            let previous = self.runtime(current)?;
+        let previous = if current != route {
+            let previous = self.runtime(current)?.clone();
             if let Err(error) = previous.close_session(spec.session_id).await {
                 if !matches!(error, BrowserError::SessionNotFound(_)) {
                     return Err(error);
                 }
             }
-        }
-        let runtime = self.runtime(route)?;
-        let info = runtime.create_session(spec.clone()).await?;
+            Some(previous)
+        } else {
+            None
+        };
+        let info = match runtime.create_session(spec.clone()).await {
+            Ok(info) => info,
+            Err(error) => {
+                if let Some(previous) = previous {
+                    let _ = previous.create_session(spec).await;
+                }
+                return Err(error);
+            }
+        };
         self.bindings.lock().await.insert(spec.session_id, route);
         Ok(info)
     }
@@ -85,6 +103,24 @@ impl BrowserRuntimeRouter {
     ) -> Result<&Arc<dyn BrowserRuntime>, BrowserError> {
         self.runtime(self.route_for(session).await)
     }
+
+    async fn session_gate(&self, session: BrowserSessionId) -> Arc<Mutex<()>> {
+        self.session_gates
+            .lock()
+            .await
+            .entry(session)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn locked_runtime(
+        &self,
+        session: BrowserSessionId,
+    ) -> Result<(OwnedMutexGuard<()>, Arc<dyn BrowserRuntime>), BrowserError> {
+        let guard = self.session_gate(session).await.lock_owned().await;
+        let runtime = self.runtime_for(session).await?.clone();
+        Ok((guard, runtime))
+    }
 }
 
 #[async_trait]
@@ -97,10 +133,8 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         &self,
         spec: BrowserSessionSpec,
     ) -> Result<BrowserSessionInfo, BrowserError> {
-        self.runtime_for(spec.session_id)
-            .await?
-            .create_session(spec)
-            .await
+        let (_guard, runtime) = self.locked_runtime(spec.session_id).await?;
+        runtime.create_session(spec).await
     }
 
     async fn grant_network_access(
@@ -108,10 +142,8 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         session: BrowserSessionId,
         grant: BrowserNetworkGrant,
     ) -> Result<(), BrowserError> {
-        self.runtime_for(session)
-            .await?
-            .grant_network_access(session, grant)
-            .await
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime.grant_network_access(session, grant).await
     }
 
     async fn navigate(
@@ -119,10 +151,8 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         session: BrowserSessionId,
         request: BrowserNavigateRequest,
     ) -> Result<BrowserOutput, BrowserError> {
-        self.runtime_for(session)
-            .await?
-            .navigate(session, request)
-            .await
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime.navigate(session, request).await
     }
 
     async fn observe(
@@ -130,10 +160,8 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         session: BrowserSessionId,
         options: BrowserObserveOptions,
     ) -> Result<BrowserObservation, BrowserError> {
-        self.runtime_for(session)
-            .await?
-            .observe(session, options)
-            .await
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime.observe(session, options).await
     }
 
     async fn switch_target(
@@ -141,10 +169,8 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         session: BrowserSessionId,
         target: BrowserTargetRef,
     ) -> Result<BrowserOutput, BrowserError> {
-        self.runtime_for(session)
-            .await?
-            .switch_target(session, target)
-            .await
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime.switch_target(session, target).await
     }
 
     async fn observation_node(
@@ -153,8 +179,8 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         observation_id: BrowserObservationId,
         node_ref: BrowserNodeRef,
     ) -> Result<BrowserNode, BrowserError> {
-        self.runtime_for(session)
-            .await?
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime
             .observation_node(session, observation_id, node_ref)
             .await
     }
@@ -166,14 +192,15 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         node_ref: BrowserNodeRef,
         action: BrowserAction,
     ) -> Result<BrowserActionReceipt, BrowserError> {
-        self.runtime_for(session)
-            .await?
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime
             .perform(session, observation_id, node_ref, action)
             .await
     }
 
     async fn screenshot(&self, session: BrowserSessionId) -> Result<BrowserOutput, BrowserError> {
-        self.runtime_for(session).await?.screenshot(session).await
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime.screenshot(session).await
     }
 
     async fn wait(
@@ -181,10 +208,8 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         session: BrowserSessionId,
         request: BrowserWaitRequest,
     ) -> Result<BrowserOutput, BrowserError> {
-        self.runtime_for(session)
-            .await?
-            .wait(session, request)
-            .await
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime.wait(session, request).await
     }
 
     async fn download(
@@ -192,19 +217,60 @@ impl BrowserRuntime for BrowserRuntimeRouter {
         session: BrowserSessionId,
         request: BrowserDownloadRequest,
     ) -> Result<BrowserOutput, BrowserError> {
-        self.runtime_for(session)
-            .await?
-            .download(session, request)
-            .await
+        let (_guard, runtime) = self.locked_runtime(session).await?;
+        runtime.download(session, request).await
     }
 
     async fn close_session(&self, session: BrowserSessionId) -> Result<(), BrowserError> {
+        let gate = self.session_gate(session).await;
+        let guard = gate.clone().lock_owned().await;
         let route = self
             .bindings
             .lock()
             .await
-            .remove(&session)
+            .get(&session)
+            .copied()
             .unwrap_or(BrowserRuntimeRoute::Managed);
-        self.runtime(route)?.close_session(session).await
+        let result = self.runtime(route)?.close_session(session).await;
+        if result.is_ok() || matches!(&result, Err(BrowserError::SessionNotFound(_))) {
+            self.bindings.lock().await.remove(&session);
+        }
+        drop(guard);
+        let mut gates = self.session_gates.lock().await;
+        if gates
+            .get(&session)
+            .is_some_and(|current| Arc::ptr_eq(current, &gate) && Arc::strong_count(current) == 2)
+        {
+            gates.remove(&session);
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::browser::{BrowserRuntimeConfig, LocalBrowserRuntime};
+
+    #[tokio::test]
+    async fn unavailable_chrome_route_keeps_the_managed_binding() {
+        let managed: Arc<dyn BrowserRuntime> =
+            Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default()));
+        let router = BrowserRuntimeRouter::new(managed, None);
+        let session = BrowserSessionId::new();
+
+        let error = router
+            .bind(
+                BrowserSessionSpec::from(session),
+                BrowserRuntimeRoute::Chrome,
+            )
+            .await
+            .expect_err("Chrome must not bind without a configured bridge");
+
+        assert!(matches!(error, BrowserError::BrokerConfiguration(_)));
+        assert_eq!(
+            router.route_for(session).await,
+            BrowserRuntimeRoute::Managed
+        );
     }
 }

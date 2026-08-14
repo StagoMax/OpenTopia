@@ -61,7 +61,20 @@ mod tests {
         );
         assert_eq!(
             tool.schema()["properties"]["action"]["enum"],
-            serde_json::json!(["inspect", "list_sheets", "read_range", "write"])
+            serde_json::json!([
+                "inspect",
+                "list_sheets",
+                "read_range",
+                "read_ranges",
+                "read_rows",
+                "read_columns",
+                "write",
+                "write_rows",
+                "write_columns",
+                "copy_rows",
+                "copy_columns",
+                "batch"
+            ])
         );
         assert!(opentopia["contributes"].get("previewers").is_none());
         assert_eq!(

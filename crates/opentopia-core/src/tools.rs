@@ -29,9 +29,9 @@ use crate::git_workflow::isolated_subagent_worktree_request;
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    Artifact, CollaborationMode, MessagePart, ModelContentPart, TaskEvidenceKind, TaskEvidenceRef,
-    TaskPlan, TaskPlanCoverage, TaskPlanStep, TaskPlanStepStatus, TaskRequirement, ToolCall,
-    ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
+    Artifact, ArtifactStorage, CollaborationMode, MessagePart, ModelContentPart, TaskEvidenceKind,
+    TaskEvidenceRef, TaskPlan, TaskPlanCoverage, TaskPlanStep, TaskPlanStepStatus, TaskRequirement,
+    ToolCall, ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
 };
 use crate::model_context::CompiledModelContext;
 use crate::policy::{
@@ -45,9 +45,11 @@ use crate::skill_authoring::{
 };
 use crate::skills::{discover_skills, load_skill_slice, SkillScope, MAX_SKILL_BYTES};
 use crate::spreadsheet::{
-    execute_spreadsheet, CellRange, InspectWorkbookRequest, ListSheetsRequest, ReadRangeRequest,
-    SheetWriteRequest, SpreadsheetAction, SpreadsheetRequest, SpreadsheetResult,
-    WriteWorkbookRequest, MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
+    execute_spreadsheet, CellAddress, CellRange, CellUpdate, FormulaInput, InspectWorkbookRequest,
+    ListSheetsRequest, ReadRangeRequest, ReadRangesRequest, SheetRangeRequest, SheetWriteRequest,
+    SpreadsheetAction, SpreadsheetCell, SpreadsheetCellInput, SpreadsheetCellValue,
+    SpreadsheetRequest, SpreadsheetResult, WriteWorkbookRequest,
+    MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
 use crate::store::SessionStore;
 use crate::subagents::{
@@ -553,13 +555,73 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SpreadsheetToolAction {
     Inspect,
     ListSheets,
     ReadRange,
+    ReadRanges,
+    ReadRows,
+    ReadColumns,
     Write,
+    WriteRows,
+    WriteColumns,
+    CopyRows,
+    CopyColumns,
+    Batch,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SpreadsheetCopyContentMode {
+    #[default]
+    Values,
+    ValuesAndFormulas,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum SpreadsheetBatchOperation {
+    WriteRows {
+        sheet: String,
+        start: CellAddress,
+        #[schemars(length(max = 10000))]
+        rows: Vec<Vec<SpreadsheetCellInput>>,
+    },
+    WriteColumns {
+        sheet: String,
+        start: CellAddress,
+        #[schemars(length(max = 256))]
+        columns: Vec<Vec<SpreadsheetCellInput>>,
+    },
+    CopyRows {
+        source_path: String,
+        source_sheet: String,
+        source_start: CellAddress,
+        row_count: u32,
+        column_count: u32,
+        destination_sheet: String,
+        destination_start: CellAddress,
+        #[serde(default)]
+        content_mode: SpreadsheetCopyContentMode,
+    },
+    CopyColumns {
+        source_path: String,
+        source_sheet: String,
+        source_start: CellAddress,
+        row_count: u32,
+        column_count: u32,
+        destination_sheet: String,
+        destination_start: CellAddress,
+        #[serde(default)]
+        content_mode: SpreadsheetCopyContentMode,
+    },
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -572,21 +634,48 @@ struct SpreadsheetToolInput {
     /// Opaque user attachment ID for inspect/list/read. Provide either this or path.
     #[serde(default)]
     attachment_id: Option<String>,
-    /// Worksheet name for read_range.
+    /// Worksheet name for single-range or row/column reads.
     #[serde(default)]
     sheet: Option<String>,
     /// Inclusive zero-based range for read_range.
     #[serde(default)]
     range: Option<CellRange>,
-    /// Optional existing XLSX to rebuild before applying writes.
+    /// Multiple sheet/range pairs for read_ranges.
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    ranges: Vec<SheetRangeRequest>,
+    /// Zero-based starting row for read_rows/read_columns.
+    #[serde(default)]
+    start_row: Option<u32>,
+    /// Zero-based starting column for read_rows/read_columns.
+    #[serde(default)]
+    start_column: Option<u32>,
+    /// Number of rows for read_rows/read_columns.
+    #[serde(default)]
+    row_count: Option<u32>,
+    /// Number of columns for read_rows/read_columns.
+    #[serde(default)]
+    column_count: Option<u32>,
+    /// Optional existing XLSX to update. Compatible cell-only changes preserve
+    /// untouched template parts; structural workbook changes rebuild it.
     #[serde(default)]
     source_path: Option<String>,
-    /// Workspace-relative XLSX output path for write.
+    /// Workspace-relative XLSX output path for writes and mutations.
     #[serde(default)]
     output_path: Option<String>,
     #[serde(default)]
     #[schemars(length(max = 256))]
     sheets: Vec<SheetWriteRequest>,
+    /// One row/column write or copy operation for a direct mutation action.
+    #[serde(default)]
+    operation: Option<SpreadsheetBatchOperation>,
+    /// Ordered operations for batch. All are validated before the output is written.
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    operations: Vec<SpreadsheetBatchOperation>,
+    /// Batch mutations are validate-then-write and atomic. Omit or set true.
+    #[serde(default)]
+    atomic: Option<bool>,
 }
 
 pub struct SpreadsheetTool;
@@ -600,14 +689,17 @@ impl TypedTool for SpreadsheetTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect, list, read, create, or update bounded XLSX workbooks. Uses zero-based row and column coordinates; writes preserve values, formulas, sheet order, and visibility but not formatting or embedded workbook objects."
+        "Inspect and manipulate bounded XLSX workbooks with zero-based coordinates. Supports batched ranges, row/column reads, matrix writes, internal row/column copies, and atomic multi-operation writes. Existing templates use a preservation path when the requested mutation can be applied without rebuilding workbook objects."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
         match input.action {
             SpreadsheetToolAction::Inspect
             | SpreadsheetToolAction::ListSheets
-            | SpreadsheetToolAction::ReadRange => {
+            | SpreadsheetToolAction::ReadRange
+            | SpreadsheetToolAction::ReadRanges
+            | SpreadsheetToolAction::ReadRows
+            | SpreadsheetToolAction::ReadColumns => {
                 ToolExecutionPolicy::read_only(vec![tool_resource_key(
                     if input.attachment_id.is_some() {
                         "attachment"
@@ -621,13 +713,26 @@ impl TypedTool for SpreadsheetTool {
                         .unwrap_or("*"),
                 )])
             }
-            SpreadsheetToolAction::Write => {
+            SpreadsheetToolAction::Write
+            | SpreadsheetToolAction::WriteRows
+            | SpreadsheetToolAction::WriteColumns
+            | SpreadsheetToolAction::CopyRows
+            | SpreadsheetToolAction::CopyColumns
+            | SpreadsheetToolAction::Batch => {
                 let mut resource_keys = input
                     .source_path
                     .iter()
                     .chain(input.output_path.iter())
                     .map(|path| tool_resource_key("file", path))
                     .collect::<Vec<_>>();
+                resource_keys.extend(
+                    input
+                        .operation
+                        .iter()
+                        .chain(input.operations.iter())
+                        .filter_map(spreadsheet_operation_source_path)
+                        .map(|path| tool_resource_key("file", path)),
+                );
                 resource_keys.sort();
                 resource_keys.dedup();
                 if resource_keys.is_empty() {
@@ -648,12 +753,28 @@ impl TypedTool for SpreadsheetTool {
         match input.action {
             SpreadsheetToolAction::Inspect
             | SpreadsheetToolAction::ListSheets
-            | SpreadsheetToolAction::ReadRange => {
+            | SpreadsheetToolAction::ReadRange
+            | SpreadsheetToolAction::ReadRanges
+            | SpreadsheetToolAction::ReadRows
+            | SpreadsheetToolAction::ReadColumns => {
                 ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from))
             }
-            SpreadsheetToolAction::Write => {
+            SpreadsheetToolAction::Write
+            | SpreadsheetToolAction::WriteRows
+            | SpreadsheetToolAction::WriteColumns
+            | SpreadsheetToolAction::CopyRows
+            | SpreadsheetToolAction::CopyColumns
+            | SpreadsheetToolAction::Batch => {
+                let read_paths = input.source_path.iter().map(PathBuf::from).chain(
+                    input
+                        .operation
+                        .iter()
+                        .chain(input.operations.iter())
+                        .filter_map(spreadsheet_operation_source_path)
+                        .map(PathBuf::from),
+                );
                 ToolExecutionIntent::workspace_mutation(input.output_path.iter().map(PathBuf::from))
-                    .with_read_paths(input.source_path.iter().map(PathBuf::from))
+                    .with_read_paths(read_paths)
             }
         }
     }
@@ -667,15 +788,34 @@ impl TypedTool for SpreadsheetTool {
         match input.action {
             SpreadsheetToolAction::Inspect
             | SpreadsheetToolAction::ListSheets
-            | SpreadsheetToolAction::ReadRange => {
+            | SpreadsheetToolAction::ReadRange
+            | SpreadsheetToolAction::ReadRanges
+            | SpreadsheetToolAction::ReadRows
+            | SpreadsheetToolAction::ReadColumns => {
                 execute_spreadsheet_read(call_id, input, ctx).await
             }
             SpreadsheetToolAction::Write => execute_spreadsheet_write(call_id, input, ctx).await,
+            SpreadsheetToolAction::WriteRows
+            | SpreadsheetToolAction::WriteColumns
+            | SpreadsheetToolAction::CopyRows
+            | SpreadsheetToolAction::CopyColumns
+            | SpreadsheetToolAction::Batch => {
+                execute_spreadsheet_mutations(call_id, input, ctx).await
+            }
         }
     }
 }
 
 impl_typed_tool!(SpreadsheetTool);
+
+fn spreadsheet_operation_source_path(operation: &SpreadsheetBatchOperation) -> Option<&str> {
+    match operation {
+        SpreadsheetBatchOperation::CopyRows { source_path, .. }
+        | SpreadsheetBatchOperation::CopyColumns { source_path, .. } => Some(source_path),
+        SpreadsheetBatchOperation::WriteRows { .. }
+        | SpreadsheetBatchOperation::WriteColumns { .. } => None,
+    }
+}
 
 async fn execute_spreadsheet_read(
     call_id: Uuid,
@@ -722,6 +862,11 @@ async fn execute_spreadsheet_read(
     let action = input.action;
     let sheet = input.sheet;
     let range = input.range;
+    let ranges = input.ranges;
+    let start_row = input.start_row;
+    let start_column = input.start_column;
+    let row_count = input.row_count;
+    let column_count = input.column_count;
     let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let staging = SpreadsheetStaging::new()?;
         let staged_input = staging.path("input.xlsx");
@@ -742,7 +887,38 @@ async fn execute_spreadsheet_read(
                     .context("spreadsheet read_range requires sheet")?,
                 range: range.context("spreadsheet read_range requires range")?,
             }),
-            SpreadsheetToolAction::Write => unreachable!(),
+            SpreadsheetToolAction::ReadRanges => {
+                anyhow::ensure!(
+                    !ranges.is_empty(),
+                    "spreadsheet read_ranges requires at least one range"
+                );
+                SpreadsheetAction::ReadRanges(ReadRangesRequest {
+                    path: staged_input,
+                    ranges,
+                })
+            }
+            SpreadsheetToolAction::ReadRows | SpreadsheetToolAction::ReadColumns => {
+                let range = counted_spreadsheet_range(
+                    start_row.context("spreadsheet row/column read requires startRow")?,
+                    start_column.context("spreadsheet row/column read requires startColumn")?,
+                    row_count.context("spreadsheet row/column read requires rowCount")?,
+                    column_count.context("spreadsheet row/column read requires columnCount")?,
+                )?;
+                SpreadsheetAction::ReadRange(ReadRangeRequest {
+                    path: staged_input,
+                    sheet: sheet
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .context("spreadsheet row/column read requires sheet")?,
+                    range,
+                })
+            }
+            SpreadsheetToolAction::Write
+            | SpreadsheetToolAction::WriteRows
+            | SpreadsheetToolAction::WriteColumns
+            | SpreadsheetToolAction::CopyRows
+            | SpreadsheetToolAction::CopyColumns
+            | SpreadsheetToolAction::Batch => unreachable!(),
         };
         Ok(execute_spreadsheet(SpreadsheetRequest { action }))
     })
@@ -764,6 +940,35 @@ async fn execute_spreadsheet_read(
         insert_attachment_provenance(&mut result.metadata, &metadata);
     }
     Ok(result)
+}
+
+fn counted_spreadsheet_range(
+    start_row: u32,
+    start_column: u32,
+    row_count: u32,
+    column_count: u32,
+) -> anyhow::Result<CellRange> {
+    anyhow::ensure!(row_count > 0, "spreadsheet rowCount must be at least 1");
+    anyhow::ensure!(
+        column_count > 0,
+        "spreadsheet columnCount must be at least 1"
+    );
+    let end_row = start_row
+        .checked_add(row_count - 1)
+        .context("spreadsheet row range overflow")?;
+    let end_column = start_column
+        .checked_add(column_count - 1)
+        .context("spreadsheet column range overflow")?;
+    Ok(CellRange {
+        start: CellAddress {
+            row: start_row,
+            column: start_column,
+        },
+        end: CellAddress {
+            row: end_row,
+            column: end_column,
+        },
+    })
 }
 
 async fn execute_spreadsheet_write(
@@ -842,6 +1047,342 @@ async fn execute_spreadsheet_write(
     spreadsheet_success_result(call_id, result, Some(written.path))
 }
 
+async fn execute_spreadsheet_mutations(
+    call_id: Uuid,
+    input: SpreadsheetToolInput,
+    ctx: ToolContext,
+) -> anyhow::Result<ToolResult> {
+    anyhow::ensure!(
+        input.atomic.unwrap_or(true),
+        "spreadsheet mutations are always atomic; atomic=false is not supported"
+    );
+    let output_relative = input
+        .output_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .context("spreadsheet mutation requires outputPath")?;
+    let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
+    ensure_xlsx_path(&output_path)?;
+    enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
+
+    let operations =
+        spreadsheet_operations_for_action(input.action, input.operation, input.operations)?;
+    let base_source = if let Some(relative) = input
+        .source_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
+        enforce_read_policy(&ctx, &logical_path)?;
+        let path = ctx.environment.resolve_read_path(&logical_path)?;
+        ensure_xlsx_path(&path)?;
+        Some(
+            ctx.environment
+                .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    let mut copy_sources = BTreeMap::<String, (PathBuf, Vec<u8>)>::new();
+    for relative in operations
+        .iter()
+        .filter_map(spreadsheet_operation_source_path)
+    {
+        let key = relative.trim().to_string();
+        anyhow::ensure!(
+            !key.is_empty(),
+            "spreadsheet copy sourcePath must not be empty"
+        );
+        if copy_sources.contains_key(&key) {
+            continue;
+        }
+        let logical_path = normalize_workspace_path(&ctx.workspace_root, &key)?;
+        enforce_read_policy(&ctx, &logical_path)?;
+        let path = ctx.environment.resolve_read_path(&logical_path)?;
+        ensure_xlsx_path(&path)?;
+        let read = ctx
+            .environment
+            .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
+            .await?;
+        copy_sources.insert(key, (read.path, read.bytes));
+    }
+
+    let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let staging = SpreadsheetStaging::new()?;
+        let staged_base = if let Some(source) = base_source {
+            let path = staging.path("base.xlsx");
+            fs::write(&path, source.bytes)
+                .with_context(|| format!("failed to stage {}", source.path.display()))?;
+            Some(path)
+        } else {
+            None
+        };
+        let mut staged_copy_sources = BTreeMap::new();
+        for (index, (logical, (original, bytes))) in copy_sources.into_iter().enumerate() {
+            let path = staging.path(&format!("copy-source-{index}.xlsx"));
+            fs::write(&path, bytes)
+                .with_context(|| format!("failed to stage {}", original.display()))?;
+            staged_copy_sources.insert(logical, path);
+        }
+        let sheets = materialize_spreadsheet_operations(&operations, &staged_copy_sources)?;
+        let staged_output = staging.path("output.xlsx");
+        let outcome = execute_spreadsheet(SpreadsheetRequest {
+            action: SpreadsheetAction::WriteWorkbook(WriteWorkbookRequest {
+                source: staged_base,
+                output: staged_output.clone(),
+                sheets,
+            }),
+        });
+        match outcome {
+            Ok(result) => {
+                let bytes = fs::read(&staged_output)
+                    .with_context(|| format!("failed to read {}", staged_output.display()))?;
+                Ok(Ok((result, bytes)))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    })
+    .await
+    .context("spreadsheet mutation worker task failed")??;
+    let (mut result, bytes) = match staged {
+        Ok(result) => result,
+        Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
+    };
+    let written = ctx
+        .environment
+        .write_file(FileWriteRequest::new(&output_path, bytes))
+        .await?;
+    remap_spreadsheet_paths(&mut result, None, Some(&written.path));
+    spreadsheet_success_result(call_id, result, Some(written.path))
+}
+
+fn spreadsheet_operations_for_action(
+    action: SpreadsheetToolAction,
+    operation: Option<SpreadsheetBatchOperation>,
+    operations: Vec<SpreadsheetBatchOperation>,
+) -> anyhow::Result<Vec<SpreadsheetBatchOperation>> {
+    if action == SpreadsheetToolAction::Batch {
+        anyhow::ensure!(
+            operation.is_none(),
+            "spreadsheet batch uses operations, not operation"
+        );
+        anyhow::ensure!(
+            !operations.is_empty(),
+            "spreadsheet batch requires operations"
+        );
+        return Ok(operations);
+    }
+    anyhow::ensure!(
+        operations.is_empty(),
+        "direct spreadsheet mutations use operation, not operations"
+    );
+    let operation = operation.context("spreadsheet mutation requires operation")?;
+    let matches_action = matches!(
+        (&action, &operation),
+        (
+            SpreadsheetToolAction::WriteRows,
+            SpreadsheetBatchOperation::WriteRows { .. }
+        ) | (
+            SpreadsheetToolAction::WriteColumns,
+            SpreadsheetBatchOperation::WriteColumns { .. }
+        ) | (
+            SpreadsheetToolAction::CopyRows,
+            SpreadsheetBatchOperation::CopyRows { .. }
+        ) | (
+            SpreadsheetToolAction::CopyColumns,
+            SpreadsheetBatchOperation::CopyColumns { .. }
+        )
+    );
+    anyhow::ensure!(
+        matches_action,
+        "spreadsheet operation type must match action"
+    );
+    Ok(vec![operation])
+}
+
+fn materialize_spreadsheet_operations(
+    operations: &[SpreadsheetBatchOperation],
+    copy_sources: &BTreeMap<String, PathBuf>,
+) -> anyhow::Result<Vec<SheetWriteRequest>> {
+    let mut updates = BTreeMap::<String, Vec<CellUpdate>>::new();
+    for operation in operations {
+        match operation {
+            SpreadsheetBatchOperation::WriteRows { sheet, start, rows } => {
+                append_row_updates(&mut updates, sheet, *start, rows)?;
+            }
+            SpreadsheetBatchOperation::WriteColumns {
+                sheet,
+                start,
+                columns,
+            } => {
+                append_column_updates(&mut updates, sheet, *start, columns)?;
+            }
+            SpreadsheetBatchOperation::CopyRows {
+                source_path,
+                source_sheet,
+                source_start,
+                row_count,
+                column_count,
+                destination_sheet,
+                destination_start,
+                content_mode,
+            }
+            | SpreadsheetBatchOperation::CopyColumns {
+                source_path,
+                source_sheet,
+                source_start,
+                row_count,
+                column_count,
+                destination_sheet,
+                destination_start,
+                content_mode,
+            } => {
+                let staged_source = copy_sources.get(source_path.trim()).with_context(|| {
+                    format!("spreadsheet copy source {source_path:?} was not staged")
+                })?;
+                let range = counted_spreadsheet_range(
+                    source_start.row,
+                    source_start.column,
+                    *row_count,
+                    *column_count,
+                )?;
+                let read = crate::spreadsheet::read_range(&ReadRangeRequest {
+                    path: staged_source.clone(),
+                    sheet: source_sheet.clone(),
+                    range,
+                })?;
+                let rows = read
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|cell| spreadsheet_cell_to_input(cell, *content_mode))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                append_row_updates(&mut updates, destination_sheet, *destination_start, &rows)?;
+            }
+        }
+    }
+    Ok(updates
+        .into_iter()
+        .map(|(name, cells)| SheetWriteRequest {
+            name,
+            visibility: None,
+            cells,
+        })
+        .collect())
+}
+
+fn append_row_updates(
+    updates: &mut BTreeMap<String, Vec<CellUpdate>>,
+    sheet: &str,
+    start: CellAddress,
+    rows: &[Vec<SpreadsheetCellInput>],
+) -> anyhow::Result<()> {
+    let target = updates.entry(sheet.to_string()).or_default();
+    for (row_offset, row) in rows.iter().enumerate() {
+        let row_offset =
+            u32::try_from(row_offset).context("spreadsheet row offset is too large")?;
+        let address_row = start
+            .row
+            .checked_add(row_offset)
+            .context("spreadsheet destination row overflow")?;
+        for (column_offset, value) in row.iter().enumerate() {
+            let column_offset =
+                u32::try_from(column_offset).context("spreadsheet column offset is too large")?;
+            target.push(CellUpdate {
+                address: CellAddress {
+                    row: address_row,
+                    column: start
+                        .column
+                        .checked_add(column_offset)
+                        .context("spreadsheet destination column overflow")?,
+                },
+                value: value.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn append_column_updates(
+    updates: &mut BTreeMap<String, Vec<CellUpdate>>,
+    sheet: &str,
+    start: CellAddress,
+    columns: &[Vec<SpreadsheetCellInput>],
+) -> anyhow::Result<()> {
+    let target = updates.entry(sheet.to_string()).or_default();
+    for (column_offset, column) in columns.iter().enumerate() {
+        let column_offset =
+            u32::try_from(column_offset).context("spreadsheet column offset is too large")?;
+        let address_column = start
+            .column
+            .checked_add(column_offset)
+            .context("spreadsheet destination column overflow")?;
+        for (row_offset, value) in column.iter().enumerate() {
+            let row_offset =
+                u32::try_from(row_offset).context("spreadsheet row offset is too large")?;
+            target.push(CellUpdate {
+                address: CellAddress {
+                    row: start
+                        .row
+                        .checked_add(row_offset)
+                        .context("spreadsheet destination row overflow")?,
+                    column: address_column,
+                },
+                value: value.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn spreadsheet_cell_to_input(
+    cell: &SpreadsheetCell,
+    content_mode: SpreadsheetCopyContentMode,
+) -> SpreadsheetCellInput {
+    if matches!(content_mode, SpreadsheetCopyContentMode::ValuesAndFormulas) {
+        if let Some(expression) = &cell.formula {
+            return SpreadsheetCellInput::Formula(FormulaInput {
+                expression: expression.clone(),
+                cached_result: spreadsheet_cell_cached_result(&cell.value),
+            });
+        }
+    }
+    match &cell.value {
+        SpreadsheetCellValue::Empty => SpreadsheetCellInput::Blank,
+        SpreadsheetCellValue::String(value)
+        | SpreadsheetCellValue::DateTimeIso(value)
+        | SpreadsheetCellValue::DurationIso(value)
+        | SpreadsheetCellValue::Error(value) => SpreadsheetCellInput::String(value.clone()),
+        SpreadsheetCellValue::Integer(value) => SpreadsheetCellInput::Integer(*value),
+        SpreadsheetCellValue::Number(value) => SpreadsheetCellInput::Number(*value),
+        SpreadsheetCellValue::Boolean(value) => SpreadsheetCellInput::Boolean(*value),
+        SpreadsheetCellValue::DateTime(value) => SpreadsheetCellInput::Number(value.serial),
+    }
+}
+
+fn spreadsheet_cell_cached_result(value: &SpreadsheetCellValue) -> Option<String> {
+    match value {
+        SpreadsheetCellValue::Empty => None,
+        SpreadsheetCellValue::String(value)
+        | SpreadsheetCellValue::DateTimeIso(value)
+        | SpreadsheetCellValue::DurationIso(value)
+        | SpreadsheetCellValue::Error(value) => Some(value.clone()),
+        SpreadsheetCellValue::Integer(value) => Some(value.to_string()),
+        SpreadsheetCellValue::Number(value) => Some(value.to_string()),
+        SpreadsheetCellValue::Boolean(value) => {
+            Some(if *value { "TRUE" } else { "FALSE" }.to_string())
+        }
+        SpreadsheetCellValue::DateTime(value) => Some(value.serial.to_string()),
+    }
+}
+
 fn spreadsheet_success_result(
     call_id: Uuid,
     result: SpreadsheetResult,
@@ -915,6 +1456,14 @@ fn remap_spreadsheet_paths(
         SpreadsheetResult::RangeRead(result) => {
             if let Some(source) = source {
                 result.path = source.to_path_buf();
+            }
+        }
+        SpreadsheetResult::RangesRead(result) => {
+            if let Some(source) = source {
+                result.path = source.to_path_buf();
+                for range in &mut result.ranges {
+                    range.path = source.to_path_buf();
+                }
             }
         }
         SpreadsheetResult::WorkbookWritten(result) => {
@@ -3296,7 +3845,7 @@ impl TypedTool for ComputerTool {
     }
 
     fn description(&self) -> &str {
-        "Observe and operate an application window from the user's executable allowlist. First list windows, then observe one window. Read-only listing and observation do not grant input control. Every input action must use the latest observationId and requires explicit approval. Never use this tool for passwords, secrets, payments, publishing, deletion, UAC, or the entire desktop."
+        "Observe and operate an application window from the user's executable allowlist. After implementing or changing visible UI, use read-only observation when visual inspection would materially verify layout, overflow, overlap, focus visibility, loading or error states, or relevant viewport sizes. First list windows, then observe one window. Read-only listing and observation do not grant input control. Every input action must use the latest observationId and requires explicit approval. Never use this tool for passwords, secrets, payments, publishing, deletion, UAC, or the entire desktop."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -5945,6 +6494,115 @@ async fn execute_read_file_with_cap(
 }
 
 impl_typed_tool!(ReadFileTool);
+
+const READ_ARTIFACT_WINDOW_CHARS: usize = 16_000;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReadArtifactInput {
+    /// Artifact UUID returned by a previous tool result.
+    artifact_id: String,
+    /// Zero-based character offset. Omit for the first window.
+    #[serde(default)]
+    offset: Option<u64>,
+    /// Number of characters to return, capped at 16000.
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+pub struct ReadArtifactTool;
+
+#[async_trait]
+impl TypedTool for ReadArtifactTool {
+    type Input = ReadArtifactInput;
+
+    fn name(&self) -> &str {
+        "read_artifact"
+    }
+
+    fn description(&self) -> &str {
+        "Read a bounded character window from a text artifact produced earlier in this task. Use artifactId from a tool result, then continue with nextOffset when more content remains."
+    }
+
+    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec![tool_resource_key("artifact", &input.artifact_id)])
+    }
+
+    fn execution_intent(
+        &self,
+        _input: &Self::Input,
+        _workspace_root: &Path,
+    ) -> ToolExecutionIntent {
+        ToolExecutionIntent::observation(std::iter::empty::<PathBuf>())
+    }
+
+    async fn execute_typed(
+        &self,
+        call_id: Uuid,
+        input: Self::Input,
+        ctx: ToolContext,
+    ) -> anyhow::Result<ToolResult> {
+        let artifact_id = Uuid::parse_str(input.artifact_id.trim())
+            .context("read_artifact artifactId must be a UUID")?;
+        let thread_id = ctx
+            .thread_id
+            .context("read_artifact requires an active task")?;
+        let store = ctx
+            .store
+            .as_ref()
+            .context("read_artifact requires artifact storage")?;
+        let artifact = store
+            .get_artifact(thread_id, artifact_id)?
+            .with_context(|| format!("artifact {artifact_id} was not found in this task"))?;
+        let content = match artifact.storage {
+            ArtifactStorage::Inline { content } => content,
+            ArtifactStorage::Path { .. } => anyhow::bail!(
+                "artifact {artifact_id} is file-backed; use its preview or the corresponding file tool"
+            ),
+        };
+        let total_chars = content.chars().count();
+        let offset = input
+            .offset
+            .map(usize::try_from)
+            .transpose()
+            .context("read_artifact offset is too large")?
+            .unwrap_or(0);
+        anyhow::ensure!(
+            offset <= total_chars,
+            "read_artifact offset {offset} exceeds total characters {total_chars}"
+        );
+        let limit = input.limit.map_or(READ_ARTIFACT_WINDOW_CHARS, |limit| {
+            usize::try_from(limit)
+                .unwrap_or(usize::MAX)
+                .clamp(1, READ_ARTIFACT_WINDOW_CHARS)
+        });
+        let mut output = content.chars().skip(offset).take(limit).collect::<String>();
+        let read_to = offset.saturating_add(output.chars().count());
+        let next_offset = (read_to < total_chars).then_some(read_to);
+        if let Some(next_offset) = next_offset {
+            output.push_str(&format!(
+                "\n\n[characters {offset}-{} of {total_chars}; call read_artifact again with artifactId {artifact_id} and offset {next_offset}]",
+                read_to.saturating_sub(1)
+            ));
+        }
+        Ok(ToolResult::text(
+            call_id,
+            output,
+            json!({
+                "toolName": "read_artifact",
+                "success": true,
+                "artifactId": artifact_id,
+                "artifactKind": artifact.kind,
+                "contentType": artifact.content_type,
+                "offset": offset,
+                "nextOffset": next_offset,
+                "totalChars": total_chars
+            }),
+        ))
+    }
+}
+
+impl_typed_tool!(ReadArtifactTool);
 
 pub struct ReadFilesTool;
 
@@ -9327,6 +9985,8 @@ mod tests {
             role,
             content: content.to_string(),
             content_parts: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
         };
         let conversation = vec![
             message(ModelConversationRole::User, "first user"),
@@ -9733,6 +10393,57 @@ mod tests {
             .unwrap();
         assert_eq!(bounded.metadata["nextOffset"], 10);
 
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_artifact_windows_reach_full_ingress_output() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-read-artifact-window-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
+        let thread = store
+            .create_thread(Some("artifact window".to_string()), workspace_root.clone())
+            .expect("create task");
+        let contents = format!("{}TAIL", "a".repeat(READ_ARTIFACT_WINDOW_CHARS + 25));
+        let artifact = store
+            .insert_artifact(Artifact::inline(
+                thread.id,
+                "tool_output",
+                "text/plain; charset=utf-8",
+                contents,
+                json!({}),
+            ))
+            .expect("insert artifact");
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::Auto,
+        ));
+        let mut context = ToolContext::local(workspace_root.clone(), policy);
+        context.store = Some(store);
+        context.thread_id = Some(thread.id);
+
+        let first = ReadArtifactTool
+            .execute(
+                ToolCall::new("read_artifact", json!({ "artifactId": artifact.id })),
+                context.clone(),
+            )
+            .await
+            .expect("read first artifact window");
+        assert!(!first.output.contains("TAIL"));
+        let next_offset = first.metadata["nextOffset"].as_u64().expect("next offset");
+        let second = ReadArtifactTool
+            .execute(
+                ToolCall::new(
+                    "read_artifact",
+                    json!({ "artifactId": artifact.id, "offset": next_offset }),
+                ),
+                context,
+            )
+            .await
+            .expect("read final artifact window");
+        assert!(second.output.contains("TAIL"));
+        assert!(second.metadata["nextOffset"].is_null());
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
@@ -10750,6 +11461,107 @@ mod tests {
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
+    #[tokio::test]
+    async fn spreadsheet_batch_copies_rows_and_writes_columns_without_model_round_trip_data() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-sheet-batch-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        for (path, sheet, values) in [
+            (
+                "source.xlsx",
+                "Source",
+                json!([
+                    { "address": { "row": 0, "column": 0 }, "value": { "type": "string", "value": "A001" } },
+                    { "address": { "row": 0, "column": 1 }, "value": { "type": "integer", "value": 10 } },
+                    { "address": { "row": 1, "column": 0 }, "value": { "type": "string", "value": "A002" } },
+                    { "address": { "row": 1, "column": 1 }, "value": { "type": "integer", "value": 20 } }
+                ]),
+            ),
+            ("template.xlsx", "Orders", json!([])),
+        ] {
+            SpreadsheetTool
+                .execute(
+                    ToolCall::new(
+                        "spreadsheet",
+                        json!({
+                            "action": "write",
+                            "outputPath": path,
+                            "sheets": [{ "name": sheet, "cells": values }]
+                        }),
+                    ),
+                    ToolContext::local(workspace_root.clone(), policy.clone()),
+                )
+                .await
+                .expect("create spreadsheet fixture");
+        }
+
+        let result = SpreadsheetTool
+            .execute(
+                ToolCall::new(
+                    "spreadsheet",
+                    json!({
+                        "action": "batch",
+                        "sourcePath": "template.xlsx",
+                        "outputPath": "orders.xlsx",
+                        "operations": [
+                            {
+                                "type": "copy_rows",
+                                "sourcePath": "source.xlsx",
+                                "sourceSheet": "Source",
+                                "sourceStart": { "row": 0, "column": 0 },
+                                "rowCount": 2,
+                                "columnCount": 2,
+                                "destinationSheet": "Orders",
+                                "destinationStart": { "row": 1, "column": 1 },
+                                "contentMode": "values"
+                            },
+                            {
+                                "type": "write_columns",
+                                "sheet": "Orders",
+                                "start": { "row": 1, "column": 3 },
+                                "columns": [[
+                                    { "type": "string", "value": "ready" },
+                                    { "type": "string", "value": "ready" }
+                                ]]
+                            }
+                        ]
+                    }),
+                ),
+                ToolContext::local(workspace_root.clone(), policy.clone()),
+            )
+            .await
+            .expect("execute spreadsheet batch");
+        assert_eq!(result.metadata["success"], true);
+        assert!(result.output.contains("preservedTemplateParts"));
+
+        let read = SpreadsheetTool
+            .execute(
+                ToolCall::new(
+                    "spreadsheet",
+                    json!({
+                        "action": "read_rows",
+                        "path": "orders.xlsx",
+                        "sheet": "Orders",
+                        "startRow": 1,
+                        "startColumn": 1,
+                        "rowCount": 2,
+                        "columnCount": 3
+                    }),
+                ),
+                ToolContext::local(workspace_root.clone(), policy),
+            )
+            .await
+            .expect("read spreadsheet batch output");
+        assert!(read.output.contains("A001"));
+        assert!(read.output.contains("A002"));
+        assert!(read.output.contains("ready"));
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn write_file_allows_verbatim_workspace_target_in_approve_mode() {
@@ -11129,9 +11941,17 @@ mod tests {
                 attachment_id: None,
                 sheet: None,
                 range: None,
+                ranges: Vec::new(),
+                start_row: None,
+                start_column: None,
+                row_count: None,
+                column_count: None,
                 source_path: None,
                 output_path: None,
                 sheets: Vec::new(),
+                operation: None,
+                operations: Vec::new(),
+                atomic: None,
             },
         );
         assert!(spreadsheet_read.read_only);
@@ -11147,9 +11967,17 @@ mod tests {
                 attachment_id: Some(attachment_id.clone()),
                 sheet: None,
                 range: None,
+                ranges: Vec::new(),
+                start_row: None,
+                start_column: None,
+                row_count: None,
+                column_count: None,
                 source_path: None,
                 output_path: None,
                 sheets: Vec::new(),
+                operation: None,
+                operations: Vec::new(),
+                atomic: None,
             },
         );
         assert_eq!(
@@ -11165,9 +11993,17 @@ mod tests {
                 attachment_id: None,
                 sheet: None,
                 range: None,
+                ranges: Vec::new(),
+                start_row: None,
+                start_column: None,
+                row_count: None,
+                column_count: None,
                 source_path: Some("reports/source.xlsx".to_string()),
                 output_path: Some("reports/output.xlsx".to_string()),
                 sheets: Vec::new(),
+                operation: None,
+                operations: Vec::new(),
+                atomic: None,
             },
         );
         assert!(!spreadsheet_write.read_only);

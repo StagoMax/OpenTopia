@@ -22,19 +22,17 @@ use crate::guardian::{
 use crate::mcp::McpToolDescriptor;
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    AgentEventPayload, ApprovalStatus, CollaborationMode, ExperienceMode, GoalRecord, Message,
-    MessagePart, MessageRole, ModelCallPurpose, ModelContentPart, TaskEvidenceKind, TaskPlan,
-    TaskPlanStepStatus, ThreadModelSelection, ToolCall, ToolResult, UserInputRequest,
-    UserInputResponse,
+    AgentEventPayload, CollaborationMode, ExperienceMode, GoalRecord, Message, MessagePart,
+    MessageRole, ModelCallPurpose, ModelContentPart, TaskPlan, TaskPlanStepStatus,
+    ThreadModelSelection, ToolCall, ToolResult, UserInputRequest, UserInputResponse,
 };
 use crate::model_context::{
     content_fingerprint, CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole,
     ContextSensitivity, ModelContextItem,
 };
-use crate::policy::{
-    approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode, PolicyDecision,
-    PolicyEngine,
-};
+use crate::policy::{approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode};
+#[cfg(test)]
+use crate::policy::{PolicyDecision, PolicyEngine};
 use crate::prompt_runtime::{
     compile_runtime_prompt_modules, AgentRuntimeSettings, MultiAgentMode,
     PromptRuntimeCapabilities, RuntimeSurface,
@@ -56,6 +54,7 @@ use crate::store::{ProviderContextStateKind, SessionStore};
 use crate::subagents::{SubagentScheduler, SubagentScope};
 use crate::tool_result_ingress::{
     normalize_tool_result_at_ingress, provider_tool_result_content, provider_tool_result_metadata,
+    tool_result_is_error,
 };
 use crate::tool_surface::{bundle_is_visible, external_namespace, tool_bundle};
 use crate::tools::{
@@ -74,6 +73,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod completion_guard;
+mod continuation;
+mod tool_scheduler;
+
+pub use continuation::{AgentContinuation, AgentContinuationState};
+
 #[cfg(test)]
 use crate::provider::ModelFinishReason;
 
@@ -86,12 +91,13 @@ const MAX_TOOL_SEARCH_RESULTS: usize = 12;
 const PROMPT_CACHE_LINEAGE_VERSION: &str = "responses-lineage-v2";
 const AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD: usize = 24;
 const AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD: usize = 12_000;
-const ATTACHMENT_PROJECTED_BUNDLED_TOOLS: [(&str, &str); 3] = [
+const DEFAULT_EAGER_OFFICE_TOOLS: [(&str, &str); 3] = [
     ("document", "documents"),
     ("pdf", "pdf"),
     ("spreadsheet", "spreadsheet"),
 ];
 const ROLLOUT_CHECKPOINT_TOOL_NAME: &str = "runtime_rollout_checkpoint";
+const STEP_REMINDER_TOOL_NAME: &str = "runtime_step_reminder";
 const BACKGROUND_COMMAND_REMINDER_STAGE: &str = "background_command";
 const BACKGROUND_COMPLETION_TOOL_NAME: &str = "runtime_background_completion";
 const ROLLOUT_REVIEW_INTERVAL: usize = 90;
@@ -100,9 +106,8 @@ const MAX_ROLLOUT_MODEL_ROUNDS: usize = 270;
 /// Controls how much of the executable tool catalog is sent to the model.
 ///
 /// This is a harness policy, not a user-facing model setting. `Automatic` keeps
-/// ordinary catalogs unchanged, defers attachment-oriented bundled schemas until
-/// a matching attachment appears, and defers the whole external catalog when it
-/// has grown large enough to create meaningful selection noise.
+/// core and default Office tools directly visible, while large external MCP/plugin
+/// catalogs are disclosed on demand to avoid unnecessary selection noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolExposurePolicy {
     Eager,
@@ -179,59 +184,6 @@ pub enum AgentTurnOutcome {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentContinuation {
-    pub thread_id: Uuid,
-    pub user_message_id: Uuid,
-    pub workspace_root: PathBuf,
-    pub context_summary: Option<String>,
-    pub conversation: Vec<ModelConversationMessage>,
-    pub permission_mode: PermissionMode,
-    pub context_budget: Option<ContextBudget>,
-    #[serde(default)]
-    pub rollout_budget: Option<RolloutBudget>,
-    #[serde(default)]
-    pub model_context: CompiledModelContext,
-    #[serde(default)]
-    pub collaboration_mode: CollaborationMode,
-    #[serde(default)]
-    pub goal: Option<GoalRecord>,
-    pub state: AgentContinuationState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentContinuationState {
-    Provider {
-        model_user_message: String,
-        #[serde(default)]
-        model_user_content: Vec<ModelContentPart>,
-        tool_candidates: Vec<ProviderToolCandidate>,
-        provider_tool_calls: Vec<ProviderToolCall>,
-        provider_tool_results: Vec<ProviderToolResult>,
-        pending_tool_calls: Vec<ProviderToolCall>,
-        #[serde(default)]
-        compacted_tool_history: String,
-        #[serde(default)]
-        provider_response_items: Vec<Value>,
-        #[serde(default = "default_continuation_model_rounds")]
-        model_rounds: usize,
-        #[serde(default)]
-        rollout_reviews: usize,
-        #[serde(default)]
-        runtime_state: TurnRuntimeState,
-        #[serde(default)]
-        branch_developer_instructions: Option<String>,
-        #[serde(default)]
-        provider_compatibility_hash: String,
-    },
-}
-
-fn default_continuation_model_rounds() -> usize {
-    1
-}
-
 struct TurnEvents {
     items: Vec<AgentEventPayload>,
     sender: Option<AgentEventSender>,
@@ -295,6 +247,12 @@ pub struct TurnRuntimeState {
     /// Empty outside a suspended approval boundary.
     #[serde(default)]
     pending_batch_approval_call_ids: Vec<String>,
+    /// Exact external paths approved earlier in this turn. These leases travel
+    /// with continuations but are discarded when the turn ends.
+    #[serde(default)]
+    approved_read_path_leases: Vec<PathBuf>,
+    #[serde(default)]
+    approved_write_path_leases: Vec<PathBuf>,
     /// Consecutive model rounds containing at least one syntactically invalid
     /// tool-arguments JSON payload. The first two are returned to the model as
     /// non-executed tool errors; the third stops the loop.
@@ -303,6 +261,22 @@ pub struct TurnRuntimeState {
 }
 
 impl TurnRuntimeState {
+    fn sandbox_config_with_path_leases(&self, base: &LocalSandboxConfig) -> LocalSandboxConfig {
+        let mut sandbox = base.clone();
+        for path in &self.approved_read_path_leases {
+            sandbox.grant_read_path(path.clone());
+        }
+        for path in &self.approved_write_path_leases {
+            sandbox.grant_write_path(path.clone());
+        }
+        sandbox
+    }
+
+    fn replace_path_leases_from(&mut self, sandbox: &LocalSandboxConfig) {
+        self.approved_read_path_leases = sandbox.approved_read_paths.clone();
+        self.approved_write_path_leases = sandbox.approved_write_paths.clone();
+    }
+
     fn record_tool_calls(&mut self, calls: &[ProviderToolCall]) {
         if calls
             .iter()
@@ -785,10 +759,9 @@ impl AgentCore {
         self.enabled_bundled_plugins.contains(plugin_name)
     }
 
-    /// Marks attachment-oriented bundled tools whose schemas should be sent
-    /// directly on providers without native deferred loading. This is only an
-    /// exposure hint: normal plugin activation, capability, and tool permission
-    /// checks remain authoritative.
+    /// Retains attachment-derived Office hints for persisted/runtime compatibility.
+    /// The default Office tools are already directly visible; activation,
+    /// capability, and permission checks remain authoritative.
     pub fn set_attachment_preloaded_tools<I, S>(&mut self, tools: I)
     where
         I: IntoIterator<Item = S>,
@@ -798,7 +771,7 @@ impl AgentCore {
             .into_iter()
             .filter_map(|name| {
                 let name = name.as_ref();
-                self.is_attachment_projected_bundled_tool(name)
+                self.is_default_eager_office_tool(name)
                     .then(|| name.to_string())
             })
             .collect();
@@ -1262,6 +1235,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         provider_tool_calls: &mut Vec<ProviderToolCall>,
         provider_tool_results: &mut Vec<ProviderToolResult>,
         provider_response_items: &mut Vec<Value>,
+        events: &mut TurnEvents,
     ) {
         let call_id = format!("background_completion_{}", Uuid::new_v4());
         let call = ProviderToolCall {
@@ -1278,8 +1252,8 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             "name": BACKGROUND_COMPLETION_TOOL_NAME,
             "arguments": call.arguments.to_string(),
         }));
-        provider_tool_calls.push(call);
-        provider_tool_results.push(ProviderToolResult {
+        provider_tool_calls.push(call.clone());
+        let result = ProviderToolResult {
             call_id,
             name: BACKGROUND_COMPLETION_TOOL_NAME.to_string(),
             output: content.to_string(),
@@ -1290,290 +1264,60 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                 "success": true,
                 "untrusted": true,
             }),
-        });
+        };
+        record_provider_tool_result_event(
+            events,
+            ToolCall::new(&call.name, call.arguments.clone()),
+            &result,
+        );
+        provider_tool_results.push(result);
     }
 
-    fn apply_finalization_guard(
+    fn append_step_reminder_observation(
         &self,
-        thread_id: Uuid,
-        fallback_turn_id: Uuid,
-        store: Option<&Arc<dyn SessionStore>>,
-        pending_tool_calls: &[ProviderToolCall],
+        stage: &str,
+        content: &str,
         provider_tool_calls: &mut Vec<ProviderToolCall>,
         provider_tool_results: &mut Vec<ProviderToolResult>,
         provider_response_items: &mut Vec<Value>,
         events: &mut TurnEvents,
-    ) -> anyhow::Result<Option<FinalizationGuardIntervention>> {
-        let mut blockers = Vec::new();
-        if !pending_tool_calls.is_empty() {
-            blockers.push(json!({
-                "kind": "pending_tool_calls",
-                "count": pending_tool_calls.len(),
-            }));
-        }
-
-        if let Some(store) = store {
-            let pending_approvals =
-                store.list_approvals(thread_id, Some(ApprovalStatus::Pending))?;
-            if !pending_approvals.is_empty() {
-                blockers.push(json!({
-                    "kind": "pending_approvals",
-                    "approvalIds": pending_approvals.iter().map(|approval| approval.approval_id).collect::<Vec<_>>(),
-                }));
-            }
-        }
-
-        let latest_plan = if let Some(plan) = latest_task_plan(events, provider_tool_results) {
-            Some(plan)
-        } else if let Some(store) = store {
-            latest_task_plan_from_store(store, thread_id)?
-        } else {
-            None
-        };
-        if self.collaboration_mode == CollaborationMode::Goal && latest_plan.is_none() {
-            blockers.push(json!({
-                "kind": "plan_missing",
-                "reason": "This collaboration mode requires a durable plan created with set_plan.",
-                "goalId": self.goal.as_ref().map(|goal| goal.id),
-            }));
-        }
-        if let Some(plan) = latest_plan.as_ref() {
-            let in_progress = plan
-                .steps
-                .iter()
-                .filter(|step| step.status == TaskPlanStepStatus::InProgress)
-                .map(|step| step.title.clone())
-                .collect::<Vec<_>>();
-            if self.collaboration_mode != CollaborationMode::Plan && !in_progress.is_empty() {
-                blockers.push(json!({
-                    "kind": "plan_in_progress",
-                    "steps": in_progress,
-                }));
-            }
-            let pending = plan
-                .steps
-                .iter()
-                .filter(|step| step.status == TaskPlanStepStatus::Pending)
-                .map(|step| {
-                    json!({
-                        "id": step.id,
-                        "title": step.title,
-                        "dependencies": step.dependencies,
-                    })
-                })
-                .collect::<Vec<_>>();
-            if self.collaboration_mode != CollaborationMode::Plan && !pending.is_empty() {
-                blockers.push(json!({
-                    "kind": "plan_pending",
-                    "steps": pending,
-                    "nextRunnableStep": plan.next_runnable_step().map(|step| json!({
-                        "id": step.id,
-                        "title": step.title,
-                        "status": step.status,
-                    })),
-                    "reason": "Every pending step must be completed or explicitly resolved as deferred, blocked, or cancelled before finalizing.",
-                }));
-            }
-            if self.collaboration_mode != CollaborationMode::Plan {
-                if let Some(coverage) = plan.coverage.as_ref() {
-                    let successful_tool_call_ids =
-                        successful_provider_tool_call_ids(store, thread_id, events)?;
-                    let completed_step_ids = plan
-                        .steps
-                        .iter()
-                        .filter(|step| step.status == TaskPlanStepStatus::Completed)
-                        .map(|step| step.id.as_str())
-                        .collect::<HashSet<_>>();
-                    let covered_requirement_ids = coverage
-                        .step_requirements
-                        .values()
-                        .flatten()
-                        .map(String::as_str)
-                        .collect::<HashSet<_>>();
-                    let uncovered = coverage
-                        .requirements
-                        .iter()
-                        .filter(|requirement| {
-                            !covered_requirement_ids.contains(requirement.id.as_str())
-                        })
-                        .map(|requirement| requirement.id.clone())
-                        .collect::<Vec<_>>();
-                    if !uncovered.is_empty() {
-                        blockers.push(json!({
-                            "kind": "requirements_uncovered",
-                            "requirementIds": uncovered,
-                            "requirementsRevision": coverage.requirements_revision,
-                        }));
-                    }
-
-                    let invalid_evidence = coverage
-                        .evidence_refs
-                        .iter()
-                        .filter(|evidence| {
-                            evidence.requirements_revision != coverage.requirements_revision
-                                || !completed_step_ids.contains(evidence.step_id.as_str())
-                                || !successful_tool_call_ids.contains(&evidence.tool_call_id)
-                        })
-                        .map(|evidence| {
-                            json!({
-                                "stepId": evidence.step_id,
-                                "requirementId": evidence.requirement_id,
-                                "kind": evidence.kind,
-                                "toolCallId": evidence.tool_call_id,
-                                "evidenceRevision": evidence.requirements_revision,
-                                "currentRequirementsRevision": coverage.requirements_revision,
-                                "completedStep": completed_step_ids.contains(evidence.step_id.as_str()),
-                                "successfulToolResult": successful_tool_call_ids.contains(&evidence.tool_call_id),
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    if !invalid_evidence.is_empty() {
-                        blockers.push(json!({
-                            "kind": "plan_evidence_invalid",
-                            "evidence": invalid_evidence,
-                            "reason": "Evidence must reference a successful recorded tool result for a completed step at the current requirements revision.",
-                        }));
-                    }
-
-                    let valid_evidence = coverage
-                        .evidence_refs
-                        .iter()
-                        .filter(|evidence| {
-                            evidence.requirements_revision == coverage.requirements_revision
-                                && completed_step_ids.contains(evidence.step_id.as_str())
-                                && successful_tool_call_ids.contains(&evidence.tool_call_id)
-                        })
-                        .collect::<Vec<_>>();
-                    let missing_fulfillment = coverage
-                        .requirements
-                        .iter()
-                        .filter(|requirement| {
-                            !valid_evidence.iter().any(|evidence| {
-                                evidence.requirement_id == requirement.id
-                                    && matches!(
-                                        evidence.kind,
-                                        TaskEvidenceKind::Implementation
-                                            | TaskEvidenceKind::Observation
-                                    )
-                            })
-                        })
-                        .map(|requirement| requirement.id.clone())
-                        .collect::<Vec<_>>();
-                    if !missing_fulfillment.is_empty() {
-                        blockers.push(json!({
-                            "kind": "requirement_fulfillment_evidence_missing",
-                            "requirementIds": missing_fulfillment,
-                            "reason": "Each requirement needs current successful implementation or observation evidence.",
-                        }));
-                    }
-                    let missing_verification = coverage
-                        .requirements
-                        .iter()
-                        .filter(|requirement| {
-                            !valid_evidence.iter().any(|evidence| {
-                                evidence.requirement_id == requirement.id
-                                    && evidence.kind == TaskEvidenceKind::Verification
-                            })
-                        })
-                        .map(|requirement| requirement.id.clone())
-                        .collect::<Vec<_>>();
-                    if !missing_verification.is_empty() {
-                        blockers.push(json!({
-                            "kind": "requirement_verification_evidence_missing",
-                            "requirementIds": missing_verification,
-                            "reason": "Each requirement needs current successful verification evidence; global checks alone do not prove individual coverage.",
-                        }));
-                    }
-                }
-            }
-        }
-        let mut agent_delivery = None;
-        if let Some(scheduler) = self.subagents.as_ref() {
-            let scope = self.subagent_scope(thread_id, fallback_turn_id);
-            let active_agents = scheduler
-                .list_descendants_scoped(&scope)
-                .into_iter()
-                .filter(|run| !run.status.is_terminal())
-                .map(|run| {
-                    json!({
-                        "id": run.id,
-                        "agentPath": run.agent_path,
-                        "status": run.status,
-                        "agentType": run.agent_type,
-                        "latestTask": run.last_task_message,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let mailbox_snapshot = scheduler.mailbox_snapshot_scoped(&scope);
-            if !active_agents.is_empty() || !mailbox_snapshot.is_empty() {
-                blockers.push(json!({
-                    "kind": "descendant_agents_unresolved",
-                    "activeAgents": active_agents,
-                    "messages": mailbox_snapshot,
-                }));
-                agent_delivery = Some(AgentCompletionGuardDelivery {
-                    scope,
-                    messages: mailbox_snapshot,
-                });
-            }
-        }
-
-        if blockers.is_empty() {
-            return Ok(None);
-        }
-
-        let prior_activations = provider_tool_calls
-            .iter()
-            .filter(|call| call.name == FINALIZATION_GUARD_TOOL_NAME)
-            .count();
-        if prior_activations >= MAX_FINALIZATION_GUARD_ACTIVATIONS {
-            anyhow::bail!(
-                "finalization guard remained unresolved after {MAX_FINALIZATION_GUARD_ACTIVATIONS} model retries: {}",
-                serde_json::to_string(&blockers)?
-            );
-        }
-
-        let payload = json!({
-            "status": "completion_blocked",
-            "reason": "The runtime finalization checks are not yet satisfied.",
-            "agentPath": self.agent_path,
-            "blockers": blockers,
-            "requiredAction": [
-                "Resolve the reported runtime state using the appropriate tool, plan update, or explicit user request.",
-                "Only return a final response after the runtime state is ready."
-            ]
-        });
-        let call_id = format!("completion_guard_{}", Uuid::new_v4());
+    ) {
+        let call_id = format!("step_reminder_{}", Uuid::new_v4());
         let call = ProviderToolCall {
             id: call_id.clone(),
-            name: FINALIZATION_GUARD_TOOL_NAME.to_string(),
-            arguments: json!({ "agentPath": self.agent_path }),
+            name: STEP_REMINDER_TOOL_NAME.to_string(),
+            arguments: json!({
+                "agentPath": self.agent_path,
+                "source": "runtime",
+                "stage": stage,
+            }),
         };
-        let output = serde_json::to_string_pretty(&payload)?;
         provider_response_items.push(json!({
             "type": "function_call",
             "call_id": call_id,
-            "name": FINALIZATION_GUARD_TOOL_NAME,
+            "name": STEP_REMINDER_TOOL_NAME,
             "arguments": call.arguments.to_string(),
         }));
-        provider_tool_calls.push(call);
-        provider_tool_results.push(ProviderToolResult {
+        provider_tool_calls.push(call.clone());
+        let result = ProviderToolResult {
             call_id,
-            name: FINALIZATION_GUARD_TOOL_NAME.to_string(),
-            output,
-            content: vec![ModelContentPart::json(payload)],
+            name: STEP_REMINDER_TOOL_NAME.to_string(),
+            output: content.to_string(),
+            content: vec![ModelContentPart::text(content)],
             is_error: false,
             metadata: json!({
-                "runtimeGuard": "finalization",
+                "runtimeObservation": "step_reminder",
+                "stage": stage,
                 "success": true,
+                "untrusted": true,
             }),
-        });
-        events.push(AgentEventPayload::ContextWarning {
-            stage: "finalization_guard".to_string(),
-            message: "Final response deferred because runtime readiness checks are unresolved."
-                .to_string(),
-        });
-        Ok(Some(FinalizationGuardIntervention { agent_delivery }))
+        };
+        record_provider_tool_result_event(
+            events,
+            ToolCall::new(&call.name, call.arguments.clone()),
+            &result,
+        );
+        provider_tool_results.push(result);
     }
 
     /// Delivers an objective long-rollout checkpoint to the main model.
@@ -1586,6 +1330,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         provider_tool_calls: &mut Vec<ProviderToolCall>,
         provider_tool_results: &mut Vec<ProviderToolResult>,
         provider_response_items: &mut Vec<Value>,
+        events: &mut TurnEvents,
     ) -> anyhow::Result<()> {
         let RolloutCheckpointObservation {
             model_rounds,
@@ -1640,8 +1385,8 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             "name": ROLLOUT_CHECKPOINT_TOOL_NAME,
             "arguments": call.arguments.to_string(),
         }));
-        provider_tool_calls.push(call);
-        provider_tool_results.push(ProviderToolResult {
+        provider_tool_calls.push(call.clone());
+        let result = ProviderToolResult {
             call_id,
             name: ROLLOUT_CHECKPOINT_TOOL_NAME.to_string(),
             output: serde_json::to_string_pretty(&payload)?,
@@ -1651,7 +1396,13 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                 "runtimeGuard": "rollout_checkpoint",
                 "success": true,
             }),
-        });
+        };
+        record_provider_tool_result_event(
+            events,
+            ToolCall::new(&call.name, call.arguments.clone()),
+            &result,
+        );
+        provider_tool_results.push(result);
         Ok(())
     }
 
@@ -1667,6 +1418,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
     pub fn clear_mcp_host(&mut self) {
         self.mcp_host = None;
         self.active_mcp_tools.clear();
+        self.tools.clear_mcp();
     }
 
     pub async fn mcp_tool_catalog(&self) -> Vec<McpToolDescriptor> {
@@ -1697,6 +1449,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             None => return Vec::new(),
         };
         let descriptors = host.all_cached_tools().await;
+        self.tools.clear_mcp();
         self.active_mcp_tools = descriptors.clone();
         let mut registered = Vec::new();
         for desc in descriptors {
@@ -1714,6 +1467,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             None => return Vec::new(),
         };
         let mut registered = Vec::new();
+        self.tools.clear_mcp();
         self.active_mcp_tools.clear();
         for server_id in server_ids {
             for desc in host.cached_tools(*server_id).await {
@@ -1811,14 +1565,6 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
             );
         }
         let tool_candidates = self.provider_tool_candidates();
-        if tool_candidates
-            .iter()
-            .any(|candidate| candidate.name == "computer")
-        {
-            model_context
-                .items
-                .push(computer_use_runtime_module(&self.computer_access_policy));
-        }
         if let Some(module) = tool_search_runtime_module(&tool_candidates) {
             model_context.items.push(module);
         }
@@ -1879,16 +1625,17 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                     &mut opening_provider_tool_calls,
                     &mut opening_provider_tool_results,
                     &mut opening_provider_response_items,
+                    &mut events,
                 );
             } else {
-                model_context.items.push(ModelContextItem::text(
-                    ContextItemKind::Environment,
-                    ContextRole::Developer,
-                    format!("opentopia:step_reminder:{}", reminder.stage),
-                    reminder.content.clone(),
-                    ContextCacheScope::Round,
-                    ContextSensitivity::Workspace,
-                ));
+                self.append_step_reminder_observation(
+                    &reminder.stage,
+                    &reminder.content,
+                    &mut opening_provider_tool_calls,
+                    &mut opening_provider_tool_results,
+                    &mut opening_provider_response_items,
+                    &mut events,
+                );
             }
         }
         let response = self
@@ -2093,6 +1840,11 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 let first_new_result = provider_tool_results.len();
                 let resumed_results = if approved {
+                    self.grant_turn_path_leases(
+                        &mut runtime_state,
+                        &approved_calls,
+                        &continuation.workspace_root,
+                    )?;
                     self.execute_scoped_approved_batch(
                         approved_calls,
                         &continuation.workspace_root,
@@ -2106,7 +1858,18 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                     )
                     .await?
                 } else {
-                    approved_calls.iter().map(user_denied_tool_result).collect()
+                    let results = approved_calls
+                        .iter()
+                        .map(user_denied_tool_result)
+                        .collect::<Vec<_>>();
+                    for (call, result) in approved_calls.iter().zip(&results) {
+                        record_provider_tool_result_event(
+                            &mut events,
+                            ToolCall::new(&call.name, call.arguments.clone()),
+                            result,
+                        );
+                    }
+                    results
                 };
                 pending_tool_calls.drain(..approved_call_count);
                 provider_tool_results.extend(resumed_results);
@@ -2243,227 +2006,6 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         }
     }
 
-    fn parallel_tool_call_indices(
-        &self,
-        calls: &[ProviderToolCall],
-        workspace_root: &Path,
-        permission_mode: PermissionMode,
-    ) -> Vec<usize> {
-        let policy_engine = BasicPolicyEngine::new_with_sandbox_config(
-            workspace_root.to_path_buf(),
-            permission_mode,
-            &self.sandbox_config,
-        );
-        let mut resource_keys = HashMap::<String, bool>::new();
-        let mut selected = Vec::new();
-
-        for (index, provider_call) in calls.iter().enumerate() {
-            if selected.len() >= MAX_PARALLEL_TOOL_CALLS {
-                break;
-            }
-            // Invalid and disabled calls do not execute or own resources. They
-            // remain in provider order and therefore do not prevent independent
-            // valid calls later in the same model batch from starting.
-            if !self.tool_is_allowed(&provider_call.name)
-                || self.provider_tool_input_error(provider_call).is_some()
-            {
-                continue;
-            }
-            let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
-            let Some(tool) = self.tools.get(&provider_call.name) else {
-                continue;
-            };
-            let execution_policy = tool.execution_policy(&call);
-            if !execution_policy.parallel_safe {
-                // A tool that declines the concurrency contract is an ordering
-                // barrier. Do not speculatively run later side effects across it.
-                break;
-            }
-
-            // Parallel execution must not turn an interactive authorization into
-            // an implicit grant. Calls whose declared intent may Ask stay on the
-            // existing sequential approval path.
-            let intent = tool.execution_intent(&call, workspace_root);
-            let shell_is_allowed = provider_call.name == "shell"
-                && provider_call
-                    .arguments
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|command| {
-                        matches!(
-                            policy_engine.inspect_command(command),
-                            PolicyDecision::Allow
-                        )
-                    });
-            let network_is_approval_free = intent.network.does_not_require_network()
-                || shell_is_allowed
-                || permission_mode == PermissionMode::FullAccess;
-            let paths_are_approval_free = intent.requested_read_paths.iter().all(|path| {
-                if path
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-                {
-                    return false;
-                }
-                let resolved = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    workspace_root.join(path)
-                };
-                matches!(policy_engine.inspect_read(&resolved), PolicyDecision::Allow)
-            }) && intent.requested_write_paths.iter().all(|path| {
-                if path
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-                {
-                    return false;
-                }
-                let resolved = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    workspace_root.join(path)
-                };
-                matches!(
-                    policy_engine.inspect_write(&resolved),
-                    PolicyDecision::Allow
-                )
-            });
-            if !network_is_approval_free || !paths_are_approval_free {
-                // An approval-bound call pauses at its own provider position,
-                // but it does not prevent independent, already-authorized work
-                // elsewhere in the same model batch from starting.
-                continue;
-            }
-
-            let writes_resource = !execution_policy.read_only;
-            let conflicts = execution_policy.resource_keys.iter().any(|key| {
-                resource_keys.iter().any(|(selected_key, selected_writes)| {
-                    let same_resource = key == selected_key
-                        || key == "*"
-                        || key == "workspace:*"
-                        || selected_key == "*"
-                        || selected_key == "workspace:*";
-                    same_resource && (writes_resource || *selected_writes)
-                })
-            });
-            if conflicts {
-                continue;
-            }
-            for key in execution_policy.resource_keys {
-                resource_keys
-                    .entry(key)
-                    .and_modify(|selected_writes| *selected_writes |= writes_resource)
-                    .or_insert(writes_resource);
-            }
-            selected.push(index);
-        }
-        selected
-    }
-
-    fn approved_parallel_tool_call_indices(&self, calls: &[ProviderToolCall]) -> Vec<usize> {
-        let mut resource_keys = HashMap::<String, bool>::new();
-        let mut selected = Vec::new();
-
-        for (index, provider_call) in calls.iter().enumerate() {
-            if selected.len() >= MAX_PARALLEL_TOOL_CALLS {
-                break;
-            }
-            if !self.tool_is_allowed(&provider_call.name)
-                || self.provider_tool_input_error(provider_call).is_some()
-            {
-                break;
-            }
-            let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
-            let Some(tool) = self.tools.get(&provider_call.name) else {
-                break;
-            };
-            let execution_policy = tool.execution_policy(&call);
-            if !execution_policy.parallel_safe {
-                break;
-            }
-
-            let writes_resource = !execution_policy.read_only;
-            let conflicts = execution_policy.resource_keys.iter().any(|key| {
-                resource_keys.iter().any(|(selected_key, selected_writes)| {
-                    let same_resource = key == selected_key
-                        || key == "*"
-                        || key == "workspace:*"
-                        || selected_key == "*"
-                        || selected_key == "workspace:*";
-                    same_resource && (writes_resource || *selected_writes)
-                })
-            });
-            if conflicts {
-                continue;
-            }
-            for key in execution_policy.resource_keys {
-                resource_keys
-                    .entry(key)
-                    .and_modify(|selected_writes| *selected_writes |= writes_resource)
-                    .or_insert(writes_resource);
-            }
-            selected.push(index);
-        }
-        selected
-    }
-
-    /// Returns only a contiguous, side-effect-free preview of calls that are
-    /// definitely going to Ask. A tool that cannot decide without entering its
-    /// runtime is an ordering barrier and remains on the ordinary single-call
-    /// path.
-    fn automatic_review_batch_candidates(
-        &self,
-        calls: &[ProviderToolCall],
-        workspace_root: &Path,
-        permission_mode: PermissionMode,
-    ) -> Vec<AutomaticReviewBatchCandidate> {
-        if permission_mode.approvals_reviewer() != ApprovalsReviewer::AutoReview {
-            return Vec::new();
-        }
-        let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
-            workspace_root.to_path_buf(),
-            permission_mode,
-            &self.sandbox_config,
-        ));
-        let mut ctx = ToolContext::local_with_sandbox_config(
-            workspace_root.to_path_buf(),
-            policy,
-            self.sandbox_config.clone(),
-        );
-        ctx.permission_mode = permission_mode;
-        let mut candidates = Vec::new();
-        for provider_call in calls.iter().take(MAX_PARALLEL_TOOL_CALLS) {
-            if !self.tool_is_allowed(&provider_call.name)
-                || self.provider_tool_input_error(provider_call).is_some()
-            {
-                break;
-            }
-            let Some(tool) = self.tools.get(&provider_call.name) else {
-                break;
-            };
-            let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
-            let action = GuardianApprovalAction::from_provider_call(provider_call, workspace_root);
-            if action.reviewability_error().is_some() {
-                break;
-            }
-            match tool.authorization_preflight(&call, &ctx) {
-                Some(PolicyDecision::Ask { reason }) => {
-                    candidates.push(AutomaticReviewBatchCandidate {
-                        call: provider_call.clone(),
-                        reason,
-                        action,
-                    });
-                }
-                Some(PolicyDecision::Allow | PolicyDecision::Deny { .. }) | None => break,
-            }
-        }
-        if candidates.len() >= 2 {
-            candidates
-        } else {
-            Vec::new()
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn continue_provider_turn(
         &self,
@@ -2569,11 +2111,14 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                     }
                 }
 
+                let turn_sandbox_config =
+                    runtime_state.sandbox_config_with_path_leases(&self.sandbox_config);
                 if parallel_outcomes.is_empty() {
                     let batch = self.automatic_review_batch_candidates(
                         &pending_tool_calls,
                         &workspace_root,
                         permission_mode,
+                        &turn_sandbox_config,
                     );
                     if !batch.is_empty() {
                         let target_item_id = batch[0].call.id.clone();
@@ -2610,7 +2155,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                                     tool_calls: &provider_tool_calls,
                                     tool_results: &provider_tool_results,
                                     workspace_root: &workspace_root,
-                                    sandbox_config: &self.sandbox_config,
+                                    sandbox_config: &turn_sandbox_config,
                                 },
                                 cancellation.as_ref(),
                             )
@@ -2733,6 +2278,11 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                             .map(|item| item.call.clone())
                             .collect::<Vec<_>>();
                         let batch_results = if approved {
+                            self.grant_turn_path_leases(
+                                &mut runtime_state,
+                                &batch_calls,
+                                &workspace_root,
+                            )?;
                             self.execute_scoped_approved_batch(
                                 batch_calls,
                                 &workspace_root,
@@ -2747,10 +2297,18 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                             .await?
                         } else {
                             debug_assert!(denied_by_policy);
-                            batch_calls
+                            let results = batch_calls
                                 .iter()
                                 .map(|call| policy_denied_tool_result(call, &rationale))
-                                .collect()
+                                .collect::<Vec<_>>();
+                            for (call, result) in batch_calls.iter().zip(&results) {
+                                record_provider_tool_result_event(
+                                    events,
+                                    ToolCall::new(&call.name, call.arguments.clone()),
+                                    result,
+                                );
+                            }
+                            results
                         };
                         for result in batch_results {
                             if let Some(ref mut budget) = budget {
@@ -2765,10 +2323,11 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                 }
 
                 let parallel_indices = if parallel_outcomes.is_empty() {
-                    self.parallel_tool_call_indices(
+                    self.parallel_tool_call_indices_with_sandbox(
                         &pending_tool_calls,
                         &workspace_root,
                         permission_mode,
+                        &turn_sandbox_config,
                     )
                 } else {
                     Vec::new()
@@ -2779,12 +2338,12 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                     let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
                         workspace_root.clone(),
                         permission_mode,
-                        &self.sandbox_config,
+                        &turn_sandbox_config,
                     ));
                     let mut base_ctx = ToolContext::local_with_sandbox_config(
                         workspace_root.clone(),
                         policy,
-                        self.sandbox_config.clone(),
+                        turn_sandbox_config.clone(),
                     );
                     base_ctx.permission_mode = permission_mode;
                     base_ctx.store = store.clone();
@@ -2799,6 +2358,8 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                         role: ModelConversationRole::User,
                         content: model_user_message.clone(),
                         content_parts: model_user_content.clone(),
+                        tool_calls: Vec::new(),
+                        tool_results: Vec::new(),
                     });
                     base_ctx.fork_model_context = Some(model_context.clone());
                     base_ctx.current_task_plan = current_task_plan_for_tool(&base_ctx, events)?;
@@ -2846,12 +2407,12 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                 let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
                     workspace_root.clone(),
                     permission_mode,
-                    &self.sandbox_config,
+                    &turn_sandbox_config,
                 ));
                 let mut ctx = ToolContext::local_with_sandbox_config(
                     workspace_root.clone(),
                     policy,
-                    self.sandbox_config.clone(),
+                    turn_sandbox_config.clone(),
                 );
                 ctx.permission_mode = permission_mode;
                 ctx.store = store.clone();
@@ -2866,6 +2427,8 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                     role: ModelConversationRole::User,
                     content: model_user_message.clone(),
                     content_parts: model_user_content.clone(),
+                    tool_calls: Vec::new(),
+                    tool_results: Vec::new(),
                 });
                 ctx.fork_model_context = Some(model_context.clone());
                 match self
@@ -3000,7 +2563,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                                         tool_calls: &provider_tool_calls,
                                         tool_results: &provider_tool_results,
                                         workspace_root: &workspace_root,
-                                        sandbox_config: &self.sandbox_config,
+                                        sandbox_config: &turn_sandbox_config,
                                     },
                                     cancellation.as_ref(),
                                 )
@@ -3097,6 +2660,11 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                             }
 
                             let result = if review.approved() {
+                                self.grant_turn_path_leases(
+                                    &mut runtime_state,
+                                    std::slice::from_ref(&provider_call),
+                                    &workspace_root,
+                                )?;
                                 self.execute_scoped_approved_call(
                                     &provider_call,
                                     &workspace_root,
@@ -3111,7 +2679,17 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                                 .await?
                             } else {
                                 debug_assert!(review.denied_by_policy());
-                                policy_denied_tool_result(&provider_call, &review.rationale)
+                                let result =
+                                    policy_denied_tool_result(&provider_call, &review.rationale);
+                                record_provider_tool_result_event(
+                                    events,
+                                    ToolCall::new(
+                                        &provider_call.name,
+                                        provider_call.arguments.clone(),
+                                    ),
+                                    &result,
+                                );
+                                result
                             };
                             if let Some(ref mut budget) = budget {
                                 budget
@@ -3200,6 +2778,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                     &mut provider_tool_calls,
                     &mut provider_tool_results,
                     &mut provider_response_items,
+                    events,
                 )?;
             }
 
@@ -3218,7 +2797,7 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                 rollout_budget.as_ref(),
                 &runtime_state,
             );
-            let mut round_model_context = model_context.clone();
+            let round_model_context = model_context.clone();
             for reminder in &step_reminders.reminders {
                 events.push(AgentEventPayload::ContextWarning {
                     stage: format!("step_reminder.{}", reminder.stage),
@@ -3230,18 +2809,33 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                         &mut provider_tool_calls,
                         &mut provider_tool_results,
                         &mut provider_response_items,
+                        events,
                     );
                 } else {
-                    round_model_context.items.push(ModelContextItem::text(
-                        ContextItemKind::Environment,
-                        ContextRole::Developer,
-                        format!("opentopia:step_reminder:{}", reminder.stage),
-                        reminder.content.clone(),
-                        ContextCacheScope::Round,
-                        ContextSensitivity::Workspace,
-                    ));
+                    self.append_step_reminder_observation(
+                        &reminder.stage,
+                        &reminder.content,
+                        &mut provider_tool_calls,
+                        &mut provider_tool_results,
+                        &mut provider_response_items,
+                        events,
+                    );
                 }
             }
+            let pressure_request = build_model_request(
+                &round_model_context,
+                context_summary.as_deref(),
+                conversation.clone(),
+                model_user_message.clone(),
+                model_user_content.clone(),
+                tool_candidates.clone(),
+                provider_tool_calls.clone(),
+                provider_tool_results.clone(),
+                provider_response_items.clone(),
+                None,
+                branch_developer_instructions.clone(),
+            );
+            synchronize_context_budget(&mut budget, &pressure_request);
             compact_completed_tool_history(
                 &mut conversation,
                 &mut provider_tool_calls,
@@ -3250,9 +2844,46 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                 &mut compacted_tool_history,
                 &mut budget,
             );
-            let response = self
-                .complete_model(
-                    build_model_request(
+            let request = build_model_request(
+                &round_model_context,
+                context_summary.as_deref(),
+                conversation.clone(),
+                model_user_message.clone(),
+                model_user_content.clone(),
+                tool_candidates.clone(),
+                provider_tool_calls.clone(),
+                provider_tool_results.clone(),
+                provider_response_items.clone(),
+                None,
+                branch_developer_instructions.clone(),
+            );
+            let response = match self
+                .complete_model(request, model_rounds.saturating_add(1), events)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) if provider_context_window_exceeded(&error) => {
+                    let previous_result_count = provider_tool_results.len();
+                    if let Some(context_budget) = budget.as_mut() {
+                        context_budget.used_tokens = context_budget.max_tokens;
+                    }
+                    compact_completed_tool_history(
+                        &mut conversation,
+                        &mut provider_tool_calls,
+                        &mut provider_tool_results,
+                        &mut provider_response_items,
+                        &mut compacted_tool_history,
+                        &mut budget,
+                    );
+                    if provider_tool_results.len() == previous_result_count {
+                        return Err(error);
+                    }
+                    events.push(AgentEventPayload::ContextWarning {
+                        stage: "provider_context_overflow_recovery".to_string(),
+                        message: "The provider rejected the input as larger than its context window. Older completed tool results were compacted and the model request is being retried once."
+                            .to_string(),
+                    });
+                    let retry_request = build_model_request(
                         &round_model_context,
                         context_summary.as_deref(),
                         conversation.clone(),
@@ -3264,11 +2895,13 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
                         provider_response_items.clone(),
                         None,
                         branch_developer_instructions.clone(),
-                    ),
-                    model_rounds.saturating_add(1),
-                    events,
-                )
-                .await?;
+                    );
+                    synchronize_context_budget(&mut budget, &retry_request);
+                    self.complete_model(retry_request, model_rounds.saturating_add(1), events)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
             model_rounds = model_rounds.saturating_add(1);
             // The round carrying these observations reached the model, so the
             // matching state may now be advanced. A round that failed or was
@@ -3528,10 +3161,11 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
     }
 
     fn native_tool_search_active(&self, eligible: &[ProviderToolCandidate]) -> bool {
-        let has_external_tools = eligible
-            .iter()
-            .any(|candidate| self.tools.source(&candidate.name) != Some(ToolSource::Core));
-        has_external_tools
+        let has_deferred_external_tools = eligible.iter().any(|candidate| {
+            self.tools.source(&candidate.name) != Some(ToolSource::Core)
+                && !self.is_default_eager_office_tool(&candidate.name)
+        });
+        has_deferred_external_tools
             && self.tool_exposure_policy != ToolExposurePolicy::Eager
             && self.provider_tool_protocol.hosted_tool_search == ProviderFeatureSupport::Supported
             && self.provider_tool_protocol.deferred_tool_loading
@@ -3558,8 +3192,8 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         }
     }
 
-    fn is_attachment_projected_bundled_tool(&self, name: &str) -> bool {
-        let Some((_, expected_plugin)) = ATTACHMENT_PROJECTED_BUNDLED_TOOLS
+    fn is_default_eager_office_tool(&self, name: &str) -> bool {
+        let Some((_, expected_plugin)) = DEFAULT_EAGER_OFFICE_TOOLS
             .iter()
             .find(|(tool_name, _)| *tool_name == name)
         else {
@@ -3579,10 +3213,13 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         if self.tools.source(&candidate.name) == Some(ToolSource::Core) {
             return false;
         }
+        if self.is_default_eager_office_tool(&candidate.name) {
+            return false;
+        }
         if self.attachment_preloaded_tools.contains(&candidate.name) {
             return false;
         }
-        defer_all_external || self.is_attachment_projected_bundled_tool(&candidate.name)
+        defer_all_external
     }
 
     fn deferred_namespace_catalog(&self, eligible: &[ProviderToolCandidate]) -> String {
@@ -3608,6 +3245,9 @@ Do not call set_plan, update_plan, or create Goal state. When ready, respond as 
         let mut eligible = self.eligible_provider_tool_candidates();
         if self.native_tool_search_active(&eligible) {
             for candidate in &mut eligible {
+                if self.is_default_eager_office_tool(&candidate.name) {
+                    continue;
+                }
                 let source = self
                     .tools
                     .source(&candidate.name)
@@ -4885,7 +4525,8 @@ fn finalize_provider_turn(
         let state_kind = match (response_id.is_empty(), response_items.is_empty()) {
             (false, false) => ProviderContextStateKind::Hybrid,
             (false, true) => ProviderContextStateKind::StoredResponse,
-            (true, false) => ProviderContextStateKind::CompactionItems,
+            (true, false) if compaction_item_count > 0 => ProviderContextStateKind::CompactionItems,
+            (true, false) => ProviderContextStateKind::TranscriptItems,
             (true, true) => unreachable!("cursor requires provider state"),
         };
         ProviderConversationCursor {
@@ -4927,7 +4568,7 @@ fn replayable_provider_state_items(items: &[Value]) -> Vec<Value> {
     let mut replayable = items
         .iter()
         .filter(|item| match item.get("type").and_then(Value::as_str) {
-            Some("compaction") => true,
+            Some("compaction" | "openai_chat_assistant_state") => true,
             Some("reasoning") => item
                 .get("encrypted_content")
                 .and_then(Value::as_str)
@@ -5342,31 +4983,6 @@ fn tool_search_runtime_module(
     )
 }
 
-fn computer_use_runtime_module(policy: &ComputerAccessPolicy) -> ModelContextItem {
-    let allowed = policy.allowed_applications();
-    let instructions = if allowed.is_empty() {
-        "Computer Use is enabled, but no application executables are allowlisted. Do not attempt desktop observation or control until the user configures allowedApplications for the computer-use plugin.".to_string()
-    } else {
-        format!(
-            "Computer Use may access only these application executables: {}. After implementing or changing visible UI, use the computer tool when a running allowlisted application is available and visual inspection would materially verify the result. Prefer read-only observation to inspect layout, overflow, overlap, focus visibility, loading/error states, and relevant viewport sizes. Do not interact unless interaction is necessary for the requested verification; input actions remain separately approval-gated.",
-            allowed.join(", ")
-        )
-    };
-    ModelContextItem::text(
-        ContextItemKind::DeveloperInstructions,
-        ContextRole::Developer,
-        "opentopia:computer_use",
-        instructions,
-        ContextCacheScope::Thread,
-        ContextSensitivity::Workspace,
-    )
-    .with_metadata(json!({
-        "assemblyClass": "conditional",
-        "promptModuleId": "computer_use",
-        "selectedBy": ["computerUsePlugin", "allowedApplications"],
-    }))
-}
-
 fn canonical_json_string(value: &Value) -> String {
     fn canonicalize(value: &Value) -> Value {
         match value {
@@ -5446,6 +5062,31 @@ fn record_rollout_usage(
     Ok(())
 }
 
+fn synchronize_context_budget(budget: &mut Option<ContextBudget>, request: &ModelRequest) {
+    let Some(budget) = budget.as_mut() else {
+        return;
+    };
+    let estimate = request.token_estimate_breakdown().total;
+    budget.used_tokens = 0;
+    budget.warnings.clear();
+    budget.record_tokens(estimate);
+}
+
+fn provider_context_window_exceeded(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "context window exceeded",
+        "exceeds the context window",
+        "prompt is too long",
+        "too many input tokens",
+        "input tokens exceed",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 fn compact_completed_tool_history(
     conversation: &mut Vec<ModelConversationMessage>,
     provider_tool_calls: &mut Vec<ProviderToolCall>,
@@ -5476,8 +5117,9 @@ fn compact_completed_tool_history(
             .iter()
             .position(|call| call.id == result.call_id)
             .map(|index| provider_tool_calls.remove(index));
-        dropped_tokens =
-            dropped_tokens.saturating_add(ContextBudget::estimate_tokens(&result.output));
+        dropped_tokens = dropped_tokens.saturating_add(
+            crate::provider::estimate_provider_tool_results(std::slice::from_ref(&result)),
+        );
         let arguments = call
             .as_ref()
             .map(|call| truncate_for_summary(&canonical_json_string(&call.arguments), 240))
@@ -5532,6 +5174,8 @@ fn compact_completed_tool_history(
             role: ModelConversationRole::Assistant,
             content: summary_content,
             content_parts: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
         });
     }
 
@@ -5672,9 +5316,9 @@ fn build_model_request(
     branch_developer_instructions: Option<String>,
 ) -> ModelRequest {
     let mut context_items = model_context.items.clone();
-    // Conversation entries are immutable ledger items. The optional durable
-    // checkpoint is materialized separately below as volatile turn context so
-    // it cannot rewrite the current user message or split historical anchors.
+    // Conversation entries are immutable ledger items. A durable checkpoint is
+    // an explicit request-epoch boundary: once created it stays in the lineage
+    // prefix until the next compaction replaces it.
     context_items.extend(conversation.iter().enumerate().map(|(index, message)| {
         let role = match message.role {
             ModelConversationRole::System => ContextRole::System,
@@ -5690,7 +5334,11 @@ fn build_model_request(
             ContextCacheScope::Thread,
             ContextSensitivity::Workspace,
         )
-        .with_metadata(json!({ "contentParts": message.content_parts.len() }))
+        .with_metadata(json!({
+            "contentParts": message.content_parts.len(),
+            "toolCalls": message.tool_calls.len(),
+            "toolResults": message.tool_results.len(),
+        }))
     }));
     if let Some(summary) = context_summary.filter(|value| !value.trim().is_empty()) {
         context_items.push(
@@ -5701,11 +5349,11 @@ fn build_model_request(
                 format!(
                     "<durable_context>\n{summary}\n</durable_context>\nTreat this checkpoint as prior task state, not as a new user request."
                 ),
-                ContextCacheScope::Turn,
+                ContextCacheScope::Thread,
                 ContextSensitivity::Workspace,
             )
             .with_metadata(json!({
-                "assemblyClass": "dynamic",
+                "assemblyClass": "epoch",
                 "selectedBy": "contextCheckpoint",
             })),
         );
@@ -6000,19 +5648,6 @@ fn unreviewable_action_result(
     }
 }
 
-fn tool_result_is_error(result: &ToolResult) -> bool {
-    result
-        .metadata
-        .get("success")
-        .and_then(Value::as_bool)
-        .is_some_and(|success| !success)
-        || result
-            .metadata
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-}
-
 fn insert_tool_error_record(
     metadata: &mut Value,
     code: &str,
@@ -6171,13 +5806,23 @@ fn record_provider_tool_result_event(
     call: ToolCall,
     result: &ProviderToolResult,
 ) {
+    let mut metadata = result.metadata.clone();
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("providerToolCallId".to_string(), json!(&result.call_id));
+        object.insert("toolName".to_string(), json!(&result.name));
+        object.insert("isError".to_string(), json!(result.is_error));
+        object.insert("success".to_string(), json!(!result.is_error));
+    }
     events.push(AgentEventPayload::ToolCallStarted { call: call.clone() });
     events.push(AgentEventPayload::ToolCallFinished {
         result: ToolResult {
             call_id: call.id,
             output: result.output.clone(),
             content: result.content.clone(),
-            metadata: result.metadata.clone(),
+            metadata,
         },
     });
 }
@@ -6636,21 +6281,16 @@ mod tests {
     }
 
     #[test]
-    fn automatic_tool_disclosure_projects_office_schemas_from_attachment_hints() {
+    fn default_office_schemas_are_eager_without_attachment_hints() {
         let mut agent = AgentCore::default();
-        agent.set_bundled_plugin_activations(&HashMap::from([
-            ("documents".to_string(), true),
-            ("pdf".to_string(), true),
-            ("spreadsheet".to_string(), true),
-        ]));
 
-        let unloaded = agent.provider_tool_catalog();
-        assert!(unloaded
+        let baseline = agent.provider_tool_catalog();
+        for tool in ["document", "pdf", "spreadsheet"] {
+            assert!(baseline.iter().any(|candidate| candidate.name == tool));
+        }
+        assert!(!baseline
             .iter()
             .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
-        for tool in ["document", "pdf", "spreadsheet"] {
-            assert!(!unloaded.iter().any(|candidate| candidate.name == tool));
-        }
 
         agent.set_attachment_preloaded_tools(["pdf", "spreadsheet"]);
         let projected = agent.provider_tool_catalog();
@@ -6658,18 +6298,13 @@ mod tests {
         assert!(projected
             .iter()
             .any(|candidate| candidate.name == "spreadsheet"));
-        assert!(!projected
-            .iter()
-            .any(|candidate| candidate.name == "document"));
         assert!(projected
             .iter()
+            .any(|candidate| candidate.name == "document"));
+        assert!(!projected
+            .iter()
             .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
-        let still_deferred = agent
-            .search_deferred_tools("document pdf spreadsheet", MAX_TOOL_SEARCH_RESULTS)
-            .into_iter()
-            .map(|candidate| candidate.name)
-            .collect::<HashSet<_>>();
-        assert_eq!(still_deferred, HashSet::from(["document".to_string()]));
+        assert_eq!(baseline, projected);
     }
 
     #[test]
@@ -6689,10 +6324,8 @@ mod tests {
     }
 
     #[test]
-    fn native_deferred_loading_keeps_attachment_projected_tools_deferred() {
+    fn native_deferred_loading_keeps_default_office_tools_direct() {
         let mut agent = AgentCore::default();
-        agent.set_bundled_plugin_activations(&HashMap::from([("pdf".to_string(), true)]));
-        agent.set_attachment_preloaded_tools(["pdf"]);
         agent.provider_tool_protocol = ProviderToolProtocolCapabilities {
             function_tools: ProviderFeatureSupport::Supported,
             deferred_tool_loading: ProviderFeatureSupport::Supported,
@@ -6706,7 +6339,7 @@ mod tests {
             .into_iter()
             .find(|candidate| candidate.name == "pdf")
             .expect("eligible PDF tool descriptor");
-        assert_eq!(pdf.disclosure, ProviderToolDisclosure::DeferredNamespace);
+        assert_eq!(pdf.disclosure, ProviderToolDisclosure::Direct);
     }
 
     #[test]
@@ -6734,7 +6367,7 @@ mod tests {
     }
 
     #[test]
-    fn release_gate_native_tool_search_keeps_common_tools_direct_and_defers_external_namespace() {
+    fn release_gate_native_tool_search_keeps_office_direct_and_defers_external_namespace() {
         let mut registry = ToolRegistry::with_builtins();
         registry.insert_mcp(
             "github__search_issues".to_string(),
@@ -6764,6 +6397,13 @@ mod tests {
             .expect("external tool descriptor");
         assert_eq!(github.disclosure, ProviderToolDisclosure::DeferredNamespace);
         assert_eq!(github.namespace.as_ref().unwrap().name, "github");
+        for office in ["document", "pdf", "spreadsheet"] {
+            let candidate = catalog
+                .iter()
+                .find(|candidate| candidate.name == office)
+                .expect("default Office tool");
+            assert_eq!(candidate.disclosure, ProviderToolDisclosure::Direct);
+        }
         assert!(!catalog
             .iter()
             .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
@@ -7120,14 +6760,12 @@ mod tests {
         ] {
             assert!(tools.contains(expected), "missing Flow tool: {expected}");
         }
-        assert!(tools.contains(TOOL_SEARCH_NAME));
-        assert!(!tools.contains("spreadsheet"));
+        assert!(!tools.contains(TOOL_SEARCH_NAME));
+        assert!(tools.contains("spreadsheet"));
 
+        let before_preload_hint = agent.provider_tool_catalog();
         agent.set_attachment_preloaded_tools(["spreadsheet"]);
-        assert!(agent
-            .provider_tool_catalog()
-            .iter()
-            .any(|tool| tool.name == "spreadsheet"));
+        assert_eq!(agent.provider_tool_catalog(), before_preload_hint);
     }
 
     #[test]
@@ -7168,7 +6806,7 @@ mod tests {
     }
 
     #[test]
-    fn computer_tool_requires_vision_and_adds_visual_verification_guidance() {
+    fn computer_tool_requires_vision() {
         let mut agent = AgentCore::default();
         agent.set_tool_exposure_policy(ToolExposurePolicy::Eager);
         agent.set_bundled_plugin_activations(&HashMap::from([("computer-use".to_string(), true)]));
@@ -7176,18 +6814,6 @@ mod tests {
 
         let tools = agent.provider_tool_catalog();
         assert!(tools.iter().any(|tool| tool.name == "computer"));
-        let module = computer_use_runtime_module(&agent.computer_access_policy);
-        assert_eq!(module.metadata["promptModuleId"], "computer_use");
-        let instructions = module
-            .content
-            .iter()
-            .filter_map(|part| match part {
-                ModelContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        assert!(instructions.contains("visible UI"));
-        assert!(instructions.contains("chrome.exe, opentopia.exe"));
 
         agent.model_supports_vision = false;
         assert!(!agent
@@ -7532,6 +7158,51 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn approved_path_lease_survives_turn_state_serialization_without_widening_scope() {
+        let id = Uuid::new_v4();
+        let workspace = test_workspace("turn-path-lease");
+        let outside = std::env::temp_dir().join(format!("opentopia-turn-path-lease-{id}"));
+        fs::create_dir_all(&outside).expect("create external lease fixture");
+        let approved = outside.join("approved.txt");
+        let sibling = outside.join("sibling.txt");
+        fs::write(&approved, "approved").expect("create approved file");
+        fs::write(&sibling, "sibling").expect("create sibling file");
+
+        let agent = AgentCore::new(Arc::new(MockProvider), ToolRegistry::with_core_tools())
+            .with_sandbox_config(LocalSandboxConfig::enforce());
+        let call = ProviderToolCall {
+            id: "approved-read".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": approved.display().to_string() }),
+        };
+        let mut runtime_state = TurnRuntimeState::default();
+        agent
+            .grant_turn_path_leases(&mut runtime_state, std::slice::from_ref(&call), &workspace)
+            .expect("grant exact turn path lease");
+
+        let serialized = serde_json::to_value(&runtime_state).expect("serialize turn state");
+        let restored: TurnRuntimeState =
+            serde_json::from_value(serialized).expect("restore turn state");
+        let sandbox = restored.sandbox_config_with_path_leases(&agent.sandbox_config);
+        let policy = BasicPolicyEngine::new_with_sandbox_config(
+            workspace.clone(),
+            PermissionMode::Auto,
+            &sandbox,
+        );
+        assert!(matches!(
+            policy.inspect_read(&approved),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.inspect_read(&sibling),
+            PolicyDecision::Ask { .. }
+        ));
+
+        fs::remove_dir_all(workspace).expect("remove lease workspace");
+        fs::remove_dir_all(outside).expect("remove external lease fixture");
     }
 
     #[tokio::test]
@@ -8239,11 +7910,14 @@ mod tests {
         let requests = provider.requests();
         assert_eq!(requests.len(), 1);
         let activity = requests[0]
-            .context_items
+            .tool_results
             .iter()
-            .find(|item| item.text_content().contains("[Subagent activity]"))
+            .find(|result| {
+                result.name == STEP_REMINDER_TOOL_NAME
+                    && result.output.contains("[Subagent activity]")
+            })
             .expect("the unread completion is delivered before the round");
-        assert!(activity.text_content().contains("child evidence"));
+        assert!(activity.output.contains("child evidence"));
         assert_eq!(
             assistant_text(&result.events),
             "Reviewed child evidence and finished."
@@ -9555,13 +9229,13 @@ mod tests {
         assert_eq!(requests.len(), REPEATED_TOOL_CALL_REPORT_THRESHOLD + 1);
         let telemetry = requests
             .iter()
-            .flat_map(|request| &request.context_items)
-            .find(|item| {
-                item.text_content()
-                    .contains("[Repeated tool-call telemetry]")
+            .flat_map(|request| &request.tool_results)
+            .find(|result| {
+                result.name == STEP_REMINDER_TOOL_NAME
+                    && result.output.contains("[Repeated tool-call telemetry]")
             })
             .expect("repeated canonical calls should produce objective telemetry");
-        let telemetry = telemetry.text_content();
+        let telemetry = &telemetry.output;
         assert!(telemetry.contains(r#""occurrences":3"#));
         assert!(telemetry
             .contains(r#""groupedBy":"tool name and JSON arguments; provider call id excluded"#));
@@ -9827,12 +9501,15 @@ mod tests {
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
         let activity = requests[1]
-            .context_items
+            .tool_results
             .iter()
-            .find(|item| item.text_content().contains("[Subagent activity]"))
+            .find(|result| {
+                result.name == STEP_REMINDER_TOOL_NAME
+                    && result.output.contains("[Subagent activity]")
+            })
             .expect("a finished child is reported without the model asking for it");
-        assert!(activity.text_content().contains("child evidence"));
-        assert!(activity.text_content().contains("researcher"));
+        assert!(activity.output.contains("child evidence"));
+        assert!(activity.output.contains("researcher"));
 
         // The result arrived without the model spending a round on wait_agent.
         assert!(!requests.iter().any(|request| request
@@ -10033,6 +9710,78 @@ mod tests {
             assert!(calls.iter().any(|call| call.id == call_id));
             assert!(results.iter().any(|result| result.call_id == call_id));
         }
+    }
+
+    #[test]
+    fn context_pressure_counts_typed_tool_content_and_preserves_sub_threshold_history() {
+        let result = ProviderToolResult {
+            call_id: "call_json".to_string(),
+            name: "spreadsheet".to_string(),
+            output: "bounded".to_string(),
+            content: vec![ModelContentPart::json(json!({
+                "rows": (0..500).map(|row| format!("row-{row}-{}", "x".repeat(40))).collect::<Vec<_>>()
+            }))],
+            is_error: false,
+            metadata: json!({ "success": true }),
+        };
+        let request = ModelRequest {
+            system_prompt: String::new(),
+            conversation: Vec::new(),
+            user_message: "continue".to_string(),
+            user_content: Vec::new(),
+            tool_candidates: Vec::new(),
+            previous_tool_calls: Vec::new(),
+            tool_results: vec![result.clone()],
+            context_items: Vec::new(),
+            previous_response_items: Vec::new(),
+            previous_response_id: None,
+            branch_developer_instructions: None,
+            prompt_cache_key: Some("stable-lineage".to_string()),
+            prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy::AppendOnlyUsers,
+            final_output_json_schema: None,
+        };
+        let mut budget = Some(ContextBudget::new(100_000));
+        synchronize_context_budget(&mut budget, &request);
+        assert!(budget.as_ref().unwrap().used_tokens > 1_000);
+
+        let mut conversation = Vec::new();
+        let mut calls = vec![ProviderToolCall {
+            id: result.call_id.clone(),
+            name: result.name.clone(),
+            arguments: json!({}),
+        }];
+        let mut results = vec![result];
+        let mut response_items = Vec::new();
+        let mut compacted = String::new();
+        let mut below_threshold = Some(ContextBudget {
+            max_tokens: 10_000,
+            used_tokens: 7_999,
+            warnings: Vec::new(),
+        });
+        compact_completed_tool_history(
+            &mut conversation,
+            &mut calls,
+            &mut results,
+            &mut response_items,
+            &mut compacted,
+            &mut below_threshold,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(conversation.is_empty());
+        assert!(compacted.is_empty());
+    }
+
+    #[test]
+    fn provider_context_overflow_detection_is_specific() {
+        assert!(provider_context_window_exceeded(&anyhow::anyhow!(
+            "context_length_exceeded: maximum context length is 128000"
+        )));
+        assert!(provider_context_window_exceeded(&anyhow::anyhow!(
+            "prompt is too long"
+        )));
+        assert!(!provider_context_window_exceeded(&anyhow::anyhow!(
+            "provider returned 429 rate limit"
+        )));
     }
 
     #[tokio::test]
@@ -10910,9 +10659,13 @@ mod tests {
         );
         let requests = provider.requests();
         assert_eq!(requests.len(), 5);
-        assert_eq!(requests[4].tool_results.len(), 4);
-        assert!(requests[4]
+        let completed_reads = requests[4]
             .tool_results
+            .iter()
+            .filter(|result| result.name == "read_file")
+            .collect::<Vec<_>>();
+        assert_eq!(completed_reads.len(), 4);
+        assert!(completed_reads
             .iter()
             .all(|result| result.output.contains("stable content")));
 
@@ -12308,7 +12061,7 @@ mod tests {
         assert_eq!(checkpoint_items.len(), 1);
         assert_eq!(checkpoint_items[0].kind, ContextItemKind::Checkpoint);
         assert_eq!(checkpoint_items[0].role, ContextRole::Developer);
-        assert_eq!(checkpoint_items[0].cache_scope, ContextCacheScope::Turn);
+        assert_eq!(checkpoint_items[0].cache_scope, ContextCacheScope::Thread);
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -12512,6 +12265,21 @@ mod tests {
         assert_eq!(
             superseded[0].get("id").and_then(Value::as_str),
             Some("cmp_new")
+        );
+    }
+
+    #[test]
+    fn chat_assistant_state_is_replayable_across_turns() {
+        let state = json!({
+            "type": "openai_chat_assistant_state",
+            "content": "",
+            "reasoning_content": "",
+            "tool_call_ids": ["call_a", "call_b"],
+        });
+
+        assert_eq!(
+            replayable_provider_state_items(std::slice::from_ref(&state)),
+            vec![state]
         );
     }
 

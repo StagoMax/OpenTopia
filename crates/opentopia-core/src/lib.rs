@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_profiles;
+pub mod agent_runtime;
 pub mod artifact_runtime;
 pub mod background;
 mod base_prompt;
@@ -61,6 +62,7 @@ pub use agent::{
     ContextBudget as AgentContextBudget, ProviderConversationCursor,
 };
 pub use agent_profiles::{AgentProfile, AgentProfileRegistry};
+pub use agent_runtime::AgentTurnDriver;
 pub use artifact_runtime::{
     ArtifactRuntime, ArtifactRuntimeError, HayroPdfBackend, PdfBackend, RenderedPage,
     ValidationIssue, ValidationReport, ValidationSeverity, MAX_ARTIFACT_INPUT_BYTES,
@@ -292,10 +294,11 @@ pub use skills::{
 };
 pub use spreadsheet::{
     execute_spreadsheet, CellAddress, CellRange, CellUpdate, FormulaInput, InspectWorkbookRequest,
-    ListSheetsRequest, ReadRangeRequest, SheetVisibility, SheetWriteRequest, SpreadsheetAction,
-    SpreadsheetActionKind, SpreadsheetCell, SpreadsheetCellInput, SpreadsheetCellValue,
-    SpreadsheetError, SpreadsheetErrorCode, SpreadsheetErrorInfo, SpreadsheetRequest,
-    SpreadsheetResult, WriteWorkbookRequest, MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
+    ListSheetsRequest, ReadRangeRequest, ReadRangesRequest, ReadRangesResult, SheetRangeRequest,
+    SheetVisibility, SheetWriteRequest, SpreadsheetAction, SpreadsheetActionKind, SpreadsheetCell,
+    SpreadsheetCellInput, SpreadsheetCellValue, SpreadsheetError, SpreadsheetErrorCode,
+    SpreadsheetErrorInfo, SpreadsheetRequest, SpreadsheetResult, WriteWorkbookRequest,
+    MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
     MAX_OUTPUT_FILE_BYTES as MAX_SPREADSHEET_OUTPUT_BYTES,
 };
 pub use store::{
@@ -311,10 +314,11 @@ pub use subagents::{
     SubagentScheduler, SubagentSchedulerConfig, SubagentScope, SubagentVerificationEvidence,
     SubagentWorkspaceAssignment, SubagentWorkspaceMode,
 };
+pub use tool_result_ingress::tool_result_is_error;
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
     BrowserTool, ComputerTool, DocumentTool, GitDiffTool, ListFilesTool, ListSkillsTool,
-    McpToolWrapper, NativePatchOperation, PdfTool, ReadFileTool, ReadSkillTool,
+    McpToolWrapper, NativePatchOperation, PdfTool, ReadArtifactTool, ReadFileTool, ReadSkillTool,
     RequestUserInputTool, SearchTool, SetPlanTool, ShellTool, SpreadsheetTool, Tool,
     ToolApprovalMode, ToolCapabilityDescriptor, ToolContext, ToolRegistry, ToolRiskLevel,
     ToolSource, UpdatePlanTool, WaitAgentsTool, WriteFileTool,

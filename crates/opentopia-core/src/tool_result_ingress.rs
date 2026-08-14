@@ -11,6 +11,9 @@ const SHELL_SUCCESS_OUTPUT_MAX_BYTES: usize = 8_000;
 const FAILURE_OUTPUT_MAX_BYTES: usize = 12_000;
 const GENERIC_SUCCESS_OUTPUT_MAX_BYTES: usize = 12_000;
 const GENERIC_SUCCESS_NORMALIZE_AFTER_BYTES: usize = 16_000;
+const STRUCTURED_CONTENT_MAX_BYTES: usize = 12_000;
+const PROVIDER_METADATA_MAX_BYTES: usize = 4_000;
+const PROVIDER_RESULT_MAX_NON_MEDIA_BYTES: usize = 36_000;
 
 /// Builds the immutable, provider-visible form of a tool result exactly once,
 /// before the first model round can observe it. If normalization would discard
@@ -28,7 +31,7 @@ pub(crate) fn normalize_tool_result_at_ingress(
 
     let raw_output = result.output.clone();
     let is_error = tool_result_is_error(&result);
-    let (candidate, strategy) = match tool_name {
+    let (mut candidate, mut strategy) = match tool_name {
         "shell" => compact_shell_output(&raw_output, &result.metadata, is_error),
         "search" => (
             compact_search_output(&raw_output, SEARCH_MODEL_OUTPUT_MAX_BYTES),
@@ -45,7 +48,21 @@ pub(crate) fn normalize_tool_result_at_ingress(
         _ => (raw_output.clone(), "passthrough"),
     };
 
-    if candidate == raw_output {
+    let oversized_structured_content = result.content.iter().any(|part| {
+        matches!(
+            part,
+            ModelContentPart::Json { value }
+                if serde_json::to_vec(value)
+                    .map(|encoded| encoded.len() > STRUCTURED_CONTENT_MAX_BYTES)
+                    .unwrap_or(true)
+        )
+    });
+    if candidate == raw_output && oversized_structured_content {
+        candidate = compact_head_tail(&raw_output, GENERIC_SUCCESS_OUTPUT_MAX_BYTES);
+        strategy = "bounded_structured_content";
+    }
+
+    if candidate == raw_output && !oversized_structured_content {
         insert_envelope_metadata(
             &mut result.metadata,
             strategy,
@@ -54,6 +71,9 @@ pub(crate) fn normalize_tool_result_at_ingress(
             raw_output.len(),
             None,
             &raw_output,
+        );
+        debug_assert!(
+            provider_visible_tool_result_bytes(&result) <= PROVIDER_RESULT_MAX_NON_MEDIA_BYTES
         );
         return result;
     }
@@ -103,6 +123,12 @@ pub(crate) fn normalize_tool_result_at_ingress(
         candidate.trim_end()
     );
     replace_matching_text_content(&mut result.content, &raw_output, &normalized_output);
+    bound_structured_content(
+        tool_name,
+        &mut result.content,
+        STRUCTURED_CONTENT_MAX_BYTES,
+        artifact_id,
+    );
     result.output = normalized_output;
     if !reused_artifact {
         insert_artifact_metadata(&mut result.metadata, artifact_id, raw_output.len());
@@ -116,6 +142,9 @@ pub(crate) fn normalize_tool_result_at_ingress(
         output_bytes,
         Some(artifact_id),
         &raw_output,
+    );
+    debug_assert!(
+        provider_visible_tool_result_bytes(&result) <= PROVIDER_RESULT_MAX_NON_MEDIA_BYTES
     );
     result
 }
@@ -166,7 +195,226 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
         object.remove("raw");
     }
     bound_metadata_error_strings(object);
+    if serde_json::to_vec(&metadata)
+        .map(|encoded| encoded.len() > PROVIDER_METADATA_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        metadata = compact_provider_metadata(&metadata);
+    }
     metadata
+}
+
+/// Estimated non-media bytes that provider adapters will serialize for this result.
+/// Image bytes are deliberately excluded because they have provider-specific token
+/// accounting and are governed by the multimodal input policy instead.
+pub(crate) fn provider_visible_tool_result_bytes(result: &ToolResult) -> usize {
+    let content = provider_tool_result_content(result);
+    result.output.len()
+        + serde_json::to_vec(&provider_tool_result_metadata(
+            result
+                .metadata
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            &result.metadata,
+        ))
+        .map(|encoded| encoded.len())
+        .unwrap_or_default()
+        + content
+            .iter()
+            .map(|part| match part {
+                ModelContentPart::Image { .. } => 0,
+                _ => serde_json::to_vec(part)
+                    .map(|encoded| encoded.len())
+                    .unwrap_or_default(),
+            })
+            .sum::<usize>()
+}
+
+fn bound_structured_content(
+    tool_name: &str,
+    content: &mut [ModelContentPart],
+    max_bytes: usize,
+    artifact_id: Uuid,
+) {
+    for part in content {
+        let ModelContentPart::Json { value } = part else {
+            continue;
+        };
+        let exceeds_limit = serde_json::to_vec(value)
+            .map(|encoded| encoded.len() > max_bytes)
+            .unwrap_or(true);
+        if !exceeds_limit {
+            continue;
+        }
+        *value = if tool_name == "spreadsheet" {
+            compact_spreadsheet_json(value, max_bytes, artifact_id)
+        } else {
+            compact_generic_json(value, artifact_id)
+        };
+    }
+}
+
+fn compact_spreadsheet_json(value: &Value, max_bytes: usize, artifact_id: Uuid) -> Value {
+    let Some(root) = value.as_object() else {
+        return compact_generic_json(value, artifact_id);
+    };
+    let Some(result) = root.get("result").and_then(Value::as_object) else {
+        return compact_generic_json(value, artifact_id);
+    };
+    let Some(rows) = result.get("rows").and_then(Value::as_array) else {
+        let Some(ranges) = result.get("ranges").and_then(Value::as_array) else {
+            return compact_generic_json(value, artifact_id);
+        };
+        let per_range_budget = max_bytes
+            .saturating_sub(1_000)
+            .checked_div(ranges.len().max(1))
+            .unwrap_or(max_bytes)
+            .max(1_000);
+        let mut projected_ranges = ranges
+            .iter()
+            .map(|range| {
+                compact_spreadsheet_json(
+                    &json!({ "type": "range_read", "result": range }),
+                    per_range_budget,
+                    artifact_id,
+                )
+                .get("result")
+                .cloned()
+                .unwrap_or_else(|| compact_generic_json(range, artifact_id))
+            })
+            .collect::<Vec<_>>();
+        let mut compacted = value.clone();
+        loop {
+            let Some(compacted_result) = compacted.get_mut("result").and_then(Value::as_object_mut)
+            else {
+                return compact_generic_json(value, artifact_id);
+            };
+            compacted_result.insert("ranges".to_string(), Value::Array(projected_ranges.clone()));
+            compacted_result.insert("totalRangeCount".to_string(), json!(ranges.len()));
+            compacted_result.insert("artifactId".to_string(), json!(artifact_id));
+            compacted_result.insert(
+                "hasMoreRanges".to_string(),
+                json!(projected_ranges.len() < ranges.len()),
+            );
+            if serde_json::to_vec(&compacted)
+                .map(|encoded| encoded.len() <= max_bytes)
+                .unwrap_or(false)
+                || projected_ranges.is_empty()
+            {
+                return compacted;
+            }
+            projected_ranges.pop();
+        }
+    };
+
+    let mut compacted = value.clone();
+    {
+        let Some(compacted_result) = compacted.get_mut("result").and_then(Value::as_object_mut)
+        else {
+            return compact_generic_json(value, artifact_id);
+        };
+        compacted_result.insert("rows".to_string(), Value::Array(Vec::new()));
+        compacted_result.insert("totalRowCount".to_string(), json!(rows.len()));
+        compacted_result.insert("artifactId".to_string(), json!(artifact_id));
+    }
+
+    let mut kept = Vec::new();
+    for row in rows {
+        kept.push(row.clone());
+        if let Some(compacted_result) = compacted.get_mut("result").and_then(Value::as_object_mut) {
+            compacted_result.insert("rows".to_string(), Value::Array(kept.clone()));
+        }
+        if serde_json::to_vec(&compacted)
+            .map(|encoded| encoded.len() > max_bytes)
+            .unwrap_or(true)
+        {
+            kept.pop();
+            break;
+        }
+    }
+    let start_row = result
+        .get("range")
+        .and_then(Value::as_object)
+        .and_then(|range| range.get("start"))
+        .and_then(Value::as_object)
+        .and_then(|start| start.get("row"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    loop {
+        let returned = kept.len();
+        let Some(compacted_result) = compacted.get_mut("result").and_then(Value::as_object_mut)
+        else {
+            return compact_generic_json(value, artifact_id);
+        };
+        compacted_result.insert("rows".to_string(), Value::Array(kept.clone()));
+        compacted_result.insert("returnedRowCount".to_string(), json!(returned));
+        compacted_result.insert("hasMore".to_string(), json!(returned < rows.len()));
+        if returned < rows.len() {
+            compacted_result.insert("nextRow".to_string(), json!(start_row + returned as u64));
+            compacted_result.insert(
+                "continuation".to_string(),
+                json!("Call spreadsheet read_rows/read_range for the remaining rows, or read_artifact for the full serialized result."),
+            );
+        }
+        if serde_json::to_vec(&compacted)
+            .map(|encoded| encoded.len() <= max_bytes)
+            .unwrap_or(false)
+            || kept.is_empty()
+        {
+            break;
+        }
+        kept.pop();
+    }
+    compacted
+}
+
+fn compact_generic_json(value: &Value, artifact_id: Uuid) -> Value {
+    let (kind, item_count, keys) = match value {
+        Value::Array(items) => ("array", Some(items.len()), Vec::new()),
+        Value::Object(object) => (
+            "object",
+            None,
+            object.keys().take(64).cloned().collect::<Vec<_>>(),
+        ),
+        Value::String(_) => ("string", None, Vec::new()),
+        _ => ("scalar", None, Vec::new()),
+    };
+    json!({
+        "truncated": true,
+        "kind": kind,
+        "itemCount": item_count,
+        "keys": keys,
+        "artifactId": artifact_id,
+        "continuation": "Use read_artifact to retrieve a bounded window of the full result."
+    })
+}
+
+fn compact_provider_metadata(metadata: &Value) -> Value {
+    const KEYS: &[&str] = &[
+        "toolName",
+        "action",
+        "success",
+        "isError",
+        "errorCode",
+        "error",
+        "changedPath",
+        "artifactId",
+        "artifactKind",
+        "artifact",
+        ENVELOPE_KEY,
+    ];
+    let Some(object) = metadata.as_object() else {
+        return json!({ "metadataTruncated": true });
+    };
+    let mut compacted = serde_json::Map::new();
+    for key in KEYS {
+        if let Some(value) = object.get(*key) {
+            compacted.insert((*key).to_string(), value.clone());
+        }
+    }
+    compacted.insert("metadataTruncated".to_string(), Value::Bool(true));
+    Value::Object(compacted)
 }
 
 fn compact_shell_output(raw: &str, metadata: &Value, is_error: bool) -> (String, &'static str) {
@@ -473,7 +721,7 @@ fn ensure_object(value: &mut Value) {
     }
 }
 
-fn tool_result_is_error(result: &ToolResult) -> bool {
+pub fn tool_result_is_error(result: &ToolResult) -> bool {
     result
         .metadata
         .get("success")
@@ -484,6 +732,9 @@ fn tool_result_is_error(result: &ToolResult) -> bool {
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+        || result.metadata.get("toolError").is_some()
+        || result.metadata.get("errorRecord").is_some()
+        || result.metadata.get("error").is_some()
 }
 
 fn bound_metadata_error_strings(object: &mut serde_json::Map<String, Value>) {
@@ -641,6 +892,72 @@ mod tests {
         assert!(matches!(content[0], ModelContentPart::Image { .. }));
         let metadata = provider_tool_result_metadata("server__tool", &result.metadata);
         assert!(metadata.get("raw").is_none());
+    }
+
+    #[test]
+    fn oversized_spreadsheet_json_is_artifact_backed_and_page_shaped() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let thread = store
+            .create_thread(
+                Some("spreadsheet ingress".to_string()),
+                std::env::temp_dir(),
+            )
+            .expect("create thread");
+        let rows = (0..500)
+            .map(|row| {
+                json!([
+                    { "value": { "type": "string", "value": format!("row-{row}-{}", "x".repeat(80)) } },
+                    { "value": { "type": "number", "value": row } }
+                ])
+            })
+            .collect::<Vec<_>>();
+        let value = json!({
+            "type": "range_read",
+            "result": {
+                "path": "orders.xlsx",
+                "sheet": "Orders",
+                "range": {
+                    "start": { "row": 10, "column": 0 },
+                    "end": { "row": 509, "column": 1 }
+                },
+                "rows": rows
+            }
+        });
+        let output = serde_json::to_string_pretty(&value).expect("serialize spreadsheet result");
+        let result = ToolResult {
+            call_id: Uuid::new_v4(),
+            output: output.clone(),
+            content: vec![ModelContentPart::json(value)],
+            metadata: json!({ "toolName": "spreadsheet", "success": true }),
+        };
+
+        let normalized =
+            normalize_tool_result_at_ingress("spreadsheet", result, Some(&store), Some(thread.id));
+        let projected = provider_tool_result_content(&normalized);
+        let ModelContentPart::Json { value } = &projected[0] else {
+            panic!("spreadsheet projection must stay structured");
+        };
+        assert_eq!(value.pointer("/result/totalRowCount"), Some(&json!(500)));
+        assert_eq!(value.pointer("/result/hasMore"), Some(&json!(true)));
+        assert!(value
+            .pointer("/result/nextRow")
+            .and_then(Value::as_u64)
+            .is_some_and(|row| row > 10));
+        assert!(serde_json::to_vec(value).unwrap().len() <= STRUCTURED_CONTENT_MAX_BYTES);
+        assert!(
+            provider_visible_tool_result_bytes(&normalized) <= PROVIDER_RESULT_MAX_NON_MEDIA_BYTES
+        );
+        let artifact_id = normalized.metadata["artifactId"]
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("artifact id");
+        let artifact = store
+            .get_artifact(thread.id, artifact_id)
+            .expect("load artifact")
+            .expect("artifact exists");
+        assert!(
+            matches!(artifact.storage, ArtifactStorage::Inline { content } if content == output)
+        );
     }
 
     #[test]

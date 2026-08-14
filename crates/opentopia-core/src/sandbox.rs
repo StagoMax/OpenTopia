@@ -222,10 +222,12 @@ pub struct LocalSandboxConfig {
     pub sandbox_home: Option<PathBuf>,
     #[serde(default)]
     pub windows_backend: WindowsSandboxBackend,
-    /// Exact paths approved only for the replay of one user-approved tool call.
+    /// Exact read paths approved by the active authorization scope. The holder
+    /// decides the lifetime: a one-call replay or a turn-scoped path lease.
     #[serde(skip)]
     pub approved_read_paths: Vec<PathBuf>,
-    /// Exact paths approved only for the replay of one user-approved tool call.
+    /// Exact write paths approved by the active authorization scope. The holder
+    /// decides the lifetime: a one-call replay or a turn-scoped path lease.
     #[serde(skip)]
     pub approved_write_paths: Vec<PathBuf>,
 }
@@ -314,11 +316,37 @@ impl LocalSandboxConfig {
     }
 
     pub fn grant_read_path(&mut self, path: impl Into<PathBuf>) {
-        self.approved_read_paths.push(path.into());
+        let path = path.into();
+        if !self
+            .approved_read_paths
+            .iter()
+            .any(|approved| paths_equal(&path, approved))
+        {
+            self.approved_read_paths.push(path);
+        }
     }
 
     pub fn grant_write_path(&mut self, path: impl Into<PathBuf>) {
-        self.approved_write_paths.push(path.into());
+        let path = path.into();
+        if !self
+            .approved_write_paths
+            .iter()
+            .any(|approved| paths_equal(&path, approved))
+        {
+            self.approved_write_paths.push(path);
+        }
+    }
+
+    pub fn is_within_approved_read_scope(&self, path: &Path) -> bool {
+        self.approved_read_paths
+            .iter()
+            .any(|approved| path_is_within_approved_scope(path, approved))
+    }
+
+    pub fn is_within_approved_write_scope(&self, path: &Path) -> bool {
+        self.approved_write_paths
+            .iter()
+            .any(|approved| path_is_within_approved_scope(path, approved))
     }
 
     pub fn is_approved_write_path(&self, path: &Path) -> bool {
@@ -419,6 +447,20 @@ impl LocalSandboxConfig {
         )
     }
 
+    /// Policy/runtime roots configured independently of an approval. Exact
+    /// approval paths are checked separately so authorizing one file cannot
+    /// accidentally authorize its siblings through the parent mount.
+    pub(crate) fn configured_writable_roots(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        if self.sandbox_mode != SandboxMode::WorkspaceWrite {
+            return Vec::new();
+        }
+        dedup_paths(
+            std::iter::once(workspace_root.to_path_buf())
+                .chain(self.write_paths.iter().cloned())
+                .chain(self.writable_roots.iter().cloned()),
+        )
+    }
+
     pub fn effective_sandbox_home(&self, workspace_root: &Path) -> Option<PathBuf> {
         if !self.is_enabled() {
             return self.sandbox_home.clone();
@@ -460,9 +502,39 @@ impl LocalSandboxConfig {
             std::iter::once(workspace_root.to_path_buf())
                 .chain(self.read_paths.iter().cloned())
                 .chain(self.approved_read_paths.iter().cloned())
+                .chain(self.approved_write_paths.iter().cloned())
                 .chain(self.effective_writable_roots(workspace_root)),
         )
     }
+
+    pub(crate) fn configured_readable_roots(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        if self.sandbox_mode == SandboxMode::DangerFullAccess {
+            return Vec::new();
+        }
+        dedup_paths(
+            std::iter::once(workspace_root.to_path_buf())
+                .chain(self.read_paths.iter().cloned())
+                .chain(self.configured_writable_roots(workspace_root)),
+        )
+    }
+}
+
+fn path_is_within_approved_scope(path: &Path, approved: &Path) -> bool {
+    let path = canonicalize_existing_ancestor(&absolute_path(path));
+    let approved = canonicalize_existing_ancestor(&absolute_path(approved));
+    let within_directory = if approved.is_dir() {
+        #[cfg(windows)]
+        {
+            windows_path_starts_with(&path, &approved)
+        }
+        #[cfg(not(windows))]
+        {
+            path.starts_with(&approved)
+        }
+    } else {
+        false
+    };
+    paths_equal(&path, &approved) || within_directory
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {

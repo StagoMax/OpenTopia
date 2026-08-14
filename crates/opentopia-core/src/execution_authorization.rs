@@ -210,6 +210,34 @@ impl ExecutionGrant {
             .map(|path| resolve_requested_path(workspace_root, path))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        // A turn may carry exact path leases from earlier approvals. Project
+        // only the leases needed by this declared intent into the call sandbox.
+        // In particular, a later shell/process call must not inherit the parent
+        // directory mount used to implement an earlier exact-file write.
+        let leased_read_paths = read_paths
+            .iter()
+            .filter(|path| {
+                base.is_within_approved_read_scope(path)
+                    || base.is_within_approved_write_scope(path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let leased_write_paths = write_paths
+            .iter()
+            .filter(|path| base.is_within_approved_write_scope(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        sandbox.approved_read_paths.clear();
+        sandbox.approved_write_paths.clear();
+        if intent.approval_escalation == ApprovalEscalation::ExactPaths {
+            for path in leased_read_paths {
+                sandbox.grant_read_path(path);
+            }
+            for path in leased_write_paths {
+                sandbox.grant_write_path(path);
+            }
+        }
+
         let exact_paths_are_authorized =
             approval_granted || base.sandbox_mode == SandboxMode::DangerFullAccess;
         match intent.approval_escalation {
@@ -392,5 +420,34 @@ mod tests {
 
         assert_eq!(grant.sandbox.sandbox_mode, SandboxMode::WorkspaceWrite);
         assert!(grant.sandbox.is_approved_write_path(&external));
+    }
+
+    #[test]
+    fn exact_path_lease_is_projected_only_to_matching_declared_intent() {
+        let workspace = Path::new("C:/workspace");
+        let external = PathBuf::from("C:/outside/result.txt");
+        let sibling = PathBuf::from("C:/outside/sibling.txt");
+        let mut base = LocalSandboxConfig::enforce();
+        base.grant_write_path(external.clone());
+
+        let matching = ExecutionGrant::resolve(
+            &base,
+            workspace,
+            &ToolExecutionIntent::workspace_mutation([external.clone()]),
+            false,
+        )
+        .unwrap();
+        assert!(matching.sandbox.is_within_approved_write_scope(&external));
+        assert!(!matching.sandbox.is_within_approved_write_scope(&sibling));
+
+        let command = ExecutionGrant::resolve(
+            &base,
+            workspace,
+            &ToolExecutionIntent::session_process(ProcessLifetime::OneShot),
+            false,
+        )
+        .unwrap();
+        assert!(command.sandbox.approved_read_paths.is_empty());
+        assert!(command.sandbox.approved_write_paths.is_empty());
     }
 }

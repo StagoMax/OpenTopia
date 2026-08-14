@@ -317,6 +317,8 @@ pub struct BasicPolicyEngine {
     workspace_root: PathBuf,
     readable_roots: Vec<PathBuf>,
     writable_roots: Vec<PathBuf>,
+    approved_read_paths: Vec<PathBuf>,
+    approved_write_paths: Vec<PathBuf>,
     unrestricted_file_access: bool,
     mode: PermissionMode,
     config: PolicyConfig,
@@ -364,12 +366,14 @@ impl BasicPolicyEngine {
         config: PolicyConfig,
         sandbox_config: &LocalSandboxConfig,
     ) -> Self {
-        let readable_roots = sandbox_config.effective_readable_roots(&workspace_root);
-        let writable_roots = sandbox_config.effective_writable_roots(&workspace_root);
+        let readable_roots = sandbox_config.configured_readable_roots(&workspace_root);
+        let writable_roots = sandbox_config.configured_writable_roots(&workspace_root);
         Self {
             workspace_root,
             readable_roots,
             writable_roots,
+            approved_read_paths: sandbox_config.approved_read_paths.clone(),
+            approved_write_paths: sandbox_config.approved_write_paths.clone(),
             unrestricted_file_access: mode == PermissionMode::FullAccess
                 || sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess,
             mode,
@@ -397,6 +401,30 @@ impl BasicPolicyEngine {
         roots.iter().any(|root| {
             let root = canonicalize_existing_ancestor(root);
             path_starts_with(&candidate, &root)
+        })
+    }
+
+    fn inside_approved_scope(&self, path: &Path, approved_paths: &[PathBuf]) -> bool {
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return false;
+        }
+        let workspace_root = self
+            .workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_root.clone());
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace_root.join(path)
+        };
+        let candidate = canonicalize_existing_ancestor(&candidate);
+        approved_paths.iter().any(|approved| {
+            let approved = canonicalize_existing_ancestor(approved);
+            path_starts_with(&candidate, &approved)
+                && (paths_equal(&candidate, &approved) || approved.is_dir())
         })
     }
 
@@ -474,6 +502,10 @@ fn path_starts_with(candidate: &Path, root: &Path) -> bool {
     }
 }
 
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    path_starts_with(left, right) && path_starts_with(right, left)
+}
+
 #[cfg(windows)]
 fn windows_comparison_path(path: &Path) -> PathBuf {
     let value = path.to_string_lossy().replace('/', "\\");
@@ -497,7 +529,11 @@ impl PolicyEngine for BasicPolicyEngine {
             };
         }
 
-        if self.unrestricted_file_access || self.inside_roots(path, &self.readable_roots) {
+        if self.unrestricted_file_access
+            || self.inside_roots(path, &self.readable_roots)
+            || self.inside_approved_scope(path, &self.approved_read_paths)
+            || self.inside_approved_scope(path, &self.approved_write_paths)
+        {
             PolicyDecision::Allow
         } else {
             PolicyDecision::Ask {
@@ -517,6 +553,11 @@ impl PolicyEngine for BasicPolicyEngine {
             }
             PermissionMode::Auto | PermissionMode::Approve
                 if self.inside_roots(path, &self.writable_roots) =>
+            {
+                PolicyDecision::Allow
+            }
+            PermissionMode::Auto | PermissionMode::Approve
+                if self.inside_approved_scope(path, &self.approved_write_paths) =>
             {
                 PolicyDecision::Allow
             }
@@ -974,6 +1015,47 @@ mod tests {
         for root in [workspace, readable, writable, outside] {
             std::fs::remove_dir_all(root).expect("remove capability root fixture");
         }
+    }
+
+    #[test]
+    fn approved_file_paths_do_not_authorize_siblings() {
+        let id = Uuid::new_v4();
+        let workspace = std::env::temp_dir().join(format!("opentopia-policy-lease-workspace-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-policy-lease-outside-{id}"));
+        std::fs::create_dir_all(&workspace).expect("create lease workspace");
+        std::fs::create_dir_all(&outside).expect("create lease outside root");
+        let readable = outside.join("approved-read.txt");
+        let writable = outside.join("approved-write.txt");
+        std::fs::write(&readable, "approved").expect("create approved read fixture");
+
+        let mut sandbox = LocalSandboxConfig::default();
+        sandbox.grant_read_path(readable.clone());
+        sandbox.grant_write_path(writable.clone());
+        let policy = BasicPolicyEngine::new_with_sandbox_config(
+            workspace.clone(),
+            PermissionMode::Auto,
+            &sandbox,
+        );
+
+        assert!(matches!(
+            policy.inspect_read(&readable),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.inspect_write(&writable),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.inspect_read(&outside.join("sibling.txt")),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            policy.inspect_write(&outside.join("sibling.txt")),
+            PolicyDecision::Ask { .. }
+        ));
+
+        std::fs::remove_dir_all(workspace).expect("remove lease workspace");
+        std::fs::remove_dir_all(outside).expect("remove lease outside root");
     }
 
     #[test]
