@@ -13,6 +13,8 @@ import type {
   ArtifactContent,
   ArtifactDescriptor,
   BrowserOutput,
+  BrowserRuntimeRoute,
+  BrowserRuntimeStatus,
   CollaborationMode,
   CodexAccountStatus,
   CodexLoginStart,
@@ -953,6 +955,17 @@ export class ApiClient {
     },
   ): Promise<BrowserOutput> {
     return this.post(`/api/threads/${threadId}/browser`, input);
+  }
+
+  async getBrowserRuntime(threadId: string): Promise<BrowserRuntimeStatus> {
+    return this.get(`/api/threads/${threadId}/browser/runtime`);
+  }
+
+  async bindBrowserRuntime(
+    threadId: string,
+    route: BrowserRuntimeRoute,
+  ): Promise<BrowserRuntimeStatus> {
+    return this.post(`/api/threads/${threadId}/browser/runtime`, { route });
   }
 
   async listComputerWindows(threadId: string): Promise<ComputerWindowTarget[]> {

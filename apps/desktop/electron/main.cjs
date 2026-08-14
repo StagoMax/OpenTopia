@@ -2013,6 +2013,11 @@ function registerIpc() {
     if (!chromeBridge) throw new Error("Chrome bridge is unavailable.");
     return chromeBridge.disconnect(sessionId);
   });
+  ipcMain.handle("chrome-bridge:action", (event, sessionId, action, value) => {
+    assertMainRenderer(event);
+    if (!chromeBridge) throw new Error("Chrome bridge is unavailable.");
+    return chromeBridge.runUserAction(sessionId, action, value);
+  });
 
   ipcMain.handle("platform:close-window", (event) => {
     const owner = BrowserWindow.fromWebContents(event.sender);
@@ -2520,6 +2525,7 @@ if (!singleInstance) {
       logger: (level, event, metadata) => logConsole(level, event, metadata),
     });
     chromeBridge = createChromeBridge({
+      extensionId: process.env.OPENTOPIA_CHROME_EXTENSION_ID || undefined,
       logger: (level, event, metadata) => logConsole(level, event, metadata),
       onStateChanged: (state) => {
         if (

@@ -1325,6 +1325,30 @@ export type WebPreviewBounds = {
 
 export type BrowserProfilePersistence = "persistent" | "ephemeral";
 
+export type BrowserRuntimeRoute = "managed" | "chrome";
+
+export type BrowserRuntimeStatus = {
+  route: BrowserRuntimeRoute;
+  chromeAvailable: boolean;
+};
+
+export type ChromeBridgeState = {
+  sessionId: string;
+  availability: "available" | "unavailable";
+  status:
+    | "idle"
+    | "waiting_for_extension"
+    | "waiting_for_tab"
+    | "attached";
+  pairingCode?: string;
+  pairingExpiresAt?: string;
+  tabId?: number;
+  targetId?: string;
+  url: string;
+  title: string;
+  error?: string | null;
+};
+
 export type WebPreviewState = {
   sessionId: string;
   profileId: string;
@@ -2760,6 +2784,19 @@ declare global {
         hide(sessionId: string): Promise<unknown>;
         onStateChanged(
           listener: (state: WebPreviewState) => void,
+        ): (() => void) | void;
+      };
+      chromeBridge?: {
+        startPairing(sessionId: string): Promise<ChromeBridgeState>;
+        getStatus(sessionId: string): Promise<ChromeBridgeState>;
+        disconnect(sessionId: string): Promise<ChromeBridgeState>;
+        runAction(
+          sessionId: string,
+          action: "navigate" | "back" | "forward" | "reload",
+          value?: string,
+        ): Promise<ChromeBridgeState>;
+        onStateChanged(
+          listener: (state: ChromeBridgeState) => void,
         ): (() => void) | void;
       };
     };

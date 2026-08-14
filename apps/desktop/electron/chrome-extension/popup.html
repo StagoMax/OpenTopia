@@ -1,26 +1,33 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenTopia Chrome Bridge</title>
+    <title>OpenTopia Chrome 连接</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <main>
       <header>
         <strong>OpenTopia</strong>
-        <span id="status">Not paired</span>
+        <span id="status">未配对</span>
       </header>
       <form id="pair-form">
-        <label for="pair-code">Pairing code</label>
+        <label for="pair-code">配对码</label>
         <div class="row">
-          <input id="pair-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required />
-          <button type="submit">Pair</button>
+          <input
+            id="pair-code"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            maxlength="6"
+            pattern="[0-9]{6}"
+            required
+          />
+          <button type="submit">配对</button>
         </div>
       </form>
-      <button id="attach" type="button" disabled>Attach this tab</button>
-      <button id="detach" type="button" class="quiet" hidden>Disconnect</button>
+      <button id="attach" type="button" disabled>连接当前标签页</button>
+      <button id="detach" type="button" class="quiet" hidden>断开连接</button>
       <p id="error" role="alert"></p>
     </main>
     <script src="popup.js"></script>

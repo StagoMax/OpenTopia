@@ -10,7 +10,8 @@ function send(message) {
     chrome.runtime.sendMessage(message, (response) => {
       const runtimeError = chrome.runtime.lastError;
       if (runtimeError) reject(new Error(runtimeError.message));
-      else if (!response?.ok) reject(new Error(response?.error || "Request failed."));
+      else if (!response?.ok)
+        reject(new Error(response?.error || "操作失败。"));
       else resolve(response.value);
     });
   });
@@ -23,7 +24,7 @@ function render(state) {
   attachButton.disabled = !paired || attached;
   attachButton.hidden = attached;
   detachButton.hidden = !attached;
-  status.textContent = attached ? "Connected" : paired ? "Paired" : "Not paired";
+  status.textContent = attached ? "已连接" : paired ? "已配对" : "未配对";
 }
 
 async function refresh() {

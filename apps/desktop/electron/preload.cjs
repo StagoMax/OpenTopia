@@ -44,6 +44,8 @@ const chromeBridge = Object.freeze({
     ipcRenderer.invoke("chrome-bridge:get-status", sessionId),
   disconnect: (sessionId) =>
     ipcRenderer.invoke("chrome-bridge:disconnect", sessionId),
+  runAction: (sessionId, action, value) =>
+    ipcRenderer.invoke("chrome-bridge:action", sessionId, action, value),
   onStateChanged: (listener) => {
     if (typeof listener !== "function") {
       throw new TypeError("Chrome bridge state listener must be a function.");

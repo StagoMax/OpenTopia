@@ -55,5 +55,5 @@ test("does not treat unsupported schemes as navigable URLs", () => {
 });
 
 test("rejects empty input", () => {
-  assert.throws(() => resolveAddressBarInput("  "), /URL or search term/);
+  assert.throws(() => resolveAddressBarInput("  "), /请输入 URL 或搜索内容/);
 });

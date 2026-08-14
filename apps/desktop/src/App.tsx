@@ -3,6 +3,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -139,6 +140,7 @@ import {
 } from "./conversationMessageMeta";
 import { attachmentsByAssistantMessage } from "./conversationAttachmentReferences";
 import { formatPathForDisplay } from "./pathDisplay";
+import { hasFileDragPayload } from "./fileDrop";
 import {
   composerContentText,
   composerExternalValueSyncAction,
@@ -729,6 +731,11 @@ export function App() {
     setContextSources,
     setSelectedSkillIds,
   } = useComposerDraft(composerDraftKey);
+  const conversationComposerFileDropHandle =
+    useRef<ComposerFileDropHandle>(null);
+  const conversationFileDrop = useConversationFileDrop(
+    conversationComposerFileDropHandle,
+  );
   const [newTaskLaunchMode, setNewTaskLaunchMode] =
     useState<NewTaskLaunchMode>("local");
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
@@ -4636,8 +4643,12 @@ export function App() {
                 : activeUserInput
                   ? "has-plan-choice"
                   : ""
-            }`}
+            } ${conversationFileDrop.isDraggingFiles ? "is-dragging-files" : ""}`}
             id="workspace-center-pane"
+            onDragEnter={conversationFileDrop.onDragEnter}
+            onDragOver={conversationFileDrop.onDragOver}
+            onDragLeave={conversationFileDrop.onDragLeave}
+            onDrop={conversationFileDrop.onDrop}
           >
             <ThreadHeader
               thread={
@@ -4698,6 +4709,9 @@ export function App() {
               }
               onArchive={() => activeThread && void archiveThread(activeThread)}
             />
+            {conversationFileDrop.isDraggingFiles ? (
+              <ConversationFileDropTarget />
+            ) : null}
             {experienceMode === "flow" && flowPrimaryView === "library" ? (
               <SagLibraryPanel client={client} />
             ) : serverStatus === "offline" ? (
@@ -4814,6 +4828,8 @@ export function App() {
                   />
                 ) : (
                   <Composer
+                    fileDropHandleRef={conversationComposerFileDropHandle}
+                    fileDropScope="conversation"
                     value={composer}
                     taskPlan={composerTaskPlan}
                     isSending={isSending}
@@ -9475,8 +9491,82 @@ function fileExtension(name: string): string {
   return dotIndex > 0 ? baseName.slice(dotIndex + 1) : "";
 }
 
+type ComposerFileDropHandle = {
+  addFiles(files: File[]): void;
+};
+
+function useConversationFileDrop(receiverRef: {
+  readonly current: ComposerFileDropHandle | null;
+}) {
+  const dragDepthRef = useRef(0);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+
+  const resetDragState = useCallback(() => {
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+  }, []);
+
+  const onDragEnter = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (
+        !receiverRef.current ||
+        !hasFileDragPayload(event.dataTransfer.types)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      dragDepthRef.current += 1;
+      setIsDraggingFiles(true);
+    },
+    [receiverRef],
+  );
+
+  const onDragOver = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (
+        !receiverRef.current ||
+        !hasFileDragPayload(event.dataTransfer.types)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    },
+    [receiverRef],
+  );
+
+  const onDragLeave = useCallback(() => {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+  }, []);
+
+  const onDrop = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (!hasFileDragPayload(event.dataTransfer.types)) return;
+      event.preventDefault();
+      const receiver = receiverRef.current;
+      resetDragState();
+      receiver?.addFiles(Array.from(event.dataTransfer.files));
+    },
+    [receiverRef, resetDragState],
+  );
+
+  return { isDraggingFiles, onDragEnter, onDragOver, onDragLeave, onDrop };
+}
+
+function ConversationFileDropTarget() {
+  return (
+    <div className="conversation-drop-target" aria-hidden="true">
+      <Paperclip size={20} />
+      <span>释放以添加文件</span>
+    </div>
+  );
+}
+
 function Composer({
   autoFocus = false,
+  fileDropHandleRef,
+  fileDropScope = "composer",
   value,
   taskPlan,
   isSending,
@@ -9512,6 +9602,8 @@ function Composer({
   onToggleSkill,
 }: {
   autoFocus?: boolean;
+  fileDropHandleRef?: { current: ComposerFileDropHandle | null };
+  fileDropScope?: "composer" | "conversation";
   value: string;
   taskPlan?: TaskPlan | null;
   isSending: boolean;
@@ -10038,8 +10130,14 @@ function Composer({
     if (otherFiles.length > 0) void onAddContextSources(otherFiles);
   }
 
+  useImperativeHandle(fileDropHandleRef, () => ({
+    addFiles(files) {
+      addSelectedFiles(files);
+    },
+  }));
+
   function handleDragEnter(event: ReactDragEvent<HTMLDivElement>) {
-    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    if (!hasFileDragPayload(event.dataTransfer.types)) return;
     event.preventDefault();
     if (dragDepthRef.current === 0) {
       const editor = editorRef.current;
@@ -10054,7 +10152,7 @@ function Composer({
   }
 
   function handleDragOver(event: ReactDragEvent<HTMLDivElement>) {
-    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    if (!hasFileDragPayload(event.dataTransfer.types)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
   }
@@ -10068,7 +10166,7 @@ function Composer({
   }
 
   function handleDrop(event: ReactDragEvent<HTMLDivElement>) {
-    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    if (!hasFileDragPayload(event.dataTransfer.types)) return;
     event.preventDefault();
     dragDepthRef.current = 0;
     setIsDraggingFiles(false);
@@ -10099,10 +10197,10 @@ function Composer({
       <div
         className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
         ref={popoverRef}
-        onDragEnter={handleDragEnter}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
+        onDragEnter={fileDropScope === "composer" ? handleDragEnter : undefined}
+        onDragOver={fileDropScope === "composer" ? handleDragOver : undefined}
+        onDragLeave={fileDropScope === "composer" ? handleDragLeave : undefined}
+        onDrop={fileDropScope === "composer" ? handleDrop : undefined}
       >
         {(workspaceRoot || projectName) && (
           <div className="composer-context">
@@ -11129,6 +11227,8 @@ function SideTaskConversation({
   const [actionError, setActionError] = useState<string | null>(null);
   const [undoingTurnId, setUndoingTurnId] = useState<string | null>(null);
   const eventIdsRef = useRef(new Set<string>());
+  const composerFileDropHandle = useRef<ComposerFileDropHandle>(null);
+  const conversationFileDrop = useConversationFileDrop(composerFileDropHandle);
 
   useEffect(() => {
     setModelSelection(thread?.modelSelection ?? null);
@@ -11562,7 +11662,17 @@ function SideTaskConversation({
   }
 
   return (
-    <section className="side-task-conversation" aria-label="侧边任务会话">
+    <section
+      className={`side-task-conversation ${conversationFileDrop.isDraggingFiles ? "is-dragging-files" : ""}`}
+      aria-label="侧边任务会话"
+      onDragEnter={conversationFileDrop.onDragEnter}
+      onDragOver={conversationFileDrop.onDragOver}
+      onDragLeave={conversationFileDrop.onDragLeave}
+      onDrop={conversationFileDrop.onDrop}
+    >
+      {conversationFileDrop.isDraggingFiles ? (
+        <ConversationFileDropTarget />
+      ) : null}
       {loadState.status === "error" ? (
         <ConversationLoadErrorState
           error={loadState.error ?? "无法加载侧边任务"}
@@ -11643,6 +11753,8 @@ function SideTaskConversation({
       ) : (
         <Composer
           autoFocus
+          fileDropHandleRef={composerFileDropHandle}
+          fileDropScope="conversation"
           value={composer}
           taskPlan={taskPlan}
           isSending={isSending}

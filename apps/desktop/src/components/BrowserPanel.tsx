@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { ApiClient } from "../api/client";
 import { activeBrowserHandoff } from "../browserHandoff";
+import { resolveAddressBarInput } from "../browserNavigation";
 import type {
   AgentEvent,
   BrowserContent,
@@ -211,25 +212,29 @@ export function BrowserPanel({
     setIsRunning(true);
     setError(null);
     try {
+      const resolvedUrl =
+        action === "navigate"
+          ? resolveAddressBarInput(requestedUrl)
+          : requestedUrl;
+      if (action === "navigate") setUrl(resolvedUrl);
       const next = await client.runBrowserCommand(threadId, {
         action,
         url:
           action === "navigate" || action === "download"
-            ? requestedUrl
+            ? resolvedUrl
             : undefined,
-        observationId:
-          ["click", "type", "select", "hover", "scroll"].includes(action)
-            ? observation?.observationId
-            : undefined,
-        nodeRef:
-          ["click", "type", "select", "hover", "scroll"].includes(action)
-            ? selectedNode?.nodeRef
-            : undefined,
+        observationId: ["click", "type", "select", "hover", "scroll"].includes(
+          action,
+        )
+          ? observation?.observationId
+          : undefined,
+        nodeRef: ["click", "type", "select", "hover", "scroll"].includes(action)
+          ? selectedNode?.nodeRef
+          : undefined,
         text: action === "type" ? text : undefined,
         value: action === "select" ? text : undefined,
         deltaY: action === "scroll" ? 600 : undefined,
-        targetRef:
-          action === "switch_target" ? requestedTargetRef : undefined,
+        targetRef: action === "switch_target" ? requestedTargetRef : undefined,
       });
       if (
         requestVersionRef.current !== requestVersion ||
@@ -271,7 +276,7 @@ export function BrowserPanel({
           aria-label="Browser URL"
           autoCapitalize="none"
           autoCorrect="off"
-          placeholder="https://"
+          placeholder="输入 URL 或搜索内容"
           spellCheck={false}
           value={url}
           onChange={(event) => setUrl(event.target.value)}
@@ -427,7 +432,9 @@ export function BrowserPanel({
         <button
           aria-label="Select observed option"
           className="icon-button small"
-          disabled={disabled || selectedNode?.tagName !== "select" || !text.length}
+          disabled={
+            disabled || selectedNode?.tagName !== "select" || !text.length
+          }
           onClick={() => void run("select")}
           title="Select observed option"
           type="button"
@@ -460,10 +467,7 @@ export function BrowserPanel({
         <div className="browser-downloads">
           {downloads.map((download) =>
             download.type === "file" ? (
-              <span
-                className="browser-download-path"
-                key={download.path}
-              >
+              <span className="browser-download-path" key={download.path}>
                 <code>{download.path}</code>
               </span>
             ) : null,
@@ -583,17 +587,22 @@ function browserObservationFromOutput(
         ? value.targets.flatMap((candidate) => {
             const target = asRecord(candidate);
             return typeof target?.targetRef === "string"
-              ? [{
-                  targetRef: target.targetRef,
-                  url: typeof target.url === "string" ? target.url : "",
-                  title: typeof target.title === "string" ? target.title : "",
-                  active: target.active === true,
-                  opener: typeof target.opener === "string" ? target.opener : null,
-                }]
+              ? [
+                  {
+                    targetRef: target.targetRef,
+                    url: typeof target.url === "string" ? target.url : "",
+                    title: typeof target.title === "string" ? target.title : "",
+                    active: target.active === true,
+                    opener:
+                      typeof target.opener === "string" ? target.opener : null,
+                  },
+                ]
               : [];
           })
         : [],
-      frames: Array.isArray(value.frames) ? (value.frames as BrowserObservation["frames"]) : [],
+      frames: Array.isArray(value.frames)
+        ? (value.frames as BrowserObservation["frames"])
+        : [],
       accessibilityTree: Array.isArray(value.accessibilityTree)
         ? (value.accessibilityTree as BrowserObservation["accessibilityTree"])
         : [],

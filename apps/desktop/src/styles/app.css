@@ -9010,20 +9010,26 @@ button:disabled {
 }
 
 .web-preview-toolbar {
-  gap: 3px;
-  padding: 0 7px;
+  gap: var(--space-1);
+  padding: 0 var(--space-3);
+}
+
+.web-preview-runtime-selector .ot-segmented__option {
+  min-height: calc(var(--control-height-sm) - var(--space-2));
+  padding: 0 var(--space-3);
+  font-size: var(--font-size-xs);
 }
 
 .web-preview-toolbar input {
   min-width: 0;
-  height: 27px;
+  height: var(--control-height-sm);
   flex: 1;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
-  padding: 0 9px;
-  font-size: 11px;
+  padding: 0 var(--space-4);
+  font-size: var(--font-size-xs);
 }
 
 .web-preview-native-surface {
@@ -9058,6 +9064,46 @@ button:disabled {
 .web-preview-empty span {
   color: var(--text-muted);
   font-size: var(--font-size-sm);
+}
+
+.web-preview-chrome-surface {
+  display: grid;
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
+  align-content: center;
+  justify-items: center;
+  gap: var(--space-3);
+  background: var(--surface);
+  color: var(--text-muted);
+  padding: var(--space-8);
+  text-align: center;
+}
+
+.web-preview-chrome-surface strong {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+}
+
+.web-preview-chrome-surface span {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.web-preview-chrome-surface code {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-subtle);
+  color: var(--text);
+  padding: var(--space-3) var(--space-6);
+  font-size: var(--font-size-xl);
+  font-variant-numeric: tabular-nums;
 }
 
 .web-preview-error {
@@ -13234,6 +13280,7 @@ button:disabled {
 
 .center-pane {
   --conversation-content-padding-end: var(--space-12);
+  position: relative;
 }
 
 .workspace:not(.with-tool-stage):has(.context-rail-shell.is-inline)
@@ -13245,6 +13292,27 @@ button:disabled {
   position: relative;
   min-width: 0;
   min-height: 0;
+}
+
+.side-task-conversation {
+  position: relative;
+}
+
+.conversation-drop-target {
+  position: absolute;
+  z-index: var(--z-popover);
+  inset: var(--space-4);
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: var(--space-3);
+  border: 1px dashed var(--accent);
+  border-radius: var(--radius-lg);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+  pointer-events: none;
 }
 
 .conversation-scroll-shell > .message-list {

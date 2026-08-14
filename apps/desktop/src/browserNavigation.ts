@@ -6,7 +6,7 @@ const HTTP_SCHEMES = new Set(["http:", "https:"]);
  */
 export function resolveAddressBarInput(value: string): string {
   const input = value.trim();
-  if (!input) throw new Error("Enter a URL or search term.");
+  if (!input) throw new Error("请输入 URL 或搜索内容。");
 
   const absolute = parseHttpUrl(input);
   if (absolute) return absolute;
