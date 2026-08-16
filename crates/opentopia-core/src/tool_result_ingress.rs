@@ -1,6 +1,6 @@
 use crate::model::{Artifact, ModelContentPart, ToolResult};
 use crate::model_context::content_fingerprint;
-use crate::store::SessionStore;
+use crate::tool_state::ToolStateStore;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ const PROVIDER_RESULT_MAX_NON_MEDIA_BYTES: usize = 36_000;
 pub(crate) fn normalize_tool_result_at_ingress(
     tool_name: &str,
     mut result: ToolResult,
-    store: Option<&dyn SessionStore>,
+    store: Option<&ToolStateStore>,
     thread_id: Option<Uuid>,
 ) -> ToolResult {
     if result.metadata.get(ENVELOPE_KEY).is_some() {
@@ -768,7 +768,8 @@ fn bound_metadata_error_strings(object: &mut serde_json::Map<String, Value>) {
 mod tests {
     use super::*;
     use crate::model::ArtifactStorage;
-    use crate::store::SqliteSessionStore;
+    use crate::store::{SessionStore, SqliteSessionStore};
+    use std::sync::Arc;
 
     #[test]
     fn failure_compaction_finds_diagnostic_in_the_middle_and_keeps_tail() {
@@ -787,7 +788,8 @@ mod tests {
 
     #[test]
     fn normalized_result_is_artifact_backed_and_idempotent() {
-        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
+        let state = ToolStateStore::new(store.clone());
         let thread = store
             .create_thread(Some("tool ingress".to_string()), std::env::temp_dir())
             .expect("create thread");
@@ -809,7 +811,7 @@ mod tests {
         };
 
         let normalized =
-            normalize_tool_result_at_ingress("shell", result, Some(&store), Some(thread.id));
+            normalize_tool_result_at_ingress("shell", result, Some(&state), Some(thread.id));
         assert!(normalized.output.len() < raw.len());
         assert!(normalized.output.contains("Full output artifact"));
         assert_eq!(
@@ -833,7 +835,7 @@ mod tests {
 
         let serialized = serde_json::to_value(&normalized).expect("serialize result");
         let replayed =
-            normalize_tool_result_at_ingress("shell", normalized, Some(&store), Some(thread.id));
+            normalize_tool_result_at_ingress("shell", normalized, Some(&state), Some(thread.id));
         assert_eq!(
             serde_json::to_value(replayed).expect("serialize replay"),
             serialized
@@ -896,7 +898,8 @@ mod tests {
 
     #[test]
     fn oversized_spreadsheet_json_is_artifact_backed_and_page_shaped() {
-        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
+        let state = ToolStateStore::new(store.clone());
         let thread = store
             .create_thread(
                 Some("spreadsheet ingress".to_string()),
@@ -932,7 +935,7 @@ mod tests {
         };
 
         let normalized =
-            normalize_tool_result_at_ingress("spreadsheet", result, Some(&store), Some(thread.id));
+            normalize_tool_result_at_ingress("spreadsheet", result, Some(&state), Some(thread.id));
         let projected = provider_tool_result_content(&normalized);
         let ModelContentPart::Json { value } = &projected[0] else {
             panic!("spreadsheet projection must stay structured");

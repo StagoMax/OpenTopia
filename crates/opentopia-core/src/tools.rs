@@ -22,16 +22,18 @@ use crate::execution::{
     shell_command_compatibility_error, ExecRequest, ExecutionContext, ExecutionEnvironment,
     FileReadRequest, FileWriteRequest, LocalExecutionEnvironment, ShellDialect,
 };
-use crate::execution_authorization::{ExecutionGrant, ProcessLifetime, ToolExecutionIntent};
+use crate::execution_authorization::{
+    ApprovalEscalation, ExecutionGrant, FilesystemAccess, NetworkAccess, ProcessLifetime,
+    ToolExecutionIntent,
+};
 use crate::file_mutation::{read_optional, FileMutationBatch, PreparedFileMutation};
 use crate::flow_runtime::FlowNodeHarness;
 use crate::git_workflow::isolated_subagent_worktree_request;
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
-    Artifact, ArtifactStorage, CollaborationMode, MessagePart, ModelContentPart, TaskEvidenceKind,
-    TaskEvidenceRef, TaskPlan, TaskPlanCoverage, TaskPlanStep, TaskPlanStepStatus, TaskRequirement,
-    ToolCall, ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
+    Artifact, ArtifactStorage, CollaborationMode, MessagePart, ModelContentPart, ToolCall,
+    ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
 };
 use crate::model_context::CompiledModelContext;
 use crate::policy::{
@@ -39,23 +41,25 @@ use crate::policy::{
 };
 use crate::provider::{ModelConversationMessage, ModelConversationRole};
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
-use crate::shell_analysis::analyze_shell_command;
+use crate::shell_analysis::{analyze_shell_command, ShellCapability, ShellCommandAnalysis};
 use crate::skill_authoring::{
     create_skill_from_draft, preview_skill_draft, skill_target_path, SkillDraft, SkillResourceDraft,
 };
 use crate::skills::{discover_skills, load_skill_slice, SkillScope, MAX_SKILL_BYTES};
 use crate::spreadsheet::{
-    execute_spreadsheet, CellAddress, CellRange, CellUpdate, FormulaInput, InspectWorkbookRequest,
-    ListSheetsRequest, ReadRangeRequest, ReadRangesRequest, SheetRangeRequest, SheetWriteRequest,
-    SpreadsheetAction, SpreadsheetCell, SpreadsheetCellInput, SpreadsheetCellValue,
-    SpreadsheetRequest, SpreadsheetResult, WriteWorkbookRequest,
+    execute_spreadsheet, CellAddress, CellRange, CellUpdate, FilterRowsRequest, FindCellsRequest,
+    FormulaInput, InspectWorkbookRequest, ListSheetsRequest, ReadRangeRequest, ReadRangesRequest,
+    SheetRangeRequest, SheetWriteRequest, SpreadsheetAction, SpreadsheetCell, SpreadsheetCellInput,
+    SpreadsheetCellValue, SpreadsheetFilterCondition, SpreadsheetFilterMatchMode,
+    SpreadsheetRequest, SpreadsheetResult, SpreadsheetTextMatchMode, WriteWorkbookRequest,
     MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
-use crate::store::SessionStore;
 use crate::subagents::{
     SpawnSubagentRequest, SubagentExecutionContract, SubagentRun, SubagentRunStatus,
     SubagentScheduler, SubagentScope, SubagentWorkspaceAssignment, SubagentWorkspaceMode,
 };
+use crate::tool_state::ToolStateStore;
+use crate::work_form::WorkForm;
 use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -77,7 +81,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Clone)]
-pub struct ToolContext {
+pub struct ToolInvocationContext {
     pub workspace_root: PathBuf,
     pub policy: Arc<dyn PolicyEngine>,
     pub permission_mode: PermissionMode,
@@ -85,7 +89,9 @@ pub struct ToolContext {
     /// Base/effective local sandbox profile. `None` is reserved for injected
     /// execution environments whose authorization is enforced externally.
     pub sandbox_config: Option<LocalSandboxConfig>,
-    pub store: Option<Arc<dyn SessionStore>>,
+    /// Narrow persistence capabilities available to tool execution. The broad
+    /// product SessionStore never crosses this boundary.
+    pub state: Option<ToolStateStore>,
     pub thread_id: Option<Uuid>,
     pub cancel: Option<CancellationToken>,
     pub subagents: Option<SubagentScheduler>,
@@ -110,7 +116,7 @@ pub struct ToolContext {
     pub model_supports_vision: bool,
     pub fork_conversation: Vec<ModelConversationMessage>,
     pub fork_model_context: Option<CompiledModelContext>,
-    pub current_task_plan: Option<TaskPlan>,
+    pub current_work_form: Option<WorkForm>,
     pub collaboration_mode: CollaborationMode,
     pub goal_id: Option<Uuid>,
     /// Set only while replaying a tool call that the user explicitly approved.
@@ -125,7 +131,7 @@ pub struct ToolContext {
     pub flow_harness: Option<Arc<dyn FlowNodeHarness>>,
 }
 
-impl ToolContext {
+impl ToolInvocationContext {
     pub fn local(workspace_root: PathBuf, policy: Arc<dyn PolicyEngine>) -> Self {
         Self::local_with_sandbox_config(workspace_root, policy, LocalSandboxConfig::from_env())
     }
@@ -146,7 +152,7 @@ impl ToolContext {
             permission_mode: PermissionMode::FullAccess,
             environment,
             sandbox_config: Some(context_sandbox_config),
-            store: None,
+            state: None,
             thread_id: None,
             cancel: None,
             subagents: None,
@@ -163,7 +169,7 @@ impl ToolContext {
             model_supports_vision: true,
             fork_conversation: Vec::new(),
             fork_model_context: None,
-            current_task_plan: None,
+            current_work_form: None,
             collaboration_mode: CollaborationMode::Default,
             goal_id: None,
             approval_granted: false,
@@ -183,7 +189,7 @@ impl ToolContext {
             permission_mode: PermissionMode::FullAccess,
             environment,
             sandbox_config: None,
-            store: None,
+            state: None,
             thread_id: None,
             cancel: None,
             subagents: None,
@@ -200,7 +206,7 @@ impl ToolContext {
             model_supports_vision: true,
             fork_conversation: Vec::new(),
             fork_model_context: None,
-            current_task_plan: None,
+            current_work_form: None,
             collaboration_mode: CollaborationMode::Default,
             goal_id: None,
             approval_granted: false,
@@ -282,11 +288,15 @@ pub trait Tool: Send + Sync {
     fn authorization_preflight(
         &self,
         _call: &ToolCall,
-        _ctx: &ToolContext,
+        _ctx: &ToolInvocationContext,
     ) -> Option<PolicyDecision> {
         None
     }
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult>;
+    async fn execute(
+        &self,
+        call: ToolCall,
+        ctx: ToolInvocationContext,
+    ) -> anyhow::Result<ToolResult>;
 }
 
 /// Static tools declare their input exactly once. The associated Rust type is
@@ -300,7 +310,7 @@ trait TypedTool: Send + Sync {
 
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-    fn validate_context(&self, _ctx: &ToolContext) -> anyhow::Result<()> {
+    fn validate_context(&self, _ctx: &ToolInvocationContext) -> anyhow::Result<()> {
         Ok(())
     }
     fn execution_policy(&self, _input: &Self::Input) -> ToolExecutionPolicy {
@@ -312,7 +322,7 @@ trait TypedTool: Send + Sync {
     fn authorization_preflight(
         &self,
         _input: &Self::Input,
-        _ctx: &ToolContext,
+        _ctx: &ToolInvocationContext,
     ) -> Option<PolicyDecision> {
         None
     }
@@ -320,7 +330,7 @@ trait TypedTool: Send + Sync {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        _ctx: ToolContext,
+        _ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult>;
 }
 
@@ -417,20 +427,30 @@ macro_rules! impl_typed_tool {
             fn authorization_preflight(
                 &self,
                 call: &ToolCall,
-                ctx: &ToolContext,
+                ctx: &ToolInvocationContext,
             ) -> Option<PolicyDecision> {
                 decode_typed_tool_input::<<Self as TypedTool>::Input>(
                     <Self as TypedTool>::name(self),
                     call.input.clone(),
                 )
                 .ok()
-                .and_then(|input| <Self as TypedTool>::authorization_preflight(self, &input, ctx))
+                .map(|input| {
+                    let intent =
+                        <Self as TypedTool>::execution_intent(self, &input, &ctx.workspace_root);
+                    let intent_decision = ctx
+                        .policy
+                        .inspect_execution_intent(&intent, &ctx.workspace_root);
+                    let tool_decision =
+                        <Self as TypedTool>::authorization_preflight(self, &input, ctx)
+                            .unwrap_or(PolicyDecision::Allow);
+                    PolicyDecision::combine([intent_decision, tool_decision])
+                })
             }
 
             async fn execute(
                 &self,
                 call: ToolCall,
-                mut ctx: ToolContext,
+                mut ctx: ToolInvocationContext,
             ) -> anyhow::Result<ToolResult> {
                 <Self as TypedTool>::validate_context(self, &ctx)?;
                 let input = decode_typed_tool_input::<<Self as TypedTool>::Input>(
@@ -439,6 +459,16 @@ macro_rules! impl_typed_tool {
                 )?;
                 let intent =
                     <Self as TypedTool>::execution_intent(self, &input, &ctx.workspace_root);
+                let intent_decision = ctx
+                    .policy
+                    .inspect_execution_intent(&intent, &ctx.workspace_root);
+                let tool_decision =
+                    <Self as TypedTool>::authorization_preflight(self, &input, &ctx)
+                        .unwrap_or(PolicyDecision::Allow);
+                enforce_policy_decision(
+                    PolicyDecision::combine([intent_decision, tool_decision]),
+                    ctx.approval_granted,
+                )?;
                 ctx.apply_execution_intent(&intent)?;
                 <Self as TypedTool>::execute_typed(self, call.id, input, ctx).await
             }
@@ -448,6 +478,9 @@ macro_rules! impl_typed_tool {
 
 mod office_tools;
 pub use office_tools::{DocumentTool, PdfTool};
+mod filesystem_tool;
+pub use filesystem_tool::FilesystemTool;
+impl_typed_tool!(FilesystemTool);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -564,6 +597,8 @@ enum SpreadsheetToolAction {
     ReadRanges,
     ReadRows,
     ReadColumns,
+    Find,
+    FilterRows,
     Write,
     WriteRows,
     WriteColumns,
@@ -656,6 +691,29 @@ struct SpreadsheetToolInput {
     /// Number of columns for read_rows/read_columns.
     #[serde(default)]
     column_count: Option<u32>,
+    /// Text query for find.
+    #[serde(default)]
+    query: Option<String>,
+    /// Text matching behavior for find.
+    #[serde(default)]
+    match_mode: Option<SpreadsheetTextMatchMode>,
+    /// Whether find comparisons are case-sensitive. Filter conditions carry their own setting.
+    #[serde(default)]
+    case_sensitive: bool,
+    /// Include formula expressions while finding cells.
+    #[serde(default)]
+    include_formulas: bool,
+    /// Row predicates for filter_rows. Condition columns are absolute and zero-based.
+    #[serde(default)]
+    #[schemars(length(max = 32))]
+    conditions: Vec<SpreadsheetFilterCondition>,
+    /// Whether every or any filter condition must match.
+    #[serde(default)]
+    filter_match_mode: Option<SpreadsheetFilterMatchMode>,
+    /// Maximum matches returned by find or filter_rows.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 1000))]
+    max_results: Option<usize>,
     /// Optional existing XLSX to update. Compatible cell-only changes preserve
     /// untouched template parts; structural workbook changes rebuild it.
     #[serde(default)]
@@ -689,7 +747,7 @@ impl TypedTool for SpreadsheetTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect and manipulate bounded XLSX workbooks with zero-based coordinates. Supports batched ranges, row/column reads, matrix writes, internal row/column copies, and atomic multi-operation writes. Existing templates use a preservation path when the requested mutation can be applied without rebuilding workbook objects."
+        "Inspect, find, filter, and manipulate bounded XLSX workbooks with zero-based coordinates. Supports batched ranges, row/column reads, conditional row filtering, matrix writes, internal row/column copies, and atomic multi-operation writes. Existing templates use a preservation path when the requested mutation can be applied without rebuilding workbook objects."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -699,7 +757,9 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::ReadRange
             | SpreadsheetToolAction::ReadRanges
             | SpreadsheetToolAction::ReadRows
-            | SpreadsheetToolAction::ReadColumns => {
+            | SpreadsheetToolAction::ReadColumns
+            | SpreadsheetToolAction::Find
+            | SpreadsheetToolAction::FilterRows => {
                 ToolExecutionPolicy::read_only(vec![tool_resource_key(
                     if input.attachment_id.is_some() {
                         "attachment"
@@ -756,7 +816,9 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::ReadRange
             | SpreadsheetToolAction::ReadRanges
             | SpreadsheetToolAction::ReadRows
-            | SpreadsheetToolAction::ReadColumns => {
+            | SpreadsheetToolAction::ReadColumns
+            | SpreadsheetToolAction::Find
+            | SpreadsheetToolAction::FilterRows => {
                 ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from))
             }
             SpreadsheetToolAction::Write
@@ -783,7 +845,7 @@ impl TypedTool for SpreadsheetTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         match input.action {
             SpreadsheetToolAction::Inspect
@@ -791,7 +853,9 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::ReadRange
             | SpreadsheetToolAction::ReadRanges
             | SpreadsheetToolAction::ReadRows
-            | SpreadsheetToolAction::ReadColumns => {
+            | SpreadsheetToolAction::ReadColumns
+            | SpreadsheetToolAction::Find
+            | SpreadsheetToolAction::FilterRows => {
                 execute_spreadsheet_read(call_id, input, ctx).await
             }
             SpreadsheetToolAction::Write => execute_spreadsheet_write(call_id, input, ctx).await,
@@ -820,7 +884,7 @@ fn spreadsheet_operation_source_path(operation: &SpreadsheetBatchOperation) -> O
 async fn execute_spreadsheet_read(
     call_id: Uuid,
     input: SpreadsheetToolInput,
-    ctx: ToolContext,
+    ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     let path = input
         .path
@@ -867,6 +931,13 @@ async fn execute_spreadsheet_read(
     let start_column = input.start_column;
     let row_count = input.row_count;
     let column_count = input.column_count;
+    let query = input.query;
+    let match_mode = input.match_mode;
+    let case_sensitive = input.case_sensitive;
+    let include_formulas = input.include_formulas;
+    let conditions = input.conditions;
+    let filter_match_mode = input.filter_match_mode;
+    let max_results = input.max_results;
     let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let staging = SpreadsheetStaging::new()?;
         let staged_input = staging.path("input.xlsx");
@@ -911,6 +982,38 @@ async fn execute_spreadsheet_read(
                         .filter(|value| !value.is_empty())
                         .context("spreadsheet row/column read requires sheet")?,
                     range,
+                })
+            }
+            SpreadsheetToolAction::Find => SpreadsheetAction::FindCells(FindCellsRequest {
+                path: staged_input,
+                sheet: sheet
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                range,
+                query: query
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .context("spreadsheet find requires query")?,
+                match_mode: match_mode.unwrap_or_default(),
+                case_sensitive,
+                include_formulas,
+                max_results: max_results.unwrap_or(100),
+            }),
+            SpreadsheetToolAction::FilterRows => {
+                anyhow::ensure!(
+                    !conditions.is_empty(),
+                    "spreadsheet filter_rows requires conditions"
+                );
+                SpreadsheetAction::FilterRows(FilterRowsRequest {
+                    path: staged_input,
+                    sheet: sheet
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .context("spreadsheet filter_rows requires sheet")?,
+                    range: range.context("spreadsheet filter_rows requires range")?,
+                    conditions,
+                    match_mode: filter_match_mode.unwrap_or_default(),
+                    max_results: max_results.unwrap_or(100),
                 })
             }
             SpreadsheetToolAction::Write
@@ -974,7 +1077,7 @@ fn counted_spreadsheet_range(
 async fn execute_spreadsheet_write(
     call_id: Uuid,
     input: SpreadsheetToolInput,
-    ctx: ToolContext,
+    ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     let output_relative = input
         .output_path
@@ -1050,7 +1153,7 @@ async fn execute_spreadsheet_write(
 async fn execute_spreadsheet_mutations(
     call_id: Uuid,
     input: SpreadsheetToolInput,
-    ctx: ToolContext,
+    ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     anyhow::ensure!(
         input.atomic.unwrap_or(true),
@@ -1466,6 +1569,16 @@ fn remap_spreadsheet_paths(
                 }
             }
         }
+        SpreadsheetResult::CellsFound(result) => {
+            if let Some(source) = source {
+                result.path = source.to_path_buf();
+            }
+        }
+        SpreadsheetResult::RowsFiltered(result) => {
+            if let Some(source) = source {
+                result.path = source.to_path_buf();
+            }
+        }
         SpreadsheetResult::WorkbookWritten(result) => {
             if let Some(output) = output {
                 result.output = output.to_path_buf();
@@ -1508,10 +1621,6 @@ impl Drop for SpreadsheetStaging {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
-
-const MAX_TASK_COMPLETION_SUMMARY_CHARS: usize = 4_000;
-const MAX_TASK_COMPLETION_ITEMS: usize = 20;
-const MAX_TASK_COMPLETION_ITEM_CHARS: usize = 1_000;
 
 const MAX_USER_INPUT_QUESTIONS: usize = 3;
 const MAX_USER_INPUT_OPTIONS: usize = 3;
@@ -1570,14 +1679,10 @@ impl TypedTool for RequestUserInputTool {
     }
 
     fn description(&self) -> &str {
-        "Pause Plan and ask the user to choose between materially different approaches. Use one to three concise questions with two to three concrete options each. Put the recommended option first and mark at most one option per question as recommended."
+        "Pause the current Turn when several materially different approaches require a user choice. Use one to three concise questions with two to three concrete options each. The same Turn resumes and continues execution after the answer."
     }
 
-    fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            ctx.collaboration_mode == CollaborationMode::Plan,
-            "request_user_input is only available in plan mode"
-        );
+    fn validate_context(&self, ctx: &ToolInvocationContext) -> anyhow::Result<()> {
         anyhow::ensure!(
             ctx.agent_path == "/root",
             "only the root agent may ask the user a Plan question"
@@ -1589,7 +1694,7 @@ impl TypedTool for RequestUserInputTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        _ctx: ToolContext,
+        _ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         anyhow::ensure!(
             !input.questions.is_empty() && input.questions.len() <= MAX_USER_INPUT_QUESTIONS,
@@ -1718,1279 +1823,8 @@ fn validate_user_input_text(
     Ok(value)
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct CompleteTaskInput {
-    /// Concise description of the completed result.
-    summary: String,
-    /// Commands, checks, or observed results that verify the completed scope.
-    #[schemars(length(max = 20))]
-    verification: Vec<String>,
-    /// Work intentionally left for a later phase. Empty means no known remaining work.
-    #[schemars(length(max = 20))]
-    remaining_work: Vec<String>,
-}
-
-pub struct CompleteTaskTool;
-
-#[async_trait]
-impl TypedTool for CompleteTaskTool {
-    type Input = CompleteTaskInput;
-
-    fn name(&self) -> &str {
-        "complete_task"
-    }
-
-    fn description(&self) -> &str {
-        "Finish the current user task after its requested scope has been verified. The plan records commitments and evidence, not a mandatory reasoning path. Provide a concise summary, concrete verification evidence, and any deliberately deferred work. This is the final tool call for the turn."
-    }
-
-    fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
-        if ctx.collaboration_mode == CollaborationMode::Plan {
-            anyhow::bail!("complete_task is unavailable in plan mode");
-        }
-        if ctx.collaboration_mode == CollaborationMode::Goal {
-            let goal_id = ctx
-                .goal_id
-                .context("goal mode is missing a server-assigned goal id")?;
-            let plan = ctx
-                .current_task_plan
-                .as_ref()
-                .context("goal mode cannot complete before a plan exists")?;
-            anyhow::ensure!(
-                plan.goal_id == goal_id.to_string(),
-                "current plan belongs to a different goal"
-            );
-            anyhow::ensure!(!plan.steps.is_empty(), "goal plan cannot be empty");
-            anyhow::ensure!(
-                !plan.has_actionable_steps(),
-                "goal still contains pending or in_progress steps"
-            );
-            anyhow::ensure!(
-                plan.steps.iter().all(|step| {
-                    step.status != TaskPlanStepStatus::Completed || !step.evidence.is_empty()
-                }),
-                "every completed goal step must include verification evidence"
-            );
-        }
-        Ok(())
-    }
-
-    async fn execute_typed(
-        &self,
-        call_id: Uuid,
-        input: Self::Input,
-        _ctx: ToolContext,
-    ) -> anyhow::Result<ToolResult> {
-        let summary =
-            validate_completion_text("summary", input.summary, MAX_TASK_COMPLETION_SUMMARY_CHARS)?;
-        let verification = validate_completion_items("verification", input.verification)?;
-        let remaining_work = validate_completion_items("remaining_work", input.remaining_work)?;
-
-        let mut output = summary.clone();
-        if !verification.is_empty() {
-            output.push_str("\n\nVerification:\n");
-            for item in &verification {
-                output.push_str("- ");
-                output.push_str(item);
-                output.push('\n');
-            }
-            output.pop();
-        }
-        if !remaining_work.is_empty() {
-            output.push_str("\n\nRemaining work:\n");
-            for item in &remaining_work {
-                output.push_str("- ");
-                output.push_str(item);
-                output.push('\n');
-            }
-            output.pop();
-        }
-
-        let completion = json!({
-            "summary": summary,
-            "verification": verification,
-            "remainingWork": remaining_work
-        });
-        Ok(ToolResult {
-            call_id,
-            output,
-            content: vec![ModelContentPart::json(completion.clone())],
-            metadata: json!({
-                "toolName": "complete_task",
-                "taskCompletion": completion,
-                "success": true
-            }),
-        })
-    }
-}
-
-impl_typed_tool!(CompleteTaskTool);
-
-fn validate_completion_text(
-    field: &str,
-    value: String,
-    max_chars: usize,
-) -> anyhow::Result<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        anyhow::bail!("complete_task {field} cannot be empty");
-    }
-    if value.chars().count() > max_chars {
-        anyhow::bail!("complete_task {field} exceeds the {max_chars} character limit");
-    }
-    Ok(value)
-}
-
-fn validate_completion_items(field: &str, values: Vec<String>) -> anyhow::Result<Vec<String>> {
-    if values.len() > MAX_TASK_COMPLETION_ITEMS {
-        anyhow::bail!(
-            "complete_task {field} may contain at most {MAX_TASK_COMPLETION_ITEMS} items"
-        );
-    }
-    values
-        .into_iter()
-        .map(|value| validate_completion_text(field, value, MAX_TASK_COMPLETION_ITEM_CHARS))
-        .collect()
-}
-
-const MAX_TASK_PLAN_STEPS: usize = 20;
-const MAX_TASK_PLAN_STEP_CHARS: usize = 300;
-const MAX_TASK_PLAN_ID_CHARS: usize = 100;
-const MAX_TASK_PLAN_CHANGE_REASON_CHARS: usize = 2_000;
-const MAX_TASK_PLAN_STATUS_REASON_CHARS: usize = 1_000;
-const MAX_TASK_PLAN_STEP_ITEMS: usize = 20;
-const MAX_TASK_REQUIREMENTS: usize = 50;
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct TaskRequirementInput {
-    id: String,
-    statement: String,
-    #[schemars(length(min = 1, max = 20))]
-    source_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct TaskEvidenceRefInput {
-    requirement_id: String,
-    kind: TaskEvidenceKind,
-    /// Provider tool-call id whose persisted successful result is the evidence.
-    tool_call_id: String,
-    summary: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct SetPlanInput {
-    /// Exact goal UUID assigned by the server.
-    goal_id: String,
-    #[schemars(range(min = 0))]
-    expected_revision: u64,
-    change_reason: String,
-    #[schemars(length(min = 1, max = 50))]
-    requirements: Vec<TaskRequirementInput>,
-    #[schemars(length(min = 1, max = 20))]
-    steps: Vec<SetPlanStepInput>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct SetPlanStepInput {
-    id: String,
-    title: String,
-    #[schemars(length(max = 20))]
-    dependencies: Vec<String>,
-    #[schemars(length(min = 1, max = 50))]
-    covers_requirement_ids: Vec<String>,
-    #[schemars(length(min = 1, max = 20))]
-    acceptance_criteria: Vec<String>,
-}
-
-pub struct SetPlanTool;
-
-#[async_trait]
-impl TypedTool for SetPlanTool {
-    type Input = SetPlanInput;
-
-    fn name(&self) -> &str {
-        "set_plan"
-    }
-
-    fn description(&self) -> &str {
-        "Atomically create or replace the dependency-aware external memory for the server-assigned goal. Declare the complete currently known requirement set with source references, and map every step to the requirement ids it covers. The plan records commitments, progress, and tool-backed completion evidence; it does not prescribe a fixed execution schedule beyond explicit dependencies. Every step starts pending and may be revised as evidence changes."
-    }
-
-    fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            ctx.subagent_depth == 0,
-            "only the parent agent may set the shared task plan"
-        );
-        Ok(())
-    }
-
-    async fn execute_typed(
-        &self,
-        call_id: Uuid,
-        input: Self::Input,
-        ctx: ToolContext,
-    ) -> anyhow::Result<ToolResult> {
-        let goal_id = validate_task_plan_text("goal_id", input.goal_id, MAX_TASK_PLAN_ID_CHARS)?;
-        let parsed_goal_id =
-            Uuid::parse_str(&goal_id).context("set_plan goal_id must be a UUID")?;
-        if let Some(expected_goal_id) = ctx.goal_id {
-            anyhow::ensure!(
-                parsed_goal_id == expected_goal_id,
-                "set_plan must use the server-assigned goal id {expected_goal_id}"
-            );
-        }
-        let observed_revision = ctx
-            .current_task_plan
-            .as_ref()
-            .filter(|plan| plan.goal_id == goal_id)
-            .map(|plan| plan.plan_revision)
-            .unwrap_or(0);
-        anyhow::ensure!(
-            observed_revision == input.expected_revision,
-            "stale plan revision: expected {}, current {}",
-            input.expected_revision,
-            observed_revision
-        );
-        anyhow::ensure!(
-            !input.steps.is_empty(),
-            "set_plan requires at least one step"
-        );
-
-        let requirements = validate_task_requirements(input.requirements)?;
-        let requirement_ids = requirements
-            .iter()
-            .map(|requirement| requirement.id.as_str())
-            .collect::<HashSet<_>>();
-
-        let mut steps = Vec::with_capacity(input.steps.len());
-        let mut step_requirements = BTreeMap::new();
-        for step in input.steps {
-            let id = validate_task_plan_text("step.id", step.id, MAX_TASK_PLAN_ID_CHARS)?;
-            let title =
-                validate_task_plan_text("step.title", step.title, MAX_TASK_PLAN_STEP_CHARS)?;
-            let dependencies = validate_task_plan_ids("step.dependencies", step.dependencies)?;
-            let acceptance_criteria =
-                validate_task_plan_items("step.acceptance_criteria", step.acceptance_criteria)?;
-            anyhow::ensure!(
-                !acceptance_criteria.is_empty(),
-                "plan step {id} requires at least one acceptance criterion"
-            );
-            let covers =
-                validate_task_plan_ids("step.covers_requirement_ids", step.covers_requirement_ids)?;
-            anyhow::ensure!(
-                !covers.is_empty(),
-                "plan step {id} must cover at least one requirement"
-            );
-            for requirement_id in &covers {
-                anyhow::ensure!(
-                    requirement_ids.contains(requirement_id.as_str()),
-                    "plan step {id} covers unknown requirement: {requirement_id}"
-                );
-            }
-            step_requirements.insert(id.clone(), covers);
-            steps.push(TaskPlanStep {
-                id,
-                title,
-                status: TaskPlanStepStatus::Pending,
-                status_reason: None,
-                dependencies,
-                acceptance_criteria,
-                evidence: Vec::new(),
-            });
-        }
-        let plan = TaskPlan {
-            plan_revision: observed_revision
-                .checked_add(1)
-                .context("task plan revision overflow")?,
-            goal_id,
-            change_reason: Some(validate_task_plan_text(
-                "change_reason",
-                input.change_reason,
-                MAX_TASK_PLAN_CHANGE_REASON_CHARS,
-            )?),
-            coverage: Some(TaskPlanCoverage {
-                requirements_revision: 1,
-                requirements,
-                step_requirements,
-                evidence_refs: Vec::new(),
-            }),
-            steps,
-        };
-        validate_task_plan(&plan)?;
-        let next_runnable_step = plan.next_runnable_step().map(|step| step.id.clone());
-        let output = plan.render_for_model();
-        Ok(ToolResult {
-            call_id,
-            output,
-            content: vec![ModelContentPart::json(serde_json::to_value(&plan)?)],
-            metadata: json!({
-                "toolName": "set_plan",
-                "taskPlan": plan,
-                "nextRunnableStep": next_runnable_step,
-                "success": true
-            }),
-        })
-    }
-}
-
-impl_typed_tool!(SetPlanTool);
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum TaskPlanOperation {
-    AppendStep,
-    UpdateStep,
-    RemoveStep,
-    ReplaceRequirements,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct AppendTaskPlanStepInput {
-    id: String,
-    title: String,
-    status: TaskPlanStepStatus,
-    #[serde(default)]
-    status_reason: Option<String>,
-    dependencies: Vec<String>,
-    covers_requirement_ids: Vec<String>,
-    acceptance_criteria: Vec<String>,
-    evidence: Vec<String>,
-    #[serde(default)]
-    evidence_refs: Vec<TaskEvidenceRefInput>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct UpdateTaskPlanStepInput {
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    status: Option<TaskPlanStepStatus>,
-    #[serde(default)]
-    status_reason: Option<String>,
-    #[serde(default)]
-    dependencies: Option<Vec<String>>,
-    #[serde(default)]
-    covers_requirement_ids: Option<Vec<String>>,
-    #[serde(default)]
-    acceptance_criteria: Option<Vec<String>>,
-    #[serde(default)]
-    evidence: Option<Vec<String>>,
-    #[serde(default)]
-    evidence_refs: Option<Vec<TaskEvidenceRefInput>>,
-}
-
-impl UpdateTaskPlanStepInput {
-    fn is_empty(&self) -> bool {
-        self.title.is_none()
-            && self.status.is_none()
-            && self.status_reason.is_none()
-            && self.dependencies.is_none()
-            && self.covers_requirement_ids.is_none()
-            && self.acceptance_criteria.is_none()
-            && self.evidence.is_none()
-            && self.evidence_refs.is_none()
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct UpdatePlanInput {
-    /// The single atomic plan-memory mutation to apply.
-    operation: TaskPlanOperation,
-    /// Stable plan namespace; Goal mode must use the server-assigned goal id.
-    goal_id: String,
-    /// Revision currently observed by the caller.
-    expected_revision: u64,
-    /// Why this mutation is necessary.
-    change_reason: String,
-    /// True only when every step has a terminal, explained outcome.
-    #[serde(default)]
-    current_scope_complete: bool,
-    /// Target step id for update_step or remove_step.
-    #[serde(default)]
-    step_id: Option<String>,
-    /// Complete step payload for append_step.
-    #[serde(default)]
-    step: Option<AppendTaskPlanStepInput>,
-    /// Fields to replace for update_step. Omitted fields remain unchanged.
-    #[serde(default)]
-    updates: Option<UpdateTaskPlanStepInput>,
-    /// Complete requirement set for replace_requirements.
-    #[serde(default)]
-    requirements: Option<Vec<TaskRequirementInput>>,
-}
-
-pub struct UpdatePlanTool;
-
-#[async_trait]
-impl TypedTool for UpdatePlanTool {
-    type Input = UpdatePlanInput;
-
-    fn name(&self) -> &str {
-        "update_plan"
-    }
-
-    fn description(&self) -> &str {
-        "Apply one atomic append_step, update_step, remove_step, or replace_requirements mutation to the task's external progress memory. The first append_step must declare the complete currently known requirements; every step declares the requirement ids it covers. Completing a covered step requires tool-backed evidence_refs. Replacing requirements increments the requirements revision and invalidates affected completed work and prior verification evidence. The reported runnable step is advisory rather than a scheduler gate. Always send the current goal_id and expected_revision: goal_id is a stable plan namespace in Default mode and the exact server-assigned goal id in Goal mode. Successful changes increment the plan revision. Deferred, blocked, and cancelled steps require a status_reason."
-    }
-
-    fn validate_context(&self, ctx: &ToolContext) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            ctx.subagent_depth == 0,
-            "only the parent agent may update the shared task plan"
-        );
-        Ok(())
-    }
-
-    async fn execute_typed(
-        &self,
-        call_id: Uuid,
-        mut input: Self::Input,
-        ctx: ToolContext,
-    ) -> anyhow::Result<ToolResult> {
-        let goal_id = validate_task_plan_text("goal_id", input.goal_id, MAX_TASK_PLAN_ID_CHARS)?;
-        if let Some(expected_goal_id) = ctx.goal_id {
-            anyhow::ensure!(
-                goal_id == expected_goal_id.to_string(),
-                "update_plan must use the server-assigned goal id {expected_goal_id}"
-            );
-        }
-        let change_reason = validate_task_plan_text(
-            "change_reason",
-            input.change_reason,
-            MAX_TASK_PLAN_CHANGE_REASON_CHARS,
-        )?;
-        let mut plan = resolve_task_plan_for_mutation(
-            ctx.current_task_plan,
-            &goal_id,
-            input.expected_revision,
-            input.operation,
-        )?;
-
-        let changed_step_id = match input.operation {
-            TaskPlanOperation::AppendStep => {
-                if input.step_id.is_some() || input.updates.is_some() {
-                    anyhow::bail!("append_step accepts step but not step_id or updates");
-                }
-                if plan.coverage.is_none() {
-                    let requirements =
-                        validate_task_requirements(input.requirements.take().context(
-                            "the first append_step requires the complete known requirements",
-                        )?)?;
-                    plan.coverage = Some(TaskPlanCoverage {
-                        requirements_revision: 1,
-                        requirements,
-                        step_requirements: BTreeMap::new(),
-                        evidence_refs: Vec::new(),
-                    });
-                } else if input.requirements.is_some() {
-                    anyhow::bail!(
-                        "append_step accepts requirements only when creating the initial plan; use replace_requirements later"
-                    );
-                }
-                let step = input
-                    .step
-                    .context("append_step requires a complete step payload")?;
-                let (step, covers, evidence_refs) = validate_appended_task_plan_step(step)?;
-                if plan.steps.iter().any(|item| item.id == step.id) {
-                    anyhow::bail!("task plan already contains step id: {}", step.id);
-                }
-                let step_id = step.id.clone();
-                let coverage = plan
-                    .coverage
-                    .as_mut()
-                    .context("append_step requires a requirement-covered task plan")?;
-                validate_step_requirement_coverage(&step_id, &covers, coverage)?;
-                let evidence_refs =
-                    validate_task_evidence_refs(&step_id, evidence_refs, &covers, coverage)?;
-                coverage.step_requirements.insert(step_id.clone(), covers);
-                coverage.evidence_refs.extend(evidence_refs);
-                plan.steps.push(step);
-                Some(step_id)
-            }
-            TaskPlanOperation::UpdateStep => {
-                if input.step.is_some() || input.requirements.is_some() {
-                    anyhow::bail!(
-                        "update_step accepts step_id and updates but not step or requirements"
-                    );
-                }
-                let step_id = validate_task_plan_text(
-                    "step_id",
-                    input.step_id.context("update_step requires step_id")?,
-                    MAX_TASK_PLAN_ID_CHARS,
-                )?;
-                let mut updates = input.updates.context("update_step requires updates")?;
-                if updates.is_empty() {
-                    anyhow::bail!("update_step requires at least one changed field");
-                }
-                let covers_update = updates.covers_requirement_ids.take();
-                let evidence_refs_update = updates.evidence_refs.take();
-                {
-                    let target = plan
-                        .steps
-                        .iter_mut()
-                        .find(|step| step.id == step_id)
-                        .with_context(|| {
-                            format!("task plan does not contain step id: {step_id}")
-                        })?;
-                    apply_task_plan_step_updates(target, updates)?;
-                }
-                let coverage = plan
-                    .coverage
-                    .as_mut()
-                    .context("update_step requires a requirement-covered task plan")?;
-                let covers = match covers_update {
-                    Some(covers) => {
-                        let covers =
-                            validate_task_plan_ids("updates.covers_requirement_ids", covers)?;
-                        validate_step_requirement_coverage(&step_id, &covers, coverage)?;
-                        coverage
-                            .step_requirements
-                            .insert(step_id.clone(), covers.clone());
-                        coverage
-                            .evidence_refs
-                            .retain(|evidence| evidence.step_id != step_id);
-                        covers
-                    }
-                    None => coverage
-                        .step_requirements
-                        .get(&step_id)
-                        .cloned()
-                        .with_context(|| {
-                            format!("task plan step {step_id} has no requirement coverage")
-                        })?,
-                };
-                if let Some(evidence_refs) = evidence_refs_update {
-                    let evidence_refs =
-                        validate_task_evidence_refs(&step_id, evidence_refs, &covers, coverage)?;
-                    coverage
-                        .evidence_refs
-                        .retain(|evidence| evidence.step_id != step_id);
-                    coverage.evidence_refs.extend(evidence_refs);
-                }
-                let changed_step = plan
-                    .steps
-                    .iter()
-                    .find(|step| step.id == step_id)
-                    .expect("updated task plan step remains present");
-                if changed_step.status != TaskPlanStepStatus::Completed {
-                    coverage
-                        .evidence_refs
-                        .retain(|evidence| evidence.step_id != step_id);
-                }
-                Some(step_id)
-            }
-            TaskPlanOperation::RemoveStep => {
-                if input.step.is_some() || input.updates.is_some() || input.requirements.is_some() {
-                    anyhow::bail!(
-                        "remove_step accepts step_id but not step, updates, or requirements"
-                    );
-                }
-                let step_id = validate_task_plan_text(
-                    "step_id",
-                    input.step_id.context("remove_step requires step_id")?,
-                    MAX_TASK_PLAN_ID_CHARS,
-                )?;
-                let dependents = plan
-                    .steps
-                    .iter()
-                    .filter(|step| {
-                        step.dependencies
-                            .iter()
-                            .any(|dependency| dependency == &step_id)
-                    })
-                    .map(|step| step.id.clone())
-                    .collect::<Vec<_>>();
-                if !dependents.is_empty() {
-                    anyhow::bail!(
-                        "cannot remove step {step_id}; it is still required by: {}",
-                        dependents.join(", ")
-                    );
-                }
-                let index = plan
-                    .steps
-                    .iter()
-                    .position(|step| step.id == step_id)
-                    .with_context(|| format!("task plan does not contain step id: {step_id}"))?;
-                plan.steps.remove(index);
-                if let Some(coverage) = plan.coverage.as_mut() {
-                    coverage.step_requirements.remove(&step_id);
-                    coverage
-                        .evidence_refs
-                        .retain(|evidence| evidence.step_id != step_id);
-                }
-                None
-            }
-            TaskPlanOperation::ReplaceRequirements => {
-                if input.step_id.is_some() || input.step.is_some() || input.updates.is_some() {
-                    anyhow::bail!(
-                        "replace_requirements accepts requirements but not step_id, step, or updates"
-                    );
-                }
-                let requirements = validate_task_requirements(
-                    input
-                        .requirements
-                        .context("replace_requirements requires requirements")?,
-                )?;
-                replace_task_requirements(&mut plan, requirements)?;
-                None
-            }
-        };
-
-        if plan.steps.len() > MAX_TASK_PLAN_STEPS {
-            anyhow::bail!("task plan may contain at most {MAX_TASK_PLAN_STEPS} steps");
-        }
-        validate_task_plan(&plan)?;
-        if let Some(changed_step_id) = changed_step_id.as_deref() {
-            let changed_step = plan
-                .steps
-                .iter()
-                .find(|step| step.id == changed_step_id)
-                .expect("changed task plan step remains present");
-            if changed_step.status == TaskPlanStepStatus::Completed
-                && changed_step.acceptance_criteria.is_empty()
-            {
-                anyhow::bail!("completed step {changed_step_id} requires acceptance_criteria");
-            }
-            if changed_step.status == TaskPlanStepStatus::Completed
-                && changed_step.evidence.is_empty()
-            {
-                anyhow::bail!("completed step {changed_step_id} requires evidence");
-            }
-            if changed_step.status == TaskPlanStepStatus::Completed {
-                let has_structured_evidence = plan.coverage.as_ref().is_some_and(|coverage| {
-                    coverage
-                        .evidence_refs
-                        .iter()
-                        .any(|evidence| evidence.step_id == changed_step_id)
-                });
-                anyhow::ensure!(
-                    has_structured_evidence,
-                    "completed step {changed_step_id} requires tool-backed evidence_refs"
-                );
-            }
-        }
-
-        plan.plan_revision = plan
-            .plan_revision
-            .checked_add(1)
-            .context("task plan revision overflow")?;
-        plan.goal_id = goal_id;
-        plan.change_reason = Some(change_reason);
-        let completed = plan
-            .steps
-            .iter()
-            .filter(|step| step.status == TaskPlanStepStatus::Completed)
-            .count();
-        let resolved = plan
-            .steps
-            .iter()
-            .filter(|step| step.status.is_resolved())
-            .count();
-        let verification = plan
-            .steps
-            .iter()
-            .flat_map(|step| step.evidence.iter().cloned())
-            .collect::<Vec<_>>();
-        let status_reasons = plan
-            .steps
-            .iter()
-            .filter_map(|step| step.status_reason.clone())
-            .collect::<Vec<_>>();
-        if input.current_scope_complete && plan.steps.is_empty() {
-            anyhow::bail!("a completed current scope must contain at least one plan step");
-        }
-        if input.current_scope_complete && plan.has_actionable_steps() {
-            anyhow::bail!("a completed current scope cannot contain pending or in_progress steps");
-        }
-        if input.current_scope_complete && verification.is_empty() && status_reasons.is_empty() {
-            anyhow::bail!(
-                "a completed current scope requires step evidence or a terminal status reason"
-            );
-        }
-        let next_runnable_step = plan.next_runnable_step().cloned();
-        let current_step_index = next_runnable_step
-            .as_ref()
-            .and_then(|next| plan.steps.iter().position(|step| step.id == next.id))
-            .map(|index| index + 1);
-        let value = serde_json::to_value(&plan)?;
-        let next_runnable_value = serde_json::to_value(&next_runnable_step)?;
-        Ok(ToolResult {
-            call_id,
-            output: format!(
-                "Plan {} updated to revision {}: {resolved}/{} steps resolved.{}",
-                plan.goal_id,
-                plan.plan_revision,
-                plan.steps.len(),
-                next_runnable_step.as_ref().map_or_else(
-                    || " No runnable step remains.".to_string(),
-                    |step| format!(
-                        " Advisory runnable candidate: {} - {}.",
-                        step.id, step.title
-                    )
-                )
-            ),
-            content: vec![ModelContentPart::json(value.clone())],
-            metadata: json!({
-                "toolName": "update_plan",
-                "taskPlan": value,
-                "operation": input.operation,
-                "planRevision": plan.plan_revision,
-                "goalId": plan.goal_id,
-                "completed": completed,
-                "resolved": resolved,
-                "total": plan.steps.len(),
-                "allStepsComplete": !plan.steps.is_empty() && completed == plan.steps.len(),
-                "allStepsResolved": !plan.steps.is_empty() && resolved == plan.steps.len(),
-                "nextRunnableStep": next_runnable_value,
-                "currentStepIndex": current_step_index,
-                "currentScopeComplete": input.current_scope_complete,
-                "verification": verification,
-                "statusReasons": status_reasons,
-                "success": true
-            }),
-        })
-    }
-}
-
-impl_typed_tool!(UpdatePlanTool);
-
-fn resolve_task_plan_for_mutation(
-    current_plan: Option<TaskPlan>,
-    goal_id: &str,
-    expected_revision: u64,
-    operation: TaskPlanOperation,
-) -> anyhow::Result<TaskPlan> {
-    let Some(current_plan) = current_plan.map(TaskPlan::normalize_legacy) else {
-        if operation != TaskPlanOperation::AppendStep {
-            anyhow::bail!("no task plan exists; start one with append_step at expected_revision 0");
-        }
-        if expected_revision != 0 {
-            anyhow::bail!(
-                "task plan revision conflict: expected {expected_revision}, current revision is 0"
-            );
-        }
-        return Ok(TaskPlan {
-            plan_revision: 0,
-            goal_id: goal_id.to_string(),
-            change_reason: None,
-            coverage: None,
-            steps: Vec::new(),
-        });
-    };
-
-    if current_plan.goal_id != goal_id {
-        if operation == TaskPlanOperation::AppendStep
-            && expected_revision == 0
-            && !current_plan.has_actionable_steps()
-        {
-            return Ok(TaskPlan {
-                plan_revision: 0,
-                goal_id: goal_id.to_string(),
-                change_reason: None,
-                coverage: None,
-                steps: Vec::new(),
-            });
-        }
-        anyhow::bail!(
-            "task plan goal conflict: requested {goal_id}, current goal is {} at revision {}",
-            current_plan.goal_id,
-            current_plan.plan_revision
-        );
-    }
-    if expected_revision != current_plan.plan_revision {
-        anyhow::bail!(
-            "task plan revision conflict: expected {expected_revision}, current revision is {}",
-            current_plan.plan_revision
-        );
-    }
-    Ok(current_plan)
-}
-
-fn validate_appended_task_plan_step(
-    input: AppendTaskPlanStepInput,
-) -> anyhow::Result<(TaskPlanStep, Vec<String>, Vec<TaskEvidenceRefInput>)> {
-    let covers =
-        validate_task_plan_ids("step.covers_requirement_ids", input.covers_requirement_ids)?;
-    let evidence_refs = input.evidence_refs;
-    Ok((
-        TaskPlanStep {
-            id: validate_task_plan_text("step.id", input.id, MAX_TASK_PLAN_ID_CHARS)?,
-            title: validate_task_plan_text("step.title", input.title, MAX_TASK_PLAN_STEP_CHARS)?,
-            status: input.status,
-            status_reason: input
-                .status_reason
-                .map(|reason| {
-                    validate_task_plan_text(
-                        "step.status_reason",
-                        reason,
-                        MAX_TASK_PLAN_STATUS_REASON_CHARS,
-                    )
-                })
-                .transpose()?,
-            dependencies: validate_task_plan_ids("step.dependencies", input.dependencies)?,
-            acceptance_criteria: validate_task_plan_items(
-                "step.acceptance_criteria",
-                input.acceptance_criteria,
-            )?,
-            evidence: validate_task_plan_items("step.evidence", input.evidence)?,
-        },
-        covers,
-        evidence_refs,
-    ))
-}
-
-fn apply_task_plan_step_updates(
-    target: &mut TaskPlanStep,
-    updates: UpdateTaskPlanStepInput,
-) -> anyhow::Result<()> {
-    if let Some(title) = updates.title {
-        target.title = validate_task_plan_text("updates.title", title, MAX_TASK_PLAN_STEP_CHARS)?;
-    }
-    if let Some(status) = updates.status {
-        target.status = status;
-        if !status.requires_status_reason() {
-            target.status_reason = None;
-        }
-    }
-    if let Some(reason) = updates.status_reason {
-        target.status_reason = Some(validate_task_plan_text(
-            "updates.status_reason",
-            reason,
-            MAX_TASK_PLAN_STATUS_REASON_CHARS,
-        )?);
-    }
-    if let Some(dependencies) = updates.dependencies {
-        target.dependencies = validate_task_plan_ids("updates.dependencies", dependencies)?;
-    }
-    if let Some(criteria) = updates.acceptance_criteria {
-        target.acceptance_criteria =
-            validate_task_plan_items("updates.acceptance_criteria", criteria)?;
-    }
-    if let Some(evidence) = updates.evidence {
-        target.evidence = validate_task_plan_items("updates.evidence", evidence)?;
-    }
-    Ok(())
-}
-
-fn validate_task_plan_text(field: &str, value: String, max_chars: usize) -> anyhow::Result<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        anyhow::bail!("update_plan {field} cannot be empty");
-    }
-    if value.chars().count() > max_chars {
-        anyhow::bail!("update_plan {field} exceeds the {max_chars} character limit");
-    }
-    Ok(value)
-}
-
-fn validate_task_plan_items(field: &str, values: Vec<String>) -> anyhow::Result<Vec<String>> {
-    if values.len() > MAX_TASK_PLAN_STEP_ITEMS {
-        anyhow::bail!("update_plan {field} may contain at most {MAX_TASK_PLAN_STEP_ITEMS} items");
-    }
-    let mut unique = HashSet::new();
-    values
-        .into_iter()
-        .map(|value| {
-            let value = validate_task_plan_text(field, value, MAX_TASK_PLAN_STEP_CHARS)?;
-            if !unique.insert(value.to_lowercase()) {
-                anyhow::bail!("update_plan {field} contains a duplicate item: {value}");
-            }
-            Ok(value)
-        })
-        .collect()
-}
-
-fn validate_task_plan_ids(field: &str, values: Vec<String>) -> anyhow::Result<Vec<String>> {
-    if values.len() > MAX_TASK_PLAN_STEPS {
-        anyhow::bail!("update_plan {field} may contain at most {MAX_TASK_PLAN_STEPS} items");
-    }
-    let mut unique = HashSet::new();
-    values
-        .into_iter()
-        .map(|value| {
-            let value = validate_task_plan_text(field, value, MAX_TASK_PLAN_ID_CHARS)?;
-            if !unique.insert(value.clone()) {
-                anyhow::bail!("update_plan {field} contains a duplicate id: {value}");
-            }
-            Ok(value)
-        })
-        .collect()
-}
-
-fn validate_task_requirements(
-    inputs: Vec<TaskRequirementInput>,
-) -> anyhow::Result<Vec<TaskRequirement>> {
-    anyhow::ensure!(
-        !inputs.is_empty(),
-        "task plan requires at least one requirement"
-    );
-    anyhow::ensure!(
-        inputs.len() <= MAX_TASK_REQUIREMENTS,
-        "task plan may contain at most {MAX_TASK_REQUIREMENTS} requirements"
-    );
-    let mut ids = HashSet::new();
-    inputs
-        .into_iter()
-        .map(|input| {
-            let id = validate_task_plan_text("requirement.id", input.id, MAX_TASK_PLAN_ID_CHARS)?;
-            anyhow::ensure!(
-                ids.insert(id.clone()),
-                "task plan contains duplicate requirement id: {id}"
-            );
-            let statement = validate_task_plan_text(
-                "requirement.statement",
-                input.statement,
-                MAX_TASK_PLAN_STEP_CHARS,
-            )?;
-            let source_refs =
-                validate_task_plan_items("requirement.source_refs", input.source_refs)?;
-            anyhow::ensure!(
-                !source_refs.is_empty(),
-                "requirement {id} requires at least one source_ref"
-            );
-            Ok(TaskRequirement {
-                id,
-                statement,
-                source_refs,
-            })
-        })
-        .collect()
-}
-
-fn validate_step_requirement_coverage(
-    step_id: &str,
-    covers: &[String],
-    coverage: &TaskPlanCoverage,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !covers.is_empty(),
-        "task plan step {step_id} must cover at least one requirement"
-    );
-    let requirement_ids = coverage
-        .requirements
-        .iter()
-        .map(|requirement| requirement.id.as_str())
-        .collect::<HashSet<_>>();
-    for requirement_id in covers {
-        anyhow::ensure!(
-            requirement_ids.contains(requirement_id.as_str()),
-            "task plan step {step_id} covers unknown requirement: {requirement_id}"
-        );
-    }
-    Ok(())
-}
-
-fn validate_task_evidence_refs(
-    step_id: &str,
-    inputs: Vec<TaskEvidenceRefInput>,
-    covers: &[String],
-    coverage: &TaskPlanCoverage,
-) -> anyhow::Result<Vec<TaskEvidenceRef>> {
-    anyhow::ensure!(
-        inputs.len() <= MAX_TASK_PLAN_STEP_ITEMS,
-        "step.evidence_refs may contain at most {MAX_TASK_PLAN_STEP_ITEMS} items"
-    );
-    let requirement_ids = coverage
-        .requirements
-        .iter()
-        .map(|requirement| requirement.id.as_str())
-        .collect::<HashSet<_>>();
-    let covered = covers.iter().map(String::as_str).collect::<HashSet<_>>();
-    let mut unique = HashSet::new();
-    inputs
-        .into_iter()
-        .map(|input| {
-            let requirement_id = validate_task_plan_text(
-                "evidence_ref.requirement_id",
-                input.requirement_id,
-                MAX_TASK_PLAN_ID_CHARS,
-            )?;
-            anyhow::ensure!(
-                requirement_ids.contains(requirement_id.as_str()),
-                "evidence_ref references unknown requirement: {requirement_id}"
-            );
-            anyhow::ensure!(
-                covered.contains(requirement_id.as_str()),
-                "step {step_id} cannot submit evidence for uncovered requirement {requirement_id}"
-            );
-            let tool_call_id = validate_task_plan_text(
-                "evidence_ref.tool_call_id",
-                input.tool_call_id,
-                MAX_TASK_PLAN_ID_CHARS,
-            )?;
-            let summary = validate_task_plan_text(
-                "evidence_ref.summary",
-                input.summary,
-                MAX_TASK_PLAN_STEP_CHARS,
-            )?;
-            let unique_key = format!("{requirement_id}:{:?}:{tool_call_id}", input.kind);
-            anyhow::ensure!(
-                unique.insert(unique_key),
-                "step {step_id} contains a duplicate evidence_ref"
-            );
-            Ok(TaskEvidenceRef {
-                step_id: step_id.to_string(),
-                requirement_id,
-                kind: input.kind,
-                tool_call_id,
-                summary,
-                requirements_revision: coverage.requirements_revision,
-            })
-        })
-        .collect()
-}
-
-fn replace_task_requirements(
-    plan: &mut TaskPlan,
-    requirements: Vec<TaskRequirement>,
-) -> anyhow::Result<()> {
-    let coverage = plan
-        .coverage
-        .as_mut()
-        .context("replace_requirements requires a requirement-covered task plan")?;
-    let old = coverage
-        .requirements
-        .iter()
-        .map(|requirement| (requirement.id.clone(), requirement.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let new = requirements
-        .iter()
-        .map(|requirement| (requirement.id.clone(), requirement.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let changed = old
-        .keys()
-        .chain(new.keys())
-        .filter(|id| old.get(*id) != new.get(*id))
-        .cloned()
-        .collect::<HashSet<_>>();
-    anyhow::ensure!(!changed.is_empty(), "replace_requirements made no changes");
-
-    let verification_steps = coverage
-        .evidence_refs
-        .iter()
-        .filter(|evidence| evidence.kind == TaskEvidenceKind::Verification)
-        .map(|evidence| evidence.step_id.clone())
-        .collect::<HashSet<_>>();
-    let affected_steps = coverage
-        .step_requirements
-        .iter()
-        .filter(|(step_id, requirement_ids)| {
-            verification_steps.contains(*step_id)
-                || requirement_ids.iter().any(|id| changed.contains(id))
-        })
-        .map(|(step_id, _)| step_id.clone())
-        .collect::<HashSet<_>>();
-
-    let valid_requirement_ids = new.keys().cloned().collect::<HashSet<_>>();
-    for requirement_ids in coverage.step_requirements.values_mut() {
-        requirement_ids.retain(|id| valid_requirement_ids.contains(id));
-    }
-    for step in &mut plan.steps {
-        if affected_steps.contains(&step.id)
-            && matches!(
-                step.status,
-                TaskPlanStepStatus::InProgress | TaskPlanStepStatus::Completed
-            )
-        {
-            step.status = TaskPlanStepStatus::Pending;
-            step.status_reason = None;
-            step.evidence.clear();
-        }
-    }
-    coverage
-        .requirements_revision
-        .checked_add(1)
-        .context("requirements revision overflow")
-        .map(|revision| coverage.requirements_revision = revision)?;
-    coverage.requirements = requirements;
-    coverage.evidence_refs.retain(|evidence| {
-        !affected_steps.contains(&evidence.step_id)
-            && valid_requirement_ids.contains(&evidence.requirement_id)
-    });
-    for evidence in &mut coverage.evidence_refs {
-        evidence.requirements_revision = coverage.requirements_revision;
-    }
-    Ok(())
-}
-
-fn validate_task_plan(plan: &TaskPlan) -> anyhow::Result<()> {
-    let mut ids = HashSet::new();
-    let mut titles = HashSet::new();
-    let mut in_progress = 0usize;
-    for step in &plan.steps {
-        if !ids.insert(step.id.as_str()) {
-            anyhow::bail!("task plan contains duplicate step id: {}", step.id);
-        }
-        if !titles.insert(step.title.to_lowercase()) {
-            anyhow::bail!("task plan contains duplicate step title: {}", step.title);
-        }
-        if step.status == TaskPlanStepStatus::InProgress {
-            in_progress += 1;
-        }
-        if step.status.requires_status_reason()
-            && step.status_reason.as_deref().is_none_or(str::is_empty)
-        {
-            anyhow::bail!(
-                "task plan step {} requires status_reason when status is {:?}",
-                step.id,
-                step.status
-            );
-        }
-    }
-    if in_progress > 1 {
-        anyhow::bail!("task plan may contain at most one in_progress step");
-    }
-
-    if let Some(coverage) = plan.coverage.as_ref() {
-        anyhow::ensure!(
-            coverage.requirements_revision > 0,
-            "requirements_revision must be greater than zero"
-        );
-        let mut requirement_ids = HashSet::new();
-        for requirement in &coverage.requirements {
-            anyhow::ensure!(
-                requirement_ids.insert(requirement.id.as_str()),
-                "task plan contains duplicate requirement id: {}",
-                requirement.id
-            );
-            anyhow::ensure!(
-                !requirement.statement.trim().is_empty(),
-                "task plan requirement {} has an empty statement",
-                requirement.id
-            );
-            anyhow::ensure!(
-                !requirement.source_refs.is_empty(),
-                "task plan requirement {} requires source_refs",
-                requirement.id
-            );
-        }
-        anyhow::ensure!(
-            !coverage.requirements.is_empty(),
-            "requirement-covered task plan cannot have an empty requirement set"
-        );
-        for step in &plan.steps {
-            let covers = coverage
-                .step_requirements
-                .get(&step.id)
-                .with_context(|| format!("task plan step {} has no coverage entry", step.id))?;
-            for requirement_id in covers {
-                anyhow::ensure!(
-                    requirement_ids.contains(requirement_id.as_str()),
-                    "task plan step {} covers unknown requirement: {requirement_id}",
-                    step.id
-                );
-            }
-        }
-        for step_id in coverage.step_requirements.keys() {
-            anyhow::ensure!(
-                plan.steps.iter().any(|step| &step.id == step_id),
-                "task plan coverage references unknown step: {step_id}"
-            );
-        }
-        let mut evidence_keys = HashSet::new();
-        for evidence in &coverage.evidence_refs {
-            let covers = coverage
-                .step_requirements
-                .get(&evidence.step_id)
-                .with_context(|| {
-                    format!("evidence_ref references unknown step: {}", evidence.step_id)
-                })?;
-            anyhow::ensure!(
-                covers.contains(&evidence.requirement_id),
-                "evidence_ref step {} does not cover requirement {}",
-                evidence.step_id,
-                evidence.requirement_id
-            );
-            anyhow::ensure!(
-                evidence.requirements_revision == coverage.requirements_revision,
-                "evidence_ref for {} is stale (revision {}, current {})",
-                evidence.requirement_id,
-                evidence.requirements_revision,
-                coverage.requirements_revision
-            );
-            anyhow::ensure!(
-                evidence_keys.insert((
-                    evidence.step_id.as_str(),
-                    evidence.requirement_id.as_str(),
-                    format!("{:?}", evidence.kind),
-                    evidence.tool_call_id.as_str(),
-                )),
-                "task plan contains a duplicate evidence_ref"
-            );
-        }
-    }
-
-    for step in &plan.steps {
-        for dependency in &step.dependencies {
-            if dependency == &step.id {
-                anyhow::bail!("task plan step {} cannot depend on itself", step.id);
-            }
-            let dependency_step = plan
-                .steps
-                .iter()
-                .find(|candidate| &candidate.id == dependency)
-                .with_context(|| {
-                    format!(
-                        "task plan step {} has unknown dependency: {dependency}",
-                        step.id
-                    )
-                })?;
-            if matches!(
-                step.status,
-                TaskPlanStepStatus::InProgress | TaskPlanStepStatus::Completed
-            ) && dependency_step.status != TaskPlanStepStatus::Completed
-            {
-                anyhow::bail!(
-                    "task plan step {} cannot be {:?} before dependency {dependency} is completed",
-                    step.id,
-                    step.status
-                );
-            }
-        }
-    }
-
-    let mut unresolved = plan
-        .steps
-        .iter()
-        .map(|step| {
-            (
-                step.id.clone(),
-                step.dependencies.iter().cloned().collect::<HashSet<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    while !unresolved.is_empty() {
-        let resolved = unresolved
-            .iter()
-            .filter_map(|(id, dependencies)| dependencies.is_empty().then_some(id.clone()))
-            .collect::<Vec<_>>();
-        if resolved.is_empty() {
-            anyhow::bail!(
-                "task plan contains a dependency cycle involving: {}",
-                unresolved.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
-        }
-        for id in &resolved {
-            unresolved.remove(id);
-        }
-        for dependencies in unresolved.values_mut() {
-            for id in &resolved {
-                dependencies.remove(id);
-            }
-        }
-    }
-    Ok(())
-}
-
+mod work_form_tools;
+pub use work_form_tools::{SetPlanTool, UpdatePlanTool};
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EmptyToolInput {}
@@ -3017,7 +1851,7 @@ impl TypedTool for ListSkillsTool {
         &self,
         call_id: Uuid,
         _input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let skills = discover_skills(Some(&ctx.workspace_root))
             .into_iter()
@@ -3077,7 +1911,7 @@ impl TypedTool for ReadSkillTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let id = input.id.trim();
         anyhow::ensure!(!id.is_empty(), "read_skill id must be a non-empty string");
@@ -3171,7 +2005,7 @@ impl TypedTool for CreateSkillTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scope = input.scope.unwrap_or(SkillScope::User);
         let name = input.name.trim().to_ascii_lowercase();
@@ -3406,7 +2240,7 @@ impl TypedTool for BrowserTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let runtime = ctx
             .browser
@@ -3861,7 +2695,7 @@ impl TypedTool for ComputerTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let runtime = ctx
             .computer
@@ -4090,14 +2924,17 @@ fn computer_tool_result(
     }
 }
 
-fn inspect_browser_destination(ctx: &ToolContext, raw_url: &str) -> anyhow::Result<String> {
+fn inspect_browser_destination(
+    ctx: &ToolInvocationContext,
+    raw_url: &str,
+) -> anyhow::Result<String> {
     let host = browser_destination_host(raw_url)?;
     enforce_policy_decision(ctx.policy.inspect_network(&host), ctx.approval_granted)?;
     Ok(host)
 }
 
 fn inspect_browser_node_destinations(
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
     node: &crate::browser::BrowserNode,
 ) -> anyhow::Result<Vec<String>> {
     let mut inspected = HashSet::new();
@@ -4114,7 +2951,7 @@ fn inspect_browser_node_destinations(
 }
 
 async fn grant_browser_network_access<I>(
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
     runtime: &Arc<dyn BrowserRuntime>,
     session: BrowserSessionId,
     explicit_hosts: I,
@@ -4130,8 +2967,8 @@ where
     Ok(())
 }
 
-fn configured_browser_hosts(ctx: &ToolContext) -> anyhow::Result<HashSet<String>> {
-    let (Some(store), Some(thread_id)) = (ctx.store.as_ref(), ctx.thread_id) else {
+fn configured_browser_hosts(ctx: &ToolInvocationContext) -> anyhow::Result<HashSet<String>> {
+    let (Some(store), Some(thread_id)) = (ctx.state.as_ref(), ctx.thread_id) else {
         return Ok(HashSet::new());
     };
     let settings =
@@ -4403,7 +3240,7 @@ impl TypedTool for SpawnAgentTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
@@ -4476,7 +3313,7 @@ impl TypedTool for SpawnAgentTool {
 impl_typed_tool!(SpawnAgentTool);
 
 async fn subagent_execution_contract(
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
     task_name: &str,
     requested: &str,
     profile_read_only: bool,
@@ -4660,7 +3497,7 @@ impl TypedTool for SendAgentMessageTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = subagent_scheduler(&ctx)?;
         let target = input.target.trim();
@@ -4707,7 +3544,7 @@ impl TypedTool for FollowupAgentTaskTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = subagent_scheduler(&ctx)?;
         let target = input.target.trim();
@@ -4748,7 +3585,7 @@ impl TypedTool for InterruptAgentTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = subagent_scheduler(&ctx)?;
         let target = input.target.trim();
@@ -4788,7 +3625,7 @@ impl TypedTool for ListAgentsTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = subagent_scheduler(&ctx)?;
         let runs = scheduler.list_scoped(subagent_scope(&ctx)?, input.path_prefix.as_deref());
@@ -4833,7 +3670,7 @@ impl TypedTool for SendAgentInputTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
@@ -4876,7 +3713,7 @@ impl TypedTool for CancelAgentTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
@@ -4932,7 +3769,7 @@ impl TypedTool for WaitAgentTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
@@ -5047,7 +3884,7 @@ impl TypedTool for WaitAgentsTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let scheduler = ctx
             .subagents
@@ -5225,7 +4062,7 @@ where
     }
 }
 
-fn subagent_scope(ctx: &ToolContext) -> anyhow::Result<SubagentScope> {
+fn subagent_scope(ctx: &ToolInvocationContext) -> anyhow::Result<SubagentScope> {
     Ok(SubagentScope {
         thread_id: ctx
             .thread_id
@@ -5238,7 +4075,7 @@ fn subagent_scope(ctx: &ToolContext) -> anyhow::Result<SubagentScope> {
     })
 }
 
-fn subagent_scheduler(ctx: &ToolContext) -> anyhow::Result<&SubagentScheduler> {
+fn subagent_scheduler(ctx: &ToolInvocationContext) -> anyhow::Result<&SubagentScheduler> {
     ctx.subagents
         .as_ref()
         .context("subagent runtime is unavailable")
@@ -5305,7 +4142,7 @@ impl TypedTool for ListFilesTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let relative = input.path.trim();
         anyhow::ensure!(
@@ -5380,9 +4217,9 @@ impl StoredAttachment {
     }
 }
 
-fn attachment_context(ctx: &ToolContext) -> anyhow::Result<(Arc<dyn SessionStore>, Uuid)> {
+fn attachment_context(ctx: &ToolInvocationContext) -> anyhow::Result<(ToolStateStore, Uuid)> {
     let store = ctx
-        .store
+        .state
         .clone()
         .context("attachment tools require a persistent session store")?;
     let thread_id = ctx
@@ -5392,7 +4229,7 @@ fn attachment_context(ctx: &ToolContext) -> anyhow::Result<(Arc<dyn SessionStore
 }
 
 fn find_stored_attachment(
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
     attachment_id: Uuid,
 ) -> anyhow::Result<StoredAttachment> {
     let (store, thread_id) = attachment_context(ctx)?;
@@ -5491,7 +4328,7 @@ impl StoredAttachmentFile {
 }
 
 async fn read_stored_attachment_file(
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
     attachment_id: Uuid,
     max_bytes: u64,
 ) -> anyhow::Result<StoredAttachmentFile> {
@@ -5593,7 +4430,7 @@ impl TypedTool for ReadAttachmentTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let attachment_id = Uuid::parse_str(input.attachment_id.trim())
             .context("attachmentId must be a UUID from the attachment manifest")?;
@@ -5707,7 +4544,7 @@ impl TypedTool for ViewAttachmentTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let attachment_id = Uuid::parse_str(input.attachment_id.trim())
             .context("attachmentId must be a UUID from the attachment manifest")?;
@@ -6050,7 +4887,7 @@ async fn inspect_attachment_through_mcp(
     content_type: &str,
     data: &[u8],
     focus: Option<&str>,
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     let focus = focus
         .map(str::trim)
@@ -6295,7 +5132,7 @@ impl TypedTool for ReadFileTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         execute_read_file_with_cap(call_id, input, ctx, READ_FILE_WINDOW_CHARS).await
     }
@@ -6304,7 +5141,7 @@ impl TypedTool for ReadFileTool {
 async fn execute_read_file_with_cap(
     call_id: Uuid,
     input: FileReadInput,
-    ctx: ToolContext,
+    ctx: ToolInvocationContext,
     max_chars: usize,
 ) -> anyhow::Result<ToolResult> {
     let relative = input.path.trim();
@@ -6454,7 +5291,7 @@ async fn execute_read_file_with_cap(
     };
 
     if bytes > READ_FILE_ARTIFACT_THRESHOLD {
-        if let Some(ref store) = ctx.store {
+        if let Some(ref store) = ctx.state {
             if let Some(thread_id) = ctx.thread_id {
                 let tool_result = ToolResult {
                     call_id,
@@ -6540,7 +5377,7 @@ impl TypedTool for ReadArtifactTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let artifact_id = Uuid::parse_str(input.artifact_id.trim())
             .context("read_artifact artifactId must be a UUID")?;
@@ -6548,7 +5385,7 @@ impl TypedTool for ReadArtifactTool {
             .thread_id
             .context("read_artifact requires an active task")?;
         let store = ctx
-            .store
+            .state
             .as_ref()
             .context("read_artifact requires artifact storage")?;
         let artifact = store
@@ -6645,7 +5482,7 @@ impl TypedTool for ReadFilesTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         if input.files.is_empty() || input.files.len() > READ_FILES_MAX_ITEMS {
             anyhow::bail!("read_files accepts between 1 and {READ_FILES_MAX_ITEMS} files per call");
@@ -6762,7 +5599,7 @@ impl TypedTool for WriteFileTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let relative = input.path.trim();
         anyhow::ensure!(!relative.is_empty(), "write_file requires a path");
@@ -6849,7 +5686,7 @@ impl TypedTool for SearchTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let query = input.query.trim();
         anyhow::ensure!(!query.is_empty(), "search requires a query");
@@ -6947,7 +5784,7 @@ const DEFAULT_BACKGROUND_TIMEOUT_SECONDS: u64 = 3_600;
 const DEFAULT_FOREGROUND_YIELD_MILLISECONDS: u64 = 30_000;
 const MAX_FOREGROUND_YIELD_MILLISECONDS: u64 = 60_000;
 
-fn background_scope(ctx: &ToolContext) -> anyhow::Result<BackgroundScope> {
+fn background_scope(ctx: &ToolInvocationContext) -> anyhow::Result<BackgroundScope> {
     Ok(BackgroundScope {
         thread_id: ctx
             .thread_id
@@ -7035,7 +5872,7 @@ impl TypedTool for BackgroundOutputTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let registry = ctx
             .background
@@ -7201,27 +6038,28 @@ impl TypedTool for ShellTool {
     fn authorization_preflight(
         &self,
         input: &Self::Input,
-        ctx: &ToolContext,
+        ctx: &ToolInvocationContext,
     ) -> Option<PolicyDecision> {
+        if analyze_shell_command(&input.command).is_unreviewable_destructive_action() {
+            // Let execution return the structured UnreviewableAction result so
+            // the model can concretize the target without creating a useless
+            // approval request for an action that cannot be authorized safely.
+            return Some(PolicyDecision::Allow);
+        }
         Some(ctx.policy.inspect_command(&input.command))
     }
 
-    fn execution_intent(
-        &self,
-        _input: &Self::Input,
-        _workspace_root: &Path,
-    ) -> ToolExecutionIntent {
+    fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
         // A nominally foreground call may yield into the shared background
         // registry, so its authority must describe the process's real lifetime.
-        let lifetime = ProcessLifetime::Background;
-        ToolExecutionIntent::session_process(lifetime)
+        shell_execution_intent(&analyze_shell_command(&input.command))
     }
 
     async fn execute_typed(
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let command = input.command.trim();
         anyhow::ensure!(!command.is_empty(), "shell requires a command");
@@ -7486,6 +6324,82 @@ fn shell_completed_result(
 
 impl_typed_tool!(ShellTool);
 
+fn shell_execution_intent(analysis: &ShellCommandAnalysis) -> ToolExecutionIntent {
+    let reads_files = analysis.capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            ShellCapability::ReadFiles | ShellCapability::GitRead
+        )
+    });
+    let writes_files = analysis.capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            ShellCapability::WorkspaceWrite
+                | ShellCapability::DeleteFiles
+                | ShellCapability::GitMutation
+        )
+    });
+    let needs_network = analysis.capabilities.contains(&ShellCapability::Network);
+    let command_scoped = analysis.capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            ShellCapability::DynamicExecution
+                | ShellCapability::Unknown
+                | ShellCapability::GitMutation
+        )
+    });
+    let concrete_paths = analysis
+        .concrete_targets
+        .iter()
+        .filter(|target| shell_target_is_path(target))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+
+    let mut intent = if writes_files {
+        ToolExecutionIntent::workspace_mutation(concrete_paths.clone())
+    } else if reads_files || analysis.is_strictly_read_only() {
+        ToolExecutionIntent::observation(concrete_paths.clone())
+    } else {
+        ToolExecutionIntent::session_process(ProcessLifetime::Background)
+    };
+    intent.process_lifetime = ProcessLifetime::Background;
+    intent.network = if needs_network {
+        NetworkAccess::Required
+    } else {
+        NetworkAccess::PreferDeny
+    };
+    intent.filesystem = if writes_files {
+        FilesystemAccess::WriteWorkspace
+    } else if reads_files || analysis.is_strictly_read_only() {
+        FilesystemAccess::ReadWorkspace
+    } else {
+        FilesystemAccess::InheritSession
+    };
+    intent.approval_escalation = if command_scoped {
+        ApprovalEscalation::CommandScopedHostAccess
+    } else if concrete_paths.is_empty() {
+        ApprovalEscalation::None
+    } else {
+        ApprovalEscalation::ExactPaths
+    };
+    if reads_files && !writes_files {
+        intent.requested_read_paths = concrete_paths;
+    }
+    intent
+}
+
+fn shell_target_is_path(target: &str) -> bool {
+    let target = target.trim();
+    !target.is_empty()
+        && !target.contains("://")
+        && !matches!(
+            target,
+            "workspace:command-scope"
+                | "repository:current-workdir"
+                | "repository:index-and-worktree"
+        )
+}
+
 fn model_shell_request(command: &str, interactive: bool) -> ExecRequest {
     let request = ExecRequest::shell(command);
     if interactive {
@@ -7575,7 +6489,7 @@ impl TypedTool for GitDiffTool {
         &self,
         call_id: Uuid,
         _input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let output = ctx
             .environment
@@ -7707,7 +6621,7 @@ impl TypedTool for ApplyPatchTool {
     fn authorization_preflight(
         &self,
         input: &Self::Input,
-        _ctx: &ToolContext,
+        _ctx: &ToolInvocationContext,
     ) -> Option<PolicyDecision> {
         let deletes_file = match input {
             ApplyPatchInput::Structured(input) => {
@@ -7734,7 +6648,7 @@ impl TypedTool for ApplyPatchTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         match input {
             ApplyPatchInput::Portable(input) => {
@@ -7752,7 +6666,7 @@ impl_typed_tool!(ApplyPatchTool);
 async fn execute_portable_patch(
     call_id: Uuid,
     patch: &str,
-    ctx: ToolContext,
+    ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     if let Some(operations) = parse_apply_patch_envelope(patch)? {
         let outcome = execute_native_patch_batch(operations, &ctx).await?;
@@ -7830,7 +6744,7 @@ async fn execute_portable_patch(
 pub async fn execute_native_patch_operation(
     call_id: Uuid,
     operation: NativePatchOperation,
-    ctx: ToolContext,
+    ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     let mut outcome = execute_native_patch_batch(vec![operation], &ctx).await?;
     let report = outcome
@@ -7869,7 +6783,7 @@ struct NativePatchBatchOutcome {
 
 async fn execute_native_patch_batch(
     operations: Vec<NativePatchOperation>,
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
 ) -> anyhow::Result<NativePatchBatchOutcome> {
     anyhow::ensure!(!operations.is_empty(), "native patch batch is empty");
     let mut mutations = Vec::with_capacity(operations.len());
@@ -8364,7 +7278,7 @@ fn tool_resource_key(kind: &str, path: &str) -> String {
     )
 }
 
-fn enforce_read_policy(ctx: &ToolContext, path: &Path) -> anyhow::Result<()> {
+fn enforce_read_policy(ctx: &ToolInvocationContext, path: &Path) -> anyhow::Result<()> {
     enforce_policy_decision(ctx.policy.inspect_read(path), ctx.approval_granted)
 }
 
@@ -9047,13 +7961,17 @@ impl Tool for McpToolWrapper {
     fn authorization_preflight(
         &self,
         _call: &ToolCall,
-        ctx: &ToolContext,
+        ctx: &ToolInvocationContext,
     ) -> Option<PolicyDecision> {
         let permission = ToolPermissionDescriptor::from(&self.descriptor);
         Some(ctx.policy.inspect_mcp_tool_call(&permission))
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute(
+        &self,
+        call: ToolCall,
+        ctx: ToolInvocationContext,
+    ) -> anyhow::Result<ToolResult> {
         let permission = ToolPermissionDescriptor::from(&self.descriptor);
         enforce_policy_decision(
             ctx.policy.inspect_mcp_tool_call(&permission),
@@ -9195,7 +8113,7 @@ mod tests {
     };
     use crate::model::{ContextSourceRef, Message, MessageRole};
     use crate::policy::{BasicPolicyEngine, PermissionMode};
-    use crate::store::SqliteSessionStore;
+    use crate::store::{SessionStore, SqliteSessionStore};
     use crate::subagents::{
         NoopSubagentObserver, SubagentExecutor, SubagentRun, SubagentSchedulerConfig,
     };
@@ -9300,13 +8218,13 @@ mod tests {
     fn computer_tool_context(
         runtime: ComputerRuntimeFixture,
         allowed_applications: &[&str],
-    ) -> ToolContext {
+    ) -> ToolInvocationContext {
         let workspace = std::env::current_dir().expect("current directory");
         let policy = Arc::new(BasicPolicyEngine::new(
             workspace.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolContext::local(workspace, policy);
+        let mut context = ToolInvocationContext::local(workspace, policy);
         context.thread_id = Some(Uuid::new_v4());
         context.computer = Some(Arc::new(runtime));
         context.computer_access_policy = ComputerAccessPolicy::new(allowed_applications);
@@ -9575,8 +8493,8 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::ReadOnly,
         ));
-        let mut context = ToolContext::local(workspace_root.clone(), policy);
-        context.store = Some(store);
+        let mut context = ToolInvocationContext::local(workspace_root.clone(), policy);
+        context.state = Some(ToolStateStore::new(store));
         context.thread_id = Some(thread.id);
         context.model_supports_vision = false;
         let error = ViewAttachmentTool
@@ -9731,8 +8649,8 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::ReadOnly,
         ));
-        let mut context = ToolContext::local(workspace_root.clone(), policy);
-        context.store = Some(store);
+        let mut context = ToolInvocationContext::local(workspace_root.clone(), policy);
+        context.state = Some(ToolStateStore::new(store));
         context.thread_id = Some(thread.id);
         let result = ReadAttachmentTool
             .execute_typed(
@@ -9764,7 +8682,7 @@ mod tests {
             workspace.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolContext::local(workspace, policy);
+        let mut context = ToolInvocationContext::local(workspace, policy);
         context.capability_projection = CapabilityProjection::deny_all();
 
         let listed = ListSkillsTool
@@ -9966,13 +8884,13 @@ mod tests {
         scheduler: SubagentScheduler,
         thread_id: Uuid,
         parent_turn_id: Uuid,
-    ) -> ToolContext {
+    ) -> ToolInvocationContext {
         let workspace_root = std::env::current_dir().unwrap();
         let policy = Arc::new(BasicPolicyEngine::new(
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolContext::local(workspace_root, policy);
+        let mut context = ToolInvocationContext::local(workspace_root, policy);
         context.subagents = Some(scheduler);
         context.thread_id = Some(thread_id);
         context.parent_turn_id = Some(parent_turn_id);
@@ -10137,8 +9055,11 @@ mod tests {
         ));
         let mut sandbox = LocalSandboxConfig::enforce();
         sandbox.network = crate::sandbox::NetworkPolicy::Allow;
-        let context =
-            ToolContext::local_with_sandbox_config(workspace_root.clone(), policy, sandbox);
+        let context = ToolInvocationContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            sandbox,
+        );
 
         let searched = SearchTool
             .execute(
@@ -10203,7 +9124,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local(workspace_root.clone(), policy);
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
         let searched = SearchTool
             .execute(
@@ -10274,7 +9195,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolContext::local(workspace_root.clone(), policy);
+        let mut context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
         let traversal = ListFilesTool
             .execute(
@@ -10358,7 +9279,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::Auto,
         ));
-        let context = ToolContext::local(workspace_root.clone(), policy);
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
         let first = ReadFileTool
             .execute(
@@ -10419,8 +9340,8 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::Auto,
         ));
-        let mut context = ToolContext::local(workspace_root.clone(), policy);
-        context.store = Some(store);
+        let mut context = ToolInvocationContext::local(workspace_root.clone(), policy);
+        context.state = Some(ToolStateStore::new(store));
         context.thread_id = Some(thread.id);
 
         let first = ReadArtifactTool
@@ -10458,7 +9379,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::Auto,
         ));
-        let context = ToolContext::local(workspace_root.clone(), policy);
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
         let result = ReadFileTool
             .execute(
@@ -10495,7 +9416,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::Auto,
         ));
-        let context = ToolContext::local(workspace_root.clone(), policy);
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
         for (input, expected) in [
             (
@@ -10540,7 +9461,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::Auto,
         ));
-        let context = ToolContext::local(workspace_root.clone(), policy);
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
         let result = execute_read_file_with_cap(
             Uuid::new_v4(),
@@ -10581,8 +9502,11 @@ mod tests {
             PermissionMode::Auto,
             &config,
         ));
-        let context =
-            ToolContext::local_with_sandbox_config(workspace_root.clone(), policy, config);
+        let context = ToolInvocationContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            config,
+        );
 
         let listed = ListFilesTool
             .execute(
@@ -10638,8 +9562,11 @@ mod tests {
             PermissionMode::Auto,
             &config,
         ));
-        let context =
-            ToolContext::local_with_sandbox_config(workspace_root.clone(), policy, config);
+        let context = ToolInvocationContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            config,
+        );
         let target = outside.join("dependency-cache.txt");
 
         WriteFileTool
@@ -10716,8 +9643,8 @@ mod tests {
             workspace.clone(),
             PermissionMode::Auto,
         ));
-        let mut context = ToolContext::local(workspace, policy);
-        context.store = Some(store);
+        let mut context = ToolInvocationContext::local(workspace, policy);
+        context.state = Some(ToolStateStore::new(store));
         context.thread_id = Some(thread_id);
 
         assert_eq!(
@@ -10825,60 +9752,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_task_returns_a_structured_terminal_signal() {
-        let workspace_root = std::env::current_dir().unwrap();
-        let policy = Arc::new(BasicPolicyEngine::new(
-            workspace_root.clone(),
-            PermissionMode::FullAccess,
-        ));
-        let result = CompleteTaskTool
-            .execute(
-                ToolCall::new(
-                    "complete_task",
-                    json!({
-                        "summary": "Requested scope is complete.",
-                        "verification": ["Focused tests passed"],
-                        "remaining_work": ["A later phase remains pending"]
-                    }),
-                ),
-                ToolContext::local(workspace_root.clone(), policy.clone()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.metadata["success"], true);
-        assert_eq!(
-            result.metadata["taskCompletion"]["summary"],
-            "Requested scope is complete."
-        );
-        assert!(result.output.contains("Focused tests passed"));
-        assert!(result.output.contains("A later phase remains pending"));
-
-        let invalid = CompleteTaskTool
-            .execute(
-                ToolCall::new(
-                    "complete_task",
-                    json!({
-                        "summary": "   ",
-                        "verification": [],
-                        "remaining_work": []
-                    }),
-                ),
-                ToolContext::local(workspace_root, policy),
-            )
-            .await
-            .unwrap_err();
-        assert!(invalid.to_string().contains("summary cannot be empty"));
-    }
-
-    #[tokio::test]
     async fn request_user_input_builds_a_valid_plan_decision_request() {
         let workspace_root = std::env::current_dir().unwrap();
         let policy = Arc::new(BasicPolicyEngine::new(
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolContext::local(workspace_root, policy);
-        context.collaboration_mode = CollaborationMode::Plan;
+        let mut context = ToolInvocationContext::local(workspace_root, policy);
+        context.collaboration_mode = CollaborationMode::Default;
         let result = RequestUserInputTool
             .execute(
                 ToolCall::new(
@@ -10915,350 +9796,6 @@ mod tests {
         assert_eq!(request.questions[0].options.len(), 2);
         assert!(request.questions[0].options[0].recommended);
         assert!(request.questions[0].allow_custom);
-    }
-
-    #[tokio::test]
-    async fn set_plan_binds_to_server_goal_and_creates_a_pending_dag() {
-        let workspace_root = std::env::current_dir().unwrap();
-        let policy = Arc::new(BasicPolicyEngine::new(
-            workspace_root.clone(),
-            PermissionMode::FullAccess,
-        ));
-        let goal_id = Uuid::new_v4();
-        let mut context = ToolContext::local(workspace_root, policy);
-        context.collaboration_mode = CollaborationMode::Plan;
-        context.goal_id = Some(goal_id);
-        let result = SetPlanTool
-            .execute(
-                ToolCall::new(
-                    "set_plan",
-                    json!({
-                        "goal_id": goal_id,
-                        "expected_revision": 0,
-                        "change_reason": "Initial plan",
-                        "requirements": [{
-                            "id": "persistence",
-                            "statement": "Inspect, implement, and verify the requested persistence behavior",
-                            "source_refs": ["user request"]
-                        }],
-                        "steps": [
-                            {
-                                "id": "inspect",
-                                "title": "Inspect the current behavior",
-                                "dependencies": [],
-                                "covers_requirement_ids": ["persistence"],
-                                "acceptance_criteria": ["Behavior is documented"]
-                            },
-                            {
-                                "id": "implement",
-                                "title": "Implement and verify the change",
-                                "dependencies": ["inspect"],
-                                "covers_requirement_ids": ["persistence"],
-                                "acceptance_criteria": ["Focused tests pass"]
-                            }
-                        ]
-                    }),
-                ),
-                context,
-            )
-            .await
-            .expect("set plan");
-        let plan: TaskPlan = serde_json::from_value(result.metadata["taskPlan"].clone()).unwrap();
-        assert_eq!(plan.goal_id, goal_id.to_string());
-        assert_eq!(plan.plan_revision, 1);
-        assert_eq!(plan.next_runnable_step().unwrap().id, "inspect");
-        assert!(plan
-            .steps
-            .iter()
-            .all(|step| step.status == TaskPlanStepStatus::Pending));
-    }
-
-    #[tokio::test]
-    async fn update_plan_validates_progress_and_parent_ownership() {
-        let workspace_root = std::env::current_dir().unwrap();
-        let policy = Arc::new(BasicPolicyEngine::new(
-            workspace_root.clone(),
-            PermissionMode::FullAccess,
-        ));
-        let result = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "append_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 0,
-                        "change_reason": "Start with input inspection",
-                        "requirements": [{
-                            "id": "deliver-output",
-                            "statement": "Inspect the inputs and produce the requested output",
-                            "source_refs": ["user request"]
-                        }],
-                        "step": {
-                            "id": "inspect-inputs",
-                            "title": "Inspect inputs",
-                            "status": "in_progress",
-                            "dependencies": [],
-                            "covers_requirement_ids": ["deliver-output"],
-                            "acceptance_criteria": ["Inputs and constraints are understood"],
-                            "evidence": [],
-                            "evidence_refs": []
-                        }
-                    }),
-                ),
-                ToolContext::local(workspace_root.clone(), policy.clone()),
-            )
-            .await
-            .unwrap();
-        let first_plan: TaskPlan =
-            serde_json::from_value(result.metadata["taskPlan"].clone()).unwrap();
-        assert_eq!(first_plan.plan_revision, 1);
-        assert_eq!(first_plan.steps.len(), 1);
-        assert!(first_plan.is_active());
-
-        let mut append_context = ToolContext::local(workspace_root.clone(), policy.clone());
-        append_context.current_task_plan = Some(first_plan);
-        let appended = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "append_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 1,
-                        "change_reason": "Add the production step after inspecting inputs",
-                        "step": {
-                            "id": "produce-output",
-                            "title": "Produce output",
-                            "status": "pending",
-                            "dependencies": ["inspect-inputs"],
-                            "covers_requirement_ids": ["deliver-output"],
-                            "acceptance_criteria": ["Requested output is produced"],
-                            "evidence": [],
-                            "evidence_refs": []
-                        }
-                    }),
-                ),
-                append_context,
-            )
-            .await
-            .unwrap();
-        let plan: TaskPlan = serde_json::from_value(appended.metadata["taskPlan"].clone()).unwrap();
-        assert_eq!(plan.plan_revision, 2);
-        assert_eq!(plan.steps.len(), 2);
-        assert!(plan.is_active());
-        assert_eq!(
-            appended.metadata["nextRunnableStep"]["id"],
-            "inspect-inputs"
-        );
-        assert_eq!(appended.metadata["currentStepIndex"], 1);
-
-        let mut stale_context = ToolContext::local(workspace_root.clone(), policy.clone());
-        stale_context.current_task_plan = Some(plan.clone());
-        let stale = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "update_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 1,
-                        "change_reason": "This update is based on a stale snapshot",
-                        "step_id": "inspect-inputs",
-                        "updates": { "status": "completed", "evidence": ["Inspection recorded"] }
-                    }),
-                ),
-                stale_context,
-            )
-            .await
-            .unwrap_err();
-        assert!(stale.to_string().contains("revision conflict"));
-
-        let mut remove_context = ToolContext::local(workspace_root.clone(), policy.clone());
-        remove_context.current_task_plan = Some(plan.clone());
-        let dependent_removal = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "remove_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 2,
-                        "change_reason": "The inspection step appears redundant",
-                        "step_id": "inspect-inputs"
-                    }),
-                ),
-                remove_context,
-            )
-            .await
-            .unwrap_err();
-        assert!(dependent_removal.to_string().contains("still required by"));
-
-        let mut complete_context = ToolContext::local(workspace_root.clone(), policy.clone());
-        complete_context.current_task_plan = Some(plan);
-        let completed_inspection = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "update_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 2,
-                        "change_reason": "Inspection finished",
-                        "step_id": "inspect-inputs",
-                        "updates": {
-                            "status": "completed",
-                            "evidence": ["Reviewed the supplied inputs"],
-                            "evidence_refs": [{
-                                "requirement_id": "deliver-output",
-                                "kind": "observation",
-                                "tool_call_id": "inspect-inputs-call",
-                                "summary": "Reviewed the supplied inputs"
-                            }]
-                        }
-                    }),
-                ),
-                complete_context,
-            )
-            .await
-            .unwrap();
-        let completed_plan: TaskPlan =
-            serde_json::from_value(completed_inspection.metadata["taskPlan"].clone()).unwrap();
-        assert_eq!(completed_plan.plan_revision, 3);
-        assert_eq!(
-            completed_plan.steps[0].status,
-            TaskPlanStepStatus::Completed
-        );
-        assert_eq!(
-            completed_inspection.metadata["nextRunnableStep"]["id"],
-            "produce-output"
-        );
-        assert_eq!(completed_inspection.metadata["currentStepIndex"], 2);
-
-        let mut missing_terminal_reason_context =
-            ToolContext::local(workspace_root.clone(), policy.clone());
-        missing_terminal_reason_context.current_task_plan = Some(completed_plan.clone());
-        let missing_terminal_reason = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "update_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 3,
-                        "change_reason": "Defer the remaining output",
-                        "step_id": "produce-output",
-                        "updates": { "status": "deferred" }
-                    }),
-                ),
-                missing_terminal_reason_context,
-            )
-            .await
-            .unwrap_err();
-        assert!(missing_terminal_reason
-            .to_string()
-            .contains("requires status_reason"));
-
-        let mut deferred_context = ToolContext::local(workspace_root.clone(), policy.clone());
-        deferred_context.current_task_plan = Some(completed_plan.clone());
-        let deferred = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "update_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 3,
-                        "change_reason": "The user moved output production to a later scope",
-                        "current_scope_complete": true,
-                        "step_id": "produce-output",
-                        "updates": {
-                            "status": "deferred",
-                            "status_reason": "Explicitly postponed to the next requested phase"
-                        }
-                    }),
-                ),
-                deferred_context,
-            )
-            .await
-            .unwrap();
-        let deferred_plan: TaskPlan =
-            serde_json::from_value(deferred.metadata["taskPlan"].clone()).unwrap();
-        assert!(deferred_plan.is_active());
-        assert!(!deferred_plan.has_actionable_steps());
-        assert_eq!(deferred.metadata["allStepsResolved"], true);
-        assert!(deferred.metadata["nextRunnableStep"].is_null());
-
-        let mut cycle_context = ToolContext::local(workspace_root.clone(), policy.clone());
-        cycle_context.current_task_plan = Some(completed_plan.clone());
-        let cycle = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "update_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 3,
-                        "change_reason": "Introduce an invalid reverse dependency",
-                        "step_id": "inspect-inputs",
-                        "updates": {
-                            "status": "pending",
-                            "dependencies": ["produce-output"]
-                        }
-                    }),
-                ),
-                cycle_context,
-            )
-            .await
-            .unwrap_err();
-        assert!(cycle.to_string().contains("dependency cycle"));
-
-        let mut remove_leaf_context = ToolContext::local(workspace_root.clone(), policy.clone());
-        remove_leaf_context.current_task_plan = Some(completed_plan);
-        let removed = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "remove_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 3,
-                        "change_reason": "The output step is explicitly deferred to another goal",
-                        "current_scope_complete": true,
-                        "step_id": "produce-output"
-                    }),
-                ),
-                remove_leaf_context,
-            )
-            .await
-            .unwrap();
-        assert_eq!(removed.metadata["planRevision"], 4);
-        assert_eq!(removed.metadata["currentScopeComplete"], true);
-
-        let missing_reason = UpdatePlanTool
-            .execute(
-                ToolCall::new(
-                    "update_plan",
-                    json!({
-                        "operation": "remove_step",
-                        "goal_id": "deliver-output",
-                        "expected_revision": 3,
-                        "step_id": "produce-output"
-                    }),
-                ),
-                ToolContext::local(workspace_root.clone(), policy.clone()),
-            )
-            .await
-            .unwrap_err();
-        assert!(missing_reason.to_string().contains("invalid arguments"));
-
-        let mut child_context = ToolContext::local(workspace_root, policy);
-        child_context.subagent_depth = 1;
-        let denied = UpdatePlanTool
-            .execute(ToolCall::new("update_plan", json!({})), child_context)
-            .await
-            .unwrap_err();
-        assert!(denied.to_string().contains("only the parent agent"));
     }
 
     #[tokio::test]
@@ -11415,7 +9952,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local(workspace_root.clone(), policy.clone());
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy.clone());
         let written = SpreadsheetTool
             .execute(
                 ToolCall::new(
@@ -11453,7 +9990,7 @@ mod tests {
                         }
                     }),
                 ),
-                ToolContext::local(workspace_root.clone(), policy),
+                ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
             )
             .await
             .unwrap();
@@ -11493,7 +10030,7 @@ mod tests {
                             "sheets": [{ "name": sheet, "cells": values }]
                         }),
                     ),
-                    ToolContext::local(workspace_root.clone(), policy.clone()),
+                    ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
                 )
                 .await
                 .expect("create spreadsheet fixture");
@@ -11531,7 +10068,7 @@ mod tests {
                         ]
                     }),
                 ),
-                ToolContext::local(workspace_root.clone(), policy.clone()),
+                ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
             )
             .await
             .expect("execute spreadsheet batch");
@@ -11552,13 +10089,59 @@ mod tests {
                         "columnCount": 3
                     }),
                 ),
-                ToolContext::local(workspace_root.clone(), policy),
+                ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
             )
             .await
             .expect("read spreadsheet batch output");
         assert!(read.output.contains("A001"));
         assert!(read.output.contains("A002"));
         assert!(read.output.contains("ready"));
+
+        let found = SpreadsheetTool
+            .execute(
+                ToolCall::new(
+                    "spreadsheet",
+                    json!({
+                        "action": "find",
+                        "path": "orders.xlsx",
+                        "sheet": "Orders",
+                        "query": "A002",
+                        "matchMode": "exact",
+                        "maxResults": 10
+                    }),
+                ),
+                ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
+            )
+            .await
+            .expect("find spreadsheet cell");
+        assert!(found.output.contains("A002"));
+
+        let filtered = SpreadsheetTool
+            .execute(
+                ToolCall::new(
+                    "spreadsheet",
+                    json!({
+                        "action": "filter_rows",
+                        "path": "orders.xlsx",
+                        "sheet": "Orders",
+                        "range": {
+                            "start": { "row": 1, "column": 1 },
+                            "end": { "row": 2, "column": 3 }
+                        },
+                        "conditions": [{
+                            "column": 2,
+                            "operator": "greater_than_or_equal",
+                            "value": { "type": "integer", "value": 15 }
+                        }],
+                        "maxResults": 10
+                    }),
+                ),
+                ToolInvocationContext::local(workspace_root.clone(), policy),
+            )
+            .await
+            .expect("filter spreadsheet rows");
+        assert!(filtered.output.contains("A002"));
+        assert!(!filtered.output.contains("A001"));
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
@@ -11577,7 +10160,7 @@ mod tests {
             verbatim_root.clone(),
             PermissionMode::Approve,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             verbatim_root,
             policy,
             LocalSandboxConfig::default(),
@@ -11620,8 +10203,11 @@ mod tests {
             PermissionMode::FullAccess,
             &sandbox,
         ));
-        let context =
-            ToolContext::local_with_sandbox_config(workspace_root.clone(), policy, sandbox);
+        let context = ToolInvocationContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            sandbox,
+        );
 
         WriteFileTool
             .execute(
@@ -11673,7 +10259,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local(workspace_root.clone(), policy);
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
         let result = ReadFilesTool
             .execute(
@@ -11706,7 +10292,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -11739,7 +10325,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolContext::local_with_sandbox_config(
+        let mut context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -11790,7 +10376,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolContext::local_with_sandbox_config(
+        let mut context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -11826,7 +10412,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -11861,7 +10447,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -11946,6 +10532,13 @@ mod tests {
                 start_column: None,
                 row_count: None,
                 column_count: None,
+                query: None,
+                match_mode: None,
+                case_sensitive: false,
+                include_formulas: false,
+                conditions: Vec::new(),
+                filter_match_mode: None,
+                max_results: None,
                 source_path: None,
                 output_path: None,
                 sheets: Vec::new(),
@@ -11972,6 +10565,13 @@ mod tests {
                 start_column: None,
                 row_count: None,
                 column_count: None,
+                query: None,
+                match_mode: None,
+                case_sensitive: false,
+                include_formulas: false,
+                conditions: Vec::new(),
+                filter_match_mode: None,
+                max_results: None,
                 source_path: None,
                 output_path: None,
                 sheets: Vec::new(),
@@ -11998,6 +10598,13 @@ mod tests {
                 start_column: None,
                 row_count: None,
                 column_count: None,
+                query: None,
+                match_mode: None,
+                case_sensitive: false,
+                include_formulas: false,
+                conditions: Vec::new(),
+                filter_match_mode: None,
+                max_results: None,
                 source_path: Some("reports/source.xlsx".to_string()),
                 output_path: Some("reports/output.xlsx".to_string()),
                 sheets: Vec::new(),
@@ -12112,7 +10719,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -12145,7 +10752,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -12234,7 +10841,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -12258,61 +10865,6 @@ mod tests {
         assert!(Tool::description(&SetPlanTool).contains("external memory"));
         assert!(Tool::description(&UpdatePlanTool).contains("advisory"));
         assert!(!Tool::description(&UpdatePlanTool).contains("one step at a time"));
-        assert!(Tool::description(&CompleteTaskTool).contains("verification evidence"));
-    }
-
-    #[test]
-    fn changing_a_requirement_invalidates_affected_completion_and_verification() {
-        let mut plan = TaskPlan {
-            plan_revision: 3,
-            goal_id: "requirement-revision".to_string(),
-            change_reason: Some("initial completion".to_string()),
-            coverage: Some(TaskPlanCoverage {
-                requirements_revision: 1,
-                requirements: vec![TaskRequirement {
-                    id: "target".to_string(),
-                    statement: "Implement the original target".to_string(),
-                    source_refs: vec!["user request v1".to_string()],
-                }],
-                step_requirements: BTreeMap::from([(
-                    "implement".to_string(),
-                    vec!["target".to_string()],
-                )]),
-                evidence_refs: vec![TaskEvidenceRef {
-                    step_id: "implement".to_string(),
-                    requirement_id: "target".to_string(),
-                    kind: TaskEvidenceKind::Verification,
-                    tool_call_id: "test-v1".to_string(),
-                    summary: "Original target passed".to_string(),
-                    requirements_revision: 1,
-                }],
-            }),
-            steps: vec![TaskPlanStep {
-                id: "implement".to_string(),
-                title: "Implement target".to_string(),
-                status: TaskPlanStepStatus::Completed,
-                status_reason: None,
-                dependencies: Vec::new(),
-                acceptance_criteria: vec!["Target passes verification".to_string()],
-                evidence: vec!["Original target passed".to_string()],
-            }],
-        };
-
-        replace_task_requirements(
-            &mut plan,
-            vec![TaskRequirement {
-                id: "target".to_string(),
-                statement: "Implement the revised target".to_string(),
-                source_refs: vec!["user request v2".to_string()],
-            }],
-        )
-        .unwrap();
-
-        let coverage = plan.coverage.as_ref().unwrap();
-        assert_eq!(coverage.requirements_revision, 2);
-        assert!(coverage.evidence_refs.is_empty());
-        assert_eq!(plan.steps[0].status, TaskPlanStepStatus::Pending);
-        assert!(plan.steps[0].evidence.is_empty());
     }
 
     #[tokio::test]
@@ -12324,7 +10876,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -12395,7 +10947,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),
@@ -12442,7 +10994,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let context = ToolContext::local_with_sandbox_config(
+        let context = ToolInvocationContext::local_with_sandbox_config(
             workspace_root.clone(),
             policy,
             LocalSandboxConfig::danger_full_access(),

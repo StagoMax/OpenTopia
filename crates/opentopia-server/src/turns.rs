@@ -21,6 +21,7 @@ struct RunningTurn {
 #[derive(Clone)]
 pub struct TurnHandle {
     pub turn_id: Uuid,
+    pub invocation_id: u64,
     pub cancel: CancellationToken,
 }
 
@@ -70,6 +71,51 @@ impl TurnManager {
         );
         Ok(Ok(TurnHandle {
             turn_id: record.turn_id,
+            invocation_id: record.invocation_id,
+            cancel,
+        }))
+    }
+
+    /// Reactivates an interactive boundary inside the same logical Turn.
+    /// Only InvocationId changes; all events, effects, and continuation state
+    /// remain owned by the original TurnId.
+    pub fn resume(
+        &self,
+        thread_id: Uuid,
+        turn_id: Uuid,
+        user_message_id: Uuid,
+    ) -> anyhow::Result<Result<TurnHandle, TurnRecord>> {
+        let mut running = self.running.write().expect("turn manager poisoned");
+        if let Some(active) = running.get(&thread_id) {
+            return Ok(Err(in_memory_status(active)));
+        }
+        let persisted = self
+            .store
+            .get_turn(turn_id)?
+            .ok_or_else(|| anyhow::anyhow!("turn not found: {turn_id}"))?;
+        anyhow::ensure!(
+            persisted.thread_id == thread_id,
+            "turn belongs to another thread"
+        );
+        anyhow::ensure!(
+            persisted.user_message_id == user_message_id,
+            "continuation belongs to another user message"
+        );
+        let record = self
+            .store
+            .resume_turn_invocation(turn_id)?
+            .ok_or_else(|| anyhow::anyhow!("turn {turn_id} is not resumable"))?;
+        let cancel = CancellationToken::new();
+        running.insert(
+            thread_id,
+            RunningTurn {
+                record: record.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+        Ok(Ok(TurnHandle {
+            turn_id,
+            invocation_id: record.invocation_id,
             cancel,
         }))
     }
@@ -239,8 +285,9 @@ mod tests {
     #[test]
     fn finish_persists_waiting_and_success_states() {
         let (manager, _store, thread_id) = manager_with_thread();
+        let user_message_id = Uuid::new_v4();
         let paused = manager
-            .begin(thread_id, Uuid::new_v4())
+            .begin(thread_id, user_message_id)
             .expect("begin paused turn")
             .expect("paused turn starts");
         manager
@@ -256,9 +303,12 @@ mod tests {
         );
 
         let resumed = manager
-            .begin(thread_id, Uuid::new_v4())
-            .expect("begin resumed turn")
+            .resume(thread_id, paused.turn_id, user_message_id)
+            .expect("resume turn")
             .expect("resumed turn starts");
+        assert_eq!(resumed.turn_id, paused.turn_id);
+        assert_eq!(paused.invocation_id, 1);
+        assert_eq!(resumed.invocation_id, 2);
         manager
             .finish(thread_id, resumed.turn_id, TurnStatus::Succeeded, None)
             .expect("finish resumed turn");

@@ -8,11 +8,16 @@ use rust_xlsxwriter::{Formula, Workbook, Worksheet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::Duration;
 use thiserror::Error;
+use wait_timeout::ChildExt;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
@@ -31,8 +36,15 @@ pub const MAX_RETURN_BYTES: usize = 1024 * 1024;
 pub const MAX_CELL_CHARACTERS: usize = 32_767;
 pub const MAX_CELL_TEXT_BYTES: usize = 128 * 1024;
 pub const MAX_FORMULA_BYTES: usize = 8_192;
+pub const MAX_FIND_RESULTS: usize = 1_000;
+pub const MAX_FILTER_CONDITIONS: usize = 32;
+pub const MAX_FILTER_RESULTS: usize = 1_000;
 
 const MAX_EXCEL_INTEGER: i64 = 999_999_999_999_999;
+const OPENPYXL_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
+const OPENPYXL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const OPENPYXL_WORKER: &str = include_str!("spreadsheet_openpyxl_worker.py");
+static DISCOVERED_OPENPYXL_PYTHON: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +59,8 @@ pub enum SpreadsheetAction {
     ListSheets(ListSheetsRequest),
     ReadRange(ReadRangeRequest),
     ReadRanges(ReadRangesRequest),
+    FindCells(FindCellsRequest),
+    FilterRows(FilterRowsRequest),
     WriteWorkbook(WriteWorkbookRequest),
 }
 
@@ -57,6 +71,8 @@ pub enum SpreadsheetActionKind {
     ListSheets,
     ReadRange,
     ReadRanges,
+    FindCells,
+    FilterRows,
     WriteWorkbook,
 }
 
@@ -67,6 +83,8 @@ impl SpreadsheetAction {
             Self::ListSheets(_) => SpreadsheetActionKind::ListSheets,
             Self::ReadRange(_) => SpreadsheetActionKind::ReadRange,
             Self::ReadRanges(_) => SpreadsheetActionKind::ReadRanges,
+            Self::FindCells(_) => SpreadsheetActionKind::FindCells,
+            Self::FilterRows(_) => SpreadsheetActionKind::FilterRows,
             Self::WriteWorkbook(_) => SpreadsheetActionKind::WriteWorkbook,
         }
     }
@@ -111,6 +129,103 @@ pub struct ReadRangesRequest {
     pub path: PathBuf,
     #[serde(default)]
     pub ranges: Vec<SheetRangeRequest>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpreadsheetTextMatchMode {
+    #[default]
+    Contains,
+    Exact,
+    StartsWith,
+    EndsWith,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FindCellsRequest {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<CellRange>,
+    pub query: String,
+    #[serde(default)]
+    pub match_mode: SpreadsheetTextMatchMode,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub include_formulas: bool,
+    #[serde(default = "default_find_results")]
+    pub max_results: usize,
+}
+
+fn default_find_results() -> usize {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum SpreadsheetFilterValue {
+    String(String),
+    Integer(i64),
+    Number(f64),
+    Boolean(bool),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpreadsheetFilterOperator {
+    Equals,
+    NotEquals,
+    Contains,
+    StartsWith,
+    EndsWith,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    IsBlank,
+    IsNotBlank,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SpreadsheetFilterCondition {
+    /// Absolute zero-based worksheet column.
+    #[schemars(range(max = 16383))]
+    pub column: u32,
+    pub operator: SpreadsheetFilterOperator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<SpreadsheetFilterValue>,
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpreadsheetFilterMatchMode {
+    #[default]
+    All,
+    Any,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterRowsRequest {
+    pub path: PathBuf,
+    pub sheet: String,
+    pub range: CellRange,
+    #[serde(default)]
+    pub conditions: Vec<SpreadsheetFilterCondition>,
+    #[serde(default)]
+    pub match_mode: SpreadsheetFilterMatchMode,
+    #[serde(default = "default_filter_results")]
+    pub max_results: usize,
+}
+
+fn default_filter_results() -> usize {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -204,6 +319,8 @@ pub enum SpreadsheetResult {
     SheetsListed(ListSheetsResult),
     RangeRead(ReadRangeResult),
     RangesRead(ReadRangesResult),
+    CellsFound(FindCellsResult),
+    RowsFiltered(FilterRowsResult),
     WorkbookWritten(WriteWorkbookResult),
 }
 
@@ -214,6 +331,8 @@ impl SpreadsheetResult {
             Self::SheetsListed(_) => SpreadsheetActionKind::ListSheets,
             Self::RangeRead(_) => SpreadsheetActionKind::ReadRange,
             Self::RangesRead(_) => SpreadsheetActionKind::ReadRanges,
+            Self::CellsFound(_) => SpreadsheetActionKind::FindCells,
+            Self::RowsFiltered(_) => SpreadsheetActionKind::FilterRows,
             Self::WorkbookWritten(_) => SpreadsheetActionKind::WriteWorkbook,
         }
     }
@@ -290,6 +409,36 @@ pub struct ReadRangesResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct SpreadsheetCellMatch {
+    pub sheet: String,
+    pub address: CellAddress,
+    pub cell: SpreadsheetCell,
+    pub matched_formula: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FindCellsResult {
+    pub path: PathBuf,
+    pub matches: Vec<SpreadsheetCellMatch>,
+    pub scanned_cells: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterRowsResult {
+    pub path: PathBuf,
+    pub sheet: String,
+    pub range: CellRange,
+    pub matched_row_indices: Vec<u32>,
+    pub rows: Vec<Vec<SpreadsheetCell>>,
+    pub scanned_rows: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct SpreadsheetCell {
     pub value: SpreadsheetCellValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +476,14 @@ pub struct WriteWorkbookResult {
     pub applied_updates: usize,
     pub rebuilt_from_source: bool,
     pub preserved_template_parts: bool,
+    pub backend: SpreadsheetWriteBackend,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpreadsheetWriteBackend {
+    Native,
+    Openpyxl,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,6 +499,8 @@ pub enum SpreadsheetErrorCode {
     SheetNotFound,
     InvalidRange,
     RangeTooLarge,
+    InvalidQuery,
+    InvalidFilter,
     CellOutOfBounds,
     TooManyCells,
     DuplicateSheet,
@@ -353,6 +512,8 @@ pub enum SpreadsheetErrorCode {
     NoVisibleSheet,
     ReturnTooLarge,
     Serialization,
+    BackendUnavailable,
+    WorkerTimeout,
     WriteFailed,
 }
 
@@ -408,6 +569,10 @@ pub enum SpreadsheetError {
         max_columns: u64,
         max_cells: u64,
     },
+    #[error("invalid spreadsheet query: {reason}")]
+    InvalidQuery { reason: String },
+    #[error("invalid spreadsheet filter: {reason}")]
+    InvalidFilter { reason: String },
     #[error(
         "cell ({row}, {column}) is outside XLSX bounds (rows 0..{max_rows}, columns 0..{max_columns})"
     )]
@@ -461,6 +626,10 @@ pub enum SpreadsheetError {
     },
     #[error("failed to serialize spreadsheet result: {message}")]
     Serialization { message: String },
+    #[error("spreadsheet backend is unavailable: {message}")]
+    BackendUnavailable { message: String },
+    #[error("spreadsheet worker exceeded the {seconds} second timeout")]
+    WorkerTimeout { seconds: u64 },
     #[error("failed to generate XLSX workbook {path}: {message}")]
     WriteFailed { path: PathBuf, message: String },
 }
@@ -479,6 +648,8 @@ impl SpreadsheetError {
             Self::SheetNotFound { .. } => SpreadsheetErrorCode::SheetNotFound,
             Self::InvalidRange { .. } => SpreadsheetErrorCode::InvalidRange,
             Self::RangeTooLarge { .. } => SpreadsheetErrorCode::RangeTooLarge,
+            Self::InvalidQuery { .. } => SpreadsheetErrorCode::InvalidQuery,
+            Self::InvalidFilter { .. } => SpreadsheetErrorCode::InvalidFilter,
             Self::CellOutOfBounds { .. } => SpreadsheetErrorCode::CellOutOfBounds,
             Self::TooManyCells { .. } => SpreadsheetErrorCode::TooManyCells,
             Self::DuplicateSheet { .. } => SpreadsheetErrorCode::DuplicateSheet,
@@ -490,6 +661,8 @@ impl SpreadsheetError {
             Self::NoVisibleSheet => SpreadsheetErrorCode::NoVisibleSheet,
             Self::ReturnTooLarge { .. } => SpreadsheetErrorCode::ReturnTooLarge,
             Self::Serialization { .. } => SpreadsheetErrorCode::Serialization,
+            Self::BackendUnavailable { .. } => SpreadsheetErrorCode::BackendUnavailable,
+            Self::WorkerTimeout { .. } => SpreadsheetErrorCode::WorkerTimeout,
             Self::WriteFailed { .. } => SpreadsheetErrorCode::WriteFailed,
         }
     }
@@ -518,8 +691,14 @@ pub fn execute_spreadsheet(
         SpreadsheetAction::ReadRanges(request) => {
             read_ranges(&request).map(SpreadsheetResult::RangesRead)
         }
+        SpreadsheetAction::FindCells(request) => {
+            find_cells(&request).map(SpreadsheetResult::CellsFound)
+        }
+        SpreadsheetAction::FilterRows(request) => {
+            filter_rows(&request).map(SpreadsheetResult::RowsFiltered)
+        }
         SpreadsheetAction::WriteWorkbook(request) => {
-            write_workbook(&request).map(SpreadsheetResult::WorkbookWritten)
+            write_workbook_preferred(&request).map(SpreadsheetResult::WorkbookWritten)
         }
     }
 }
@@ -702,6 +881,593 @@ pub fn read_ranges(request: &ReadRangesRequest) -> Result<ReadRangesResult, Spre
     Ok(result)
 }
 
+pub fn find_cells(request: &FindCellsRequest) -> Result<FindCellsResult, SpreadsheetError> {
+    if request.query.is_empty() {
+        return Err(SpreadsheetError::InvalidQuery {
+            reason: "query must not be empty".to_string(),
+        });
+    }
+    if request.max_results == 0 || request.max_results > MAX_FIND_RESULTS {
+        return Err(SpreadsheetError::InvalidQuery {
+            reason: format!("maxResults must be between 1 and {MAX_FIND_RESULTS}"),
+        });
+    }
+    if request.range.is_some() && request.sheet.is_none() {
+        return Err(SpreadsheetError::InvalidQuery {
+            reason: "range requires a sheet".to_string(),
+        });
+    }
+    if let Some(range) = request.range {
+        validate_read_range(range)?;
+    }
+
+    let (mut workbook, _) = open_xlsx(&request.path)?;
+    let metadata = workbook.sheets_metadata().to_vec();
+    ensure_sheet_count(metadata.len())?;
+    if let Some(sheet) = request.sheet.as_deref() {
+        if !metadata.iter().any(|candidate| candidate.name == sheet) {
+            return Err(SpreadsheetError::SheetNotFound {
+                sheet: sheet.to_string(),
+            });
+        }
+    }
+
+    let mut matches = Vec::new();
+    let mut scanned_cells = 0usize;
+    let mut truncated = false;
+    for sheet in metadata {
+        let info = sheet_info(&sheet);
+        if info.kind != SheetKind::Worksheet
+            || request
+                .sheet
+                .as_deref()
+                .is_some_and(|requested| requested != info.name)
+        {
+            continue;
+        }
+        let values = worksheet_values(&mut workbook, &request.path, &info.name)?;
+        let formulas = worksheet_formulas(&mut workbook, &request.path, &info.name)?;
+        let mut positions = HashSet::new();
+        add_used_positions(&values, &mut positions, &info.name)?;
+        add_used_positions(&formulas, &mut positions, &info.name)?;
+        let mut positions = positions.into_iter().collect::<Vec<_>>();
+        positions.sort_unstable();
+
+        for (row, column) in positions {
+            if request.range.is_some_and(|range| {
+                row < range.start.row
+                    || row > range.end.row
+                    || column < range.start.column
+                    || column > range.end.column
+            }) {
+                continue;
+            }
+            scanned_cells = scanned_cells.saturating_add(1);
+            ensure_workbook_cell_count(scanned_cells)?;
+            let value = values.get_value((row, column)).unwrap_or(&Data::Empty);
+            let formula = formulas
+                .get_value((row, column))
+                .filter(|formula| !formula.is_empty())
+                .cloned();
+            let cell = SpreadsheetCell {
+                value: cell_value_from_data(value, &info.name, row, column)?,
+                formula,
+            };
+            let value_text = spreadsheet_cell_display_text(&cell.value);
+            let value_matches = text_matches(
+                &value_text,
+                &request.query,
+                request.match_mode,
+                request.case_sensitive,
+            );
+            let formula_matches = request.include_formulas
+                && cell.formula.as_deref().is_some_and(|formula| {
+                    text_matches(
+                        formula,
+                        &request.query,
+                        request.match_mode,
+                        request.case_sensitive,
+                    )
+                });
+            if value_matches || formula_matches {
+                if matches.len() == request.max_results {
+                    truncated = true;
+                    break;
+                }
+                matches.push(SpreadsheetCellMatch {
+                    sheet: info.name.clone(),
+                    address: CellAddress { row, column },
+                    cell,
+                    matched_formula: !value_matches && formula_matches,
+                });
+            }
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    let result = FindCellsResult {
+        path: request.path.clone(),
+        matches,
+        scanned_cells: scanned_cells as u64,
+        truncated,
+    };
+    ensure_return_size(&result)?;
+    Ok(result)
+}
+
+pub fn filter_rows(request: &FilterRowsRequest) -> Result<FilterRowsResult, SpreadsheetError> {
+    validate_read_range(request.range)?;
+    if request.conditions.is_empty() {
+        return Err(SpreadsheetError::InvalidFilter {
+            reason: "conditions must not be empty".to_string(),
+        });
+    }
+    if request.conditions.len() > MAX_FILTER_CONDITIONS {
+        return Err(SpreadsheetError::InvalidFilter {
+            reason: format!("conditions are limited to {MAX_FILTER_CONDITIONS}"),
+        });
+    }
+    if request.max_results == 0 || request.max_results > MAX_FILTER_RESULTS {
+        return Err(SpreadsheetError::InvalidFilter {
+            reason: format!("maxResults must be between 1 and {MAX_FILTER_RESULTS}"),
+        });
+    }
+    for condition in &request.conditions {
+        validate_filter_condition(condition, request.range)?;
+    }
+
+    let read = read_range(&ReadRangeRequest {
+        path: request.path.clone(),
+        sheet: request.sheet.clone(),
+        range: request.range,
+    })?;
+    let mut rows = Vec::new();
+    let mut matched_row_indices = Vec::new();
+    let mut truncated = false;
+    let mut scanned_rows = 0_u64;
+    for (row_offset, row) in read.rows.into_iter().enumerate() {
+        scanned_rows = scanned_rows.saturating_add(1);
+        let include = match request.match_mode {
+            SpreadsheetFilterMatchMode::All => request.conditions.iter().all(|condition| {
+                let index = (condition.column - request.range.start.column) as usize;
+                filter_condition_matches(&row[index], condition)
+            }),
+            SpreadsheetFilterMatchMode::Any => request.conditions.iter().any(|condition| {
+                let index = (condition.column - request.range.start.column) as usize;
+                filter_condition_matches(&row[index], condition)
+            }),
+        };
+        if include {
+            if rows.len() == request.max_results {
+                truncated = true;
+                break;
+            }
+            let row_index = request
+                .range
+                .start
+                .row
+                .checked_add(row_offset as u32)
+                .ok_or(SpreadsheetError::InvalidRange {
+                    reason: "filtered row index overflowed",
+                })?;
+            matched_row_indices.push(row_index);
+            rows.push(row);
+        }
+    }
+
+    let result = FilterRowsResult {
+        path: request.path.clone(),
+        sheet: request.sheet.clone(),
+        range: request.range,
+        matched_row_indices,
+        rows,
+        scanned_rows,
+        truncated,
+    };
+    ensure_return_size(&result)?;
+    Ok(result)
+}
+
+fn spreadsheet_cell_display_text(value: &SpreadsheetCellValue) -> String {
+    match value {
+        SpreadsheetCellValue::Empty => String::new(),
+        SpreadsheetCellValue::String(value)
+        | SpreadsheetCellValue::DateTimeIso(value)
+        | SpreadsheetCellValue::DurationIso(value)
+        | SpreadsheetCellValue::Error(value) => value.clone(),
+        SpreadsheetCellValue::Integer(value) => value.to_string(),
+        SpreadsheetCellValue::Number(value) => value.to_string(),
+        SpreadsheetCellValue::Boolean(value) => value.to_string(),
+        SpreadsheetCellValue::DateTime(value) => value.serial.to_string(),
+    }
+}
+
+fn text_matches(
+    candidate: &str,
+    query: &str,
+    mode: SpreadsheetTextMatchMode,
+    case_sensitive: bool,
+) -> bool {
+    let (candidate, query) = if case_sensitive {
+        (candidate.to_string(), query.to_string())
+    } else {
+        (candidate.to_lowercase(), query.to_lowercase())
+    };
+    match mode {
+        SpreadsheetTextMatchMode::Contains => candidate.contains(&query),
+        SpreadsheetTextMatchMode::Exact => candidate == query,
+        SpreadsheetTextMatchMode::StartsWith => candidate.starts_with(&query),
+        SpreadsheetTextMatchMode::EndsWith => candidate.ends_with(&query),
+    }
+}
+
+fn validate_filter_condition(
+    condition: &SpreadsheetFilterCondition,
+    range: CellRange,
+) -> Result<(), SpreadsheetError> {
+    validate_address(CellAddress {
+        row: range.start.row,
+        column: condition.column,
+    })?;
+    if condition.column < range.start.column || condition.column > range.end.column {
+        return Err(SpreadsheetError::InvalidFilter {
+            reason: format!(
+                "condition column {} is outside the requested range {}..={}",
+                condition.column, range.start.column, range.end.column
+            ),
+        });
+    }
+    let blank_operator = matches!(
+        condition.operator,
+        SpreadsheetFilterOperator::IsBlank | SpreadsheetFilterOperator::IsNotBlank
+    );
+    if blank_operator && condition.value.is_some() {
+        return Err(SpreadsheetError::InvalidFilter {
+            reason: "is_blank and is_not_blank conditions must omit value".to_string(),
+        });
+    }
+    if !blank_operator && condition.value.is_none() {
+        return Err(SpreadsheetError::InvalidFilter {
+            reason: format!("{:?} condition requires value", condition.operator),
+        });
+    }
+    if matches!(
+        condition.operator,
+        SpreadsheetFilterOperator::GreaterThan
+            | SpreadsheetFilterOperator::GreaterThanOrEqual
+            | SpreadsheetFilterOperator::LessThan
+            | SpreadsheetFilterOperator::LessThanOrEqual
+    ) && !matches!(
+        condition.value,
+        Some(SpreadsheetFilterValue::Integer(_) | SpreadsheetFilterValue::Number(_))
+    ) {
+        return Err(SpreadsheetError::InvalidFilter {
+            reason: "numeric comparison conditions require an integer or number value".to_string(),
+        });
+    }
+    if let Some(SpreadsheetFilterValue::Number(value)) = condition.value {
+        if !value.is_finite() {
+            return Err(SpreadsheetError::InvalidFilter {
+                reason: "filter number must be finite".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn filter_condition_matches(
+    cell: &SpreadsheetCell,
+    condition: &SpreadsheetFilterCondition,
+) -> bool {
+    match condition.operator {
+        SpreadsheetFilterOperator::IsBlank => {
+            matches!(cell.value, SpreadsheetCellValue::Empty)
+                || spreadsheet_cell_display_text(&cell.value).is_empty()
+        }
+        SpreadsheetFilterOperator::IsNotBlank => {
+            !matches!(cell.value, SpreadsheetCellValue::Empty)
+                && !spreadsheet_cell_display_text(&cell.value).is_empty()
+        }
+        SpreadsheetFilterOperator::Equals => condition
+            .value
+            .as_ref()
+            .is_some_and(|value| filter_values_equal(&cell.value, value, condition.case_sensitive)),
+        SpreadsheetFilterOperator::NotEquals => condition.value.as_ref().is_some_and(|value| {
+            !filter_values_equal(&cell.value, value, condition.case_sensitive)
+        }),
+        SpreadsheetFilterOperator::Contains
+        | SpreadsheetFilterOperator::StartsWith
+        | SpreadsheetFilterOperator::EndsWith => {
+            let Some(value) = condition.value.as_ref() else {
+                return false;
+            };
+            let mode = match condition.operator {
+                SpreadsheetFilterOperator::Contains => SpreadsheetTextMatchMode::Contains,
+                SpreadsheetFilterOperator::StartsWith => SpreadsheetTextMatchMode::StartsWith,
+                SpreadsheetFilterOperator::EndsWith => SpreadsheetTextMatchMode::EndsWith,
+                _ => unreachable!(),
+            };
+            text_matches(
+                &spreadsheet_cell_display_text(&cell.value),
+                &filter_value_display_text(value),
+                mode,
+                condition.case_sensitive,
+            )
+        }
+        SpreadsheetFilterOperator::GreaterThan
+        | SpreadsheetFilterOperator::GreaterThanOrEqual
+        | SpreadsheetFilterOperator::LessThan
+        | SpreadsheetFilterOperator::LessThanOrEqual => {
+            let Some(left) = spreadsheet_cell_number(&cell.value) else {
+                return false;
+            };
+            let Some(right) = condition.value.as_ref().and_then(filter_value_number) else {
+                return false;
+            };
+            match condition.operator {
+                SpreadsheetFilterOperator::GreaterThan => left > right,
+                SpreadsheetFilterOperator::GreaterThanOrEqual => left >= right,
+                SpreadsheetFilterOperator::LessThan => left < right,
+                SpreadsheetFilterOperator::LessThanOrEqual => left <= right,
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+fn filter_values_equal(
+    cell: &SpreadsheetCellValue,
+    expected: &SpreadsheetFilterValue,
+    case_sensitive: bool,
+) -> bool {
+    match expected {
+        SpreadsheetFilterValue::String(expected) => text_matches(
+            &spreadsheet_cell_display_text(cell),
+            expected,
+            SpreadsheetTextMatchMode::Exact,
+            case_sensitive,
+        ),
+        SpreadsheetFilterValue::Integer(expected) => {
+            spreadsheet_cell_number(cell) == Some(*expected as f64)
+        }
+        SpreadsheetFilterValue::Number(expected) => {
+            spreadsheet_cell_number(cell) == Some(*expected)
+        }
+        SpreadsheetFilterValue::Boolean(expected) => {
+            matches!(cell, SpreadsheetCellValue::Boolean(actual) if actual == expected)
+        }
+    }
+}
+
+fn spreadsheet_cell_number(value: &SpreadsheetCellValue) -> Option<f64> {
+    match value {
+        SpreadsheetCellValue::Integer(value) => Some(*value as f64),
+        SpreadsheetCellValue::Number(value) => Some(*value),
+        SpreadsheetCellValue::DateTime(value) => Some(value.serial),
+        _ => None,
+    }
+}
+
+fn filter_value_number(value: &SpreadsheetFilterValue) -> Option<f64> {
+    match value {
+        SpreadsheetFilterValue::Integer(value) => Some(*value as f64),
+        SpreadsheetFilterValue::Number(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn filter_value_display_text(value: &SpreadsheetFilterValue) -> String {
+    match value {
+        SpreadsheetFilterValue::String(value) => value.clone(),
+        SpreadsheetFilterValue::Integer(value) => value.to_string(),
+        SpreadsheetFilterValue::Number(value) => value.to_string(),
+        SpreadsheetFilterValue::Boolean(value) => value.to_string(),
+    }
+}
+
+pub fn write_workbook_preferred(
+    request: &WriteWorkbookRequest,
+) -> Result<WriteWorkbookResult, SpreadsheetError> {
+    let preference = env::var("OPENTOPIA_SPREADSHEET_BACKEND")
+        .unwrap_or_else(|_| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if preference == "native" || (preference == "auto" && native_template_patch_applies(request)?) {
+        return write_workbook(request);
+    }
+
+    let python = discover_openpyxl_python();
+    match (preference.as_str(), python) {
+        ("auto", Some(python)) => write_workbook_openpyxl(request, &python)
+            .or_else(|_| write_workbook(request)),
+        ("auto", None) => write_workbook(request),
+        ("openpyxl", Some(python)) => write_workbook_openpyxl(request, &python),
+        ("openpyxl", None) => Err(SpreadsheetError::BackendUnavailable {
+            message: "OPENTOPIA_SPREADSHEET_BACKEND=openpyxl, but no Python executable with openpyxl was found; set OPENTOPIA_SPREADSHEET_PYTHON".to_string(),
+        }),
+        (other, _) => Err(SpreadsheetError::BackendUnavailable {
+            message: format!(
+                "unsupported OPENTOPIA_SPREADSHEET_BACKEND value {other:?}; expected auto, native, or openpyxl"
+            ),
+        }),
+    }
+}
+
+fn native_template_patch_applies(request: &WriteWorkbookRequest) -> Result<bool, SpreadsheetError> {
+    let Some(source) = request.source.as_ref() else {
+        return Ok(false);
+    };
+    if request
+        .sheets
+        .iter()
+        .any(|sheet| sheet.visibility.is_some())
+    {
+        return Ok(false);
+    }
+    let listed = list_sheets(&ListSheetsRequest {
+        path: source.clone(),
+    })?;
+    Ok(request.sheets.iter().all(|requested| {
+        listed
+            .sheets
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&requested.name))
+    }))
+}
+
+fn discover_openpyxl_python() -> Option<PathBuf> {
+    DISCOVERED_OPENPYXL_PYTHON
+        .get_or_init(discover_openpyxl_python_uncached)
+        .clone()
+}
+
+fn discover_openpyxl_python_uncached() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(configured) = env::var_os("OPENTOPIA_SPREADSHEET_PYTHON") {
+        let configured = PathBuf::from(configured);
+        if !configured.as_os_str().is_empty() {
+            candidates.push(configured);
+        }
+    }
+    candidates.extend([PathBuf::from("python3"), PathBuf::from("python")]);
+    candidates.into_iter().find(python_has_openpyxl)
+}
+
+fn python_has_openpyxl(candidate: &PathBuf) -> bool {
+    let Ok(mut child) = Command::new(candidate)
+        .args(["-I", "-c", "import openpyxl"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    match child.wait_timeout(OPENPYXL_PROBE_TIMEOUT) {
+        Ok(Some(status)) => status.success(),
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn write_workbook_openpyxl(
+    request: &WriteWorkbookRequest,
+    python: &Path,
+) -> Result<WriteWorkbookResult, SpreadsheetError> {
+    validate_xlsx_path(&request.output)?;
+    let applied_updates = validate_write_request(request)?;
+    if request.sheets.is_empty() && request.source.is_none() {
+        return Err(SpreadsheetError::NoSheets);
+    }
+    if let Some(source) = request.source.as_ref() {
+        let _ = list_sheets(&ListSheetsRequest {
+            path: source.clone(),
+        })?;
+    }
+
+    let payload = serde_json::to_vec(request).map_err(|error| SpreadsheetError::Serialization {
+        message: error.to_string(),
+    })?;
+    let mut child = Command::new(python)
+        .args(["-I", "-c", OPENPYXL_WORKER])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| SpreadsheetError::BackendUnavailable {
+            message: format!("failed to start {}: {error}", python.display()),
+        })?;
+    child
+        .stdin
+        .take()
+        .expect("piped worker stdin")
+        .write_all(&payload)
+        .map_err(|error| write_failed(&request.output, error))?;
+
+    let status = match child
+        .wait_timeout(OPENPYXL_WORKER_TIMEOUT)
+        .map_err(|error| write_failed(&request.output, error))?
+    {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SpreadsheetError::WorkerTimeout {
+                seconds: OPENPYXL_WORKER_TIMEOUT.as_secs(),
+            });
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut output) = child.stdout.take() {
+        output
+            .read_to_string(&mut stdout)
+            .map_err(|error| write_failed(&request.output, error))?;
+    }
+    if let Some(mut output) = child.stderr.take() {
+        output
+            .read_to_string(&mut stderr)
+            .map_err(|error| write_failed(&request.output, error))?;
+    }
+    if !status.success() {
+        let message = stderr.trim();
+        return Err(write_failed(
+            &request.output,
+            if message.is_empty() {
+                format!("openpyxl worker exited with {status}")
+            } else {
+                message.to_string()
+            },
+        ));
+    }
+    let worker_result: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|error| SpreadsheetError::Serialization {
+            message: format!("invalid openpyxl worker response: {error}"),
+        })?;
+    if worker_result.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        return Err(write_failed(
+            &request.output,
+            "openpyxl worker did not report success",
+        ));
+    }
+
+    let bytes_written = fs::metadata(&request.output)
+        .map_err(|source| SpreadsheetError::Io {
+            operation: "inspect",
+            path: request.output.clone(),
+            source,
+        })?
+        .len();
+    if bytes_written > MAX_OUTPUT_FILE_BYTES {
+        let _ = fs::remove_file(&request.output);
+        return Err(SpreadsheetError::OutputTooLarge {
+            actual_bytes: bytes_written,
+            limit_bytes: MAX_OUTPUT_FILE_BYTES,
+        });
+    }
+    let inspected = inspect_workbook(&InspectWorkbookRequest {
+        path: request.output.clone(),
+    })?;
+    let result = WriteWorkbookResult {
+        output: request.output.clone(),
+        bytes_written,
+        sheet_count: inspected.sheets.len(),
+        output_cells: inspected.populated_cells as usize,
+        applied_updates,
+        rebuilt_from_source: request.source.is_some(),
+        preserved_template_parts: false,
+        backend: SpreadsheetWriteBackend::Openpyxl,
+    };
+    ensure_return_size(&result)?;
+    Ok(result)
+}
+
 pub fn write_workbook(
     request: &WriteWorkbookRequest,
 ) -> Result<WriteWorkbookResult, SpreadsheetError> {
@@ -760,6 +1526,7 @@ pub fn write_workbook(
         applied_updates,
         rebuilt_from_source: request.source.is_some() && !preserve_template_parts,
         preserved_template_parts: preserve_template_parts,
+        backend: SpreadsheetWriteBackend::Native,
     };
     ensure_return_size(&result)?;
 
@@ -2528,6 +3295,173 @@ mod tests {
             result.ranges[1].rows[0][0].value,
             SpreadsheetCellValue::Number(42.0)
         );
+    }
+
+    #[test]
+    fn find_and_filter_return_bounded_structured_rows() {
+        let directory = TestDirectory::new();
+        let workbook = directory.path("search-filter.xlsx");
+        write_workbook(&WriteWorkbookRequest {
+            source: None,
+            output: workbook.clone(),
+            sheets: vec![SheetWriteRequest {
+                name: "Orders".to_string(),
+                visibility: None,
+                cells: vec![
+                    update(0, 0, SpreadsheetCellInput::String("Order".to_string())),
+                    update(0, 1, SpreadsheetCellInput::String("Status".to_string())),
+                    update(0, 2, SpreadsheetCellInput::String("Amount".to_string())),
+                    update(1, 0, SpreadsheetCellInput::String("A-001".to_string())),
+                    update(1, 1, SpreadsheetCellInput::String("Paid".to_string())),
+                    update(1, 2, SpreadsheetCellInput::Integer(120)),
+                    update(2, 0, SpreadsheetCellInput::String("A-002".to_string())),
+                    update(2, 1, SpreadsheetCellInput::String("Pending".to_string())),
+                    update(2, 2, SpreadsheetCellInput::Integer(80)),
+                    update(3, 0, SpreadsheetCellInput::String("B-003".to_string())),
+                    update(3, 1, SpreadsheetCellInput::String("paid".to_string())),
+                    update(3, 2, SpreadsheetCellInput::Integer(200)),
+                    update(
+                        4,
+                        2,
+                        SpreadsheetCellInput::Formula(FormulaInput {
+                            expression: "SUM(C2:C4)".to_string(),
+                            cached_result: Some("400".to_string()),
+                        }),
+                    ),
+                ],
+            }],
+        })
+        .expect("create search/filter workbook");
+
+        let found = find_cells(&FindCellsRequest {
+            path: workbook.clone(),
+            sheet: Some("Orders".to_string()),
+            range: None,
+            query: "paid".to_string(),
+            match_mode: SpreadsheetTextMatchMode::Exact,
+            case_sensitive: false,
+            include_formulas: false,
+            max_results: 10,
+        })
+        .expect("find status cells");
+        assert_eq!(
+            found
+                .matches
+                .iter()
+                .map(|item| item.address)
+                .collect::<Vec<_>>(),
+            vec![address(1, 1), address(3, 1)]
+        );
+        assert!(!found.truncated);
+
+        let formula = find_cells(&FindCellsRequest {
+            path: workbook.clone(),
+            sheet: Some("Orders".to_string()),
+            range: None,
+            query: "SUM(".to_string(),
+            match_mode: SpreadsheetTextMatchMode::Contains,
+            case_sensitive: true,
+            include_formulas: true,
+            max_results: 10,
+        })
+        .expect("find formula");
+        assert_eq!(formula.matches.len(), 1);
+        assert!(formula.matches[0].matched_formula);
+
+        let filtered = filter_rows(&FilterRowsRequest {
+            path: workbook,
+            sheet: "Orders".to_string(),
+            range: range((1, 0), (3, 2)),
+            conditions: vec![
+                SpreadsheetFilterCondition {
+                    column: 1,
+                    operator: SpreadsheetFilterOperator::Equals,
+                    value: Some(SpreadsheetFilterValue::String("paid".to_string())),
+                    case_sensitive: false,
+                },
+                SpreadsheetFilterCondition {
+                    column: 2,
+                    operator: SpreadsheetFilterOperator::GreaterThanOrEqual,
+                    value: Some(SpreadsheetFilterValue::Integer(100)),
+                    case_sensitive: false,
+                },
+            ],
+            match_mode: SpreadsheetFilterMatchMode::All,
+            max_results: 10,
+        })
+        .expect("filter order rows");
+        assert_eq!(filtered.matched_row_indices, vec![1, 3]);
+        assert_eq!(filtered.rows.len(), 2);
+        assert!(!filtered.truncated);
+    }
+
+    #[test]
+    fn openpyxl_backend_round_trips_structural_changes_when_available() {
+        let Some(python) = discover_openpyxl_python() else {
+            return;
+        };
+        let directory = TestDirectory::new();
+        let template = directory.path("openpyxl-template.xlsx");
+        let output = directory.path("openpyxl-output.xlsx");
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
+        worksheet.set_name("Orders").expect("set sheet name");
+        let format = Format::new().set_bold().set_background_color(Color::Yellow);
+        worksheet
+            .write_with_format(0, 0, "old", &format)
+            .expect("write formatted template cell");
+        workbook.save(&template).expect("save template");
+
+        let result = write_workbook_openpyxl(
+            &WriteWorkbookRequest {
+                source: Some(template),
+                output: output.clone(),
+                sheets: vec![
+                    SheetWriteRequest {
+                        name: "Orders".to_string(),
+                        visibility: None,
+                        cells: vec![update(
+                            0,
+                            0,
+                            SpreadsheetCellInput::String("updated".to_string()),
+                        )],
+                    },
+                    SheetWriteRequest {
+                        name: "Review".to_string(),
+                        visibility: None,
+                        cells: vec![update(
+                            0,
+                            0,
+                            SpreadsheetCellInput::String("ready".to_string()),
+                        )],
+                    },
+                ],
+            },
+            &python,
+        )
+        .expect("run openpyxl backend");
+        assert_eq!(result.backend, SpreadsheetWriteBackend::Openpyxl);
+        assert_eq!(result.sheet_count, 2);
+        assert!(result.rebuilt_from_source);
+        assert!(!result.preserved_template_parts);
+        let listed = list_sheets(&ListSheetsRequest {
+            path: output.clone(),
+        })
+        .expect("list openpyxl output sheets");
+        assert_eq!(listed.sheets.len(), 2);
+        let read = read_range(&ReadRangeRequest {
+            path: output.clone(),
+            sheet: "Review".to_string(),
+            range: range((0, 0), (0, 0)),
+        })
+        .expect("read added sheet");
+        assert_eq!(
+            read.rows[0][0].value,
+            SpreadsheetCellValue::String("ready".to_string())
+        );
+        let worksheet_xml = String::from_utf8(zip_part(&output, "xl/worksheets/sheet1.xml"))
+            .expect("worksheet XML is UTF-8");
+        assert!(worksheet_xml.contains("s=\"1\""));
     }
 
     #[test]

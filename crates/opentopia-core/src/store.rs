@@ -13,15 +13,15 @@ use crate::flow_runtime::FlowRunV1;
 use crate::mcp::{McpServerConfig, McpToolDescriptor, ThreadMcpServer};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    ArtifactStorage, ArtifactStorageMetadata, ExperienceMode, GoalAttemptStatus, GoalRecord,
-    GoalSnapshot, GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart,
-    MessageRole, Project, TaskPlan, TerminalCommandHistory, TerminalCommandStatus, Thread,
-    ThreadModelSelection, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord, TurnStatus,
-    UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
+    ArtifactStorage, ArtifactStorageMetadata, ExperienceMode, GoalRecord, GoalSnapshot, GoalStatus,
+    Message, MessagePart, MessageRole, Project, TerminalCommandHistory, TerminalCommandStatus,
+    Thread, ThreadModelSelection, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord,
+    TurnStatus, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::provider::ModelConversationMessage;
 use crate::settings::AppSettings;
 use crate::subagents::{SubagentExecutionContract, SubagentRun, SubagentRunStatus};
+use crate::work_form::{WorkForm, WorkFormStatus, WorkItemStatus, WorkScope};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -119,7 +119,6 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         &self,
         thread_id: Uuid,
         objective: String,
-        status: GoalStatus,
         token_budget: Option<u64>,
     ) -> anyhow::Result<GoalSnapshot>;
     fn get_goal(&self, id: Uuid) -> anyhow::Result<Option<GoalSnapshot>>;
@@ -130,12 +129,9 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         goal_id: Uuid,
         status: GoalStatus,
     ) -> anyhow::Result<Option<GoalSnapshot>>;
-    fn apply_goal_plan(
-        &self,
-        thread_id: Uuid,
-        turn_id: Uuid,
-        plan: &TaskPlan,
-    ) -> anyhow::Result<GoalSnapshot>;
+    fn upsert_work_form(&self, form: &WorkForm) -> anyhow::Result<WorkForm>;
+    fn get_work_form(&self, form_id: Uuid) -> anyhow::Result<Option<WorkForm>>;
+    fn get_work_form_for_scope(&self, scope: WorkScope) -> anyhow::Result<Option<WorkForm>>;
     fn add_goal_usage(
         &self,
         goal_id: Uuid,
@@ -158,6 +154,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         status: TurnStatus,
         error: Option<String>,
     ) -> anyhow::Result<Option<TurnRecord>>;
+    fn resume_turn_invocation(&self, turn_id: Uuid) -> anyhow::Result<Option<TurnRecord>>;
     fn interrupt_active_turns(&self) -> anyhow::Result<usize>;
     fn upsert_turn_change_set(&self, change_set: &TurnChangeSet) -> anyhow::Result<()>;
     fn get_turn_change_set(&self, turn_id: Uuid) -> anyhow::Result<Option<TurnChangeSet>>;
@@ -629,6 +626,7 @@ impl SqliteSessionStore {
 
             CREATE TABLE IF NOT EXISTS turns (
                 turn_id TEXT PRIMARY KEY,
+                invocation_id INTEGER NOT NULL DEFAULT 1,
                 thread_id TEXT NOT NULL,
                 user_message_id TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -651,70 +649,29 @@ impl SqliteSessionStore {
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS work_forms (
+                form_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                scope_kind TEXT NOT NULL CHECK(scope_kind IN ('turn', 'goal')),
+                scope_id TEXT NOT NULL,
+                form_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(scope_kind, scope_id),
+                FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS goals (
                 id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL,
                 objective TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN (
-                    'draft', 'ready', 'active', 'paused', 'completed',
-                    'blocked', 'cancelled', 'failed'
-                )),
-                plan_revision INTEGER NOT NULL DEFAULT 0,
                 token_budget INTEGER,
                 tokens_used INTEGER NOT NULL DEFAULT 0,
                 time_used_seconds INTEGER NOT NULL DEFAULT 0,
                 version INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                completed_at TEXT,
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS goal_plan_revisions (
-                goal_id TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                plan_json TEXT NOT NULL,
-                change_reason TEXT,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(goal_id, revision),
-                FOREIGN KEY(goal_id) REFERENCES goals(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS goal_tasks (
-                goal_id TEXT NOT NULL,
-                step_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN (
-                    'pending', 'running', 'succeeded', 'deferred',
-                    'blocked', 'cancelled', 'failed'
-                )),
-                status_reason TEXT,
-                dependencies_json TEXT NOT NULL,
-                acceptance_criteria_json TEXT NOT NULL,
-                evidence_json TEXT NOT NULL,
-                attempt_count INTEGER NOT NULL DEFAULT 0,
-                max_attempts INTEGER NOT NULL DEFAULT 3,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(goal_id, step_id),
-                FOREIGN KEY(goal_id) REFERENCES goals(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS goal_task_attempts (
-                id TEXT PRIMARY KEY,
-                goal_id TEXT NOT NULL,
-                step_id TEXT NOT NULL,
-                turn_id TEXT NOT NULL,
-                attempt_no INTEGER NOT NULL,
-                status TEXT NOT NULL CHECK(status IN (
-                    'running', 'succeeded', 'failed', 'interrupted'
-                )),
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                evidence_json TEXT NOT NULL,
-                error TEXT,
-                UNIQUE(goal_id, step_id, attempt_no),
-                FOREIGN KEY(goal_id, step_id) REFERENCES goal_tasks(goal_id, step_id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS turn_change_sets (
@@ -1037,12 +994,6 @@ impl SqliteSessionStore {
             CREATE INDEX IF NOT EXISTS idx_goals_thread_updated
                 ON goals(thread_id, updated_at DESC);
 
-            CREATE INDEX IF NOT EXISTS idx_goal_tasks_goal_ordinal
-                ON goal_tasks(goal_id, ordinal);
-
-            CREATE INDEX IF NOT EXISTS idx_goal_attempts_goal_started
-                ON goal_task_attempts(goal_id, started_at);
-
             CREATE INDEX IF NOT EXISTS idx_turn_change_sets_thread_created
                 ON turn_change_sets(thread_id, created_at DESC);
 
@@ -1095,6 +1046,12 @@ impl SqliteSessionStore {
         if !table_has_column(&conn, "threads", "project_id")? {
             conn.execute(
                 "ALTER TABLE threads ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL",
+                [],
+            )?;
+        }
+        if !table_has_column(&conn, "turns", "invocation_id")? {
+            conn.execute(
+                "ALTER TABLE turns ADD COLUMN invocation_id INTEGER NOT NULL DEFAULT 1",
                 [],
             )?;
         }
@@ -1357,6 +1314,58 @@ impl SqliteSessionStore {
                 "#,
             )?;
         }
+        if schema_version < 15 {
+            if table_has_column(&conn, "goals", "status")? {
+                conn.execute_batch(
+                    r#"
+                    PRAGMA foreign_keys = OFF;
+                    DROP TABLE IF EXISTS goal_task_attempts;
+                    DROP TABLE IF EXISTS goal_tasks;
+                    DROP TABLE IF EXISTS goal_plan_revisions;
+                    CREATE TABLE goals_v15 (
+                        id TEXT PRIMARY KEY,
+                        thread_id TEXT NOT NULL,
+                        objective TEXT NOT NULL,
+                        token_budget INTEGER,
+                        tokens_used INTEGER NOT NULL DEFAULT 0,
+                        time_used_seconds INTEGER NOT NULL DEFAULT 0,
+                        version INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO goals_v15 (
+                        id, thread_id, objective, token_budget, tokens_used,
+                        time_used_seconds, version, created_at, updated_at
+                    )
+                    SELECT id, thread_id, objective, token_budget, tokens_used,
+                           time_used_seconds, version, created_at, updated_at
+                    FROM goals;
+                    DROP TABLE goals;
+                    ALTER TABLE goals_v15 RENAME TO goals;
+                    CREATE INDEX IF NOT EXISTS idx_goals_thread_updated
+                        ON goals(thread_id, updated_at DESC);
+                    PRAGMA foreign_keys = ON;
+                    PRAGMA user_version = 15;
+                    "#,
+                )?;
+            } else {
+                conn.execute_batch(
+                    r#"
+                    DROP TABLE IF EXISTS goal_task_attempts;
+                    DROP TABLE IF EXISTS goal_tasks;
+                    DROP TABLE IF EXISTS goal_plan_revisions;
+                    PRAGMA user_version = 15;
+                    "#,
+                )?;
+            }
+            let foreign_key_error: Option<String> = conn
+                .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+                .optional()?;
+            if let Some(table) = foreign_key_error {
+                anyhow::bail!("schema v15 foreign-key check failed for table {table}");
+            }
+        }
         conn.execute(
             r#"
             UPDATE flow_runs
@@ -1374,37 +1383,32 @@ impl SqliteSessionStore {
             "#,
             params![Utc::now().to_rfc3339()],
         )?;
-        let recovered_at = Utc::now().to_rfc3339();
-        conn.execute(
-            r#"
-            UPDATE goal_task_attempts
-            SET status = 'interrupted', finished_at = ?1,
-                error = COALESCE(error, 'server restarted before task attempt completed')
-            WHERE status = 'running'
-            "#,
-            params![&recovered_at],
-        )?;
-        conn.execute(
-            r#"
-            UPDATE goal_tasks
-            SET status = 'blocked', status_reason = 'server restarted during task execution',
-                updated_at = ?1
-            WHERE status = 'running'
-            "#,
-            params![&recovered_at],
-        )?;
-        conn.execute(
-            r#"
-            UPDATE goals
-            SET status = 'blocked', updated_at = ?1, version = version + 1
-            WHERE status = 'active'
-              AND EXISTS (
-                  SELECT 1 FROM goal_tasks
-                  WHERE goal_tasks.goal_id = goals.id AND goal_tasks.status = 'blocked'
-              )
-            "#,
-            params![recovered_at],
-        )?;
+        let recoverable_forms = {
+            let mut stmt =
+                conn.prepare("SELECT form_json FROM work_forms WHERE scope_kind = 'goal'")?;
+            let forms = collect_rows(stmt.query_map([], |row| {
+                let raw: String = row.get(0)?;
+                serde_json::from_str::<WorkForm>(&raw)
+                    .map_err(|error| invalid_column(0, error.to_string()))
+            })?)?;
+            forms
+        };
+        for mut form in recoverable_forms {
+            let mut interrupted = false;
+            for item in &mut form.items {
+                if item.status == WorkItemStatus::InProgress {
+                    item.status = WorkItemStatus::Blocked;
+                    item.note = Some("server restarted during task execution".to_string());
+                    interrupted = true;
+                }
+            }
+            if !interrupted {
+                continue;
+            }
+            form.status = WorkFormStatus::Blocked;
+            form.updated_at = Utc::now();
+            upsert_work_form_conn(&conn, &form)?;
+        }
         Ok(())
     }
 
@@ -3096,7 +3100,6 @@ impl SessionStore for SqliteSessionStore {
         &self,
         thread_id: Uuid,
         objective: String,
-        status: GoalStatus,
         token_budget: Option<u64>,
     ) -> anyhow::Result<GoalSnapshot> {
         let objective = objective.trim().to_string();
@@ -3106,29 +3109,28 @@ impl SessionStore for SqliteSessionStore {
             query_thread(&conn, thread_id)?.is_some(),
             "thread not found: {thread_id}"
         );
-        let goal = GoalRecord::new(thread_id, objective, status, token_budget);
+        let goal = GoalRecord::new(thread_id, objective, token_budget);
         conn.execute(
             r#"
             INSERT INTO goals (
-                id, thread_id, objective, status, plan_revision, token_budget,
-                tokens_used, time_used_seconds, version, created_at, updated_at, completed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                id, thread_id, objective, token_budget, tokens_used,
+                time_used_seconds, version, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
             params![
                 goal.id.to_string(),
                 goal.thread_id.to_string(),
                 &goal.objective,
-                goal.status.as_str(),
-                goal.plan_revision as i64,
                 goal.token_budget.map(|value| value as i64),
                 goal.tokens_used as i64,
                 goal.time_used_seconds as i64,
                 goal.version as i64,
                 goal.created_at.to_rfc3339(),
                 goal.updated_at.to_rfc3339(),
-                goal.completed_at.map(|value| value.to_rfc3339()),
             ],
         )?;
+        let form = WorkForm::empty_goal(thread_id, goal.id, goal.objective.clone());
+        upsert_work_form_conn(&conn, &form)?;
         load_goal_snapshot(&conn, goal.id)?.context("created goal disappeared")
     }
 
@@ -3139,27 +3141,27 @@ impl SessionStore for SqliteSessionStore {
 
     fn get_thread_goal(&self, thread_id: Uuid) -> anyhow::Result<Option<GoalSnapshot>> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let goal_id = conn
-            .query_row(
-                r#"
-                SELECT id
-                FROM goals
-                WHERE thread_id = ?1
-                ORDER BY
-                    CASE WHEN status IN ('completed', 'cancelled', 'failed') THEN 1 ELSE 0 END,
-                    updated_at DESC, rowid DESC
-                LIMIT 1
-                "#,
-                params![thread_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|value| Uuid::parse_str(&value))
-            .transpose()?;
-        goal_id
-            .map(|goal_id| load_goal_snapshot(&conn, goal_id))
-            .transpose()
-            .map(Option::flatten)
+        let goal_ids = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM goals WHERE thread_id = ?1 ORDER BY updated_at DESC, rowid DESC",
+            )?;
+            let ids = collect_rows(stmt.query_map(params![thread_id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })?)?;
+            ids
+        };
+        let mut latest_terminal = None;
+        for id in goal_ids {
+            let id = Uuid::parse_str(&id)?;
+            let Some(snapshot) = load_goal_snapshot(&conn, id)? else {
+                continue;
+            };
+            if !snapshot.status().is_terminal() {
+                return Ok(Some(snapshot));
+            }
+            latest_terminal.get_or_insert(snapshot);
+        }
+        Ok(latest_terminal)
     }
 
     fn update_goal_status(
@@ -3169,236 +3171,52 @@ impl SessionStore for SqliteSessionStore {
         status: GoalStatus,
     ) -> anyhow::Result<Option<GoalSnapshot>> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let current = match query_goal(&conn, goal_id)? {
-            Some(goal) if goal.thread_id == thread_id => goal,
+        let current = match load_goal_snapshot(&conn, goal_id)? {
+            Some(goal) if goal.goal.thread_id == thread_id => goal,
             Some(_) => anyhow::bail!("goal {goal_id} does not belong to thread {thread_id}"),
             None => return Ok(None),
         };
         anyhow::ensure!(
-            valid_goal_transition(current.status, status),
+            valid_goal_transition(current.status(), status),
             "invalid goal transition: {} -> {}",
-            current.status.as_str(),
+            current.status().as_str(),
             status.as_str()
         );
         let now = Utc::now();
-        let completed_at = status.is_terminal().then(|| now.to_rfc3339());
         conn.execute(
             r#"
             UPDATE goals
-            SET status = ?3, updated_at = ?4, completed_at = ?5, version = version + 1
+            SET updated_at = ?3, version = version + 1
             WHERE id = ?1 AND thread_id = ?2
             "#,
-            params![
-                goal_id.to_string(),
-                thread_id.to_string(),
-                status.as_str(),
-                now.to_rfc3339(),
-                completed_at,
-            ],
+            params![goal_id.to_string(), thread_id.to_string(), now.to_rfc3339(),],
         )?;
+        if let Some(mut form) = query_work_form_for_scope(&conn, WorkScope::Goal(goal_id))? {
+            form.set_status(status);
+            upsert_work_form_conn(&conn, &form)?;
+        }
         load_goal_snapshot(&conn, goal_id)
     }
 
-    fn apply_goal_plan(
-        &self,
-        thread_id: Uuid,
-        turn_id: Uuid,
-        plan: &TaskPlan,
-    ) -> anyhow::Result<GoalSnapshot> {
-        let goal_id = Uuid::parse_str(plan.goal_id.trim())
-            .with_context(|| format!("task plan has invalid goal id: {}", plan.goal_id))?;
-        anyhow::ensure!(!plan.steps.is_empty(), "goal plan cannot be empty");
-        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let tx = conn.transaction()?;
-        let goal = query_goal(&tx, goal_id)?.context("goal does not exist")?;
+    fn upsert_work_form(&self, form: &WorkForm) -> anyhow::Result<WorkForm> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
         anyhow::ensure!(
-            goal.thread_id == thread_id,
-            "goal {goal_id} does not belong to thread {thread_id}"
+            query_thread(&conn, form.thread_id)?.is_some(),
+            "thread not found: {}",
+            form.thread_id
         );
-        anyhow::ensure!(
-            plan.plan_revision >= goal.plan_revision,
-            "stale goal plan revision {} (current {})",
-            plan.plan_revision,
-            goal.plan_revision
-        );
-        if plan.plan_revision == goal.plan_revision && goal.plan_revision > 0 {
-            let snapshot = load_goal_snapshot(&tx, goal_id)?.context("goal disappeared")?;
-            tx.commit()?;
-            return Ok(snapshot);
-        }
+        upsert_work_form_conn(&conn, form)?;
+        Ok(form.clone())
+    }
 
-        let now = Utc::now();
-        tx.execute(
-            r#"
-            INSERT INTO goal_plan_revisions (
-                goal_id, revision, plan_json, change_reason, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
-            "#,
-            params![
-                goal_id.to_string(),
-                plan.plan_revision as i64,
-                serde_json::to_string(plan)?,
-                plan.change_reason.as_deref(),
-                now.to_rfc3339(),
-            ],
-        )?;
+    fn get_work_form(&self, form_id: Uuid) -> anyhow::Result<Option<WorkForm>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        query_work_form(&conn, form_id)
+    }
 
-        let existing = query_goal_task_states(&tx, goal_id)?;
-        let incoming_ids = plan
-            .steps
-            .iter()
-            .map(|step| step.id.clone())
-            .collect::<std::collections::HashSet<_>>();
-
-        for (ordinal, step) in plan.steps.iter().enumerate() {
-            let new_status = GoalTaskStatus::from(step.status);
-            let (old_status, old_attempt_count, max_attempts) = existing
-                .get(&step.id)
-                .copied()
-                .map(|(status, attempts, max)| (Some(status), attempts, max))
-                .unwrap_or((None, 0, 3));
-            let starts_attempt = new_status == GoalTaskStatus::Running
-                && old_status != Some(GoalTaskStatus::Running);
-            let attempt_count = old_attempt_count + u32::from(starts_attempt);
-            anyhow::ensure!(
-                attempt_count <= max_attempts,
-                "task {} exceeded its retry limit ({max_attempts})",
-                step.id
-            );
-
-            tx.execute(
-                r#"
-                INSERT INTO goal_tasks (
-                    goal_id, step_id, ordinal, title, status, status_reason,
-                    dependencies_json, acceptance_criteria_json, evidence_json,
-                    attempt_count, max_attempts, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(goal_id, step_id) DO UPDATE SET
-                    ordinal = excluded.ordinal,
-                    title = excluded.title,
-                    status = excluded.status,
-                    status_reason = excluded.status_reason,
-                    dependencies_json = excluded.dependencies_json,
-                    acceptance_criteria_json = excluded.acceptance_criteria_json,
-                    evidence_json = excluded.evidence_json,
-                    attempt_count = excluded.attempt_count,
-                    updated_at = excluded.updated_at
-                "#,
-                params![
-                    goal_id.to_string(),
-                    &step.id,
-                    ordinal as i64,
-                    &step.title,
-                    new_status.as_str(),
-                    step.status_reason.as_deref(),
-                    serde_json::to_string(&step.dependencies)?,
-                    serde_json::to_string(&step.acceptance_criteria)?,
-                    serde_json::to_string(&step.evidence)?,
-                    attempt_count as i64,
-                    max_attempts as i64,
-                    now.to_rfc3339(),
-                ],
-            )?;
-
-            if starts_attempt {
-                tx.execute(
-                    r#"
-                    INSERT INTO goal_task_attempts (
-                        id, goal_id, step_id, turn_id, attempt_no, status,
-                        started_at, finished_at, evidence_json, error
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL, '[]', NULL)
-                    "#,
-                    params![
-                        Uuid::new_v4().to_string(),
-                        goal_id.to_string(),
-                        &step.id,
-                        turn_id.to_string(),
-                        attempt_count as i64,
-                        now.to_rfc3339(),
-                    ],
-                )?;
-            } else if old_status == Some(GoalTaskStatus::Running)
-                && new_status != GoalTaskStatus::Running
-            {
-                let (attempt_status, error) = match new_status {
-                    GoalTaskStatus::Succeeded => (GoalAttemptStatus::Succeeded, None),
-                    GoalTaskStatus::Cancelled | GoalTaskStatus::Deferred => (
-                        GoalAttemptStatus::Interrupted,
-                        step.status_reason.as_deref(),
-                    ),
-                    _ => (GoalAttemptStatus::Failed, step.status_reason.as_deref()),
-                };
-                tx.execute(
-                    r#"
-                    UPDATE goal_task_attempts
-                    SET status = ?4, finished_at = ?5, evidence_json = ?6, error = ?7
-                    WHERE goal_id = ?1 AND step_id = ?2 AND attempt_no = ?3
-                      AND status = 'running'
-                    "#,
-                    params![
-                        goal_id.to_string(),
-                        &step.id,
-                        old_attempt_count as i64,
-                        attempt_status.as_str(),
-                        now.to_rfc3339(),
-                        serde_json::to_string(&step.evidence)?,
-                        error,
-                    ],
-                )?;
-            }
-        }
-
-        for (step_id, (old_status, _, _)) in &existing {
-            if incoming_ids.contains(step_id) {
-                continue;
-            }
-            tx.execute(
-                r#"
-                UPDATE goal_tasks
-                SET status = 'cancelled', status_reason = 'removed by plan revision', updated_at = ?3
-                WHERE goal_id = ?1 AND step_id = ?2
-                "#,
-                params![goal_id.to_string(), step_id, now.to_rfc3339()],
-            )?;
-            if *old_status == GoalTaskStatus::Running {
-                tx.execute(
-                    r#"
-                    UPDATE goal_task_attempts
-                    SET status = 'interrupted', finished_at = ?3,
-                        error = 'step removed by plan revision'
-                    WHERE goal_id = ?1 AND step_id = ?2 AND status = 'running'
-                    "#,
-                    params![goal_id.to_string(), step_id, now.to_rfc3339()],
-                )?;
-            }
-        }
-
-        let projected_status = if goal.status == GoalStatus::Draft {
-            GoalStatus::Ready
-        } else if goal.status == GoalStatus::Active && !plan.is_active() {
-            GoalStatus::Completed
-        } else {
-            goal.status
-        };
-        let completed_at = (projected_status == GoalStatus::Completed).then(|| now.to_rfc3339());
-        tx.execute(
-            r#"
-            UPDATE goals
-            SET status = ?2, plan_revision = ?3, updated_at = ?4,
-                completed_at = ?5, version = version + 1
-            WHERE id = ?1
-            "#,
-            params![
-                goal_id.to_string(),
-                projected_status.as_str(),
-                plan.plan_revision as i64,
-                now.to_rfc3339(),
-                completed_at,
-            ],
-        )?;
-        let snapshot = load_goal_snapshot(&tx, goal_id)?.context("goal disappeared")?;
-        tx.commit()?;
-        Ok(snapshot)
+    fn get_work_form_for_scope(&self, scope: WorkScope) -> anyhow::Result<Option<WorkForm>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        query_work_form_for_scope(&conn, scope)
     }
 
     fn add_goal_usage(
@@ -3522,13 +3340,14 @@ impl SessionStore for SqliteSessionStore {
         conn.execute(
             r#"
             INSERT INTO turns (
-                turn_id, thread_id, user_message_id, status, started_at,
-                updated_at, completed_at, error
+                turn_id, invocation_id, thread_id, user_message_id, status,
+                started_at, updated_at, completed_at, error
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
             params![
                 turn.turn_id.to_string(),
+                turn.invocation_id as i64,
                 turn.thread_id.to_string(),
                 turn.user_message_id.to_string(),
                 turn.status.as_str(),
@@ -3546,8 +3365,8 @@ impl SessionStore for SqliteSessionStore {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         conn.query_row(
             r#"
-            SELECT turn_id, thread_id, user_message_id, status, started_at,
-                   updated_at, completed_at, error
+            SELECT turn_id, invocation_id, thread_id, user_message_id, status,
+                   started_at, updated_at, completed_at, error
             FROM turns
             WHERE turn_id = ?1
             "#,
@@ -3562,8 +3381,8 @@ impl SessionStore for SqliteSessionStore {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         conn.query_row(
             r#"
-            SELECT turn_id, thread_id, user_message_id, status, started_at,
-                   updated_at, completed_at, error
+            SELECT turn_id, invocation_id, thread_id, user_message_id, status,
+                   started_at, updated_at, completed_at, error
             FROM turns
             WHERE thread_id = ?1 AND status IN ('running', 'cancelling')
             ORDER BY started_at DESC, rowid DESC
@@ -3580,8 +3399,8 @@ impl SessionStore for SqliteSessionStore {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         conn.query_row(
             r#"
-            SELECT turn_id, thread_id, user_message_id, status, started_at,
-                   updated_at, completed_at, error
+            SELECT turn_id, invocation_id, thread_id, user_message_id, status,
+                   started_at, updated_at, completed_at, error
             FROM turns
             WHERE thread_id = ?1
             ORDER BY started_at DESC, rowid DESC
@@ -3622,8 +3441,37 @@ impl SessionStore for SqliteSessionStore {
         }
         conn.query_row(
             r#"
-            SELECT turn_id, thread_id, user_message_id, status, started_at,
-                   updated_at, completed_at, error
+            SELECT turn_id, invocation_id, thread_id, user_message_id, status,
+                   started_at, updated_at, completed_at, error
+            FROM turns
+            WHERE turn_id = ?1
+            "#,
+            params![turn_id.to_string()],
+            map_turn,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn resume_turn_invocation(&self, turn_id: Uuid) -> anyhow::Result<Option<TurnRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now();
+        let changed = conn.execute(
+            r#"
+            UPDATE turns
+            SET invocation_id = invocation_id + 1, status = 'running',
+                updated_at = ?2, completed_at = NULL, error = NULL
+            WHERE turn_id = ?1 AND status IN ('waiting_approval', 'waiting_user_action')
+            "#,
+            params![turn_id.to_string(), now.to_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        conn.query_row(
+            r#"
+            SELECT turn_id, invocation_id, thread_id, user_message_id, status,
+                   started_at, updated_at, completed_at, error
             FROM turns
             WHERE turn_id = ?1
             "#,
@@ -5231,10 +5079,10 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 }
 
 fn map_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
-    let status_value: String = row.get(3)?;
+    let status_value: String = row.get(4)?;
     let status = TurnStatus::from_str(&status_value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(
-            3,
+            4,
             Type::Text,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -5242,19 +5090,72 @@ fn map_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
             )),
         )
     })?;
-    let completed_at: Option<String> = row.get(6)?;
+    let completed_at: Option<String> = row.get(7)?;
     Ok(TurnRecord {
         turn_id: parse_uuid(row.get(0)?, 0)?,
-        thread_id: parse_uuid(row.get(1)?, 1)?,
-        user_message_id: parse_uuid(row.get(2)?, 2)?,
+        invocation_id: row.get::<_, i64>(1)?.max(1) as u64,
+        thread_id: parse_uuid(row.get(2)?, 2)?,
+        user_message_id: parse_uuid(row.get(3)?, 3)?,
         status,
-        started_at: parse_datetime(row.get(4)?, 4)?,
-        updated_at: parse_datetime(row.get(5)?, 5)?,
+        started_at: parse_datetime(row.get(5)?, 5)?,
+        updated_at: parse_datetime(row.get(6)?, 6)?,
         completed_at: completed_at
-            .map(|value| parse_datetime(value, 6))
+            .map(|value| parse_datetime(value, 7))
             .transpose()?,
-        error: row.get(7)?,
+        error: row.get(8)?,
     })
+}
+
+fn upsert_work_form_conn(conn: &Connection, form: &WorkForm) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        form.id == form.scope.form_id(),
+        "work form id does not match its stable scope identity"
+    );
+    conn.execute(
+        r#"
+        INSERT INTO work_forms (
+            form_id, thread_id, scope_kind, scope_id, form_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(form_id) DO UPDATE SET
+            thread_id = excluded.thread_id,
+            scope_kind = excluded.scope_kind,
+            scope_id = excluded.scope_id,
+            form_json = excluded.form_json,
+            updated_at = excluded.updated_at
+        "#,
+        params![
+            form.id.to_string(),
+            form.thread_id.to_string(),
+            form.scope.kind(),
+            form.scope.id().to_string(),
+            serde_json::to_string(form)?,
+            form.created_at.to_rfc3339(),
+            form.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn query_work_form(conn: &Connection, form_id: Uuid) -> anyhow::Result<Option<WorkForm>> {
+    conn.query_row(
+        "SELECT form_json FROM work_forms WHERE form_id = ?1",
+        params![form_id.to_string()],
+        |row| {
+            let json: String = row.get(0)?;
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_work_form_for_scope(
+    conn: &Connection,
+    scope: WorkScope,
+) -> anyhow::Result<Option<WorkForm>> {
+    query_work_form(conn, scope.form_id())
 }
 
 fn valid_goal_transition(from: GoalStatus, to: GoalStatus) -> bool {
@@ -5262,37 +5163,25 @@ fn valid_goal_transition(from: GoalStatus, to: GoalStatus) -> bool {
         return true;
     }
     match from {
-        GoalStatus::Draft => matches!(
-            to,
-            GoalStatus::Ready | GoalStatus::Active | GoalStatus::Cancelled | GoalStatus::Failed
-        ),
-        GoalStatus::Ready => matches!(
-            to,
-            GoalStatus::Active | GoalStatus::Cancelled | GoalStatus::Failed
-        ),
         GoalStatus::Active => matches!(
             to,
             GoalStatus::Paused
                 | GoalStatus::Blocked
                 | GoalStatus::Completed
                 | GoalStatus::Cancelled
-                | GoalStatus::Failed
         ),
         GoalStatus::Paused | GoalStatus::Blocked => {
-            matches!(
-                to,
-                GoalStatus::Active | GoalStatus::Cancelled | GoalStatus::Failed
-            )
+            matches!(to, GoalStatus::Active | GoalStatus::Cancelled)
         }
-        GoalStatus::Completed | GoalStatus::Cancelled | GoalStatus::Failed => false,
+        GoalStatus::Completed | GoalStatus::Cancelled => false,
     }
 }
 
 fn query_goal(conn: &Connection, id: Uuid) -> anyhow::Result<Option<GoalRecord>> {
     conn.query_row(
         r#"
-        SELECT id, thread_id, objective, status, plan_revision, token_budget,
-               tokens_used, time_used_seconds, version, created_at, updated_at, completed_at
+        SELECT id, thread_id, objective, token_budget, tokens_used,
+               time_used_seconds, version, created_at, updated_at
         FROM goals
         WHERE id = ?1
         "#,
@@ -5307,150 +5196,29 @@ fn load_goal_snapshot(conn: &Connection, id: Uuid) -> anyhow::Result<Option<Goal
     let Some(goal) = query_goal(conn, id)? else {
         return Ok(None);
     };
-    let mut task_stmt = conn.prepare(
-        r#"
-        SELECT goal_id, step_id, ordinal, title, status, status_reason,
-               dependencies_json, acceptance_criteria_json, evidence_json,
-               attempt_count, max_attempts, updated_at
-        FROM goal_tasks
-        WHERE goal_id = ?1
-        ORDER BY ordinal ASC, rowid ASC
-        "#,
-    )?;
-    let tasks = collect_rows(task_stmt.query_map(params![id.to_string()], map_goal_task)?)?;
-    let mut attempt_stmt = conn.prepare(
-        r#"
-        SELECT id, goal_id, step_id, turn_id, attempt_no, status,
-               started_at, finished_at, evidence_json, error
-        FROM goal_task_attempts
-        WHERE goal_id = ?1
-        ORDER BY started_at ASC, rowid ASC
-        "#,
-    )?;
-    let attempts =
-        collect_rows(attempt_stmt.query_map(params![id.to_string()], map_goal_task_attempt)?)?;
-    Ok(Some(GoalSnapshot {
-        goal,
-        tasks,
-        attempts,
-    }))
-}
-
-fn query_goal_task_states(
-    conn: &Connection,
-    goal_id: Uuid,
-) -> anyhow::Result<HashMap<String, (GoalTaskStatus, u32, u32)>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT step_id, status, attempt_count, max_attempts
-        FROM goal_tasks
-        WHERE goal_id = ?1
-        "#,
-    )?;
-    let rows = stmt.query_map(params![goal_id.to_string()], |row| {
-        let raw_status: String = row.get(1)?;
-        let status = GoalTaskStatus::from_str(&raw_status)
-            .map_err(|error| invalid_column(1, error.to_string()))?;
-        let attempts = u32::try_from(row.get::<_, i64>(2)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error))
-        })?;
-        let max_attempts = u32::try_from(row.get::<_, i64>(3)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
-        })?;
-        Ok((row.get::<_, String>(0)?, (status, attempts, max_attempts)))
-    })?;
-    collect_rows(rows).map(|rows| rows.into_iter().collect())
+    let work_form = query_work_form_for_scope(conn, WorkScope::Goal(id))?
+        .with_context(|| format!("goal {id} is missing its WorkForm"))?;
+    Ok(Some(GoalSnapshot { goal, work_form }))
 }
 
 fn map_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalRecord> {
-    let raw_status: String = row.get(3)?;
-    let status =
-        GoalStatus::from_str(&raw_status).map_err(|error| invalid_column(3, error.to_string()))?;
     let token_budget = row
-        .get::<_, Option<i64>>(5)?
-        .map(|value| u64::try_from(value))
+        .get::<_, Option<i64>>(3)?
+        .map(u64::try_from)
         .transpose()
         .map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
         })?;
-    let completed_at: Option<String> = row.get(11)?;
     Ok(GoalRecord {
         id: parse_uuid(row.get(0)?, 0)?,
         thread_id: parse_uuid(row.get(1)?, 1)?,
         objective: row.get(2)?,
-        status,
-        plan_revision: parse_u64(row.get(4)?, 4)?,
         token_budget,
-        tokens_used: parse_u64(row.get(6)?, 6)?,
-        time_used_seconds: parse_u64(row.get(7)?, 7)?,
-        version: parse_u64(row.get(8)?, 8)?,
-        created_at: parse_datetime(row.get(9)?, 9)?,
-        updated_at: parse_datetime(row.get(10)?, 10)?,
-        completed_at: completed_at
-            .map(|value| parse_datetime(value, 11))
-            .transpose()?,
-    })
-}
-
-fn map_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTask> {
-    let raw_status: String = row.get(4)?;
-    let status = GoalTaskStatus::from_str(&raw_status)
-        .map_err(|error| invalid_column(4, error.to_string()))?;
-    let dependencies_json: String = row.get(6)?;
-    let acceptance_json: String = row.get(7)?;
-    let evidence_json: String = row.get(8)?;
-    Ok(GoalTask {
-        goal_id: parse_uuid(row.get(0)?, 0)?,
-        step_id: row.get(1)?,
-        ordinal: usize::try_from(row.get::<_, i64>(2)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error))
-        })?,
-        title: row.get(3)?,
-        status,
-        status_reason: row.get(5)?,
-        dependencies: parse_json_column(&dependencies_json, 6)?,
-        acceptance_criteria: parse_json_column(&acceptance_json, 7)?,
-        evidence: parse_json_column(&evidence_json, 8)?,
-        attempt_count: u32::try_from(row.get::<_, i64>(9)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(9, Type::Integer, Box::new(error))
-        })?,
-        max_attempts: u32::try_from(row.get::<_, i64>(10)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(10, Type::Integer, Box::new(error))
-        })?,
-        updated_at: parse_datetime(row.get(11)?, 11)?,
-    })
-}
-
-fn map_goal_task_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskAttempt> {
-    let raw_status: String = row.get(5)?;
-    let status = GoalAttemptStatus::from_str(&raw_status)
-        .map_err(|error| invalid_column(5, error.to_string()))?;
-    let finished_at: Option<String> = row.get(7)?;
-    let evidence_json: String = row.get(8)?;
-    Ok(GoalTaskAttempt {
-        id: parse_uuid(row.get(0)?, 0)?,
-        goal_id: parse_uuid(row.get(1)?, 1)?,
-        step_id: row.get(2)?,
-        turn_id: parse_uuid(row.get(3)?, 3)?,
-        attempt_no: u32::try_from(row.get::<_, i64>(4)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(4, Type::Integer, Box::new(error))
-        })?,
-        status,
-        started_at: parse_datetime(row.get(6)?, 6)?,
-        finished_at: finished_at
-            .map(|value| parse_datetime(value, 7))
-            .transpose()?,
-        evidence: parse_json_column(&evidence_json, 8)?,
-        error: row.get(9)?,
-    })
-}
-
-fn parse_json_column<T: serde::de::DeserializeOwned>(
-    value: &str,
-    column: usize,
-) -> rusqlite::Result<T> {
-    serde_json::from_str(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+        tokens_used: parse_u64(row.get(4)?, 4)?,
+        time_used_seconds: parse_u64(row.get(5)?, 5)?,
+        version: parse_u64(row.get(6)?, 6)?,
+        created_at: parse_datetime(row.get(7)?, 7)?,
+        updated_at: parse_datetime(row.get(8)?, 8)?,
     })
 }
 
@@ -5510,6 +5278,8 @@ fn conversation_payload_json(
             request_id,
             round,
             context_hash,
+            stable_prefix_hash,
+            dynamic_tail_hash,
             token_estimate,
             purpose,
             token_breakdown,
@@ -5519,6 +5289,8 @@ fn conversation_payload_json(
             "request_id": request_id,
             "round": round,
             "context_hash": context_hash,
+            "stable_prefix_hash": stable_prefix_hash,
+            "dynamic_tail_hash": dynamic_tail_hash,
             "token_estimate": token_estimate,
             "purpose": purpose,
             "token_breakdown": token_breakdown,
@@ -6089,7 +5861,7 @@ mod tests {
         AgentBudgetV1, AgentModelBindingV1, AgentModelPolicyV1, AgentRiskClassV1,
         AgentTemplateSpecV1, CapabilityProjection, ExperienceSurfaceProfile,
     };
-    use crate::model::{TaskPlanStep, TaskPlanStepStatus, TurnFileChange, TurnFileChangeKind};
+    use crate::model::{TurnFileChange, TurnFileChangeKind};
     use std::collections::BTreeSet;
 
     fn temporary_db_path(label: &str) -> PathBuf {
@@ -6819,125 +6591,6 @@ mod tests {
                 .expect("list remaining messages"),
             vec![second.id]
         );
-    }
-
-    #[test]
-    fn goal_plan_projection_tracks_attempts_and_completion() {
-        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
-        let thread = store
-            .create_thread(None, PathBuf::from("C:/workspace/goal-projection"))
-            .expect("create thread");
-        let created = store
-            .create_goal(
-                thread.id,
-                "Ship durable goal execution".to_string(),
-                GoalStatus::Draft,
-                Some(50_000),
-            )
-            .expect("create goal");
-        let goal_id = created.goal.id;
-        let turn_id = Uuid::new_v4();
-        let plan = |revision, status, evidence: Vec<&str>| TaskPlan {
-            plan_revision: revision,
-            goal_id: goal_id.to_string(),
-            change_reason: Some(format!("revision {revision}")),
-            coverage: None,
-            steps: vec![TaskPlanStep {
-                id: "implement".to_string(),
-                title: "Implement and verify".to_string(),
-                status,
-                status_reason: None,
-                dependencies: Vec::new(),
-                acceptance_criteria: vec!["tests pass".to_string()],
-                evidence: evidence.into_iter().map(str::to_string).collect(),
-            }],
-        };
-
-        let ready = store
-            .apply_goal_plan(
-                thread.id,
-                turn_id,
-                &plan(1, TaskPlanStepStatus::Pending, vec![]),
-            )
-            .expect("project draft plan");
-        assert_eq!(ready.goal.status, GoalStatus::Ready);
-        assert_eq!(ready.tasks[0].status, GoalTaskStatus::Pending);
-
-        store
-            .update_goal_status(thread.id, goal_id, GoalStatus::Active)
-            .expect("activate goal");
-        let running = store
-            .apply_goal_plan(
-                thread.id,
-                turn_id,
-                &plan(2, TaskPlanStepStatus::InProgress, vec![]),
-            )
-            .expect("start task");
-        assert_eq!(running.tasks[0].attempt_count, 1);
-        assert_eq!(running.attempts.len(), 1);
-        assert_eq!(running.attempts[0].status, GoalAttemptStatus::Running);
-
-        let completed = store
-            .apply_goal_plan(
-                thread.id,
-                turn_id,
-                &plan(3, TaskPlanStepStatus::Completed, vec!["cargo test passed"]),
-            )
-            .expect("complete task");
-        assert_eq!(completed.goal.status, GoalStatus::Completed);
-        assert_eq!(completed.completed_tasks(), 1);
-        assert_eq!(completed.attempts[0].status, GoalAttemptStatus::Succeeded);
-        assert_eq!(completed.attempts[0].evidence, vec!["cargo test passed"]);
-    }
-
-    #[test]
-    fn goal_recovery_interrupts_running_attempts_without_replaying_them() {
-        let path = temporary_db_path("goal-recovery");
-        let (thread_id, goal_id) = {
-            let store = SqliteSessionStore::open(&path).expect("open goal store");
-            let thread = store
-                .create_thread(None, PathBuf::from("C:/workspace/goal-recovery"))
-                .expect("create thread");
-            let goal = store
-                .create_goal(
-                    thread.id,
-                    "Recover safely".to_string(),
-                    GoalStatus::Active,
-                    None,
-                )
-                .expect("create goal");
-            let plan = TaskPlan {
-                plan_revision: 1,
-                goal_id: goal.goal.id.to_string(),
-                change_reason: Some("start".to_string()),
-                coverage: None,
-                steps: vec![TaskPlanStep {
-                    id: "side-effect".to_string(),
-                    title: "Perform side effect".to_string(),
-                    status: TaskPlanStepStatus::InProgress,
-                    status_reason: None,
-                    dependencies: Vec::new(),
-                    acceptance_criteria: vec!["effect observed".to_string()],
-                    evidence: Vec::new(),
-                }],
-            };
-            store
-                .apply_goal_plan(thread.id, Uuid::new_v4(), &plan)
-                .expect("start attempt");
-            (thread.id, goal.goal.id)
-        };
-
-        let recovered = SqliteSessionStore::open(&path).expect("reopen goal store");
-        let snapshot = recovered
-            .get_goal(goal_id)
-            .expect("load goal")
-            .expect("goal exists");
-        assert_eq!(snapshot.goal.thread_id, thread_id);
-        assert_eq!(snapshot.goal.status, GoalStatus::Blocked);
-        assert_eq!(snapshot.tasks[0].status, GoalTaskStatus::Blocked);
-        assert_eq!(snapshot.attempts[0].status, GoalAttemptStatus::Interrupted);
-        drop(recovered);
-        remove_sqlite_files(&path);
     }
 
     #[test]
@@ -7839,5 +7492,97 @@ mod tests {
                 .content_hash,
             definition.content_hash
         );
+    }
+
+    #[test]
+    fn goal_snapshot_and_lifecycle_are_projected_from_one_work_form() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/work-form-goal"))
+            .expect("create thread");
+        let created = store
+            .create_goal(thread.id, "Ship the goal".into(), None)
+            .expect("create goal");
+        let scope = WorkScope::Goal(created.goal.id);
+        let form = store
+            .get_work_form_for_scope(scope)
+            .expect("read form")
+            .expect("goal form");
+        assert_eq!(form.id, scope.form_id());
+        assert!(form.items.is_empty());
+
+        let mut form = WorkForm::new(
+            thread.id,
+            scope,
+            created.goal.objective.clone(),
+            vec![crate::work_form::WorkItem {
+                id: "implement".into(),
+                title: "Implement".into(),
+                status: WorkItemStatus::Pending,
+                completion_disposition: crate::completion_runtime::CompletionDisposition::Blocking,
+                note: None,
+                depends_on: Vec::new(),
+                acceptance: vec!["works".into()],
+                evidence_refs: Vec::new(),
+            }],
+        );
+        form.revision = 1;
+        form.change_reason = Some("commit work".into());
+        store.upsert_work_form(&form).expect("persist WorkForm");
+        let snapshot = store
+            .get_goal(created.goal.id)
+            .expect("load goal")
+            .expect("goal");
+        assert_eq!(snapshot.work_form.items.len(), 1);
+        assert_eq!(snapshot.work_form.items[0].id, "implement");
+        assert_eq!(snapshot.work_form.revision, 1);
+
+        let paused = store
+            .update_goal_status(thread.id, created.goal.id, GoalStatus::Paused)
+            .expect("pause goal")
+            .expect("goal");
+        assert_eq!(paused.status(), GoalStatus::Paused);
+        assert_eq!(
+            store
+                .get_work_form_for_scope(scope)
+                .unwrap()
+                .unwrap()
+                .status,
+            WorkFormStatus::Paused
+        );
+        let resumed = store
+            .update_goal_status(thread.id, created.goal.id, GoalStatus::Active)
+            .expect("resume goal")
+            .expect("goal");
+        assert_eq!(resumed.status(), GoalStatus::Active);
+    }
+
+    #[test]
+    fn default_turn_forms_and_goal_forms_share_schema_without_sharing_state() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/work-form-turns"))
+            .expect("create thread");
+        let first_scope = WorkScope::Turn(Uuid::new_v4());
+        let second_scope = WorkScope::Turn(Uuid::new_v4());
+        for scope in [first_scope, second_scope] {
+            store
+                .upsert_work_form(&WorkForm::new(
+                    thread.id,
+                    scope,
+                    "same-model-namespace",
+                    Vec::new(),
+                ))
+                .expect("persist turn form");
+        }
+        assert_ne!(first_scope.form_id(), second_scope.form_id());
+        assert!(store
+            .get_work_form_for_scope(first_scope)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_work_form_for_scope(second_scope)
+            .unwrap()
+            .is_some());
     }
 }

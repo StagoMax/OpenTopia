@@ -75,7 +75,7 @@ impl TypedTool for PdfTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let artifact_input = read_artifact_input(
             &ctx,
@@ -224,7 +224,7 @@ impl TypedTool for DocumentTool {
         &self,
         call_id: Uuid,
         input: Self::Input,
-        ctx: ToolContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let artifact_input = read_artifact_input(
             &ctx,
@@ -306,7 +306,7 @@ struct ArtifactInput {
 }
 
 async fn read_artifact_input(
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
     requested: Option<&str>,
     attachment_id: Option<&str>,
     expected_extension: &str,
@@ -421,7 +421,7 @@ fn render_success(
     path: &Path,
     dpi: u16,
     pages: Vec<RenderedPage>,
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     let artifacts = persist_rendered_pages(tool_name, path, dpi, &pages, ctx)?;
     let summaries = pages
@@ -488,10 +488,10 @@ fn persist_rendered_pages(
     source_path: &Path,
     dpi: u16,
     pages: &[RenderedPage],
-    ctx: &ToolContext,
+    ctx: &ToolInvocationContext,
 ) -> anyhow::Result<Vec<Artifact>> {
     let (Some(store), Some(thread_id), Some(output_root)) = (
-        ctx.store.as_ref(),
+        ctx.state.as_ref(),
         ctx.thread_id,
         ctx.artifact_runtime.artifact_output_root(),
     ) else {

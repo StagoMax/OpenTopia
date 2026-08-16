@@ -3,7 +3,8 @@ use opentopia_core::{
     extract_document_text, extract_pdf_text, inspect_document, inspect_pdf, inspect_plugin,
     validate_document, validate_pdf, ArtifactRuntime, ArtifactRuntimeError, BasicPolicyEngine,
     ContextSourceKind, ContextSourceRef, Message, MessagePart, MessageRole, ModelContentPart,
-    PermissionMode, SessionStore, SqliteSessionStore, ToolCall, ToolContext, ToolRegistry,
+    PermissionMode, SessionStore, SqliteSessionStore, ToolCall, ToolInvocationContext,
+    ToolRegistry, ToolStateStore,
 };
 use rust_xlsxwriter::Workbook;
 use serde_json::json;
@@ -83,8 +84,8 @@ async fn native_tools_read_through_the_workspace_environment_and_return_typed_pn
         workspace.clone(),
         PermissionMode::FullAccess,
     ));
-    let context = ToolContext::local(workspace.clone(), policy.clone());
-    let second_context = ToolContext::local(workspace.clone(), policy);
+    let context = ToolInvocationContext::local(workspace.clone(), policy.clone());
+    let second_context = ToolInvocationContext::local(workspace.clone(), policy);
     assert!(Arc::ptr_eq(
         &context.artifact_runtime,
         &second_context.artifact_runtime
@@ -178,8 +179,8 @@ async fn native_office_tools_read_real_thread_attachments_by_id() {
         workspace.clone(),
         PermissionMode::ReadOnly,
     ));
-    let mut context = ToolContext::local(workspace.clone(), policy);
-    context.store = Some(store.clone());
+    let mut context = ToolInvocationContext::local(workspace.clone(), policy);
+    context.state = Some(ToolStateStore::new(store.clone()));
     context.thread_id = Some(thread.id);
     context.artifact_runtime =
         Arc::new(ArtifactRuntime::default().with_artifact_output_root(workspace.join("artifacts")));

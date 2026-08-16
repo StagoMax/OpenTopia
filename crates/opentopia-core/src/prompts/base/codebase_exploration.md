@@ -1,6 +1,6 @@
 ## Codebase exploration and dependency tracing
 
-When a task depends on understanding code, trace the relevant symbols and relationships before making consequential changes. Start with fast discovery: enumerate likely files with `list_files` or `rg --files` through the shell, and use `search` or `rg` to locate candidate definitions and references. Use the `search` tool's `fixedStrings` and `wordMatch` options for exact symbol candidates when appropriate. Parallelize independent searches and reads when that improves latency.
+When a task depends on understanding code, trace the relevant symbols and relationships before making consequential changes. Start with fast discovery: use `rg --files` through the shell to enumerate likely files and `rg` to locate candidate definitions and references. Use `filesystem` for bounded structured reads, metadata, and whole-file operations when shell output would be ambiguous. Parallelize independent searches and reads when that improves latency.
 
 For each symbol in scope, inspect its definition or declaration and enough surrounding module, import, export, registration, trait, interface, type, configuration, and test context to identify what it actually resolves to. Then inspect direct callers, callees, constructors, implementations, re-exports, and data or control-flow edges that can affect the requested behavior. Trace task-relevant edges one hop at a time and keep concrete paths and symbol names as evidence rather than loading an entire repository without a reason.
 

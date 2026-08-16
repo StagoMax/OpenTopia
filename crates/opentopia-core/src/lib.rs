@@ -9,7 +9,9 @@ pub mod browser_router;
 pub mod bundled_plugins;
 pub mod capabilities;
 pub mod chrome_extension_browser;
+pub mod completion_runtime;
 pub mod computer;
+pub mod context_runtime;
 pub mod context_sources;
 pub mod contribution_hosts;
 pub mod desktop_browser;
@@ -32,6 +34,7 @@ pub mod mcp;
 pub mod mcp_host;
 pub mod model;
 pub mod model_context;
+pub mod model_gateway;
 pub mod pdf;
 pub mod plugin_control;
 pub mod plugins;
@@ -51,9 +54,14 @@ pub mod spreadsheet;
 pub mod store;
 pub mod subagents;
 mod tool_adapter;
+mod tool_error;
 mod tool_result_ingress;
+pub mod tool_runtime;
+pub mod tool_state;
 mod tool_surface;
 pub mod tools;
+pub mod turn_inbox;
+pub mod work_form;
 pub mod workspace;
 
 pub use agent::{
@@ -62,15 +70,15 @@ pub use agent::{
     ContextBudget as AgentContextBudget, ProviderConversationCursor,
 };
 pub use agent_profiles::{AgentProfile, AgentProfileRegistry};
-pub use agent_runtime::AgentTurnDriver;
+pub use agent_runtime::{AgentResumeSignal, AgentTurnDriver, TurnKernel};
 pub use artifact_runtime::{
     ArtifactRuntime, ArtifactRuntimeError, HayroPdfBackend, PdfBackend, RenderedPage,
     ValidationIssue, ValidationReport, ValidationSeverity, MAX_ARTIFACT_INPUT_BYTES,
     MAX_RENDERED_PAGES,
 };
 pub use background::{
-    BackgroundJobSnapshot, BackgroundJobStatus, BackgroundOutputChunk, BackgroundProcessRegistry,
-    BackgroundRegistryConfig, BackgroundScope, BackgroundSpawnRequest,
+    BackgroundCompletionSink, BackgroundJobSnapshot, BackgroundJobStatus, BackgroundOutputChunk,
+    BackgroundProcessRegistry, BackgroundRegistryConfig, BackgroundScope, BackgroundSpawnRequest,
 };
 pub use browser::{
     BrowserAccessibilityNode, BrowserAction, BrowserActionCapability, BrowserActionReceipt,
@@ -101,12 +109,20 @@ pub use capabilities::{
 pub use chrome_extension_browser::{
     ChromeExtensionBrowserRuntime, ChromeExtensionBrowserRuntimeConfig,
 };
+pub use completion_runtime::{
+    CompletionDisposition, CompletionGate, CompletionRegistry, CompletionReport, CompletionSignal,
+    DefaultCompletionGate, DefaultCompletionRegistry,
+};
 pub use computer::{
     ComputerAccessPolicy, ComputerAction, ComputerActionReceipt, ComputerError,
     ComputerMouseButton, ComputerObservation, ComputerPolicyContext, ComputerRuntime,
     ComputerRuntimeConfig, ComputerScreenshot, ComputerSessionId, LocalComputerRuntime,
     ObserveOptions, ScreenRect, WindowTarget, MAX_COMPUTER_IMAGE_EDGE,
     MAX_COMPUTER_SCREENSHOT_BYTES, MAX_COMPUTER_WINDOWS,
+};
+pub use context_runtime::{
+    prompt_cache_lineage_key, CanonicalModelRequest, ContextAssembler, ContextAssemblyInput,
+    ContextAssemblyManifest, ContextManifestItem, ContextPreparationInput, DefaultContextAssembler,
 };
 pub use context_sources::{
     load_context_source_metadata, load_context_sources, ContextSourceError, ContextSourceKind,
@@ -201,10 +217,8 @@ pub use model::{
     ContextCheckpointFact, ContextCheckpointFile, ContextCheckpointInteraction,
     ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
     ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextProjection,
-    ContextSourceRef, ContextSummary, ExperienceMode, GoalAttemptStatus, GoalRecord, GoalSnapshot,
-    GoalStatus, GoalTask, GoalTaskAttempt, GoalTaskStatus, Message, MessagePart, MessageRole,
-    ModelCallPurpose, ModelContentPart, Project, SkillRef, TaskEvidenceKind, TaskEvidenceRef,
-    TaskPlan, TaskPlanCoverage, TaskPlanStep, TaskPlanStepStatus, TaskRequirement,
+    ContextSourceRef, ContextSummary, ExperienceMode, GoalRecord, GoalSnapshot, GoalStatus,
+    Message, MessagePart, MessageRole, ModelCallPurpose, ModelContentPart, Project, SkillRef,
     TerminalCommandHistory, TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall,
     ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord,
     TurnStatus, UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord,
@@ -212,10 +226,14 @@ pub use model::{
 };
 pub use model_context::{
     content_fingerprint, estimate_tokens as estimate_model_context_tokens,
-    world_state_catalog_item, world_state_item, CompiledModelContext, ContextCacheScope,
-    ContextItemKind, ContextRole, ContextSensitivity, InstructionSnapshotRef, ModelContextItem,
-    ThreadContextSnapshot, TokenEstimateBreakdown, TurnContextSnapshot, WorldStateSkill,
-    WorldStateSnapshot,
+    world_state_catalog_item, world_state_item, CompiledModelContext, ContextAuthority,
+    ContextCacheScope, ContextItemKind, ContextLifecycle, ContextRole, ContextSensitivity,
+    InstructionSnapshotRef, ModelContextItem, ThreadContextSnapshot, TokenEstimateBreakdown,
+    TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
+};
+pub use model_gateway::{
+    LegacyProviderCodec, LegacyProviderTransport, ModelGateway, ProviderCodec,
+    ProviderModelGateway, ProviderTransport,
 };
 pub use pdf::{
     extract_pdf_text, inspect_pdf, validate_pdf, PdfError, PdfExtraction, PdfInspection,
@@ -293,12 +311,16 @@ pub use skills::{
     discover_skills, load_selected_skills, LoadedSkill, SkillDescriptor, SkillError, SkillScope,
 };
 pub use spreadsheet::{
-    execute_spreadsheet, CellAddress, CellRange, CellUpdate, FormulaInput, InspectWorkbookRequest,
+    execute_spreadsheet, filter_rows, find_cells, write_workbook_openpyxl,
+    write_workbook_preferred, CellAddress, CellRange, CellUpdate, FilterRowsRequest,
+    FilterRowsResult, FindCellsRequest, FindCellsResult, FormulaInput, InspectWorkbookRequest,
     ListSheetsRequest, ReadRangeRequest, ReadRangesRequest, ReadRangesResult, SheetRangeRequest,
     SheetVisibility, SheetWriteRequest, SpreadsheetAction, SpreadsheetActionKind, SpreadsheetCell,
-    SpreadsheetCellInput, SpreadsheetCellValue, SpreadsheetError, SpreadsheetErrorCode,
-    SpreadsheetErrorInfo, SpreadsheetRequest, SpreadsheetResult, WriteWorkbookRequest,
-    MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
+    SpreadsheetCellInput, SpreadsheetCellMatch, SpreadsheetCellValue, SpreadsheetError,
+    SpreadsheetErrorCode, SpreadsheetErrorInfo, SpreadsheetFilterCondition,
+    SpreadsheetFilterMatchMode, SpreadsheetFilterOperator, SpreadsheetFilterValue,
+    SpreadsheetRequest, SpreadsheetResult, SpreadsheetTextMatchMode, SpreadsheetWriteBackend,
+    WriteWorkbookRequest, MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
     MAX_OUTPUT_FILE_BYTES as MAX_SPREADSHEET_OUTPUT_BYTES,
 };
 pub use store::{
@@ -315,14 +337,23 @@ pub use subagents::{
     SubagentWorkspaceAssignment, SubagentWorkspaceMode,
 };
 pub use tool_result_ingress::tool_result_is_error;
+pub use tool_runtime::{
+    AcceptedToolResult, AsyncToolResult, DefaultToolRuntime, DurableAsyncToolResultSink,
+    ProviderToolExecutionInput, ProviderToolExecutionReport, ToolApprovalCandidate,
+    ToolExecutionInput, ToolExecutionReport, ToolReviewInput, ToolRuntime, ToolRuntimeCatalog,
+    ToolSchedulingInput,
+};
+pub use tool_state::ToolStateStore;
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
     BrowserTool, ComputerTool, DocumentTool, GitDiffTool, ListFilesTool, ListSkillsTool,
     McpToolWrapper, NativePatchOperation, PdfTool, ReadArtifactTool, ReadFileTool, ReadSkillTool,
     RequestUserInputTool, SearchTool, SetPlanTool, ShellTool, SpreadsheetTool, Tool,
-    ToolApprovalMode, ToolCapabilityDescriptor, ToolContext, ToolRegistry, ToolRiskLevel,
-    ToolSource, UpdatePlanTool, WaitAgentsTool, WriteFileTool,
+    ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy, ToolInvocationContext,
+    ToolRegistry, ToolRiskLevel, ToolSource, UpdatePlanTool, WaitAgentsTool, WriteFileTool,
 };
+pub use turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
+pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScope};
 pub use workspace::{
     ChangedFile, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,
     WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,

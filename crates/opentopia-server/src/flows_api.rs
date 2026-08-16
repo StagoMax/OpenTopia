@@ -11,7 +11,8 @@ use opentopia_core::{
     resolve_flow_approval, simulate_flow, spawn_flow_run, validate_flow_spec, BasicPolicyEngine,
     CapabilityProjection, ExperienceMode, ExperienceSurfaceProfile, FlowDefinitionV1,
     FlowDraftStatusV1, FlowDraftV1, FlowRunStatusV1, FlowRunV1, FlowSourceV1, FlowSpecV1,
-    FlowStoreError, FlowTrialV1, RuntimeSurface, SessionStore, ToolContext, TurnStatus,
+    FlowStoreError, FlowTrialV1, RuntimeSurface, SessionStore, ToolInvocationContext,
+    ToolStateStore, TurnStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -413,7 +414,7 @@ async fn flow_runtime_context(
     thread: &opentopia_core::Thread,
     parent_run_id: Uuid,
     capabilities: CapabilityProjection,
-) -> Result<ToolContext, ApiError> {
+) -> Result<ToolInvocationContext, ApiError> {
     let settings = current_settings(state);
     let mut agent = state.agent.read().expect("agent lock poisoned").clone();
     agent.apply_experience_mode(thread.experience_mode);
@@ -437,13 +438,13 @@ async fn flow_runtime_context(
         settings.permission_mode,
         &sandbox,
     ));
-    let mut context = ToolContext::local_with_sandbox_config(
+    let mut context = ToolInvocationContext::local_with_sandbox_config(
         thread.workspace_root.clone(),
         policy,
         sandbox.clone(),
     );
     context.permission_mode = settings.permission_mode;
-    context.store = Some(state.store.clone());
+    context.state = Some(ToolStateStore::new(state.store.clone()));
     context.thread_id = Some(thread.id);
     context.parent_turn_id = Some(parent_run_id);
     context.subagents = Some(state.subagents.clone());

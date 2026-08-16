@@ -107,6 +107,24 @@ pub struct BackgroundOutputChunk {
     pub dropped_bytes: usize,
 }
 
+/// Receives a terminal job result without coupling the process registry to a
+/// particular ledger or live-turn implementation.
+pub trait BackgroundCompletionSink: Send + Sync {
+    fn deliver(&self, chunk: BackgroundOutputChunk) -> anyhow::Result<()>;
+}
+
+#[derive(Clone)]
+struct BackgroundCompletionSinkHandle(Arc<dyn BackgroundCompletionSink>);
+
+impl std::fmt::Debug for BackgroundCompletionSinkHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("BackgroundCompletionSink")
+            .field(&"<runtime>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BackgroundRegistryConfig {
     pub max_buffered_bytes: usize,
@@ -205,6 +223,7 @@ struct Job {
     /// arrives without requiring the model to poll snapshots.
     changes: watch::Sender<u64>,
     max_buffered_bytes: usize,
+    completion_sink: Mutex<Option<BackgroundCompletionSinkHandle>>,
     session: Option<InteractiveSession>,
     state: Mutex<JobState>,
 }
@@ -242,6 +261,50 @@ impl Job {
             stderr_bytes: state.stderr.total_bytes,
             dropped_bytes: state.stdout.dropped_bytes + state.stderr.dropped_bytes,
             unread_bytes: state.stdout.unread.len() + state.stderr.unread.len(),
+        }
+    }
+
+    fn completion_chunk(&self) -> BackgroundOutputChunk {
+        let state = self.lock();
+        let stdout = state.stdout.peek();
+        let stderr = state.stderr.peek();
+        let dropped = state.stdout.unread_dropped_bytes + state.stderr.unread_dropped_bytes;
+        drop(state);
+        BackgroundOutputChunk {
+            job: self.snapshot(),
+            stdout,
+            stderr,
+            dropped_bytes: dropped,
+        }
+    }
+
+    fn publish_completion(&self) {
+        let mut sink_slot = self
+            .completion_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.lock().completion_reported {
+            return;
+        }
+        // Taking the sink is the delivery claim. Completion and a late attach
+        // can race, but only one caller may publish the terminal result.
+        let Some(sink) = sink_slot.take() else {
+            return;
+        };
+        drop(sink_slot);
+        if sink.0.deliver(self.completion_chunk()).is_ok() {
+            let mut state = self.lock();
+            state.completion_reported = true;
+            state.stdout.clear();
+            state.stderr.clear();
+        } else {
+            let mut sink_slot = self
+                .completion_sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if sink_slot.is_none() {
+                *sink_slot = Some(sink);
+            }
         }
     }
 }
@@ -325,6 +388,27 @@ impl BackgroundProcessRegistry {
         Ok(job)
     }
 
+    pub fn attach_completion_sink(
+        &self,
+        scope: &BackgroundScope,
+        job_id: Uuid,
+        sink: Arc<dyn BackgroundCompletionSink>,
+    ) -> anyhow::Result<()> {
+        let job = self.visible(scope, job_id)?;
+        *job.completion_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(BackgroundCompletionSinkHandle(sink));
+        let terminal = {
+            let state = job.lock();
+            state.status.is_terminal() && !state.completion_reported
+        };
+        if terminal {
+            job.publish_completion();
+        }
+        Ok(())
+    }
+
     fn register_detached_job(
         &self,
         scope: BackgroundScope,
@@ -354,6 +438,7 @@ impl BackgroundProcessRegistry {
             finished: finished.clone(),
             changes,
             max_buffered_bytes: self.inner.config.max_buffered_bytes,
+            completion_sink: Mutex::new(None),
             session: None,
             state: Mutex::new(JobState {
                 status: BackgroundJobStatus::Running,
@@ -451,6 +536,7 @@ impl BackgroundProcessRegistry {
                 }
             }
             drop(state);
+            job.publish_completion();
             job.signal_change();
             finished.cancel();
         });
@@ -501,6 +587,7 @@ impl BackgroundProcessRegistry {
                 }
             }
             drop(state);
+            job.publish_completion();
             job.signal_change();
             finished.cancel();
         });
@@ -571,6 +658,7 @@ impl BackgroundProcessRegistry {
             finished: finished.clone(),
             changes,
             max_buffered_bytes: self.inner.config.max_buffered_bytes,
+            completion_sink: Mutex::new(None),
             session: Some(InteractiveSession {
                 inner: session.clone(),
             }),
@@ -696,6 +784,7 @@ impl BackgroundProcessRegistry {
                 }
             }
             drop(state);
+            job.publish_completion();
             job.signal_change();
             finished.cancel();
         });
@@ -897,6 +986,21 @@ mod tests {
     use super::*;
     use crate::execution::LocalExecutionEnvironment;
     use crate::sandbox::LocalSandboxConfig;
+
+    #[derive(Default)]
+    struct RecordingCompletionSink {
+        chunks: Mutex<Vec<BackgroundOutputChunk>>,
+    }
+
+    impl BackgroundCompletionSink for RecordingCompletionSink {
+        fn deliver(&self, chunk: BackgroundOutputChunk) -> anyhow::Result<()> {
+            self.chunks
+                .lock()
+                .expect("recording sink mutex poisoned")
+                .push(chunk);
+            Ok(())
+        }
+    }
 
     fn workspace(name: &str) -> std::path::PathBuf {
         let dir =
@@ -1194,6 +1298,32 @@ mod tests {
             .expect("task finishes inline");
         assert!(output.job.success);
         assert!(output.stdout.contains("fixture.zip"));
+        assert!(registry.pending_completions(&scope).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sink_attached_after_completion_delivers_exactly_once() {
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let snapshot = registry
+            .spawn_task(scope.clone(), "late sink".to_string(), None, async {
+                Ok("terminal output".to_string())
+            })
+            .expect("task starts");
+        wait_until_terminal(&registry, &scope, snapshot.job_id).await;
+        assert_eq!(registry.pending_completions(&scope).len(), 1);
+
+        let sink = Arc::new(RecordingCompletionSink::default());
+        registry
+            .attach_completion_sink(&scope, snapshot.job_id, sink.clone())
+            .expect("late attach succeeds");
+        registry
+            .attach_completion_sink(&scope, snapshot.job_id, sink.clone())
+            .expect("repeated attach is harmless");
+
+        let chunks = sink.chunks.lock().expect("recording sink mutex poisoned");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].stdout.contains("terminal output"));
         assert!(registry.pending_completions(&scope).is_empty());
     }
 

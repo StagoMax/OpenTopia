@@ -5,7 +5,7 @@ use crate::flow_runtime::{
     prepare_flow_resume, resolve_flow_approval, spawn_flow_run, FlowRunStatusV1, FlowRunV1,
 };
 use crate::model::{ExperienceMode, ToolCall, ToolResult, TurnStatus};
-use crate::tools::{Tool, ToolContext, ToolExecutionPolicy, ToolSideEffect};
+use crate::tools::{Tool, ToolExecutionPolicy, ToolInvocationContext, ToolSideEffect};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
@@ -59,19 +59,20 @@ struct FlowTool {
 impl FlowTool {
     fn store<'a>(
         &self,
-        ctx: &'a ToolContext,
+        ctx: &'a ToolInvocationContext,
     ) -> anyhow::Result<&'a Arc<dyn crate::store::SessionStore>> {
-        ctx.store
+        ctx.state
             .as_ref()
+            .map(crate::tool_state::ToolStateStore::flow_session_store)
             .ok_or_else(|| anyhow::anyhow!("{} requires a persistent SessionStore", self.name()))
     }
 
-    fn thread_id(&self, ctx: &ToolContext) -> anyhow::Result<Uuid> {
+    fn thread_id(&self, ctx: &ToolInvocationContext) -> anyhow::Result<Uuid> {
         ctx.thread_id
             .ok_or_else(|| anyhow::anyhow!("{} requires an active thread", self.name()))
     }
 
-    fn require_flow_thread(&self, ctx: &ToolContext) -> anyhow::Result<Uuid> {
+    fn require_flow_thread(&self, ctx: &ToolInvocationContext) -> anyhow::Result<Uuid> {
         let thread_id = self.thread_id(ctx)?;
         let thread = self
             .store(ctx)?
@@ -392,7 +393,11 @@ impl Tool for FlowTool {
         }
     }
 
-    async fn execute(&self, call: ToolCall, ctx: ToolContext) -> anyhow::Result<ToolResult> {
+    async fn execute(
+        &self,
+        call: ToolCall,
+        ctx: ToolInvocationContext,
+    ) -> anyhow::Result<ToolResult> {
         let store = self.store(&ctx)?;
         match self.action {
             FlowToolAction::Search => {

@@ -19,7 +19,7 @@ const FILES: &[BundledPluginFile] = &[
 pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
     metadata: BundledPluginMetadata {
         name: "spreadsheet",
-        version: "1.1.0",
+        version: "1.2.0",
         trust: BundledPluginTrust::Official,
         default_enabled: true,
         native_capabilities: &["spreadsheet"],
@@ -68,6 +68,8 @@ mod tests {
                 "read_ranges",
                 "read_rows",
                 "read_columns",
+                "find",
+                "filter_rows",
                 "write",
                 "write_rows",
                 "write_columns",

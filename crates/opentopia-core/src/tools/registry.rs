@@ -1,6 +1,6 @@
 use super::{
-    ApplyPatchTool, BackgroundOutputTool, BrowserTool, CancelAgentTool, CompleteTaskTool,
-    ComputerTool, CreateSkillTool, DocumentTool, FollowupAgentTaskTool, GitDiffTool,
+    ApplyPatchTool, BackgroundOutputTool, BrowserTool, CancelAgentTool, ComputerTool,
+    CreateSkillTool, DocumentTool, FilesystemTool, FollowupAgentTaskTool, GitDiffTool,
     InterruptAgentTool, ListAgentsTool, ListFilesTool, ListSkillsTool, PdfTool, ReadArtifactTool,
     ReadAttachmentTool, ReadFileTool, ReadFilesTool, ReadSkillTool, RequestUserInputTool,
     SearchTool, SendAgentInputTool, SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool,
@@ -50,6 +50,7 @@ impl ToolRegistry {
         tools.insert("read_artifact".to_string(), Arc::new(ReadArtifactTool));
         tools.insert("read_files".to_string(), Arc::new(ReadFilesTool));
         tools.insert("write_file".to_string(), Arc::new(WriteFileTool));
+        tools.insert("filesystem".to_string(), Arc::new(FilesystemTool));
         tools.insert("search".to_string(), Arc::new(SearchTool));
         tools.insert("shell".to_string(), Arc::new(ShellTool));
         tools.insert(
@@ -73,7 +74,6 @@ impl ToolRegistry {
         );
         tools.insert("set_plan".to_string(), Arc::new(SetPlanTool));
         tools.insert("update_plan".to_string(), Arc::new(UpdatePlanTool));
-        tools.insert("complete_task".to_string(), Arc::new(CompleteTaskTool));
         tools.insert("list_skills".to_string(), Arc::new(ListSkillsTool));
         tools.insert("read_skill".to_string(), Arc::new(ReadSkillTool));
         tools.insert("create_skill".to_string(), Arc::new(CreateSkillTool));
@@ -210,21 +210,20 @@ fn tool_governance_metadata(
     match name {
         "list_files" | "read_attachment" | "read_file" | "read_artifact" | "read_files"
         | "search" | "git_diff" | "background_output" | "list_agents" | "wait_agent"
-        | "wait_agents" | "list_skills" | "read_skill" | "flow_search" | "flow_inspect" | "pdf" => {
-            (
-                ToolRiskLevel::Low,
-                vec![ToolSideEffect::None],
-                ToolApprovalMode::PolicyControlled,
-                DataClassification::Restricted,
-            )
-        }
+        | "wait_agents" | "list_skills" | "read_skill" | "flow_search" | "flow_inspect"
+        | "library_search" | "pdf" => (
+            ToolRiskLevel::Low,
+            vec![ToolSideEffect::None],
+            ToolApprovalMode::PolicyControlled,
+            DataClassification::Restricted,
+        ),
         "view_attachment" => (
             ToolRiskLevel::High,
             vec![ToolSideEffect::External],
             ToolApprovalMode::PolicyControlled,
             DataClassification::Restricted,
         ),
-        "write_file" | "apply_patch" | "create_skill" | "spreadsheet" => (
+        "write_file" | "filesystem" | "apply_patch" | "create_skill" | "spreadsheet" => (
             ToolRiskLevel::High,
             vec![ToolSideEffect::WorkspaceWrite],
             ToolApprovalMode::PolicyControlled,
@@ -255,7 +254,7 @@ fn tool_governance_metadata(
             ToolApprovalMode::PolicyControlled,
             DataClassification::Confidential,
         ),
-        "request_user_input" | "set_plan" | "update_plan" | "complete_task" => (
+        "request_user_input" | "set_plan" | "update_plan" => (
             ToolRiskLevel::Medium,
             vec![ToolSideEffect::SessionMutation],
             ToolApprovalMode::PolicyControlled,

@@ -9,11 +9,10 @@ use crate::model_context::{
 use crate::provider::ModelUsage;
 use crate::skills::LoadedSkill;
 use crate::subagents::SubagentRun;
+use crate::work_form::{WorkForm, WorkFormStatus};
 use chrono::{DateTime, Utc};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -107,7 +106,6 @@ impl ExperienceMode {
 pub enum CollaborationMode {
     #[default]
     Default,
-    Plan,
     Goal,
 }
 
@@ -115,7 +113,6 @@ impl CollaborationMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Plan => "plan",
             Self::Goal => "goal",
         }
     }
@@ -123,7 +120,9 @@ impl CollaborationMode {
     pub fn from_str(value: &str) -> anyhow::Result<Self> {
         match value {
             "default" => Ok(Self::Default),
-            "plan" => Ok(Self::Plan),
+            // P6 removes the fixed Plan runtime. Persisted clients that still
+            // send `plan` enter the normal executable collaboration path.
+            "plan" => Ok(Self::Default),
             "goal" => Ok(Self::Goal),
             other => anyhow::bail!("unknown collaboration mode: {other}"),
         }
@@ -263,6 +262,11 @@ pub enum MessagePart {
         collaboration_mode: CollaborationMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         goal_id: Option<Uuid>,
+        /// Optional per-Turn retrieval backend selected by the conversation UI.
+        /// This is execution metadata only; model history projection omits the
+        /// TurnContext part itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_provider: Option<String>,
     },
     Error {
         message: String,
@@ -427,374 +431,7 @@ impl ToolResult {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskPlanStepStatus {
-    Pending,
-    InProgress,
-    Completed,
-    Deferred,
-    Blocked,
-    Cancelled,
-}
-
-impl TaskPlanStepStatus {
-    pub fn marker(self) -> &'static str {
-        match self {
-            Self::Pending => "[ ]",
-            Self::InProgress => "[>]",
-            Self::Completed => "[x]",
-            Self::Deferred => "[-]",
-            Self::Blocked => "[!]",
-            Self::Cancelled => "[/]",
-        }
-    }
-
-    pub fn is_actionable(self) -> bool {
-        matches!(self, Self::Pending | Self::InProgress)
-    }
-
-    pub fn is_resolved(self) -> bool {
-        !self.is_actionable()
-    }
-
-    pub fn requires_status_reason(self) -> bool {
-        matches!(self, Self::Deferred | Self::Blocked | Self::Cancelled)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskRequirement {
-    pub id: String,
-    pub statement: String,
-    #[serde(default)]
-    pub source_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskEvidenceKind {
-    Observation,
-    Implementation,
-    Verification,
-    GlobalCheck,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskEvidenceRef {
-    pub step_id: String,
-    pub requirement_id: String,
-    pub kind: TaskEvidenceKind,
-    pub tool_call_id: String,
-    pub summary: String,
-    pub requirements_revision: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskPlanCoverage {
-    pub requirements_revision: u64,
-    pub requirements: Vec<TaskRequirement>,
-    #[serde(default)]
-    pub step_requirements: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub evidence_refs: Vec<TaskEvidenceRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskPlanStep {
-    #[serde(default)]
-    pub id: String,
-    #[serde(alias = "step")]
-    pub title: String,
-    pub status: TaskPlanStepStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_reason: Option<String>,
-    #[serde(default)]
-    pub dependencies: Vec<String>,
-    #[serde(default)]
-    pub acceptance_criteria: Vec<String>,
-    #[serde(default)]
-    pub evidence: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskPlan {
-    #[serde(default)]
-    pub plan_revision: u64,
-    #[serde(default)]
-    pub goal_id: String,
-    #[serde(
-        default,
-        alias = "explanation",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub change_reason: Option<String>,
-    /// Structured requirement coverage for plans created by the current
-    /// runtime. `None` preserves persisted legacy plans without pretending
-    /// their free-form steps were already coverage-complete.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage: Option<TaskPlanCoverage>,
-    pub steps: Vec<TaskPlanStep>,
-}
-
-impl TaskPlan {
-    pub fn normalize_legacy(mut self) -> Self {
-        if self.goal_id.trim().is_empty() {
-            self.goal_id = "legacy-plan".to_string();
-        }
-        for index in 0..self.steps.len() {
-            if !self.steps[index].id.trim().is_empty() {
-                continue;
-            }
-            let mut suffix = index + 1;
-            loop {
-                let candidate = format!("legacy-step-{suffix}");
-                if !self.steps.iter().any(|step| step.id == candidate) {
-                    self.steps[index].id = candidate;
-                    break;
-                }
-                suffix += 1;
-            }
-        }
-        self
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.steps.iter().any(|step| {
-            !matches!(
-                step.status,
-                TaskPlanStepStatus::Completed | TaskPlanStepStatus::Cancelled
-            )
-        })
-    }
-
-    pub fn has_actionable_steps(&self) -> bool {
-        self.steps.iter().any(|step| step.status.is_actionable())
-    }
-
-    pub fn next_runnable_step(&self) -> Option<&TaskPlanStep> {
-        self.steps
-            .iter()
-            .find(|step| step.status == TaskPlanStepStatus::InProgress)
-            .or_else(|| {
-                self.steps.iter().find(|step| {
-                    step.status == TaskPlanStepStatus::Pending
-                        && step.dependencies.iter().all(|dependency| {
-                            self.steps.iter().any(|candidate| {
-                                candidate.id == *dependency
-                                    && candidate.status == TaskPlanStepStatus::Completed
-                            })
-                        })
-                })
-            })
-    }
-
-    pub fn render_for_model(&self) -> String {
-        let plan = self.clone().normalize_legacy();
-        let mut lines = vec![format!(
-            "Goal: {} (plan revision {})",
-            plan.goal_id, plan.plan_revision
-        )];
-        if let Some(change_reason) = plan.change_reason.as_deref() {
-            lines.push(format!("Last change: {change_reason}"));
-        }
-        if let Some(coverage) = plan.coverage.as_ref() {
-            lines.push(format!(
-                "Requirements revision: {}",
-                coverage.requirements_revision
-            ));
-            for requirement in &coverage.requirements {
-                lines.push(format!(
-                    "Requirement {}: {}",
-                    requirement.id, requirement.statement
-                ));
-                if !requirement.source_refs.is_empty() {
-                    lines.push(format!("  Sources: {}", requirement.source_refs.join(", ")));
-                }
-            }
-        }
-        for step in &plan.steps {
-            lines.push(format!(
-                "{} {}: {}",
-                step.status.marker(),
-                step.id,
-                step.title
-            ));
-            if let Some(reason) = step.status_reason.as_deref() {
-                lines.push(format!("  Status reason: {reason}"));
-            }
-            if !step.dependencies.is_empty() {
-                lines.push(format!("  Depends on: {}", step.dependencies.join(", ")));
-            }
-            if let Some(requirements) = plan
-                .coverage
-                .as_ref()
-                .and_then(|coverage| coverage.step_requirements.get(&step.id))
-            {
-                lines.push(format!("  Covers: {}", requirements.join(", ")));
-            }
-            for criterion in &step.acceptance_criteria {
-                lines.push(format!("  Acceptance: {criterion}"));
-            }
-            for evidence in &step.evidence {
-                lines.push(format!("  Evidence: {evidence}"));
-            }
-            if let Some(coverage) = plan.coverage.as_ref() {
-                for evidence in coverage
-                    .evidence_refs
-                    .iter()
-                    .filter(|evidence| evidence.step_id == step.id)
-                {
-                    lines.push(format!(
-                        "  Evidence ref: {:?} for {} via {} — {}",
-                        evidence.kind,
-                        evidence.requirement_id,
-                        evidence.tool_call_id,
-                        evidence.summary
-                    ));
-                }
-            }
-        }
-        lines.join("\n")
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalStatus {
-    Draft,
-    Ready,
-    Active,
-    Paused,
-    Completed,
-    Blocked,
-    Cancelled,
-    Failed,
-}
-
-impl GoalStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Draft => "draft",
-            Self::Ready => "ready",
-            Self::Active => "active",
-            Self::Paused => "paused",
-            Self::Completed => "completed",
-            Self::Blocked => "blocked",
-            Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
-        }
-    }
-
-    pub fn from_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "draft" => Ok(Self::Draft),
-            "ready" => Ok(Self::Ready),
-            "active" => Ok(Self::Active),
-            "paused" => Ok(Self::Paused),
-            "completed" => Ok(Self::Completed),
-            "blocked" => Ok(Self::Blocked),
-            "cancelled" => Ok(Self::Cancelled),
-            "failed" => Ok(Self::Failed),
-            other => anyhow::bail!("unknown goal status: {other}"),
-        }
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalTaskStatus {
-    Pending,
-    Running,
-    Succeeded,
-    Deferred,
-    Blocked,
-    Cancelled,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalAttemptStatus {
-    Running,
-    Succeeded,
-    Failed,
-    Interrupted,
-}
-
-impl GoalAttemptStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-        }
-    }
-
-    pub fn from_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "running" => Ok(Self::Running),
-            "succeeded" => Ok(Self::Succeeded),
-            "failed" => Ok(Self::Failed),
-            "interrupted" => Ok(Self::Interrupted),
-            other => anyhow::bail!("unknown goal attempt status: {other}"),
-        }
-    }
-}
-
-impl GoalTaskStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Deferred => "deferred",
-            Self::Blocked => "blocked",
-            Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
-        }
-    }
-
-    pub fn from_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "running" => Ok(Self::Running),
-            "succeeded" => Ok(Self::Succeeded),
-            "deferred" => Ok(Self::Deferred),
-            "blocked" => Ok(Self::Blocked),
-            "cancelled" => Ok(Self::Cancelled),
-            "failed" => Ok(Self::Failed),
-            other => anyhow::bail!("unknown goal task status: {other}"),
-        }
-    }
-
-    pub fn is_resolved(self) -> bool {
-        !matches!(self, Self::Pending | Self::Running)
-    }
-}
-
-impl From<TaskPlanStepStatus> for GoalTaskStatus {
-    fn from(value: TaskPlanStepStatus) -> Self {
-        match value {
-            TaskPlanStepStatus::Pending => Self::Pending,
-            TaskPlanStepStatus::InProgress => Self::Running,
-            TaskPlanStepStatus::Completed => Self::Succeeded,
-            TaskPlanStepStatus::Deferred => Self::Deferred,
-            TaskPlanStepStatus::Blocked => Self::Blocked,
-            TaskPlanStepStatus::Cancelled => Self::Cancelled,
-        }
-    }
-}
+pub type GoalStatus = WorkFormStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -802,106 +439,53 @@ pub struct GoalRecord {
     pub id: Uuid,
     pub thread_id: Uuid,
     pub objective: String,
-    pub status: GoalStatus,
-    pub plan_revision: u64,
     pub token_budget: Option<u64>,
     pub tokens_used: u64,
     pub time_used_seconds: u64,
     pub version: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
 }
 
 impl GoalRecord {
-    pub fn new(
-        thread_id: Uuid,
-        objective: impl Into<String>,
-        status: GoalStatus,
-        token_budget: Option<u64>,
-    ) -> Self {
+    pub fn new(thread_id: Uuid, objective: impl Into<String>, token_budget: Option<u64>) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             thread_id,
             objective: objective.into(),
-            status,
-            plan_revision: 0,
             token_budget,
             tokens_used: 0,
             time_used_seconds: 0,
             version: 1,
             created_at: now,
             updated_at: now,
-            completed_at: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GoalTask {
-    pub goal_id: Uuid,
-    pub step_id: String,
-    pub ordinal: usize,
-    pub title: String,
-    pub status: GoalTaskStatus,
-    pub status_reason: Option<String>,
-    pub dependencies: Vec<String>,
-    pub acceptance_criteria: Vec<String>,
-    pub evidence: Vec<String>,
-    pub attempt_count: u32,
-    pub max_attempts: u32,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GoalTaskAttempt {
-    pub id: Uuid,
-    pub goal_id: Uuid,
-    pub step_id: String,
-    pub turn_id: Uuid,
-    pub attempt_no: u32,
-    pub status: GoalAttemptStatus,
-    pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-    pub evidence: Vec<String>,
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalSnapshot {
     pub goal: GoalRecord,
-    pub tasks: Vec<GoalTask>,
-    pub attempts: Vec<GoalTaskAttempt>,
+    pub work_form: WorkForm,
 }
 
 impl GoalSnapshot {
+    pub fn status(&self) -> GoalStatus {
+        self.work_form.status
+    }
+
     pub fn completed_tasks(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter(|task| task.status == GoalTaskStatus::Succeeded)
-            .count()
+        self.work_form.completed_items()
     }
 
     pub fn render_for_model(&self) -> String {
-        let mut lines = vec![
-            format!("Goal id: {}", self.goal.id),
-            format!("Objective: {}", self.goal.objective),
-            format!("Status: {}", self.goal.status.as_str()),
-            format!("Plan revision: {}", self.goal.plan_revision),
-        ];
-        for task in &self.tasks {
-            lines.push(format!(
-                "- {} [{}]: {}",
-                task.step_id,
-                task.status.as_str(),
-                task.title
-            ));
-        }
-        lines.join("\n")
+        format!(
+            "Goal id: {}\n{}",
+            self.goal.id,
+            self.work_form.render_for_model()
+        )
     }
 }
 
@@ -1464,6 +1048,10 @@ impl TurnStatus {
 #[serde(rename_all = "camelCase")]
 pub struct TurnRecord {
     pub turn_id: Uuid,
+    /// Monotonic execution attempt inside this logical Turn. Interactive
+    /// resumes increment this value without changing `turn_id`.
+    #[serde(default = "default_turn_invocation_id")]
+    pub invocation_id: u64,
     pub thread_id: Uuid,
     pub user_message_id: Uuid,
     pub status: TurnStatus,
@@ -1478,6 +1066,7 @@ impl TurnRecord {
         let now = Utc::now();
         Self {
             turn_id: Uuid::new_v4(),
+            invocation_id: 1,
             thread_id,
             user_message_id,
             status: TurnStatus::Running,
@@ -1487,6 +1076,10 @@ impl TurnRecord {
             error: None,
         }
     }
+}
+
+fn default_turn_invocation_id() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1698,6 +1291,10 @@ pub enum AgentEventPayload {
         request_id: Uuid,
         round: usize,
         context_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stable_prefix_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dynamic_tail_hash: Option<String>,
         token_estimate: usize,
         #[serde(default)]
         purpose: ModelCallPurpose,
@@ -1758,8 +1355,8 @@ pub enum AgentEventPayload {
     ToolCallFinished {
         result: ToolResult,
     },
-    PlanUpdated {
-        plan: TaskPlan,
+    WorkFormUpdated {
+        form: WorkForm,
     },
     GoalUpdated {
         snapshot: GoalSnapshot,
@@ -1924,7 +1521,7 @@ impl AgentEventPayload {
             Self::ReasoningDelta { .. } => "reasoning_delta",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallFinished { .. } => "tool_call_finished",
-            Self::PlanUpdated { .. } => "plan_updated",
+            Self::WorkFormUpdated { .. } => "work_form_updated",
             Self::GoalUpdated { .. } => "goal_updated",
             Self::UserInputRequested { .. } => "user_input_requested",
             Self::AssistantMessage { .. } => "assistant_message",
@@ -2082,76 +1679,6 @@ mod tests {
                 }
             })
         );
-    }
-
-    #[test]
-    fn legacy_task_plans_gain_stable_fields_when_restored() {
-        let legacy: TaskPlan = serde_json::from_value(json!({
-            "explanation": "Continue the existing work",
-            "steps": [
-                { "step": "Inspect the repository", "status": "in_progress" },
-                { "step": "Implement the fix", "status": "pending" }
-            ]
-        }))
-        .unwrap();
-
-        let restored = legacy.normalize_legacy();
-        assert_eq!(restored.plan_revision, 0);
-        assert_eq!(restored.goal_id, "legacy-plan");
-        assert_eq!(
-            restored.change_reason.as_deref(),
-            Some("Continue the existing work")
-        );
-        assert_eq!(restored.steps[0].id, "legacy-step-1");
-        assert_eq!(restored.steps[0].title, "Inspect the repository");
-        assert!(restored.steps[0].dependencies.is_empty());
-        assert!(restored
-            .render_for_model()
-            .contains("[>] legacy-step-1: Inspect the repository"));
-    }
-
-    #[test]
-    fn task_plan_selects_the_next_dependency_ready_step() {
-        let plan: TaskPlan = serde_json::from_value(json!({
-            "planRevision": 4,
-            "goalId": "ordered-work",
-            "steps": [
-                {
-                    "id": "inspect",
-                    "title": "Inspect",
-                    "status": "completed",
-                    "evidence": ["Inspection finished"]
-                },
-                {
-                    "id": "implement",
-                    "title": "Implement",
-                    "status": "pending",
-                    "dependencies": ["inspect"]
-                },
-                {
-                    "id": "verify",
-                    "title": "Verify",
-                    "status": "pending",
-                    "dependencies": ["implement"]
-                }
-            ]
-        }))
-        .unwrap();
-
-        assert!(plan.is_active());
-        assert_eq!(
-            plan.next_runnable_step().map(|step| step.id.as_str()),
-            Some("implement")
-        );
-
-        let mut deferred_plan = plan.clone();
-        deferred_plan.steps[1].status = TaskPlanStepStatus::Deferred;
-        deferred_plan.steps[1].status_reason = Some("Continue next session".to_string());
-        deferred_plan.steps[2].status = TaskPlanStepStatus::Cancelled;
-        deferred_plan.steps[2].status_reason = Some("No longer required".to_string());
-        assert!(deferred_plan.is_active());
-        assert!(!deferred_plan.has_actionable_steps());
-        assert!(deferred_plan.next_runnable_step().is_none());
     }
 
     #[test]

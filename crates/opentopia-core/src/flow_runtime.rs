@@ -3,7 +3,7 @@ use crate::flow::{
     compile_flow, FlowBudgetV1, FlowDefinitionV1, GraphDefinitionV1, GraphEdgeV1,
     GraphLoopPolicyV1, GraphNodeKindV1, GraphNodeV1, LoopExhaustionActionV1,
 };
-use crate::tools::ToolContext;
+use crate::tools::ToolInvocationContext;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -289,7 +289,7 @@ pub struct FlowNodeExecutionRequestV1 {
     pub input: Value,
     pub effective_capabilities: CapabilityProjection,
     pub remaining_tool_calls: u32,
-    pub context: ToolContext,
+    pub context: ToolInvocationContext,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -309,9 +309,9 @@ pub trait FlowNodeHarness: Send + Sync {
     ) -> anyhow::Result<FlowNodeExecutionResultV1>;
 }
 
-pub fn spawn_flow_run(run_id: Uuid, context: ToolContext) -> anyhow::Result<()> {
+pub fn spawn_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow::Result<()> {
     anyhow::ensure!(
-        context.store.is_some(),
+        context.state.is_some(),
         "Flow Runtime requires a persistent SessionStore"
     );
     anyhow::ensure!(
@@ -320,9 +320,10 @@ pub fn spawn_flow_run(run_id: Uuid, context: ToolContext) -> anyhow::Result<()> 
     );
     tokio::spawn(async move {
         if let Err(error) = drive_flow_run(run_id, context.clone()).await {
-            let Some(store) = context.store.as_ref() else {
+            let Some(state) = context.state.as_ref() else {
                 return;
             };
+            let store = state.flow_session_store();
             let Ok(Some(mut run)) = store.get_flow_run(run_id) else {
                 return;
             };
@@ -415,11 +416,12 @@ pub fn prepare_flow_resume(
     Ok(())
 }
 
-async fn drive_flow_run(run_id: Uuid, context: ToolContext) -> anyhow::Result<()> {
+async fn drive_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow::Result<()> {
     let store = context
-        .store
+        .state
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Flow Runtime requires a persistent SessionStore"))?;
+    let store = store.flow_session_store();
     let harness = context
         .flow_harness
         .as_ref()
@@ -987,14 +989,14 @@ mod tests {
         }
     }
 
-    fn runtime_context(store: Arc<SqliteSessionStore>, thread_id: Uuid) -> ToolContext {
+    fn runtime_context(store: Arc<SqliteSessionStore>, thread_id: Uuid) -> ToolInvocationContext {
         let workspace = PathBuf::from(".");
         let policy = Arc::new(BasicPolicyEngine::new(
             workspace.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolContext::local(workspace, policy);
-        context.store = Some(store);
+        let mut context = ToolInvocationContext::local(workspace, policy);
+        context.state = Some(crate::tool_state::ToolStateStore::new(store));
         context.thread_id = Some(thread_id);
         context.flow_harness = Some(Arc::new(NeverCalledHarness));
         context

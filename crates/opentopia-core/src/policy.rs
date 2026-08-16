@@ -1,6 +1,7 @@
 use crate::computer::{ComputerAction, ComputerPolicyContext, WindowTarget};
+use crate::execution_authorization::{FilesystemAccess, NetworkAccess, ToolExecutionIntent};
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
-use crate::shell_analysis::analyze_shell_command;
+use crate::shell_analysis::{analyze_shell_command, ShellCapability};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
@@ -94,6 +95,29 @@ pub enum PolicyDecision {
     Allow,
     Deny { reason: String },
     Ask { reason: String },
+}
+
+impl PolicyDecision {
+    /// Combine independent behavior checks into one authorization boundary.
+    /// A denial is authoritative, approval requirements are accumulated, and
+    /// the call is allowed only when every declared effect is allowed.
+    pub fn combine(decisions: impl IntoIterator<Item = Self>) -> Self {
+        let mut asks = Vec::new();
+        for decision in decisions {
+            match decision {
+                Self::Deny { reason } => return Self::Deny { reason },
+                Self::Ask { reason } if !asks.contains(&reason) => asks.push(reason),
+                Self::Ask { .. } | Self::Allow => {}
+            }
+        }
+        if asks.is_empty() {
+            Self::Allow
+        } else {
+            Self::Ask {
+                reason: asks.join("; "),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -281,6 +305,37 @@ pub trait PolicyEngine: Send + Sync {
     fn inspect_read(&self, path: &Path) -> PolicyDecision;
     fn inspect_write(&self, path: &Path) -> PolicyDecision;
     fn inspect_command(&self, command: &str) -> PolicyDecision;
+    /// Inspect the semantic effects declared by a tool call. This is the
+    /// shared behavior gateway used by scheduling, approval previews, and the
+    /// final execution path; tool names never grant authority by themselves.
+    fn inspect_execution_intent(
+        &self,
+        intent: &ToolExecutionIntent,
+        workspace_root: &Path,
+    ) -> PolicyDecision {
+        let mut decisions = Vec::new();
+        decisions.extend(intent.requested_read_paths.iter().map(|path| {
+            let path = resolve_intent_path(workspace_root, path);
+            self.inspect_read(&path)
+        }));
+        decisions.extend(intent.requested_write_paths.iter().map(|path| {
+            let path = resolve_intent_path(workspace_root, path);
+            self.inspect_write(&path)
+        }));
+
+        // A path-free workspace mutation still declares a real write effect.
+        // This closes the gap where a mutating tool could omit a concrete path
+        // and accidentally bypass read-only mode.
+        if intent.requested_write_paths.is_empty()
+            && intent.filesystem == FilesystemAccess::WriteWorkspace
+        {
+            decisions.push(self.inspect_write(workspace_root));
+        }
+        if intent.network == NetworkAccess::Required {
+            decisions.push(self.inspect_network("tool-execution"));
+        }
+        PolicyDecision::combine(decisions)
+    }
     fn inspect_mcp_tool_call(&self, descriptor: &ToolPermissionDescriptor) -> PolicyDecision {
         PolicyDecision::Ask {
             reason: format!(
@@ -309,6 +364,14 @@ pub trait PolicyEngine: Send + Sync {
                 target.title
             ),
         }
+    }
+}
+
+fn resolve_intent_path(workspace_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
     }
 }
 
@@ -569,6 +632,29 @@ impl PolicyEngine for BasicPolicyEngine {
 
     fn inspect_command(&self, command: &str) -> PolicyDecision {
         let analysis = analyze_shell_command(command);
+
+        // Permission presets constrain effects, not tool names. Read-only mode
+        // may use the shell for a deliberately narrow set of observations,
+        // while every mutation, network call, dynamic runtime, or unknown
+        // command remains blocked by the read-only execution boundary.
+        match self.mode {
+            PermissionMode::Chat => {
+                return PolicyDecision::Deny {
+                    reason: "Chat mode does not allow shell commands.".to_string(),
+                };
+            }
+            PermissionMode::ReadOnly if analysis.is_strictly_read_only() => {
+                return PolicyDecision::Allow;
+            }
+            PermissionMode::ReadOnly => {
+                return PolicyDecision::Deny {
+                    reason: "Read-only mode only allows shell commands classified as strict observations."
+                        .to_string(),
+                };
+            }
+            PermissionMode::Auto | PermissionMode::Approve | PermissionMode::FullAccess => {}
+        }
+
         for rule in &self.config.command_rules {
             if rule.matches(command) {
                 let decision = rule.decision(command);
@@ -596,14 +682,21 @@ impl PolicyEngine for BasicPolicyEngine {
             };
         }
 
-        match self.mode {
-            PermissionMode::Chat | PermissionMode::ReadOnly => PolicyDecision::Deny {
-                reason: "Current permission mode does not allow shell commands.".to_string(),
-            },
-            PermissionMode::Auto | PermissionMode::Approve | PermissionMode::FullAccess => {
-                PolicyDecision::Allow
-            }
+        if analysis.capabilities.contains(&ShellCapability::Network) {
+            return match self.mode {
+                PermissionMode::FullAccess => PolicyDecision::Allow,
+                PermissionMode::Auto | PermissionMode::Approve => self
+                    .config
+                    .network
+                    .default_effect
+                    .to_decision(format!("Shell command requires network access: {command}")),
+                PermissionMode::Chat | PermissionMode::ReadOnly => unreachable!(
+                    "chat and read-only command decisions return before network inspection"
+                ),
+            };
         }
+
+        PolicyDecision::Allow
     }
 
     fn inspect_mcp_tool_call(&self, descriptor: &ToolPermissionDescriptor) -> PolicyDecision {
@@ -747,6 +840,62 @@ mod tests {
             auto.inspect_network("browser-interaction"),
             PolicyDecision::Ask { .. }
         ));
+    }
+
+    #[test]
+    fn shell_permissions_follow_inferred_behavior_instead_of_tool_name() {
+        let read_only = policy(PermissionMode::ReadOnly);
+        assert!(matches!(
+            read_only.inspect_command("git status --short"),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            read_only.inspect_command("Set-Content -LiteralPath result.txt -Value changed"),
+            PolicyDecision::Deny { .. }
+        ));
+
+        let approve = policy(PermissionMode::Approve);
+        assert!(matches!(
+            approve.inspect_command("cargo test -p opentopia-core"),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            approve.inspect_command("curl https://example.com/archive.zip"),
+            PolicyDecision::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn execution_intent_is_the_shared_path_authorization_gateway() {
+        let id = Uuid::new_v4();
+        let workspace = std::env::temp_dir().join(format!("opentopia-intent-workspace-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-intent-outside-{id}"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let policy = BasicPolicyEngine::new(workspace.clone(), PermissionMode::Approve);
+
+        let workspace_write =
+            ToolExecutionIntent::workspace_mutation([PathBuf::from("src/lib.rs")]);
+        assert!(matches!(
+            policy.inspect_execution_intent(&workspace_write, &workspace),
+            PolicyDecision::Allow
+        ));
+
+        let external_write = ToolExecutionIntent::workspace_mutation([outside.join("result.txt")]);
+        assert!(matches!(
+            policy.inspect_execution_intent(&external_write, &workspace),
+            PolicyDecision::Ask { .. }
+        ));
+
+        let read_only = BasicPolicyEngine::new(workspace.clone(), PermissionMode::ReadOnly);
+        let path_free_write = ToolExecutionIntent::workspace_mutation([]);
+        assert!(matches!(
+            read_only.inspect_execution_intent(&path_free_write, &workspace),
+            PolicyDecision::Deny { .. }
+        ));
+
+        std::fs::remove_dir_all(workspace).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     fn policy(mode: PermissionMode) -> BasicPolicyEngine {

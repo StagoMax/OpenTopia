@@ -7,9 +7,7 @@ use crate::tools::ToolSource;
 pub enum ToolBundle {
     Common,
     Flow,
-    Plan,
     Task,
-    Goal,
     External,
 }
 
@@ -21,9 +19,8 @@ pub fn tool_bundle(name: &str, source: &ToolSource) -> ToolBundle {
         return ToolBundle::Flow;
     }
     match name {
-        "request_user_input" => ToolBundle::Plan,
-        "update_plan" | "complete_task" => ToolBundle::Task,
-        "set_plan" => ToolBundle::Goal,
+        "request_user_input" => ToolBundle::Common,
+        "set_plan" | "update_plan" => ToolBundle::Task,
         _ => ToolBundle::Common,
     }
 }
@@ -31,17 +28,12 @@ pub fn tool_bundle(name: &str, source: &ToolSource) -> ToolBundle {
 pub fn bundle_is_visible(
     bundle: ToolBundle,
     experience_mode: ExperienceMode,
-    collaboration_mode: CollaborationMode,
+    _collaboration_mode: CollaborationMode,
 ) -> bool {
     match bundle {
         ToolBundle::Common | ToolBundle::External => true,
         ToolBundle::Flow => experience_mode == ExperienceMode::Flow,
-        ToolBundle::Plan => collaboration_mode == CollaborationMode::Plan,
-        ToolBundle::Task => matches!(
-            collaboration_mode,
-            CollaborationMode::Default | CollaborationMode::Goal
-        ),
-        ToolBundle::Goal => collaboration_mode == CollaborationMode::Goal,
+        ToolBundle::Task => true,
     }
 }
 
@@ -75,36 +67,27 @@ mod tests {
     fn mode_bundles_are_orthogonal() {
         assert_eq!(
             tool_bundle("request_user_input", &ToolSource::Core),
-            ToolBundle::Plan
+            ToolBundle::Common
         );
         assert_eq!(
             tool_bundle("update_plan", &ToolSource::Core),
             ToolBundle::Task
         );
-        assert_eq!(
-            tool_bundle("complete_task", &ToolSource::Core),
-            ToolBundle::Task
-        );
-        assert_eq!(tool_bundle("set_plan", &ToolSource::Core), ToolBundle::Goal);
+        assert_eq!(tool_bundle("set_plan", &ToolSource::Core), ToolBundle::Task);
         assert!(bundle_is_visible(
-            ToolBundle::Plan,
+            ToolBundle::Common,
             ExperienceMode::Code,
-            CollaborationMode::Plan
-        ));
-        assert!(!bundle_is_visible(
-            ToolBundle::Goal,
-            ExperienceMode::Code,
-            CollaborationMode::Plan
+            CollaborationMode::Default
         ));
         assert!(bundle_is_visible(
             ToolBundle::Task,
             ExperienceMode::Code,
             CollaborationMode::Default
         ));
-        assert!(!bundle_is_visible(
+        assert!(bundle_is_visible(
             ToolBundle::Task,
             ExperienceMode::Code,
-            CollaborationMode::Plan
+            CollaborationMode::Default
         ));
         assert!(bundle_is_visible(
             ToolBundle::Task,

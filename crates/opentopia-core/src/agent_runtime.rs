@@ -17,6 +17,24 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// One typed signal for every resumable interactive boundary.
+///
+/// The product layer may keep approval and structured-input persistence in
+/// separate stores, but the turn runtime resumes through one control-plane
+/// operation. Adding another suspension kind therefore does not add another
+/// driver method.
+#[derive(Debug, Clone)]
+pub enum AgentResumeSignal {
+    Approval {
+        approval_id: Option<Uuid>,
+        approved: bool,
+    },
+    UserInput {
+        request_id: Uuid,
+        response: UserInputResponse,
+    },
+}
+
 /// Trusted, object-safe entry point for starting and resuming one agent turn.
 ///
 /// This trait intentionally contains only control-loop operations. Agent
@@ -31,22 +49,11 @@ pub trait AgentTurnDriver: Send + Sync {
         sender: Option<AgentEventSender>,
     ) -> anyhow::Result<AgentTurnResult>;
 
-    /// Resume the exact approval boundary captured by a continuation.
-    async fn resume_after_approval(
+    /// Resume the exact boundary captured by a continuation.
+    async fn resume_turn(
         &self,
         continuation: AgentContinuation,
-        approved: bool,
-        store: Option<Arc<dyn SessionStore>>,
-        cancellation: Option<CancellationToken>,
-        sender: Option<AgentEventSender>,
-    ) -> anyhow::Result<AgentTurnResult>;
-
-    /// Resume the exact structured-input boundary captured by a continuation.
-    async fn resume_after_user_input(
-        &self,
-        continuation: AgentContinuation,
-        request_id: Uuid,
-        response: UserInputResponse,
+        signal: AgentResumeSignal,
         store: Option<Arc<dyn SessionStore>>,
         cancellation: Option<CancellationToken>,
         sender: Option<AgentEventSender>,
@@ -65,42 +72,78 @@ impl AgentTurnDriver for AgentCore {
             .await
     }
 
-    async fn resume_after_approval(
+    async fn resume_turn(
         &self,
         continuation: AgentContinuation,
-        approved: bool,
+        signal: AgentResumeSignal,
         store: Option<Arc<dyn SessionStore>>,
         cancellation: Option<CancellationToken>,
         sender: Option<AgentEventSender>,
     ) -> anyhow::Result<AgentTurnResult> {
-        self.resume_turn_streaming(continuation, approved, store, cancellation, sender)
+        self.resume_from_signal_streaming(continuation, signal, store, cancellation, sender)
             .await
     }
+}
 
-    async fn resume_after_user_input(
+/// Thin, product-neutral facade over the active turn driver.
+///
+/// During migration this wraps the legacy [`AgentCore`] adapter. The server
+/// depends on this facade rather than on the concrete loop, so the legacy
+/// driver can later be replaced without changing HTTP, persistence, or SSE
+/// lifecycle code.
+#[derive(Debug, Clone)]
+pub struct TurnKernel<D> {
+    driver: D,
+}
+
+impl<D> TurnKernel<D> {
+    pub fn new(driver: D) -> Self {
+        Self { driver }
+    }
+
+    pub fn driver(&self) -> &D {
+        &self.driver
+    }
+
+    pub fn into_driver(self) -> D {
+        self.driver
+    }
+}
+
+#[async_trait]
+impl<D> AgentTurnDriver for TurnKernel<D>
+where
+    D: AgentTurnDriver,
+{
+    async fn run_turn(
+        &self,
+        input: AgentTurnInput,
+        model_context: Option<CompiledModelContext>,
+        sender: Option<AgentEventSender>,
+    ) -> anyhow::Result<AgentTurnResult> {
+        self.driver.run_turn(input, model_context, sender).await
+    }
+
+    async fn resume_turn(
         &self,
         continuation: AgentContinuation,
-        request_id: Uuid,
-        response: UserInputResponse,
+        signal: AgentResumeSignal,
         store: Option<Arc<dyn SessionStore>>,
         cancellation: Option<CancellationToken>,
         sender: Option<AgentEventSender>,
     ) -> anyhow::Result<AgentTurnResult> {
-        self.resume_turn_with_user_input_streaming(
-            continuation,
-            request_id,
-            response,
-            store,
-            cancellation,
-            sender,
-        )
-        .await
+        self.driver
+            .resume_turn(continuation, signal, store, cancellation, sender)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentTurnOutcome;
+    use crate::model::AgentEventPayload;
+    use crate::policy::PermissionMode;
 
     fn accepts_object_safe_driver(_driver: &dyn AgentTurnDriver) {}
 
@@ -108,5 +151,114 @@ mod tests {
     fn agent_core_implements_object_safe_turn_driver() {
         let agent = AgentCore::default();
         accepts_object_safe_driver(&agent);
+    }
+
+    #[test]
+    fn turn_kernel_preserves_the_object_safe_driver_boundary() {
+        let kernel = TurnKernel::new(AgentCore::default());
+        accepts_object_safe_driver(&kernel);
+        let _driver = kernel.into_driver();
+    }
+
+    #[test]
+    fn thin_kernel_does_not_import_concrete_product_runtimes() {
+        let source = include_str!("agent_runtime.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("agent runtime has production source");
+        for forbidden in [
+            "crate::background",
+            "crate::browser",
+            "crate::computer",
+            "crate::guardian",
+            "crate::mcp",
+            "crate::subagents",
+            "crate::tools",
+        ] {
+            assert!(
+                !production_source.contains(forbidden),
+                "thin kernel must not depend on {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_delegates_tool_batch_and_model_request_materialization() {
+        let source = include_str!("agent.rs");
+        let production_source = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("agent has production source");
+        for migrated_concern in [
+            "futures_util::future::join_all",
+            "EffectIntent",
+            "DurableAsyncToolResultSink",
+            "let request = ModelRequest {",
+            ".complete(ModelRequest {",
+        ] {
+            assert!(
+                !production_source.contains(migrated_concern),
+                "driver must delegate migrated concern `{migrated_concern}`"
+            );
+        }
+        assert!(production_source.contains("execute_provider_batch(inputs)"));
+        assert!(production_source.contains("context_assembler.compile(ContextAssemblyInput"));
+    }
+
+    #[tokio::test]
+    async fn driver_event_sequence_is_preserved_behind_the_kernel() {
+        let kernel = TurnKernel::new(AgentCore::default());
+        let result = kernel
+            .run_turn(
+                AgentTurnInput {
+                    thread_id: Uuid::from_u128(1),
+                    user_message_id: Uuid::from_u128(2),
+                    workspace_root: std::env::temp_dir(),
+                    content: "event-sequence-golden".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    provider_cursor: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("legacy driver completes behind the kernel");
+
+        assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+        let sequence = result
+            .events
+            .iter()
+            .map(|event| match event {
+                AgentEventPayload::TurnStarted { .. } => "turn_started",
+                AgentEventPayload::ModelContextBuilt { .. } => "model_context_built",
+                AgentEventPayload::ModelRequest { .. } => "model_request",
+                AgentEventPayload::ProviderRequestSent { .. } => "provider_request_sent",
+                AgentEventPayload::ModelDelta { .. } => "model_delta",
+                AgentEventPayload::ProviderResponseReceived { .. } => "provider_response_received",
+                AgentEventPayload::AssistantMessage { .. } => "assistant_message",
+                AgentEventPayload::TurnFinished { .. } => "turn_finished",
+                _ => "unexpected",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequence,
+            vec![
+                "turn_started",
+                "model_context_built",
+                "model_request",
+                "provider_request_sent",
+                "model_delta",
+                "provider_response_received",
+                "assistant_message",
+                "turn_finished",
+            ]
+        );
     }
 }

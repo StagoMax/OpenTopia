@@ -1082,7 +1082,11 @@ mod tests {
     fn test_state_with_mcp(store: Arc<SqliteSessionStore>, mcp_host: McpExtensionHost) -> AppState {
         let loaded_settings = AppSettings::from_env(PermissionMode::Auto);
         let settings = Arc::new(RwLock::new(loaded_settings.clone()));
-        let agent = Arc::new(RwLock::new(AgentCore::from_settings(&loaded_settings)));
+        let turn_inbox: Arc<dyn opentopia_core::TurnInbox> =
+            Arc::new(opentopia_core::BufferedTurnInbox::default());
+        let agent = Arc::new(RwLock::new(
+            AgentCore::from_settings(&loaded_settings).with_turn_inbox(turn_inbox.clone()),
+        ));
         let background = BackgroundProcessRegistry::default();
         let subagents = SubagentScheduler::new(
             SubagentSchedulerConfig::default(),
@@ -1120,10 +1124,11 @@ mod tests {
             turns: TurnManager::new(store.clone()),
             turn_changes: TurnChangeManager::new(store),
             turn_queue,
+            turn_inbox,
             subagents,
             background,
             app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
-            sag_library: Arc::new(crate::library_api::SagLibraryGateway::for_tests()),
+            library_providers: Arc::new(crate::library_api::LibraryProviderRegistry::for_tests()),
         }
     }
 

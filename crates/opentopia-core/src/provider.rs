@@ -1,10 +1,10 @@
 use crate::model::{ModelContentPart, ProviderRetryKind};
-#[cfg(test)]
-use crate::model_context::ContextItemKind;
 use crate::model_context::{
     content_fingerprint, estimate_tokens, CompiledModelContext, ContextCacheScope, ContextRole,
-    ModelContextItem, TokenEstimateBreakdown,
+    TokenEstimateBreakdown,
 };
+#[cfg(test)]
+use crate::model_context::{ContextItemKind, ModelContextItem};
 use crate::settings::{
     model_accepts_temperature, official_openai_explicit_prompt_cache_support,
     official_openai_tool_search_support, OpenAiCompatibilityReport, OpenAiProtocol,
@@ -76,25 +76,45 @@ pub enum PromptCacheBreakpointPolicy {
     AppendOnlyUsers,
 }
 
+/// Current user input carried by the append-only model ledger.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUserInput {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ModelInputContent>,
+}
+
+/// Provider-neutral, typed request ledger. Conversation, the current user
+/// input, and the current round's tool exchange have exactly one owner.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInputLedger {
+    #[serde(default)]
+    pub conversation: Vec<ModelConversationMessage>,
+    pub current_user: ModelUserInput,
+    #[serde(default)]
+    pub tool_calls: Vec<ProviderToolCall>,
+    #[serde(default)]
+    pub tool_results: Vec<ProviderToolResult>,
+}
+
+/// Canonical logical shape consumed by provider codecs.
+///
+/// `instructions` contains only classified instruction/context modules. Typed
+/// history lives once in `input`; providers are adapters over this shape and
+/// may not assemble a second prompt representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRequest {
-    pub system_prompt: String,
     #[serde(default)]
-    pub conversation: Vec<ModelConversationMessage>,
-    pub user_message: String,
-    /// Native user input carried alongside `user_message`. Keep the string for
-    /// older callers and providers; adapters combine both fields in order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub user_content: Vec<ModelInputContent>,
+    pub instructions: CompiledModelContext,
+    #[serde(default)]
+    pub input: ModelInputLedger,
+    /// Provider-native tool surface. Adapters map these candidates to `tools`
+    /// or `dynamicTools`; they must not serialize schemas into prompt text.
     #[serde(default)]
     pub tool_candidates: Vec<ProviderToolCandidate>,
-    #[serde(default)]
-    pub previous_tool_calls: Vec<ProviderToolCall>,
-    #[serde(default)]
-    pub tool_results: Vec<ProviderToolResult>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_items: Vec<ModelContextItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previous_response_items: Vec<Value>,
     /// Continue a stored Responses API chain. The logical request still carries
@@ -102,12 +122,6 @@ pub struct ModelRequest {
     /// unknown or expired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
-    /// Legacy transport for branch-specific developer instructions. AgentCore
-    /// now materializes these in the thread lineage header before history.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch_developer_instructions: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
     #[serde(default)]
     pub prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,27 +133,24 @@ impl ModelRequest {
     /// Provider adapters add their own framing, so actual response usage remains
     /// authoritative and is used to report the estimate error.
     pub fn token_estimate_breakdown(&self) -> TokenEstimateBreakdown {
-        let mut breakdown = TokenEstimateBreakdown::from_context_items(&self.context_items);
-        let has_materialized_context = !self.context_items.is_empty();
-
-        if !has_materialized_context {
-            breakdown.base_instructions = estimate_tokens(&self.system_prompt);
-            breakdown.conversation = self
-                .conversation
-                .iter()
-                .map(|message| estimate_tokens(&message.content))
-                .sum();
-            breakdown.current_user = estimate_tokens(&self.user_message);
-        }
+        let mut breakdown = TokenEstimateBreakdown::from_context_items(&self.instructions.items);
+        breakdown.conversation = self
+            .input
+            .conversation
+            .iter()
+            .map(|message| estimate_tokens(&message.content))
+            .sum();
+        breakdown.current_user = estimate_tokens(&self.input.current_user.message);
 
         // Tool calls/results may also be represented by materialized context
         // items. Re-estimate them from their typed source so image byte buffers
         // are never counted as enormous JSON integer arrays.
-        breakdown.tool_calls = estimate_serialized_slice(&self.previous_tool_calls);
-        breakdown.tool_results = estimate_provider_tool_results(&self.tool_results);
+        breakdown.tool_calls = estimate_serialized_slice(&self.input.tool_calls);
+        breakdown.tool_results = estimate_provider_tool_results(&self.input.tool_results);
 
         breakdown.conversation = breakdown.conversation.saturating_add(
-            self.conversation
+            self.input
+                .conversation
                 .iter()
                 .map(|message| {
                     estimate_model_input_content(&message.content_parts)
@@ -148,15 +159,12 @@ impl ModelRequest {
                 })
                 .sum(),
         );
-        breakdown.current_user = breakdown
-            .current_user
-            .saturating_add(estimate_model_input_content(&self.user_content));
-        breakdown.developer_instructions = breakdown.developer_instructions.saturating_add(
-            self.branch_developer_instructions
-                .as_deref()
-                .map(estimate_tokens)
-                .unwrap_or_default(),
-        );
+        breakdown.current_user =
+            breakdown
+                .current_user
+                .saturating_add(estimate_model_input_content(
+                    &self.input.current_user.content,
+                ));
         let output_schema_tokens = self
             .final_output_json_schema
             .as_ref()
@@ -1601,6 +1609,7 @@ impl OpenAiCompatibleProvider {
             }
         }
         if let Some(prompt_cache_key) = request
+            .instructions
             .prompt_cache_key
             .as_deref()
             .or(self.prompt_cache_key.as_deref())
@@ -2223,6 +2232,7 @@ impl OpenAiResponsesProvider {
             payload["tool_choice"] = json!("auto");
         }
         if let Some(prompt_cache_key) = request
+            .instructions
             .prompt_cache_key
             .as_deref()
             .or(self.prompt_cache_key.as_deref())
@@ -3693,12 +3703,14 @@ fn anthropic_effort_value(value: &str) -> Option<&str> {
 
 fn request_image_part_count(request: &ModelRequest) -> usize {
     request
+        .input
         .conversation
         .iter()
         .flat_map(|message| message.content_parts.iter())
-        .chain(request.user_content.iter())
+        .chain(request.input.current_user.content.iter())
         .chain(
             request
+                .input
                 .tool_results
                 .iter()
                 .flat_map(|result| result.content.iter()),
@@ -3850,23 +3862,16 @@ fn scoped_instruction_messages(
     request: &ModelRequest,
     lineage_prefix: bool,
 ) -> Vec<(ContextRole, String)> {
-    if request.context_items.is_empty() {
-        return lineage_prefix
-            .then(|| vec![(ContextRole::System, request.system_prompt.clone())])
-            .unwrap_or_default();
-    }
-    CompiledModelContext {
-        items: request.context_items.clone(),
-        prompt_cache_key: request.prompt_cache_key.clone(),
-    }
-    .instruction_messages_with_scope()
-    .into_iter()
-    .filter_map(|(role, scope, content)| {
-        let belongs_to_prefix =
-            matches!(scope, ContextCacheScope::Stable | ContextCacheScope::Thread);
-        (belongs_to_prefix == lineage_prefix).then_some((role, content))
-    })
-    .collect()
+    request
+        .instructions
+        .instruction_messages_with_scope()
+        .into_iter()
+        .filter_map(|(role, scope, content)| {
+            let belongs_to_prefix =
+                matches!(scope, ContextCacheScope::Stable | ContextCacheScope::Thread);
+            (belongs_to_prefix == lineage_prefix).then_some((role, content))
+        })
+        .collect()
 }
 
 fn openai_instruction_messages(request: &ModelRequest) -> Vec<Value> {
@@ -3894,24 +3899,17 @@ fn responses_system_instructions(request: &ModelRequest) -> String {
 }
 
 fn anthropic_system_instructions(request: &ModelRequest) -> String {
-    let mut instructions = scoped_instruction_messages(request, true)
+    scoped_instruction_messages(request, true)
         .into_iter()
         .map(|(_, content)| content)
         .filter(|content| !content.trim().is_empty())
-        .collect::<Vec<_>>();
-    if let Some(branch) = request
-        .branch_developer_instructions
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        instructions.push(branch.to_string());
-    }
-    instructions.join("\n\n")
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
     let mut messages = Vec::new();
-    for (index, message) in request.conversation.iter().enumerate() {
+    for (index, message) in request.input.conversation.iter().enumerate() {
         if message.role == ModelConversationRole::System {
             continue;
         }
@@ -3983,7 +3981,10 @@ fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
     push_anthropic_message(
         &mut messages,
         "user",
-        anthropic_content_parts(&request.user_message, &request.user_content),
+        anthropic_content_parts(
+            &request.input.current_user.message,
+            &request.input.current_user.content,
+        ),
     );
     let runtime_context = scoped_instruction_messages(request, false)
         .into_iter()
@@ -4000,7 +4001,7 @@ fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
             })],
         );
     }
-    for call in &request.previous_tool_calls {
+    for call in &request.input.tool_calls {
         push_anthropic_message(
             &mut messages,
             "assistant",
@@ -4012,6 +4013,7 @@ fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
             })],
         );
         let results = request
+            .input
             .tool_results
             .iter()
             .filter(|result| result.call_id == call.id)
@@ -4021,9 +4023,10 @@ fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
             push_anthropic_message(&mut messages, "user", results);
         }
     }
-    for result in &request.tool_results {
+    for result in &request.input.tool_results {
         if !request
-            .previous_tool_calls
+            .input
+            .tool_calls
             .iter()
             .any(|call| call.id == result.call_id)
         {
@@ -4108,7 +4111,7 @@ fn anthropic_tools(candidates: &[ProviderToolCandidate]) -> Vec<Value> {
 }
 
 fn chat_request_needs_message_compatibility_fallback(request: &ModelRequest) -> bool {
-    !request.tool_results.is_empty()
+    !request.input.tool_results.is_empty()
         || instruction_messages(request)
             .iter()
             .any(|(role, _)| *role == ContextRole::Developer)
@@ -4130,21 +4133,10 @@ fn openai_messages_with_reasoning(
 ) -> Vec<Value> {
     let mut messages = openai_instruction_messages(request);
 
-    if let Some(instructions) = request
-        .branch_developer_instructions
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        messages.push(json!({
-            "role": "developer",
-            "content": instructions,
-        }));
-    }
-
     append_openai_conversation(&mut messages, request, replay_chat_reasoning, false);
     messages.push(json!({
         "role": "user",
-        "content": openai_message_content(&request.user_message, &request.user_content)
+        "content": openai_message_content(&request.input.current_user.message, &request.input.current_user.content)
     }));
 
     messages.extend(
@@ -4184,20 +4176,10 @@ fn openai_compatibility_messages_with_reasoning(
     let mut messages = (!lineage_system.trim().is_empty())
         .then(|| vec![json!({ "role": "system", "content": lineage_system })])
         .unwrap_or_default();
-    if let Some(instructions) = request
-        .branch_developer_instructions
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        messages.push(json!({
-            "role": "system",
-            "content": instructions,
-        }));
-    }
     append_openai_conversation(&mut messages, request, replay_chat_reasoning, true);
     messages.push(json!({
         "role": "user",
-        "content": openai_message_content(&request.user_message, &request.user_content)
+        "content": openai_message_content(&request.input.current_user.message, &request.input.current_user.content)
     }));
 
     let runtime_system = scoped_instruction_messages(request, false)
@@ -4226,10 +4208,12 @@ fn openai_compatibility_messages_with_reasoning(
     }
 
     let history = request
-        .previous_tool_calls
+        .input
+        .tool_calls
         .iter()
         .map(|call| {
             let results = request
+                .input
                 .tool_results
                 .iter()
                 .filter(|result| result.call_id == call.id)
@@ -4267,7 +4251,7 @@ fn append_openai_conversation(
     replay_chat_reasoning: bool,
     _compatibility_roles: bool,
 ) {
-    for (index, message) in request.conversation.iter().enumerate() {
+    for (index, message) in request.input.conversation.iter().enumerate() {
         if message.role == ModelConversationRole::Tool
             && message.tool_calls.is_empty()
             && message.tool_results.is_empty()
@@ -4358,7 +4342,7 @@ fn append_openai_tool_history(
     // valid Chat Completions sequence, grouping calls that came from the same
     // assistant response when provider-owned reasoning state is available.
     let mut emitted_call_ids = HashSet::new();
-    let mut emitted_results = vec![false; request.tool_results.len()];
+    let mut emitted_results = vec![false; request.input.tool_results.len()];
 
     for item in request.previous_response_items.iter().filter(|item| {
         item.get("type").and_then(Value::as_str) == Some(OPENAI_CHAT_ASSISTANT_STATE_TYPE)
@@ -4374,7 +4358,8 @@ fn append_openai_tool_history(
             .iter()
             .filter_map(|call_id| {
                 request
-                    .previous_tool_calls
+                    .input
+                    .tool_calls
                     .iter()
                     .find(|call| call.id == *call_id)
             })
@@ -4404,7 +4389,7 @@ fn append_openai_tool_history(
 
         for call in calls {
             emitted_call_ids.insert(call.id.clone());
-            for (index, result) in request.tool_results.iter().enumerate() {
+            for (index, result) in request.input.tool_results.iter().enumerate() {
                 if result.call_id == call.id {
                     messages.push(openai_tool_result_message(result));
                     emitted_results[index] = true;
@@ -4413,7 +4398,7 @@ fn append_openai_tool_history(
         }
     }
 
-    for call in &request.previous_tool_calls {
+    for call in &request.input.tool_calls {
         if emitted_call_ids.contains(&call.id) {
             continue;
         }
@@ -4422,19 +4407,19 @@ fn append_openai_tool_history(
             "content": "",
             "tool_calls": [openai_tool_call_message(call)]
         }));
-        for (index, result) in request.tool_results.iter().enumerate() {
+        for (index, result) in request.input.tool_results.iter().enumerate() {
             if result.call_id == call.id {
                 messages.push(openai_tool_result_message(result));
                 emitted_results[index] = true;
             }
         }
     }
-    for (index, result) in request.tool_results.iter().enumerate() {
+    for (index, result) in request.input.tool_results.iter().enumerate() {
         if !emitted_results[index] {
             messages.push(openai_tool_result_message(result));
         }
     }
-    if let Some(companion) = openai_tool_image_companion(&request.tool_results) {
+    if let Some(companion) = openai_tool_image_companion(&request.input.tool_results) {
         messages.push(companion);
     }
 }
@@ -4842,18 +4827,9 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
     let mut input = Vec::new();
     if replay_full_prefix {
         input.extend(responses_scoped_instruction_input(request, true));
-        if let Some(instructions) = request
-            .branch_developer_instructions
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            input.push(json!({
-                "role": "developer",
-                "content": instructions,
-            }));
-        }
         input.extend(
             request
+                .input
                 .conversation
                 .iter()
                 .enumerate()
@@ -4864,8 +4840,8 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
         "role": "user",
         "content": responses_message_content(
             ModelConversationRole::User,
-            &request.user_message,
-            &request.user_content,
+            &request.input.current_user.message,
+            &request.input.current_user.content,
         ),
     }));
 
@@ -4875,7 +4851,7 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
     input.extend(responses_scoped_instruction_input(request, false));
 
     if request.previous_response_items.is_empty() {
-        input.extend(request.previous_tool_calls.iter().map(|call| {
+        input.extend(request.input.tool_calls.iter().map(|call| {
             json!({
                 "type": "function_call",
                 "call_id": &call.id,
@@ -4886,7 +4862,7 @@ fn responses_input(request: &ModelRequest) -> Vec<Value> {
     } else {
         input.extend(request.previous_response_items.iter().cloned());
     }
-    input.extend(request.tool_results.iter().map(|result| {
+    input.extend(request.input.tool_results.iter().map(|result| {
         let output = responses_tool_result_output(result);
         match responses_tool_call_kind(&request.previous_response_items, &result.call_id) {
             Some(ResponsesToolCallKind::ApplyPatch) => json!({
@@ -5007,35 +4983,33 @@ fn legacy_tool_observation(
 }
 
 fn responses_scoped_instruction_input(request: &ModelRequest, lineage_prefix: bool) -> Vec<Value> {
-    if request.context_items.is_empty() {
+    if request.instructions.items.is_empty() {
         return Vec::new();
     }
-    CompiledModelContext {
-        items: request.context_items.clone(),
-        prompt_cache_key: request.prompt_cache_key.clone(),
-    }
-    .instruction_messages_with_scope()
-    .into_iter()
-    .filter_map(|(role, scope, content)| {
-        let belongs_to_prefix =
-            matches!(scope, ContextCacheScope::Stable | ContextCacheScope::Thread);
-        if belongs_to_prefix != lineage_prefix {
-            return None;
-        }
-        let role = match role {
-            ContextRole::Developer => "developer",
-            // Stable system instructions live in the top-level `instructions`
-            // field. A volatile system item must instead remain behind the
-            // current user cache anchor, alongside volatile developer context.
-            ContextRole::System if !lineage_prefix => "system",
-            _ => return None,
-        };
-        Some(json!({
-            "role": role,
-            "content": content,
-        }))
-    })
-    .collect()
+    request
+        .instructions
+        .instruction_messages_with_scope()
+        .into_iter()
+        .filter_map(|(role, scope, content)| {
+            let belongs_to_prefix =
+                matches!(scope, ContextCacheScope::Stable | ContextCacheScope::Thread);
+            if belongs_to_prefix != lineage_prefix {
+                return None;
+            }
+            let role = match role {
+                ContextRole::Developer => "developer",
+                // Stable system instructions live in the top-level `instructions`
+                // field. A volatile system item must instead remain behind the
+                // current user cache anchor, alongside volatile developer context.
+                ContextRole::System if !lineage_prefix => "system",
+                _ => return None,
+            };
+            Some(json!({
+                "role": role,
+                "content": content,
+            }))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5065,7 +5039,7 @@ fn responses_tool_call_kind(items: &[Value], call_id: &str) -> Option<ResponsesT
 }
 
 fn add_responses_prompt_cache_breakpoint(input: &mut Value, request: &ModelRequest) {
-    if request.context_items.is_empty() {
+    if request.instructions.items.is_empty() {
         return;
     }
 
@@ -5074,12 +5048,6 @@ fn add_responses_prompt_cache_breakpoint(input: &mut Value, request: &ModelReque
     };
     let lineage_developer_count = if request.previous_response_id.is_none() {
         responses_scoped_instruction_input(request, true).len()
-            + usize::from(
-                request
-                    .branch_developer_instructions
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty()),
-            )
     } else {
         0
     };
@@ -7185,7 +7153,7 @@ impl CodexAppServerProvider {
 
         let outcome = async {
             if previous_response_id.is_some() && session.pending_tool_call.is_some() {
-                self.resume_session(&mut session, &request.tool_results)
+                self.resume_session(&mut session, &request.input.tool_results)
                     .await?;
             }
             self.drive_session(&mut session, on_transport).await
@@ -7514,13 +7482,6 @@ fn codex_developer_instructions(request: &ModelRequest, native_web_search: bool)
         .map(|(_, content)| content)
         .filter(|content| !content.trim().is_empty())
         .collect::<Vec<_>>();
-    if let Some(instructions) = request
-        .branch_developer_instructions
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        sections.push(instructions.to_string());
-    }
     sections.push(if native_web_search && request.tool_candidates.is_empty() {
         "You are executing inside OpenTopia. Respond directly. You may use the built-in web search tool when current external information is needed; do not invoke other built-in tools."
             .to_string()
@@ -7545,7 +7506,7 @@ fn codex_turn_input(
     attachment_paths: &mut Vec<PathBuf>,
 ) -> anyhow::Result<Vec<Value>> {
     let mut input = Vec::new();
-    for message in &request.conversation {
+    for message in &request.input.conversation {
         let role = match message.role {
             ModelConversationRole::System => "System",
             ModelConversationRole::User => "User",
@@ -7566,19 +7527,29 @@ fn codex_turn_input(
     let separator = if input.is_empty() { "" } else { "\n\n" };
     push_codex_input_text(
         &mut input,
-        format!("{separator}Current user request:\n{}", request.user_message),
+        format!(
+            "{separator}Current user request:\n{}",
+            request.input.current_user.message
+        ),
     );
-    if !request.user_message.is_empty() && !request.user_content.is_empty() {
+    if !request.input.current_user.message.is_empty()
+        && !request.input.current_user.content.is_empty()
+    {
         push_codex_input_text(&mut input, "\n");
     }
-    append_codex_input_parts(&mut input, &request.user_content, attachment_paths)?;
+    append_codex_input_parts(
+        &mut input,
+        &request.input.current_user.content,
+        attachment_paths,
+    )?;
 
-    if !request.tool_results.is_empty() {
+    if !request.input.tool_results.is_empty() {
         push_codex_input_text(
             &mut input,
             format!(
                 "\n\nCompleted OpenTopia tool results:\n{}",
                 request
+                    .input
                     .tool_results
                     .iter()
                     .map(provider_tool_result_content)
@@ -7586,7 +7557,7 @@ fn codex_turn_input(
                     .join("\n")
             ),
         );
-        for result in &request.tool_results {
+        for result in &request.input.tool_results {
             for part in &result.content {
                 if matches!(part, ModelContentPart::Image { .. }) {
                     append_codex_input_parts(
@@ -7724,7 +7695,7 @@ impl ModelProvider for MockProvider {
     async fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
         Ok(ModelResponse::text(format!(
             "OpenTopia MVP mock provider received: {}",
-            request.user_message
+            request.input.current_user.message
         )))
     }
 
@@ -7748,18 +7719,27 @@ mod tests {
 
     fn model_request() -> ModelRequest {
         ModelRequest {
-            system_prompt: "system".to_string(),
-            conversation: Vec::new(),
-            user_message: "current".to_string(),
-            user_content: Vec::new(),
+            instructions: CompiledModelContext {
+                items: vec![ModelContextItem::text(
+                    ContextItemKind::BaseInstructions,
+                    ContextRole::System,
+                    "test:system",
+                    "system",
+                    ContextCacheScope::Stable,
+                    crate::model_context::ContextSensitivity::Public,
+                )],
+                prompt_cache_key: None,
+            },
+            input: ModelInputLedger {
+                current_user: ModelUserInput {
+                    message: "current".to_string(),
+                    content: Vec::new(),
+                },
+                ..Default::default()
+            },
             tool_candidates: Vec::new(),
-            previous_tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-            context_items: Vec::new(),
             previous_response_items: Vec::new(),
             previous_response_id: None,
-            branch_developer_instructions: None,
-            prompt_cache_key: None,
             prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy::StableOnly,
             final_output_json_schema: None,
         }
@@ -7801,8 +7781,7 @@ mod tests {
     #[test]
     fn token_estimate_breakdown_attributes_materialized_context_and_schemas() {
         let mut request = model_request();
-        request.system_prompt = "must not be counted twice".to_string();
-        request.context_items = vec![
+        request.instructions.items = vec![
             ModelContextItem::text(
                 ContextItemKind::BaseInstructions,
                 ContextRole::System,
@@ -7820,7 +7799,15 @@ mod tests {
                 crate::model_context::ContextSensitivity::Workspace,
             ),
         ];
-        request.branch_developer_instructions = Some("branch rules".to_string());
+        request.instructions.items.push(ModelContextItem::text(
+            ContextItemKind::DeveloperInstructions,
+            ContextRole::Developer,
+            "test:branch",
+            "branch rules",
+            ContextCacheScope::Thread,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
+        request.input.current_user.message = "question".to_string();
         request.tool_candidates = vec![ProviderToolCandidate {
             name: "read_file".to_string(),
             description: "Read one file".to_string(),
@@ -7832,11 +7819,11 @@ mod tests {
 
         assert_eq!(
             breakdown.base_instructions,
-            request.context_items[0].token_estimate
+            request.instructions.items[0].token_estimate
         );
         assert_eq!(
             breakdown.current_user,
-            request.context_items[1].token_estimate
+            estimate_tokens(&request.input.current_user.message)
         );
         assert!(breakdown.developer_instructions > 0);
         assert!(breakdown.tool_schemas > 0);
@@ -7853,8 +7840,8 @@ mod tests {
     fn token_estimate_breakdown_treats_images_as_typed_inputs() {
         let image = ModelContentPart::image("image/png", vec![0xff; 282_039]);
         let mut request = model_request();
-        request.user_content = vec![image.clone()];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.current_user.content = vec![image.clone()];
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "image_result".to_string(),
             name: "view_image".to_string(),
             output: "image attached".to_string(),
@@ -7862,12 +7849,12 @@ mod tests {
             is_error: false,
             metadata: json!({ "success": true }),
         }];
-        request.context_items = vec![
+        request.instructions.items = vec![
             ModelContextItem::text(
                 ContextItemKind::User,
                 ContextRole::User,
                 "current_user_message",
-                &request.user_message,
+                &request.input.current_user.message,
                 ContextCacheScope::Turn,
                 crate::model_context::ContextSensitivity::Workspace,
             ),
@@ -7875,18 +7862,19 @@ mod tests {
                 ContextItemKind::ToolResult,
                 ContextRole::Tool,
                 "tool_result:image_result",
-                serde_json::to_string(&request.tool_results[0]).unwrap(),
+                serde_json::to_string(&request.input.tool_results[0]).unwrap(),
                 ContextCacheScope::Round,
                 crate::model_context::ContextSensitivity::Sensitive,
             ),
         ];
 
-        let serialized_user_content = estimate_serialized_slice(&request.user_content);
+        let serialized_user_content =
+            estimate_serialized_slice(&request.input.current_user.content);
         let breakdown = request.token_estimate_breakdown();
 
         assert_eq!(
             breakdown.current_user,
-            estimate_tokens(&request.user_message) + 282_039 / 16
+            estimate_tokens(&request.input.current_user.message) + 282_039 / 16
         );
         assert!(
             serialized_user_content > breakdown.current_user.saturating_mul(8),
@@ -7898,7 +7886,7 @@ mod tests {
     #[test]
     fn codex_turn_input_preserves_order_around_local_image_attachments() {
         let mut request = model_request();
-        request.user_content = vec![
+        request.input.current_user.content = vec![
             ModelContentPart::text("before image"),
             ModelContentPart::image("image/png", vec![0x89, b'P', b'N', b'G']),
             ModelContentPart::text("after image"),
@@ -7954,7 +7942,7 @@ mod tests {
     #[test]
     fn visual_input_requires_the_declared_model_capability() {
         let mut request = model_request();
-        request.user_content = vec![ModelContentPart::image("image/png", vec![1])];
+        request.input.current_user.content = vec![ModelContentPart::image("image/png", vec![1])];
 
         let error = ensure_visual_input_supported(&request, false).unwrap_err();
 
@@ -8109,8 +8097,7 @@ mod tests {
     fn layered_model_request() -> ModelRequest {
         let mut request = model_request();
         request.prompt_cache_breakpoint_policy = PromptCacheBreakpointPolicy::AppendOnlyUsers;
-        request.system_prompt = "legacy combined system and developer text".to_string();
-        request.context_items = vec![
+        request.instructions.items = vec![
             ModelContextItem::text(
                 crate::model_context::ContextItemKind::BaseInstructions,
                 ContextRole::System,
@@ -8124,14 +8111,6 @@ mod tests {
                 ContextRole::Developer,
                 "opentopia:environment",
                 "developer environment",
-                crate::model_context::ContextCacheScope::Turn,
-                crate::model_context::ContextSensitivity::Workspace,
-            ),
-            ModelContextItem::text(
-                crate::model_context::ContextItemKind::User,
-                ContextRole::User,
-                "current_user_message",
-                "must not be duplicated",
                 crate::model_context::ContextCacheScope::Turn,
                 crate::model_context::ContextSensitivity::Workspace,
             ),
@@ -8186,10 +8165,14 @@ mod tests {
             input_schema: json!({ "type": "object", "properties": {} }),
             ..Default::default()
         });
-        request.user_content.push(ModelInputContent::image(
-            "image/png",
-            vec![0x89, b'P', b'N', b'G'],
-        ));
+        request
+            .input
+            .current_user
+            .content
+            .push(ModelInputContent::image(
+                "image/png",
+                vec![0x89, b'P', b'N', b'G'],
+            ));
 
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
 
@@ -8455,9 +8438,9 @@ mod tests {
             .contains("none"));
 
         let mut request = model_request();
-        request.previous_tool_calls = response.tool_calls;
+        request.input.tool_calls = response.tool_calls;
         request.previous_response_items = response.provider_items;
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_malformed".to_string(),
             name: "spawn_agent".to_string(),
             output: "Tool `spawn_agent` was not executed because function.arguments was invalid JSON. Retry with valid JSON.".to_string(),
@@ -8512,7 +8495,7 @@ mod tests {
     #[test]
     fn orders_system_history_current_user_and_current_tool_messages() {
         let mut request = model_request();
-        request.conversation = vec![
+        request.input.conversation = vec![
             ModelConversationMessage {
                 role: ModelConversationRole::User,
                 content: "earlier user".to_string(),
@@ -8528,12 +8511,12 @@ mod tests {
                 tool_results: Vec::new(),
             },
         ];
-        request.previous_tool_calls = vec![ProviderToolCall {
+        request.input.tool_calls = vec![ProviderToolCall {
             id: "call_1".to_string(),
             name: "read_file".to_string(),
             arguments: json!({ "path": "Cargo.toml" }),
         }];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_1".to_string(),
             name: "read_file".to_string(),
             output: "workspace".to_string(),
@@ -8568,7 +8551,7 @@ mod tests {
     #[test]
     fn chat_messages_return_malformed_argument_diagnostics_as_a_tool_error() {
         let mut request = model_request();
-        request.previous_tool_calls = vec![ProviderToolCall {
+        request.input.tool_calls = vec![ProviderToolCall {
             id: "call_malformed".to_string(),
             name: "spawn_agent".to_string(),
             arguments: json!({
@@ -8580,7 +8563,7 @@ mod tests {
                 }
             }),
         }];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_malformed".to_string(),
             name: "spawn_agent".to_string(),
             output: "Tool `spawn_agent` was not executed because function.arguments was invalid JSON at line 1, column 47. Retry with valid JSON.".to_string(),
@@ -8656,11 +8639,59 @@ mod tests {
     }
 
     #[test]
+    fn responses_keeps_harness_labels_out_of_wire_messages_and_tools_separate() {
+        let provider =
+            OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
+        let mut request = layered_model_request();
+        request.instructions.items.push(ModelContextItem::text(
+            ContextItemKind::CapabilityCatalog,
+            ContextRole::Developer,
+            "opentopia:skill_catalog",
+            r#"{"skills":[{"name":"review"}]}"#,
+            ContextCacheScope::Thread,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
+        request.tool_candidates.push(ProviderToolCandidate::direct(
+            "read_file",
+            "Read a workspace file",
+            json!({ "type": "object", "properties": {} }),
+        ));
+
+        let text_transports = [
+            serde_json::to_string(&openai_messages(&request)).unwrap(),
+            anthropic_system_instructions(&request),
+            codex_developer_instructions(&request, false),
+        ];
+        for transport in text_transports {
+            assert!(transport.contains("<context_data"));
+            assert!(!transport.contains("\"authority\""));
+            assert!(!transport.contains("\"lifecycle\""));
+            assert!(!transport.contains("Read a workspace file"));
+        }
+        let dynamic_tools = codex_dynamic_tools(&request.tool_candidates);
+        assert_eq!(dynamic_tools[0]["name"], "read_file");
+        assert_eq!(dynamic_tools[0]["description"], "Read a workspace file");
+
+        let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+        let input = prepared.body["input"].to_string();
+
+        assert!(input.contains("<context_data"));
+        assert!(!input.contains("\"authority\""));
+        assert!(!input.contains("\"lifecycle\""));
+        assert!(!input.contains("Read a workspace file"));
+        assert_eq!(prepared.body["tools"][1]["name"], "read_file");
+        assert_eq!(
+            prepared.body["tools"][1]["description"],
+            "Read a workspace file"
+        );
+    }
+
+    #[test]
     fn responses_keeps_volatile_system_context_behind_the_user_anchor() {
         let provider =
             OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
         let mut request = layered_model_request();
-        request.context_items.push(ModelContextItem::text(
+        request.instructions.items.push(ModelContextItem::text(
             ContextItemKind::Environment,
             ContextRole::System,
             "volatile-system-state",
@@ -8694,7 +8725,7 @@ mod tests {
             OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.6");
         provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
         let mut request = layered_model_request();
-        request.context_items.push(ModelContextItem::text(
+        request.instructions.items.push(ModelContextItem::text(
             crate::model_context::ContextItemKind::RepositoryInstructions,
             ContextRole::Developer,
             "AGENTS.md",
@@ -8726,7 +8757,7 @@ mod tests {
         let provider =
             OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
         let mut request = layered_model_request();
-        request.conversation = vec![ModelConversationMessage {
+        request.input.conversation = vec![ModelConversationMessage {
             role: ModelConversationRole::User,
             content: "already stored".to_string(),
             content_parts: Vec::new(),
@@ -8755,14 +8786,21 @@ mod tests {
             OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.6");
         provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
         let mut request = layered_model_request();
-        request.conversation = vec![ModelConversationMessage {
+        request.input.conversation = vec![ModelConversationMessage {
             role: ModelConversationRole::User,
             content: "parent fork point".to_string(),
             content_parts: Vec::new(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
         }];
-        request.branch_developer_instructions = Some("review this branch".to_string());
+        request.instructions.items.push(ModelContextItem::text(
+            ContextItemKind::DeveloperInstructions,
+            ContextRole::Developer,
+            "opentopia:execution_branch",
+            "review this branch",
+            ContextCacheScope::Thread,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
 
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
 
@@ -8824,7 +8862,7 @@ mod tests {
         provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
         let mut request = layered_model_request();
         request.prompt_cache_breakpoint_policy = PromptCacheBreakpointPolicy::StableOnly;
-        request.context_items.push(ModelContextItem::text(
+        request.instructions.items.push(ModelContextItem::text(
             ContextItemKind::DeveloperInstructions,
             ContextRole::Developer,
             "one-shot-contract",
@@ -8860,7 +8898,7 @@ mod tests {
         provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
 
         let mut first = layered_model_request();
-        first.context_items.push(ModelContextItem::text(
+        first.instructions.items.push(ModelContextItem::text(
             ContextItemKind::RepositoryInstructions,
             ContextRole::Developer,
             "AGENTS.md",
@@ -8868,11 +8906,11 @@ mod tests {
             ContextCacheScope::Thread,
             crate::model_context::ContextSensitivity::Workspace,
         ));
-        first.user_message = "U1".to_string();
+        first.input.current_user.message = "U1".to_string();
         let first = provider.prepare(Uuid::nil(), first).unwrap();
 
         let mut second = layered_model_request();
-        second.context_items.push(ModelContextItem::text(
+        second.instructions.items.push(ModelContextItem::text(
             ContextItemKind::RepositoryInstructions,
             ContextRole::Developer,
             "AGENTS.md",
@@ -8880,10 +8918,10 @@ mod tests {
             ContextCacheScope::Thread,
             crate::model_context::ContextSensitivity::Workspace,
         ));
-        second.context_items.retain(|item| {
+        second.instructions.items.retain(|item| {
             item.source != "opentopia:environment" || item.text_content() != "developer environment"
         });
-        second.context_items.push(ModelContextItem::text(
+        second.instructions.items.push(ModelContextItem::text(
             ContextItemKind::Environment,
             ContextRole::Developer,
             "opentopia:environment",
@@ -8891,7 +8929,7 @@ mod tests {
             ContextCacheScope::Turn,
             crate::model_context::ContextSensitivity::Workspace,
         ));
-        second.conversation = vec![
+        second.input.conversation = vec![
             ModelConversationMessage {
                 role: ModelConversationRole::User,
                 content: "U1".to_string(),
@@ -8907,7 +8945,7 @@ mod tests {
                 tool_results: Vec::new(),
             },
         ];
-        second.user_message = "U2".to_string();
+        second.input.current_user.message = "U2".to_string();
         let second = provider.prepare(Uuid::nil(), second).unwrap();
 
         let first_input = first.body["input"].as_array().unwrap();
@@ -8943,7 +8981,7 @@ mod tests {
     #[test]
     fn compatibility_fallback_preserves_structured_cross_turn_tool_history() {
         let mut request = model_request();
-        request.conversation = vec![
+        request.input.conversation = vec![
             ModelConversationMessage {
                 role: ModelConversationRole::User,
                 content: "inspect both files".to_string(),
@@ -9126,12 +9164,12 @@ mod tests {
     #[test]
     fn deepseek_tool_history_replays_reasoning_content() {
         let mut request = model_request();
-        request.previous_tool_calls = vec![ProviderToolCall {
+        request.input.tool_calls = vec![ProviderToolCall {
             id: "call_1".to_string(),
             name: "read_file".to_string(),
             arguments: json!({ "path": "Cargo.toml" }),
         }];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_1".to_string(),
             name: "read_file".to_string(),
             output: "workspace".to_string(),
@@ -9231,7 +9269,8 @@ mod tests {
         assert_eq!(request_image_part_count(&request), 0);
 
         let mut request_with_image = request;
-        request_with_image.user_content = vec![ModelContentPart::image("image/png", vec![1])];
+        request_with_image.input.current_user.content =
+            vec![ModelContentPart::image("image/png", vec![1])];
         assert_eq!(request_image_part_count(&request_with_image), 1);
     }
 
@@ -9251,7 +9290,7 @@ mod tests {
     #[test]
     fn serializes_native_user_images_and_structured_tool_content() {
         let mut request = model_request();
-        request.user_content = vec![
+        request.input.current_user.content = vec![
             ModelInputContent::image("image/png", vec![0x89, b'P', b'N', b'G']),
             ModelInputContent::json(json!({ "selection": 4 })),
             ModelInputContent::resource(
@@ -9260,12 +9299,12 @@ mod tests {
                 Some("spec.pdf".to_string()),
             ),
         ];
-        request.previous_tool_calls = vec![ProviderToolCall {
+        request.input.tool_calls = vec![ProviderToolCall {
             id: "call_1".to_string(),
             name: "inspect".to_string(),
             arguments: json!({}),
         }];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_1".to_string(),
             name: "inspect".to_string(),
             output: "legacy".to_string(),
@@ -9304,12 +9343,12 @@ mod tests {
     #[test]
     fn compacts_completed_tool_history_for_strict_compatible_providers() {
         let mut request = model_request();
-        request.previous_tool_calls = vec![ProviderToolCall {
+        request.input.tool_calls = vec![ProviderToolCall {
             id: "call_1".to_string(),
             name: "read_file".to_string(),
             arguments: json!({ "path": "SPEC.md" }),
         }];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_1".to_string(),
             name: "read_file".to_string(),
             output: "contract".to_string(),
@@ -9332,7 +9371,7 @@ mod tests {
     #[test]
     fn appends_native_tool_images_after_all_tool_messages() {
         let mut request = model_request();
-        request.previous_tool_calls = vec![
+        request.input.tool_calls = vec![
             ProviderToolCall {
                 id: "call_first".to_string(),
                 name: "browser_screenshot".to_string(),
@@ -9344,7 +9383,7 @@ mod tests {
                 arguments: json!({}),
             },
         ];
-        request.tool_results = vec![
+        request.input.tool_results = vec![
             ProviderToolResult {
                 call_id: "call_first".to_string(),
                 name: "browser_screenshot".to_string(),
@@ -9810,7 +9849,7 @@ mod tests {
         provider.max_output_tokens = Some(2048);
         provider.reasoning_effort = Some("high".to_string());
         let mut request = model_request();
-        request.conversation.push(ModelConversationMessage {
+        request.input.conversation.push(ModelConversationMessage {
             role: ModelConversationRole::Assistant,
             content: "history".to_string(),
             content_parts: Vec::new(),
@@ -10456,7 +10495,8 @@ mod tests {
         let provider =
             OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
         let mut request = model_request();
-        request.user_content = vec![ModelInputContent::image("image/png", vec![1, 2, 3])];
+        request.input.current_user.content =
+            vec![ModelInputContent::image("image/png", vec![1, 2, 3])];
         let prepared = provider.prepare(Uuid::nil(), request).unwrap();
         let mut transport = Vec::new();
 
@@ -10927,12 +10967,12 @@ mod tests {
                 "arguments": "{\"path\":\"Cargo.toml\"}"
             }),
         ];
-        request.previous_tool_calls = vec![ProviderToolCall {
+        request.input.tool_calls = vec![ProviderToolCall {
             id: "call_1".to_string(),
             name: "read_file".to_string(),
             arguments: json!({ "path": "Cargo.toml" }),
         }];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_1".to_string(),
             name: "read_file".to_string(),
             output: "workspace".to_string(),
@@ -10987,8 +11027,9 @@ mod tests {
         let provider =
             OpenAiResponsesProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
         let mut request = model_request();
-        request.user_content = vec![ModelInputContent::image("image/png", vec![1, 2, 3])];
-        request.prompt_cache_key = Some("workspace-cache".to_string());
+        request.input.current_user.content =
+            vec![ModelInputContent::image("image/png", vec![1, 2, 3])];
+        request.instructions.prompt_cache_key = Some("workspace-cache".to_string());
         request.tool_candidates = vec![ProviderToolCandidate {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
@@ -11094,7 +11135,7 @@ mod tests {
             OpenAiResponsesProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
         provider.store_responses = true;
         let mut request = layered_model_request();
-        request.conversation = vec![ModelConversationMessage {
+        request.input.conversation = vec![ModelConversationMessage {
             role: ModelConversationRole::User,
             content: "canonical local history".to_string(),
             content_parts: Vec::new(),
@@ -11481,7 +11522,7 @@ mod tests {
 
         let mut request = model_request();
         request.previous_response_items = vec![item];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_patch".to_string(),
             name: "apply_patch".to_string(),
             output: "Done!".to_string(),
@@ -11610,6 +11651,9 @@ mod tests {
         let mut unconfigured = settings;
         unconfigured.kind = ProviderKind::OpenAiCompatible;
         unconfigured.api_key_configured = false;
+        // Do not let a developer/CI machine's real provider environment make
+        // this fallback test configured by accident.
+        unconfigured.api_key_source = "OPENTOPIA_TEST_MISSING_PROVIDER_KEY".to_string();
         assert!(configured_provider_from_settings(&unconfigured).is_none());
         let _fallback = provider_from_settings(&unconfigured);
     }
@@ -11684,7 +11728,7 @@ mod tests {
     #[test]
     fn release_gate_provider_payloads_keep_initial_user_message_last() {
         let mut request = model_request();
-        request.conversation = vec![
+        request.input.conversation = vec![
             ModelConversationMessage {
                 role: ModelConversationRole::User,
                 content: "earlier question".to_string(),
@@ -11700,7 +11744,7 @@ mod tests {
                 tool_results: Vec::new(),
             },
         ];
-        request.user_message = "current user request".to_string();
+        request.input.current_user.message = "current user request".to_string();
 
         let chat = OpenAiCompatibleProvider::new(
             "https://compatible.example/v1",
@@ -11739,7 +11783,7 @@ mod tests {
             OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.6");
         provider.prompt_cache_policy = Some(PromptCachePolicy::Explicit30m);
         let mut request = layered_model_request();
-        request.context_items.push(ModelContextItem::text(
+        request.instructions.items.push(ModelContextItem::text(
             ContextItemKind::RepositoryInstructions,
             ContextRole::Developer,
             "AGENTS.md",
@@ -11747,7 +11791,7 @@ mod tests {
             ContextCacheScope::Stable,
             crate::model_context::ContextSensitivity::Workspace,
         ));
-        request.conversation = vec![
+        request.input.conversation = vec![
             ModelConversationMessage {
                 role: ModelConversationRole::User,
                 content: "inherited request".to_string(),
@@ -11763,8 +11807,15 @@ mod tests {
                 tool_results: Vec::new(),
             },
         ];
-        request.branch_developer_instructions = Some("branch instructions".to_string());
-        request.user_message = "new user request".to_string();
+        request.instructions.items.push(ModelContextItem::text(
+            ContextItemKind::DeveloperInstructions,
+            ContextRole::Developer,
+            "opentopia:execution_branch",
+            "branch instructions",
+            ContextCacheScope::Thread,
+            crate::model_context::ContextSensitivity::Workspace,
+        ));
+        request.input.current_user.message = "new user request".to_string();
 
         let prepared = provider
             .prepare(Uuid::nil(), request)
@@ -11817,7 +11868,7 @@ mod tests {
             json!({ "type": "tool_search_output", "id": "tso_1", "tools": [{"type": "function", "name": "github__search_issues"}] }),
             json!({ "type": "function_call", "call_id": "call_1", "name": "github__search_issues", "arguments": "{\"query\":\"bug\"}" }),
         ];
-        request.tool_results = vec![ProviderToolResult {
+        request.input.tool_results = vec![ProviderToolResult {
             call_id: "call_1".to_string(),
             name: "github__search_issues".to_string(),
             output: "[]".to_string(),

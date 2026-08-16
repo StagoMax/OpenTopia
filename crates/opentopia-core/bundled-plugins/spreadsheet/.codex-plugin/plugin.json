@@ -1,7 +1,7 @@
 {
   "name": "spreadsheet",
-  "version": "1.1.0",
-  "description": "Inspect, read, create, and update bounded XLSX workbooks through the model tool.",
+  "version": "1.2.0",
+  "description": "Inspect, search, filter, create, and update bounded XLSX workbooks through the model tool.",
   "author": {
     "name": "OpenTopia Contributors"
   },
@@ -15,6 +15,7 @@
     "capabilities": [
       "XLSX inspection",
       "Bounded range reading",
+      "Cell finding and conditional row filtering",
       "Workbook creation and update"
     ]
   },

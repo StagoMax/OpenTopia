@@ -1,10 +1,15 @@
+use crate::context_runtime::{ContextAssembler, ContextAssemblyInput, DefaultContextAssembler};
 use crate::model_context::{
-    ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity, ModelContextItem,
+    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
+    ModelContextItem,
 };
+use crate::model_gateway::{ModelGateway, ProviderModelGateway};
 use crate::policy::{BasicPolicyEngine, PermissionMode, PolicyDecision, PolicyEngine};
+#[cfg(test)]
+use crate::provider::ModelRequest;
 use crate::provider::{
-    ModelConversationMessage, ModelConversationRole, ModelProvider, ModelRequest, ModelUsage,
-    ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
+    ModelConversationMessage, ModelConversationRole, ModelProvider, ModelUsage,
+    PromptCacheBreakpointPolicy, ProviderToolCall, ProviderToolCandidate, ProviderToolResult,
 };
 use crate::sandbox::LocalSandboxConfig;
 use crate::shell_analysis::analyze_shell_command;
@@ -656,7 +661,7 @@ async fn run_review_model(
     user_message: String,
     workspace_root: &Path,
     sandbox_config: &LocalSandboxConfig,
-    thread_id: Uuid,
+    _thread_id: Uuid,
 ) -> anyhow::Result<GuardianModelReviewOutput> {
     let mut previous_tool_calls = Vec::new();
     let mut tool_results = Vec::new();
@@ -664,43 +669,47 @@ async fn run_review_model(
     let mut usage = ModelUsage::default();
     let mut tool_rounds = 0usize;
     let guardian_prompt = guardian_policy_prompt();
-    let guardian_context = vec![
-        ModelContextItem::text(
+    let guardian_context = CompiledModelContext {
+        items: vec![ModelContextItem::text(
             ContextItemKind::BaseInstructions,
             ContextRole::System,
             "opentopia:guardian_policy",
             guardian_prompt.clone(),
             ContextCacheScope::Stable,
             ContextSensitivity::Public,
-        ),
-        ModelContextItem::text(
+        ), ModelContextItem::text(
             ContextItemKind::DeveloperInstructions,
             ContextRole::Developer,
             "opentopia:guardian_review_contract",
             "Perform one bounded guardian review using only the supplied read-only tools and the required structured output schema.",
             ContextCacheScope::Stable,
             ContextSensitivity::Public,
-        ),
-    ];
+        )],
+        // Cache identity is semantic and shared across reviews. The review's
+        // thread/turn ids remain control-plane correlation only.
+        prompt_cache_key: Some("guardian-policy-v1".to_string()),
+    };
+    let gateway = ProviderModelGateway::new(provider);
+    let assembler = DefaultContextAssembler;
     for _ in 0..=GUARDIAN_MAX_TOOL_ROUNDS {
-        let response = provider
-            .complete(ModelRequest {
-                system_prompt: guardian_prompt.clone(),
-                conversation: conversation.clone(),
-                user_message: user_message.clone(),
-                user_content: Vec::new(),
-                tool_candidates: guardian_read_only_tool_candidates(),
-                previous_tool_calls: previous_tool_calls.clone(),
-                tool_results: tool_results.clone(),
-                context_items: guardian_context.clone(),
-                previous_response_items: previous_response_items.clone(),
-                previous_response_id: None,
-                branch_developer_instructions: None,
-                prompt_cache_key: Some(format!("guardian-{thread_id}")),
-                prompt_cache_breakpoint_policy:
-                    crate::provider::PromptCacheBreakpointPolicy::StableOnly,
-                final_output_json_schema: Some(guardian_output_schema()),
-            })
+        let canonical = assembler.compile(ContextAssemblyInput {
+            model_context: &guardian_context,
+            context_summary: None,
+            conversation: conversation.clone(),
+            user_message: user_message.clone(),
+            user_content: Vec::new(),
+            tool_candidates: guardian_read_only_tool_candidates(),
+            previous_tool_calls: previous_tool_calls.clone(),
+            tool_results: tool_results.clone(),
+            previous_response_items: previous_response_items.clone(),
+            previous_response_id: None,
+            branch_developer_instructions: None,
+            prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy::StableOnly,
+            final_output_json_schema: Some(guardian_output_schema()),
+        })?;
+        let prepared = gateway.prepare(Uuid::new_v4(), canonical)?;
+        let response = gateway
+            .stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(()))
             .await?;
         if let Some(response_usage) = response.usage.as_ref() {
             accumulate_model_usage(&mut usage, response_usage);
@@ -1383,11 +1392,17 @@ mod tests {
             .await;
 
         let requests = reviewer.requests.lock().unwrap();
-        assert!(requests[0].user_message.contains(">>> TRANSCRIPT START"));
+        assert!(requests[0]
+            .input
+            .current_user
+            .message
+            .contains(">>> TRANSCRIPT START"));
         assert!(requests[1]
-            .user_message
+            .input
+            .current_user
+            .message
             .contains(">>> TRANSCRIPT DELTA START"));
-        assert_eq!(requests[1].conversation.len(), 2);
+        assert_eq!(requests[1].input.conversation.len(), 2);
     }
 
     #[tokio::test]
@@ -1533,8 +1548,8 @@ mod tests {
         assert_eq!(result.usage.reasoning_tokens, Some(1));
         let requests = reviewer.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].tool_results.len(), 1);
-        assert!(requests[1].tool_results[0]
+        assert_eq!(requests[1].input.tool_results.len(), 1);
+        assert!(requests[1].input.tool_results[0]
             .output
             .contains("bounded evidence"));
         let _ = std::fs::remove_dir_all(workspace);
@@ -1591,16 +1606,17 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[1]
+                .input
                 .tool_results
                 .iter()
                 .map(|result| result.call_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["guardian-read-first", "guardian-read-second"]
         );
-        assert!(requests[1].tool_results[0]
+        assert!(requests[1].input.tool_results[0]
             .output
             .contains("first evidence"));
-        assert!(requests[1].tool_results[1]
+        assert!(requests[1].input.tool_results[1]
             .output
             .contains("second evidence"));
         let _ = std::fs::remove_dir_all(workspace);

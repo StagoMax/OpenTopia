@@ -22,6 +22,12 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub struct AgentContinuation {
     pub thread_id: Uuid,
+    /// Stable logical Turn identity. Legacy continuations use
+    /// `user_message_id` as a compatibility fallback.
+    #[serde(default)]
+    pub turn_id: Uuid,
+    #[serde(default = "default_continuation_invocation_id")]
+    pub invocation_id: u64,
     pub user_message_id: Uuid,
     pub workspace_root: PathBuf,
     pub context_summary: Option<String>,
@@ -69,5 +75,9 @@ pub enum AgentContinuationState {
 }
 
 fn default_continuation_model_rounds() -> usize {
+    1
+}
+
+fn default_continuation_invocation_id() -> u64 {
     1
 }
