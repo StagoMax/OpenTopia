@@ -213,23 +213,12 @@ export function RightContextRail({
       <RailSection
         title="环境信息"
         action={
-          libraryPickerEnabled ? (
-            <LibraryPicker
-              value={libraryProvider}
-              onChange={onChangeLibraryProvider}
-              onOpenEnvironment={onOpenEnvironment}
-            />
-          ) : (
-            <button
-              className="right-context-rail__header-action"
-              type="button"
-              title="管理环境"
-              aria-label="管理环境"
-              onClick={onOpenEnvironment}
-            >
-              <Plus size={14} aria-hidden="true" />
-            </button>
-          )
+          <LibraryPicker
+            enabled={libraryPickerEnabled}
+            value={libraryProvider}
+            onChange={onChangeLibraryProvider}
+            onOpenEnvironment={onOpenEnvironment}
+          />
         }
       >
         {workspaceDiff && (
@@ -468,10 +457,12 @@ export function RightContextRail({
 }
 
 function LibraryPicker({
+  enabled,
   value,
   onChange,
   onOpenEnvironment,
 }: {
+  enabled: boolean;
   value: LibraryProviderId | null;
   onChange(provider: LibraryProviderId | null): void;
   onOpenEnvironment(): void;
@@ -518,32 +509,38 @@ function LibraryPicker({
       {({ close }) => (
         <div className="right-context-rail__library-picker">
           <header>
-            <strong>Lib 检索测试</strong>
-            <span>启用后，模型会在需要时调用检索工具。</span>
+            <strong>{enabled ? "Lib 检索测试" : "添加环境能力"}</strong>
+            <span>
+              {enabled
+                ? "启用后，模型会在需要时调用检索工具。"
+                : "Lib 检索仅在 Flow 模式下提供。"}
+            </span>
           </header>
-          <div className="right-context-rail__library-options">
-            {options.map((option) => {
-              const selected = option.value === value;
-              return (
-                <button
-                  key={option.value ?? "none"}
-                  className="right-context-rail__library-option"
-                  type="button"
-                  aria-pressed={selected}
-                  onClick={() => {
-                    onChange(option.value);
-                    close();
-                  }}
-                >
-                  <span>
-                    <strong>{option.label}</strong>
-                    <small>{option.description}</small>
-                  </span>
-                  {selected ? <Check size={14} aria-hidden="true" /> : null}
-                </button>
-              );
-            })}
-          </div>
+          {enabled ? (
+            <div className="right-context-rail__library-options">
+              {options.map((option) => {
+                const selected = option.value === value;
+                return (
+                  <button
+                    key={option.value ?? "none"}
+                    className="right-context-rail__library-option"
+                    type="button"
+                    aria-pressed={selected}
+                    onClick={() => {
+                      onChange(option.value);
+                      close();
+                    }}
+                  >
+                    <span>
+                      <strong>{option.label}</strong>
+                      <small>{option.description}</small>
+                    </span>
+                    {selected ? <Check size={14} aria-hidden="true" /> : null}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
           <button
             className="right-context-rail__library-environment-link"
             type="button"

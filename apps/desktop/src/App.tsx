@@ -4970,6 +4970,7 @@ export function App() {
           ) : null}
           <RightPanel
             client={client}
+            experienceMode={experienceMode}
             threads={threads}
             toolTabs={toolTabs}
             activeToolTab={activeToolTab}
@@ -11847,6 +11848,7 @@ function SideTaskConversation({
 
 function RightPanel({
   client,
+  experienceMode,
   threads,
   toolTabs,
   activeToolTab,
@@ -11933,6 +11935,7 @@ function RightPanel({
   onCancelSubagent,
 }: {
   client: ApiClient | null;
+  experienceMode: ExperienceMode;
   threads: Thread[];
   toolTabs: ToolTab[];
   activeToolTab: ToolTab | null;
@@ -12232,7 +12235,7 @@ function RightPanel({
         subagentRuns={subagentRuns}
         artifacts={artifacts}
         messages={messages}
-        libraryPickerEnabled={thread?.experienceMode === "flow"}
+        libraryPickerEnabled={experienceMode === "flow"}
         libraryProvider={libraryProvider}
         onOpenDiff={() => onOpenToolTab("diff")}
         onOpenTerminal={() => onOpenToolTab("terminal")}
