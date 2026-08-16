@@ -38,6 +38,8 @@ function contextItem(
     id: `${kind}:${contentHash}`,
     kind,
     role: "developer",
+    authority: "developer",
+    lifecycle: "build",
     source,
     content: [{ type: "text", text: source }],
     contentHash,
@@ -197,19 +199,28 @@ test("correlates usage by request id and attributes token modules and waste sign
     other: 0,
     total: 100,
   };
-  const plan = {
-    planRevision: 1,
-    goalId: "goal-1",
-    steps: [
+  const form = {
+    id: "form-1",
+    threadId: "thread-1",
+    scope: { kind: "turn" as const, id: "turn-1" },
+    objective: "Inspect",
+    constraints: [],
+    acceptance: [],
+    status: "active" as const,
+    revision: 1,
+    items: [
       {
         id: "step-1",
         title: "Inspect",
         status: "in_progress" as const,
-        dependencies: [],
-        acceptanceCriteria: [],
-        evidence: [],
+        completionDisposition: "blocking" as const,
+        dependsOn: [],
+        acceptance: [],
+        evidenceRefs: [],
       },
     ],
+    createdAt: "2026-08-05T00:00:00.000Z",
+    updatedAt: "2026-08-05T00:00:00.000Z",
   };
   const result = aggregateUsageEvents([
     event(1, "2026-08-05T00:00:00.000Z", {
@@ -298,12 +309,12 @@ test("correlates usage by request id and attributes token modules and waste sign
       message: "stalled",
     }),
     event(11, "2026-08-05T00:00:00.100Z", {
-      type: "plan_updated",
-      plan,
+      type: "work_form_updated",
+      form,
     }),
     event(12, "2026-08-05T00:00:00.110Z", {
-      type: "plan_updated",
-      plan,
+      type: "work_form_updated",
+      form,
     }),
     event(13, "2026-08-05T00:00:00.120Z", {
       type: "turn_finished",

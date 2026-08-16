@@ -167,7 +167,7 @@ export function classifyToolCall(call: ToolCall): ToolActivityKind {
   ) {
     return "agent";
   }
-  if (["set_plan", "update_plan", "complete_task"].includes(call.name)) {
+  if (["set_plan", "update_plan"].includes(call.name)) {
     return "plan";
   }
   if (["list_skills", "read_skill", "create_skill"].includes(call.name)) {
@@ -439,10 +439,10 @@ function buildToolActivityView(
     };
   }
 
-  if (["set_plan", "update_plan", "complete_task"].includes(call.name)) {
+  if (["set_plan", "update_plan"].includes(call.name)) {
     return {
       kind,
-      title: call.name === "complete_task" ? "完成任务" : "更新执行计划",
+      title: "更新执行计划",
       chips: [],
       body: bodyFromFields(input, output, result),
       failed,

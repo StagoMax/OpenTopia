@@ -62,6 +62,8 @@ contextBridge.exposeInMainWorld("opentopia", {
   quit: () => ipcRenderer.invoke("platform:quit"),
   getPlatformInfo: () => ipcRenderer.invoke("platform:get-info"),
   ensureSagLibraryService: () => ipcRenderer.invoke("library:sag:ensure-ready"),
+  ensureLibraryProviderService: (provider) =>
+    ipcRenderer.invoke("library:provider:ensure-ready", provider),
   getOpenRequests: () => ipcRenderer.invoke("platform:get-open-requests"),
   onOpenRequest: (listener) => {
     if (typeof listener !== "function") {

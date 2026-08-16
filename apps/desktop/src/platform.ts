@@ -5,6 +5,8 @@ import type {
   FileLinkActionResult,
   KeyringMetadata,
   LogFileInfo,
+  LibraryProviderId,
+  LibraryProviderServiceRuntimeStatus,
   PlatformInfo,
   PluginDirectoryPickResult,
   RecentWorkspace,
@@ -43,6 +45,16 @@ export async function loadPlatformInfo(): Promise<PlatformInfo> {
 export async function ensureSagLibraryService(): Promise<SagServiceRuntimeStatus | null> {
   if (!window.opentopia?.ensureSagLibraryService) return null;
   return window.opentopia.ensureSagLibraryService();
+}
+
+export async function ensureLibraryProviderService(
+  provider: LibraryProviderId,
+): Promise<LibraryProviderServiceRuntimeStatus | null> {
+  if (window.opentopia?.ensureLibraryProviderService) {
+    return window.opentopia.ensureLibraryProviderService(provider);
+  }
+  if (provider === "sag") return ensureSagLibraryService();
+  return null;
 }
 
 export function getLoadedApiToken(): string {

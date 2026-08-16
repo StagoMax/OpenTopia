@@ -439,6 +439,8 @@ function contextKindLabel(kind: string): string {
     repository_instructions: "仓库指令",
     environment: "环境上下文",
     world_state: "世界状态",
+    capability_catalog: "能力目录",
+    skill_instructions: "Skill 指令",
     skill: "Skill",
     summary: "上下文摘要",
     checkpoint: "上下文检查点",

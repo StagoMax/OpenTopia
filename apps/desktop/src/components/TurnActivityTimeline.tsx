@@ -31,7 +31,7 @@ import {
 import type {
   AgentEvent,
   SubagentRun,
-  TaskPlan,
+  WorkForm,
   ToolCall,
   ToolResult,
   TurnChangeSet,
@@ -73,7 +73,7 @@ type ToolExecution = {
   finishedAt?: string;
 };
 
-type PlanStepTiming = {
+type WorkItemTiming = {
   startedAt?: string;
   finishedAt?: string;
 };
@@ -95,12 +95,12 @@ type ActivityFile = {
 type PrimitiveActivity =
   | { kind: "tool"; seq: number; execution: ToolExecution }
   | {
-      kind: "plan";
+      kind: "work-form";
       seq: number;
-      plan: TaskPlan;
+      form: WorkForm;
       startedAt: string;
       finishedAt?: string;
-      stepTimings: PlanStepTiming[];
+      itemTimings: WorkItemTiming[];
     }
   | {
       kind: "file";
@@ -1058,11 +1058,11 @@ function ActivityEntryView({
       />
     );
   }
-  if (entry.kind === "plan") {
+  if (entry.kind === "work-form") {
     return (
-      <PlanActivity
-        plan={entry.plan}
-        stepTimings={entry.stepTimings}
+      <WorkFormActivity
+        form={entry.form}
+        itemTimings={entry.itemTimings}
         startedAt={entry.startedAt}
         finishedAt={entry.finishedAt}
         defaultExpanded={isActive}
@@ -1384,43 +1384,43 @@ function NarrativeActivity({
   );
 }
 
-function PlanActivity({
-  plan,
-  stepTimings,
+function WorkFormActivity({
+  form,
+  itemTimings,
   startedAt,
   finishedAt,
   defaultExpanded,
   isActive,
   now,
 }: {
-  plan: TaskPlan;
-  stepTimings: PlanStepTiming[];
+  form: WorkForm;
+  itemTimings: WorkItemTiming[];
   startedAt: string;
   finishedAt?: string;
   defaultExpanded: boolean;
   isActive: boolean;
   now: number;
 }) {
-  const resolved = plan.steps.filter((step) =>
-    ["completed", "deferred", "blocked", "cancelled"].includes(step.status),
+  const resolved = form.items.filter((item) =>
+    ["completed", "deferred", "blocked", "cancelled"].includes(item.status),
   ).length;
-  const running = plan.steps.some((step) => step.status === "in_progress");
-  const actionable = plan.steps.some(
-    (step) => step.status === "pending" || step.status === "in_progress",
+  const running = form.items.some((item) => item.status === "in_progress");
+  const actionable = form.items.some(
+    (item) => item.status === "pending" || item.status === "in_progress",
   );
   const completedIds = new Set(
-    plan.steps
-      .filter((step) => step.status === "completed")
-      .map((step) => step.id),
+    form.items
+      .filter((item) => item.status === "completed")
+      .map((item) => item.id),
   );
-  let currentStepIndex = plan.steps.findIndex(
-    (step) => step.status === "in_progress",
+  let currentStepIndex = form.items.findIndex(
+    (item) => item.status === "in_progress",
   );
   if (currentStepIndex < 0) {
-    currentStepIndex = plan.steps.findIndex(
-      (step) =>
-        step.status === "pending" &&
-        step.dependencies.every((dependency) => completedIds.has(dependency)),
+    currentStepIndex = form.items.findIndex(
+      (item) =>
+        item.status === "pending" &&
+        item.dependsOn.every((dependency) => completedIds.has(dependency)),
     );
   }
   const timing = formatActivityTiming(
@@ -1447,41 +1447,39 @@ function PlanActivity({
         <span>执行计划</span>
         <small className="activity-group-count">
           {currentStepIndex >= 0
-            ? `第 ${currentStepIndex + 1}/${plan.steps.length} 步`
-            : `${resolved}/${plan.steps.length} 已处理`}
+            ? `第 ${currentStepIndex + 1}/${form.items.length} 步`
+            : `${resolved}/${form.items.length} 已处理`}
           {timing ? ` · ${timing}` : ""}
         </small>
         {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
       </button>
       {expanded && (
         <div className="activity-plan">
-          {(plan.changeReason || plan.explanation) && (
-            <p>{plan.changeReason || plan.explanation}</p>
-          )}
+          {form.changeReason && <p>{form.changeReason}</p>}
           <ol>
-            {plan.steps.map((step, index) => {
-              const title = step.title || step.step || step.id;
-              const stepTiming = formatPlanStepTiming(
-                stepTimings[index],
-                step.status,
+            {form.items.map((item, index) => {
+              const title = item.title || item.id;
+              const stepTiming = formatWorkItemTiming(
+                itemTimings[index],
+                item.status,
                 isActive,
                 now,
               );
               return (
                 <li
-                  key={step.id || `${index}-${title}`}
-                  data-status={step.status}
+                  key={item.id || `${index}-${title}`}
+                  data-status={item.status}
                 >
                   <span aria-hidden="true">
-                    {step.status === "completed" ? (
+                    {item.status === "completed" ? (
                       <span className="activity-plan-dot is-complete" />
-                    ) : step.status === "in_progress" ? (
+                    ) : item.status === "in_progress" ? (
                       <ActivityFlow compact />
-                    ) : step.status === "blocked" ? (
+                    ) : item.status === "blocked" ? (
                       <AlertCircle size={12} />
-                    ) : step.status === "cancelled" ? (
+                    ) : item.status === "cancelled" ? (
                       <X size={12} />
-                    ) : step.status === "deferred" ? (
+                    ) : item.status === "deferred" ? (
                       <Clock3 size={12} />
                     ) : (
                       <span className="activity-plan-dot" />
@@ -1492,7 +1490,7 @@ function PlanActivity({
                       {title}
                       {stepTiming ? ` · ${stepTiming}` : ""}
                     </span>
-                    {step.statusReason && <small>{step.statusReason}</small>}
+                    {item.note && <small>{item.note}</small>}
                   </span>
                 </li>
               );
@@ -1732,17 +1730,17 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
     Extract<PrimitiveActivity, { kind: "reconnect" }>
   >();
   const primitives: PrimitiveActivity[] = [];
-  const planEvents = sorted.filter(
-    (event) => event.payload.type === "plan_updated",
+  const formEvents = sorted.filter(
+    (event) => event.payload.type === "work_form_updated",
   );
-  const firstPlanEvent = planEvents[0];
-  const latestPlanEvent = planEvents[planEvents.length - 1];
-  const latestPlan =
-    latestPlanEvent?.payload.type === "plan_updated"
-      ? latestPlanEvent.payload.plan
+  const firstFormEvent = formEvents[0];
+  const latestFormEvent = formEvents[formEvents.length - 1];
+  const latestForm =
+    latestFormEvent?.payload.type === "work_form_updated"
+      ? latestFormEvent.payload.form
       : undefined;
-  const planStepTimings = latestPlan
-    ? buildPlanStepTimings(planEvents, latestPlan)
+  const workItemTimings = latestForm
+    ? buildWorkItemTimings(formEvents, latestForm)
     : [];
 
   for (const event of sorted) {
@@ -1791,21 +1789,21 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         },
       });
     } else if (
-      payload.type === "plan_updated" &&
-      event.id === firstPlanEvent?.id &&
-      latestPlanEvent?.payload.type === "plan_updated"
+      payload.type === "work_form_updated" &&
+      event.id === firstFormEvent?.id &&
+      latestFormEvent?.payload.type === "work_form_updated"
     ) {
       primitives.push({
-        kind: "plan",
+        kind: "work-form",
         seq: event.seq,
-        plan: latestPlanEvent.payload.plan,
+        form: latestFormEvent.payload.form,
         startedAt: event.createdAt,
-        finishedAt: latestPlanEvent.payload.plan.steps.every(
-          (step) => step.status === "completed",
+        finishedAt: latestFormEvent.payload.form.items.every(
+          (item) => item.status === "completed",
         )
-          ? latestPlanEvent.createdAt
+          ? latestFormEvent.createdAt
           : undefined,
-        stepTimings: planStepTimings,
+        itemTimings: workItemTimings,
       });
     } else if (payload.type === "file_changed") {
       primitives.push({
@@ -2054,35 +2052,35 @@ function findFinalResponseDeltaSeqs(events: AgentEvent[]): Set<number> {
   return new Set();
 }
 
-function buildPlanStepTimings(
-  planEvents: AgentEvent[],
-  latestPlan: TaskPlan,
-): PlanStepTiming[] {
-  return latestPlan.steps.map((latestStep, stepIndex) => {
+function buildWorkItemTimings(
+  formEvents: AgentEvent[],
+  latestForm: WorkForm,
+): WorkItemTiming[] {
+  return latestForm.items.map((latestItem, itemIndex) => {
     let firstSeenAt: string | undefined;
     let startedAt: string | undefined;
     let finishedAt: string | undefined;
 
-    for (const event of planEvents) {
-      if (event.payload.type !== "plan_updated") continue;
-      const snapshotStep =
-        event.payload.plan.steps.find(
-          (step) =>
-            (step.id && step.id === latestStep.id) ||
-            (step.title || step.step) === (latestStep.title || latestStep.step),
-        ) ?? event.payload.plan.steps[stepIndex];
-      if (!snapshotStep) continue;
+    for (const event of formEvents) {
+      if (event.payload.type !== "work_form_updated") continue;
+      const snapshotItem =
+        event.payload.form.items.find(
+          (item) =>
+            (item.id && item.id === latestItem.id) ||
+            item.title === latestItem.title,
+        ) ?? event.payload.form.items[itemIndex];
+      if (!snapshotItem) continue;
 
       firstSeenAt ??= event.createdAt;
-      if (snapshotStep.status === "in_progress") {
+      if (snapshotItem.status === "in_progress") {
         startedAt ??= event.createdAt;
-      } else if (snapshotStep.status === "completed") {
+      } else if (snapshotItem.status === "completed") {
         startedAt ??= firstSeenAt;
         finishedAt ??= event.createdAt;
       }
     }
 
-    if (latestStep.status === "in_progress") {
+    if (latestItem.status === "in_progress") {
       startedAt ??= firstSeenAt;
     }
     return { startedAt, finishedAt };
@@ -2106,8 +2104,8 @@ function activityEntryIsRunning(entry: ActivityEntry) {
   if (entry.kind === "tool-group") {
     return entry.executions.some((execution) => !execution.result);
   }
-  if (entry.kind === "plan") {
-    return entry.plan.steps.some((step) => step.status === "in_progress");
+  if (entry.kind === "work-form") {
+    return entry.form.items.some((item) => item.status === "in_progress");
   }
   if (entry.kind === "subagent") {
     return entry.run.status === "queued" || entry.run.status === "running";
@@ -2353,9 +2351,9 @@ function formatFileGroupTiming(files: Array<{ createdAt: string }>) {
   return formatParsedTiming(Math.min(...times), Math.max(...times), false);
 }
 
-function formatPlanStepTiming(
-  timing: PlanStepTiming | undefined,
-  status: TaskPlan["steps"][number]["status"],
+function formatWorkItemTiming(
+  timing: WorkItemTiming | undefined,
+  status: WorkForm["items"][number]["status"],
   isActive: boolean,
   now: number,
 ) {

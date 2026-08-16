@@ -756,7 +756,7 @@ function blankDraft(
     instructions:
       "只在当前 ExecutionContext 投影的能力范围内完成任务；无法确定时明确标记 unknown。",
     tools:
-      "read_file, read_files, search, git_diff, list_skills, read_skill, complete_task",
+      "read_file, read_files, search, git_diff, list_skills, read_skill",
     skills: "",
     plugins: "",
     mcpServers: "",

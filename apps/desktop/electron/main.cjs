@@ -24,6 +24,10 @@ const {
   createSagServiceManager,
 } = require("./sag-service.cjs");
 const {
+  DEFAULT_GRAPH_RAG_URL,
+  createGraphRagServiceManager,
+} = require("./graph-rag-service.cjs");
+const {
   inspectSandboxProtocol,
   loadRuntimeBundle,
   runtimeManifestName,
@@ -74,6 +78,7 @@ let desktopBrowserBroker = null;
 let chromeBridge = null;
 let chromeBridgeBackend = null;
 let sagServiceManager = null;
+let graphRagServiceManager = null;
 let packagedRuntimeBundle = null;
 let packagedRuntimeBundleError = null;
 
@@ -1866,6 +1871,28 @@ function getSagServiceManager() {
   return sagServiceManager;
 }
 
+function getGraphRagServiceManager() {
+  if (graphRagServiceManager) return graphRagServiceManager;
+  const repoRoot = resolveRepoRoot();
+  const runtimeEnv = { ...process.env };
+  importEnvFile(runtimeEnv, resolveOpenTopiaEnvFile(repoRoot));
+  graphRagServiceManager = createGraphRagServiceManager({
+    endpoint: runtimeEnv.OPENTOPIA_GRAPH_RAG_URL || DEFAULT_GRAPH_RAG_URL,
+    env: runtimeEnv,
+    isPackaged: app.isPackaged,
+    repoRoot,
+    resourcesPath: process.resourcesPath,
+    logger: (level, event, metadata) => logConsole(level, event, metadata),
+  });
+  return graphRagServiceManager;
+}
+
+function getLibraryProviderServiceManager(provider) {
+  if (provider === "sag") return getSagServiceManager();
+  if (provider === "graph-rag") return getGraphRagServiceManager();
+  throw new Error(`未知的资料库后端：${provider}`);
+}
+
 function listSecretSources() {
   const backendEnv = createBackendEnv(resolveRepoRoot(), {
     includeKeyring: false,
@@ -2059,6 +2086,11 @@ function registerIpc() {
   ipcMain.handle("library:sag:ensure-ready", (event) => {
     assertMainRenderer(event);
     return getSagServiceManager().ensureReady();
+  });
+
+  ipcMain.handle("library:provider:ensure-ready", (event, provider) => {
+    assertMainRenderer(event);
+    return getLibraryProviderServiceManager(provider).ensureReady();
   });
 
   ipcMain.handle("platform:get-open-requests", () =>
@@ -2574,5 +2606,6 @@ app.on("before-quit", () => {
     logConsole("warn", "chrome.bridge.close.failed", { error });
   });
   sagServiceManager?.stopSync();
+  graphRagServiceManager?.stopSync();
   killBackendProcessTree();
 });

@@ -2618,16 +2618,15 @@ function buildTerminalRows(events: AgentEvent[]): TerminalRow[] {
               event.payload.result.output,
             ),
           };
-        case "plan_updated":
+        case "work_form_updated":
           return {
             id: event.id,
             kind: "info",
-            label: "task plan updated",
+            label: "work form updated",
             time,
-            body: event.payload.plan.steps
+            body: event.payload.form.items
               .map(
-                (item) =>
-                  `[${item.status}] ${item.title || item.step || item.id}`,
+                (item) => `[${item.status}] ${item.title || item.id}`,
               )
               .join("\n"),
             artifacts: [],

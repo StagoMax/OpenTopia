@@ -40,7 +40,9 @@
           "opentopia-server.exe",
           "opentopia-sandbox/opentopia-sandbox.exe",
           "sag/enterprise-sag-panel",
-          "sag/enterprise-sag-panel.exe"
+          "sag/enterprise-sag-panel.exe",
+          "graph-rag/enterprise-graph-rag-panel",
+          "graph-rag/enterprise-graph-rag-panel.exe"
         ]
       }
     ],

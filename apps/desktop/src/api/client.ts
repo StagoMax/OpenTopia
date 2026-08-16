@@ -40,6 +40,13 @@ import type {
   InlineMessageContentPart,
   LocalGitOperation,
   LocalGitResponse,
+  LibraryIngestionResult,
+  LibraryProviderDescriptor,
+  LibraryProviderId,
+  LibraryProviderStatus,
+  LibrarySearchRequest,
+  LibrarySearchResponse,
+  LibrarySourcePage,
   McpCallResult,
   McpServerInput,
   McpServerStatus,
@@ -205,15 +212,56 @@ export class ApiClient {
   }
 
   async getSagLibraryStatus(signal?: AbortSignal): Promise<SagLibraryStatus> {
-    return this.get("/api/library/sag/status", signal);
+    return this.getLibraryProviderStatus(
+      "sag",
+      signal,
+    ) as Promise<SagLibraryStatus>;
   }
 
   async listSagSources(signal?: AbortSignal): Promise<SagSource[]> {
-    return this.get("/api/library/sag/sources", signal);
+    const page = await this.listLibrarySources("sag", {}, signal);
+    return page.items as SagSource[];
   }
 
   async searchSag(input: SagSearchRequest): Promise<SagSearchResponse> {
-    return this.post("/api/library/sag/search", input);
+    return this.searchLibrary("sag", input) as Promise<SagSearchResponse>;
+  }
+
+  async listLibraryProviders(
+    signal?: AbortSignal,
+  ): Promise<LibraryProviderDescriptor[]> {
+    return this.get("/api/library/providers", signal);
+  }
+
+  async getLibraryProviderStatus(
+    provider: LibraryProviderId,
+    signal?: AbortSignal,
+  ): Promise<LibraryProviderStatus> {
+    return this.get(`/api/library/${provider}/status`, signal);
+  }
+
+  async listLibrarySources(
+    provider: LibraryProviderId,
+    options: { query?: string; offset?: number; limit?: number } = {},
+    signal?: AbortSignal,
+  ): Promise<LibrarySourcePage> {
+    const params = new URLSearchParams({
+      offset: String(options.offset ?? 0),
+      limit: String(options.limit ?? 100),
+    });
+    const query = options.query?.trim();
+    if (query) params.set("query", query);
+    return this.get(
+      `/api/library/${provider}/sources?${params.toString()}`,
+      signal,
+    );
+  }
+
+  async searchLibrary(
+    provider: LibraryProviderId,
+    input: LibrarySearchRequest,
+  ): Promise<LibrarySearchResponse> {
+    return this.post(`/api/library/${provider}/search`, input);
   }
 
   async ingestSagText(input: {
@@ -236,6 +284,23 @@ export class ApiClient {
     title?: string;
     metadata?: Record<string, unknown>;
   }): Promise<SagIngestionResult> {
+    return this.uploadLibrarySource(
+      "sag",
+      input,
+    ) as Promise<SagIngestionResult>;
+  }
+
+  async uploadLibrarySource(
+    provider: LibraryProviderId,
+    input: {
+      file: File;
+      assetId?: string;
+      sourceKey?: string;
+      namespace?: string;
+      title?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<LibraryIngestionResult> {
     const form = new FormData();
     form.set("file", input.file, input.file.name);
     if (input.assetId) form.set("asset_id", input.assetId);
@@ -244,14 +309,14 @@ export class ApiClient {
     if (input.title) form.set("title", input.title);
     form.set("metadata_json", JSON.stringify(input.metadata ?? {}));
     const response = await fetch(
-      `${this.baseUrl}/api/library/sag/ingestions/upload`,
+      `${this.baseUrl}/api/library/${provider}/ingestions/upload`,
       {
         method: "POST",
         headers: this.authHeaders(),
         body: form,
       },
     );
-    return parseResponse<SagIngestionResult>(response);
+    return parseResponse<LibraryIngestionResult>(response);
   }
 
   async setupWindowsSandbox(): Promise<WindowsSandboxSetupStatus> {
@@ -877,6 +942,7 @@ export class ApiClient {
     goalId?: string,
     imageAttachments: InlineImageAttachment[] = [],
     contentParts: InlineMessageContentPart[] = [],
+    libraryProvider?: LibraryProviderId,
   ): Promise<{
     message: Message;
     turnId: string | null;
@@ -895,6 +961,7 @@ export class ApiClient {
           goalId,
           imageAttachments,
           contentParts,
+          libraryProvider,
         }),
       },
     );

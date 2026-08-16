@@ -298,8 +298,8 @@ export function aggregateUsageEvents(
       }
     }
 
-    if (payload.type === "plan_updated") {
-      const signature = stableSerialize(payload.plan);
+    if (payload.type === "work_form_updated") {
+      const signature = stableSerialize(payload.form);
       if (latestPlanSignatureByTurn.get(turnKey) === signature) {
         wasteSignals.duplicatePlanCount += 1;
       }
@@ -932,7 +932,11 @@ function contextItemMatches(
   return Boolean(
     left &&
     right &&
+    left.kind === right.kind &&
     left.role === right.role &&
+    left.authority === right.authority &&
+    left.source === right.source &&
+    left.cacheScope === right.cacheScope &&
     left.contentHash === right.contentHash,
   );
 }

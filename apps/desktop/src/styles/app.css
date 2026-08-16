@@ -2791,7 +2791,7 @@ button:disabled {
   color: var(--text);
 }
 
-.primary-nav .flow-library-nav-item[aria-current="page"] {
+.primary-nav button[aria-current="page"] {
   background: var(--surface-active);
   color: var(--text);
 }

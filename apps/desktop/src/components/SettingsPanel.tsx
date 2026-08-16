@@ -1537,7 +1537,15 @@ function AgentRuntimeSettingsView({
           <div>
             <span className="settings-layer-badge dynamic">动态</span>
             <strong>每轮状态</strong>
-            <small>工作区、项目规则、权限、工具、Skills 与当前环境快照。</small>
+            <small>工作区、项目规则、权限、选定 Skills 与当前环境状态。</small>
+          </div>
+          <div>
+            <span className="settings-layer-badge conditional">独立</span>
+            <strong>Provider 工具面</strong>
+            <small>
+              直接工具的完整 Schema 通过 tools / dynamicTools
+              传输；延迟工具先暴露目录，Tool Search 后再加载所选 Schema。两者都不拼入文字提示词。
+            </small>
           </div>
         </div>
       </SettingsGroup>

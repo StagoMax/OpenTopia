@@ -17,7 +17,10 @@ export type PlatformInfo = {
   };
 };
 
-export type SagServiceRuntimeStatus = {
+export type LibraryProviderId = "sag" | "graph-rag";
+
+export type LibraryProviderServiceRuntimeStatus = {
+  provider?: LibraryProviderId;
   state: "ready" | "unavailable";
   endpoint: string;
   managed: boolean;
@@ -25,6 +28,8 @@ export type SagServiceRuntimeStatus = {
   source: string | null;
   message?: string;
 };
+
+export type SagServiceRuntimeStatus = LibraryProviderServiceRuntimeStatus;
 
 export type SystemNotificationOptions = {
   title: string;
@@ -194,7 +199,7 @@ export type ComputerObservation = {
 };
 
 export type ExperienceMode = "work" | "code" | "flow";
-export type CollaborationMode = "default" | "plan" | "goal";
+export type CollaborationMode = "default" | "goal";
 
 export type Thread = {
   id: string;
@@ -470,6 +475,132 @@ export type SagIngestionResult = {
   llmRequests: number;
   createdAt: string;
 };
+
+export type LibraryProviderDescriptor = {
+  id: LibraryProviderId;
+  name: string;
+  title: string;
+  description: string;
+  capabilities: {
+    graphPaths: boolean;
+    temporalMemory: boolean;
+    incrementalUpload: boolean;
+    llmPlanning: boolean;
+  };
+};
+
+export type GraphRagLibraryStatus = {
+  provider: "Graph RAG";
+  endpoint: string;
+  status: {
+    status: string;
+    embeddingBackend?: string | null;
+    embeddingDimensions?: number | null;
+    rerankerBackend?: string | null;
+    vectorBackend?: string | null;
+    documents: number;
+    chunks: number;
+    relations: number;
+    indexVersion?: string | null;
+    graphEnabled: boolean;
+    stats: Record<string, number>;
+    agentLoopIntegration: boolean;
+    promptInjection: boolean;
+  };
+};
+
+export type LibraryProviderStatus = SagLibraryStatus | GraphRagLibraryStatus;
+
+export type GraphRagSource = {
+  documentId: string;
+  title: string;
+  owner: string;
+  businessClass: string;
+  sensitivity: string;
+  version: string;
+  sourceUri?: string | null;
+};
+
+export type LibrarySource = SagSource | GraphRagSource;
+
+export type LibrarySourcePage = {
+  items: LibrarySource[];
+  total: number;
+  authorizedTotal: number;
+  indexTotal: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+};
+
+export type LibrarySearchRequest = SagSearchRequest & {
+  retrievalMode?: "auto" | "hybrid" | "graph";
+};
+
+export type GraphRagContextPackItem = {
+  itemId: string;
+  chunkId: string;
+  documentId: string;
+  title: string;
+  content: string;
+  anchor: string;
+  sectionTitle?: string | null;
+  score: number;
+  lexicalScore: number;
+  denseScore: number;
+  retrievalMode: "hybrid" | "graph";
+  graphPath: string[];
+  graphRelations: string[];
+  selectionReason: string;
+  estimatedTokens: number;
+};
+
+export type GraphRagSearchResponse = {
+  pack: {
+    packId: string;
+    status: "draft";
+    query: string;
+    route: string;
+    routeReason: string;
+    indexVersion: string;
+    retrievalEngine: "graph_rag";
+    items: GraphRagContextPackItem[];
+    graphPaths: Array<{
+      nodeIds: string[];
+      relations: string[];
+      confidence: number;
+    }>;
+    estimatedTokens: number;
+    maximumTokens: number;
+    createdAt: string;
+  };
+  diagnostics: {
+    hitCount: number;
+    graphUsed: boolean;
+    graphPathCount: number;
+    embeddingBackend: string;
+    agentLoopIntegration: false;
+    promptInjection: false;
+  };
+};
+
+export type LibrarySearchResponse = SagSearchResponse | GraphRagSearchResponse;
+
+export type GraphRagIngestionResult = {
+  status: "indexed" | string;
+  documentId: string;
+  sourceKey: string;
+  namespace: string;
+  title: string;
+  originalFilename: string;
+  version: string;
+  chunkCount: number;
+  indexVersion: string;
+  contentHash: string;
+};
+
+export type LibraryIngestionResult =
+  SagIngestionResult | GraphRagIngestionResult;
 
 export type ReasoningEffort =
   "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -1335,11 +1466,7 @@ export type BrowserRuntimeStatus = {
 export type ChromeBridgeState = {
   sessionId: string;
   availability: "available" | "unavailable";
-  status:
-    | "idle"
-    | "waiting_for_extension"
-    | "waiting_for_tab"
-    | "attached";
+  status: "idle" | "waiting_for_extension" | "waiting_for_tab" | "attached";
   pairingCode?: string;
   pairingExpiresAt?: string;
   tabId?: number;
@@ -1485,6 +1612,7 @@ export type MessagePart =
       type: "turn_context";
       collaboration_mode: CollaborationMode;
       goal_id?: string | null;
+      library_provider?: LibraryProviderId | null;
     }
   | { type: "error"; message: string };
 
@@ -2158,7 +2286,14 @@ export type ToolResult = {
   metadata: unknown;
 };
 
-export type TaskPlanStepStatus =
+export type WorkFormStatus =
+  | "active"
+  | "completed"
+  | "blocked"
+  | "paused"
+  | "cancelled";
+
+export type WorkItemStatus =
   | "pending"
   | "in_progress"
   | "completed"
@@ -2166,116 +2301,55 @@ export type TaskPlanStepStatus =
   | "blocked"
   | "cancelled";
 
-export type TaskPlanStep = {
+export type CompletionDisposition = "blocking" | "advisory";
+
+export type WorkScope =
+  | { kind: "turn"; id: string }
+  | { kind: "goal"; id: string };
+
+export type WorkItem = {
   id: string;
   title: string;
-  step?: string;
-  status: TaskPlanStepStatus;
-  statusReason?: string | null;
-  dependencies: string[];
-  acceptanceCriteria: string[];
-  evidence: string[];
+  status: WorkItemStatus;
+  completionDisposition: CompletionDisposition;
+  dependsOn: string[];
+  note?: string | null;
+  acceptance: string[];
+  evidenceRefs: string[];
 };
 
-export type TaskEvidenceKind =
-  "observation" | "implementation" | "verification" | "global_check";
-
-export type TaskPlanCoverage = {
-  requirementsRevision: number;
-  requirements: Array<{
-    id: string;
-    statement: string;
-    sourceRefs: string[];
-  }>;
-  stepRequirements: Record<string, string[]>;
-  evidenceRefs: Array<{
-    stepId: string;
-    requirementId: string;
-    kind: TaskEvidenceKind;
-    toolCallId: string;
-    summary: string;
-    requirementsRevision: number;
-  }>;
-};
-
-export type TaskPlan = {
-  planRevision: number;
-  goalId: string;
+export type WorkForm = {
+  id: string;
+  threadId: string;
+  scope: WorkScope;
+  objective: string;
+  constraints: string[];
+  acceptance: string[];
+  status: WorkFormStatus;
+  revision: number;
   changeReason?: string | null;
-  explanation?: string | null;
-  coverage?: TaskPlanCoverage | null;
-  steps: TaskPlanStep[];
+  items: WorkItem[];
+  createdAt: string;
+  updatedAt: string;
 };
 
-export type GoalStatus =
-  | "draft"
-  | "ready"
-  | "active"
-  | "paused"
-  | "completed"
-  | "blocked"
-  | "cancelled"
-  | "failed";
-
-export type GoalTaskStatus =
-  | "pending"
-  | "running"
-  | "succeeded"
-  | "deferred"
-  | "blocked"
-  | "cancelled"
-  | "failed";
-
-export type GoalAttemptStatus =
-  "running" | "succeeded" | "failed" | "interrupted";
+export type GoalStatus = WorkFormStatus;
 
 export type GoalRecord = {
   id: string;
   threadId: string;
   objective: string;
-  status: GoalStatus;
-  planRevision: number;
   tokenBudget?: number | null;
   tokensUsed: number;
   timeUsedSeconds: number;
   version: number;
   createdAt: string;
   updatedAt: string;
-  completedAt?: string | null;
-};
-
-export type GoalTask = {
-  goalId: string;
-  stepId: string;
-  ordinal: number;
-  title: string;
-  status: GoalTaskStatus;
-  statusReason?: string | null;
-  dependencies: string[];
-  acceptanceCriteria: string[];
-  evidence: string[];
-  attemptCount: number;
-  maxAttempts: number;
-  updatedAt: string;
-};
-
-export type GoalTaskAttempt = {
-  id: string;
-  goalId: string;
-  stepId: string;
-  turnId: string;
-  attemptNo: number;
-  status: GoalAttemptStatus;
-  startedAt: string;
-  finishedAt?: string | null;
-  evidence: string[];
-  error?: string | null;
 };
 
 export type GoalSnapshot = {
   goal: GoalRecord;
-  tasks: GoalTask[];
-  attempts: GoalTaskAttempt[];
+  workForm: WorkForm;
 };
 
 export type ModelContentPart =
@@ -2331,6 +2405,8 @@ export type ModelContextItem = {
     | "repository_instructions"
     | "environment"
     | "world_state"
+    | "capability_catalog"
+    | "skill_instructions"
     | "skill"
     | "summary"
     | "checkpoint"
@@ -2339,10 +2415,15 @@ export type ModelContextItem = {
     | "tool_call"
     | "tool_result";
   role: "system" | "developer" | "user" | "assistant" | "tool";
+  /** Harness semantic authority; never emitted as a Provider prompt role. */
+  authority: "system" | "developer" | "user" | "assistant" | "tool" | "data";
+  /** Harness lifetime metadata; never emitted as a Provider prompt tag. */
+  lifecycle: "build" | "thread" | "epoch" | "turn" | "round";
   source: string;
   content: ModelContentPart[];
   contentHash: string;
   tokenEstimate: number;
+  /** Internal cache/placement segment, not a Provider-supported lifecycle. */
   cacheScope: "stable" | "thread" | "turn" | "round" | "none";
   sensitivity: "public" | "workspace" | "sensitive";
   metadata?: unknown;
@@ -2510,7 +2591,7 @@ export type AgentEventPayload =
   | { type: "reasoning_delta"; text: string }
   | { type: "tool_call_started"; call: ToolCall }
   | { type: "tool_call_finished"; result: ToolResult }
-  | { type: "plan_updated"; plan: TaskPlan }
+  | { type: "work_form_updated"; form: WorkForm }
   | { type: "goal_updated"; snapshot: GoalSnapshot }
   | { type: "user_input_requested"; request: UserInputRequest }
   | { type: "assistant_message"; message: Message }
@@ -2694,6 +2775,9 @@ declare global {
       quit(): Promise<boolean>;
       getPlatformInfo(): Promise<PlatformInfo>;
       ensureSagLibraryService(): Promise<SagServiceRuntimeStatus>;
+      ensureLibraryProviderService(
+        provider: LibraryProviderId,
+      ): Promise<LibraryProviderServiceRuntimeStatus>;
       getOpenRequests(): Promise<PlatformOpenRequest[]>;
       onOpenRequest(
         listener: (request: PlatformOpenRequest) => void,

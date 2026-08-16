@@ -12,6 +12,7 @@ import {
   GitBranch,
   GitCommitHorizontal,
   Laptop,
+  Library,
   Package,
   Plus,
   RefreshCw,
@@ -29,6 +30,7 @@ import type {
   GitStatusSummary,
   GitWorkflowAction,
   GitWorkflowResponse,
+  LibraryProviderId,
   Message,
   PreviewTarget,
   TerminalEvent,
@@ -36,6 +38,7 @@ import type {
   WorkspaceDiff,
   SubagentRun,
 } from "../types";
+import { Popover } from "./ui";
 import "../styles/right-context-rail.css";
 
 export type RightContextRailProps = {
@@ -49,10 +52,13 @@ export type RightContextRailProps = {
   subagentRuns: SubagentRun[];
   artifacts: ArtifactDescriptor[];
   messages: Message[];
+  libraryPickerEnabled: boolean;
+  libraryProvider: LibraryProviderId | null;
   onOpenDiff(): void;
   onOpenTerminal(): void;
   onOpenFiles(): void;
   onOpenEnvironment(): void;
+  onChangeLibraryProvider(provider: LibraryProviderId | null): void;
   onOpenPreview(target: PreviewTarget, title: string): void;
   onAddSource(): void;
   onCancelSubagent(runId: string): void;
@@ -109,10 +115,13 @@ export function RightContextRail({
   subagentRuns,
   artifacts,
   messages,
+  libraryPickerEnabled,
+  libraryProvider,
   onOpenDiff,
   onOpenTerminal,
   onOpenFiles,
   onOpenEnvironment,
+  onChangeLibraryProvider,
   onOpenPreview,
   onAddSource,
   onCancelSubagent,
@@ -204,15 +213,23 @@ export function RightContextRail({
       <RailSection
         title="环境信息"
         action={
-          <button
-            className="right-context-rail__header-action"
-            type="button"
-            title="管理环境"
-            aria-label="管理环境"
-            onClick={onOpenEnvironment}
-          >
-            <Plus size={14} aria-hidden="true" />
-          </button>
+          libraryPickerEnabled ? (
+            <LibraryPicker
+              value={libraryProvider}
+              onChange={onChangeLibraryProvider}
+              onOpenEnvironment={onOpenEnvironment}
+            />
+          ) : (
+            <button
+              className="right-context-rail__header-action"
+              type="button"
+              title="管理环境"
+              aria-label="管理环境"
+              onClick={onOpenEnvironment}
+            >
+              <Plus size={14} aria-hidden="true" />
+            </button>
+          )
         }
       >
         {workspaceDiff && (
@@ -239,6 +256,22 @@ export function RightContextRail({
               <span className="right-context-rail__inline-value">
                 <ChevronDown size={13} aria-hidden="true" />
               </span>
+            }
+          />
+        )}
+        {libraryPickerEnabled && (
+          <RailRow
+            icon={Library}
+            label="Lib 检索"
+            title={
+              libraryProvider
+                ? `模型可按需调用 ${libraryProviderName(libraryProvider)} 检索工具`
+                : "点击环境信息右侧的加号启用模型检索"
+            }
+            value={
+              <StatusText active={Boolean(libraryProvider)} muted={!libraryProvider}>
+                {libraryProvider ? libraryProviderName(libraryProvider) : "未启用"}
+              </StatusText>
             }
           />
         )}
@@ -432,6 +465,103 @@ export function RightContextRail({
       )}
     </div>
   );
+}
+
+function LibraryPicker({
+  value,
+  onChange,
+  onOpenEnvironment,
+}: {
+  value: LibraryProviderId | null;
+  onChange(provider: LibraryProviderId | null): void;
+  onOpenEnvironment(): void;
+}) {
+  const options: Array<{
+    value: LibraryProviderId | null;
+    label: string;
+    description: string;
+  }> = [
+    {
+      value: null,
+      label: "不使用 Lib",
+      description: "当前对话不向模型提供资料库检索工具",
+    },
+    {
+      value: "sag",
+      label: "SAG 记忆检索",
+      description: "适合事件、实体与时序记忆",
+    },
+    {
+      value: "graph-rag",
+      label: "Graph RAG 图谱检索",
+      description: "适合文档、实体关系与路径证据",
+    },
+  ];
+
+  return (
+    <Popover
+      align="end"
+      placement="bottom"
+      label="选择 Lib 检索后端"
+      trigger={(triggerProps) => (
+        <button
+          {...triggerProps}
+          className="right-context-rail__header-action"
+          type="button"
+          title="添加环境能力"
+          aria-label="添加环境能力"
+        >
+          <Plus size={14} aria-hidden="true" />
+        </button>
+      )}
+    >
+      {({ close }) => (
+        <div className="right-context-rail__library-picker">
+          <header>
+            <strong>Lib 检索测试</strong>
+            <span>启用后，模型会在需要时调用检索工具。</span>
+          </header>
+          <div className="right-context-rail__library-options">
+            {options.map((option) => {
+              const selected = option.value === value;
+              return (
+                <button
+                  key={option.value ?? "none"}
+                  className="right-context-rail__library-option"
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => {
+                    onChange(option.value);
+                    close();
+                  }}
+                >
+                  <span>
+                    <strong>{option.label}</strong>
+                    <small>{option.description}</small>
+                  </span>
+                  {selected ? <Check size={14} aria-hidden="true" /> : null}
+                </button>
+              );
+            })}
+          </div>
+          <button
+            className="right-context-rail__library-environment-link"
+            type="button"
+            onClick={() => {
+              close();
+              onOpenEnvironment();
+            }}
+          >
+            打开本地环境设置
+          </button>
+        </div>
+      )}
+    </Popover>
+  );
+}
+
+function libraryProviderName(provider: LibraryProviderId): string {
+  return provider === "sag" ? "SAG" : "Graph RAG";
 }
 
 function GitCommitDialog({

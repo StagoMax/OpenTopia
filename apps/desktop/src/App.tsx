@@ -112,7 +112,7 @@ import {
   PreviewHost,
 } from "./components/PreviewHost";
 import { FlowWorkspacePanel } from "./components/FlowWorkspacePanel";
-import { SagLibraryPanel } from "./components/SagLibraryPanel";
+import { LibraryPanel } from "./components/LibraryPanel";
 import { RightContextRail } from "./components/RightContextRail";
 import {
   SettingsPanel as RedesignedSettingsPanel,
@@ -134,6 +134,7 @@ import {
 } from "./components/WorkbenchPanel";
 import { Button, IconButton, Popover, Tooltip } from "./components/ui";
 import { normalizeCopiedText } from "./clipboardText";
+import { resolveSidebarDestination } from "./workspaceNavigation";
 import {
   conversationMessageCopyText,
   formatConversationMessageTimestamp,
@@ -166,7 +167,7 @@ import {
   mergeConversationMessages,
   type ConversationCacheEntry,
 } from "./conversationCache";
-import { resolveRuntimeTaskPlan } from "./conversationPlan";
+import { resolveRuntimeWorkForm } from "./conversationWorkForm";
 import { shouldShowRecordedTurnChanges } from "./turnChangeOwnership";
 import {
   conversationStreamEventTrace,
@@ -183,6 +184,7 @@ import {
 import {
   closeAppWindow,
   deleteProviderApiKey,
+  ensureLibraryProviderService,
   getDroppedContextFiles,
   getRecentWorkspaces,
   listSecretSources,
@@ -267,6 +269,7 @@ import type {
   GoalStatus,
   InlineImageAttachment,
   InlineMessageContentPart,
+  LibraryProviderId,
   McpServerInput,
   McpServerView,
   Message,
@@ -287,7 +290,7 @@ import type {
   SecretSources,
   SkillDescriptor,
   SubagentRun,
-  TaskPlan,
+  WorkForm,
   TerminalEvent,
   TerminalSession,
   Thread,
@@ -455,6 +458,7 @@ type TurnUndoDialogState = {
 const workspaceLayoutStorageKey = "opentopia.workspace-layout.v1";
 const experienceModeStorageKey = "opentopia.experience-mode.v1";
 const collaborationModeStorageKey = "opentopia.collaboration-mode.v1";
+const flowLibraryBindingsStorageKey = "opentopia.flow-library-bindings.v1";
 const workspaceThreePaneBreakpoint = 1120;
 const contextRailInlineMinWidth = 1120;
 const workspaceLeftMin = 200;
@@ -474,9 +478,26 @@ function readCollaborationMode(): CollaborationMode {
   if (typeof window === "undefined") return "default";
   try {
     const value = window.localStorage.getItem(collaborationModeStorageKey);
-    return value === "plan" || value === "goal" ? value : "default";
+    return value === "goal" ? value : "default";
   } catch {
     return "default";
+  }
+}
+
+function readFlowLibraryBindings(): Record<string, LibraryProviderId> {
+  if (typeof window === "undefined") return {};
+  try {
+    const parsed = JSON.parse(
+      window.localStorage.getItem(flowLibraryBindingsStorageKey) ?? "{}",
+    ) as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, LibraryProviderId] =>
+          entry[1] === "sag" || entry[1] === "graph-rag",
+      ),
+    );
+  } catch {
+    return {};
   }
 }
 
@@ -485,50 +506,22 @@ function reusableGoalId(
   snapshot: GoalSnapshot | null,
 ): string | undefined {
   if (!snapshot || mode !== "goal") return undefined;
-  if (["completed", "cancelled", "failed"].includes(snapshot.goal.status)) {
+  if (["completed", "cancelled"].includes(snapshot.workForm.status)) {
     return undefined;
   }
   return snapshot.goal.id;
 }
 
-function goalSnapshotAsTaskPlan(snapshot: GoalSnapshot): TaskPlan | null {
-  if (snapshot.tasks.length === 0) return null;
-  return {
-    planRevision: snapshot.goal.planRevision,
-    goalId: snapshot.goal.id,
-    steps: snapshot.tasks.map((task) => ({
-      id: task.stepId,
-      title: task.title,
-      status:
-        task.status === "running"
-          ? "in_progress"
-          : task.status === "succeeded"
-            ? "completed"
-            : task.status === "failed"
-              ? "blocked"
-              : task.status,
-      statusReason: task.statusReason,
-      dependencies: task.dependencies,
-      acceptanceCriteria: task.acceptanceCriteria,
-      evidence: task.evidence,
-    })),
-  };
-}
-
-function resolveComposerTaskPlan(
+function resolveComposerWorkForm(
   events: AgentEvent[],
   snapshot: GoalSnapshot | null,
-): TaskPlan | null {
-  const latestRuntimePlan = resolveRuntimeTaskPlan(events);
-  const goalPlan = snapshot ? goalSnapshotAsTaskPlan(snapshot) : null;
-
-  if (
-    goalPlan &&
-    (!latestRuntimePlan || latestRuntimePlan.goalId === goalPlan.goalId)
-  ) {
-    return goalPlan;
+): WorkForm | null {
+  const latestRuntimeForm = resolveRuntimeWorkForm(events);
+  const goalForm = snapshot?.workForm ?? null;
+  if (goalForm && (!latestRuntimeForm || latestRuntimeForm.id === goalForm.id)) {
+    return goalForm;
   }
-  return latestRuntimePlan ?? goalPlan;
+  return latestRuntimeForm ?? goalForm;
 }
 
 function readWorkspaceLayoutPreferences(): WorkspaceLayoutPreferences {
@@ -692,6 +685,9 @@ export function App() {
   const [flowPrimaryView, setFlowPrimaryView] = useState<
     "conversation" | "library"
   >("conversation");
+  const [flowLibraryBindings, setFlowLibraryBindings] = useState<
+    Record<string, LibraryProviderId>
+  >(readFlowLibraryBindings);
   const [collaborationMode, setCollaborationMode] = useState<CollaborationMode>(
     readCollaborationMode,
   );
@@ -1200,6 +1196,32 @@ export function App() {
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
     [threads, activeThreadId],
   );
+  const activeFlowLibraryProvider = activeThread
+    ? (flowLibraryBindings[activeThread.id] ?? null)
+    : null;
+  const changeFlowLibraryProvider = useCallback(
+    (provider: LibraryProviderId | null) => {
+      if (!activeThreadId) return;
+      setFlowLibraryBindings((current) => {
+        const next = { ...current };
+        if (provider) next[activeThreadId] = provider;
+        else delete next[activeThreadId];
+        return next;
+      });
+      if (!provider) return;
+      setActionError(null);
+      void ensureLibraryProviderService(provider)
+        .then((runtime) => {
+          if (runtime?.state === "unavailable") {
+            throw new Error(runtime.message || "资料库服务尚未就绪");
+          }
+        })
+        .catch((error: unknown) => {
+          setActionError(`无法启动资料库检索：${errorMessage(error)}`);
+        });
+    },
+    [activeThreadId],
+  );
   useEffect(() => {
     if (!activeThread) return;
     writeLastActiveThreadId(activeThread.experienceMode, activeThread.id);
@@ -1262,6 +1284,14 @@ export function App() {
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
   );
+  const flowLibraryView =
+    experienceMode === "flow" && flowPrimaryView === "library";
+  const sidebarDestination = resolveSidebarDestination({
+    experienceMode,
+    flowPrimaryView,
+    toolStageOpen,
+    activeToolKind: activeToolTab?.kind ?? null,
+  });
   const activeToolRequiresFullWorkspace = activeToolTab?.kind === "extensions";
   const toolStageCoversConversation =
     toolStageOpen && (conversationCollapsed || activeToolRequiresFullWorkspace);
@@ -1282,8 +1312,8 @@ export function App() {
   const activeUserInput = isConversationReady
     ? (pendingUserInput[0] ?? null)
     : null;
-  const composerTaskPlan = useMemo(
-    () => resolveComposerTaskPlan(conversationEvents, conversationGoalSnapshot),
+  const composerWorkForm = useMemo(
+    () => resolveComposerWorkForm(conversationEvents, conversationGoalSnapshot),
     [conversationEvents, conversationGoalSnapshot],
   );
 
@@ -1367,10 +1397,12 @@ export function App() {
     ],
   );
   const contextRailAutoVisible =
+    !flowLibraryView &&
     !toolStageOpen &&
     workspaceWidth - (sidebarCollapsed ? 0 : workspaceLayout.left) >=
       contextRailInlineMinWidth;
   const contextRailVisible =
+    !flowLibraryView &&
     !toolStageOpen &&
     (contextRailOpen || (contextRailAutoVisible && !contextRailCollapsed));
   const workspaceStyle = {
@@ -1429,6 +1461,17 @@ export function App() {
       // Mode persistence is best-effort when storage is unavailable.
     }
   }, [experienceMode]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        flowLibraryBindingsStorageKey,
+        JSON.stringify(flowLibraryBindings),
+      );
+    } catch {
+      // Test bindings are best-effort when browser storage is unavailable.
+    }
+  }, [flowLibraryBindings]);
 
   useEffect(() => {
     updateSidebarNavigationState({ collapsed: sidebarCollapsed });
@@ -1718,9 +1761,6 @@ export function App() {
           !event.turnId || current === event.turnId ? null : current,
         );
         clearTurnCancellationRequest(event.threadId);
-        setCollaborationMode((current) =>
-          current === "plan" ? "default" : current,
-        );
       } else if (event.payload.type === "turn_suspended") {
         setThreadActivityStatus(event.threadId, "approval");
         markThreadActivityRead(event.threadId);
@@ -2434,6 +2474,7 @@ export function App() {
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
     setFlowPrimaryView("conversation");
+    if (activeToolTab?.kind === "extensions") setToolStageOpen(false);
     setActiveTurnId(cachedActiveTurnId);
     if (cached) {
       setMessages(cached.messages);
@@ -3581,6 +3622,9 @@ export function App() {
         submittedGoalId,
         imageAttachments,
         imageAttachments.length > 0 ? contentParts : [],
+        activeThread.experienceMode === "flow"
+          ? (flowLibraryBindings[threadId] ?? undefined)
+          : undefined,
       );
       mergeMessagesForThread(threadId, [message]);
       markThreadActivityRead(threadId);
@@ -3675,7 +3719,7 @@ export function App() {
     setActionError(null);
     try {
       let snapshot = goalSnapshot;
-      if (snapshot.goal.status !== "active") {
+      if (snapshot.workForm.status !== "active") {
         snapshot = await client.updateGoalStatus(
           activeThread.id,
           goalId,
@@ -4563,18 +4607,27 @@ export function App() {
             projects={projects}
             threads={threads}
             threadActivityStatuses={threadActivityStatuses}
-            activeThreadId={activeThreadId}
-            activeProjectId={activeThread?.projectId ?? draftProjectId}
+            activeThreadId={
+              sidebarDestination === "conversation" ? activeThreadId : null
+            }
+            activeProjectId={
+              sidebarDestination === "conversation"
+                ? (activeThread?.projectId ?? draftProjectId)
+                : null
+            }
             workspaceError={workspaceError}
             isPickingWorkspace={isPickingWorkspace}
             experienceMode={experienceMode}
             flowModeEnabled={settings?.enterprise.enabled ?? false}
-            flowLibraryOpen={
-              experienceMode === "flow" && flowPrimaryView === "library"
+            newTaskOpen={
+              sidebarDestination === "conversation" && activeThreadId === null
             }
+            flowLibraryOpen={sidebarDestination === "flow-library"}
+            pluginsOpen={sidebarDestination === "plugins"}
             onExperienceModeChange={changeExperienceMode}
             onOpenFlowLibrary={() => {
               setFlowPrimaryView("library");
+              setToolStageOpen(false);
               setConversationCollapsed(false);
             }}
             onSelect={selectThread}
@@ -4651,24 +4704,14 @@ export function App() {
             onDrop={conversationFileDrop.onDrop}
           >
             <ThreadHeader
-              thread={
-                experienceMode === "flow" && flowPrimaryView === "library"
-                  ? null
-                  : activeThread
-              }
+              thread={flowLibraryView ? null : activeThread}
               headingIcon={
-                experienceMode === "flow" && flowPrimaryView === "library" ? (
+                flowLibraryView ? (
                   <Library aria-hidden="true" size={15} />
                 ) : undefined
               }
-              title={
-                experienceMode === "flow" && flowPrimaryView === "library"
-                  ? "Library"
-                  : undefined
-              }
-              showThreadControls={
-                !(experienceMode === "flow" && flowPrimaryView === "library")
-              }
+              title={flowLibraryView ? "Library" : undefined}
+              showThreadControls={!flowLibraryView}
               toolStageOpen={toolStageOpen}
               contextRailOpen={contextRailVisible}
               onOpenLocation={() =>
@@ -4712,8 +4755,8 @@ export function App() {
             {conversationFileDrop.isDraggingFiles ? (
               <ConversationFileDropTarget />
             ) : null}
-            {experienceMode === "flow" && flowPrimaryView === "library" ? (
-              <SagLibraryPanel client={client} />
+            {flowLibraryView ? (
+              <LibraryPanel client={client} />
             ) : serverStatus === "offline" ? (
               <OfflineState
                 backendUrl={platform?.backendUrl}
@@ -4831,7 +4874,7 @@ export function App() {
                     fileDropHandleRef={conversationComposerFileDropHandle}
                     fileDropScope="conversation"
                     value={composer}
-                    taskPlan={composerTaskPlan}
+                    workForm={composerWorkForm}
                     isSending={isSending}
                     isRunning={conversationTurnCanBeCancelled}
                     isCancelling={conversationTurnIsCancelling}
@@ -4940,6 +4983,7 @@ export function App() {
             projects={projects}
             skills={skills}
             collaborationMode={collaborationMode}
+            libraryProvider={activeFlowLibraryProvider}
             workspaceRoot={currentWorkspaceRoot}
             messages={conversationMessages}
             events={conversationEvents.filter(
@@ -5026,6 +5070,7 @@ export function App() {
             onMarkThreadActivityRead={markThreadActivityRead}
             onChangePermissionMode={changeExecutionPreset}
             onChangeSandboxMode={changeSandboxMode}
+            onChangeLibraryProvider={changeFlowLibraryProvider}
             onOpenSettings={openModelSettings}
             onActivateToolTab={setActiveToolTabId}
             onCloseToolTab={closeToolTab}
@@ -6900,7 +6945,9 @@ function Sidebar({
   isPickingWorkspace,
   experienceMode,
   flowModeEnabled,
+  newTaskOpen,
   flowLibraryOpen,
+  pluginsOpen,
   onExperienceModeChange,
   onOpenFlowLibrary,
   onSelect,
@@ -6929,7 +6976,9 @@ function Sidebar({
   isPickingWorkspace: boolean;
   experienceMode: ExperienceMode;
   flowModeEnabled: boolean;
+  newTaskOpen: boolean;
   flowLibraryOpen: boolean;
+  pluginsOpen: boolean;
   onExperienceModeChange(mode: ExperienceMode): void;
   onOpenFlowLibrary(): void;
   onSelect(id: string): void;
@@ -7102,7 +7151,10 @@ function Sidebar({
           </IconButton>
         </div>
         <nav className="primary-nav" aria-label="主要导航">
-          <button onClick={onNew}>
+          <button
+            aria-current={newTaskOpen ? "page" : undefined}
+            onClick={onNew}
+          >
             <FileText size={15} />
             <span>新建任务</span>
           </button>
@@ -7127,7 +7179,11 @@ function Sidebar({
             <span>已安排</span>
             <small>未实现</small>
           </button>
-          <button onClick={onOpenExtensions} title="管理插件">
+          <button
+            aria-current={pluginsOpen ? "page" : undefined}
+            onClick={onOpenExtensions}
+            title="管理插件"
+          >
             <Plug size={15} />
             <span>插件</span>
             <small>插件</small>
@@ -7681,6 +7737,7 @@ function SidebarThreadRow({
     >
       <button
         className={`thread-row ${active ? "active" : ""}`}
+        aria-current={active ? "page" : undefined}
         onPointerDown={(event) => {
           if (event.button !== 0) return;
           onSelect();
@@ -8008,39 +8065,38 @@ function GoalStrip({
   onPause(): void;
   onCancel(): void;
 }) {
-  const completed = snapshot.tasks.filter(
-    (task) => task.status === "succeeded",
+  const items = snapshot.workForm.items;
+  const status = snapshot.workForm.status;
+  const completed = items.filter(
+    (item) => item.status === "completed",
   ).length;
-  const resolved = snapshot.tasks.filter((task) =>
-    ["succeeded", "deferred", "blocked", "cancelled", "failed"].includes(
-      task.status,
+  const resolved = items.filter((item) =>
+    ["completed", "deferred", "blocked", "cancelled"].includes(
+      item.status,
     ),
   ).length;
-  const total = snapshot.tasks.length;
+  const total = items.length;
   const progress = total ? Math.round((completed / total) * 100) : 0;
   const succeededIds = new Set(
-    snapshot.tasks
-      .filter((task) => task.status === "succeeded")
-      .map((task) => task.stepId),
+    items
+      .filter((item) => item.status === "completed")
+      .map((item) => item.id),
   );
-  let currentTaskIndex = snapshot.tasks.findIndex(
-    (task) => task.status === "running",
+  let currentTaskIndex = items.findIndex(
+    (item) => item.status === "in_progress",
   );
   if (currentTaskIndex < 0) {
-    currentTaskIndex = snapshot.tasks.findIndex(
-      (task) =>
-        task.status === "pending" &&
-        task.dependencies.every((dependency) => succeededIds.has(dependency)),
+    currentTaskIndex = items.findIndex(
+      (item) =>
+        item.status === "pending" &&
+        item.dependsOn.every((dependency) => succeededIds.has(dependency)),
     );
   }
-  const terminal = ["completed", "cancelled", "failed"].includes(
-    snapshot.goal.status,
-  );
+  const terminal = ["completed", "cancelled"].includes(status);
   const canRun =
-    !isRunning &&
-    ["ready", "active", "paused", "blocked"].includes(snapshot.goal.status);
+    !isRunning && ["active", "paused", "blocked"].includes(status);
   return (
-    <section className={`goal-strip is-${snapshot.goal.status}`}>
+    <section className={`goal-strip is-${status}`}>
       <details open>
         <summary>
           <span className="goal-strip-icon" aria-hidden="true">
@@ -8049,8 +8105,8 @@ function GoalStrip({
           <span className="goal-strip-objective">
             {snapshot.goal.objective}
           </span>
-          <span className={`goal-status is-${snapshot.goal.status}`}>
-            {goalStatusLabel(snapshot.goal.status)}
+          <span className={`goal-status is-${status}`}>
+            {goalStatusLabel(status)}
           </span>
           {total ? (
             <span className="goal-count">
@@ -8071,22 +8127,17 @@ function GoalStrip({
           >
             <span style={{ width: `${progress}%` }} />
           </div>
-          {snapshot.tasks.length ? (
+          {items.length ? (
             <ol className="goal-task-list">
-              {snapshot.tasks.map((task) => (
-                <li className={`is-${task.status}`} key={task.stepId}>
+              {items.map((item) => (
+                <li className={`is-${item.status}`} key={item.id}>
                   <span className="goal-task-state" aria-hidden="true" />
                   <span className="goal-task-content">
-                    <span>{task.title}</span>
-                    {task.statusReason ? (
-                      <small>{task.statusReason}</small>
+                    <span>{item.title}</span>
+                    {item.note ? (
+                      <small>{item.note}</small>
                     ) : null}
                   </span>
-                  {task.attemptCount ? (
-                    <small className="goal-task-attempts">
-                      {task.attemptCount}x
-                    </small>
-                  ) : null}
                 </li>
               ))}
             </ol>
@@ -8104,12 +8155,10 @@ function GoalStrip({
                   ) : (
                     <Zap size={14} />
                   )}
-                  <span>
-                    {snapshot.goal.status === "ready" ? "启动" : "继续"}
-                  </span>
+                  <span>继续</span>
                 </button>
               ) : null}
-              {snapshot.goal.status === "active" && isRunning ? (
+              {status === "active" && isRunning ? (
                 <button
                   type="button"
                   disabled={Boolean(action)}
@@ -8147,14 +8196,11 @@ function GoalStrip({
 
 function goalStatusLabel(status: GoalStatus): string {
   const labels: Record<GoalStatus, string> = {
-    draft: "规划中",
-    ready: "待启动",
     active: "执行中",
     paused: "已暂停",
     completed: "已完成",
     blocked: "受阻",
     cancelled: "已取消",
-    failed: "失败",
   };
   return labels[status];
 }
@@ -9101,42 +9147,42 @@ function MessageArtifactLinks({
   );
 }
 
-function ComposerTaskPlan({ plan }: { plan: TaskPlan }) {
+function ComposerWorkForm({ form }: { form: WorkForm }) {
   const [expanded, setExpanded] = useState(false);
   const completedIds = useMemo(
     () =>
       new Set(
-        plan.steps
-          .filter((step) => step.status === "completed")
-          .map((step) => step.id),
+        form.items
+          .filter((item) => item.status === "completed")
+          .map((item) => item.id),
       ),
-    [plan.steps],
+    [form.items],
   );
   const currentStepIndex = useMemo(() => {
-    const inProgressIndex = plan.steps.findIndex(
-      (step) => step.status === "in_progress",
+    const inProgressIndex = form.items.findIndex(
+      (item) => item.status === "in_progress",
     );
     if (inProgressIndex >= 0) return inProgressIndex;
-    return plan.steps.findIndex(
-      (step) =>
-        step.status === "pending" &&
-        step.dependencies.every((dependency) => completedIds.has(dependency)),
+    return form.items.findIndex(
+      (item) =>
+        item.status === "pending" &&
+        item.dependsOn.every((dependency) => completedIds.has(dependency)),
     );
-  }, [completedIds, plan.steps]);
-  const resolvedCount = plan.steps.filter((step) =>
-    ["completed", "deferred", "blocked", "cancelled"].includes(step.status),
+  }, [completedIds, form.items]);
+  const resolvedCount = form.items.filter((item) =>
+    ["completed", "deferred", "blocked", "cancelled"].includes(item.status),
   ).length;
   const currentStep =
-    currentStepIndex >= 0 ? plan.steps[currentStepIndex] : undefined;
+    currentStepIndex >= 0 ? form.items[currentStepIndex] : undefined;
   const progressLabel = currentStep
-    ? `第 ${currentStepIndex + 1}/${plan.steps.length} 步`
-    : `${resolvedCount}/${plan.steps.length} 已处理`;
+    ? `第 ${currentStepIndex + 1}/${form.items.length} 步`
+    : `${resolvedCount}/${form.items.length} 已处理`;
 
   useEffect(() => {
     setExpanded(false);
-  }, [plan.goalId]);
+  }, [form.id]);
 
-  if (plan.steps.length === 0) return null;
+  if (form.items.length === 0) return null;
 
   return (
     <section className={`composer-plan ${expanded ? "is-expanded" : ""}`}>
@@ -9149,7 +9195,7 @@ function ComposerTaskPlan({ plan }: { plan: TaskPlan }) {
       >
         <ListTodo size={15} aria-hidden="true" />
         <span className="composer-plan-current">
-          {currentStep?.title || currentStep?.step || "任务清单"}
+          {currentStep?.title || "任务清单"}
         </span>
         <span className="composer-plan-count">{progressLabel}</span>
         <ChevronDown
@@ -9161,19 +9207,19 @@ function ComposerTaskPlan({ plan }: { plan: TaskPlan }) {
       {expanded ? (
         <div className="composer-plan-body" id="composer-plan-steps">
           <ol className="composer-plan-list">
-            {plan.steps.map((step, index) => (
+            {form.items.map((item, index) => (
               <li
-                className={`is-${step.status} ${index === currentStepIndex ? "is-current" : ""}`}
-                data-status={step.status}
-                key={step.id}
+                className={`is-${item.status} ${index === currentStepIndex ? "is-current" : ""}`}
+                data-status={item.status}
+                key={item.id}
               >
                 <span className="composer-plan-step-icon" aria-hidden="true">
-                  <ComposerPlanStepIcon status={step.status} />
+                  <ComposerPlanStepIcon status={item.status} />
                 </span>
                 <span className="composer-plan-step-copy">
-                  <span>{step.title || step.step || step.id}</span>
-                  {step.statusReason ? (
-                    <small>{step.statusReason}</small>
+                  <span>{item.title || item.id}</span>
+                  {item.note ? (
+                    <small>{item.note}</small>
                   ) : null}
                 </span>
                 {index === currentStepIndex ? (
@@ -9191,7 +9237,7 @@ function ComposerTaskPlan({ plan }: { plan: TaskPlan }) {
 function ComposerPlanStepIcon({
   status,
 }: {
-  status: TaskPlan["steps"][number]["status"];
+  status: WorkForm["items"][number]["status"];
 }) {
   if (status === "completed")
     return <span className="composer-plan-complete" />;
@@ -9568,7 +9614,7 @@ function Composer({
   fileDropHandleRef,
   fileDropScope = "composer",
   value,
-  taskPlan,
+  workForm,
   isSending,
   isRunning,
   isCancelling,
@@ -9605,7 +9651,7 @@ function Composer({
   fileDropHandleRef?: { current: ComposerFileDropHandle | null };
   fileDropScope?: "composer" | "conversation";
   value: string;
-  taskPlan?: TaskPlan | null;
+  workForm?: WorkForm | null;
   isSending: boolean;
   isRunning: boolean;
   isCancelling: boolean;
@@ -10193,7 +10239,7 @@ function Composer({
 
   return (
     <div className="composer-shell">
-      {taskPlan ? <ComposerTaskPlan plan={taskPlan} /> : null}
+      {workForm ? <ComposerWorkForm form={workForm} /> : null}
       <div
         className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
         ref={popoverRef}
@@ -11076,17 +11122,10 @@ const collaborationModeOptions: Array<{
     detail: "设置要持续追求的目标",
     icon: Target,
   },
-  {
-    value: "plan",
-    label: "计划模式",
-    detail: "开启计划模式",
-    icon: ListTodo,
-  },
 ];
 
 function collaborationModePlaceholder(mode: CollaborationMode): string {
   if (mode === "goal") return "描述要持续推进的目标";
-  if (mode === "plan") return "描述需要调研和规划的任务";
   return "请求后续更改";
 }
 
@@ -11298,9 +11337,6 @@ function SideTaskConversation({
         );
         setCancellingTurnId(null);
         setPendingTurnFeedback(null);
-        setCollaborationMode((current) =>
-          current === "plan" ? "default" : current,
-        );
         onMarkThreadActivityRead(threadId);
       } else if (event.payload.type === "turn_suspended") {
         onSetThreadActivity(threadId, "approval");
@@ -11440,8 +11476,8 @@ function SideTaskConversation({
   );
   const activeApproval = pendingApprovalQueue[0]?.payload ?? null;
   const activeUserInput = pendingUserInput[0] ?? null;
-  const taskPlan = useMemo(
-    () => resolveComposerTaskPlan(events, null),
+  const workForm = useMemo(
+    () => resolveComposerWorkForm(events, null),
     [events],
   );
 
@@ -11756,7 +11792,7 @@ function SideTaskConversation({
           fileDropHandleRef={composerFileDropHandle}
           fileDropScope="conversation"
           value={composer}
-          taskPlan={taskPlan}
+          workForm={workForm}
           isSending={isSending}
           isRunning={Boolean(activeTurnId)}
           isCancelling={
@@ -11824,6 +11860,7 @@ function RightPanel({
   projects,
   skills,
   collaborationMode,
+  libraryProvider,
   workspaceRoot,
   subagentRuns,
   messages,
@@ -11886,6 +11923,7 @@ function RightPanel({
   onMarkThreadActivityRead,
   onChangePermissionMode,
   onChangeSandboxMode,
+  onChangeLibraryProvider,
   onOpenSettings,
   onActivateToolTab,
   onCloseToolTab,
@@ -11908,6 +11946,7 @@ function RightPanel({
   projects: Project[];
   skills: SkillDescriptor[];
   collaborationMode: CollaborationMode;
+  libraryProvider: LibraryProviderId | null;
   workspaceRoot: string | null;
   messages: Message[];
   subagentRuns: SubagentRun[];
@@ -11989,6 +12028,7 @@ function RightPanel({
   onMarkThreadActivityRead(threadId: string): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
+  onChangeLibraryProvider(provider: LibraryProviderId | null): void;
   onOpenSettings(): void;
   onActivateToolTab(tabId: string): void;
   onCloseToolTab(tabId: string): void;
@@ -12192,10 +12232,13 @@ function RightPanel({
         subagentRuns={subagentRuns}
         artifacts={artifacts}
         messages={messages}
+        libraryPickerEnabled={thread?.experienceMode === "flow"}
+        libraryProvider={libraryProvider}
         onOpenDiff={() => onOpenToolTab("diff")}
         onOpenTerminal={() => onOpenToolTab("terminal")}
         onOpenFiles={() => onOpenToolTab("files")}
         onOpenEnvironment={() => onOpenToolTab("sandbox")}
+        onChangeLibraryProvider={onChangeLibraryProvider}
         onOpenPreview={(target, title) => {
           if (thread) onOpenPreview(thread.id, target, title);
         }}
