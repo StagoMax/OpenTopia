@@ -89,12 +89,11 @@ pnpm.cmd install
 pnpm.cmd dev:desktop
 ```
 
-### Connect the SAG library
+### Connect a Library retrieval provider
 
-The Flow-mode **Library** surface connects to SAG through the local OpenTopia
-server. In the desktop app, opening Library asks Electron to ensure the service
-is ready. It reuses an existing service first, then starts a trusted local
-runtime when one is configured or discovered:
+The Flow-mode **Library** surface can switch between SAG and Graph RAG through
+one provider contract in the local OpenTopia server. The desktop app starts or
+reuses only the provider selected in Library:
 
 ```powershell
 # Optional explicit source project for development
@@ -102,14 +101,25 @@ $env:OPENTOPIA_SAG_PROJECT_ROOT="J:\path\to\sag-project"
 
 # Or connect to an externally managed service
 $env:OPENTOPIA_SAG_URL="http://127.0.0.1:8765"
+
+# Graph RAG supports the same two options
+$env:OPENTOPIA_GRAPH_RAG_PROJECT_ROOT="J:\path\to\graph-rag-project"
+$env:OPENTOPIA_GRAPH_RAG_URL="http://127.0.0.1:8000"
 pnpm dev:desktop
 ```
 
-During development, an adjacent project is discovered by its
-`enterprise-sag-panel` entry in `pyproject.toml`, so its directory name is not
-part of the integration contract. A packaged build can instead provide
-`OPENTOPIA_SAG_EXECUTABLE` or ship `resources/sag/enterprise-sag-panel` as a
-sidecar. Remote endpoints are never launched by OpenTopia.
+During development, adjacent projects are discovered from the
+`enterprise-sag-panel` or `enterprise-graph-rag-panel` entry in
+`pyproject.toml`, so directory names are not part of the integration contract.
+A packaged build can instead provide `OPENTOPIA_SAG_EXECUTABLE` /
+`OPENTOPIA_GRAPH_RAG_EXECUTABLE`, or ship the corresponding executable under
+`resources/sag/` / `resources/graph-rag/`. Remote endpoints are never launched
+by OpenTopia.
+
+For a non-development Graph RAG service, set `OPENTOPIA_GRAPH_RAG_TOKEN` to a
+service identity token. The local development handshake otherwise requests a
+short-lived token using `OPENTOPIA_GRAPH_RAG_ROLES` and
+`OPENTOPIA_GRAPH_RAG_TENANT`.
 
 This integration is review-only: it manages sources and builds draft Context
 Packs, but does not inject them into prompts or change the Agent Loop.
