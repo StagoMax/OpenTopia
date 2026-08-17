@@ -1,3 +1,4 @@
+use crate::powershell_runtime::current_shell_runtime;
 use crate::sandbox::NetworkPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -8,21 +9,19 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellDialect {
+    PowerShell7,
     WindowsPowerShell51,
     PosixSh,
 }
 
 impl ShellDialect {
     pub fn current() -> Self {
-        if cfg!(windows) {
-            Self::WindowsPowerShell51
-        } else {
-            Self::PosixSh
-        }
+        current_shell_runtime().dialect
     }
 
     pub fn id(self) -> &'static str {
         match self {
+            Self::PowerShell7 => "powershell_7",
             Self::WindowsPowerShell51 => "windows_powershell_5_1",
             Self::PosixSh => "posix_sh",
         }
@@ -30,6 +29,9 @@ impl ShellDialect {
 
     pub fn model_guidance(self) -> &'static str {
         match self {
+            Self::PowerShell7 => {
+                "Shell commands use PowerShell 7 on Windows. Use PowerShell syntax, not Bash; `&&`/`||` are supported, `Select-Object` replaces `head`/`tail`, and `$null` discards output. UTF-8 script files are supported with or without a BOM."
+            }
             Self::WindowsPowerShell51 => {
                 "Shell commands use Windows PowerShell 5.1, not Bash or PowerShell 7. Use `;` or explicit `$LASTEXITCODE` checks instead of `&&`/`||`, `Select-Object -First/-Last` instead of `head`/`tail`, and `$null` for discarded output."
             }
@@ -179,7 +181,7 @@ fn is_here_string_terminator(chars: &[char], index: usize, quote: char) -> bool 
         && (index == 0 || chars.get(index.wrapping_sub(1)) == Some(&'\n'))
 }
 
-fn windows_powershell_wrapper(command: &str) -> String {
+fn powershell_wrapper(command: &str) -> String {
     format!(
         "$__otUtf8 = New-Object System.Text.UTF8Encoding($false); \
          [Console]::InputEncoding = $__otUtf8; \
@@ -280,13 +282,15 @@ impl ExecutionSpec {
     pub fn shell(command: impl Into<String>) -> Self {
         let command = command.into();
         if cfg!(windows) {
-            Self::new("powershell.exe")
+            let runtime = current_shell_runtime();
+            Self::new(runtime.program.to_string_lossy().into_owned())
                 .arg("-NoProfile")
                 .arg("-NonInteractive")
                 .arg("-ExecutionPolicy")
                 .arg("Bypass")
                 .arg("-Command")
-                .arg(windows_powershell_wrapper(&command))
+                .arg(powershell_wrapper(&command))
+                .runtime("powershell", runtime.runtime_read_roots())
         } else {
             Self::new("sh").arg("-lc").arg(command)
         }
@@ -446,13 +450,16 @@ mod tests {
 
     #[test]
     fn shell_dialect_matches_the_platform() {
-        let expected = if cfg!(windows) {
-            ShellDialect::WindowsPowerShell51
+        let current = ShellDialect::current();
+        if cfg!(windows) {
+            assert!(matches!(
+                current,
+                ShellDialect::PowerShell7 | ShellDialect::WindowsPowerShell51
+            ));
         } else {
-            ShellDialect::PosixSh
-        };
-        assert_eq!(ShellDialect::current(), expected);
-        assert!(!expected.model_guidance().is_empty());
+            assert_eq!(current, ShellDialect::PosixSh);
+        }
+        assert!(!current.model_guidance().is_empty());
     }
 
     #[test]
@@ -484,7 +491,10 @@ mod tests {
     fn windows_shell_initializes_utf8_before_user_input() {
         let command = format!("Write-Output '{}{}'", '\u{4e2d}', '\u{6587}');
         let request = ExecutionSpec::shell(&command);
-        assert_eq!(request.program, "powershell.exe");
+        assert!(matches!(
+            ShellDialect::current(),
+            ShellDialect::PowerShell7 | ShellDialect::WindowsPowerShell51
+        ));
         let wrapper = request.args.last().expect("PowerShell wrapper");
         assert!(wrapper.contains("[Console]::OutputEncoding = $__otUtf8"));
         assert!(wrapper.ends_with(&command));

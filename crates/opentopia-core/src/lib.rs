@@ -42,6 +42,7 @@ pub mod pdf;
 pub mod plugin_control;
 pub mod plugins;
 pub mod policy;
+pub mod powershell_runtime;
 pub mod preview;
 pub mod process_quota;
 mod process_supervisor;
@@ -258,6 +259,11 @@ pub use policy::{
     approval_required, ApprovalPolicy, ApprovalRequired, ApprovalsReviewer, BasicPolicyEngine,
     CommandPolicyRule, CommandRuleMatch, NetworkPolicyConfig, PermissionMode, PolicyConfig,
     PolicyDecision, PolicyEngine, PolicyRuleEffect, ToolPermissionDescriptor,
+};
+pub use powershell_runtime::{
+    current_shell_runtime, current_shell_runtime_status, initialize_shell_runtime,
+    start_managed_powershell_install, ManagedPowerShellStatus, ShellRuntime, ShellRuntimeSource,
+    ShellRuntimeStatus, MANAGED_POWERSHELL_VERSION,
 };
 pub use preview::{
     decode_preview_id, encode_preview_id, preview_spreadsheet_range, preview_workbook,

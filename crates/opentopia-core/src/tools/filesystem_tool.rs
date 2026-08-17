@@ -4,7 +4,9 @@ use super::{
 };
 use crate::execution::FileReadRequest;
 use crate::execution_authorization::ToolExecutionIntent;
-use crate::file_mutation::{read_optional, FileMutationBatch, PreparedFileMutation};
+use crate::file_mutation::{
+    normalize_text_encoding, read_optional, FileMutationBatch, PreparedFileMutation,
+};
 use crate::model::ToolResult;
 use crate::model_context::content_fingerprint;
 use crate::policy::PolicyDecision;
@@ -315,6 +317,7 @@ async fn read_file(
             read.path.display()
         )
     })?;
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
     let total_chars = contents.chars().count();
     let offset = offset
         .map(usize::try_from)
@@ -363,15 +366,15 @@ async fn write_file(
     expected_hash: Option<&str>,
     ctx: &ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
-    anyhow::ensure!(
-        content.len() <= MAX_WRITE_BYTES,
-        "filesystem write is {} bytes; limit is {MAX_WRITE_BYTES} bytes",
-        content.len()
-    );
     let path = normalized_path(ctx, raw_path)?;
     let original = read_optional(ctx.environment.as_ref(), &path).await?;
     verify_expected_hash(&path, original.as_deref(), expected_hash)?;
-    let contents = content.into_bytes();
+    let contents = normalize_text_encoding(&path, content.into_bytes());
+    anyhow::ensure!(
+        contents.len() <= MAX_WRITE_BYTES,
+        "filesystem write is {} bytes; limit is {MAX_WRITE_BYTES} bytes",
+        contents.len()
+    );
     let hash = content_fingerprint(&contents);
     let batch = FileMutationBatch::new(vec![PreparedFileMutation::write(
         path.clone(),
@@ -965,6 +968,46 @@ mod tests {
             .unwrap();
         assert_eq!(read.output, "alpha");
         assert_eq!(read.metadata["path"], "notes/c.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn powershell_write_adds_bom_without_exposing_it_as_text() {
+        let (root, context) = fixture();
+        let script = "Write-Output \"中文（全角括号）\"";
+        let written = FilesystemTool
+            .execute(
+                ToolCall::new(
+                    "filesystem",
+                    json!({
+                        "operation": "write",
+                        "path": "scripts/unicode.ps1",
+                        "content": script,
+                        "expectedHash": "missing"
+                    }),
+                ),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+
+        let bytes = fs::read(root.join("scripts/unicode.ps1")).unwrap();
+        assert!(bytes.starts_with(&[0xef, 0xbb, 0xbf]));
+        assert_eq!(written.metadata["contentHash"], content_fingerprint(&bytes));
+
+        let read = FilesystemTool
+            .execute(
+                ToolCall::new(
+                    "filesystem",
+                    json!({ "operation": "read", "path": "scripts/unicode.ps1" }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.output, script);
+        assert_eq!(read.metadata["totalChars"], script.chars().count());
+        assert_eq!(read.metadata["contentHash"], content_fingerprint(&bytes));
         fs::remove_dir_all(root).unwrap();
     }
 

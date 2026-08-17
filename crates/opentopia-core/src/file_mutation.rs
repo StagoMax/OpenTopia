@@ -55,10 +55,11 @@ impl PreparedFileMutation {
         original: Option<Vec<u8>>,
         contents: impl Into<Vec<u8>>,
     ) -> Self {
+        let path = path.into();
         Self {
-            path: path.into(),
+            target: FileMutationTarget::Write(normalize_text_encoding(&path, contents.into())),
+            path,
             original,
-            target: FileMutationTarget::Write(contents.into()),
         }
     }
 
@@ -68,6 +69,24 @@ impl PreparedFileMutation {
             original: Some(original),
             target: FileMutationTarget::Delete,
         }
+    }
+}
+
+pub(crate) fn normalize_text_encoding(path: &Path, mut contents: Vec<u8>) -> Vec<u8> {
+    let is_powershell_script = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"));
+    if is_powershell_script
+        && !contents.starts_with(&[0xEF, 0xBB, 0xBF])
+        && std::str::from_utf8(&contents).is_ok()
+    {
+        let mut encoded = Vec::with_capacity(contents.len() + 3);
+        encoded.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        encoded.append(&mut contents);
+        encoded
+    } else {
+        contents
     }
 }
 
@@ -326,6 +345,22 @@ mod tests {
     use crate::sandbox::LocalSandboxConfig;
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn powershell_text_mutations_use_one_utf8_bom() {
+        let created = PreparedFileMutation::write("script.ps1", None, "中文".as_bytes().to_vec());
+        let FileMutationTarget::Write(created) = created.target else {
+            panic!("expected write mutation");
+        };
+        assert!(created.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert_eq!(&created[3..], "中文".as_bytes());
+
+        let preserved = PreparedFileMutation::write("script.ps1", None, created.clone());
+        let FileMutationTarget::Write(preserved) = preserved.target else {
+            panic!("expected write mutation");
+        };
+        assert_eq!(preserved, created);
+    }
 
     #[tokio::test]
     async fn failed_commit_restores_previously_written_files() {

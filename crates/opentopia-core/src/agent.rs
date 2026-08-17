@@ -6333,6 +6333,9 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn shell_dialect_preflight_is_a_failed_unexecuted_effect() {
+        if ShellDialect::current() != ShellDialect::WindowsPowerShell51 {
+            return;
+        }
         let workspace = test_workspace("journal-shell-dialect");
         let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
         let thread = store.create_thread(None, workspace.clone()).unwrap();

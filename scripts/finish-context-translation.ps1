@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$OriginalPath = "docs/evaluations/context-compaction-long-horizon-2026-07-28.md",
   [string]$TranslationPath = "docs/evaluations/context-compaction-long-horizon-2026-07-28.zh.md",
   [string]$EnvFile = "J:/Project/信贷审核助手/.env",

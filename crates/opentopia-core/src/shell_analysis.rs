@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Coarse capabilities inferred from a shell command. This is advisory
@@ -84,8 +86,7 @@ enum Lexeme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandFamily {
     Ripgrep,
-    SelectString,
-    GetContent,
+    PowerShellRead,
     Git,
     Delete,
     SetContent,
@@ -100,8 +101,29 @@ enum CommandFamily {
 const COMMAND_FAMILIES: &[(&str, CommandFamily)] = &[
     ("rg", CommandFamily::Ripgrep),
     ("ripgrep", CommandFamily::Ripgrep),
-    ("select-string", CommandFamily::SelectString),
-    ("get-content", CommandFamily::GetContent),
+    // Keep filesystem observations in one declarative family. These commands
+    // may be followed by an unrecognized PowerShell pipeline transform; the
+    // exact read paths they expose are still safe to project into that call's
+    // restricted sandbox.
+    ("select-string", CommandFamily::PowerShellRead),
+    ("sls", CommandFamily::PowerShellRead),
+    ("get-content", CommandFamily::PowerShellRead),
+    ("gc", CommandFamily::PowerShellRead),
+    ("cat", CommandFamily::PowerShellRead),
+    ("type", CommandFamily::PowerShellRead),
+    ("get-childitem", CommandFamily::PowerShellRead),
+    ("get-child-item", CommandFamily::PowerShellRead),
+    ("gci", CommandFamily::PowerShellRead),
+    ("dir", CommandFamily::PowerShellRead),
+    ("ls", CommandFamily::PowerShellRead),
+    ("get-item", CommandFamily::PowerShellRead),
+    ("gi", CommandFamily::PowerShellRead),
+    ("import-csv", CommandFamily::PowerShellRead),
+    ("ipcsv", CommandFamily::PowerShellRead),
+    ("test-path", CommandFamily::PowerShellRead),
+    ("resolve-path", CommandFamily::PowerShellRead),
+    ("get-acl", CommandFamily::PowerShellRead),
+    ("get-filehash", CommandFamily::PowerShellRead),
     ("git", CommandFamily::Git),
     ("remove-item", CommandFamily::Delete),
     ("rm", CommandFamily::Delete),
@@ -223,8 +245,21 @@ pub fn analyze_shell_command(command: &str) -> ShellCommandAnalysis {
     }
 
     let mut aggregate = Aggregate::default();
+    let mut static_values = HashMap::<String, Word>::new();
     for segment in &segments {
-        classify_segment(segment, &mut aggregate);
+        if let Some((name, value)) = static_string_assignment(segment) {
+            aggregate.init_if_needed();
+            aggregate.capabilities.push(ShellCapability::Observation);
+            static_values.insert(name, value);
+            continue;
+        }
+        if let Some(name) = assigned_variable_name(segment) {
+            // Never let an earlier literal survive a later dynamic assignment.
+            // Destructive review in particular must see the final reference as
+            // unresolved instead of authorizing a stale, safer-looking path.
+            static_values.remove(&name);
+        }
+        classify_segment(segment, &static_values, &mut aggregate);
     }
 
     if has_redirection {
@@ -320,6 +355,31 @@ impl Aggregate {
         }
     }
 
+    fn add_resolved_targets<'a>(
+        &mut self,
+        words: impl IntoIterator<Item = &'a Word>,
+        static_values: &HashMap<String, Word>,
+    ) {
+        let resolved = words
+            .into_iter()
+            .map(|word| resolve_static_word(word, static_values))
+            .collect::<Vec<_>>();
+        self.add_targets(resolved.iter());
+    }
+
+    fn add_read_targets<'a>(&mut self, words: impl IntoIterator<Item = &'a Word>) {
+        for word in words {
+            if word.wildcard && !word.dynamic {
+                self.targets_concrete = false;
+                if let Some(scope) = wildcard_read_scope(&word.value) {
+                    self.concrete_targets.push(scope);
+                }
+            } else {
+                self.add_targets(std::iter::once(word));
+            }
+        }
+    }
+
     fn add_destructive_targets<'a>(&mut self, words: impl IntoIterator<Item = &'a Word>) {
         let words = words.into_iter().collect::<Vec<_>>();
         self.saw_destructive_target |= !words.is_empty();
@@ -333,6 +393,244 @@ impl Aggregate {
         }
         self.add_targets(words);
     }
+
+    fn add_resolved_destructive_targets<'a>(
+        &mut self,
+        words: impl IntoIterator<Item = &'a Word>,
+        static_values: &HashMap<String, Word>,
+    ) {
+        let resolved = words
+            .into_iter()
+            .map(|word| resolve_static_word(word, static_values))
+            .collect::<Vec<_>>();
+        self.add_destructive_targets(resolved.iter());
+    }
+}
+
+fn static_string_assignment(words: &[Word]) -> Option<(String, Word)> {
+    let (name, value) = match words {
+        [name, equals, value] if equals.value == "=" => {
+            (variable_reference(&name.value)?, value.clone())
+        }
+        [assignment] => {
+            let (name, value) = assignment.value.split_once('=')?;
+            let name = variable_reference(name)?;
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            (
+                name,
+                Word {
+                    value: value.to_string(),
+                    dynamic: value.contains('$')
+                        || value.contains('`')
+                        || value.starts_with('(')
+                        || value.starts_with('{'),
+                    wildcard: value.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']')),
+                },
+            )
+        }
+        _ => return None,
+    };
+    if value.dynamic
+        || value.value.contains("::")
+        || !looks_like_static_path_literal(&value.value)
+        || looks_like_dynamic_target(&value.value)
+    {
+        return None;
+    }
+    Some((name, value))
+}
+
+fn assigned_variable_name(words: &[Word]) -> Option<String> {
+    match words {
+        [name, equals, ..] if equals.value == "=" => variable_reference(&name.value),
+        [assignment, ..] => assignment
+            .value
+            .split_once('=')
+            .and_then(|(name, _)| variable_reference(name)),
+        _ => None,
+    }
+}
+
+fn looks_like_static_path_literal(value: &str) -> bool {
+    value.contains(['/', '\\'])
+        || value.starts_with('.')
+        || value.as_bytes().get(1) == Some(&b':')
+        || value.rsplit_once('.').is_some_and(|(stem, extension)| {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        })
+}
+
+fn variable_reference(value: &str) -> Option<String> {
+    let value = value.trim();
+    let name = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| value.strip_prefix('$'))?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
+fn resolve_static_word(word: &Word, static_values: &HashMap<String, Word>) -> Word {
+    variable_reference(&word.value)
+        .and_then(|name| static_values.get(&name))
+        .cloned()
+        .unwrap_or_else(|| word.clone())
+}
+
+const DOTNET_READ_INVOCATIONS: &[&str] = &[
+    "[system.io.file]::readallbytes(",
+    "[io.file]::readallbytes(",
+    "[system.io.file]::readalltext(",
+    "[io.file]::readalltext(",
+    "[system.io.file]::readalllines(",
+    "[io.file]::readalllines(",
+    "[system.io.file]::openread(",
+    "[io.file]::openread(",
+    "[system.io.file]::opentext(",
+    "[io.file]::opentext(",
+    "[system.io.directory]::enumeratefiles(",
+    "[io.directory]::enumeratefiles(",
+    "[system.io.directory]::enumeratedirectories(",
+    "[io.directory]::enumeratedirectories(",
+    "[system.io.directory]::enumeratefilesystementries(",
+    "[io.directory]::enumeratefilesystementries(",
+    "[system.io.directory]::getfiles(",
+    "[io.directory]::getfiles(",
+    "[system.io.directory]::getdirectories(",
+    "[io.directory]::getdirectories(",
+    "[system.io.directory]::getfilesystementries(",
+    "[io.directory]::getfilesystementries(",
+    "[system.io.streamreader]::new(",
+    "[io.streamreader]::new(",
+    "[microsoft.visualbasic.fileio.textfieldparser]::new(",
+];
+
+fn classify_known_dotnet_read(
+    words: &[Word],
+    static_values: &HashMap<String, Word>,
+    aggregate: &mut Aggregate,
+) -> bool {
+    let argument = direct_dotnet_read_argument(words).or_else(|| new_object_reader_argument(words));
+    let Some(argument) = argument else {
+        return false;
+    };
+
+    aggregate
+        .capabilities
+        .extend([ShellCapability::Observation, ShellCapability::ReadFiles]);
+    let mut argument = resolve_static_word(&argument, static_values);
+    // .NET APIs receive literal strings rather than PowerShell provider globs.
+    argument.wildcard = false;
+    aggregate.dynamic |= argument.dynamic;
+    if argument.dynamic {
+        aggregate.all_read_only = false;
+    }
+    aggregate.add_read_targets(std::iter::once(&argument));
+    true
+}
+
+fn direct_dotnet_read_argument(words: &[Word]) -> Option<Word> {
+    if let Some(argument) = words
+        .first()
+        .and_then(|word| dotnet_read_argument(&word.value))
+    {
+        return Some(argument);
+    }
+    match words {
+        [name, equals, expression, ..]
+            if equals.value == "=" && variable_reference(&name.value).is_some() =>
+        {
+            dotnet_read_argument(&expression.value)
+        }
+        _ => None,
+    }
+}
+
+fn dotnet_read_argument(value: &str) -> Option<Word> {
+    let lower = value.to_ascii_lowercase();
+    for invocation in DOTNET_READ_INVOCATIONS {
+        let Some(start) = lower.find(invocation) else {
+            continue;
+        };
+        let start = start + invocation.len();
+        let tail = value.get(start..)?;
+        let end = tail.find(')')?;
+        let argument = tail[..end].split(',').next()?.trim();
+        if argument.is_empty() {
+            return None;
+        }
+        return Some(inline_argument_word(argument));
+    }
+    None
+}
+
+fn new_object_reader_argument(words: &[Word]) -> Option<Word> {
+    let command = words.first()?;
+    if normalize_command_name(&command.value) != "new-object" {
+        return None;
+    }
+    let type_index = words.iter().position(|word| {
+        matches!(
+            word.value.to_ascii_lowercase().as_str(),
+            "system.io.streamreader"
+                | "io.streamreader"
+                | "microsoft.visualbasic.fileio.textfieldparser"
+        )
+    })?;
+    let argument_index = words
+        .iter()
+        .position(|word| word.value.eq_ignore_ascii_case("-argumentlist"))
+        .map(|index| index + 1)
+        .unwrap_or(type_index + 1);
+    words.get(argument_index).cloned()
+}
+
+fn inline_argument_word(value: &str) -> Word {
+    let value = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(value)
+        .trim()
+        .to_string();
+    Word {
+        dynamic: value.contains('$')
+            || value.contains('`')
+            || value.starts_with('(')
+            || value.starts_with('{'),
+        wildcard: false,
+        value,
+    }
+}
+
+fn wildcard_read_scope(value: &str) -> Option<String> {
+    let wildcard = value.find(|ch| matches!(ch, '*' | '?' | '[' | ']'))?;
+    let prefix = &value[..wildcard];
+    let separator = prefix.rfind(['/', '\\']);
+    let scope = match separator {
+        Some(0) => &prefix[..1],
+        Some(2) if prefix.as_bytes().get(1) == Some(&b':') => &prefix[..3],
+        Some(index) => &prefix[..index],
+        None => ".",
+    };
+    (!scope.is_empty()).then(|| scope.to_string())
 }
 
 fn looks_like_dynamic_target(value: &str) -> bool {
@@ -344,8 +642,15 @@ fn looks_like_dynamic_target(value: &str) -> bool {
         || value.starts_with('{')
 }
 
-fn classify_segment(words: &[Word], aggregate: &mut Aggregate) {
+fn classify_segment(
+    words: &[Word],
+    static_values: &HashMap<String, Word>,
+    aggregate: &mut Aggregate,
+) {
     aggregate.init_if_needed();
+    if classify_known_dotnet_read(words, static_values, aggregate) {
+        return;
+    }
     let Some(command_word) = words.first() else {
         return;
     };
@@ -366,7 +671,7 @@ fn classify_segment(words: &[Word], aggregate: &mut Aggregate) {
         ]);
         aggregate.dynamic = true;
         aggregate.all_read_only = false;
-        aggregate.add_targets(words.get(0..1).unwrap_or_default());
+        aggregate.add_resolved_targets(words.get(0..1).unwrap_or_default(), static_values);
         return;
     }
 
@@ -380,18 +685,16 @@ fn classify_segment(words: &[Word], aggregate: &mut Aggregate) {
 
     match family {
         CommandFamily::Ripgrep => classify_ripgrep(words, aggregate),
-        CommandFamily::SelectString | CommandFamily::GetContent => {
-            classify_read_command(words, aggregate)
-        }
-        CommandFamily::Git => classify_git(words, aggregate),
-        CommandFamily::Delete => classify_delete(words, &command_name, aggregate),
+        CommandFamily::PowerShellRead => classify_read_command(words, static_values, aggregate),
+        CommandFamily::Git => classify_git(words, static_values, aggregate),
+        CommandFamily::Delete => classify_delete(words, &command_name, static_values, aggregate),
         CommandFamily::SetContent | CommandFamily::OutFile => {
             aggregate.capabilities.push(ShellCapability::WorkspaceWrite);
             aggregate.all_read_only = false;
-            aggregate.add_targets(extract_powershell_paths(
-                words,
-                &["-path", "-literalpath", "-filepath"],
-            ));
+            aggregate.add_resolved_targets(
+                extract_powershell_paths(words, &["-path", "-literalpath", "-filepath"]),
+                static_values,
+            );
         }
         CommandFamily::Network => classify_network(words, aggregate),
         CommandFamily::DynamicRuntime => classify_dynamic_runtime(words, aggregate),
@@ -401,7 +704,8 @@ fn classify_segment(words: &[Word], aggregate: &mut Aggregate) {
             aggregate.capabilities.push(ShellCapability::DeleteFiles);
             aggregate.destructive = true;
             aggregate.all_read_only = false;
-            aggregate.add_destructive_targets(positional_arguments(words, 1));
+            aggregate
+                .add_resolved_destructive_targets(positional_arguments(words, 1), static_values);
         }
     }
 }
@@ -438,27 +742,47 @@ fn classify_ripgrep(words: &[Word], aggregate: &mut Aggregate) {
         .push("workspace:command-scope".to_string());
 }
 
-fn classify_read_command(words: &[Word], aggregate: &mut Aggregate) {
+fn classify_read_command(
+    words: &[Word],
+    static_values: &HashMap<String, Word>,
+    aggregate: &mut Aggregate,
+) {
     aggregate
         .capabilities
         .extend([ShellCapability::Observation, ShellCapability::ReadFiles]);
-    aggregate.dynamic |= words.iter().any(|word| word.dynamic);
-    if aggregate.dynamic {
+    let paths = extract_powershell_paths(words, &["-path", "-literalpath"]);
+    let literal_path = words
+        .iter()
+        .any(|word| word.value.eq_ignore_ascii_case("-literalpath"));
+    let mut resolved_paths = paths
+        .iter()
+        .map(|word| resolve_static_word(word, static_values))
+        .collect::<Vec<_>>();
+    if !literal_path {
+        for path in &mut resolved_paths {
+            path.wildcard |= path
+                .value
+                .chars()
+                .any(|ch| matches!(ch, '*' | '?' | '[' | ']'));
+        }
+    }
+    let has_unresolved_dynamic_path = resolved_paths.iter().any(|word| word.dynamic);
+    aggregate.dynamic |= has_unresolved_dynamic_path;
+    if has_unresolved_dynamic_path {
         aggregate.all_read_only = false;
     }
-    let paths = extract_powershell_paths(words, &["-path", "-literalpath"]);
-    if !paths.is_empty() {
-        aggregate.add_targets(paths);
+    if !resolved_paths.is_empty() {
+        aggregate.add_read_targets(resolved_paths.iter());
     }
 }
 
-fn classify_git(words: &[Word], aggregate: &mut Aggregate) {
+fn classify_git(words: &[Word], static_values: &HashMap<String, Word>, aggregate: &mut Aggregate) {
     let Some((subcommand_index, subcommand)) = git_subcommand(words) else {
         mark_unknown(aggregate);
         return;
     };
     if let Some(workdir) = git_workdir(words) {
-        aggregate.add_targets(std::iter::once(workdir));
+        aggregate.add_resolved_targets(std::iter::once(workdir), static_values);
     } else {
         aggregate
             .concrete_targets
@@ -579,7 +903,12 @@ fn classify_git(words: &[Word], aggregate: &mut Aggregate) {
     }
 }
 
-fn classify_delete(words: &[Word], command_name: &str, aggregate: &mut Aggregate) {
+fn classify_delete(
+    words: &[Word],
+    command_name: &str,
+    static_values: &HashMap<String, Word>,
+    aggregate: &mut Aggregate,
+) {
     aggregate.capabilities.extend([
         ShellCapability::WorkspaceWrite,
         ShellCapability::DeleteFiles,
@@ -591,7 +920,7 @@ fn classify_delete(words: &[Word], command_name: &str, aggregate: &mut Aggregate
     } else {
         positional_arguments(words, 1)
     };
-    aggregate.add_destructive_targets(targets);
+    aggregate.add_resolved_destructive_targets(targets, static_values);
 }
 
 fn classify_network(words: &[Word], aggregate: &mut Aggregate) {
@@ -730,17 +1059,74 @@ fn extract_powershell_paths<'a>(words: &'a [Word], named: &[&str]) -> Vec<&'a Wo
         return targets;
     }
 
-    let positionals = positional_arguments(words, 1);
-    let positional_index = usize::from(
-        words
-            .first()
-            .is_some_and(|word| normalize_command_name(&word.value) == "select-string"),
-    );
+    let command_name = words
+        .first()
+        .map(|word| normalize_command_name(&word.value))
+        .unwrap_or_default();
+    let positionals = powershell_positional_arguments(words);
+    let select_string = matches!(command_name.as_str(), "select-string" | "sls");
+    let pattern_is_named = words
+        .iter()
+        .any(|word| word.value.eq_ignore_ascii_case("-pattern"));
+    let positional_index = usize::from(select_string && !pattern_is_named);
     positionals
         .get(positional_index)
         .copied()
         .into_iter()
         .collect()
+}
+
+fn powershell_positional_arguments(words: &[Word]) -> Vec<&Word> {
+    let mut positionals = Vec::new();
+    let mut index = 1;
+    while index < words.len() {
+        let value = words[index].value.as_str();
+        if powershell_parameter_takes_value(value) {
+            index += 2;
+            continue;
+        }
+        if value.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        positionals.push(&words[index]);
+        index += 1;
+    }
+    positionals
+}
+
+fn powershell_parameter_takes_value(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "-algorithm"
+            | "-credential"
+            | "-delimiter"
+            | "-depth"
+            | "-encoding"
+            | "-erroraction"
+            | "-errorvariable"
+            | "-exclude"
+            | "-filter"
+            | "-header"
+            | "-include"
+            | "-informationaction"
+            | "-informationvariable"
+            | "-newerthan"
+            | "-olderthan"
+            | "-outbuffer"
+            | "-outvariable"
+            | "-parameter"
+            | "-pathtype"
+            | "-pattern"
+            | "-pipelinevariable"
+            | "-readcount"
+            | "-relativebasepath"
+            | "-stream"
+            | "-tail"
+            | "-totalcount"
+            | "-warningaction"
+            | "-warningvariable"
+    )
 }
 
 fn positional_arguments(words: &[Word], start: usize) -> Vec<&Word> {
@@ -924,6 +1310,156 @@ mod tests {
             );
             assert!(!analysis.destructive);
         }
+    }
+
+    #[test]
+    fn common_powershell_filesystem_observations_expose_exact_read_targets() {
+        for command in [
+            "Get-ChildItem -LiteralPath 'C:\\Users\\me\\Downloads'",
+            "Import-Csv -LiteralPath 'C:\\Users\\me\\Downloads\\orders.csv'",
+            "Test-Path -LiteralPath 'C:\\Users\\me\\Downloads\\orders.csv'",
+            "Get-Item -LiteralPath 'C:\\Users\\me\\Downloads\\orders.csv'",
+            "Get-FileHash -LiteralPath 'C:\\Users\\me\\Downloads\\orders.csv'",
+            "Import-Csv -LiteralPath 'C:\\Users\\me\\Downloads\\货物贸易B2C-订单模板.csv'",
+        ] {
+            let analysis = analyze_shell_command(command);
+            assert!(
+                analysis.capabilities.contains(&ShellCapability::ReadFiles),
+                "expected filesystem read classification for {command}: {analysis:?}"
+            );
+            assert!(
+                !analysis.capabilities.contains(&ShellCapability::Unknown),
+                "known read command must not remain unknown: {command}: {analysis:?}"
+            );
+            assert!(
+                analysis
+                    .concrete_targets
+                    .iter()
+                    .any(|target| target.starts_with("C:\\Users\\me\\Downloads")),
+                "expected exact external target for {command}: {analysis:?}"
+            );
+            assert!(analysis.is_strictly_read_only(), "{command}: {analysis:?}");
+        }
+
+        for (command, expected) in [
+            (
+                "Import-Csv -Encoding UTF8 'C:\\Users\\me\\Downloads\\orders.csv'",
+                "C:\\Users\\me\\Downloads\\orders.csv",
+            ),
+            (
+                "Get-FileHash -Algorithm SHA256 'C:\\Users\\me\\Downloads\\orders.csv'",
+                "C:\\Users\\me\\Downloads\\orders.csv",
+            ),
+            (
+                "sls -Pattern order 'C:\\Users\\me\\Downloads\\orders.csv'",
+                "C:\\Users\\me\\Downloads\\orders.csv",
+            ),
+        ] {
+            let analysis = analyze_shell_command(command);
+            assert_eq!(analysis.concrete_targets, vec![expected], "{command}");
+        }
+
+        let wildcard =
+            analyze_shell_command("Get-ChildItem -Path 'C:\\Users\\me\\Downloads\\*.xlsx' -File");
+        assert_eq!(wildcard.concrete_targets, vec!["C:\\Users\\me\\Downloads"]);
+        assert!(!wildcard.targets_concrete);
+        assert!(wildcard.is_strictly_read_only());
+    }
+
+    #[test]
+    fn literal_path_variables_are_resolved_before_read_intent_is_built() {
+        for command in [
+            "$path = 'C:\\Users\\me\\Downloads\\orders.csv'; Import-Csv -LiteralPath $path",
+            "$path='C:\\Users\\me\\Downloads\\orders.csv'; Get-Content -LiteralPath $path",
+        ] {
+            let analysis = analyze_shell_command(command);
+            assert_eq!(
+                analysis.concrete_targets,
+                vec!["C:\\Users\\me\\Downloads\\orders.csv"]
+            );
+            assert!(!analysis.dynamic, "{command}: {analysis:?}");
+            assert!(analysis.is_strictly_read_only(), "{command}: {analysis:?}");
+        }
+
+        let command_expression = analyze_shell_command("$value = Remove-Item");
+        assert!(command_expression
+            .capabilities
+            .contains(&ShellCapability::Unknown));
+        assert!(command_expression
+            .capabilities
+            .contains(&ShellCapability::DynamicExecution));
+
+        let reassigned = analyze_shell_command(
+            "$target = 'C:\\safe'; $target = $env:TEMP; Remove-Item -Recurse -LiteralPath $target",
+        );
+        assert!(reassigned.is_unreviewable_destructive_action());
+        assert!(!reassigned
+            .concrete_targets
+            .contains(&"C:\\safe".to_string()));
+    }
+
+    #[test]
+    fn known_read_paths_survive_unclassified_pipeline_transforms() {
+        let analysis = analyze_shell_command(
+            "Import-Csv -LiteralPath 'C:\\Users\\me\\Downloads\\orders.csv' | Where-Object Status -eq open",
+        );
+        assert!(analysis.capabilities.contains(&ShellCapability::ReadFiles));
+        assert!(analysis.capabilities.contains(&ShellCapability::Unknown));
+        assert_eq!(
+            analysis.concrete_targets,
+            vec!["C:\\Users\\me\\Downloads\\orders.csv"]
+        );
+        assert!(!analysis.is_strictly_read_only());
+    }
+
+    #[test]
+    fn known_dotnet_read_apis_expose_exact_targets_without_allowing_writes() {
+        for command in [
+            "[System.IO.File]::ReadAllBytes('C:\\Users\\me\\Downloads\\orders.xlsx')",
+            "$reader = [System.IO.StreamReader]::new('C:\\Users\\me\\Downloads\\orders.csv'); $reader.ReadToEnd()",
+            "New-Object System.IO.StreamReader -ArgumentList 'C:\\Users\\me\\Downloads\\orders.csv'",
+            "[Microsoft.VisualBasic.FileIO.TextFieldParser]::new('C:\\Users\\me\\Downloads\\orders.csv')",
+        ] {
+            let analysis = analyze_shell_command(command);
+            assert!(
+                analysis.capabilities.contains(&ShellCapability::ReadFiles),
+                "expected .NET read classification for {command}: {analysis:?}"
+            );
+            assert!(
+                analysis
+                    .concrete_targets
+                    .iter()
+                    .any(|target| target.starts_with("C:\\Users\\me\\Downloads")),
+                "expected exact .NET read target for {command}: {analysis:?}"
+            );
+            assert!(!analysis
+                .capabilities
+                .contains(&ShellCapability::WorkspaceWrite));
+        }
+
+        let write = analyze_shell_command(
+            "[System.IO.File]::WriteAllText('C:\\Users\\me\\Downloads\\orders.txt', 'changed')",
+        );
+        assert!(write.capabilities.contains(&ShellCapability::Unknown));
+        assert!(!write.capabilities.contains(&ShellCapability::ReadFiles));
+
+        let wrapped_delete = analyze_shell_command(
+            "Remove-Item ([System.IO.File]::ReadAllText('C:\\Users\\me\\Downloads\\target.txt'))",
+        );
+        assert!(wrapped_delete.destructive);
+        assert!(wrapped_delete
+            .capabilities
+            .contains(&ShellCapability::DeleteFiles));
+
+        let dynamic_wrapper = analyze_shell_command(
+            "Invoke-Expression \"[System.IO.File]::ReadAllText('C:\\Users\\me\\Downloads\\orders.txt')\"",
+        );
+        assert!(dynamic_wrapper
+            .capabilities
+            .contains(&ShellCapability::Unknown));
+        assert!(!dynamic_wrapper
+            .capabilities
+            .contains(&ShellCapability::ReadFiles));
     }
 
     #[test]

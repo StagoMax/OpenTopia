@@ -15,7 +15,8 @@ use opentopia_core::collaboration::{
 };
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    bundled_plugins_path, compact_database_copy, ensure_bundled_plugins_installed, AppSettings,
+    bundled_plugins_path, compact_database_copy, ensure_bundled_plugins_installed,
+    initialize_shell_runtime, start_managed_powershell_install, AppSettings,
     BackgroundProcessRegistry, BrowserRuntime, BrowserRuntimeConfig, BrowserRuntimeRouter,
     BufferedTurnInbox, ChromeExtensionBrowserRuntime, ChromeExtensionBrowserRuntimeConfig,
     CodexAccountManager, ComputerRuntime, ComputerRuntimeConfig, DesktopBrowserRuntime,
@@ -95,7 +96,17 @@ pub(super) async fn run(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let shell = initialize_shell_runtime();
+    info!(
+        dialect = shell.runtime.dialect.id(),
+        version = shell.runtime.version.as_deref().unwrap_or("unknown"),
+        source = ?shell.runtime.source,
+        path = %shell.runtime.program.display(),
+        "resolved shell runtime"
+    );
+
     let state = assemble_application(&args).await?;
+    let _managed_powershell_install = start_managed_powershell_install();
     start_recovery_workers(&state).await?;
 
     let app = routes::build_router(state);

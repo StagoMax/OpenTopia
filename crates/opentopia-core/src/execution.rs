@@ -1826,6 +1826,81 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn local_environment_windows_dedicated_user_read_command_matrix() {
+        if !crate::sandbox::dedicated_user_credentials_are_installed_for_tests() {
+            return;
+        }
+        let id = Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("opentopia-core-read-matrix-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-core-read-inputs-{id}"));
+        let sandbox_home = std::env::temp_dir().join(format!("opentopia-core-read-home-{id}"));
+        std::fs::create_dir_all(&root).expect("create read-matrix workspace");
+        std::fs::create_dir_all(&outside).expect("create read-matrix input directory");
+        let text = outside.join("input.txt");
+        let csv = outside.join("orders.csv");
+        std::fs::write(&text, "external-readable").expect("write text fixture");
+        std::fs::write(&csv, "id,status\n42,open\n").expect("write csv fixture");
+
+        let mut config = LocalSandboxConfig::enforce();
+        config.network = NetworkPolicy::Deny;
+        config.sandbox_home = Some(sandbox_home.clone());
+        config.grant_read_path(outside.clone());
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config);
+        let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
+        let commands = [
+            (
+                format!(
+                    "Get-ChildItem -LiteralPath '{}' | Select-Object -ExpandProperty Name",
+                    quote(&outside)
+                ),
+                "orders.csv",
+            ),
+            (
+                format!(
+                    "Import-Csv -LiteralPath '{}' | Select-Object -ExpandProperty id",
+                    quote(&csv)
+                ),
+                "42",
+            ),
+            (
+                format!(
+                    "[System.IO.File]::ReadAllBytes('{}').Length",
+                    quote(&text)
+                ),
+                "17",
+            ),
+            (
+                format!(
+                    "$reader = [System.IO.StreamReader]::new('{}'); try {{ $reader.ReadToEnd() }} finally {{ $reader.Dispose() }}",
+                    quote(&text)
+                ),
+                "external-readable",
+            ),
+        ];
+
+        for (command, expected) in commands {
+            let output = env
+                .exec(
+                    ExecRequest::shell(command.clone()),
+                    ExecutionContext::with_timeout(Duration::from_secs(60)),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("read command failed to start: {command}: {error}"));
+            assert!(
+                output.success && String::from_utf8_lossy(&output.stdout).contains(expected),
+                "sandboxed read command failed: {command}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        std::fs::remove_dir_all(root).expect("remove read-matrix workspace");
+        std::fs::remove_dir_all(outside).expect("remove read-matrix input directory");
+        let _ = std::fs::remove_dir_all(sandbox_home);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn local_environment_windows_dedicated_user_command_matrix() {
         if !crate::sandbox::dedicated_user_credentials_are_installed_for_tests() {
             return;

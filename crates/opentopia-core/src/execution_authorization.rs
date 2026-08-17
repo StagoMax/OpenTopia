@@ -211,18 +211,10 @@ impl ExecutionGrant {
             .map(|path| resolve_requested_path(workspace_root, path))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // A turn may carry exact path leases from earlier approvals. Project
-        // only the leases needed by this declared intent into the call sandbox.
-        // In particular, a later shell/process call must not inherit the parent
-        // directory mount used to implement an earlier exact-file write.
-        let leased_read_paths = read_paths
-            .iter()
-            .filter(|path| {
-                base.is_within_approved_read_scope(path)
-                    || base.is_within_approved_write_scope(path)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        // A turn may carry exact write leases from earlier approvals. Project
+        // only leases needed by this declared intent into the call sandbox; a
+        // later shell/process call must not inherit the parent directory mount
+        // used to implement an earlier exact-file write.
         let leased_write_paths = write_paths
             .iter()
             .filter(|path| base.is_within_approved_write_scope(path))
@@ -230,10 +222,18 @@ impl ExecutionGrant {
             .collect::<Vec<_>>();
         sandbox.approved_read_paths.clear();
         sandbox.approved_write_paths.clear();
+
+        // Exact reads are safe, independently composable capabilities. Keep
+        // projecting a path that a tool has positively identified even when
+        // another part of the same shell command remains unknown and therefore
+        // uses command-scoped escalation. The unknown part stays inside the
+        // restricted sandbox; known reads no longer need a full-access replay
+        // merely because they are piped through an unclassified transform.
+        for path in read_paths {
+            sandbox.grant_read_path(path);
+        }
+
         if intent.approval_escalation == ApprovalEscalation::ExactPaths {
-            for path in leased_read_paths {
-                sandbox.grant_read_path(path);
-            }
             for path in leased_write_paths {
                 sandbox.grant_write_path(path);
             }
@@ -241,13 +241,6 @@ impl ExecutionGrant {
 
         match intent.approval_escalation {
             ApprovalEscalation::ExactPaths => {
-                // Read access is part of both restricted sandbox profiles, not
-                // an approval escalation. Project only the paths declared by
-                // this call so Windows can provision normal-user ACL access
-                // without widening later shell/process calls.
-                for path in read_paths {
-                    sandbox.grant_read_path(path);
-                }
                 if approval_granted || base.sandbox_mode == SandboxMode::DangerFullAccess {
                     for path in write_paths {
                         sandbox.grant_write_path(path);
@@ -450,6 +443,23 @@ mod tests {
 
         assert_eq!(ordinary.sandbox.sandbox_mode, SandboxMode::WorkspaceWrite);
         assert_eq!(approved.sandbox.sandbox_mode, SandboxMode::DangerFullAccess);
+    }
+
+    #[test]
+    fn command_scoped_process_still_projects_its_declared_exact_reads() {
+        let base = LocalSandboxConfig::enforce();
+        let requested = PathBuf::from("C:/outside/input.csv");
+        let sibling = PathBuf::from("C:/outside/other.csv");
+        let intent = ToolExecutionIntent::session_process(ProcessLifetime::OneShot)
+            .with_read_paths([requested.clone()]);
+
+        let ordinary =
+            ExecutionGrant::resolve(&base, Path::new("C:/workspace"), &intent, false).unwrap();
+
+        assert_eq!(ordinary.sandbox.sandbox_mode, SandboxMode::WorkspaceWrite);
+        assert!(ordinary.sandbox.is_within_approved_read_scope(&requested));
+        assert!(!ordinary.sandbox.is_within_approved_read_scope(&sibling));
+        assert!(ordinary.sandbox.approved_write_paths.is_empty());
     }
 
     #[test]

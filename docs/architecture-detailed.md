@@ -541,6 +541,10 @@ pnpm.cmd dev:desktop
 
 直接启动服务端时必须设置符合长度要求的 `OPENTOPIA_API_TOKEN`。`dev-env.ps1` 仅为本地验证提供默认 Token；Electron 启动时会替换为每次启动随机生成的 Token。
 
+Windows shell 由统一运行时解析器选择，优先级为：`OPENTOPIA_POWERSHELL_PATH` 显式路径、OpenTopia 受管理运行时、PowerShell 7 标准安装目录、绝对 `PATH` 条目，最后回退系统 `powershell.exe` 5.1。找不到 PowerShell 7 时，服务端在后台下载固定版本到 `%LOCALAPPDATA%\OpenTopia\runtimes`，校验固定 SHA-256 后安全解压并原子启用；下载失败不阻止启动。可用 `OPENTOPIA_RUNTIME_HOME` 改变运行时根目录、用 `OPENTOPIA_POWERSHELL_ARCHIVE` 提供离线官方 ZIP，或用 `OPENTOPIA_POWERSHELL_AUTO_INSTALL=false` 禁用自动下载。`/health` 返回当前 executable、版本、来源和受管理安装状态。
+
+所有内置文件变更入口把 `.ps1` 规范化为 UTF-8 BOM，使同一脚本在 PowerShell 7 和 Windows PowerShell 5.1 下都能按相同 Unicode 源码解析；控制台 UTF-8 设置只负责进程 I/O，不能替代脚本源码编码策略。
+
 ### 13.3 打包
 
 `scripts/build-desktop.ps1` 按顺序：
