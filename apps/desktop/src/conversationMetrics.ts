@@ -44,7 +44,9 @@ export function conversationMetrics(
 export function formatMetricDuration(durationMs: number | null): string {
   if (durationMs === null || !Number.isFinite(durationMs)) return "—";
   const safeDurationMs = Math.max(0, durationMs);
-  if (safeDurationMs < 1_000) return safeDurationMs === 0 ? "0s" : "<1s";
+  if (safeDurationMs < 1_000) {
+    return `${Math.round(safeDurationMs).toLocaleString("en-US")}ms`;
+  }
 
   const totalSeconds = Math.round(safeDurationMs / 1_000);
   if (totalSeconds < 60) {

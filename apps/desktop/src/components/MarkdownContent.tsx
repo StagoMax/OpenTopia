@@ -292,6 +292,7 @@ function MarkdownAnchor({
       <>
         <a
           aria-haspopup="menu"
+          data-text-context-menu="custom"
           href={href}
           title={targetTitle}
           className="markdown-file-link"

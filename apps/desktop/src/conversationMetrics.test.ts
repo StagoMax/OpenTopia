@@ -101,6 +101,8 @@ test("derives composer metrics from conversation usage events", () => {
 test("formats metric values with explicit compact units", () => {
   assert.equal(formatMetricDuration(782_000), "13m 2s");
   assert.equal(formatMetricDuration(1_300), "1.3s");
+  assert.equal(formatMetricDuration(850), "850ms");
+  assert.equal(formatMetricDuration(0), "0ms");
   assert.equal(formatMetricDuration(null), "—");
   assert.equal(formatMetricTokenCount(12_500_000), "12.5M tok");
   assert.equal(formatMetricTokenRate(132), "132 tok/s");

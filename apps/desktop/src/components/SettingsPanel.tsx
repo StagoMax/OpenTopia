@@ -44,10 +44,7 @@ import {
   classifyModelFamily,
   formatModelDisplayName,
 } from "../modelCatalog";
-import {
-  modelSupportsVision,
-  modelVisionSupportSource,
-} from "../modelCapabilities";
+import { resolveModelVisionSupport } from "../modelCapabilities";
 import { ModelInputDropdown } from "./ModelInputDropdown";
 import {
   Badge,
@@ -3205,8 +3202,20 @@ function ModelConfigurationSection({
     modelId,
   );
   const reportedContextWindow = connection.modelContextWindows?.[modelId];
-  const visionSource = modelVisionSupportSource(connection, modelId);
-  const supportsVision = modelSupportsVision(connection, modelId);
+  const visionResolution = resolveModelVisionSupport(connection, modelId);
+  const supportsVision = visionResolution.supportsVision;
+  const visionPreference =
+    modelSettings?.supportsVision === undefined
+      ? "automatic"
+      : modelSettings.supportsVision
+        ? "supported"
+        : "unsupported";
+  const automaticVisionDescription =
+    visionResolution.automaticSource === "detected"
+      ? `API 识别结果：${visionResolution.automaticSupportsVision ? "支持" : "不支持"}`
+      : visionResolution.automaticSource === "official"
+        ? `官方能力表：${visionResolution.automaticSupportsVision ? "支持" : "不支持"}`
+        : "API 与官方能力表均无记录；自动模式按不支持处理";
   const selectedContextWindowPreset =
     modelSettings?.contextWindowTokens == null
       ? "auto"
@@ -3401,33 +3410,35 @@ function ModelConfigurationSection({
       </div>
       <div className="settings-toggle-stack">
         <SettingsRow
-          title="支持图片输入"
+          title="图片输入能力"
           description={
-            visionSource === "manual"
-              ? `${modelId} · 已手动覆盖`
-              : visionSource === "detected"
+            visionResolution.source === "manual"
+              ? `${modelId} · 已手动设为${supportsVision ? "支持" : "不支持"}图片输入；${automaticVisionDescription}`
+              : visionResolution.source === "detected"
                 ? `${modelId} · API 已识别为${supportsVision ? "支持" : "不支持"}图片输入`
-                : `${modelId} · API 未返回多模态信息，沿用连接默认值`
+                : visionResolution.source === "official"
+                  ? `${modelId} · 官方能力表标记为${supportsVision ? "支持" : "不支持"}图片输入`
+                  : `${modelId} · API 与官方能力表均无记录；自动模式按不支持处理`
           }
           control={
-            <div className="settings-model-capability-control">
-              <Switch
-                label={`${modelId} 支持图片输入`}
-                checked={supportsVision}
-                onChange={(checked) =>
-                  updateModelSettings({ supportsVision: checked })
+            <Select
+              label={`${modelId} 图片输入能力`}
+              value={visionPreference}
+              options={[
+                { value: "automatic", label: "自动" },
+                { value: "supported", label: "手动：支持" },
+                { value: "unsupported", label: "手动：不支持" },
+              ]}
+              onChange={(preference) => {
+                if (preference === "automatic") {
+                  resetModelSetting("supportsVision");
+                  return;
                 }
-              />
-              {visionSource === "manual" ? (
-                <Button
-                  size="compact"
-                  variant="quiet"
-                  onClick={() => resetModelSetting("supportsVision")}
-                >
-                  恢复自动识别
-                </Button>
-              ) : null}
-            </div>
+                updateModelSettings({
+                  supportsVision: preference === "supported",
+                });
+              }}
+            />
           }
         />
       </div>
@@ -3694,7 +3705,6 @@ function createProviderSettings(
     promptCachePolicy: null,
     responsesCompactionThresholdTokens: null,
     rolloutBudget: null,
-    supportsVision: true,
     openaiCompatibility: null,
     apiKeySource: "OPENTOPIA_API_KEY",
     apiKeyConfigured: false,
@@ -3771,12 +3781,12 @@ function providerProtocolDescription(provider: ProviderSettings): string {
     return "仅用于本地模拟，不会调用远程 API。";
   }
   if (providerProtocolSelection(provider) === "openai_auto") {
-    return "同一连接会分别保存 Chat Completions 与 Responses 能力档案；线程可独立选择。";
+    return "本连接会自动选择 Chat Completions 或 Responses，并应用到所有使用它的任务。";
   }
   if (providerProtocolSelection(provider) === "anthropic_messages") {
-    return "请求使用 Anthropic Messages 线协议；认证方式由上方设置独立决定。";
+    return "本连接的所有任务使用 Anthropic Messages 线协议；认证方式由上方设置独立决定。";
   }
-  return "仅启用所选协议；连接测试会保存该模型的能力档案。";
+  return "仅启用所选协议，并应用到所有使用本连接的任务；连接测试会保存该模型的能力档案。";
 }
 
 function isOpenAiProviderKind(kind: ProviderKind): boolean {

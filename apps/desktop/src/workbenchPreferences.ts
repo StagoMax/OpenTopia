@@ -1,6 +1,5 @@
 import type {
   ExperienceMode,
-  ProviderAdapterKind,
   ProviderKind,
   ReasoningEffort,
   ThreadModelSelection,
@@ -26,8 +25,6 @@ type DraftModelProvider = {
   enabledFamilies: string[];
   syncedModels: string[];
   reasoningEffort?: ReasoningEffort | null;
-  allowedAdapters?: ProviderAdapterKind[];
-  preferredAdapter?: ProviderAdapterKind | null;
 };
 
 const sidebarStorageKey = "opentopia.sidebar-navigation.v1";
@@ -49,14 +46,6 @@ const reasoningEfforts = new Set<ReasoningEffort>([
   "high",
   "xhigh",
   "max",
-]);
-
-const providerAdapters = new Set<ProviderAdapterKind>([
-  "open_ai_chat",
-  "open_ai_responses",
-  "anthropic_messages",
-  "codex_app_server",
-  "mock",
 ]);
 
 export function parseSidebarNavigationState(
@@ -123,12 +112,6 @@ export function parseDraftModelSelection(
     typeof stored.modelId !== "string" ||
     !stored.modelId ||
     !(
-      stored.adapter === undefined ||
-      stored.adapter === null ||
-      (typeof stored.adapter === "string" &&
-        providerAdapters.has(stored.adapter as ProviderAdapterKind))
-    ) ||
-    !(
       stored.reasoningEffort === null ||
       (typeof stored.reasoningEffort === "string" &&
         reasoningEfforts.has(stored.reasoningEffort as ReasoningEffort))
@@ -136,14 +119,9 @@ export function parseDraftModelSelection(
   ) {
     return null;
   }
-  const adapter =
-    typeof stored.adapter === "string"
-      ? (stored.adapter as ProviderAdapterKind)
-      : null;
   return {
     connectionId: stored.connectionId,
     modelId: stored.modelId,
-    ...(adapter ? { adapter } : {}),
     reasoningEffort: stored.reasoningEffort as ReasoningEffort | null,
   };
 }
@@ -197,26 +175,9 @@ export function resolveDraftModelSelection(
   const modelId = canRestoreStored
     ? storedSelection.modelId
     : resolveDefaultModelId(modelIds, provider.enabledFamilies, provider.model);
-  const allowedAdapters = provider.allowedAdapters?.length
-    ? provider.allowedAdapters
-    : provider.kind === "anthropic"
-      ? (["anthropic_messages"] as ProviderAdapterKind[])
-      : provider.kind === "codex_app_server"
-        ? (["codex_app_server"] as ProviderAdapterKind[])
-        : provider.kind === "mock"
-          ? (["mock"] as ProviderAdapterKind[])
-          : (["open_ai_chat", "open_ai_responses"] as ProviderAdapterKind[]);
-  const storedAdapter = canRestoreStored ? storedSelection?.adapter : null;
-  const adapter =
-    storedAdapter &&
-    providerAdapters.has(storedAdapter) &&
-    allowedAdapters.includes(storedAdapter)
-      ? storedAdapter
-      : null;
   return {
     connectionId: provider.id,
     modelId,
-    ...(adapter ? { adapter } : {}),
     reasoningEffort: reconcileReasoningEffort(
       provider.kind,
       modelId,

@@ -82,3 +82,15 @@ export function hasPendingProviderRequest(events: AgentEvent[]): boolean {
   }
   return pendingRequestIds.size > 0;
 }
+
+export function hasPendingToolCall(events: AgentEvent[]): boolean {
+  const pendingCallIds = new Set<string>();
+  for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
+    if (event.payload.type === "tool_call_started") {
+      pendingCallIds.add(event.payload.call.id);
+    } else if (event.payload.type === "tool_call_finished") {
+      pendingCallIds.delete(event.payload.result.callId);
+    }
+  }
+  return pendingCallIds.size > 0;
+}

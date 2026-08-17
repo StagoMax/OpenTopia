@@ -165,13 +165,10 @@ export function classifyToolCall(call: ToolCall): ToolActivityKind {
   if (
     [
       "spawn_agent",
-      "send_input",
       "send_message",
       "followup_task",
       "interrupt_agent",
-      "cancel_agent",
       "wait_agent",
-      "wait_agents",
       "list_agents",
     ].includes(call.name)
   ) {
@@ -352,8 +349,7 @@ function buildToolActivityView(
     return {
       kind,
       title,
-      detail:
-        operation === "find" && path ? displayPath(path) : undefined,
+      detail: operation === "find" && path ? displayPath(path) : undefined,
       chips:
         numberField(metadata, "bytes") !== undefined
           ? [{ label: formatBytes(numberField(metadata, "bytes") ?? 0) }]
@@ -365,7 +361,11 @@ function buildToolActivityView(
           ? { type: "file", path: displayPath(path), text: clampText(content) }
           : result
             ? operation === "read"
-              ? { type: "file", path: displayPath(path), text: clampText(output) }
+              ? {
+                  type: "file",
+                  path: displayPath(path),
+                  text: clampText(output),
+                }
               : { type: "text", text: output }
             : { type: "pending" },
       failed,
@@ -468,7 +468,7 @@ function buildToolActivityView(
     const action = stringField(input, "action") || "操作";
     return {
       kind,
-      title: `表格 · ${action}`,
+      title: action,
       detail:
         displayPath(
           stringField(input, "path") || stringField(input, "outputPath"),
@@ -482,19 +482,16 @@ function buildToolActivityView(
   if (
     [
       "spawn_agent",
-      "send_input",
       "send_message",
       "followup_task",
       "interrupt_agent",
-      "cancel_agent",
       "wait_agent",
-      "wait_agents",
       "list_agents",
     ].includes(call.name)
   ) {
     return {
       kind,
-      title: subagentTitle(call.name, input),
+      title: agentToolTitle(call.name, input),
       chips: [],
       body: bodyFromFields(input, output, result),
       failed,
@@ -1071,6 +1068,17 @@ export function toolResultFailed(result?: ToolResult) {
   return metadata?.success === false || metadata?.isError === true;
 }
 
+export function toolActivityGroupStatus(
+  results: readonly (ToolResult | undefined)[],
+): "running" | "complete" {
+  // A folded group describes batch lifecycle, while failures belong to their
+  // individual tool cards. This keeps a recoverable child failure from
+  // escalating the presentation of the whole group.
+  return results.some((result) => result === undefined)
+    ? "running"
+    : "complete";
+}
+
 export function mcpToolNameParts(
   name: string,
 ): { server: string; tool: string } | null {
@@ -1258,15 +1266,14 @@ function inputFields(
     });
 }
 
-function subagentTitle(name: string, input: Record<string, unknown>) {
+function agentToolTitle(name: string, input: Record<string, unknown>) {
   if (name === "spawn_agent") {
-    return `创建子智能体 ${stringField(input, "name")}`.trim();
+    return `创建子智能体 ${stringField(input, "task_name")}`.trim();
   }
   if (name === "list_agents") return "查看子智能体";
-  if (name === "cancel_agent") return "取消子智能体";
   if (name === "interrupt_agent") return "中断子智能体";
-  if (name === "wait_agent" || name === "wait_agents")
-    return "等待子智能体完成";
+  if (name === "wait_agent") return "等待子智能体完成";
+  if (name === "followup_task") return "向子智能体追加任务";
   return "向子智能体发送消息";
 }
 

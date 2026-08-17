@@ -9,7 +9,6 @@ import {
 import {
   Activity,
   AlertCircle,
-  Bot,
   ChevronDown,
   ChevronRight,
   ChevronUp,
@@ -30,7 +29,6 @@ import {
 } from "lucide-react";
 import type {
   AgentEvent,
-  SubagentRun,
   WorkForm,
   ToolCall,
   ToolResult,
@@ -44,7 +42,7 @@ import {
   redactText,
   stringField,
   toolActivityGroup,
-  toolResultFailed,
+  toolActivityGroupStatus,
   truncateText,
   type ToolActivityGroup as ToolGroupKey,
   type ToolActivityIconKind,
@@ -122,7 +120,6 @@ type PrimitiveActivity =
       text: string;
       createdAt: string;
     }
-  | { kind: "subagent"; seq: number; run: SubagentRun; createdAt: string }
   | {
       kind: "approval";
       seq: number;
@@ -1071,9 +1068,6 @@ function ActivityEntryView({
       />
     );
   }
-  if (entry.kind === "subagent") {
-    return <SubagentActivity run={entry.run} now={now} />;
-  }
   if (entry.kind === "approval") {
     return (
       <ActivityNotice
@@ -1159,14 +1153,14 @@ function ToolActivityGroup({
   defaultExpanded: boolean;
   now: number;
 }) {
-  const running = executions.some((execution) => !execution.result);
+  const state = toolActivityGroupStatus(
+    executions.map((execution) => execution.result),
+  );
+  const running = state === "running";
   const commandBatch = group === "shell" && executions.length > 1;
   const runningCommand = [...executions]
     .reverse()
     .find((execution) => !execution.result);
-  const failed = executions.some((execution) =>
-    toolResultFailed(execution.result),
-  );
   const timing = formatExecutionGroupTiming(executions, running, now);
   const [expanded, setExpanded] = useState(
     !commandBatch && (defaultExpanded || running),
@@ -1193,10 +1187,7 @@ function ToolActivityGroup({
   }
 
   return (
-    <div
-      className="activity-group"
-      data-state={failed ? "error" : running ? "running" : "complete"}
-    >
+    <div className="activity-group" data-state={state}>
       <button
         className="activity-group-header"
         type="button"
@@ -1210,7 +1201,7 @@ function ToolActivityGroup({
           {toolGroupTitle(group, executions)}
           {timing ? ` · ${timing}` : ""}
         </span>
-        <ActivityResultIcon running={running} failed={failed} />
+        <ActivityResultIcon running={running} />
         {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
       </button>
       {expanded && (
@@ -1279,7 +1270,7 @@ function FileActivityGroup({
         <span>
           修改了 {files.length} 个文件{timing ? ` · ${timing}` : ""}
         </span>
-        <ActivityResultIcon running={false} failed={false} />
+        <ActivityResultIcon running={false} />
         {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
       </button>
       {expanded && (
@@ -1502,56 +1493,6 @@ function WorkFormActivity({
   );
 }
 
-function SubagentActivity({ run, now }: { run: SubagentRun; now: number }) {
-  const [expanded, setExpanded] = useState(run.status === "running");
-  const running = run.status === "running" || run.status === "queued";
-  const failed = run.status === "failed" || run.status === "timed_out";
-  const timing = formatActivityTiming(
-    run.startedAt || run.createdAt,
-    run.completedAt || undefined,
-    running,
-    now,
-  );
-  return (
-    <div
-      className="activity-group"
-      data-state={failed ? "error" : running ? "running" : "complete"}
-    >
-      <button
-        className="activity-group-header"
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <span className="activity-group-icon" aria-hidden="true">
-          <Bot size={13} />
-        </span>
-        <span>Agent：{run.agentPath || run.name}</span>
-        <small className="activity-group-count">
-          {subagentStatusLabel(run.status)}
-          {timing ? ` · ${timing}` : ""}
-        </small>
-        {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-      </button>
-      {expanded && (
-        <div className="subagent-activity-details">
-          <span>任务</span>
-          <p>{redactText(run.input)}</p>
-          {(run.result || run.error) && (
-            <span>{run.error ? "错误" : "结果"}</span>
-          )}
-          {run.result && (
-            <pre>{truncateText(redactText(run.result), 12_000)}</pre>
-          )}
-          {run.error && (
-            <pre>{truncateText(redactText(run.error), 12_000)}</pre>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function ActivityNotice({
   className,
   icon,
@@ -1647,15 +1588,8 @@ function guardianActivityIcon(kind: GuardianActivityIcon): ReactNode {
   }
 }
 
-function ActivityResultIcon({
-  running,
-  failed,
-}: {
-  running: boolean;
-  failed: boolean;
-}) {
+function ActivityResultIcon({ running }: { running: boolean }) {
   if (running) return <ActivityFlow compact />;
-  if (failed) return <X size={12} className="activity-result-icon" />;
   return <span className="activity-result-spacer" aria-hidden="true" />;
 }
 
@@ -1717,10 +1651,6 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
     { result: ToolResult; createdAt: string; seq: number }
   >();
   const startedCallIds = new Set<string>();
-  const subagents = new Map<
-    string,
-    Extract<PrimitiveActivity, { kind: "subagent" }>
-  >();
   const guardianReviews = new Map<
     string,
     Extract<PrimitiveActivity, { kind: "guardian-review" }>
@@ -1813,20 +1743,6 @@ function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         summary: payload.summary,
         createdAt: event.createdAt,
       });
-    } else if (payload.type === "subagent_updated") {
-      const current = subagents.get(payload.run.id);
-      if (current) {
-        current.run = payload.run;
-      } else {
-        const entry: Extract<PrimitiveActivity, { kind: "subagent" }> = {
-          kind: "subagent",
-          seq: event.seq,
-          run: payload.run,
-          createdAt: event.createdAt,
-        };
-        subagents.set(payload.run.id, entry);
-        primitives.push(entry);
-      }
     } else if (payload.type === "approval_requested") {
       primitives.push({
         kind: "approval",
@@ -2107,9 +2023,6 @@ function activityEntryIsRunning(entry: ActivityEntry) {
   if (entry.kind === "work-form") {
     return entry.form.items.some((item) => item.status === "in_progress");
   }
-  if (entry.kind === "subagent") {
-    return entry.run.status === "queued" || entry.run.status === "running";
-  }
   if (entry.kind === "guardian-review") return !entry.completed;
   return false;
 }
@@ -2137,7 +2050,6 @@ function activityState(events: AgentEvent[], isActive: boolean): ActivityState {
 function activityEntryKey(entry: ActivityEntry) {
   if (entry.kind === "tool-group" || entry.kind === "file-group")
     return entry.id;
-  if (entry.kind === "subagent") return `subagent-${entry.run.id}`;
   if (entry.kind === "guardian-review") {
     return `guardian-review-${entry.reviewId}`;
   }
@@ -2408,18 +2320,6 @@ function formatTurnElapsed(duration: number) {
   if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
   if (minutes > 0) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
-}
-
-function subagentStatusLabel(status: SubagentRun["status"]) {
-  const labels: Record<SubagentRun["status"], string> = {
-    queued: "排队中",
-    running: "执行中",
-    completed: "已完成",
-    failed: "失败",
-    cancelled: "已取消",
-    timed_out: "超时",
-  };
-  return labels[status];
 }
 
 function toolGroupTitle(group: ToolGroupKey, executions: ToolExecution[]) {

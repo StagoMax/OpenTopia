@@ -4,6 +4,7 @@ import {
   activeTurnIdFromEvents,
   canCancelTurn,
   hasPendingProviderRequest,
+  hasPendingToolCall,
   inactiveTurnIdsFromEvents,
   resolveActiveTurnId,
 } from "./turnActivityStatus.ts";
@@ -116,6 +117,31 @@ test("keeps thinking while any provider request remains unanswered", () => {
       providerRequest(2, "request-2"),
       providerResponse(3, "request-1"),
       providerResponse(4, "request-2"),
+    ]),
+    false,
+  );
+});
+
+test("tracks whether a tool call already has a terminal result", () => {
+  assert.equal(
+    hasPendingToolCall([
+      event(1, {
+        type: "tool_call_started",
+        call: { id: "call-1", name: "read_file", input: {} },
+      }),
+    ]),
+    true,
+  );
+  assert.equal(
+    hasPendingToolCall([
+      event(2, {
+        type: "tool_call_finished",
+        result: { callId: "call-1", output: "ok", metadata: {} },
+      }),
+      event(1, {
+        type: "tool_call_started",
+        call: { id: "call-1", name: "read_file", input: {} },
+      }),
     ]),
     false,
   );

@@ -9,8 +9,12 @@ import {
 import { createPortal } from "react-dom";
 import {
   editableTextMenuAvailability,
+  textContextMenuActions,
   type EditableTextMenuAvailability,
+  type TextContextMenuAction,
+  type TextContextMenuMode,
 } from "../../editableTextContextMenu";
+import { normalizeCopiedText } from "../../clipboardText";
 import {
   fitContextMenuPosition,
   type ContextMenuPoint,
@@ -18,7 +22,6 @@ import {
 
 type TextControl = HTMLInputElement | HTMLTextAreaElement;
 type EditableTarget = TextControl | HTMLElement;
-type EditAction = "cut" | "copy" | "paste" | "selectAll";
 
 type SelectionSnapshot =
   | {
@@ -27,10 +30,12 @@ type SelectionSnapshot =
       end: number;
       direction: "forward" | "backward" | "none";
     }
-  | { kind: "content"; range: Range };
+  | { kind: "content"; range: Range; text: string };
 
 type MenuState = {
   availability: EditableTextMenuAvailability;
+  focusTarget: HTMLElement | null;
+  mode: TextContextMenuMode;
   point: ContextMenuPoint;
   selectedText: string;
   selection: SelectionSnapshot;
@@ -46,12 +51,12 @@ const textInputTypes = new Set([
   "url",
 ]);
 
-const menuItems: Array<{ action: EditAction; label: string }> = [
-  { action: "cut", label: "剪切" },
-  { action: "copy", label: "复制" },
-  { action: "paste", label: "粘贴" },
-  { action: "selectAll", label: "全选" },
-];
+const menuLabels: Record<TextContextMenuAction, string> = {
+  cut: "剪切",
+  copy: "复制",
+  paste: "粘贴",
+  selectAll: "全选",
+};
 
 export function EditableTextContextMenu() {
   const menuRef = useRef<HTMLDivElement>(null);
@@ -69,10 +74,17 @@ export function EditableTextContextMenu() {
 
   useEffect(() => {
     function handleContextMenu(event: MouseEvent) {
-      const target = editableTargetFrom(event.target);
+      const editableTarget = editableTargetFrom(event.target);
+      const selectionTarget = editableTarget
+        ? null
+        : selectionTargetFrom(event.target);
+      const target = editableTarget ?? selectionTarget;
       if (!target) return;
       const selection = captureSelection(target);
       if (!selection) return;
+      const mode: TextContextMenuMode = editableTarget
+        ? "editable"
+        : "selection";
 
       event.preventDefault();
       const bounds = target.getBoundingClientRect();
@@ -83,10 +95,15 @@ export function EditableTextContextMenu() {
       const selectedText = selectedTextFor(target, selection);
       const nextMenu = {
         availability: editableTextMenuAvailability({
-          readOnly: isReadOnly(target),
+          readOnly: mode === "selection" || isReadOnly(target),
           selectionLength: selectedText.length,
           textLength: editableTextLength(target),
         }),
+        focusTarget:
+          document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null,
+        mode,
         point,
         selectedText,
         selection,
@@ -162,7 +179,7 @@ export function EditableTextContextMenu() {
     }
   }, [close, menu]);
 
-  async function runAction(action: EditAction) {
+  async function runAction(action: TextContextMenuAction) {
     if (!menu || !menu.target.isConnected) return close();
     const current = menu;
     close();
@@ -173,7 +190,11 @@ export function EditableTextContextMenu() {
       return;
     }
     if (action === "copy") {
-      await copyText(current.selectedText);
+      await copyText(
+        current.mode === "selection"
+          ? normalizeCopiedText(current.selectedText)
+          : current.selectedText,
+      );
       return;
     }
     if (action === "cut") {
@@ -226,7 +247,7 @@ export function EditableTextContextMenu() {
   if (!menu) return null;
   return createPortal(
     <div
-      aria-label="文本编辑"
+      aria-label={menu.mode === "editable" ? "文本编辑" : "对话文本操作"}
       className="ot-editable-context-menu"
       onContextMenu={(event) => event.preventDefault()}
       onKeyDown={handleMenuKeyDown}
@@ -238,7 +259,7 @@ export function EditableTextContextMenu() {
         visibility: position ? "visible" : "hidden",
       }}
     >
-      {menuItems.map(({ action, label }) => (
+      {textContextMenuActions(menu.mode).map((action) => (
         <button
           className="ot-editable-context-menu__item"
           disabled={!menu.availability[actionAvailabilityKey(action)]}
@@ -247,7 +268,7 @@ export function EditableTextContextMenu() {
           role="menuitem"
           type="button"
         >
-          {label}
+          {menuLabels[action]}
         </button>
       ))}
     </div>,
@@ -256,12 +277,7 @@ export function EditableTextContextMenu() {
 }
 
 function editableTargetFrom(value: EventTarget | null): EditableTarget | null {
-  const element =
-    value instanceof Element
-      ? value
-      : value instanceof Node
-        ? value.parentElement
-        : null;
+  const element = eventElement(value);
   if (!element) return null;
 
   const control = element.closest("input, textarea");
@@ -285,6 +301,29 @@ function editableTargetFrom(value: EventTarget | null): EditableTarget | null {
   return editable;
 }
 
+function selectionTargetFrom(value: EventTarget | null): HTMLElement | null {
+  const element = eventElement(value);
+  if (!element) return null;
+  if (
+    element.closest(
+      'input, textarea, select, [contenteditable], [data-text-context-menu="custom"]',
+    )
+  ) {
+    return null;
+  }
+  return element.closest<HTMLElement>(
+    '[data-text-context-menu="conversation-history"]',
+  );
+}
+
+function eventElement(value: EventTarget | null): Element | null {
+  return value instanceof Element
+    ? value
+    : value instanceof Node
+      ? value.parentElement
+      : null;
+}
+
 function captureSelection(target: EditableTarget): SelectionSnapshot | null {
   if (isTextControl(target)) {
     if (target.selectionStart === null || target.selectionEnd === null) {
@@ -304,18 +343,26 @@ function captureSelection(target: EditableTarget): SelectionSnapshot | null {
     selection.rangeCount > 0 &&
     target.contains(selection.getRangeAt(0).commonAncestorContainer)
   ) {
-    return { kind: "content", range: selection.getRangeAt(0).cloneRange() };
+    return {
+      kind: "content",
+      range: selection.getRangeAt(0).cloneRange(),
+      text: selection.toString(),
+    };
   }
   const range = document.createRange();
   range.selectNodeContents(target);
   range.collapse(false);
-  return { kind: "content", range };
+  return { kind: "content", range, text: "" };
 }
 
 function restoreSelection(menu: MenuState) {
   const { selection, target } = menu;
   if (!target.isConnected) return;
-  target.focus({ preventScroll: true });
+  if (menu.mode === "editable") {
+    target.focus({ preventScroll: true });
+  } else if (menu.focusTarget?.isConnected) {
+    menu.focusTarget.focus({ preventScroll: true });
+  }
   if (selection.kind === "control" && isTextControl(target)) {
     target.setSelectionRange(
       selection.start,
@@ -338,7 +385,7 @@ function selectedTextFor(
   if (selection.kind === "control" && isTextControl(target)) {
     return target.value.slice(selection.start, selection.end);
   }
-  return selection.kind === "content" ? selection.range.toString() : "";
+  return selection.kind === "content" ? selection.text : "";
 }
 
 function editableTextLength(target: EditableTarget): number {
@@ -360,7 +407,7 @@ function isTextControl(target: EditableTarget): target is TextControl {
 }
 
 function actionAvailabilityKey(
-  action: EditAction,
+  action: TextContextMenuAction,
 ): keyof EditableTextMenuAvailability {
   if (action === "cut") return "canCut";
   if (action === "copy") return "canCopy";
@@ -389,7 +436,20 @@ async function copyText(text: string): Promise<boolean> {
       // Fall through to Chromium's focused-selection command.
     }
   }
-  return document.execCommand("copy");
+
+  let wroteClipboardData = false;
+  const writePlainText = (event: ClipboardEvent) => {
+    if (!event.clipboardData) return;
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+    wroteClipboardData = true;
+  };
+  document.addEventListener("copy", writePlainText, true);
+  try {
+    return document.execCommand("copy") && wroteClipboardData;
+  } finally {
+    document.removeEventListener("copy", writePlainText, true);
+  }
 }
 
 async function readClipboardText(): Promise<string | null> {

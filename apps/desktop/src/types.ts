@@ -220,7 +220,6 @@ export type Thread = {
 export type ThreadModelSelection = {
   connectionId: string;
   modelId: string;
-  adapter?: ProviderAdapterKind | null;
   reasoningEffort: ReasoningEffort | null;
 };
 
@@ -731,7 +730,6 @@ export type ProviderSettings = {
   promptCachePolicy?: "explicit_30m" | "legacy_in_memory" | "legacy_24h" | null;
   responsesCompactionThresholdTokens?: number | null;
   rolloutBudget?: RolloutBudgetSettings | null;
-  supportsVision: boolean;
   openaiCompatibility?: OpenAiCompatibilityReport | null;
   apiKeySource: string;
   apiKeyConfigured: boolean;
@@ -2686,7 +2684,6 @@ export type AgentEventPayload =
       target_turn_id: string;
       files_changed: number;
     }
-  | { type: "subagent_updated"; run: SubagentRun }
   | {
       type: "approval_requested";
       approval_id: string;
@@ -2778,27 +2775,107 @@ export type AgentEventPayload =
   | { type: "turn_cancelled"; reason: string }
   | { type: "error"; message: string };
 
-export type SubagentRunStatus =
-  "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
+export type AgentTurnStatus =
+  | "queued"
+  | "running"
+  | "waiting_approval"
+  | "waiting_input"
+  | "waiting_action"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
 
-export type SubagentRun = {
+export type AgentAvailability =
+  | "idle"
+  | "queued"
+  | "running"
+  | "needs_attention"
+  | "archived";
+
+export type AgentSpawnPolicy = {
+  allowChildSpawns: boolean;
+  maxDepth: number;
+  maxDirectChildren: number;
+};
+
+export type AgentThread = {
   id: string;
-  parentThreadId: string;
-  parentTurnId: string;
-  agentPath: string;
-  parentAgentPath: string;
-  name: string;
+  sessionId: string;
+  parentAgentThreadId?: string | null;
+  path: string;
+  taskName: string;
   agentType: string;
-  input: string;
-  forkTurns: string;
-  lastTaskMessage: string;
-  depth: number;
-  status: SubagentRunStatus;
-  result?: string | null;
-  error?: string | null;
+  runtimeSnapshotId: string;
+  spawnPolicy: AgentSpawnPolicy;
+  createdAt: string;
+  archivedAt?: string | null;
+};
+
+export type AgentTurn = {
+  id: string;
+  sessionId: string;
+  agentThreadId: string;
+  requestedByAgentThreadId?: string | null;
+  requestedByTurnId?: string | null;
+  sequence: number;
+  taskMessage: string;
+  status: AgentTurnStatus;
+  invocationId: number;
+  outcomeRef?: string | null;
   createdAt: string;
   startedAt?: string | null;
   completedAt?: string | null;
+};
+
+export type AgentActivityEventDetails =
+  | { type: "model_round"; round: number }
+  | {
+      type: "tool_call_started";
+      invocation_id: string;
+      tool_name: string;
+      input_preview: unknown;
+    }
+  | {
+      type: "tool_call_finished";
+      invocation_id: string;
+      tool_name?: string | null;
+    }
+  | { type: "waiting"; reason: string }
+  | { type: "error"; message: string };
+
+export type AgentActivityEvent = {
+  seq: number;
+  kind: string;
+  createdAt: string;
+  details?: AgentActivityEventDetails | null;
+};
+
+export type AgentToolResultProjection = {
+  invocationId: string;
+  toolName?: string | null;
+  kind: "text" | "json" | "resource" | "binary" | "mixed";
+  preview: unknown;
+  truncated: boolean;
+  resultRef: string;
+};
+
+export type AgentActivityWindow = {
+  agentThreadId: string;
+  agentTurnId: string;
+  turnStatus: AgentTurnStatus;
+  modelRound?: number | null;
+  cursor: number;
+  reasoningTail?: string | null;
+  recentEvents: AgentActivityEvent[];
+  recentToolResults: AgentToolResultProjection[];
+};
+
+export type AgentListItem = {
+  agent: AgentThread;
+  latestTurn?: AgentTurn | null;
+  availability: AgentAvailability;
+  activity?: AgentActivityWindow | null;
 };
 
 export type TurnStatus = {

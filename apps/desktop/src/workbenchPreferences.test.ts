@@ -31,7 +31,7 @@ test("restores durable sidebar navigation state and removes invalid ids", () => 
   );
 });
 
-test("accepts only complete stored draft model selections", () => {
+test("accepts complete stored draft model selections and drops legacy protocol overrides", () => {
   assert.deepEqual(
     parseDraftModelSelection({
       connectionId: "openai",
@@ -62,18 +62,21 @@ test("accepts only complete stored draft model selections", () => {
     {
       connectionId: "tokenhub",
       modelId: "gpt-5.6-sol",
-      adapter: "open_ai_responses",
       reasoningEffort: "high",
     },
   );
-  assert.equal(
+  assert.deepEqual(
     parseDraftModelSelection({
       connectionId: "tokenhub",
       modelId: "gpt-5.6-sol",
       adapter: "tokenhub_magic",
       reasoningEffort: "high",
     }),
-    null,
+    {
+      connectionId: "tokenhub",
+      modelId: "gpt-5.6-sol",
+      reasoningEffort: "high",
+    },
   );
 });
 

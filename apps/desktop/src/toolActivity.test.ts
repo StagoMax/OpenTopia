@@ -17,6 +17,7 @@ const {
   parseShellEnvelope,
   parseShellStreams,
   patchTargets,
+  toolActivityGroupStatus,
 } = toolActivity;
 
 const call = (name: string, input: unknown) => ({ id: "call-1", name, input });
@@ -176,6 +177,19 @@ test("builds a terminal body for shell calls", () => {
   }
 });
 
+test("uses the spreadsheet action as the activity title without a redundant type prefix", () => {
+  const view = buildToolActivity(
+    call("spreadsheet", {
+      action: "inspect",
+      path: String.raw`C:\Users\Stargo\Downloads\orders.xlsx`,
+    }),
+  );
+
+  assert.equal(view.kind, "spreadsheet");
+  assert.equal(view.title, "inspect");
+  assert.equal(view.detail, "C:/Users/Stargo/Downloads/orders.xlsx");
+});
+
 test("presents image attachments with their file format and size", () => {
   const pending = buildToolActivity(
     call("view_attachment", { attachmentId: "attachment-1" }),
@@ -307,6 +321,14 @@ test("marks a non-zero exit as failed and labels it as failed", () => {
     view.chips.map((chip) => chip.label),
     ["失败"],
   );
+});
+
+test("keeps a finished tool group neutral when a nested call failed", () => {
+  const successful = result("ok", { success: true });
+  const failed = result("not found", { success: false, exitCode: 1 });
+
+  assert.equal(toolActivityGroupStatus([successful, failed]), "complete");
+  assert.equal(toolActivityGroupStatus([successful, undefined]), "running");
 });
 
 test("labels a successful shell call as successful", () => {

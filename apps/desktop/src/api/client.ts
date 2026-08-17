@@ -82,7 +82,7 @@ import type {
   SkillDescriptor,
   SpreadsheetPreview,
   SpreadsheetPreviewRange,
-  SubagentRun,
+  AgentListItem,
   TerminalCancelResponse,
   TerminalEvent,
   TerminalStartResponse,
@@ -1086,39 +1086,21 @@ export class ApiClient {
     return this.get(`/api/threads/${threadId}/turn`, signal);
   }
 
-  async listSubagents(
+  async listAgents(
     threadId: string,
     signal?: AbortSignal,
-  ): Promise<SubagentRun[]> {
-    return this.get(`/api/threads/${threadId}/subagents`, signal);
+  ): Promise<AgentListItem[]> {
+    return this.get(`/api/threads/${threadId}/agents`, signal);
   }
 
-  async spawnSubagent(
+  async interruptAgent(
     threadId: string,
-    input: {
-      name: string;
-      input: string;
-      agentType?: string;
-      forkTurns?: string;
-      parentTurnId?: string;
-      depth?: number;
-    },
-  ): Promise<SubagentRun> {
-    return this.post(`/api/threads/${threadId}/subagents`, input);
-  }
-
-  async sendSubagentInput(
-    threadId: string,
-    runId: string,
-    input: string,
+    agentThreadId: string,
   ): Promise<void> {
-    return this.post(`/api/threads/${threadId}/subagents/${runId}/input`, {
-      input,
-    });
-  }
-
-  async cancelSubagent(threadId: string, runId: string): Promise<void> {
-    return this.post(`/api/threads/${threadId}/subagents/${runId}/cancel`, {});
+    return this.post(
+      `/api/threads/${threadId}/agents/${agentThreadId}/interrupt`,
+      {},
+    );
   }
 
   async cancelTurn(
@@ -1655,6 +1637,18 @@ export class ApiClient {
       `/api/threads/${threadId}/events/stream${query}`,
       (data) => onEvent(JSON.parse(data) as AgentEvent),
       "projected",
+    );
+  }
+
+  openAgentEventStream(
+    threadId: string,
+    since: number | undefined,
+    onEvent: (event: AgentEvent) => void,
+  ): StreamHandle {
+    const query = queryString({ since });
+    return this.openAuthenticatedSse(
+      `/api/threads/${threadId}/agents/events/stream${query}`,
+      (data) => onEvent(JSON.parse(data) as AgentEvent),
     );
   }
 

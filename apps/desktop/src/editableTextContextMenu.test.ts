@@ -3,7 +3,7 @@ import test from "node:test";
 
 import type * as EditableTextContextMenuModule from "./editableTextContextMenu";
 
-const { editableTextMenuAvailability } = (await import(
+const { editableTextMenuAvailability, textContextMenuActions } = (await import(
   "./editableTextContextMenu" + ".ts"
 )) as typeof EditableTextContextMenuModule;
 
@@ -53,4 +53,17 @@ test("allows paste into an empty writable field", () => {
       canSelectAll: false,
     },
   );
+});
+
+test("shows only copy and select all for selectable history text", () => {
+  assert.deepEqual(textContextMenuActions("selection"), ["copy", "selectAll"]);
+});
+
+test("keeps the complete edit menu for writable fields", () => {
+  assert.deepEqual(textContextMenuActions("editable"), [
+    "cut",
+    "copy",
+    "paste",
+    "selectAll",
+  ]);
 });

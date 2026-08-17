@@ -5480,36 +5480,6 @@ button:disabled {
   background: var(--surface-subtle);
 }
 
-.subagent-activity-details {
-  display: grid;
-  min-width: 0;
-  gap: 8px;
-  padding: 2px 0 10px var(--activity-gutter);
-}
-
-.subagent-activity-details > span {
-  display: block;
-  margin-bottom: 4px;
-  color: var(--text-muted);
-  font-size: 10px;
-}
-
-.subagent-activity-details pre {
-  max-height: 320px;
-  margin: 0;
-  padding: 9px 10px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--surface-subtle);
-  color: var(--text);
-  font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 10px;
-  line-height: 1.55;
-  overflow: auto;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .thread-row-wrap:hover
     .thread-title-viewport.is-overflowing
@@ -7958,36 +7928,6 @@ button:disabled {
   background: var(--surface-subtle);
 }
 
-.subagent-activity-details {
-  display: grid;
-  min-width: 0;
-  gap: 8px;
-  padding: 2px 0 10px var(--activity-gutter);
-}
-
-.subagent-activity-details > span {
-  display: block;
-  margin-bottom: 4px;
-  color: var(--text-muted);
-  font-size: 10px;
-}
-
-.subagent-activity-details pre {
-  max-height: 320px;
-  margin: 0;
-  padding: 9px 10px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--surface-subtle);
-  color: var(--text);
-  font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 10px;
-  line-height: 1.55;
-  overflow: auto;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .activity-flow::after {
     animation: none;
@@ -8033,8 +7973,7 @@ button:disabled {
   padding: 2px 0 9px var(--activity-gutter);
 }
 
-.activity-plan > p,
-.subagent-activity-details p {
+.activity-plan > p {
   margin: 0 0 7px;
   color: var(--text-muted);
   font-size: 10px;
@@ -11065,12 +11004,6 @@ button:disabled {
 
 .settings-model-parameter-grid {
   padding: var(--space-6) var(--space-8);
-}
-
-.settings-model-capability-control {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
 }
 
 .settings-provider-footer {

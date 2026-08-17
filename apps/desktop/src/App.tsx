@@ -248,6 +248,7 @@ import {
   activeTurnIdFromEvents,
   canCancelTurn,
   hasPendingProviderRequest,
+  hasPendingToolCall,
   inactiveTurnIdFromEvent,
   inactiveTurnIdsFromEvents,
   resolveActiveTurnId,
@@ -302,7 +303,7 @@ import type {
   SandboxDescriptor,
   SecretSources,
   SkillDescriptor,
-  SubagentRun,
+  AgentListItem,
   WorkForm,
   TerminalEvent,
   TerminalSession,
@@ -533,7 +534,10 @@ function resolveComposerWorkForm(
 ): WorkForm | null {
   const latestRuntimeForm = resolveRuntimeWorkForm(events);
   const goalForm = snapshot?.workForm ?? null;
-  if (goalForm && (!latestRuntimeForm || latestRuntimeForm.id === goalForm.id)) {
+  if (
+    goalForm &&
+    (!latestRuntimeForm || latestRuntimeForm.id === goalForm.id)
+  ) {
     return goalForm;
   }
   return latestRuntimeForm ?? goalForm;
@@ -729,7 +733,7 @@ export function App() {
   );
   const conversationCacheClientRef = useRef<ApiClient | null>(null);
   const inactiveTurnIdsRef = useRef<ReadonlySet<string>>(new Set());
-  const [subagentRuns, setSubagentRuns] = useState<SubagentRun[]>([]);
+  const [agentItems, setAgentItems] = useState<AgentListItem[]>([]);
   const [terminalEvents, setTerminalEvents] = useState<TerminalEvent[]>([]);
   const [terminalSession, setTerminalSession] =
     useState<TerminalSession | null>(null);
@@ -1905,15 +1909,6 @@ export function App() {
           };
         });
       }
-
-      if (event.payload.type === "subagent_updated") {
-        const run = event.payload.run;
-        setSubagentRuns((current) =>
-          [run, ...current.filter((item) => item.id !== run.id)].sort(
-            (left, right) => right.createdAt.localeCompare(left.createdAt),
-          ),
-        );
-      }
     },
     [
       clearTurnCancellationRequest,
@@ -2206,7 +2201,44 @@ export function App() {
     const threadId = activeThreadId;
     let cancelled = false;
     let source: StreamHandle | null = null;
+    let agentSource: StreamHandle | null = null;
+    let agentRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     const controller = new AbortController();
+    const openAgentStream = (items: AgentListItem[]) => {
+      if (agentSource || items.length === 0) return;
+      const cursor = items.reduce(
+        (latest, item) => Math.max(latest, item.activity?.cursor ?? 0),
+        0,
+      );
+      agentSource = client.openAgentEventStream(
+        threadId,
+        cursor || undefined,
+        () => scheduleAgentRefresh(),
+      );
+    };
+    const refreshAgents = () => {
+      void client
+        .listAgents(threadId, controller.signal)
+        .then((items) => {
+          if (cancelled) return;
+          setAgentItems(items);
+          openAgentStream(items);
+        })
+        .catch((error) => {
+          if (!cancelled && !isAbortError(error)) {
+            setServerError(
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        });
+    };
+    const scheduleAgentRefresh = () => {
+      if (agentRefreshTimer) return;
+      agentRefreshTimer = setTimeout(() => {
+        agentRefreshTimer = null;
+        refreshAgents();
+      }, 150);
+    };
     if (conversationCacheClientRef.current !== client) {
       conversationCacheRef.current.clear();
       conversationCacheClientRef.current = client;
@@ -2266,7 +2298,10 @@ export function App() {
         source = client.openEventStream(
           threadId,
           nextEvents.at(-1)?.seq,
-          ingestEvent,
+          (event) => {
+            ingestEvent(event);
+            scheduleAgentRefresh();
+          },
         );
       })
       .catch((error) => {
@@ -2286,7 +2321,7 @@ export function App() {
       client.getTurnStatus(threadId, controller.signal),
       client.listPendingApprovals(threadId, controller.signal),
       client.listPendingUserInput(threadId, controller.signal),
-      client.listSubagents(threadId, controller.signal),
+      client.listAgents(threadId, controller.signal),
       client.getGoal(threadId, controller.signal),
     ])
       .then(
@@ -2294,7 +2329,7 @@ export function App() {
           turnStatus,
           pendingApprovals,
           pendingPlanningInput,
-          loadedSubagents,
+          loadedAgents,
           loadedGoal,
         ]) => {
           if (cancelled) return;
@@ -2323,7 +2358,8 @@ export function App() {
             pendingApprovals.map((approval) => approval.approvalId),
           );
           setPendingUserInput(pendingPlanningInput);
-          setSubagentRuns(loadedSubagents);
+          setAgentItems(loadedAgents);
+          openAgentStream(loadedAgents);
           setGoalSnapshot(loadedGoal);
         },
       )
@@ -2338,6 +2374,8 @@ export function App() {
       cancelled = true;
       controller.abort();
       source?.close();
+      agentSource?.close();
+      if (agentRefreshTimer) clearTimeout(agentRefreshTimer);
     };
   }, [
     activeThreadId,
@@ -3264,13 +3302,13 @@ export function App() {
     });
   }
 
-  async function cancelSubagent(runId: string) {
+  async function interruptAgent(agentThreadId: string) {
     if (!client || !activeThread) return;
     setActionError(null);
     try {
-      await client.cancelSubagent(activeThread.id, runId);
+      await client.interruptAgent(activeThread.id, agentThreadId);
     } catch (error) {
-      setActionError(`取消子智能体失败：${errorMessage(error)}`);
+      setActionError(`中断 Agent 失败：${errorMessage(error)}`);
     }
   }
 
@@ -3431,11 +3469,7 @@ export function App() {
       });
       createdThreadId = thread.id;
       setFlowLibraryBindings((current) =>
-        updateFlowLibraryBindings(
-          current,
-          thread.id,
-          submittedLibraryProvider,
-        ),
+        updateFlowLibraryBindings(current, thread.id, submittedLibraryProvider),
       );
       setDraftFlowLibraryProvider(null);
       if (shouldSendInitialPrompt) setThreadSending(thread.id, true);
@@ -5030,7 +5064,7 @@ export function App() {
                 pendingApprovalIds.includes(event.payload.approval_id),
             )}
             conversationLoading={isConversationLoading}
-            subagentRuns={isConversationReady ? subagentRuns : []}
+            agentItems={isConversationReady ? agentItems : []}
             terminalEvents={terminalEvents}
             terminalSession={terminalSession}
             workspaceTree={workspaceTree}
@@ -5120,7 +5154,9 @@ export function App() {
               setConversationCollapsed(false);
             }}
             onAddContextSources={() => void addContextSources()}
-            onCancelSubagent={(runId) => void cancelSubagent(runId)}
+            onInterruptAgent={(agentThreadId) =>
+              void interruptAgent(agentThreadId)
+            }
           />
         </main>
         {settingsOpen && (
@@ -6212,7 +6248,6 @@ function SettingsPanel({
         promptCachePolicy: null,
         responsesCompactionThresholdTokens: null,
         rolloutBudget: null,
-        supportsVision: true,
         apiKeySource: "OPENTOPIA_API_KEY",
         apiKeyConfigured: false,
         healthStatus: null,
@@ -8105,20 +8140,14 @@ function GoalStrip({
 }) {
   const items = snapshot.workForm.items;
   const status = snapshot.workForm.status;
-  const completed = items.filter(
-    (item) => item.status === "completed",
-  ).length;
+  const completed = items.filter((item) => item.status === "completed").length;
   const resolved = items.filter((item) =>
-    ["completed", "deferred", "blocked", "cancelled"].includes(
-      item.status,
-    ),
+    ["completed", "deferred", "blocked", "cancelled"].includes(item.status),
   ).length;
   const total = items.length;
   const progress = total ? Math.round((completed / total) * 100) : 0;
   const succeededIds = new Set(
-    items
-      .filter((item) => item.status === "completed")
-      .map((item) => item.id),
+    items.filter((item) => item.status === "completed").map((item) => item.id),
   );
   let currentTaskIndex = items.findIndex(
     (item) => item.status === "in_progress",
@@ -8131,8 +8160,7 @@ function GoalStrip({
     );
   }
   const terminal = ["completed", "cancelled"].includes(status);
-  const canRun =
-    !isRunning && ["active", "paused", "blocked"].includes(status);
+  const canRun = !isRunning && ["active", "paused", "blocked"].includes(status);
   return (
     <section className={`goal-strip is-${status}`}>
       <details open>
@@ -8172,9 +8200,7 @@ function GoalStrip({
                   <span className="goal-task-state" aria-hidden="true" />
                   <span className="goal-task-content">
                     <span>{item.title}</span>
-                    {item.note ? (
-                      <small>{item.note}</small>
-                    ) : null}
+                    {item.note ? <small>{item.note}</small> : null}
                   </span>
                 </li>
               ))}
@@ -8420,11 +8446,19 @@ function MessageList({
     : false;
   const showPendingTurnStatus =
     pendingTurnFeedback !== null && !pendingTurnIsAnchored;
+  const activeTurnEvents =
+    activeTurnId === null ? [] : (eventsByTurn.get(activeTurnId) ?? []);
   const showModelThinkingStatus =
     activeTurnId !== null &&
-    hasPendingProviderRequest(eventsByTurn.get(activeTurnId) ?? []);
+    hasPendingProviderRequest(activeTurnEvents);
+  const showActiveProcessingStatus =
+    activeTurnId !== null &&
+    !showModelThinkingStatus &&
+    !hasPendingToolCall(activeTurnEvents);
   const showTrailingTurnStatus =
-    showPendingTurnStatus || showModelThinkingStatus;
+    showPendingTurnStatus ||
+    showModelThinkingStatus ||
+    showActiveProcessingStatus;
 
   useEffect(() => {
     if (!hasPendingMessages) return;
@@ -8531,6 +8565,11 @@ function MessageList({
               ? "is-empty"
               : ""
           }`.trim()}
+          data-text-context-menu={
+            visibleMessages.length > 0 || showTrailingTurnStatus
+              ? "conversation-history"
+              : undefined
+          }
           ref={messageListContentRef}
         >
           {visibleMessages.length === 0 && !showTrailingTurnStatus ? (
@@ -8599,6 +8638,13 @@ function MessageList({
             <PendingTurnStatus
               key={`model-thinking-${activeTurnId}`}
               phase="thinking"
+              threadId={threadId}
+              turnId={activeTurnId}
+            />
+          ) : showActiveProcessingStatus && activeTurnId ? (
+            <PendingTurnStatus
+              key={`model-processing-${activeTurnId}`}
+              phase="processing"
               threadId={threadId}
               turnId={activeTurnId}
             />
@@ -8982,6 +9028,7 @@ function InlineImageMessagePart({
     <>
       <button
         className={`message-inline-image ${compact ? "is-reference" : ""}`}
+        data-text-context-menu="custom"
         type="button"
         aria-controls="workspace-right-panel"
         aria-label={`在右侧预览 ${name}`}
@@ -9256,9 +9303,7 @@ function ComposerWorkForm({ form }: { form: WorkForm }) {
                 </span>
                 <span className="composer-plan-step-copy">
                   <span>{item.title || item.id}</span>
-                  {item.note ? (
-                    <small>{item.note}</small>
-                  ) : null}
+                  {item.note ? <small>{item.note}</small> : null}
                 </span>
                 {index === currentStepIndex ? (
                   <span className="composer-plan-step-marker">当前</span>
@@ -11947,7 +11992,7 @@ function RightPanel({
   collaborationMode,
   libraryProvider,
   workspaceRoot,
-  subagentRuns,
+  agentItems,
   messages,
   events,
   conversationLoading,
@@ -12015,7 +12060,7 @@ function RightPanel({
   onToggleConversation,
   onHideToolStage,
   onAddContextSources,
-  onCancelSubagent,
+  onInterruptAgent,
 }: {
   client: ApiClient | null;
   experienceMode: ExperienceMode;
@@ -12035,7 +12080,7 @@ function RightPanel({
   libraryProvider: LibraryProviderId | null;
   workspaceRoot: string | null;
   messages: Message[];
-  subagentRuns: SubagentRun[];
+  agentItems: AgentListItem[];
   events: AgentEvent[];
   conversationLoading: boolean;
   terminalEvents: TerminalEvent[];
@@ -12121,7 +12166,7 @@ function RightPanel({
   onToggleConversation(): void;
   onHideToolStage(): void;
   onAddContextSources(): void;
-  onCancelSubagent(runId: string): void;
+  onInterruptAgent(agentThreadId: string): void;
 }) {
   const renderWorkbench = (
     mode: "panel" | "stage",
@@ -12315,7 +12360,7 @@ function RightPanel({
         terminalEvents={terminalEvents}
         terminalSession={terminalSession}
         agentEvents={events}
-        subagentRuns={subagentRuns}
+        agentItems={agentItems}
         artifacts={artifacts}
         messages={messages}
         libraryPickerEnabled={experienceMode === "flow"}
@@ -12329,7 +12374,7 @@ function RightPanel({
           if (thread) onOpenPreview(thread.id, target, title);
         }}
         onAddSource={onAddContextSources}
-        onCancelSubagent={onCancelSubagent}
+        onInterruptAgent={onInterruptAgent}
         onGitChanged={onRefreshWorkbench}
       />
     </aside>

@@ -36,7 +36,7 @@ import type {
   TerminalEvent,
   TerminalSession,
   WorkspaceDiff,
-  SubagentRun,
+  AgentListItem,
 } from "../types";
 import { Popover } from "./ui";
 import "../styles/right-context-rail.css";
@@ -49,7 +49,7 @@ export type RightContextRailProps = {
   terminalEvents: TerminalEvent[];
   terminalSession: TerminalSession | null;
   agentEvents: AgentEvent[];
-  subagentRuns: SubagentRun[];
+  agentItems: AgentListItem[];
   artifacts: ArtifactDescriptor[];
   messages: Message[];
   libraryPickerEnabled: boolean;
@@ -61,7 +61,7 @@ export type RightContextRailProps = {
   onChangeLibraryProvider(provider: LibraryProviderId | null): void;
   onOpenPreview(target: PreviewTarget, title: string): void;
   onAddSource(): void;
-  onCancelSubagent(runId: string): void;
+  onInterruptAgent(agentThreadId: string): void;
   onGitChanged(): void;
 };
 
@@ -84,10 +84,19 @@ type ActiveProcess = {
   kind: "session" | "command";
 };
 
-type SubagentItem = {
+type AgentItem = {
   id: string;
   label: string;
-  status: "排队中" | "运行中" | "已返回" | "失败" | "已取消" | "已超时";
+  title: string;
+  status:
+    | "空闲"
+    | "排队中"
+    | "运行中"
+    | "需处理"
+    | "已完成"
+    | "失败"
+    | "已取消"
+    | "已中断";
   createdAt: string;
 };
 
@@ -112,7 +121,7 @@ export function RightContextRail({
   terminalEvents,
   terminalSession,
   agentEvents,
-  subagentRuns,
+  agentItems,
   artifacts,
   messages,
   libraryPickerEnabled,
@@ -124,7 +133,7 @@ export function RightContextRail({
   onChangeLibraryProvider,
   onOpenPreview,
   onAddSource,
-  onCancelSubagent,
+  onInterruptAgent,
   onGitChanged,
 }: RightContextRailProps) {
   const [gitStatus, setGitStatus] = useState<GitStatusSummary | null>(null);
@@ -144,7 +153,7 @@ export function RightContextRail({
     terminalSession,
     terminalEvents,
   );
-  const subagents = collectSubagents(subagentRuns, agentEvents);
+  const agents = collectAgents(agentItems, agentEvents);
   const allSources = collectSources(messages, agentEvents, artifacts);
   const sources = allSources.slice(0, SOURCE_LIMIT);
   const gitAvailable = Boolean(gitStatus || workspaceDiff?.branch?.trim());
@@ -366,14 +375,14 @@ export function RightContextRail({
           document.body,
         )}
 
-      {subagents.length > 0 && (
-        <RailSection title={`子智能体 ${subagents.length}`}>
-          {subagents.slice(0, 4).map((agent) => (
+      {agents.length > 0 && (
+        <RailSection title={`Agent ${agents.length}`}>
+          {agents.slice(0, 4).map((agent) => (
             <RailRow
               key={agent.id}
               icon={Bot}
               label={agent.label}
-              title={agent.label}
+              title={agent.title}
               value={
                 <StatusText
                   muted={agent.status !== "运行中"}
@@ -384,7 +393,7 @@ export function RightContextRail({
               }
               onClick={
                 agent.status === "运行中" || agent.status === "排队中"
-                  ? () => onCancelSubagent(agent.id)
+                  ? () => onInterruptAgent(agent.id)
                   : undefined
               }
             />
@@ -917,17 +926,33 @@ function collectActiveProcesses(
   return [...processes, ...commands];
 }
 
-function collectSubagents(
-  runs: SubagentRun[],
+function collectAgents(
+  items: AgentListItem[],
   events: AgentEvent[],
-): SubagentItem[] {
-  if (runs.length) {
-    return runs.map((run) => ({
-      id: run.id,
-      label: `${run.agentPath} · ${run.agentType}`,
-      status: subagentStatusLabel(run.status),
-      createdAt: run.createdAt,
-    }));
+): AgentItem[] {
+  const descendants = items.filter(
+    (item) => item.agent.parentAgentThreadId != null,
+  );
+  if (descendants.length) {
+    return descendants
+      .map((item) => ({
+        id: item.agent.id,
+        label: `${item.agent.path} · ${item.agent.agentType}`,
+        title: [
+          item.latestTurn?.taskMessage,
+          item.activity?.reasoningTail,
+          item.activity?.modelRound != null
+            ? `模型轮次 ${item.activity.modelRound}`
+            : null,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        status: agentStatusLabel(item),
+        createdAt: item.latestTurn?.createdAt ?? item.agent.createdAt,
+      }))
+      .sort(
+        (left, right) => timestamp(right.createdAt) - timestamp(left.createdAt),
+      );
   }
   const finishedCalls = new Map(
     events
@@ -941,19 +966,20 @@ function collectSubagents(
 
   return events
     .filter((event) => event.payload.type === "tool_call_started")
-    .flatMap((event): SubagentItem[] => {
+    .flatMap((event): AgentItem[] => {
       if (event.payload.type !== "tool_call_started") return [];
       const { call } = event.payload;
-      if (!isSubagentTool(call.name)) return [];
+      if (!isAgentTool(call.name)) return [];
       const result = finishedCalls.get(call.id);
       return [
         {
           id: call.id,
-          label: subagentLabel(call.input) ?? call.name,
+          label: agentToolLabel(call.input) ?? call.name,
+          title: agentToolLabel(call.input) ?? call.name,
           status: result
             ? toolResultFailed(result.metadata)
               ? "失败"
-              : "已返回"
+              : "已完成"
             : "运行中",
           createdAt: event.createdAt,
         },
@@ -964,22 +990,27 @@ function collectSubagents(
     );
 }
 
-function subagentStatusLabel(
-  status: SubagentRun["status"],
-): SubagentItem["status"] {
+function agentStatusLabel(item: AgentListItem): AgentItem["status"] {
+  const status = item.latestTurn?.status;
   switch (status) {
     case "queued":
       return "排队中";
     case "running":
       return "运行中";
     case "completed":
-      return "已返回";
+      return "已完成";
     case "cancelled":
       return "已取消";
-    case "timed_out":
-      return "已超时";
-    default:
+    case "interrupted":
+      return "已中断";
+    case "waiting_approval":
+    case "waiting_input":
+    case "waiting_action":
+      return "需处理";
+    case "failed":
       return "失败";
+    default:
+      return item.availability === "archived" ? "已中断" : "空闲";
   }
 }
 
@@ -1109,14 +1140,14 @@ function sourceIcon(label: string, contentType: string): LucideIcon {
   return File;
 }
 
-function isSubagentTool(name: string): boolean {
+function isAgentTool(name: string): boolean {
   const normalized = name.toLocaleLowerCase().replace(/[.-]/g, "_");
   return /(^|_)(sub_?agent|spawn_agent|create_agent|run_agent|delegate_task)(_|$)/.test(
     normalized,
   );
 }
 
-function subagentLabel(input: unknown): string | null {
+function agentToolLabel(input: unknown): string | null {
   if (!isRecord(input)) return null;
   for (const key of ["agentName", "agent_name", "name", "title", "role"]) {
     const value = input[key];
