@@ -52,6 +52,29 @@ test("accepts only complete stored draft model selections", () => {
     }),
     null,
   );
+  assert.deepEqual(
+    parseDraftModelSelection({
+      connectionId: "tokenhub",
+      modelId: "gpt-5.6-sol",
+      adapter: "open_ai_responses",
+      reasoningEffort: "high",
+    }),
+    {
+      connectionId: "tokenhub",
+      modelId: "gpt-5.6-sol",
+      adapter: "open_ai_responses",
+      reasoningEffort: "high",
+    },
+  );
+  assert.equal(
+    parseDraftModelSelection({
+      connectionId: "tokenhub",
+      modelId: "gpt-5.6-sol",
+      adapter: "tokenhub_magic",
+      reasoningEffort: "high",
+    }),
+    null,
+  );
 });
 
 test("restores the chosen new-task model and reasoning effort", () => {

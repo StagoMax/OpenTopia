@@ -2,25 +2,26 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
-  Cable,
   ExternalLink,
   Globe2,
   Loader2,
   RefreshCw,
 } from "lucide-react";
 import type { ApiClient } from "../api/client";
+import {
+  activeBrowserHandoff,
+  activeBrowserHandoffTurnId,
+  type BrowserHandoff,
+} from "../browserHandoff";
+import { browserSessionId, navigateBrowserAddress } from "../browserNavigation";
 import { openExternal } from "../platform";
 import type {
   AgentEvent,
   BrowserNavigationRequest,
-  BrowserRuntimeRoute,
-  ChromeBridgeState,
   WebPreviewState,
 } from "../types";
-import { activeBrowserHandoff, type BrowserHandoff } from "../browserHandoff";
-import { resolveAddressBarInput } from "../browserNavigation";
 import { BrowserPanel } from "./BrowserPanel";
-import { SegmentedControl } from "./ui/SegmentedControl";
+import { Button } from "./ui";
 
 export function WebPreviewSurface({
   client,
@@ -46,33 +47,39 @@ export function WebPreviewSurface({
   }
 
   const handoff = activeBrowserHandoff(events, threadId);
+  const handoffTurnId = activeBrowserHandoffTurnId(events, threadId);
+  const sessionId = browserSessionId(threadId);
 
   return (
     <NativeWebPreview
-      key={threadId ?? "no-active-thread"}
+      key={sessionId}
+      sessionId={sessionId}
       client={client}
       threadId={threadId}
       handoff={handoff}
+      handoffTurnId={handoffTurnId}
       navigationRequest={navigationRequest}
     />
   );
 }
 
 function NativeWebPreview({
+  sessionId,
   client,
   threadId,
   handoff,
+  handoffTurnId,
   navigationRequest,
 }: {
+  sessionId: string;
   client: ApiClient | null;
   threadId: string | null;
   handoff: BrowserHandoff | null;
+  handoffTurnId: string | null;
   navigationRequest: BrowserNavigationRequest | null;
 }) {
   const api = window.opentopia!.browserHost!;
-  const chromeApi = window.opentopia?.chromeBridge;
   const containerRef = useRef<HTMLDivElement>(null);
-  const sessionId = threadId ?? "";
   const [address, setAddress] = useState("");
   const [state, setState] = useState<WebPreviewState>({
     sessionId,
@@ -83,96 +90,31 @@ function NativeWebPreview({
     canGoBack: false,
     canGoForward: false,
   });
-  const [runtimeRoute, setRuntimeRoute] =
-    useState<BrowserRuntimeRoute>("managed");
-  const [runtimeBusy, setRuntimeBusy] = useState(false);
-  const [chromeAvailable, setChromeAvailable] = useState(false);
-  const [chromeState, setChromeState] = useState<ChromeBridgeState | null>(
-    null,
-  );
   const [error, setError] = useState<string | null>(null);
-  const runtimeRouteRef = useRef<BrowserRuntimeRoute>("managed");
+  const [isResuming, setIsResuming] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const visibleRef = useRef(true);
   const hasUrlRef = useRef(false);
   const handledNavigationIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!sessionId) return;
-    let disposed = false;
-    const applyChromeState = (next: ChromeBridgeState) => {
-      if (disposed || next.sessionId !== sessionId) return;
-      setChromeState(next);
-      if (runtimeRouteRef.current === "chrome") {
-        setAddress(next.url);
-        setError(next.error ?? null);
-      }
-    };
-    const unsubscribe = chromeApi?.onStateChanged(applyChromeState);
-    void (async () => {
-      if (client && threadId) {
-        const runtime = await client.getBrowserRuntime(threadId);
-        if (disposed) return;
-        runtimeRouteRef.current = runtime.route;
-        setRuntimeRoute(runtime.route);
-        setChromeAvailable(runtime.chromeAvailable && Boolean(chromeApi));
-      }
-      if (chromeApi) applyChromeState(await chromeApi.getStatus(sessionId));
-    })().catch((cause) => {
-      if (!disposed) setError(errorMessage(cause));
-    });
-    return () => {
-      disposed = true;
-      unsubscribe?.();
-    };
-  }, [chromeApi, client, sessionId, threadId]);
-
-  useEffect(() => {
-    if (
-      runtimeRoute !== "chrome" ||
-      chromeState?.status !== "attached" ||
-      !client ||
-      !threadId
-    ) {
-      return;
-    }
-    let disposed = false;
-    setRuntimeBusy(true);
-    void client
-      .bindBrowserRuntime(threadId, "chrome")
-      .then((runtime) => {
-        if (!disposed) setChromeAvailable(runtime.chromeAvailable);
-      })
-      .catch((cause) => {
-        if (!disposed) setError(errorMessage(cause));
-      })
-      .finally(() => {
-        if (!disposed) setRuntimeBusy(false);
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [chromeState?.status, chromeState?.tabId, client, runtimeRoute, threadId]);
-
-  useEffect(() => {
-    if (!handoff || !sessionId || runtimeRoute !== "managed") return;
+    if (!handoff) return;
     void api
       .createSession({ sessionId })
       .then(() => api.beginUserControl(sessionId))
       .catch((cause) => setError(errorMessage(cause)));
-  }, [api, handoff, runtimeRoute, sessionId]);
+  }, [api, handoff, sessionId]);
 
   const reportBounds = useCallback(() => {
     const element = containerRef.current;
     if (!element) return;
     const rect = element.getBoundingClientRect();
     const visible =
-      runtimeRouteRef.current === "managed" &&
       visibleRef.current &&
       hasUrlRef.current &&
       document.visibilityState === "visible" &&
       rect.width > 0 &&
       rect.height > 0;
-    if (!sessionId) return;
     const bounds = {
       x: Math.round(rect.x),
       y: Math.round(rect.y),
@@ -186,15 +128,6 @@ function NativeWebPreview({
   }, [api, sessionId]);
 
   useEffect(() => {
-    if (!threadId) {
-      setError("Browser preview requires an active task.");
-      return;
-    }
-    if (runtimeRoute !== "managed") {
-      hasUrlRef.current = false;
-      void api.hide(sessionId).catch(() => {});
-      return;
-    }
     let disposed = false;
     setError(null);
     setState({
@@ -232,12 +165,11 @@ function NativeWebPreview({
       unsubscribe?.();
       void api.hide(sessionId).catch(() => {});
     };
-  }, [api, reportBounds, runtimeRoute, sessionId, threadId]);
+  }, [api, reportBounds, sessionId]);
 
   useEffect(() => {
     if (
       !navigationRequest ||
-      !sessionId ||
       handledNavigationIdRef.current === navigationRequest.id
     ) {
       return;
@@ -246,36 +178,16 @@ function NativeWebPreview({
     let disposed = false;
     setAddress(navigationRequest.url);
     setError(null);
-    const navigation =
-      runtimeRoute === "chrome"
-        ? chromeApi?.runAction(sessionId, "navigate", navigationRequest.url)
-        : api
-            .createSession({ sessionId, visible: false })
-            .then(() => api.navigate(sessionId, navigationRequest.url));
-    void Promise.resolve(navigation)
-      .then(() => {
-        if (
-          !disposed &&
-          runtimeRoute === "chrome" &&
-          chromeState?.status !== "attached"
-        ) {
-          throw new Error("请先在 Chrome 扩展中连接当前标签页。");
-        }
-      })
+    void api
+      .createSession({ sessionId, visible: false })
+      .then(() => api.navigate(sessionId, navigationRequest.url))
       .catch((cause) => {
         if (!disposed) setError(errorMessage(cause));
       });
     return () => {
       disposed = true;
     };
-  }, [
-    api,
-    chromeApi,
-    chromeState?.status,
-    navigationRequest,
-    runtimeRoute,
-    sessionId,
-  ]);
+  }, [api, navigationRequest, sessionId]);
 
   useEffect(() => {
     const element = containerRef.current;
@@ -295,7 +207,7 @@ function NativeWebPreview({
     reportBounds();
     return () => {
       visibleRef.current = false;
-      if (sessionId) void api.hide(sessionId).catch(() => {});
+      void api.hide(sessionId).catch(() => {});
       resizeObserver.disconnect();
       intersectionObserver.disconnect();
       document.removeEventListener("visibilitychange", handleVisibility);
@@ -305,18 +217,10 @@ function NativeWebPreview({
   }, [api, reportBounds, sessionId]);
 
   async function navigate() {
+    setError(null);
     try {
-      const url = resolveAddressBarInput(address);
-      setError(null);
+      const url = await navigateBrowserAddress(api, sessionId, address);
       setAddress(url);
-      if (runtimeRoute === "chrome") {
-        if (!chromeApi || chromeState?.status !== "attached") {
-          throw new Error("请先在 Chrome 扩展中连接当前标签页。");
-        }
-        await chromeApi.runAction(sessionId, "navigate", url);
-      } else {
-        await api.navigateFromAddressBar(sessionId, url);
-      }
     } catch (cause) {
       setError(errorMessage(cause));
     }
@@ -325,12 +229,7 @@ function NativeWebPreview({
   async function run(action: "back" | "forward" | "reload") {
     setError(null);
     try {
-      if (runtimeRoute === "chrome") {
-        if (!chromeApi || chromeState?.status !== "attached") {
-          throw new Error("请先在 Chrome 扩展中连接当前标签页。");
-        }
-        await chromeApi.runAction(sessionId, action);
-      } else if (action === "back") await api.back(sessionId);
+      if (action === "back") await api.back(sessionId);
       else if (action === "forward") await api.forward(sessionId);
       else await api.reload(sessionId);
     } catch (cause) {
@@ -338,74 +237,50 @@ function NativeWebPreview({
     }
   }
 
-  async function changeRuntime(next: BrowserRuntimeRoute) {
-    if (!sessionId || runtimeBusy) return;
-    setRuntimeBusy(true);
+  async function resumeHandoff() {
+    if (!client || !threadId || !handoffTurnId || isResuming || isCancelling)
+      return;
+    setIsResuming(true);
     setError(null);
     try {
-      if (next === "chrome") {
-        if (!chromeApi || !chromeAvailable) {
-          throw new Error("Chrome 连接服务当前不可用。");
-        }
-        let nextChromeState = await chromeApi.getStatus(sessionId);
-        if (nextChromeState.status === "idle") {
-          nextChromeState = await chromeApi.startPairing(sessionId);
-        }
-        await api.hide(sessionId);
-        runtimeRouteRef.current = "chrome";
-        setRuntimeRoute("chrome");
-        setChromeState(nextChromeState);
-        setAddress(nextChromeState.url);
-      } else {
-        if (client && threadId) {
-          const runtime = await client.bindBrowserRuntime(threadId, "managed");
-          setChromeAvailable(runtime.chromeAvailable && Boolean(chromeApi));
-        }
-        if (chromeApi) await chromeApi.disconnect(sessionId);
-        runtimeRouteRef.current = "managed";
-        setRuntimeRoute("managed");
-        setAddress(state.url);
-        window.requestAnimationFrame(reportBounds);
+      await client.resumeExternalAction(
+        threadId,
+        handoffTurnId,
+        "用户已在嵌入式浏览器中完成所需操作。",
+      );
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setIsResuming(false);
+    }
+  }
+
+  async function cancelHandoff() {
+    if (!client || !threadId || !handoffTurnId || isResuming || isCancelling)
+      return;
+    setIsCancelling(true);
+    setError(null);
+    try {
+      const result = await client.cancelTurn(threadId, handoffTurnId);
+      if (!result.cancelled) {
+        throw new Error(result.message || "服务端未取消等待中的任务。");
       }
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
-      setRuntimeBusy(false);
+      setIsCancelling(false);
     }
   }
 
-  const chromeReady =
-    runtimeRoute === "managed" || chromeState?.status === "attached";
-  const currentUrl =
-    runtimeRoute === "chrome" ? (chromeState?.url ?? "") : state.url;
-  const currentLoading = runtimeRoute === "managed" && state.loading;
-
   return (
-    <section className="web-preview" aria-label="Web preview">
+    <section className="web-preview" aria-label="浏览器">
       <div className="web-preview-toolbar">
-        <SegmentedControl
-          className="web-preview-runtime-selector"
-          label="浏览器运行方式"
-          value={runtimeRoute}
-          disabled={runtimeBusy}
-          options={[
-            { value: "managed", label: "内置" },
-            {
-              value: "chrome",
-              label: "Chrome",
-              disabled: !chromeAvailable,
-            },
-          ]}
-          onChange={(next) => void changeRuntime(next)}
-        />
         <button
           className="icon-button small"
           type="button"
-          title="Back"
-          aria-label="Go back"
-          disabled={
-            !chromeReady || (runtimeRoute === "managed" && !state.canGoBack)
-          }
+          title="后退"
+          aria-label="后退"
+          disabled={!state.canGoBack}
           onClick={() => void run("back")}
         >
           <ArrowLeft size={14} />
@@ -413,11 +288,9 @@ function NativeWebPreview({
         <button
           className="icon-button small"
           type="button"
-          title="Forward"
-          aria-label="Go forward"
-          disabled={
-            !chromeReady || (runtimeRoute === "managed" && !state.canGoForward)
-          }
+          title="前进"
+          aria-label="前进"
+          disabled={!state.canGoForward}
           onClick={() => void run("forward")}
         >
           <ArrowRight size={14} />
@@ -425,25 +298,24 @@ function NativeWebPreview({
         <button
           className="icon-button small"
           type="button"
-          title="Reload"
-          aria-label="Reload page"
-          disabled={!chromeReady || !currentUrl}
+          title="重新加载"
+          aria-label="重新加载"
+          disabled={!state.url}
           onClick={() => void run("reload")}
         >
-          {currentLoading ? (
+          {state.loading ? (
             <Loader2 className="spin" size={14} />
           ) : (
             <RefreshCw size={14} />
           )}
         </button>
         <input
-          aria-label="Web address"
+          aria-label="网址或搜索内容"
           autoCapitalize="none"
           autoCorrect="off"
           spellCheck={false}
           value={address}
-          placeholder="输入 URL 或搜索内容"
-          disabled={!chromeReady}
+          placeholder="输入网址或搜索内容"
           onChange={(event) => setAddress(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter") void navigate();
@@ -452,10 +324,10 @@ function NativeWebPreview({
         <button
           className="icon-button small"
           type="button"
-          title="Open in default browser"
-          aria-label="Open in default browser"
-          disabled={!currentUrl}
-          onClick={() => currentUrl && void openExternal(currentUrl)}
+          title="在默认浏览器中打开"
+          aria-label="在默认浏览器中打开"
+          disabled={!state.url}
+          onClick={() => state.url && void openExternal(state.url)}
         >
           <ExternalLink size={14} />
         </button>
@@ -469,61 +341,42 @@ function NativeWebPreview({
         <div className="web-preview-handoff" role="status">
           <strong>需要你在当前页面完成操作</strong>
           <span>{handoff.reason}</span>
-          <span>完成后在对话中告诉我继续。</span>
+          <Button
+            size="compact"
+            variant="primary"
+            disabled={
+              !client ||
+              !threadId ||
+              !handoffTurnId ||
+              isResuming ||
+              isCancelling
+            }
+            onClick={() => void resumeHandoff()}
+          >
+            {isResuming ? "正在继续…" : "已完成，继续执行"}
+          </Button>
+          <Button
+            size="compact"
+            variant="quiet"
+            disabled={
+              !client ||
+              !threadId ||
+              !handoffTurnId ||
+              isResuming ||
+              isCancelling
+            }
+            onClick={() => void cancelHandoff()}
+          >
+            {isCancelling ? "正在结束…" : "结束本轮"}
+          </Button>
         </div>
       )}
-      <div
-        className="web-preview-native-surface"
-        ref={containerRef}
-        hidden={runtimeRoute !== "managed"}
-      />
-      {runtimeRoute === "chrome" ? (
-        <div
-          className="web-preview-chrome-surface"
-          role="status"
-          aria-live="polite"
-        >
-          <Cable size={32} aria-hidden="true" />
-          {chromeState?.status === "attached" ? (
-            <>
-              <strong>{chromeState.title || "已连接 Chrome 标签页"}</strong>
-              <span>{chromeState.url || "OpenTopia 可以使用此标签页。"}</span>
-            </>
-          ) : chromeState?.status === "waiting_for_tab" ? (
-            <>
-              <strong>选择要连接的 Chrome 标签页</strong>
-              <span>打开 OpenTopia 扩展，然后点击“连接当前标签页”。</span>
-            </>
-          ) : chromeState?.status === "waiting_for_extension" ? (
-            <>
-              <strong>在 Chrome 扩展中输入配对码</strong>
-              {chromeState.pairingCode ? (
-                <code aria-label={`配对码 ${chromeState.pairingCode}`}>
-                  {chromeState.pairingCode}
-                </code>
-              ) : null}
-              <span>配对后，由你明确选择允许 OpenTopia 使用的标签页。</span>
-            </>
-          ) : (
-            <>
-              <strong>Chrome 尚未连接</strong>
-              <span>重新生成一次性配对码后，在 OpenTopia 扩展中完成连接。</span>
-              <button
-                className="secondary-button compact"
-                type="button"
-                disabled={runtimeBusy}
-                onClick={() => void changeRuntime("chrome")}
-              >
-                重新连接
-              </button>
-            </>
-          )}
-        </div>
-      ) : !state.url ? (
+      <div className="web-preview-native-surface" ref={containerRef} />
+      {!state.url ? (
         <div className="web-preview-empty">
           <Globe2 size={32} aria-hidden="true" />
           <strong>开始浏览</strong>
-          <span>输入完整网址，或直接使用 Google 搜索</span>
+          <span>输入网址，或直接使用 Google 搜索</span>
         </div>
       ) : null}
     </section>

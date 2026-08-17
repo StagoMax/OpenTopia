@@ -172,6 +172,7 @@ test("aggregates API token, prompt cache, latency, retry, and tool metrics", () 
   assert.equal(result.summary.cacheReadReportedRequestCount, 1);
   assert.equal(result.summary.cacheReadRatio, 0.6);
   assert.equal(result.summary.averageLatencyMs, 1_000);
+  assert.equal(result.summary.totalModelDurationMs, 1_000);
   assert.equal(result.summary.retryRate, 1);
   assert.equal(result.summary.estimatedRetryInputTokens, 900);
   assert.equal(result.summary.estimateErrorP95, 0.1);
@@ -179,6 +180,7 @@ test("aggregates API token, prompt cache, latency, retry, and tool metrics", () 
   assert.equal(result.summary.tokensPerSuccessfulTask, 1_250);
   assert.equal(result.summary.toolCallCount, 1);
   assert.equal(result.summary.averageToolDurationMs, 300);
+  assert.equal(result.summary.totalToolDurationMs, 300);
 });
 
 test("correlates usage by request id and attributes token modules and waste signals", () => {

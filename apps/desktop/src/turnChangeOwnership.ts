@@ -33,6 +33,13 @@ export function turnHasSuccessfulWorkspaceWrite(
     ) {
       return true;
     }
+    if (
+      metadata.toolName === "filesystem" &&
+      typeof metadata.operation === "string" &&
+      ["write", "copy", "move", "delete"].includes(metadata.operation)
+    ) {
+      return true;
+    }
     return (
       typeof metadata.toolName === "string" &&
       directWorkspaceWriteTools.has(metadata.toolName)

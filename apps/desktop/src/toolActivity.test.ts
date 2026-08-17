@@ -358,6 +358,38 @@ test("uses per-tool bodies for reads, listings and searches", () => {
   assert.equal(search.title, "搜索 tool_call");
 });
 
+test("renders canonical filesystem operations without legacy tool names", () => {
+  const read = buildToolActivity(
+    call("filesystem", { operation: "read", path: "src/app.ts" }),
+    result("const a = 1;", { operation: "read", bytes: 12 }),
+  );
+  assert.equal(read.kind, "read");
+  assert.equal(read.title, "读取 src/app.ts");
+  assert.equal(read.body.type, "file");
+
+  const find = buildToolActivity(
+    call("filesystem", {
+      operation: "find",
+      path: "src",
+      nameContains: "app",
+    }),
+    result('{"entries":[]}', { operation: "find", count: 0 }),
+  );
+  assert.equal(find.kind, "search");
+  assert.equal(find.title, "查找 app");
+  assert.equal(find.detail, "src");
+
+  const write = buildToolActivity(
+    call("filesystem", {
+      operation: "write",
+      path: "src/app.ts",
+      content: "export {};",
+    }),
+  );
+  assert.equal(write.kind, "edit");
+  assert.equal(write.title, "写入 src/app.ts");
+});
+
 test("renders read paths without the Windows device prefix", () => {
   const rawPath = String.raw`\\?\J:\Project\OpenTopia\inspect.mjs`;
   const read = buildToolActivity(

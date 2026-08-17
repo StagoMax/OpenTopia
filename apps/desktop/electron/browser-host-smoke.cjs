@@ -491,7 +491,8 @@ async function main() {
       throw new Error("javascript dialog was not dismissed and reported");
     }
 
-    const addressBarSessionId = "00000000-0000-4000-8000-000000000002";
+    // The visible browser is usable before a conversation creates a thread.
+    const addressBarSessionId = "browser:standalone";
     await executeAction("prepare address-bar navigation", {
       sessionId: addressBarSessionId,
       action: "navigate",
@@ -594,6 +595,7 @@ async function main() {
         crossHostRedirectBlocked: true,
         crossHostSubresourceBlocked: true,
         profileIsolation: true,
+        standaloneSessionNavigation: true,
         addressBarRedirectAllowed: true,
         unauthorizedStatus: unauthorized.status,
         healthyStatus: healthy.status,

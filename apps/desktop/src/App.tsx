@@ -53,6 +53,7 @@ import {
   Hand,
   Laptop,
   Library,
+  Lightbulb,
   ListTodo,
   Loader2,
   Maximize2,
@@ -136,6 +137,10 @@ import { Button, IconButton, Popover, Tooltip } from "./components/ui";
 import { normalizeCopiedText } from "./clipboardText";
 import { resolveSidebarDestination } from "./workspaceNavigation";
 import {
+  resolveFlowLibraryProvider,
+  updateFlowLibraryBindings,
+} from "./flowLibraryBinding";
+import {
   conversationMessageCopyText,
   formatConversationMessageTimestamp,
 } from "./conversationMessageMeta";
@@ -177,6 +182,14 @@ import {
 import { threadTitleRetryDelay } from "./threadTitleRetry";
 import { closeToolTabState } from "./toolTabState";
 import { resolveMarkdownLink } from "./markdownLinks";
+import {
+  conversationMetrics as deriveConversationMetrics,
+  formatMetricDuration,
+  formatMetricPercent,
+  formatMetricTokenCount,
+  formatMetricTokenRate,
+  type ConversationMetrics,
+} from "./conversationMetrics";
 import {
   useWorkspacePathIndex,
   WorkspacePathIndexContext,
@@ -348,6 +361,8 @@ function resolveThreadActivityStatus(
       return "processing";
     case "waiting_approval":
       return "approval";
+    case "waiting_user_input":
+      return "user_action";
     case "waiting_user_action":
       return "user_action";
     case "succeeded":
@@ -478,7 +493,7 @@ function readCollaborationMode(): CollaborationMode {
   if (typeof window === "undefined") return "default";
   try {
     const value = window.localStorage.getItem(collaborationModeStorageKey);
-    return value === "goal" ? value : "default";
+    return value === "plan" || value === "goal" ? value : "default";
   } catch {
     return "default";
   }
@@ -688,6 +703,8 @@ export function App() {
   const [flowLibraryBindings, setFlowLibraryBindings] = useState<
     Record<string, LibraryProviderId>
   >(readFlowLibraryBindings);
+  const [draftFlowLibraryProvider, setDraftFlowLibraryProvider] =
+    useState<LibraryProviderId | null>(null);
   const [collaborationMode, setCollaborationMode] = useState<CollaborationMode>(
     readCollaborationMode,
   );
@@ -1196,18 +1213,20 @@ export function App() {
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
     [threads, activeThreadId],
   );
-  const activeFlowLibraryProvider = activeThread
-    ? (flowLibraryBindings[activeThread.id] ?? null)
-    : null;
+  const activeFlowLibraryProvider = resolveFlowLibraryProvider(
+    activeThreadId,
+    flowLibraryBindings,
+    draftFlowLibraryProvider,
+  );
   const changeFlowLibraryProvider = useCallback(
     (provider: LibraryProviderId | null) => {
-      if (!activeThreadId) return;
-      setFlowLibraryBindings((current) => {
-        const next = { ...current };
-        if (provider) next[activeThreadId] = provider;
-        else delete next[activeThreadId];
-        return next;
-      });
+      if (activeThreadId) {
+        setFlowLibraryBindings((current) =>
+          updateFlowLibraryBindings(current, activeThreadId, provider),
+        );
+      } else {
+        setDraftFlowLibraryProvider(provider);
+      }
       if (!provider) return;
       setActionError(null);
       void ensureLibraryProviderService(provider)
@@ -1248,6 +1267,14 @@ export function App() {
     conversationLoadError === null;
   const conversationMessages = isConversationReady ? messages : [];
   const conversationEvents = isConversationReady ? events : [];
+  const conversationActivityMetrics = useMemo(
+    () =>
+      deriveConversationMetrics(
+        conversationEvents,
+        activeThread?.modelSelection,
+      ),
+    [activeThread?.modelSelection, conversationEvents],
+  );
   const conversationGoalSnapshot = isConversationReady ? goalSnapshot : null;
   const conversationActiveTurnId = isConversationReady ? activeTurnId : null;
   const conversationPendingTurnFeedback =
@@ -1373,7 +1400,7 @@ export function App() {
     setToolStageOpen(false);
     setActionError((current) =>
       current &&
-      /answer the pending planning question before starting another turn/i.test(
+      /answer or dismiss the pending user decision before starting another turn/i.test(
         current,
       )
         ? null
@@ -2546,6 +2573,7 @@ export function App() {
     setActiveToolTabId(null);
     setToolStageOpen(false);
     setConversationCollapsed(false);
+    setDraftFlowLibraryProvider(null);
     setSelectedWorkspaceRoot(workspaceRoot);
     setDraftProjectId(projectId);
   }
@@ -3345,6 +3373,8 @@ export function App() {
     contentParts: InlineMessageContentPart[] = [],
   ): Promise<boolean> {
     if (!client || isCreatingThread) return false;
+    const submittedLibraryProvider =
+      experienceMode === "flow" ? draftFlowLibraryProvider : null;
     if (newTaskLaunchMode === "new_worktree") {
       setActionError(
         "“新工作树”启动模式尚未接入线程创建；请选择“在本地处理”后继续。",
@@ -3400,6 +3430,14 @@ export function App() {
         experienceMode,
       });
       createdThreadId = thread.id;
+      setFlowLibraryBindings((current) =>
+        updateFlowLibraryBindings(
+          current,
+          thread.id,
+          submittedLibraryProvider,
+        ),
+      );
+      setDraftFlowLibraryProvider(null);
       if (shouldSendInitialPrompt) setThreadSending(thread.id, true);
       if (submittedModelSelection) {
         // Pin before the first turn runs, so the conversation starts on the
@@ -3450,6 +3488,7 @@ export function App() {
           undefined,
           imageAttachments,
           imageAttachments.length > 0 ? contentParts : [],
+          submittedLibraryProvider ?? undefined,
         );
         mergeMessagesForThread(thread.id, [message]);
         markThreadActivityRead(thread.id);
@@ -3806,8 +3845,8 @@ export function App() {
         requestId,
         response,
       );
-      if (!result.accepted || !result.resumed) {
-        throw new Error("服务端未恢复规划，请重试。");
+      if (!result.accepted || (!response.cancelled && !result.resumed)) {
+        throw new Error("服务端未恢复当前任务，请重试。");
       }
       setPendingUserInput((current) =>
         current.filter((record) => record.request.requestId !== requestId),
@@ -4403,16 +4442,7 @@ export function App() {
           ? {
               ...current,
               providers: current.providers.map((provider) =>
-                provider.id === providerId
-                  ? {
-                      ...provider,
-                      model: result.defaultModel,
-                      syncedModels: result.models,
-                      modelContextWindows: result.modelContextWindows,
-                      modelCapabilities: result.modelCapabilities,
-                      modelsSyncedAt: result.syncedAt,
-                    }
-                  : provider,
+                provider.id === providerId ? result.provider : provider,
               ),
             }
           : current,
@@ -4868,6 +4898,12 @@ export function App() {
                         skipped: true,
                       })
                     }
+                    onCancel={() =>
+                      void submitUserInput(activeUserInput.request.requestId, {
+                        answers: [],
+                        cancelled: true,
+                      })
+                    }
                   />
                 ) : (
                   <Composer
@@ -4881,6 +4917,7 @@ export function App() {
                     queuedMessageCount={
                       isConversationReady ? queuedMessageCount : 0
                     }
+                    metrics={conversationActivityMetrics}
                     modelSelection={activeThread?.modelSelection ?? null}
                     providers={settings?.providers ?? []}
                     activeProviderId={settings?.activeProviderId ?? ""}
@@ -8104,7 +8141,7 @@ function GoalStrip({
             <Target size={15} />
           </span>
           <span className="goal-strip-objective">
-            {snapshot.goal.objective}
+            {snapshot.workForm.objective}
           </span>
           <span className={`goal-status is-${status}`}>
             {goalStatusLabel(status)}
@@ -9620,6 +9657,7 @@ function Composer({
   isRunning,
   isCancelling,
   queuedMessageCount = 0,
+  metrics,
   providers,
   activeProviderId,
   modelSelection,
@@ -9657,6 +9695,7 @@ function Composer({
   isRunning: boolean;
   isCancelling: boolean;
   queuedMessageCount?: number;
+  metrics?: ConversationMetrics | null;
   providers: ProviderSettings[];
   activeProviderId: string;
   modelSelection: ThreadModelSelection | null;
@@ -10239,7 +10278,7 @@ function Composer({
   const ActivePermissionIcon = activePermissionOption.icon;
 
   return (
-    <div className="composer-shell">
+    <div className={`composer-shell${metrics ? " has-metrics" : ""}`}>
       {workForm ? <ComposerWorkForm form={workForm} /> : null}
       <div
         className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
@@ -10878,6 +10917,7 @@ function Composer({
           </div>
         )}
       </div>
+      {metrics ? <ComposerMetrics metrics={metrics} /> : null}
       {previewIndex !== null && imageAttachments[previewIndex] ? (
         <ImageLightbox
           attachments={imageAttachments}
@@ -10939,6 +10979,31 @@ function Composer({
             document.body,
           )
         : null}
+    </div>
+  );
+}
+
+function ComposerMetrics({ metrics }: { metrics: ConversationMetrics }) {
+  const groups = [
+    `${metrics.turnCount.toLocaleString()} 轮 · ${metrics.stepCount.toLocaleString()} 步`,
+    `LLM ${formatMetricDuration(metrics.modelDurationMs)} · 工具调用 ${formatMetricDuration(metrics.toolDurationMs)}`,
+    `首 token 平均 ${formatMetricDuration(metrics.averageTtftMs)} · ${formatMetricTokenRate(metrics.outputTokensPerSecond)}`,
+    `缓存命中 ${formatMetricPercent(metrics.cacheReadRatio)}`,
+    `输入 ${formatMetricTokenCount(metrics.inputTokens)} · 输出 ${formatMetricTokenCount(metrics.outputTokens)}`,
+  ];
+  const exactTokenCounts = `输入 ${metrics.inputTokens.toLocaleString()} tok · 输出 ${metrics.outputTokens.toLocaleString()} tok`;
+
+  return (
+    <div
+      className="composer-metrics"
+      aria-label={`对话运行指标：${groups.slice(0, -1).join("；")}；${exactTokenCounts}`}
+      title={`${groups.slice(0, -1).join(" | ")} | ${exactTokenCounts}`}
+    >
+      {groups.map((group) => (
+        <span className="composer-metric-group" key={group}>
+          {group}
+        </span>
+      ))}
     </div>
   );
 }
@@ -11118,6 +11183,12 @@ const collaborationModeOptions: Array<{
   icon: typeof Zap;
 }> = [
   {
+    value: "plan",
+    label: "计划模式",
+    detail: "开启计划模式",
+    icon: Lightbulb,
+  },
+  {
     value: "goal",
     label: "目标",
     detail: "设置要持续追求的目标",
@@ -11126,6 +11197,7 @@ const collaborationModeOptions: Array<{
 ];
 
 function collaborationModePlaceholder(mode: CollaborationMode): string {
+  if (mode === "plan") return "描述任务；需要选择时会列出方案";
   if (mode === "goal") return "描述要持续推进的目标";
   return "请求后续更改";
 }
@@ -11252,6 +11324,10 @@ function SideTaskConversation({
   );
   const [modelSelection, setModelSelection] =
     useState<ThreadModelSelection | null>(thread?.modelSelection ?? null);
+  const activityMetrics = useMemo(
+    () => deriveConversationMetrics(events, modelSelection),
+    [events, modelSelection],
+  );
   const [pendingApprovalIds, setPendingApprovalIds] = useState<string[]>([]);
   const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(
     null,
@@ -11667,7 +11743,7 @@ function SideTaskConversation({
         requestId,
         response,
       );
-      if (!result.accepted || !result.resumed) {
+      if (!result.accepted || (!response.cancelled && !result.resumed)) {
         throw new Error("服务端未恢复侧边任务。");
       }
       setPendingUserInput((current) =>
@@ -11786,6 +11862,12 @@ function SideTaskConversation({
               skipped: true,
             })
           }
+          onCancel={() =>
+            void submitSideTaskUserInput(activeUserInput.request.requestId, {
+              answers: [],
+              cancelled: true,
+            })
+          }
         />
       ) : (
         <Composer
@@ -11800,6 +11882,7 @@ function SideTaskConversation({
             Boolean(activeTurnId) && cancellingTurnId === activeTurnId
           }
           queuedMessageCount={queuedMessageCount}
+          metrics={activityMetrics}
           modelSelection={modelSelection}
           providers={settings?.providers ?? []}
           activeProviderId={settings?.activeProviderId ?? ""}

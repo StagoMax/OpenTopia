@@ -12,7 +12,10 @@ import {
   Square,
 } from "lucide-react";
 import { ApiClient } from "../api/client";
-import { activeBrowserHandoff } from "../browserHandoff";
+import {
+  activeBrowserHandoff,
+  activeBrowserHandoffTurnId,
+} from "../browserHandoff";
 import { resolveAddressBarInput } from "../browserNavigation";
 import type {
   AgentEvent,
@@ -24,6 +27,7 @@ import type {
   ModelContentPart,
   ToolResult,
 } from "../types";
+import { Button } from "./ui";
 
 type BrowserAction =
   | "navigate"
@@ -55,6 +59,8 @@ export function BrowserPanel({
   const [text, setText] = useState("");
   const [output, setOutput] = useState<BrowserOutput | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+  const [isResuming, setIsResuming] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeThreadIdRef = useRef(threadId);
   const requestVersionRef = useRef(0);
@@ -106,6 +112,8 @@ export function BrowserPanel({
     setOutput(null);
     setError(null);
     setIsRunning(false);
+    setIsResuming(false);
+    setIsCancelling(false);
   }, [threadId]);
 
   useEffect(() => {
@@ -199,6 +207,45 @@ export function BrowserPanel({
     () => activeBrowserHandoff(events, threadId),
     [events, threadId],
   );
+  const handoffTurnId = useMemo(
+    () => activeBrowserHandoffTurnId(events, threadId),
+    [events, threadId],
+  );
+
+  async function resumeHandoff() {
+    if (!client || !threadId || !handoffTurnId || isResuming || isCancelling)
+      return;
+    setIsResuming(true);
+    setError(null);
+    try {
+      await client.resumeExternalAction(
+        threadId,
+        handoffTurnId,
+        "用户已在浏览器面板中完成所需操作。",
+      );
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setIsResuming(false);
+    }
+  }
+
+  async function cancelHandoff() {
+    if (!client || !threadId || !handoffTurnId || isResuming || isCancelling)
+      return;
+    setIsCancelling(true);
+    setError(null);
+    try {
+      const result = await client.cancelTurn(threadId, handoffTurnId);
+      if (!result.cancelled) {
+        throw new Error(result.message || "服务端未取消等待中的任务。");
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setIsCancelling(false);
+    }
+  }
 
   async function run(
     action: BrowserAction,
@@ -452,7 +499,34 @@ export function BrowserPanel({
         <div className="browser-handoff" role="status">
           <strong>需要手动完成浏览器操作</strong>
           <span>{handoff.reason}</span>
-          <span>完成后在对话中告诉我继续。</span>
+          <Button
+            size="compact"
+            variant="primary"
+            disabled={
+              !client ||
+              !threadId ||
+              !handoffTurnId ||
+              isResuming ||
+              isCancelling
+            }
+            onClick={() => void resumeHandoff()}
+          >
+            {isResuming ? "正在继续…" : "已完成，继续执行"}
+          </Button>
+          <Button
+            size="compact"
+            variant="quiet"
+            disabled={
+              !client ||
+              !threadId ||
+              !handoffTurnId ||
+              isResuming ||
+              isCancelling
+            }
+            onClick={() => void cancelHandoff()}
+          >
+            {isCancelling ? "正在结束…" : "结束本轮"}
+          </Button>
         </div>
       )}
       {screenshot && (

@@ -65,3 +65,38 @@ test("keeps changes made successfully before cancellation", () => {
     true,
   );
 });
+
+test("recognizes canonical filesystem mutations without treating reads as writes", () => {
+  const cancellation = event(3, {
+    type: "turn_cancelled",
+    reason: "Cancelled by user.",
+  });
+  const filesystemResult = (operation: "read" | "move"): AgentEvent =>
+    event(operation === "read" ? 1 : 2, {
+      type: "tool_call_finished",
+      result: {
+        callId: `filesystem-${operation}`,
+        output: operation,
+        metadata: {
+          toolName: "filesystem",
+          operation,
+          success: true,
+        },
+      },
+    });
+
+  assert.equal(
+    shouldShowRecordedTurnChanges(
+      [filesystemResult("read"), cancellation],
+      "turn-1",
+    ),
+    false,
+  );
+  assert.equal(
+    shouldShowRecordedTurnChanges(
+      [filesystemResult("move"), cancellation],
+      "turn-1",
+    ),
+    true,
+  );
+});

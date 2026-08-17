@@ -140,10 +140,20 @@ export function classifyToolCall(call: ToolCall): ToolActivityKind {
     );
   }
 
+  if (call.name === "filesystem") {
+    const operation = stringField(asRecord(call.input), "operation");
+    if (operation === "read" || operation === "stat") return "read";
+    if (operation === "list") return "list";
+    if (operation === "find") return "search";
+    return "edit";
+  }
+
   if (call.name === "git_diff") return "diff";
   if (call.name === "read_file") return "read";
   if (call.name === "list_files") return "list";
-  if (call.name === "search") return "search";
+  if (call.name === "search" || call.name === "workspace_search") {
+    return "search";
+  }
   if (call.name === "write_file" || call.name === "apply_patch") return "edit";
   if (call.name === "browser") return "browser";
   if (call.name === "computer") return "computer";
@@ -310,6 +320,58 @@ function buildToolActivityView(
     };
   }
 
+  if (call.name === "filesystem") {
+    const operation = stringField(input, "operation") || "operation";
+    const source = stringField(input, "source");
+    const destination = stringField(input, "destination");
+    const path =
+      stringField(input, "path") ||
+      stringField(metadata, "path") ||
+      stringField(metadata, "changedPath") ||
+      destination ||
+      source;
+    const title =
+      operation === "read"
+        ? `读取 ${displayPath(path) || "文件"}`
+        : operation === "list"
+          ? `列出 ${displayPath(path) || "."}`
+          : operation === "find"
+            ? `查找 ${stringField(input, "nameContains") || "文件"}`
+            : operation === "stat"
+              ? `检查 ${displayPath(path) || "路径"}`
+              : operation === "write"
+                ? `写入 ${displayPath(path) || "文件"}`
+                : operation === "copy"
+                  ? `复制到 ${displayPath(destination) || "目标文件"}`
+                  : operation === "move"
+                    ? `移动到 ${displayPath(destination) || "目标文件"}`
+                    : operation === "delete"
+                      ? `删除 ${displayPath(path) || "文件"}`
+                      : "文件操作";
+    const content = stringField(input, "content");
+    return {
+      kind,
+      title,
+      detail:
+        operation === "find" && path ? displayPath(path) : undefined,
+      chips:
+        numberField(metadata, "bytes") !== undefined
+          ? [{ label: formatBytes(numberField(metadata, "bytes") ?? 0) }]
+          : numberField(metadata, "count") !== undefined
+            ? [{ label: `${numberField(metadata, "count")} 项` }]
+            : [],
+      body:
+        content && operation === "write"
+          ? { type: "file", path: displayPath(path), text: clampText(content) }
+          : result
+            ? operation === "read"
+              ? { type: "file", path: displayPath(path), text: clampText(output) }
+              : { type: "text", text: output }
+            : { type: "pending" },
+      failed,
+    };
+  }
+
   if (call.name === "write_file") {
     const path =
       stringField(input, "path") || stringField(metadata, "changedPath");
@@ -356,7 +418,7 @@ function buildToolActivityView(
     };
   }
 
-  if (call.name === "search") {
+  if (call.name === "search" || call.name === "workspace_search") {
     const query =
       stringField(metadata, "query") ||
       stringField(input, "query") ||

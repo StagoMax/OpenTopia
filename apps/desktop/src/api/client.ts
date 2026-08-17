@@ -986,7 +986,36 @@ export class ApiClient {
     goalId: string,
     status: GoalStatus,
   ): Promise<GoalSnapshot> {
-    return this.patch(`/api/threads/${threadId}/goal/${goalId}`, { status });
+    return this.updateGoal(threadId, goalId, { status });
+  }
+
+  async updateGoal(
+    threadId: string,
+    goalId: string,
+    update: {
+      status?: GoalStatus;
+      objective?: string;
+      constraints?: string[];
+      acceptance?: string[];
+    },
+  ): Promise<GoalSnapshot> {
+    return this.patch(`/api/threads/${threadId}/goal/${goalId}`, update);
+  }
+
+  async resumeExternalAction(
+    threadId: string,
+    turnId: string,
+    observation?: string,
+  ): Promise<{
+    accepted: boolean;
+    resumed: boolean;
+    turnId: string;
+    invocationId: number;
+  }> {
+    return this.post(
+      `/api/threads/${threadId}/turns/${turnId}/external-action/resume`,
+      { observation },
+    );
   }
 
   async runBrowserCommand(

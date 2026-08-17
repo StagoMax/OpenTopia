@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { EditableTextContextMenu } from "./components/ui";
 import { applyAppearance, readAppearanceSettings } from "./appearance";
 import { startSolarChromeClock } from "./solarChrome";
 import "./styles/app.css";
@@ -18,6 +19,7 @@ if (!root) throw new Error("Root element not found");
 
 createRoot(root).render(
   <React.StrictMode>
+    <EditableTextContextMenu />
     <App />
   </React.StrictMode>,
 );

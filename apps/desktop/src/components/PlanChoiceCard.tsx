@@ -22,6 +22,7 @@ type PlanChoiceCardProps = {
   error: string | null;
   onSubmit(response: UserInputResponse): void;
   onSkip(): void;
+  onCancel(): void;
 };
 
 export function PlanChoiceCard({
@@ -30,6 +31,7 @@ export function PlanChoiceCard({
   error,
   onSubmit,
   onSkip,
+  onCancel,
 }: PlanChoiceCardProps) {
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [selections, setSelections] = useState<PlanChoiceSelections>({});
@@ -138,7 +140,7 @@ export function PlanChoiceCard({
           <p>
             {questionCount > 1
               ? "选择后自动进入下一题。"
-              : "选择后将继续生成计划。"}
+              : "选择后将继续执行当前任务。"}
           </p>
         </div>
 
@@ -279,7 +281,10 @@ export function PlanChoiceCard({
             disabled={isSubmitting}
             onClick={onSkip}
           >
-            跳过
+            跳过并继续
+          </Button>
+          <Button variant="quiet" disabled={isSubmitting} onClick={onCancel}>
+            结束本轮
           </Button>
           {isCustomSelected ? (
             <Button

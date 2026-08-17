@@ -82,6 +82,8 @@ import type {
   CodexAccountStatus,
   CodexLoginStart,
   PlatformInfo,
+  ProviderAdapterKind,
+  ProviderAuthKind,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
@@ -89,6 +91,7 @@ import type {
   ProviderModelSettings,
   ProviderSecretOutcome,
   ProviderSettings,
+  ProviderTransportKind,
   SecretSources,
   WindowsSandboxSetupStatus,
 } from "../types";
@@ -186,6 +189,81 @@ const providerBaseUrlPresets: readonly ProviderBaseUrlPreset[] = [
     kind: "openai_compatible",
   },
 ];
+
+type ProviderProtocolSelection =
+  "openai_auto" | "open_ai_chat" | "open_ai_responses" | "anthropic_messages";
+
+function providerAxesFromKind(kind: ProviderKind): {
+  transport: ProviderTransportKind;
+  auth: ProviderAuthKind;
+  allowedAdapters: ProviderAdapterKind[];
+  preferredAdapter: ProviderAdapterKind | null;
+} {
+  if (kind === "codex_app_server") {
+    return {
+      transport: "codex_app_server",
+      auth: "codex_session",
+      allowedAdapters: ["codex_app_server"],
+      preferredAdapter: "codex_app_server",
+    };
+  }
+  if (kind === "mock") {
+    return {
+      transport: "mock",
+      auth: "none",
+      allowedAdapters: ["mock"],
+      preferredAdapter: "mock",
+    };
+  }
+  if (kind === "anthropic") {
+    return {
+      transport: "http",
+      auth: "x_api_key",
+      allowedAdapters: ["anthropic_messages"],
+      preferredAdapter: "anthropic_messages",
+    };
+  }
+  return {
+    transport: "http",
+    auth: "bearer",
+    allowedAdapters: ["open_ai_chat", "open_ai_responses"],
+    preferredAdapter: kind === "openai_responses" ? "open_ai_responses" : null,
+  };
+}
+
+function providerEffectiveTransport(
+  provider: ProviderSettings,
+): ProviderTransportKind {
+  return provider.transport ?? providerAxesFromKind(provider.kind).transport;
+}
+
+function providerEffectiveAuth(provider: ProviderSettings): ProviderAuthKind {
+  return provider.auth ?? providerAxesFromKind(provider.kind).auth;
+}
+
+function providerAllowedAdapters(
+  provider: ProviderSettings,
+): ProviderAdapterKind[] {
+  return provider.allowedAdapters?.length
+    ? provider.allowedAdapters
+    : providerAxesFromKind(provider.kind).allowedAdapters;
+}
+
+function providerProtocolSelection(
+  provider: ProviderSettings,
+): ProviderProtocolSelection {
+  const allowed = providerAllowedAdapters(provider);
+  if (allowed.includes("anthropic_messages")) return "anthropic_messages";
+  if (
+    allowed.includes("open_ai_chat") &&
+    allowed.includes("open_ai_responses")
+  ) {
+    return "openai_auto";
+  }
+  return allowed.includes("open_ai_responses")
+    ? "open_ai_responses"
+    : "open_ai_chat";
+}
 
 const contextWindowPresets = [
   { tokens: 8_000, label: "8K" },
@@ -715,15 +793,21 @@ export function SettingsPanel({
     );
     if (!initialProvider) return;
 
-    const initialApiKey = pendingApiKeysRef.current[providerId]?.trim() ?? "";
+    const initialApiKey =
+      providerEffectiveAuth(initialProvider) === "none"
+        ? ""
+        : (pendingApiKeysRef.current[providerId]?.trim() ?? "");
     const signature = providerDiscoverySignature(
       initialProvider,
       initialApiKey,
     );
     if (!signature) {
+      const needsApiKey = providerEffectiveAuth(initialProvider) !== "none";
       setModelDiscoveryState(providerId, {
         status: "error",
-        message: "请先填写有效的 Base URL 和 API 密钥。",
+        message: needsApiKey
+          ? "请先填写有效的 Base URL 和 API 密钥。"
+          : "请先填写有效的 Base URL。",
       });
       return;
     }
@@ -783,16 +867,7 @@ export function SettingsPanel({
 
       const result = await onSyncProviderModels(providerId);
       nextProviders = providersRef.current.map((provider) =>
-        provider.id === providerId
-          ? {
-              ...provider,
-              model: result.defaultModel,
-              syncedModels: result.models,
-              modelContextWindows: result.modelContextWindows,
-              modelCapabilities: result.modelCapabilities,
-              modelsSyncedAt: result.syncedAt,
-            }
-          : provider,
+        provider.id === providerId ? result.provider : provider,
       );
       providersRef.current = nextProviders;
       setProviders(nextProviders);
@@ -933,7 +1008,8 @@ export function SettingsPanel({
       );
       const invalidProvider = nextProviders.find(
         (provider) =>
-          provider.kind !== "codex_app_server" && !provider.baseUrl.trim(),
+          providerEffectiveTransport(provider) === "http" &&
+          !provider.baseUrl.trim(),
       );
       if (invalidProvider) {
         setEditingProviderId(invalidProvider.id);
@@ -947,6 +1023,11 @@ export function SettingsPanel({
       const backendWarnings: string[] = [];
       for (const [providerId, apiKey] of Object.entries(pendingApiKeys)) {
         if (!apiKey.trim()) continue;
+        const provider = nextProviders.find(
+          (candidate) => candidate.id === providerId,
+        );
+        const auth = provider ? providerEffectiveAuth(provider) : null;
+        if (!provider || (auth !== "bearer" && auth !== "x_api_key")) continue;
         const outcome = await onStoreProviderApiKey(providerId, apiKey);
         if (!outcome.stored) {
           setEditingProviderId(providerId);
@@ -989,7 +1070,7 @@ export function SettingsPanel({
       setStatusMessage(
         backendWarnings.length > 0
           ? `设置已保存，密钥也已写入系统密钥库；但本地后端未能重启：${backendWarnings[0]} 请重启应用后再发起对话。`
-          : "设置已保存。填写 Base URL 和 API 密钥后会自动识别模型。",
+          : "设置已保存。填写连接信息后会自动识别模型。",
       );
     } finally {
       setIsApplyingSave(false);
@@ -1544,7 +1625,8 @@ function AgentRuntimeSettingsView({
             <strong>Provider 工具面</strong>
             <small>
               直接工具的完整 Schema 通过 tools / dynamicTools
-              传输；延迟工具先暴露目录，Tool Search 后再加载所选 Schema。两者都不拼入文字提示词。
+              传输；延迟工具先暴露目录，Tool Search 后再加载所选
+              Schema。两者都不拼入文字提示词。
             </small>
           </div>
         </div>
@@ -1665,7 +1747,15 @@ function ProviderSettingsView({
   onCancelCodexLogin(): Promise<void>;
   onLogoutCodexAccount(): Promise<void>;
 }) {
-  const usesCodexAppServer = editingProvider?.kind === "codex_app_server";
+  const usesHttpTransport = editingProvider
+    ? providerEffectiveTransport(editingProvider) === "http"
+    : false;
+  const usesCodexAppServer = editingProvider
+    ? providerEffectiveTransport(editingProvider) === "codex_app_server"
+    : false;
+  const usesResponsesAdapter = editingProvider
+    ? providerAllowedAdapters(editingProvider).includes("open_ai_responses")
+    : false;
   // Existing connection-wide values remain readable for migrated settings, but
   // new setup is intentionally configured at the individual-model level.
   const showLegacyConnectionDefaults = false;
@@ -1697,7 +1787,7 @@ function ProviderSettingsView({
     ? editingProvider.modelContextWindows?.[editingProvider.model.trim()]
     : undefined;
   const providerProtocolHint = editingProvider
-    ? providerProtocolDescription(editingProvider.kind)
+    ? providerProtocolDescription(editingProvider)
     : "";
   const modelSourceUrl =
     selectedModelPreset?.sourceUrl ?? reasoningCapability?.sourceUrl ?? null;
@@ -1737,7 +1827,20 @@ function ProviderSettingsView({
         : kind;
     const model =
       resolvedKind === "codex_app_server" ? "" : editingProvider.model.trim();
+    const axes = providerAxesFromKind(resolvedKind);
     onUpdateProvider(editingProvider.id, "kind", resolvedKind);
+    onUpdateProvider(editingProvider.id, "transport", axes.transport);
+    onUpdateProvider(editingProvider.id, "auth", axes.auth);
+    onUpdateProvider(
+      editingProvider.id,
+      "allowedAdapters",
+      axes.allowedAdapters,
+    );
+    onUpdateProvider(
+      editingProvider.id,
+      "preferredAdapter",
+      axes.preferredAdapter,
+    );
     if (model !== editingProvider.model) {
       onUpdateProvider(editingProvider.id, "model", model);
     }
@@ -1750,6 +1853,52 @@ function ProviderSettingsView({
       onUpdateProvider(editingProvider.id, "reasoningEffort", reasoningEffort);
     }
     if (resolvedKind === "codex_app_server") setManualModelProviderId(null);
+  }
+
+  function updateTransport(transport: ProviderTransportKind) {
+    if (transport === "codex_app_server") {
+      updateProviderKind("codex_app_server");
+    } else if (transport === "mock") {
+      updateProviderKind("mock");
+    } else {
+      updateProviderKind(
+        editingProvider?.kind === "anthropic" ? "anthropic" : "openai",
+      );
+    }
+  }
+
+  function updateProtocol(selection: ProviderProtocolSelection) {
+    if (!editingProvider) return;
+    const config =
+      selection === "anthropic_messages"
+        ? {
+            kind: "anthropic" as const,
+            allowed: ["anthropic_messages"] as ProviderAdapterKind[],
+            preferred: "anthropic_messages" as ProviderAdapterKind,
+          }
+        : selection === "open_ai_responses"
+          ? {
+              kind: "openai_responses" as const,
+              allowed: ["open_ai_responses"] as ProviderAdapterKind[],
+              preferred: "open_ai_responses" as ProviderAdapterKind,
+            }
+          : selection === "open_ai_chat"
+            ? {
+                kind: "openai_compatible" as const,
+                allowed: ["open_ai_chat"] as ProviderAdapterKind[],
+                preferred: "open_ai_chat" as ProviderAdapterKind,
+              }
+            : {
+                kind: "openai_compatible" as const,
+                allowed: [
+                  "open_ai_chat",
+                  "open_ai_responses",
+                ] as ProviderAdapterKind[],
+                preferred: null,
+              };
+    onUpdateProvider(editingProvider.id, "kind", config.kind);
+    onUpdateProvider(editingProvider.id, "allowedAdapters", config.allowed);
+    onUpdateProvider(editingProvider.id, "preferredAdapter", config.preferred);
   }
 
   const selectedBaseUrlPresetId = editingProvider
@@ -1813,7 +1962,7 @@ function ProviderSettingsView({
                   onClick={() => onSelectProvider(provider.id)}
                 >
                   <span className="settings-provider-name">{displayName}</span>
-                  <small>{health?.status ?? "未检测"}</small>
+                  <small>{providerHealthStatusLabel(health?.status)}</small>
                 </button>
                 <button
                   type="button"
@@ -1869,24 +2018,66 @@ function ProviderSettingsView({
                 />
               </label>
               <label>
-                <span>供应商类型</span>
+                <span>连接方式</span>
                 <select
-                  value={providerTypeSelection(editingProvider.kind)}
+                  value={providerEffectiveTransport(editingProvider)}
                   onChange={(event) =>
-                    updateProviderKind(
-                      event.target.value as ProviderKind | "openai",
-                    )
+                    updateTransport(event.target.value as ProviderTransportKind)
                   }
                 >
-                  <option value="openai">OpenAI Compatible（自动识别）</option>
-                  <option value="anthropic">Anthropic Messages</option>
+                  <option value="http">HTTP API</option>
                   <option value="codex_app_server">
                     Codex App Server (local)
                   </option>
                   <option value="mock">Mock</option>
                 </select>
-                <small>{providerProtocolHint}</small>
               </label>
+              {providerEffectiveTransport(editingProvider) === "http" ? (
+                <>
+                  <label>
+                    <span>认证方式</span>
+                    <select
+                      value={providerEffectiveAuth(editingProvider)}
+                      onChange={(event) =>
+                        onUpdateProvider(
+                          editingProvider.id,
+                          "auth",
+                          event.target.value as ProviderAuthKind,
+                        )
+                      }
+                    >
+                      <option value="bearer">Bearer Token</option>
+                      <option value="x_api_key">x-api-key</option>
+                      <option value="none">无需认证</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>协议适配器</span>
+                    <select
+                      value={providerProtocolSelection(editingProvider)}
+                      onChange={(event) =>
+                        updateProtocol(
+                          event.target.value as ProviderProtocolSelection,
+                        )
+                      }
+                    >
+                      <option value="openai_auto">
+                        OpenAI Chat + Responses（自动）
+                      </option>
+                      <option value="open_ai_chat">
+                        OpenAI Chat Completions
+                      </option>
+                      <option value="open_ai_responses">
+                        OpenAI Responses
+                      </option>
+                      <option value="anthropic_messages">
+                        Anthropic Messages
+                      </option>
+                    </select>
+                    <small>{providerProtocolHint}</small>
+                  </label>
+                </>
+              ) : null}
               {usesCodexAppServer ? (
                 <div className="settings-field-wide settings-provider-local-note">
                   <CodexAccountSettings
@@ -1901,7 +2092,7 @@ function ProviderSettingsView({
                   使用本机已安装的 Codex 及其模型配置处理本地附件；不需要 Base
                   URL、API 密钥、模型名或图片服务器。
                 </div>
-              ) : (
+              ) : usesHttpTransport ? (
                 <>
                   <label className="settings-field-wide">
                     <span>Base URL</span>
@@ -1922,48 +2113,54 @@ function ProviderSettingsView({
                       onOptionSelect={selectBaseUrlPreset}
                     />
                   </label>
-                  <label className="settings-field-wide">
-                    <span>API 密钥</span>
-                    <div className="settings-secret-input">
-                      <KeyRound size={15} aria-hidden="true" />
-                      <input
-                        type={showApiKey ? "text" : "password"}
-                        autoComplete="off"
-                        value={pendingApiKey}
-                        disabled={
-                          platform?.platform === "desktop" &&
-                          secretSources?.keyring &&
-                          !secretSources.keyring.encryptionAvailable
-                        }
-                        placeholder={
-                          editingProvider.apiKeyConfigured
-                            ? "已加密保存，输入新密钥可替换"
-                            : "输入密钥，保存时写入系统安全存储"
-                        }
-                        onChange={(event) =>
-                          onPendingApiKeyChange(
-                            editingProvider.id,
-                            event.target.value,
-                          )
-                        }
-                      />
-                      <button
-                        type="button"
-                        aria-label={
-                          showApiKey ? "隐藏 API 密钥" : "显示 API 密钥"
-                        }
-                        title={showApiKey ? "隐藏密钥" : "显示密钥"}
-                        onClick={onToggleApiKeyVisibility}
-                      >
-                        {showApiKey ? <EyeOff size={15} /> : <Eye size={15} />}
-                      </button>
-                    </div>
-                    <small>
-                      {editingProvider.apiKeyConfigured
-                        ? "密钥已加密保存；界面不会回显原文。"
-                        : "密钥不会写入普通设置文件。"}
-                    </small>
-                  </label>
+                  {providerEffectiveAuth(editingProvider) !== "none" ? (
+                    <label className="settings-field-wide">
+                      <span>API 密钥</span>
+                      <div className="settings-secret-input">
+                        <KeyRound size={15} aria-hidden="true" />
+                        <input
+                          type={showApiKey ? "text" : "password"}
+                          autoComplete="off"
+                          value={pendingApiKey}
+                          disabled={
+                            platform?.platform === "desktop" &&
+                            secretSources?.keyring &&
+                            !secretSources.keyring.encryptionAvailable
+                          }
+                          placeholder={
+                            editingProvider.apiKeyConfigured
+                              ? "已加密保存，输入新密钥可替换"
+                              : "输入密钥，保存时写入系统安全存储"
+                          }
+                          onChange={(event) =>
+                            onPendingApiKeyChange(
+                              editingProvider.id,
+                              event.target.value,
+                            )
+                          }
+                        />
+                        <button
+                          type="button"
+                          aria-label={
+                            showApiKey ? "隐藏 API 密钥" : "显示 API 密钥"
+                          }
+                          title={showApiKey ? "隐藏密钥" : "显示密钥"}
+                          onClick={onToggleApiKeyVisibility}
+                        >
+                          {showApiKey ? (
+                            <EyeOff size={15} />
+                          ) : (
+                            <Eye size={15} />
+                          )}
+                        </button>
+                      </div>
+                      <small>
+                        {editingProvider.apiKeyConfigured
+                          ? "密钥已加密保存；界面不会回显原文。"
+                          : "密钥不会写入普通设置文件。"}
+                      </small>
+                    </label>
+                  ) : null}
                   <div className="settings-field-wide">
                     <label>
                       <span>默认模型</span>
@@ -1980,7 +2177,9 @@ function ProviderSettingsView({
                       <span>
                         {editingProvider.syncedModels.length > 0
                           ? modelDescription
-                          : "填写 Base URL 和 API 密钥后会自动识别此 API 的所有模型，无需手动填写模型名称。"}
+                          : providerEffectiveAuth(editingProvider) === "none"
+                            ? "填写 Base URL 后会自动识别此 API 的所有模型，无需手动填写模型名称。"
+                            : "填写 Base URL 和 API 密钥后会自动识别此 API 的所有模型，无需手动填写模型名称。"}
                       </span>
                       {modelSourceUrl ? (
                         <button
@@ -2000,24 +2199,28 @@ function ProviderSettingsView({
                     />
                   </div>
                 </>
+              ) : (
+                <div className="settings-field-wide settings-provider-local-note">
+                  Mock 连接只用于本地模拟，不需要 Base URL、API 密钥或模型目录。
+                </div>
               )}
             </div>
 
-            {!usesCodexAppServer ? (
+            {usesHttpTransport ? (
               <ModelFamilySection
                 connection={editingProvider}
                 onUpdateProvider={onUpdateProvider}
               />
             ) : null}
 
-            {!usesCodexAppServer ? (
+            {usesHttpTransport ? (
               <ModelConfigurationSection
                 connection={editingProvider}
                 onUpdateProvider={onUpdateProvider}
               />
             ) : null}
 
-            {showLegacyConnectionDefaults && !usesCodexAppServer ? (
+            {showLegacyConnectionDefaults && usesHttpTransport ? (
               <details className="settings-advanced-fields">
                 <summary>连接默认参数</summary>
                 <div className="settings-form-grid">
@@ -2169,7 +2372,7 @@ function ProviderSettingsView({
                       }
                     />
                   </label>
-                  {editingProvider.kind === "openai_responses" ? (
+                  {usesResponsesAdapter ? (
                     <>
                       <label>
                         <span>缓存策略</span>
@@ -2235,7 +2438,7 @@ function ProviderSettingsView({
                       />
                     }
                   />
-                  {editingProvider.kind === "openai_responses" ? (
+                  {usesResponsesAdapter ? (
                     <SettingsRow
                       title="延续 Responses 状态"
                       description="在多轮请求间保留供应商响应状态。"
@@ -2268,7 +2471,9 @@ function ProviderSettingsView({
                 ) : null}
               </div>
               <div className="settings-provider-actions">
-                {!usesCodexAppServer && editingProvider.apiKeyConfigured ? (
+                {usesHttpTransport &&
+                providerEffectiveAuth(editingProvider) !== "none" &&
+                editingProvider.apiKeyConfigured ? (
                   <button
                     type="button"
                     className="secondary-button danger-text"
@@ -3412,8 +3617,8 @@ function OpenAiCompatibilityDetails({
         {report.selectedProtocol === "responses"
           ? "已选择 Responses 适配器；系统与开发者指令会通过 Responses 原生 instructions 发送。"
           : report.messageCompatibility
-            ? "已启用兼容模式：运行时会直接合并 developer 指令并扁平化结构化工具历史，避免每轮先触发 400。"
-            : "使用原生 Chat 消息格式；若运行时首次遇到同类 400，会自动学习并缓存兼容模式。"}
+            ? "已选择兼容编码：Adapter 会按已保存的能力档案合并 developer 指令并编码工具历史。"
+            : "已选择原生 Chat 编码；若供应商能力变化，请重新测试连接以更新 Adapter 档案。"}
       </div>
     </div>
   );
@@ -3441,14 +3646,16 @@ function providerDiscoverySignature(
   pendingApiKey: string,
 ): string | null {
   if (
-    provider.kind === "mock" ||
-    provider.kind === "codex_app_server" ||
+    providerEffectiveTransport(provider) !== "http" ||
     !isHttpUrl(provider.baseUrl)
   ) {
     return null;
   }
-  if (!pendingApiKey && !provider.apiKeyConfigured) return null;
-  return `${provider.id}\u0000${provider.baseUrl.trim()}\u0000${
+  const auth = providerEffectiveAuth(provider);
+  if (auth !== "none" && !pendingApiKey && !provider.apiKeyConfigured) {
+    return null;
+  }
+  return `${provider.id}\u0000${provider.baseUrl.trim()}\u0000${provider.model.trim()}\u0000${providerProtocolSelection(provider)}\u0000${auth}\u0000${
     pendingApiKey || "configured"
   }`;
 }
@@ -3466,10 +3673,12 @@ function createProviderSettings(
   id: string,
   overrides: Partial<ProviderSettings> = {},
 ): ProviderSettings {
+  const axes = providerAxesFromKind(overrides.kind ?? "openai_compatible");
   return {
     id,
     name: "",
     kind: "openai_compatible",
+    ...axes,
     baseUrl: "",
     model: "",
     enabledFamilies: [],
@@ -3554,25 +3763,24 @@ function providerKindLabel(kind: ProviderKind): string {
   return "Mock";
 }
 
-function providerProtocolDescription(kind: ProviderKind): string {
-  if (isOpenAiProviderKind(kind)) {
-    return "填写统一的 /v1 Base URL；连接测试会自动识别 Chat Completions、Responses 与消息格式兼容性。";
-  }
-  if (kind === "anthropic") {
-    return "Anthropic Messages：请求会发到 Base URL + /v1/messages，并使用 x-api-key 认证。";
-  }
-  if (kind === "codex_app_server") {
+function providerProtocolDescription(provider: ProviderSettings): string {
+  if (providerEffectiveTransport(provider) === "codex_app_server") {
     return "使用本机 Codex App Server，不需要 URL 或 API 密钥。";
   }
-  return "仅用于本地模拟，不会调用远程 API。";
+  if (providerEffectiveTransport(provider) === "mock") {
+    return "仅用于本地模拟，不会调用远程 API。";
+  }
+  if (providerProtocolSelection(provider) === "openai_auto") {
+    return "同一连接会分别保存 Chat Completions 与 Responses 能力档案；线程可独立选择。";
+  }
+  if (providerProtocolSelection(provider) === "anthropic_messages") {
+    return "请求使用 Anthropic Messages 线协议；认证方式由上方设置独立决定。";
+  }
+  return "仅启用所选协议；连接测试会保存该模型的能力档案。";
 }
 
 function isOpenAiProviderKind(kind: ProviderKind): boolean {
   return kind === "openai_compatible" || kind === "openai_responses";
-}
-
-function providerTypeSelection(kind: ProviderKind): ProviderKind | "openai" {
-  return isOpenAiProviderKind(kind) ? "openai" : kind;
 }
 
 function providerFeatureSupportLabel(
@@ -3590,17 +3798,28 @@ function providerStatusChips(
   const providerHealth = health.find((item) => item.id === provider.id);
   return (
     <>
-      <span>{providerHealth?.status ?? "状态未知"}</span>
+      <span>{providerHealthStatusLabel(providerHealth?.status)}</span>
       <span>
-        {provider.kind === "codex_app_server"
+        {providerEffectiveTransport(provider) === "codex_app_server"
           ? "本地 Codex"
-          : provider.apiKeyConfigured
-            ? "密钥已配置"
-            : "未配置密钥"}
+          : providerEffectiveAuth(provider) === "none"
+            ? "无需认证"
+            : provider.apiKeyConfigured
+              ? "密钥已配置"
+              : "未配置密钥"}
       </span>
       <span>{providerHealth?.usingMock ? "Mock" : "模型"}</span>
     </>
   );
+}
+
+function providerHealthStatusLabel(status?: string): string {
+  if (status === "ready") return "可用于对话";
+  if (status === "needs_negotiation") return "等待能力检测";
+  if (status === "mock_or_unconfigured") return "未配置";
+  if (status === "local_codex") return "本地可用";
+  if (status === "configured") return "已配置";
+  return status ?? "未检测";
 }
 
 function formatImportFormat(

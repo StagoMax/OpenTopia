@@ -1,4 +1,27 @@
 const HTTP_SCHEMES = new Set(["http:", "https:"]);
+const BROWSER_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+export const STANDALONE_BROWSER_SESSION_ID = "browser:standalone";
+
+interface AddressBarBrowserHost {
+  createSession(input: {
+    sessionId: string;
+    visible?: boolean;
+  }): Promise<unknown>;
+  navigateFromAddressBar(sessionId: string, url: string): Promise<unknown>;
+}
+
+/**
+ * The visible browser can exist before a conversation does. Once a task is
+ * active, retaining its id keeps agent actions and the visible surface on the
+ * same browser session.
+ */
+export function browserSessionId(threadId: string | null | undefined): string {
+  const candidate = threadId?.trim();
+  return candidate && BROWSER_SESSION_ID_PATTERN.test(candidate)
+    ? candidate
+    : STANDALONE_BROWSER_SESSION_ID;
+}
 
 /**
  * Resolves text entered by a person in the browser toolbar. Programmatic
@@ -20,6 +43,21 @@ export function resolveAddressBarInput(value: string): string {
   const search = new URL("https://www.google.com/search");
   search.searchParams.set("q", input);
   return search.toString();
+}
+
+/**
+ * Makes address-bar navigation safe during initial render by ensuring the
+ * browser session exists before handing control to the user navigation path.
+ */
+export async function navigateBrowserAddress(
+  host: AddressBarBrowserHost,
+  sessionId: string,
+  value: string,
+): Promise<string> {
+  const url = resolveAddressBarInput(value);
+  await host.createSession({ sessionId, visible: false });
+  await host.navigateFromAddressBar(sessionId, url);
+  return url;
 }
 
 function parseHttpUrl(value: string): string | null {

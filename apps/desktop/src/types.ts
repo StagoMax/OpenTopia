@@ -199,7 +199,7 @@ export type ComputerObservation = {
 };
 
 export type ExperienceMode = "work" | "code" | "flow";
-export type CollaborationMode = "default" | "goal";
+export type CollaborationMode = "default" | "plan" | "goal";
 
 export type Thread = {
   id: string;
@@ -220,6 +220,7 @@ export type Thread = {
 export type ThreadModelSelection = {
   connectionId: string;
   modelId: string;
+  adapter?: ProviderAdapterKind | null;
   reasoningEffort: ReasoningEffort | null;
 };
 
@@ -233,6 +234,62 @@ export type ProviderModelSyncResult = {
   /** A valid default selected from the models returned by the endpoint. */
   defaultModel: string;
   syncedAt: string;
+  /** Complete persisted connection, including negotiated per-model adapter profiles. */
+  provider: ProviderSettings;
+};
+
+export type ProviderAdapterKind =
+  | "open_ai_chat"
+  | "open_ai_responses"
+  | "anthropic_messages"
+  | "codex_app_server"
+  | "mock";
+
+export type ProviderTransportKind = "http" | "codex_app_server" | "mock";
+
+export type ProviderAuthKind =
+  "bearer" | "x_api_key" | "codex_session" | "none";
+
+export type ProviderInstructionEncoding =
+  "native_roles" | "fold_developer_into_system" | "portable_chat_envelope";
+
+export type ProviderReasoningProtocol =
+  | "reasoning_effort"
+  | "deep_seek_thinking"
+  | "glm_thinking";
+
+export type ProviderMessageProtocolCapabilities = {
+  requiresReasoningContentForToolCalls: boolean;
+};
+
+export type ProviderOutputProtocolCapabilities = {
+  jsonSchema: ProviderFeatureSupport;
+};
+
+export type ProviderToolProtocolCapabilities = {
+  functionTools: ProviderFeatureSupport;
+  strictFunctionTools: ProviderFeatureSupport;
+  streamingTools: ProviderFeatureSupport;
+  parallelToolCalls: ProviderFeatureSupport;
+  freeformTools: ProviderFeatureSupport;
+  hostedApplyPatch: ProviderFeatureSupport;
+  assistantPhase: ProviderFeatureSupport;
+  deferredToolLoading: ProviderFeatureSupport;
+  namespaceTools: ProviderFeatureSupport;
+  hostedToolSearch: ProviderFeatureSupport;
+};
+
+export type ProviderAdapterProfile = {
+  profileVersion: number;
+  baseUrl: string;
+  model: string;
+  adapter: ProviderAdapterKind;
+  instructionEncoding: ProviderInstructionEncoding;
+  reasoningProtocol: ProviderReasoningProtocol;
+  messageProtocol: ProviderMessageProtocolCapabilities;
+  outputProtocol: ProviderOutputProtocolCapabilities;
+  toolProtocol: ProviderToolProtocolCapabilities;
+  checkedAt: string;
 };
 
 export type ProviderModelCapabilities = {
@@ -243,11 +300,12 @@ export type ProviderModelCapabilities = {
 export type ProviderModelSettings = {
   /** User overrides that apply only to this model. */
   supportsVision?: boolean;
-  /** `undefined` inherits the legacy connection default; `null` omits the parameter. */
+  /** `undefined` inherits the connection default; `null` omits the parameter. */
   temperature?: number | null;
   maxOutputTokens?: number | null;
   contextWindowTokens?: number | null;
   reasoningEffort?: ReasoningEffort | null;
+  preferredAdapter?: ProviderAdapterKind;
 };
 
 export type Project = {
@@ -279,7 +337,8 @@ export type ProviderKind =
 
 export type ProviderDriverDescriptor = {
   id: string;
-  kind: ProviderKind;
+  adapter: ProviderAdapterKind;
+  transport: ProviderTransportKind;
   displayName: string;
   trust: "built_in" | "signed";
 };
@@ -294,8 +353,20 @@ export type OpenAiCompatibilityReport = {
   selectedProtocol: OpenAiProtocol;
   chatCompletions: ProviderFeatureSupport;
   chatFunctionTools: ProviderFeatureSupport;
+  chatStrictFunctionTools: ProviderFeatureSupport;
+  chatStreamingTools: ProviderFeatureSupport;
+  chatParallelToolCalls: ProviderFeatureSupport;
+  chatJsonSchemaOutput: ProviderFeatureSupport;
+  chatMessageProtocol: ProviderMessageProtocolCapabilities;
   responses: ProviderFeatureSupport;
   responsesNativeTools: ProviderFeatureSupport;
+  responsesFunctionTools: ProviderFeatureSupport;
+  responsesStrictFunctionTools: ProviderFeatureSupport;
+  responsesStreamingTools: ProviderFeatureSupport;
+  responsesParallelToolCalls: ProviderFeatureSupport;
+  responsesJsonSchemaOutput: ProviderFeatureSupport;
+  responsesCustomTools: ProviderFeatureSupport;
+  responsesApplyPatch: ProviderFeatureSupport;
   developerMessages: ProviderFeatureSupport;
   messageCompatibility: boolean;
   checkedAt: string;
@@ -609,6 +680,14 @@ export type ProviderSettings = {
   id: string;
   name: string;
   kind: ProviderKind;
+  /** Independent connection transport. Missing values are migrated from `kind`. */
+  transport?: ProviderTransportKind | null;
+  /** Authentication is independent from the selected wire protocol. */
+  auth?: ProviderAuthKind | null;
+  /** Every protocol this connection may use. */
+  allowedAdapters?: ProviderAdapterKind[];
+  /** Optional connection-wide protocol preference; absent means automatic. */
+  preferredAdapter?: ProviderAdapterKind | null;
   baseUrl: string;
   /**
    * Default model for this connection. Threads may pin a different model; this
@@ -629,6 +708,11 @@ export type ProviderSettings = {
   modelContextWindows?: Record<string, number>;
   /** Model capabilities automatically discovered from the provider's API. */
   modelCapabilities?: Record<string, ProviderModelCapabilities>;
+  /** Negotiated runtime adapter contract per exact model id. */
+  adapterProfiles?: Record<
+    string,
+    Partial<Record<ProviderAdapterKind, ProviderAdapterProfile>>
+  >;
   /** Per-model user overrides, preserved across capability re-discovery. */
   modelSettings?: Record<string, ProviderModelSettings>;
   modelsSyncedAt?: string | null;
@@ -663,6 +747,9 @@ export type RolloutBudgetSettings = {
 export type ProviderHealth = {
   id: string;
   kind: ProviderKind;
+  transport: ProviderTransportKind;
+  auth: ProviderAuthKind;
+  adapter: ProviderAdapterKind;
   baseUrl: string;
   model: string;
   apiKeySource: string;
@@ -2287,11 +2374,7 @@ export type ToolResult = {
 };
 
 export type WorkFormStatus =
-  | "active"
-  | "completed"
-  | "blocked"
-  | "paused"
-  | "cancelled";
+  "active" | "completed" | "blocked" | "paused" | "cancelled";
 
 export type WorkItemStatus =
   | "pending"
@@ -2304,8 +2387,7 @@ export type WorkItemStatus =
 export type CompletionDisposition = "blocking" | "advisory";
 
 export type WorkScope =
-  | { kind: "turn"; id: string }
-  | { kind: "goal"; id: string };
+  { kind: "turn"; id: string } | { kind: "goal"; id: string };
 
 export type WorkItem = {
   id: string;
@@ -2461,6 +2543,7 @@ export type ThreadContextSnapshot = {
   capturedAt: string;
   providerId: string;
   providerKind: string;
+  providerAdapter?: string;
   model: string;
   workspaceRoot: string;
   cwd: string;
@@ -2526,6 +2609,7 @@ export type UserInputAnswer = {
 export type UserInputResponse = {
   answers: UserInputAnswer[];
   skipped?: boolean;
+  cancelled?: boolean;
 };
 
 export type UserInputRecord = {
@@ -2572,7 +2656,7 @@ export type AgentEventPayload =
       request_id: string;
       round: number;
       attempt: number;
-      retry_kind?: "compatibility" | "network";
+      retry_kind?: "network" | "state_recovery";
       retry_index?: number | null;
       retry_limit?: number | null;
       reason: string;
@@ -2724,6 +2808,7 @@ export type TurnStatus = {
   status:
     | "running"
     | "waiting_approval"
+    | "waiting_user_input"
     | "waiting_user_action"
     | "cancelling"
     | "succeeded"

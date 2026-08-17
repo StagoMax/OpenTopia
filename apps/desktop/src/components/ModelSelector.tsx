@@ -24,6 +24,7 @@ import {
 } from "../modelCatalog";
 import { providerDisplayName } from "../providerSettings";
 import type {
+  ProviderAdapterKind,
   ProviderSettings,
   ReasoningEffort,
   ThreadModelSelection,
@@ -48,7 +49,7 @@ type ModelOption = {
   familyLabel: string;
 };
 
-type OpenSubmenu = "model" | "effort" | null;
+type OpenSubmenu = "model" | "protocol" | "effort" | null;
 type SubmenuSide = "left" | "right";
 
 /** Grace period that covers the gap between the panel and an open submenu. */
@@ -221,13 +222,14 @@ export function ModelSelector({
 
   if (!resolved) return null;
 
-  const { connection, modelId, reasoningEffort } = resolved;
+  const { connection, modelId, adapter, reasoningEffort } = resolved;
   const capability = resolveReasoningOptions(connection.kind, modelId);
   const modelLabel = formatModelDisplayName(modelId);
   const effortLabel = reasoningEffort
     ? REASONING_EFFORT_DETAILS[reasoningEffort].label
     : null;
   const supportsEffort = capability.supportedEfforts.length > 0;
+  const availableAdapters = connectionAdapters(connection);
 
   return (
     <div
@@ -294,6 +296,11 @@ export function ModelSelector({
                     onChange({
                       connectionId: option.connection.id,
                       modelId: option.modelId,
+                      adapter: connectionAdapters(option.connection).includes(
+                        adapter ?? "open_ai_chat",
+                      )
+                        ? adapter
+                        : null,
                       reasoningEffort: reconcileReasoningEffort(
                         option.connection.kind,
                         option.modelId,
@@ -308,6 +315,73 @@ export function ModelSelector({
               </div>
             ) : null}
           </div>
+
+          {availableAdapters.length > 1 ? (
+            <div className="model-selector-row-wrap">
+              <button
+                aria-expanded={submenu === "protocol"}
+                aria-haspopup="menu"
+                className="model-selector-row"
+                onClick={() => toggleSubmenu("protocol")}
+                onMouseEnter={() => {
+                  if (submenu !== "protocol") showSubmenu("protocol");
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <span className="model-selector-row-label">协议</span>
+                <span className="model-selector-row-value">
+                  {adapter ? adapterLabel(adapter) : "自动"}
+                </span>
+                <ChevronRight aria-hidden="true" size={14} />
+              </button>
+              {submenu === "protocol" ? (
+                <div
+                  className={`model-selector-submenu model-selector-submenu--effort${
+                    submenuSide === "left"
+                      ? " model-selector-submenu--left"
+                      : ""
+                  }`}
+                  ref={submenuRef}
+                  style={{
+                    maxHeight: submenuMaxHeight ?? undefined,
+                    top: submenuTopOffset,
+                  }}
+                >
+                  <ul className="model-menu-list" role="listbox">
+                    {[null, ...availableAdapters].map((option) => (
+                      <li key={option ?? "auto"}>
+                        <button
+                          aria-selected={option === adapter}
+                          className="model-menu-option"
+                          onClick={() => {
+                            onChange({
+                              connectionId: connection.id,
+                              modelId,
+                              adapter: option,
+                              reasoningEffort,
+                            });
+                            setSubmenu(null);
+                          }}
+                          role="option"
+                          type="button"
+                        >
+                          <span className="model-menu-option-main">
+                            <span className="model-menu-option-name">
+                              {option ? adapterLabel(option) : "自动选择"}
+                            </span>
+                          </span>
+                          {option === adapter ? (
+                            <Check aria-hidden="true" size={14} />
+                          ) : null}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           {supportsEffort ? (
             <div className="model-selector-row-wrap">
@@ -351,6 +425,7 @@ export function ModelSelector({
                             onChange({
                               connectionId: connection.id,
                               modelId,
+                              adapter,
                               reasoningEffort: effort,
                             });
                             setSubmenu(null);
@@ -658,6 +733,24 @@ function connectionModelIds(connection: ProviderSettings): string[] {
   return synced.length > 0 ? synced : configured ? [configured] : [];
 }
 
+function connectionAdapters(
+  connection: ProviderSettings,
+): ProviderAdapterKind[] {
+  if (connection.allowedAdapters?.length) return connection.allowedAdapters;
+  if (connection.kind === "codex_app_server") return ["codex_app_server"];
+  if (connection.kind === "mock") return ["mock"];
+  if (connection.kind === "anthropic") return ["anthropic_messages"];
+  return ["open_ai_chat", "open_ai_responses"];
+}
+
+function adapterLabel(adapter: ProviderAdapterKind): string {
+  if (adapter === "open_ai_chat") return "Chat Completions";
+  if (adapter === "open_ai_responses") return "Responses";
+  if (adapter === "anthropic_messages") return "Anthropic Messages";
+  if (adapter === "codex_app_server") return "Codex App Server";
+  return "Mock";
+}
+
 /**
  * Falls back to the active connection's default model so threads created
  * before per-thread models still render a selection.
@@ -669,6 +762,7 @@ function useResolvedSelection(
 ): {
   connection: ProviderSettings;
   modelId: string;
+  adapter: ProviderAdapterKind | null;
   reasoningEffort: ReasoningEffort | null;
 } | null {
   return useMemo(() => {
@@ -680,6 +774,7 @@ function useResolvedSelection(
       return {
         connection: active,
         modelId: active.model,
+        adapter: null,
         reasoningEffort: active.reasoningEffort ?? null,
       };
     }
@@ -688,6 +783,7 @@ function useResolvedSelection(
     return {
       connection,
       modelId: selection.modelId || connection.model,
+      adapter: selection.adapter ?? null,
       reasoningEffort: selection.reasoningEffort ?? null,
     };
   }, [activeConnectionId, connections, selection]);

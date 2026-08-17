@@ -134,12 +134,14 @@ export type UsageSummary = {
   p95LatencyMs: number | null;
   averageTtftMs: number | null;
   outputTokensPerSecond: number | null;
+  totalModelDurationMs: number;
   retryCount: number;
   retryRate: number | null;
   errorEventCount: number;
   toolCallCount: number;
   toolErrorCount: number;
   averageToolDurationMs: number | null;
+  totalToolDurationMs: number;
 };
 
 export type UsageDashboardData = {
@@ -379,7 +381,8 @@ export function aggregateUsageEvents(
         call.responseReceived = true;
         break;
       }
-      case "model_delta": {
+      case "model_delta":
+      case "reasoning_delta": {
         const call = latestCallForTurn(callsById, latestRequestByTurn, turnKey);
         if (!call || call.firstTokenAt) break;
         call.firstTokenAt = event.createdAt;
@@ -654,12 +657,17 @@ function summarizeUsage(
       totalDurationMs > 0
         ? totals.outputTokens / (totalDurationMs / 1_000)
         : null,
+    totalModelDurationMs: totalDurationMs,
     retryCount: totals.retryCount,
     retryRate: ratio(totals.retryCount, calls.length),
     errorEventCount,
     toolCallCount,
     toolErrorCount,
     averageToolDurationMs: average(toolDurations),
+    totalToolDurationMs: toolDurations.reduce(
+      (total, duration) => total + duration,
+      0,
+    ),
   };
 }
 

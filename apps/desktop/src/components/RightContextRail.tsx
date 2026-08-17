@@ -213,12 +213,15 @@ export function RightContextRail({
       <RailSection
         title="环境信息"
         action={
-          <LibraryPicker
-            enabled={libraryPickerEnabled}
-            value={libraryProvider}
-            onChange={onChangeLibraryProvider}
-            onOpenEnvironment={onOpenEnvironment}
-          />
+          <button
+            className="right-context-rail__header-action"
+            type="button"
+            title="管理本地环境"
+            aria-label="管理本地环境"
+            onClick={onOpenEnvironment}
+          >
+            <Plus size={14} aria-hidden="true" />
+          </button>
         }
       >
         {workspaceDiff && (
@@ -255,12 +258,13 @@ export function RightContextRail({
             title={
               libraryProvider
                 ? `模型可按需调用 ${libraryProviderName(libraryProvider)} 检索工具`
-                : "点击环境信息右侧的加号启用模型检索"
+                : "点击本行右侧的加号启用模型检索"
             }
             value={
-              <StatusText active={Boolean(libraryProvider)} muted={!libraryProvider}>
-                {libraryProvider ? libraryProviderName(libraryProvider) : "未启用"}
-              </StatusText>
+              <LibraryPicker
+                value={libraryProvider}
+                onChange={onChangeLibraryProvider}
+              />
             }
           />
         )}
@@ -457,15 +461,11 @@ export function RightContextRail({
 }
 
 function LibraryPicker({
-  enabled,
   value,
   onChange,
-  onOpenEnvironment,
 }: {
-  enabled: boolean;
   value: LibraryProviderId | null;
   onChange(provider: LibraryProviderId | null): void;
-  onOpenEnvironment(): void;
 }) {
   const options: Array<{
     value: LibraryProviderId | null;
@@ -497,60 +497,56 @@ function LibraryPicker({
       trigger={(triggerProps) => (
         <button
           {...triggerProps}
-          className="right-context-rail__header-action"
+          className={`right-context-rail__library-trigger ${value ? "is-active" : ""}`.trim()}
           type="button"
-          title="添加环境能力"
-          aria-label="添加环境能力"
+          title={
+            value
+              ? `当前使用 ${libraryProviderName(value)}，点击切换`
+              : "添加 Lib 检索"
+          }
+          aria-label={
+            value
+              ? `当前使用 ${libraryProviderName(value)}，点击切换 Lib 检索`
+              : "添加 Lib 检索"
+          }
         >
-          <Plus size={14} aria-hidden="true" />
+          {value ? (
+            libraryProviderName(value)
+          ) : (
+            <Plus size={14} aria-hidden="true" />
+          )}
         </button>
       )}
     >
       {({ close }) => (
         <div className="right-context-rail__library-picker">
           <header>
-            <strong>{enabled ? "Lib 检索测试" : "添加环境能力"}</strong>
-            <span>
-              {enabled
-                ? "启用后，模型会在需要时调用检索工具。"
-                : "Lib 检索仅在 Flow 模式下提供。"}
-            </span>
+            <strong>Lib 检索测试</strong>
+            <span>启用后，模型会在需要时调用检索工具。</span>
           </header>
-          {enabled ? (
-            <div className="right-context-rail__library-options">
-              {options.map((option) => {
-                const selected = option.value === value;
-                return (
-                  <button
-                    key={option.value ?? "none"}
-                    className="right-context-rail__library-option"
-                    type="button"
-                    aria-pressed={selected}
-                    onClick={() => {
-                      onChange(option.value);
-                      close();
-                    }}
-                  >
-                    <span>
-                      <strong>{option.label}</strong>
-                      <small>{option.description}</small>
-                    </span>
-                    {selected ? <Check size={14} aria-hidden="true" /> : null}
-                  </button>
-                );
-              })}
-            </div>
-          ) : null}
-          <button
-            className="right-context-rail__library-environment-link"
-            type="button"
-            onClick={() => {
-              close();
-              onOpenEnvironment();
-            }}
-          >
-            打开本地环境设置
-          </button>
+          <div className="right-context-rail__library-options">
+            {options.map((option) => {
+              const selected = option.value === value;
+              return (
+                <button
+                  key={option.value ?? "none"}
+                  className="right-context-rail__library-option"
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => {
+                    onChange(option.value);
+                    close();
+                  }}
+                >
+                  <span>
+                    <strong>{option.label}</strong>
+                    <small>{option.description}</small>
+                  </span>
+                  {selected ? <Check size={14} aria-hidden="true" /> : null}
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
     </Popover>
