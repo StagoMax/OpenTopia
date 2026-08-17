@@ -92,6 +92,20 @@ export function resolveMarkdownFileLink(
 }
 
 /**
+ * Returns the path that desktop-only file actions may use. Workspace paths use
+ * their resolved on-disk location; explicit absolute paths remain actionable
+ * even when they cannot be previewed through the workspace-scoped API.
+ */
+export function markdownFileActionPath(
+  target: MarkdownFileLinkTarget | null,
+  workspaceAbsolutePath: string | null,
+): string | null {
+  if (!target) return null;
+  if (workspaceAbsolutePath) return workspaceAbsolutePath;
+  return /^(?:[A-Za-z]:\/|\/)/.test(target.path) ? target.path : null;
+}
+
+/**
  * Keeps an automatically detected path's filename stable while its workspace
  * lookup is pending. Explicit Markdown links keep their authored children
  * until they are known to point at a workspace file.

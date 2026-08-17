@@ -223,10 +223,11 @@ export function FileLinkContextMenu({
           );
         }
         const Icon = item.icon;
+        const unavailable = item.action === "copy-content" && !readText;
         return (
           <button
             className="file-link-context-menu__item"
-            disabled={pendingAction !== null}
+            disabled={pendingAction !== null || unavailable}
             key={item.action}
             onClick={() => void runAction(item.action)}
             role="menuitem"

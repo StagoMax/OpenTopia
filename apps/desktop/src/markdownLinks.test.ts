@@ -8,6 +8,7 @@ const markdownLinks: typeof MarkdownLinksModule = await import(
 );
 
 const {
+  markdownFileActionPath,
   markdownFileLinkDisplayState,
   markdownStreamInterval,
   resolveMarkdownFileLink,
@@ -94,6 +95,25 @@ test("derives a filename label from explicit local file links", () => {
     },
   );
   assert.equal(resolveMarkdownFileLink("https://example.com/app.css"), null);
+});
+
+test("keeps absolute file links actionable outside the workspace", () => {
+  const outsideWorkspace = resolveMarkdownFileLink(
+    "C:/Users/Stargo/Downloads/report.xlsx",
+  );
+  assert.equal(
+    markdownFileActionPath(outsideWorkspace, null),
+    "C:/Users/Stargo/Downloads/report.xlsx",
+  );
+  assert.equal(
+    markdownFileActionPath(outsideWorkspace, "C:\\resolved\\report.xlsx"),
+    "C:\\resolved\\report.xlsx",
+  );
+  assert.equal(
+    markdownFileActionPath(resolveMarkdownFileLink("docs/report.xlsx"), null),
+    null,
+  );
+  assert.equal(markdownFileActionPath(null, "C:\\unrelated.xlsx"), null);
 });
 
 test("keeps detected file labels stable while workspace lookup settles", () => {

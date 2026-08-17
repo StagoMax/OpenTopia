@@ -12,6 +12,7 @@ import {
   type AnchorHTMLAttributes,
   type HTMLAttributes,
   type ImgHTMLAttributes,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
 import ReactMarkdown, {
@@ -38,6 +39,7 @@ import {
   remarkFilePathLinks,
 } from "../filePathLinks";
 import {
+  markdownFileActionPath,
   markdownFileLinkDisplayState,
   markdownStreamInterval,
   resolveMarkdownFileLink,
@@ -237,12 +239,51 @@ function MarkdownAnchor({
     pathStatus,
   );
   const absolutePath = useWorkspaceAbsolutePath(linkInfo?.path ?? null);
+  const fileActionPath = markdownFileActionPath(linkInfo, absolutePath);
   const readFileText = useWorkspaceFileTextReader(linkInfo?.path ?? null);
   const anchorRef = useRef<HTMLAnchorElement>(null);
   const [contextMenuPoint, setContextMenuPoint] = useState<{
     x: number;
     y: number;
   } | null>(null);
+  const line = markdownLineNumber(linkInfo?.fragment ?? null);
+
+  function handleFileContextMenu(event: ReactMouseEvent<HTMLAnchorElement>) {
+    props.onContextMenu?.(event);
+    if (event.defaultPrevented || !fileActionPath) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    setContextMenuPoint({
+      x: event.clientX || bounds.left,
+      y: event.clientY || bounds.bottom,
+    });
+  }
+
+  const fileContextMenu =
+    fileActionPath && contextMenuPoint ? (
+      <FileLinkContextMenu
+        line={line}
+        onClose={(options) => {
+          setContextMenuPoint(null);
+          if (options?.restoreFocus) {
+            window.requestAnimationFrame(() => anchorRef.current?.focus());
+          }
+        }}
+        onOpen={
+          fileLinkDisplayState === "link" && onOpenLink && href
+            ? () => onOpenLink(href)
+            : undefined
+        }
+        path={fileActionPath}
+        point={contextMenuPoint}
+        readText={
+          fileLinkDisplayState === "link"
+            ? (readFileText ?? undefined)
+            : undefined
+        }
+      />
+    ) : null;
 
   if (attachment) {
     return (
@@ -286,8 +327,6 @@ function MarkdownAnchor({
       );
     }
 
-    const line = markdownLineNumber(linkInfo.fragment);
-
     return (
       <>
         <a
@@ -304,33 +343,12 @@ function MarkdownAnchor({
             onOpenLink(href);
           }}
           onContextMenu={(event) => {
-            if (!absolutePath) return;
-            event.preventDefault();
-            event.stopPropagation();
-            const bounds = event.currentTarget.getBoundingClientRect();
-            setContextMenuPoint({
-              x: event.clientX || bounds.left,
-              y: event.clientY || bounds.bottom,
-            });
+            handleFileContextMenu(event);
           }}
         >
           {linkInfo.fileName}
         </a>
-        {absolutePath && contextMenuPoint ? (
-          <FileLinkContextMenu
-            line={line}
-            onClose={(options) => {
-              setContextMenuPoint(null);
-              if (options?.restoreFocus) {
-                window.requestAnimationFrame(() => anchorRef.current?.focus());
-              }
-            }}
-            onOpen={onOpenLink && href ? () => onOpenLink(href) : undefined}
-            path={absolutePath}
-            point={contextMenuPoint}
-            readText={readFileText ?? undefined}
-          />
-        ) : null}
+        {fileContextMenu}
       </>
     );
   }
@@ -341,19 +359,28 @@ function MarkdownAnchor({
 
   // Normal markdown link
   return (
-    <a
-      {...props}
-      href={href}
-      onClick={(event) => {
-        props.onClick?.(event);
-        if (event.defaultPrevented || !href || href.startsWith("#")) return;
-        if (!onOpenLink) return;
-        event.preventDefault();
-        onOpenLink(href);
-      }}
-    >
-      {children}
-    </a>
+    <>
+      <a
+        {...props}
+        aria-haspopup={fileActionPath ? "menu" : props["aria-haspopup"]}
+        data-text-context-menu={fileActionPath ? "custom" : undefined}
+        href={href}
+        ref={fileActionPath ? anchorRef : undefined}
+        onClick={(event) => {
+          props.onClick?.(event);
+          if (event.defaultPrevented || !href || href.startsWith("#")) return;
+          if (!onOpenLink) return;
+          event.preventDefault();
+          onOpenLink(href);
+        }}
+        onContextMenu={
+          fileActionPath ? handleFileContextMenu : props.onContextMenu
+        }
+      >
+        {children}
+      </a>
+      {fileContextMenu}
+    </>
   );
 }
 
