@@ -34,7 +34,7 @@ User Input
   -> UI sends request to local API Server
   -> Server persists user message, creates a Turn
   -> Agent Core requests model reasoning
-  -> Model proposes tool calls (read_file, shell, apply_patch, etc.)
+  -> Model proposes tool calls (filesystem, shell, apply_patch, etc.)
   -> Policy + Sandbox check permissions
   -> Tools execute, results returned to model
   -> Model produces final response
@@ -71,9 +71,9 @@ The agent loop follows a structured turn lifecycle:
 
 | Tool | Category |
 |---|---|
-| list_files, read_file, write_file, search | Filesystem |
+| filesystem | Structured filesystem operations, including bounded filename find |
 | shell | Terminal execution |
-| git_diff, apply_patch | Git and patch operations |
+| shell, apply_patch | Git inspection and patch operations |
 | update_plan | Task planning |
 | spreadsheet | XLSX inspect/list/read/create/update |
 | browser | CDP-based browser control |

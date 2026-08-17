@@ -24,7 +24,7 @@ Implemented:
 - OpenAI-compatible provider with env reuse from the credit review project and
   an eight-round bounded autonomous built-in/MCP tool loop.
 - Built-in tools registered in `ToolRegistry` (`crates/opentopia-core/src/tools.rs`):
-  - Files/shell: `list_files`, `read_file`, `write_file`, `search`, `shell`, `git_diff`,
+  - Files/shell: `filesystem`, `apply_patch`, `shell`,
     `apply_patch`.
   - Planning: `set_plan`, `update_plan`, `complete_task`.
   - Subagents: `spawn_agent`, `send_message`, `followup_task`, `interrupt_agent`,
@@ -188,16 +188,19 @@ Acceptance:
 - Allow/deny updates stored state.
 - Existing frontend approval flow keeps working.
 
-### Search Tool
+### Workspace Search
 
-Goal: repo search is a first-class built-in tool.
+Goal: repo search is available to the deterministic workspace UI and through the
+canonical agent tool surface.
 
 Status: complete for the local MVP built-in tool and deterministic command. The
 disabled app-wide sidebar search is a separate desktop feature tracked in Roadmap #4.
 
 Implemented:
 
-- Add `search` tool backed by `rg`.
+- Add the UI-only `workspace_search` implementation backed by `rg`.
+- Use `filesystem.find` for filename discovery and `shell` with `rg` for agent-side
+  content search.
 - Add deterministic `/search` command.
 - Enforce workspace read policy.
 - Add output truncation metadata.

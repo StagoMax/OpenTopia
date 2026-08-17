@@ -249,7 +249,7 @@ TurnStarted
 
 Provider 首轮没有工具调用时，直接落库助手消息并结束。否则 Agent 在每一轮把模型工具调用转为 `ToolCall`，顺序执行后将结构化 `ToolResult` 回传给 Provider。大文件、搜索和 shell 输出会在满足阈值时保存为 Artifact，并在工具结果中返回引用。
 
-Agent 不会在每个 Turn 开始时自动执行 `list_files`，也不会承诺“先读文件再改文件”的固定工作流。是否调用工具由模型和系统提示共同决定。
+Agent 不会在每个 Turn 开始时自动执行 `filesystem.list`，也不会承诺“先读文件再改文件”的固定工作流。是否调用工具由模型和系统提示共同决定。
 
 **这里的逻辑分工很重要：** 模型负责提出下一步；工具负责做确定性的操作；服务端负责让这两者之间有记录、有权限检查、有超时。模型不是直接执行 PowerShell 的主体，而是“提出工具调用请求”的决策者。
 
@@ -359,10 +359,10 @@ Provider 响应先归一化为 `ModelDecision::Act`、`Final` 或 `Incomplete`�
 
 | 工具 | 用途 |
 |---|---|
-| `list_files`、`read_file`、`write_file` | 工作区内的目录和 UTF-8 文本文件操作 |
-| `search` | 首选 `rg`，不可用时使用受限的文本扫描回退 |
+| `filesystem` | 工作区内有界的读取、写入、列举、文件名查找、元数据、复制、移动和删除 |
+| `shell` + `rg` | 文件内容搜索、测试、生成器和批量操作 |
 | `shell` | 带超时、输出截断、取消和策略检查的 shell 命令 |
-| `git_diff`、`apply_patch` | 获取 diff、用 `git apply` 应用统一补丁 |
+| `apply_patch` | 应用统一补丁或结构化文件修改；Git 检查通过 `shell` 执行 |
 | `update_plan`、`complete_task` | 持久化计划和结构化完成信息；工具调用本身不会终止 Turn |
 | `list_skills`、`read_skill` | 发现并按需读取 `SKILL.md` |
 | `browser` | 以 action 执行导航、快照、点击、输入、等待、截图和下载 |
@@ -618,7 +618,7 @@ waiting_approval -- 用户允许或拒绝 --> 新建一个 running 的恢复 Tur
 
 ### 练习 3：追踪一次工具调用
 
-1. 从 `crates/opentopia-core/src/tools.rs` 的 `ToolRegistry::with_builtins` 选择 `shell` 或 `write_file`。
+1. 从 `crates/opentopia-core/src/tools/registry.rs` 的 `ToolRegistry::with_builtins` 选择 `shell`、`filesystem` 或 `apply_patch`。
 2. 观察工具如何读取输入 schema，如何调用 `ctx.policy`，以及如何通过 `ctx.environment` 执行。
 3. 再读 `policy.rs` 和 `execution.rs`，分别回答“产品规则是否同意？”与“底层如何安全完成？”。
 4. 最后读 `sandbox.rs`，理解 OS 级限制为什么仍然需要存在。

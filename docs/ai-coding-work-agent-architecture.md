@@ -18,7 +18,7 @@
 
 最终产品不应把所有工具都塞进 MCP。建议采用：
 
-- **内置高信任工具**：shell、read、write、edit、apply_patch、diff、search、sandbox exec、browser control。
+- **内置高信任工具**：filesystem、apply_patch、shell、sandbox exec、browser control。
 - **MCP 扩展工具**：GitHub、Linear、Office、浏览器自动化、数据库、云服务、设计工具、企业系统。
 - **前端工具**：用户确认、图片/文件选择、浏览器/桌面交互、可视化编辑。
 
@@ -54,7 +54,7 @@ flowchart TB
     Core["Agent Core<br/>Turn Loop / Context / Tool Runtime / Policy"]
     Store["Session Store<br/>SQLite WAL + Event Log + Artifact Index"]
     Provider["Model Provider Layer<br/>OpenAI / Anthropic / Gemini / Local"]
-    Tools["Built-in Tools<br/>shell/read/write/edit/apply_patch/search/diff"]
+    Tools["Built-in Tools<br/>filesystem/apply_patch/shell"]
     MCP["MCP Extension Host<br/>stdio / HTTP / frontend / builtin"]
     Sandbox["Execution Sandbox<br/>OS-level sandbox (bwrap/Seatbelt/restricted token)"]
     Work["Work Connectors<br/>GitHub/Linear/Docs/Sheets/Browser/Scheduler"]
@@ -404,13 +404,8 @@ pub trait ModelProvider: Send + Sync {
 Built-in tools：
 
 - `shell`
-- `read_file`
-- `write_file`
-- `edit_file`
+- `filesystem`
 - `apply_patch`
-- `search`
-- `list_files`
-- `git_diff`
 - `browser_control`
 - `task_done`
 
@@ -1071,7 +1066,7 @@ apps/
 
 - Rust Agent Core
 - Provider: OpenAI-compatible + Anthropic
-- Built-in tools: read/search/edit/apply_patch/shell
+- Built-in tools: filesystem/apply_patch/shell
 - Permission policy
 - SQLite event store
 - CLI
@@ -1273,7 +1268,7 @@ pub trait EventSink: Send + Sync {
 
 1. 建 `opentopia-core`，先跑通一个 thread/turn/event。
 2. 接一个 OpenAI-compatible provider。
-3. 做 read/search/apply_patch/shell 四个工具。
+3. 做 filesystem/apply_patch/shell 三个规范工具。
 4. 做确定性 permission policy。
 5. 做 SQLite event store。
 6. 做 CLI。

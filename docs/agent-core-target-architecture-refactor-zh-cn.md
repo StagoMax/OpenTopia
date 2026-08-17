@@ -11,7 +11,7 @@
 本文遵循以下术语规则：
 
 - 英文架构术语在第一次出现时使用“English Term（中文解释）”格式。
-- Rust 类型、函数名和字段名保持代码拼写，例如 `TurnKernel`，并在相邻文字中解释其含义。
+- Rust 类型、函数名和字段名保持代码拼写，例如 `AgentTurnDriver`，并在相邻文字中解释其含义。
 - “Agent Core（智能体核心）”特指单个 Agent Turn（智能体轮次）内部的确定性执行内核，不包含 HTTP（超文本传输协议）、SSE（服务器发送事件）、数据库和桌面 UI（用户界面）。
 
 ---
@@ -614,7 +614,7 @@ flowchart TB
 
 | 标识平面 | 示例 | 是否允许进入可缓存前缀 |
 | --- | --- | --- |
-| Semantic Identity（语义标识） | 指令内容摘要、工具 Schema 摘要、模型配置摘要 | 是；内容不变时字节必须稳定 |
+| Semantic Identity（语义标识） | 指令内容摘要、模型配置摘要、固定快照摘要 | 是；内容不变时字节必须稳定 |
 | Control Identity（控制标识） | `TurnId`、`InvocationId`、`RoundId`、请求 ID、时间戳 | 否；只保存在运行状态、日志和事件中 |
 
 具体规则：
@@ -622,17 +622,17 @@ flowchart TB
 1. Stable Header（稳定头部）按 Runtime Build（运行时构建版本）固定，禁止插入当前时间、Turn ID、Round ID、追踪 ID 或随机生成的模块 ID。
 2. Thread Modules（会话模块）使用规范化内容的不可变哈希；内容未变时，跨 Turn 的序列化字节和顺序必须完全一致。
 3. `RuntimeSnapshotId` 是控制面引用，不是提示词内容。Context Assembler 不得因为新建 Turn 或 Invocation 就把它写进请求正文。
-4. Tool Catalog（工具目录）按稳定键排序；工具描述、JSON Schema 和 Provider 工具字段不能混入会话级动态标识。
+4. Tool Catalog（工具目录）按稳定键排序，但作为 Turn-scoped Dynamic Tail（轮次级动态尾部）和 Provider 原生 `tools` 字段传输，不参与历史稳定提示前缀；其内容摘要单独参与 Provider Cursor（供应商游标）兼容性判断。
 5. 指令发生语义变化时创建新的 Context Epoch（上下文世代）或追加 Superseding Item（替代条目），不重写历史条目。
 6. 动态时间、Git 状态、异步工具结果和临时提醒只追加到 Conversation Tail（会话尾部），不能插入稳定前缀中间。
 7. 新 Turn 只在已有会话尾部追加新 User Message（用户消息）；即使 `TurnId` 变化，之前的 Provider-visible Prefix（供应商可见前缀）仍应保持字节一致。
-8. Tool Schema（工具模式）优先通过 Provider 原生 `tools` 字段传输，不重复序列化进普通 Prompt；Provider Adapter 需要保证工具列表稳定排序。
+8. Tool Schema（工具模式）优先通过 Provider 原生 `tools` 字段传输，不重复序列化进普通 Prompt；Provider Adapter 需要保证工具列表稳定排序。目录变化可以使当前 Cursor 失效，但不能改写之前 Turn 的缓存前缀。
 9. 每次请求记录 `stable_prefix_hash` 与 `dynamic_tail_hash`，用回归测试证明动态控制状态没有污染前缀。
 10. 缓存命中是优化；供应商无法保持缓存时，必须优先保证指令语义正确。
 
 ```mermaid
 flowchart LR
-    CP["Cache-stable Prefix（缓存稳定前缀）<br/>系统指令、仓库指令、稳定工具目录、历史前缀"]
+    CP["Cache-stable Prefix（缓存稳定前缀）<br/>系统指令、稳定会话指令、历史前缀"]
     DT["Append-only Dynamic Tail（追加式动态尾部）<br/>新用户消息、工具结果、异步结果、提醒"]
     CTL["Control Plane Only（仅控制面）<br/>TurnId、InvocationId、RoundId、时间戳"]
     REQ["Provider Request（供应商请求）"]
@@ -683,18 +683,18 @@ enum CanonicalModelEvent {
 
 ```mermaid
 flowchart LR
-    CR["Canonical Request（规范请求）"] --> PC["Provider Codec（供应商编解码器）"]
+    CR["Canonical Request（规范请求）"] --> PC["Provider Codec（供应商请求编码器）"]
     PC --> WR["Wire Request（线协议请求）"]
     WR --> PT["Provider Transport（供应商传输层）"]
     PT --> WS["Wire Stream（线协议流）"]
-    WS --> PC
-    PC --> CE["Canonical Events（规范事件）"]
+    WS --> PT
+    PT --> CE["Canonical Events（规范事件）"]
 ```
 
 模块职责：
 
-- Provider Codec（供应商编解码器）：角色映射、工具 Schema 映射、流式事件解析、Finish Reason（结束原因）归一化。
-- Provider Transport（供应商传输层）：HTTP、SSE、进程通信、超时和网络重试。
+- Provider Codec（供应商请求编码器）：按持久化 Profile 完成角色、推理控制、输出格式和工具 Schema 的确定性请求映射。
+- Provider Transport（供应商传输层）：认证、HTTP、SSE、进程通信、超时、网络重试、供应商事件解析和 Finish Reason（结束原因）归一化。
 - Model Gateway（模型网关）：选择 Adapter、发送请求、将规范事件交给 Kernel 和 Event Pipeline。
 
 #### Capability Negotiation（能力协商）
@@ -705,12 +705,68 @@ flowchart LR
 | --- | --- |
 | System Role（系统角色） | Native（原生）/ Emulated（模拟）/ Unsupported（不支持） |
 | Developer Role（开发者角色） | Native / Folded Into System（合并到系统角色）/ Unsupported |
-| Function Tools（函数工具） | Native / Compatibility Encoding（兼容编码）/ Unsupported |
+| Function Tools（函数工具） | Native / Portable Encoding（可移植编码）/ Unsupported |
 | Parallel Tool Calls（并行工具调用） | Supported（支持）/ Unsupported |
+| Streaming Tool Calls（流式工具调用） | Supported / Unsupported |
+| JSON Schema Output（结构化输出） | Supported / Unsupported |
+| Reasoning Protocol（推理协议） | Reasoning Effort / DeepSeek Thinking / GLM Thinking |
 | Reasoning Summary（推理摘要） | Supported / Unsupported |
 | Provider Cursor（供应商游标） | Stored Response（已存响应）/ Replay Items（重放条目）/ None（无） |
 
 Kernel 不允许根据 Provider 名称或模型名称增加行为分支。
+
+#### Adapter Capability Profile（适配器能力档案）
+
+Provider Setup（供应商设置）负责执行一次 Capability Negotiation（能力协商），并把结果归一化为按模型与 Adapter 保存的 `ProviderAdapterProfile（供应商适配器档案）`。`/models` 成功只代表 Catalog Discovery（模型目录发现）成功，不能代表该模型已经可以执行对话。
+
+```mermaid
+flowchart LR
+    K["Credential Saved（密钥已保存）"] --> C["Catalog Discovered（模型目录已发现）"]
+    C --> N["Adapter Negotiated（适配器已协商）"]
+    N --> P["Capability Profile Persisted（能力档案已持久化）"]
+    P --> R["Ready for Conversation（可用于对话）"]
+```
+
+能力档案使用稳定键 `connection + normalized endpoint + model + adapter + profile version`；Turn ID（轮次 ID）、Request ID（请求 ID）、探测时间戳不能参与运行时选择，也不能进入可缓存的提示词前缀。`checkedAt（检测时间）` 只用于诊断展示。
+
+```mermaid
+sequenceDiagram
+    participant UI as Provider Settings（供应商设置）
+    participant N as Capability Negotiator（能力协商器）
+    participant S as Settings Store（设置存储）
+    participant G as Model Gateway（模型网关）
+    participant A as Adapter（适配器）
+    participant P as Provider（供应商）
+
+    UI->>N: test connection + exact model（检测连接与精确模型）
+    N->>P: independent role/tool/stream/parallel/output probes（独立能力探测）
+    P-->>N: probe outcomes（探测结果）
+    N->>S: persist ProviderAdapterProfile v5（持久化能力档案）
+    Note over S: messageProtocol / reasoningProtocol / outputProtocol / toolProtocol
+    UI-->>UI: mark Ready only after profile persisted（仅持久化后标记可用）
+    G->>S: load exact endpoint + model + adapter profile（读取精确档案）
+    G->>A: canonical request + immutable profile（规范请求 + 不可变档案）
+    A->>P: one deterministic wire request（一次确定性线协议请求）
+    alt provider rejects a declared capability（供应商拒绝已声明能力）
+        P-->>A: HTTP 400 / protocol failure（协议失败）
+        A-->>G: CapabilityProfileStale（能力档案过期）
+    else request succeeds（请求成功）
+        P-->>A: canonicalized stream/result（归一化流/结果）
+    end
+```
+
+`OpenAiCompatibilityReport（OpenAI 兼容诊断报告）` 只保留探测详情和旧设置迁移所需信息；运行时路由、角色编码、工具能力和输出格式只读取 `ProviderAdapterProfile`，不存在双事实源。旧报告在加载时单向迁移为 Profile，之后不会在请求路径被查询。
+
+Adapter（适配器）的职责严格限定为确定性协议转换：
+
+- 把 Canonical Request（规范请求）编码为 Wire Request（线协议请求）。
+- 根据已保存的能力档案映射 System / Developer / Tool 等角色。
+- 映射 Tool Schema（工具模式）并解码供应商事件。
+- Decode Normalization（解码归一化）只允许解析供应商明确发送的完整值，不得补全、截断、删除或改写 Tool Arguments（工具参数）。即使尾部字段在 Schema 中可选，只要 JSON 已写出字段名却缺少值，也必须判为语法错误。
+- Required Field（必填字段）缺值、Partial Value（部分值）、未知字段或 Schema 不匹配时，必须保留为 Malformed Tool Call（畸形工具调用），禁止执行；Adapter 不得猜测模型意图，也不得按 Provider 或模型名称硬编码例外。
+- 不访问网络做能力探测，不更新能力档案，不在 HTTP 400 后重新组装提示词。
+
+Transport（传输层）如果发现能力档案已经过期，只返回 `CapabilityProfileStale（能力档案已过期）`。更新档案必须重新进入 Provider Setup / Negotiation（供应商设置/协商）流程；不能在发送路径中偷偷生成第二份 messages。
 
 ---
 
@@ -960,7 +1016,7 @@ struct WorkItem {
 
 #### Model-driven Plan（模型驱动规划）的准确定位
 
-Plan 不是强制 Run Profile（运行配置），也不是“只规划、不执行”的独立循环。它是模型在普通执行过程中按需采用的推理与交互行为：
+Plan 可以由用户显式选择为 Interaction Profile（交互偏好），但它不是“只规划、不执行”的独立循环，也不强制创建任务列表。选择 Plan 只是在同一个普通执行循环中提示模型：存在多个实质方向时优先让用户选择；最终是否需要提问仍由模型根据当前证据判断：
 
 ```rust
 enum WorkContext {
@@ -977,7 +1033,7 @@ enum WorkContext {
 4. 收到选择后恢复同一个 Turn，必要时调用 `update_plan` 更新执行计划。
 5. 继续调用执行工具并完成原任务，而不是把“给出计划”当成默认终点。
 
-是否需要向用户选择由模型判断，Harness 不根据任务类型强制切换 Plan Mode。没有实质性分岔时，模型应直接执行。用户明确要求“只给方案、不执行”时，停止执行来自用户意图，而不是来自架构中的 `PlanOnly` 模式。
+是否需要向用户选择由模型判断，Harness 不因用户选择 Plan 就强制生成 Work Form（工作表单）或问题卡。没有实质性分岔时，模型应直接执行。用户明确要求“只给方案、不执行”时，停止执行来自用户意图，而不是来自架构中的 `PlanOnly` 模式。
 
 `request_user_input` 是通用的可暂停工具；`update_plan` 是可选的可视化进度工具。二者都复用普通 Agent Loop（智能体循环），不会改变 Tool Runtime、Completion Gate 或权限模型。
 
@@ -1356,14 +1412,14 @@ flowchart TD
     R["Provider Request（供应商请求）"] --> E{"Result（结果）"}
     E -->|Retryable network error（可重试网络错误）| RT["Bounded transport retry（有界传输重试）"]
     RT --> R
-    E -->|Compatibility rejection（兼容性拒绝）| FB["Adapter fallback within declared capabilities（在声明能力内降级）"]
-    FB --> R
+    E -->|Capability rejection（能力拒绝）| ST["CapabilityProfileStale（能力档案已过期）"]
+    ST --> NP["Stop current invocation and renegotiate（结束当前运行片段并重新检测）"]
     E -->|Complete response（完整响应）| N["Normalize and continue（归一化并继续）"]
     E -->|Incomplete stream（不完整流）| P["Preserve complete committed prefix（保留已完整提交前缀）"]
     P --> F["Fail current invocation with classified error（以分类错误结束当前运行片段）"]
 ```
 
-Adapter 不能把 Length Limit（长度限制）、Content Filter（内容过滤）或 Stream Interrupted（流中断）伪装成正常 Final。
+Adapter 不能把 Length Limit（长度限制）、Content Filter（内容过滤）或 Stream Interrupted（流中断）伪装成正常 Final，也不能在收到 HTTP 400 后删除字段、改写消息或切换传输形态再次请求模型。只有 Network Retry（网络重试）与失效 `previous_response_id` 的 State Recovery（状态恢复）可以重发；两者都不得改变规范语义请求。
 
 ### 7.7 Crash Recovery（崩溃恢复）
 
@@ -1540,7 +1596,7 @@ crates/opentopia-server/src/
 - Context Assembler 成为唯一请求组装入口。
 - Provider 拆分 Codec（编解码器）与 Transport（传输层）。
 - 逐步弃用 `ModelRequest` 的重复字段。
-- 保持旧 Provider Driver 的兼容外观。
+- 通过私有端口适配器把现有 Provider Driver 接到 Codec 与 Transport，不向 Agent 层暴露组合 Driver。
 - 把 Control Identity（控制标识）从模型可见上下文中移除，并稳定 Tool Catalog 和 Prompt Module 的序列化顺序。
 
 退出条件：
@@ -1552,26 +1608,26 @@ crates/opentopia-server/src/
 
 #### Phase 2 / Phase 3 实现结果（2026-08-15）
 
-状态：**Completed（已完成）**。这里的“完成”指 Phase 2、Phase 3 的边界和退出条件已经落地；`LegacyToolExecutor` 与旧 `ModelProvider` 外观仍作为兼容适配器保留，它们的删除属于后续清理阶段，不再是 Kernel 的运行时依赖。
+状态：**Completed（已完成）**。这里的“完成”指 Phase 2、Phase 3 的边界和退出条件已经落地；临时公开兼容包装器已经在后续清理中删除。
 
 Phase 2 已落地：
 
 - `ToolRuntime` 现在拥有 Provider Tool Call（供应商工具调用）的参数校验、授权预检、Guardian Review（守卫审查）、调度、单调用执行、批次执行、Effect Journal（副作用日志）、结果归一化以及后台完成挂接。
 - `execute_provider_batch` 并发执行独立调用，但按 Provider 原始调用顺序返回 `ProviderToolExecutionReport`；事件也延迟到有序提交点发布。
-- 旧 `Tool` 实现通过构造器注入的 `LegacyToolExecutor` 执行。宽 `ToolContext` 只存在于兼容边界内，执行器不能回读 `AgentCore` 的可变循环状态。
+- 本地 `Tool` 实现通过构造器注入的 `ToolExecutor` 执行。`ToolInvocationContext` 只在 Tool Runtime 边界创建，执行器不能回读 `AgentCore` 的可变循环状态。
 - Detached Job（分离后台任务）首先返回唯一的 `AcceptedToolResult`；终态使用独立的 `AsyncToolResult`，以 `JobId` 关联并追加到 Durable Ledger（持久账本）与 `TurnInbox`，不会阻塞模型 Final（最终回答）。
 - Effect Replay（副作用回放）、Reconciliation（对账）、拒绝、执行失败和后台接受都在 Tool Runtime 内生成规范同步结果；`AgentCore` 不再实现 Effect Journal 或并行 `join_all`。
-- `TurnKernel` 的架构守卫测试禁止导入 Browser、Computer、MCP、Subagent、Background、Guardian 和具体 Tool 模块。
+- `AgentTurnDriver` 的架构守卫测试禁止导入 Browser、Computer、MCP、Subagent、Background、Guardian 和具体 Tool 模块；无状态的 `TurnKernel` 转发外观已删除。
 
 Phase 3 已落地：
 
 - `ContextAssembler::prepare_context` 是 Lineage Module（谱系模块）、Tool Search Protocol（工具搜索协议）和 Prompt Cache Key（提示缓存键）的唯一准备入口；`ContextAssembler::compile` 是 `CanonicalModelRequest`（规范模型请求）的唯一 Agent 请求组装入口。
 - `ContextAssemblyManifest` 为每次请求提供 `context_hash`、`stable_prefix_hash`、`dynamic_tail_hash`、逐项 Content Hash（内容哈希）以及 `provider_prefix_segments`（供应商前缀分段）。因此可以解释每个输入项，也可以直接验证跨 Turn 的追加式前缀不变量。
-- `stable_prefix_hash` 只哈希供应商实际可见的 Stable/Thread 指令字节与规范排序后的 Tool Catalog（工具目录）。`TurnId`、`InvocationId`、`RoundId`、Provider Call Id、时间戳和 Provider Cursor（供应商游标）只允许进入 Dynamic Tail（动态尾部）或控制面。
-- Tool Catalog 按 Disclosure（披露方式）、Namespace（命名空间）和 Name（名称）规范排序；Prompt Module 按 Cache Scope（缓存范围）稳定放置。仅改变工具调用 ID 不会改变稳定前缀。
-- `ModelGateway` 已拆成 `ProviderCodec`（供应商编解码器）与 `ProviderTransport`（供应商传输层）。`LegacyProviderCodec` / `LegacyProviderTransport` 保留旧 Driver 行为，但编码和 I/O 已可独立替换、测试。
+- `stable_prefix_hash` 只哈希供应商实际可见的 Stable/Thread 指令字节。Tool Catalog（工具目录）与 `TurnId`、`InvocationId`、`RoundId`、Provider Call Id、时间戳和 Provider Cursor（供应商游标）只允许进入 Dynamic Tail（动态尾部）或控制面。
+- Tool Catalog 按 Disclosure（披露方式）、Namespace（命名空间）和 Name（名称）规范排序，并单独进入 Provider Cursor 兼容性摘要；目录变化不会改写历史稳定前缀，但会阻止复用不兼容的 Cursor。仅改变工具调用 ID 同样不会改变稳定前缀。
+- `ModelGateway` 已拆成 `ProviderCodec`（供应商请求编码器）与 `ProviderTransport`（供应商传输层）。两个公开 `LegacyProvider*` 包装器已合并为私有 `ModelProviderPorts`；Codec 只编码请求，Transport 负责认证、I/O、网络重试并交付规范增量与终态。
 - Guardian Review、Thread Title（会话标题）和 Context Compaction（上下文压缩）等辅助模型调用也通过 Canonical Request + Model Gateway，不再在产品层直接构造 `ModelRequest`。
-- `ModelRequest` 现在是 Provider 兼容层的 Legacy Logical Shape（旧逻辑形状）；Agent Runtime 的规范事实源是 `CanonicalModelRequest`，后续可以在不改变 Kernel 的情况下逐项删除重复字段。
+- `ModelRequest` 是 Provider-neutral Logical Payload（供应商无关逻辑载荷）；`CanonicalModelRequest` 在其外层同时携带物化上下文与可解释 Manifest（清单），Agent Runtime 不再维护第二份请求字段。
 
 对应回归：
 
@@ -1756,7 +1812,7 @@ Safe Point（安全点）语义：
 Phase 5 退出条件验证：
 
 - Waiting Turn 恢复后 TurnId 不变，InvocationId 从 1 递增到 2。
-- Post-Parse Steer（解析后引导）端到端测试验证：未启动的 `write_file` 被丢弃、无 ToolCallStarted 孤儿事件、无文件副作用，引导内容仅在下一模型轮出现一次。
+- Post-Parse Steer（解析后引导）端到端测试验证：未启动的 `filesystem.write` 被丢弃、无 ToolCallStarted 孤儿事件、无文件副作用，引导内容仅在下一模型轮出现一次。
 - Turn Inbox 按 TurnId 隔离并保持 FIFO（先进先出）顺序。
 - Queue Next 历史测试验证排队消息不会进入当前 Turn 上下文。
 - Provider Cursor 与 Cache Lineage（缓存谱系）回归验证控制标识变化不破坏稳定前缀命中。
@@ -1779,14 +1835,20 @@ Verification Snapshot（验证快照，2026-08-16）：
 已完成的删除与收敛：
 
 - 删除 `TaskPlan`、`TaskPlanStep`、`GoalTask`、`GoalTaskAttempt`、旧 Plan/Goal 数据表、事件和双向投影；Turn 与 Goal 只使用同一种 `WorkForm（工作表单）` 模型，并通过 `WorkScope（工作作用域）` 隔离身份。
-- 删除 `PlanOnly（仅规划）` 运行配置、固定 Plan 循环和桌面端 Plan 模式。模型在确有多个方向时按需调用 `request_user_input（请求用户输入）`，获得选择后继续执行同一个 Turn。
+- 删除 `PlanOnly（仅规划）` 运行配置和固定 Plan 循环；保留桌面端可选择的 Plan Interaction Profile（方案交互偏好）。它不创建 Work Form，也不改变执行循环；模型在确有多个方向时按需调用 `request_user_input（请求用户输入）`，获得选择后继续执行同一个 Turn。
 - 删除 `complete_task（完成任务）` 工具。模型 Final（最终回答）进入 `CompletionGate（完成闸门）`；后台任务运行中仅产生 Advisory（提醒），完成后追加独立 `AsyncToolResult（异步工具结果）`。
 - 删除按审批与用户输入分裂的多套 Resume（恢复）入口；统一为 `resume_from_signal_streaming(..., AgentResumeSignal, ...)`。
+- Approval（审批）、User Input（用户选择）和 External Action（外部动作）统一持久化 `TurnCheckpoint`。Checkpoint 只保存控制状态与内容引用；Conversation、Model Context 和 Tool Catalog 按类型隔离的内容哈希去重存储。恢复保留原 `TurnId`，只递增 `InvocationId`；普通新消息不能越过未完成的外部动作另开 Turn，用户也可以显式取消该 Waiting Turn（等待轮次）。
+- Waiting 状态区分 `waiting_approval`、`waiting_user_input` 与 `waiting_user_action`，避免把用户选择错误建模为审批。所有 Waiting Event 在对应 Checkpoint 成功持久化后才发布。
 - 把 AgentCore 原先平铺的 Tool Registry、Tool Runtime、Browser、Computer、MCP、Subagent 与 Background 字段收敛进单一 `ToolRuntimeHost（工具运行时宿主）` 组合根。
-- 删除旧 `ToolContext` 与 `LegacyTool*` 名称。执行边界统一为 `ToolInvocationContext（工具调用上下文）`、`ToolExecutor（工具执行器）` 和 `DefaultToolRuntime（默认工具运行时）`。
+- Tool Registry 以 `ToolClass（工具类别）` 元数据标记 Standard、Subagent、Structured Input、Work Form 与 Flow；Agent Core 不再通过 `is_subagent_tool` 或 Plan 工具名称列表判断可见性，Tool Runtime 也按 `ToolClass::WorkForm` 触发表单持久化与事件发布。
+- 删除旧 `ToolContext` 与 `LegacyTool*` 名称。执行边界统一为 `ToolInvocationContext（工具调用上下文）`、`ToolExecutor（工具执行器）` 和 `LocalToolRuntime（本地工具运行时）`。
 - `ToolInvocationContext` 不再暴露完整 `SessionStore（会话存储）`，只暴露能力受限的 `ToolStateStore（工具状态存储端口）`。Flow（流程）暂时通过显式 `flow_session_store` 兼容桥接使用旧接口，边界已隔离，留给 Flow 独立重构。
 - 删除 `ModelRequest` 的 `system_prompt`、`context_items`、`conversation`、`user_message`、`user_content`、`previous_tool_calls`、`tool_results`、`branch_developer_instructions` 和独立 `prompt_cache_key` 等并行字段。新的请求只包含 `instructions（分类指令上下文）` 与 `input ledger（类型化输入账本）`；Provider（供应商）只负责协议适配。
-- `ContextAssembler（上下文组装器）` 是运行时唯一组装入口。分支指令被物化为 Thread-scoped（会话作用域）分类项；动态 Turn/Invocation/Round ID（轮次/运行片段/模型轮标识）不进入稳定缓存前缀。
+- `ContextAssembler（上下文组装器）` 是运行时唯一组装入口。可变分支、所选 Skill（技能）、工具目录和世界状态被物化到 Turn-scoped（轮次作用域）动态尾部；动态 Turn/Invocation/Round ID（轮次/运行片段/模型轮标识）不进入稳定缓存前缀。
+- 删除公开的 `LegacyProviderCodec`、`LegacyProviderTransport` 与 `TurnKernel` 转发门面。`AgentCore` 直接实现 `AgentTurnDriver（智能体轮次驱动端口）`；Provider 组合桥只保留在 `ProviderModelGateway（供应商模型网关）` 内部。
+- Provider 设置阶段把探测结果一次性物化为版本化 `ProviderAdapterProfile（供应商适配档案）`。运行时只读取该档案，不再读取诊断报告、按模型名重新猜测协议，也不再通过删除字段、改写消息或切换流式模式来做隐藏兼容重试；档案与真实端点不一致时返回 `CapabilityProfileStale（能力档案过期）`，由设置/重新协商边界处理。
+- 删除 Chat/Responses 的 strict、parallel、enhanced-tools 进程内“不支持”缓存，以及流式工具调用失败后的非流式二次请求。Transport（传输层）仅保留网络重试与明确的 Provider State Recovery（供应商状态恢复）；Codec（编解码器）只做确定性协议编码。
 
 #### P6 模块边界
 
@@ -1808,12 +1870,12 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant K as Turn Kernel（轮次内核）
+    participant A as AgentTurnDriver（智能体轮次驱动端口）
     participant C as Context Assembler（上下文组装器）
     participant R as Canonical Request（规范请求）
     participant P as Provider Adapter（供应商适配器）
 
-    K->>C: semantic inputs（语义输入）
+    A->>C: semantic inputs（语义输入）
     C->>C: classify stable/thread/turn/round items（分类稳定/会话/轮次/模型轮项）
     C->>C: materialize branch instruction once（一次性物化分支指令）
     C-->>R: instructions + typed input ledger（指令 + 类型化输入账本）
@@ -1830,15 +1892,17 @@ Phase 6 退出条件：
 4. `ModelRequest` 不再保留并行的文本历史与 `context_items`；Context Assembler 生成唯一规范请求。
 5. 只有一个 Resume Signal（恢复信号）入口，且 Waiting Turn（等待轮次）恢复后保留 TurnId、递增 InvocationId。
 6. 缓存回归测试证明：只改变控制标识或动态尾部不会改变 `stable_prefix_hash（稳定前缀哈希）`。
+7. Provider 运行时只读取持久化 `ProviderAdapterProfile`；`OpenAiCompatibilityReport（OpenAI 兼容性报告）` 只用于诊断与一次性迁移。
+8. HTTP 400 或工具参数协议错误不会触发第二次提示词组装；能力拒绝显式终止并要求重新协商。
 
-Verification Snapshot（验证快照，2026-08-16）：
+Verification Snapshot（验证快照，2026-08-17）：
 
-- `cargo test -p opentopia-core`：Unit Tests（单元测试）712 passed / 0 failed / 1 ignored；Integration Tests（集成测试）9 passed / 0 failed，总计 721 passed。
+- `cargo test -p opentopia-core`：Unit Tests（单元测试）761 passed / 0 failed / 1 ignored；Integration Tests（集成测试）9 passed / 0 failed，总计 770 passed。
 - `cargo test -p opentopia-server`：106 passed / 0 failed。
-- `pnpm --filter @opentopia/desktop test`：Desktop Tests（桌面测试）273 passed / 0 failed。
+- `pnpm --filter @opentopia/desktop test`：Desktop Tests（桌面测试）287 passed / 0 failed。
 - `pnpm --filter @opentopia/desktop typecheck`：通过。
 - `pnpm design:check`：通过。
-- `cargo fmt --all -- --check`、P6 旧符号审计与 scoped `git diff --check`：通过。
+- 本次变更文件的 scoped `rustfmt --check`、P6 旧符号审计与 scoped `git diff --check`：通过；全仓格式检查另受并发编辑中的 `collaboration/sqlite_repository.rs` 影响。
 
 ---
 
@@ -1869,6 +1933,7 @@ Verification Snapshot（验证快照，2026-08-16）：
 | 模型发现多个实质方向 | 按需调用用户选择工具，不依赖固定 Plan 模式 |
 | 用户完成选择 | 恢复同一 Turn，更新计划后继续执行原任务 |
 | 选择卡片关闭 | 明确 Skip 或 Cancel 语义，不留下 Waiting 状态 |
+| 外部动作完成或取消 | 完成时恢复同一 Turn；取消时关闭 Checkpoint 与等待记录并唤醒队列 |
 | Steer during model stream（模型流期间引导） | 在安全点追加且不产生残缺协议项 |
 | Steer during tool batch（工具批次期间引导） | 已启动调用真实收尾，未启动调用显式取消 |
 | Queue Next | 当前上下文不可见，终态后自动启动 |
@@ -1968,8 +2033,8 @@ pnpm design:check
 首个 PR 只实施 Phase 1，不改数据库和业务语义：
 
 1. 新增五个端口接口。
-2. 新增 `TurnKernel` 外观，内部委托现有 `AgentCore`。
-3. 把 Server 新 Turn 和 Resume 的调用统一到同一个 `AgentTurnDriver` 外观。
+2. 让现有 `AgentCore` 直接实现对象安全的 `AgentTurnDriver` 端口，不增加无状态转发外观。
+3. 把 Server 新 Turn 和 Resume 的调用统一到同一个 `AgentTurnDriver` 端口。
 4. 为现有事件序列增加 Golden Test（黄金测试）。
 5. 写入依赖禁止测试，防止新 Kernel import 具体工具和产品模块。
 

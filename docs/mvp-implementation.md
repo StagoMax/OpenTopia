@@ -24,7 +24,9 @@ Implemented:
 - Artifact model and SQLite artifact index with inline/path storage.
 - Basic permission policy with configurable command rules and a network policy placeholder.
 - Built-in tool abstraction.
-- Built-in `list_files`, `read_file`, `write_file`, `search`, `shell`, `git_diff`, and `apply_patch` tools.
+- Canonical built-in `filesystem`, `shell`, and `apply_patch` tools for workspace
+  observation and mutation; deterministic workspace search remains an internal UI
+  service rather than a model-facing tool.
 - OpenAI-compatible provider with mock fallback.
 - Settings, MCP, sandbox, and workspace workbench shared types.
 - Context summary, compaction, and provider-reported token-usage event types used by
