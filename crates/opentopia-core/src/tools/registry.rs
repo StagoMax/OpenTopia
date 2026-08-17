@@ -1,12 +1,10 @@
 use super::{
-    ApplyPatchTool, BackgroundOutputTool, BrowserTool, CancelAgentTool, ComputerTool,
-    CreateSkillTool, DocumentTool, FilesystemTool, FollowupAgentTaskTool, GitDiffTool,
-    InterruptAgentTool, ListAgentsTool, ListFilesTool, ListSkillsTool, PdfTool, ReadArtifactTool,
-    ReadAttachmentTool, ReadFileTool, ReadFilesTool, ReadSkillTool, RequestUserInputTool,
-    SearchTool, SendAgentInputTool, SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool,
-    SpreadsheetTool, Tool, ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy,
-    ToolRiskLevel, ToolSideEffect, UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
-    WaitAgentsTool, WriteFileTool,
+    ApplyPatchTool, BackgroundOutputTool, BrowserTool, ComputerTool, CreateSkillTool, DocumentTool,
+    FilesystemTool, FollowupAgentTaskTool, InterruptAgentTool, ListAgentsTool, ListSkillsTool,
+    PdfTool, ReadArtifactTool, ReadAttachmentTool, ReadSkillTool, RequestUserInputTool,
+    SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool, SpreadsheetTool, Tool,
+    ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy, ToolRiskLevel, ToolSideEffect,
+    UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
 };
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::enterprise::DataClassification;
@@ -23,6 +21,7 @@ use std::sync::Arc;
 pub struct ToolRegistry {
     tools: Arc<BTreeMap<String, Arc<dyn Tool>>>,
     sources: Arc<BTreeMap<String, ToolSource>>,
+    classes: Arc<BTreeMap<String, ToolClass>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +29,17 @@ pub enum ToolSource {
     Core,
     BundledPlugin { plugin_name: String },
     Mcp,
+}
+
+/// Product-neutral scheduling and visibility class carried by the catalog.
+/// The turn driver consumes this metadata instead of recognizing tool names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolClass {
+    Standard,
+    Subagent,
+    StructuredInput,
+    WorkForm,
+    Flow,
 }
 
 impl ToolRegistry {
@@ -43,31 +53,22 @@ impl ToolRegistry {
     /// Compose the trusted kernel tools without optional bundled plugins.
     pub fn with_core_tools() -> Self {
         let mut tools: BTreeMap<String, Arc<dyn Tool>> = BTreeMap::new();
-        tools.insert("list_files".to_string(), Arc::new(ListFilesTool));
         tools.insert("read_attachment".to_string(), Arc::new(ReadAttachmentTool));
         tools.insert("view_attachment".to_string(), Arc::new(ViewAttachmentTool));
-        tools.insert("read_file".to_string(), Arc::new(ReadFileTool));
         tools.insert("read_artifact".to_string(), Arc::new(ReadArtifactTool));
-        tools.insert("read_files".to_string(), Arc::new(ReadFilesTool));
-        tools.insert("write_file".to_string(), Arc::new(WriteFileTool));
         tools.insert("filesystem".to_string(), Arc::new(FilesystemTool));
-        tools.insert("search".to_string(), Arc::new(SearchTool));
         tools.insert("shell".to_string(), Arc::new(ShellTool));
         tools.insert(
             "background_output".to_string(),
             Arc::new(BackgroundOutputTool),
         );
-        tools.insert("git_diff".to_string(), Arc::new(GitDiffTool));
         tools.insert("apply_patch".to_string(), Arc::new(ApplyPatchTool));
         tools.insert("spawn_agent".to_string(), Arc::new(SpawnAgentTool));
         tools.insert("send_message".to_string(), Arc::new(SendAgentMessageTool));
         tools.insert("followup_task".to_string(), Arc::new(FollowupAgentTaskTool));
         tools.insert("interrupt_agent".to_string(), Arc::new(InterruptAgentTool));
         tools.insert("list_agents".to_string(), Arc::new(ListAgentsTool));
-        tools.insert("send_input".to_string(), Arc::new(SendAgentInputTool));
-        tools.insert("cancel_agent".to_string(), Arc::new(CancelAgentTool));
         tools.insert("wait_agent".to_string(), Arc::new(WaitAgentTool));
-        tools.insert("wait_agents".to_string(), Arc::new(WaitAgentsTool));
         tools.insert(
             "request_user_input".to_string(),
             Arc::new(RequestUserInputTool),
@@ -85,9 +86,18 @@ impl ToolRegistry {
             .cloned()
             .map(|name| (name, ToolSource::Core))
             .collect();
+        let classes = tools
+            .keys()
+            .cloned()
+            .map(|name| {
+                let class = core_tool_class(&name);
+                (name, class)
+            })
+            .collect();
         Self {
             tools: Arc::new(tools),
             sources: Arc::new(sources),
+            classes: Arc::new(classes),
         }
     }
 
@@ -139,15 +149,23 @@ impl ToolRegistry {
         }
         let tools = Arc::make_mut(&mut self.tools);
         let sources = Arc::make_mut(&mut self.sources);
+        let classes = Arc::make_mut(&mut self.classes);
         for name in mcp_names {
             tools.remove(&name);
             sources.remove(&name);
+            classes.remove(&name);
         }
     }
 
     fn insert_with_source(&mut self, name: String, tool: Arc<dyn Tool>, source: ToolSource) {
+        let class = if matches!(source, ToolSource::Core) {
+            core_tool_class(&name)
+        } else {
+            ToolClass::Standard
+        };
         Arc::make_mut(&mut self.tools).insert(name.clone(), tool);
-        Arc::make_mut(&mut self.sources).insert(name, source);
+        Arc::make_mut(&mut self.sources).insert(name.clone(), source);
+        Arc::make_mut(&mut self.classes).insert(name, class);
     }
 
     pub fn list(&self) -> Vec<String> {
@@ -156,6 +174,10 @@ impl ToolRegistry {
 
     pub fn source(&self, name: &str) -> Option<ToolSource> {
         self.sources.get(name).cloned()
+    }
+
+    pub fn class(&self, name: &str) -> Option<ToolClass> {
+        self.classes.get(name).copied()
     }
 
     pub fn execution_policy(&self, name: &str, call: &ToolCall) -> Option<ToolExecutionPolicy> {
@@ -190,6 +212,17 @@ impl ToolRegistry {
     }
 }
 
+fn core_tool_class(name: &str) -> ToolClass {
+    match name {
+        "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent" | "list_agents"
+        | "wait_agent" => ToolClass::Subagent,
+        "request_user_input" => ToolClass::StructuredInput,
+        "set_plan" | "update_plan" => ToolClass::WorkForm,
+        name if name.starts_with("flow_") => ToolClass::Flow,
+        _ => ToolClass::Standard,
+    }
+}
+
 fn tool_governance_metadata(
     name: &str,
     source: &ToolSource,
@@ -208,9 +241,8 @@ fn tool_governance_metadata(
         );
     }
     match name {
-        "list_files" | "read_attachment" | "read_file" | "read_artifact" | "read_files"
-        | "search" | "git_diff" | "background_output" | "list_agents" | "wait_agent"
-        | "wait_agents" | "list_skills" | "read_skill" | "flow_search" | "flow_inspect"
+        "read_attachment" | "read_artifact" | "background_output" | "list_agents"
+        | "wait_agent" | "list_skills" | "read_skill" | "flow_search" | "flow_inspect"
         | "library_search" | "pdf" => (
             ToolRiskLevel::Low,
             vec![ToolSideEffect::None],
@@ -223,7 +255,7 @@ fn tool_governance_metadata(
             ToolApprovalMode::PolicyControlled,
             DataClassification::Restricted,
         ),
-        "write_file" | "filesystem" | "apply_patch" | "create_skill" | "spreadsheet" => (
+        "filesystem" | "apply_patch" | "create_skill" | "spreadsheet" => (
             ToolRiskLevel::High,
             vec![ToolSideEffect::WorkspaceWrite],
             ToolApprovalMode::PolicyControlled,
@@ -247,8 +279,7 @@ fn tool_governance_metadata(
             ToolApprovalMode::PolicyControlled,
             DataClassification::Public,
         ),
-        "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent" | "send_input"
-        | "cancel_agent" => (
+        "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent" => (
             ToolRiskLevel::Medium,
             vec![ToolSideEffect::ControlPlane],
             ToolApprovalMode::PolicyControlled,

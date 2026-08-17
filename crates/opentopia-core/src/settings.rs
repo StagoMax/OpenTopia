@@ -8,7 +8,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Legacy provider preset identity. New runtime code resolves transport,
+/// authentication, and adapter independently; this enum remains serialized for
+/// one compatibility window so older desktop builds can still read settings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Mock,
@@ -27,6 +30,23 @@ pub enum ProviderKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ProviderTransportKind {
+    Http,
+    CodexAppServer,
+    Mock,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthKind {
+    Bearer,
+    XApiKey,
+    CodexSession,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum OpenAiProtocol {
     ChatCompletions,
     Responses,
@@ -39,6 +59,142 @@ pub enum ProviderFeatureSupport {
     Unsupported,
     #[default]
     Unknown,
+}
+
+/// Wire protocol selected for one concrete endpoint/model pair. Connections
+/// are credentials and routing; adapters are protocol codecs, so one relay may
+/// legitimately select different adapters for different models.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAdapterKind {
+    OpenAiChat,
+    OpenAiResponses,
+    AnthropicMessages,
+    CodexAppServer,
+    Mock,
+}
+
+impl ProviderAdapterKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "open_ai_chat",
+            Self::OpenAiResponses => "open_ai_responses",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::CodexAppServer => "codex_app_server",
+            Self::Mock => "mock",
+        }
+    }
+}
+
+/// Deterministic instruction lowering selected during capability negotiation.
+/// The adapter reads this value while encoding; it never probes or changes it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderInstructionEncoding {
+    NativeRoles,
+    FoldDeveloperIntoSystem,
+    PortableChatEnvelope,
+}
+
+/// Provider-specific request fields used to control model reasoning. The
+/// negotiated profile owns this choice; request codecs never infer it again
+/// from a model id.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReasoningProtocol {
+    #[default]
+    ReasoningEffort,
+    DeepSeekThinking,
+    GlmThinking,
+}
+
+pub const PROVIDER_ADAPTER_PROFILE_VERSION: u32 = 5;
+const MIN_MIGRATABLE_PROVIDER_ADAPTER_PROFILE_VERSION: u32 = 2;
+#[cfg(test)]
+const PREVIOUS_PROVIDER_ADAPTER_PROFILE_VERSION: u32 = PROVIDER_ADAPTER_PROFILE_VERSION - 1;
+
+/// Assistant-message constraints imposed by one concrete wire protocol. These
+/// are negotiated or supplied by a trusted built-in endpoint contract; request
+/// codecs consume the result without inspecting vendor or model names.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ProviderMessageProtocolCapabilities {
+    /// Every assistant message that contains tool calls must preserve the
+    /// provider-issued `reasoning_content` field in subsequent requests.
+    pub requires_reasoning_content_for_tool_calls: bool,
+}
+
+/// Structured final-output features exposed by one concrete wire protocol.
+/// These are negotiated during provider setup and never inferred by retrying a
+/// modified request after a live turn has already started.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ProviderOutputProtocolCapabilities {
+    pub json_schema: ProviderFeatureSupport,
+}
+
+impl ProviderMessageProtocolCapabilities {
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            requires_reasoning_content_for_tool_calls: self
+                .requires_reasoning_content_for_tool_calls
+                || other.requires_reasoning_content_for_tool_calls,
+        }
+    }
+}
+
+/// Normalized output of provider capability negotiation. Probe diagnostics may
+/// remain provider-specific, but the runtime consumes only this stable adapter
+/// contract and therefore never needs to reinterpret a probe response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAdapterProfile {
+    pub profile_version: u32,
+    pub base_url: String,
+    pub model: String,
+    pub adapter: ProviderAdapterKind,
+    pub instruction_encoding: ProviderInstructionEncoding,
+    #[serde(default)]
+    pub reasoning_protocol: ProviderReasoningProtocol,
+    #[serde(default)]
+    pub message_protocol: ProviderMessageProtocolCapabilities,
+    #[serde(default)]
+    pub output_protocol: ProviderOutputProtocolCapabilities,
+    #[serde(default)]
+    pub tool_protocol: ProviderToolProtocolCapabilities,
+    pub checked_at: DateTime<Utc>,
+}
+
+impl ProviderAdapterProfile {
+    pub fn applies_to(&self, base_url: &str, model: &str) -> bool {
+        self.profile_version == PROVIDER_ADAPTER_PROFILE_VERSION
+            && self.matches_connection(base_url, model)
+    }
+
+    fn matches_connection(&self, base_url: &str, model: &str) -> bool {
+        self.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+            && self.model.trim() == model.trim()
+    }
+
+    fn normalized_for(mut self, base_url: &str, model: &str) -> Option<Self> {
+        if !self.matches_connection(base_url, model) {
+            return None;
+        }
+        match self.profile_version {
+            PROVIDER_ADAPTER_PROFILE_VERSION => Some(self),
+            MIN_MIGRATABLE_PROVIDER_ADAPTER_PROFILE_VERSION..PROVIDER_ADAPTER_PROFILE_VERSION => {
+                self.profile_version = PROVIDER_ADAPTER_PROFILE_VERSION;
+                if self.adapter == ProviderAdapterKind::OpenAiChat {
+                    self.reasoning_protocol = chat_reasoning_protocol_for_model(model);
+                    self.message_protocol = self
+                        .message_protocol
+                        .union(trusted_chat_message_protocol_contract(base_url, model)?);
+                }
+                Some(self)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,6 +211,19 @@ pub struct OpenAiCompatibilityReport {
     /// tools because many compatible relays accept `tools` but reject `strict`.
     #[serde(default)]
     pub chat_strict_function_tools: ProviderFeatureSupport,
+    /// Chat Completions function calls remain structurally valid when tool
+    /// arguments are delivered as a stream. This is negotiated separately from
+    /// non-streaming function support because compatible relays frequently use
+    /// different translation paths for the two transports.
+    #[serde(default)]
+    pub chat_streaming_tools: ProviderFeatureSupport,
+    #[serde(default)]
+    pub chat_parallel_tool_calls: ProviderFeatureSupport,
+    #[serde(default)]
+    pub chat_json_schema_output: ProviderFeatureSupport,
+    /// Assistant-message replay requirements discovered for Chat Completions.
+    #[serde(default)]
+    pub chat_message_protocol: ProviderMessageProtocolCapabilities,
     pub responses: ProviderFeatureSupport,
     #[serde(default)]
     pub responses_native_tools: ProviderFeatureSupport,
@@ -67,6 +236,14 @@ pub struct OpenAiCompatibilityReport {
     /// output. Kept separate from the portable function-tool capability.
     #[serde(default)]
     pub responses_strict_function_tools: ProviderFeatureSupport,
+    /// Responses tool calls remain structurally valid over the streaming event
+    /// protocol used by the runtime.
+    #[serde(default)]
+    pub responses_streaming_tools: ProviderFeatureSupport,
+    #[serde(default)]
+    pub responses_parallel_tool_calls: ProviderFeatureSupport,
+    #[serde(default)]
+    pub responses_json_schema_output: ProviderFeatureSupport,
     /// Freeform/custom tool definitions and `custom_tool_call` output items.
     #[serde(default)]
     pub responses_custom_tools: ProviderFeatureSupport,
@@ -86,6 +263,109 @@ impl OpenAiCompatibilityReport {
     pub fn applies_to(&self, base_url: &str, model: &str) -> bool {
         self.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
             && self.model.trim() == model.trim()
+    }
+
+    fn profile_for_protocol(&self, protocol: OpenAiProtocol) -> ProviderAdapterProfile {
+        let (adapter, instruction_encoding, output_protocol, tool_protocol) = match protocol {
+            OpenAiProtocol::ChatCompletions => (
+                ProviderAdapterKind::OpenAiChat,
+                if self.developer_messages == ProviderFeatureSupport::Supported
+                    && !self.message_compatibility
+                {
+                    ProviderInstructionEncoding::NativeRoles
+                } else {
+                    ProviderInstructionEncoding::PortableChatEnvelope
+                },
+                ProviderOutputProtocolCapabilities {
+                    json_schema: self.chat_json_schema_output,
+                },
+                ProviderToolProtocolCapabilities {
+                    function_tools: self.chat_function_tools,
+                    strict_function_tools: self.chat_strict_function_tools,
+                    streaming_tools: self.chat_streaming_tools,
+                    parallel_tool_calls: self.chat_parallel_tool_calls,
+                    ..ProviderToolProtocolCapabilities::default()
+                },
+            ),
+            OpenAiProtocol::Responses => (
+                ProviderAdapterKind::OpenAiResponses,
+                ProviderInstructionEncoding::NativeRoles,
+                ProviderOutputProtocolCapabilities {
+                    json_schema: self.responses_json_schema_output,
+                },
+                ProviderToolProtocolCapabilities {
+                    function_tools: self.responses_function_tools,
+                    strict_function_tools: self.responses_strict_function_tools,
+                    streaming_tools: self.responses_streaming_tools,
+                    parallel_tool_calls: self.responses_parallel_tool_calls,
+                    freeform_tools: self.responses_custom_tools,
+                    hosted_apply_patch: self.responses_apply_patch,
+                    deferred_tool_loading: official_openai_tool_search_support(
+                        &self.base_url,
+                        &self.model,
+                    ),
+                    namespace_tools: official_openai_tool_search_support(
+                        &self.base_url,
+                        &self.model,
+                    ),
+                    hosted_tool_search: official_openai_tool_search_support(
+                        &self.base_url,
+                        &self.model,
+                    ),
+                    ..ProviderToolProtocolCapabilities::default()
+                },
+            ),
+        };
+        ProviderAdapterProfile {
+            profile_version: PROVIDER_ADAPTER_PROFILE_VERSION,
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            adapter,
+            instruction_encoding,
+            reasoning_protocol: if protocol == OpenAiProtocol::ChatCompletions {
+                chat_reasoning_protocol_for_model(&self.model)
+            } else {
+                ProviderReasoningProtocol::ReasoningEffort
+            },
+            message_protocol: if protocol == OpenAiProtocol::ChatCompletions {
+                self.chat_message_protocol.union(
+                    trusted_chat_message_protocol_contract(&self.base_url, &self.model)
+                        .unwrap_or_default(),
+                )
+            } else {
+                ProviderMessageProtocolCapabilities::default()
+            },
+            output_protocol,
+            tool_protocol,
+            checked_at: self.checked_at,
+        }
+    }
+
+    /// Returns every wire contract proven by the probe. A connection can keep
+    /// both Chat Completions and Responses profiles for the same model. A bare
+    /// text HTTP success is not an agent adapter contract: only protocols that
+    /// completed the required function-tool round trip are persisted.
+    pub fn adapter_profiles(&self) -> Vec<ProviderAdapterProfile> {
+        let mut profiles = Vec::new();
+        if self.chat_completions == ProviderFeatureSupport::Supported
+            && self.chat_function_tools == ProviderFeatureSupport::Supported
+        {
+            profiles.push(self.profile_for_protocol(OpenAiProtocol::ChatCompletions));
+        }
+        if self.responses == ProviderFeatureSupport::Supported
+            && self.responses_function_tools == ProviderFeatureSupport::Supported
+            && self.responses_native_tools == ProviderFeatureSupport::Supported
+        {
+            profiles.push(self.profile_for_protocol(OpenAiProtocol::Responses));
+        }
+        profiles
+    }
+
+    /// Recommended profile retained for legacy readers. Persisting a report
+    /// must still store every successful profile returned by
+    /// [`Self::adapter_profiles`].
+    pub fn adapter_profile(&self) -> ProviderAdapterProfile {
+        self.profile_for_protocol(self.selected_protocol)
     }
 }
 
@@ -128,6 +408,13 @@ pub struct ProviderCapabilities {
 pub struct ProviderToolProtocolCapabilities {
     pub function_tools: ProviderFeatureSupport,
     pub strict_function_tools: ProviderFeatureSupport,
+    /// The selected adapter/model/endpoint tuple has passed a production-codec
+    /// round trip with tools enabled and streaming transport selected. Unknown
+    /// is deliberately treated as unsupported when preparing a tool-capable
+    /// request.
+    pub streaming_tools: ProviderFeatureSupport,
+    /// The protocol accepts the optional `parallel_tool_calls` request hint.
+    pub parallel_tool_calls: ProviderFeatureSupport,
     pub freeform_tools: ProviderFeatureSupport,
     pub hosted_apply_patch: ProviderFeatureSupport,
     pub assistant_phase: ProviderFeatureSupport,
@@ -149,15 +436,102 @@ impl ProviderKind {
             Self::Anthropic => "anthropic",
         }
     }
+
+    fn legacy_transport(self) -> ProviderTransportKind {
+        match self {
+            Self::Mock => ProviderTransportKind::Mock,
+            Self::CodexAppServer => ProviderTransportKind::CodexAppServer,
+            Self::OpenAiCompatible | Self::OpenAiResponses | Self::Anthropic => {
+                ProviderTransportKind::Http
+            }
+        }
+    }
+
+    fn legacy_auth(self) -> ProviderAuthKind {
+        match self {
+            Self::Mock => ProviderAuthKind::None,
+            Self::CodexAppServer => ProviderAuthKind::CodexSession,
+            Self::Anthropic => ProviderAuthKind::XApiKey,
+            Self::OpenAiCompatible | Self::OpenAiResponses => ProviderAuthKind::Bearer,
+        }
+    }
+
+    fn legacy_adapters(self) -> Vec<ProviderAdapterKind> {
+        match self {
+            Self::Mock => vec![ProviderAdapterKind::Mock],
+            Self::CodexAppServer => vec![ProviderAdapterKind::CodexAppServer],
+            Self::Anthropic => vec![ProviderAdapterKind::AnthropicMessages],
+            Self::OpenAiCompatible | Self::OpenAiResponses => vec![
+                ProviderAdapterKind::OpenAiChat,
+                ProviderAdapterKind::OpenAiResponses,
+            ],
+        }
+    }
+
+    fn legacy_preferred_adapter(self) -> ProviderAdapterKind {
+        match self {
+            Self::Mock => ProviderAdapterKind::Mock,
+            Self::CodexAppServer => ProviderAdapterKind::CodexAppServer,
+            Self::Anthropic => ProviderAdapterKind::AnthropicMessages,
+            Self::OpenAiResponses => ProviderAdapterKind::OpenAiResponses,
+            Self::OpenAiCompatible => ProviderAdapterKind::OpenAiChat,
+        }
+    }
+}
+
+pub(crate) fn is_official_openai_endpoint(base_url: &str) -> bool {
+    base_url
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case("https://api.openai.com/v1")
+}
+
+/// Trusted built-in contracts cover direct vendor endpoints before the first
+/// connection probe. Relays and opaque model aliases acquire the same flag from
+/// observed probe output and persist it in their adapter profile.
+pub(crate) fn trusted_chat_message_protocol_contract(
+    base_url: &str,
+    model: &str,
+) -> Option<ProviderMessageProtocolCapabilities> {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    let model = model.split(':').next().unwrap_or(model);
+    let official_deepseek = reqwest::Url::parse(base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.deepseek.com"));
+    let deepseek_thinking_model = model.starts_with("deepseek-v4-flash")
+        || model.starts_with("deepseek-v4-pro")
+        || model.starts_with("deepseek-reasoner");
+
+    if official_deepseek && deepseek_thinking_model {
+        return Some(ProviderMessageProtocolCapabilities {
+            requires_reasoning_content_for_tool_calls: true,
+        });
+    }
+    is_official_openai_endpoint(base_url).then_some(ProviderMessageProtocolCapabilities::default())
+}
+
+pub(crate) fn chat_reasoning_protocol_for_model(model: &str) -> ProviderReasoningProtocol {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    let model = model.split(':').next().unwrap_or(model);
+    if model.starts_with("deepseek-v4-flash")
+        || model.starts_with("deepseek-v4-pro")
+        || model.starts_with("deepseek-reasoner")
+    {
+        ProviderReasoningProtocol::DeepSeekThinking
+    } else if model.starts_with("glm") || model.starts_with("chatglm") {
+        ProviderReasoningProtocol::GlmThinking
+    } else {
+        ProviderReasoningProtocol::ReasoningEffort
+    }
 }
 
 pub(crate) fn official_openai_tool_search_support(
     base_url: &str,
     model: &str,
 ) -> ProviderFeatureSupport {
-    let official_endpoint = base_url
-        .trim_end_matches('/')
-        .eq_ignore_ascii_case("https://api.openai.com/v1");
+    let official_endpoint = is_official_openai_endpoint(base_url);
     let version = model.strip_prefix("gpt-").and_then(|suffix| {
         let version = suffix
             .split(|character: char| !character.is_ascii_digit() && character != '.')
@@ -184,9 +558,7 @@ pub(crate) fn official_openai_explicit_prompt_cache_support(
     base_url: &str,
     model: &str,
 ) -> ProviderFeatureSupport {
-    let official_endpoint = base_url
-        .trim_end_matches('/')
-        .eq_ignore_ascii_case("https://api.openai.com/v1");
+    let official_endpoint = is_official_openai_endpoint(base_url);
     let version = model.strip_prefix("gpt-").and_then(|suffix| {
         let version = suffix
             .split(|character: char| !character.is_ascii_digit() && character != '.')
@@ -230,6 +602,38 @@ pub struct ProviderModelSettings {
     pub context_window_tokens: Option<Option<usize>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<Option<String>>,
+    /// Optional model-level protocol preference. This is independent from the
+    /// connection preset and may be overridden again by a thread selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_adapter: Option<ProviderAdapterKind>,
+}
+
+type ProviderAdapterProfiles =
+    BTreeMap<String, BTreeMap<ProviderAdapterKind, ProviderAdapterProfile>>;
+
+fn deserialize_provider_adapter_profiles<'de, D>(
+    deserializer: D,
+) -> Result<ProviderAdapterProfiles, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredProfiles {
+        Multiple(ProviderAdapterProfiles),
+        Legacy(BTreeMap<String, ProviderAdapterProfile>),
+    }
+
+    match StoredProfiles::deserialize(deserializer)? {
+        StoredProfiles::Multiple(profiles) => Ok(profiles),
+        StoredProfiles::Legacy(profiles) => Ok(profiles
+            .into_iter()
+            .map(|(model, profile)| {
+                let adapter = profile.adapter;
+                (model, BTreeMap::from([(adapter, profile)]))
+            })
+            .collect()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,7 +643,22 @@ pub struct ProviderSettings {
     /// User-facing label. Empty values from legacy settings fall back to `id`.
     #[serde(default)]
     pub name: String,
+    /// Deprecated preset identity retained only for serialized compatibility.
+    /// Runtime dispatch must use `effective_transport`, `effective_auth`, and
+    /// `resolved_adapter_for_model` instead.
     pub kind: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<ProviderTransportKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ProviderAuthKind>,
+    /// Protocols this connection is permitted to use. Empty is a legacy value
+    /// and is interpreted from `kind` until settings are next saved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_adapters: Vec<ProviderAdapterKind>,
+    /// Connection-wide preference. `None` means use model preference, then the
+    /// latest probe recommendation, then the legacy preset fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_adapter: Option<ProviderAdapterKind>,
     pub base_url: String,
     /// Default model for this connection. Threads may override it per
     /// conversation; this value is the fallback for new threads and for
@@ -261,6 +680,14 @@ pub struct ProviderSettings {
     /// Capabilities reported for each model by the connection's catalog.
     #[serde(default)]
     pub model_capabilities: BTreeMap<String, ProviderModelCapabilities>,
+    /// Negotiated wire contract per model. This is the sole runtime source for
+    /// adapter selection and message lowering; probe reports are diagnostics.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_provider_adapter_profiles"
+    )]
+    pub adapter_profiles: ProviderAdapterProfiles,
     /// Per-model user overrides. These are intentionally separate from the
     /// catalog so a subsequent sync never discards an explicit choice.
     #[serde(default)]
@@ -312,12 +739,20 @@ impl Default for ProviderSettings {
             id: "default".to_string(),
             name: "default".to_string(),
             kind: ProviderKind::OpenAiCompatible,
+            // Keep these empty until AppSettings::touch materializes the
+            // independent axes. This preserves programmatic legacy callers
+            // that construct a default and then only replace `kind`.
+            transport: None,
+            auth: None,
+            allowed_adapters: Vec::new(),
+            preferred_adapter: None,
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4.1-mini".to_string(),
             enabled_families: Vec::new(),
             synced_models: Vec::new(),
             model_context_windows: BTreeMap::new(),
             model_capabilities: BTreeMap::new(),
+            adapter_profiles: BTreeMap::new(),
             model_settings: BTreeMap::new(),
             models_synced_at: None,
             temperature: None,
@@ -335,6 +770,26 @@ impl Default for ProviderSettings {
             api_key_source: "OPENTOPIA_API_KEY".to_string(),
             api_key_configured: false,
             health_status: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedProviderRoute {
+    pub connection_id: String,
+    pub model: String,
+    pub transport: ProviderTransportKind,
+    pub transport_driver_id: String,
+    pub adapter: ProviderAdapterKind,
+    pub adapter_profile_version: Option<u32>,
+}
+
+impl ResolvedProviderRoute {
+    pub fn adapter_identity(&self) -> String {
+        match self.adapter_profile_version {
+            Some(version) => format!("{}:v{version}", self.adapter.as_str()),
+            None => self.adapter.as_str().to_string(),
         }
     }
 }
@@ -368,13 +823,195 @@ impl RolloutBudgetSettings {
 }
 
 impl ProviderSettings {
+    /// Applies a deprecated `kind` update as a complete compatibility preset.
+    /// New callers should update the independent axes directly.
+    pub fn apply_legacy_kind_preset(&mut self, kind: ProviderKind) {
+        self.kind = kind;
+        self.transport = Some(kind.legacy_transport());
+        self.auth = Some(kind.legacy_auth());
+        self.allowed_adapters = kind.legacy_adapters();
+        self.preferred_adapter = Some(kind.legacy_preferred_adapter());
+    }
+
+    pub fn effective_transport(&self) -> ProviderTransportKind {
+        self.transport
+            .unwrap_or_else(|| self.kind.legacy_transport())
+    }
+
+    pub fn effective_auth(&self) -> ProviderAuthKind {
+        self.auth.unwrap_or_else(|| self.kind.legacy_auth())
+    }
+
+    pub fn effective_allowed_adapters(&self) -> Vec<ProviderAdapterKind> {
+        let mut adapters = if self.allowed_adapters.is_empty() {
+            self.kind.legacy_adapters()
+        } else {
+            self.allowed_adapters.clone()
+        };
+        adapters.sort();
+        adapters.dedup();
+        adapters
+    }
+
+    pub fn allows_adapter(&self, adapter: ProviderAdapterKind) -> bool {
+        self.effective_allowed_adapters().contains(&adapter)
+    }
+
+    /// Materializes the legacy compatibility fields into the independent
+    /// connection axes. Called on load/save so new serialized settings no
+    /// longer need `kind` to resolve runtime behavior.
+    pub fn migrate_legacy_connection_axes(&mut self) {
+        self.transport
+            .get_or_insert_with(|| self.kind.legacy_transport());
+        self.auth.get_or_insert_with(|| self.kind.legacy_auth());
+        if self.allowed_adapters.is_empty() {
+            self.allowed_adapters = self.kind.legacy_adapters();
+        }
+    }
+
+    /// One-way load migration for settings written before normalized adapter
+    /// profiles became authoritative. The compatibility report remains useful
+    /// diagnostics, but no request-path decision reads it after this step.
+    pub fn migrate_legacy_openai_compatibility_report(&mut self) {
+        let Some(report) = self
+            .openai_compatibility
+            .clone()
+            .filter(|report| report.applies_to(&self.base_url, &report.model))
+        else {
+            return;
+        };
+        let model = report.model.trim().to_string();
+        for profile in report.adapter_profiles() {
+            self.adapter_profiles
+                .entry(model.clone())
+                .or_default()
+                .entry(profile.adapter)
+                .or_insert(profile);
+        }
+        if self.preferred_adapter.is_none() {
+            let settings = self.model_settings.entry(model).or_default();
+            settings
+                .preferred_adapter
+                .get_or_insert(match report.selected_protocol {
+                    OpenAiProtocol::ChatCompletions => ProviderAdapterKind::OpenAiChat,
+                    OpenAiProtocol::Responses => ProviderAdapterKind::OpenAiResponses,
+                });
+        }
+    }
+
+    /// Persists deterministic schema upgrades once during settings load/save,
+    /// so provider construction consumes the stored v5 profile verbatim.
+    pub fn migrate_adapter_profiles(&mut self) {
+        for (model, profiles) in &mut self.adapter_profiles {
+            for profile in profiles.values_mut() {
+                if let Some(normalized) =
+                    profile.clone().normalized_for(&self.base_url, model.trim())
+                {
+                    *profile = normalized;
+                }
+            }
+        }
+    }
+
+    pub fn adapter_profile_for_model_and_adapter(
+        &self,
+        model: &str,
+        adapter: ProviderAdapterKind,
+    ) -> Option<ProviderAdapterProfile> {
+        let model = model.trim();
+        self.adapter_profiles
+            .get(model)
+            .and_then(|profiles| profiles.get(&adapter))
+            .cloned()
+            .and_then(|profile| profile.normalized_for(&self.base_url, model))
+    }
+
+    pub fn resolved_adapter_for_model(&self, model: &str) -> ProviderAdapterKind {
+        match self.effective_transport() {
+            ProviderTransportKind::Mock => return ProviderAdapterKind::Mock,
+            ProviderTransportKind::CodexAppServer => {
+                return ProviderAdapterKind::CodexAppServer;
+            }
+            ProviderTransportKind::Http => {}
+        }
+
+        let model = model.trim();
+        let allowed = self.effective_allowed_adapters();
+        let allowed_contains = |adapter: ProviderAdapterKind| allowed.contains(&adapter);
+        if let Some(adapter) = self
+            .model_settings
+            .get(model)
+            .and_then(|settings| settings.preferred_adapter)
+            .filter(|adapter| allowed_contains(*adapter))
+        {
+            return adapter;
+        }
+        if let Some(adapter) = self
+            .preferred_adapter
+            .filter(|adapter| allowed_contains(*adapter))
+        {
+            return adapter;
+        }
+        if let Some(adapter) = allowed.iter().copied().find(|adapter| {
+            self.adapter_profile_for_model_and_adapter(model, *adapter)
+                .is_some()
+        }) {
+            return adapter;
+        }
+        let legacy = self.kind.legacy_preferred_adapter();
+        if allowed_contains(legacy) {
+            legacy
+        } else {
+            allowed.first().copied().unwrap_or(legacy)
+        }
+    }
+
+    pub fn adapter_profile_for_model(&self, model: &str) -> Option<ProviderAdapterProfile> {
+        self.adapter_profile_for_model_and_adapter(model, self.resolved_adapter_for_model(model))
+    }
+
+    pub fn active_adapter_profile(&self) -> Option<ProviderAdapterProfile> {
+        self.adapter_profile_for_model(&self.model)
+    }
+
+    pub fn apply_openai_compatibility_report(&mut self, report: OpenAiCompatibilityReport) {
+        let model = report.model.trim().to_string();
+        let selected_adapter = match report.selected_protocol {
+            OpenAiProtocol::ChatCompletions => ProviderAdapterKind::OpenAiChat,
+            OpenAiProtocol::Responses => ProviderAdapterKind::OpenAiResponses,
+        };
+        if let Some(profiles) = self.adapter_profiles.get_mut(report.model.trim()) {
+            profiles.remove(&ProviderAdapterKind::OpenAiChat);
+            profiles.remove(&ProviderAdapterKind::OpenAiResponses);
+        }
+        for profile in report.adapter_profiles() {
+            self.apply_adapter_profile(profile);
+        }
+        if self.preferred_adapter.is_none() {
+            self.model_settings
+                .entry(model)
+                .or_default()
+                .preferred_adapter
+                .get_or_insert(selected_adapter);
+        }
+        self.openai_compatibility = Some(report);
+    }
+
+    pub fn apply_adapter_profile(&mut self, profile: ProviderAdapterProfile) {
+        self.adapter_profiles
+            .entry(profile.model.trim().to_string())
+            .or_default()
+            .insert(profile.adapter, profile);
+    }
+
     pub fn capabilities(&self) -> ProviderCapabilities {
-        match self.kind {
-            ProviderKind::OpenAiResponses => {
-                let negotiated = self
-                    .openai_compatibility
-                    .as_ref()
-                    .filter(|report| report.applies_to(&self.base_url, &self.model));
+        self.capabilities_for_adapter(self.resolved_adapter_for_model(&self.model))
+    }
+
+    pub fn capabilities_for_adapter(&self, adapter: ProviderAdapterKind) -> ProviderCapabilities {
+        let negotiated = self.adapter_profile_for_model_and_adapter(&self.model, adapter);
+        match adapter {
+            ProviderAdapterKind::OpenAiResponses => {
                 ProviderCapabilities {
                     supports_native_compaction: self
                         .responses_compaction_threshold_tokens
@@ -390,16 +1027,28 @@ impl ProviderSettings {
                         // Function tools are the portable Responses baseline.
                         // An explicit failed probe overrides that baseline.
                         function_tools: negotiated
-                            .map(|report| report.responses_function_tools)
+                            .as_ref()
+                            .map(|profile| profile.tool_protocol.function_tools)
                             .unwrap_or(ProviderFeatureSupport::Supported),
                         strict_function_tools: negotiated
-                            .map(|report| report.responses_strict_function_tools)
+                            .as_ref()
+                            .map(|profile| profile.tool_protocol.strict_function_tools)
+                            .unwrap_or_default(),
+                        streaming_tools: negotiated
+                            .as_ref()
+                            .map(|profile| profile.tool_protocol.streaming_tools)
+                            .unwrap_or_default(),
+                        parallel_tool_calls: negotiated
+                            .as_ref()
+                            .map(|profile| profile.tool_protocol.parallel_tool_calls)
                             .unwrap_or_default(),
                         freeform_tools: negotiated
-                            .map(|report| report.responses_custom_tools)
+                            .as_ref()
+                            .map(|profile| profile.tool_protocol.freeform_tools)
                             .unwrap_or_default(),
                         hosted_apply_patch: negotiated
-                            .map(|report| report.responses_apply_patch)
+                            .as_ref()
+                            .map(|profile| profile.tool_protocol.hosted_apply_patch)
                             .unwrap_or_default(),
                         // Phase is optional on the wire and cannot be proven
                         // without observing an assistant message. Parsing is
@@ -420,28 +1069,34 @@ impl ProviderSettings {
                     },
                 }
             }
-            ProviderKind::OpenAiCompatible => ProviderCapabilities {
+            ProviderAdapterKind::OpenAiChat => ProviderCapabilities {
                 supports_prompt_cache: true,
-                tool_protocol: ProviderToolProtocolCapabilities {
-                    function_tools: self
-                        .openai_compatibility
-                        .as_ref()
-                        .filter(|report| report.applies_to(&self.base_url, &self.model))
-                        .map(|report| report.chat_function_tools)
-                        .unwrap_or(ProviderFeatureSupport::Unknown),
-                    strict_function_tools: self
-                        .openai_compatibility
-                        .as_ref()
-                        .filter(|report| report.applies_to(&self.base_url, &self.model))
-                        .map(|report| report.chat_strict_function_tools)
-                        .unwrap_or_default(),
-                    ..ProviderToolProtocolCapabilities::default()
-                },
+                tool_protocol: negotiated
+                    .map(|profile| profile.tool_protocol)
+                    .unwrap_or_default(),
                 ..ProviderCapabilities::default()
             },
-            ProviderKind::Mock | ProviderKind::CodexAppServer | ProviderKind::Anthropic => {
-                ProviderCapabilities::default()
-            }
+            ProviderAdapterKind::Mock
+            | ProviderAdapterKind::CodexAppServer
+            | ProviderAdapterKind::AnthropicMessages => ProviderCapabilities::default(),
+        }
+    }
+
+    pub fn resolved_route(&self) -> ResolvedProviderRoute {
+        let adapter = self.resolved_adapter_for_model(&self.model);
+        let profile = self.adapter_profile_for_model_and_adapter(&self.model, adapter);
+        let transport = self.effective_transport();
+        ResolvedProviderRoute {
+            connection_id: self.id.clone(),
+            model: self.model.clone(),
+            transport,
+            transport_driver_id: match transport {
+                ProviderTransportKind::Http => "http".to_string(),
+                ProviderTransportKind::CodexAppServer => "codex_app_server".to_string(),
+                ProviderTransportKind::Mock => "mock".to_string(),
+            },
+            adapter,
+            adapter_profile_version: profile.map(|profile| profile.profile_version),
         }
     }
 
@@ -535,6 +1190,26 @@ impl ProviderSettings {
                 .entry(resolved.model.clone())
                 .or_default()
                 .reasoning_effort = Some(value);
+        }
+        resolved
+    }
+
+    /// Applies the complete thread route without mutating the persisted
+    /// connection. The adapter override is stored on the cloned model settings
+    /// so it outranks connection defaults during runtime resolution.
+    pub fn with_model_route_override(
+        &self,
+        model: Option<&str>,
+        reasoning_effort: Option<Option<&str>>,
+        adapter: Option<ProviderAdapterKind>,
+    ) -> Self {
+        let mut resolved = self.with_model_override(model, reasoning_effort);
+        if let Some(adapter) = adapter {
+            resolved
+                .model_settings
+                .entry(resolved.model.clone())
+                .or_default()
+                .preferred_adapter = Some(adapter);
         }
         resolved
     }
@@ -871,19 +1546,6 @@ fn context_window_for_base(model: &str) -> Option<usize> {
         .find_map(|(id, context_window)| (*id == model).then_some(*context_window))
 }
 
-/// Whether a model accepts a caller-supplied `temperature`.
-///
-/// OpenAI's reasoning families (o-series, GPT-5.x) reject any value other than
-/// the default and answer with HTTP 400, so the parameter must be omitted
-/// rather than clamped. Unknown models are assumed to accept it: relay
-/// endpoints serve arbitrary ids, and dropping the parameter for everything
-/// would silently change behaviour for models that do honour it.
-pub fn model_accepts_temperature(model: &str) -> bool {
-    !model_bases(model)
-        .iter()
-        .any(|base| is_openai_reasoning_model(base))
-}
-
 /// Candidate model names after removing the vendor prefixes relays prepend.
 ///
 /// Only a leading `vendor.` is stripped, never an inner dot, because dots also
@@ -909,15 +1571,6 @@ fn model_bases(model: &str) -> Vec<String> {
         }
     }
     bases
-}
-
-fn is_openai_reasoning_model(model: &str) -> bool {
-    if model.starts_with("gpt-5") {
-        return true;
-    }
-    // o1 / o3 / o4-mini and friends, but not `olmo` or `openai`.
-    let mut chars = model.chars();
-    chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 pub const MIN_PROVIDER_CONTEXT_WINDOW_TOKENS: usize = 4_096;
@@ -1246,10 +1899,14 @@ impl AppSettings {
 
     pub fn touch(&mut self) {
         for provider in &mut self.providers {
-            provider.api_key_configured = if provider.kind == ProviderKind::CodexAppServer {
-                true
-            } else {
-                std::env::var(&provider.api_key_source).is_ok_and(|value| !value.is_empty())
+            provider.migrate_legacy_connection_axes();
+            provider.migrate_legacy_openai_compatibility_report();
+            provider.migrate_adapter_profiles();
+            provider.api_key_configured = match provider.effective_auth() {
+                ProviderAuthKind::CodexSession | ProviderAuthKind::None => true,
+                ProviderAuthKind::Bearer | ProviderAuthKind::XApiKey => {
+                    std::env::var(&provider.api_key_source).is_ok_and(|value| !value.is_empty())
+                }
             };
         }
         self.updated_at = Utc::now();
@@ -1260,7 +1917,11 @@ impl AppSettings {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderHealth {
     pub id: String,
+    /// Legacy preset identity for older desktop builds.
     pub kind: ProviderKind,
+    pub transport: ProviderTransportKind,
+    pub auth: ProviderAuthKind,
+    pub adapter: ProviderAdapterKind,
     pub base_url: String,
     pub model: String,
     pub api_key_source: String,
@@ -1271,26 +1932,39 @@ pub struct ProviderHealth {
 
 impl ProviderHealth {
     pub fn from_settings(settings: &ProviderSettings) -> Self {
-        let codex_app_server = settings.kind == ProviderKind::CodexAppServer;
-        let api_key_configured = codex_app_server
+        let transport = settings.effective_transport();
+        let auth = settings.effective_auth();
+        let adapter = settings.resolved_adapter_for_model(&settings.model);
+        let local_or_anonymous = matches!(
+            auth,
+            ProviderAuthKind::CodexSession | ProviderAuthKind::None
+        );
+        let api_key_configured = local_or_anonymous
             || std::env::var(&settings.api_key_source).is_ok_and(|value| !value.is_empty())
             || settings.api_key_configured;
-        let using_mock =
-            settings.kind == ProviderKind::Mock || (!codex_app_server && !api_key_configured);
+        let using_mock = transport == ProviderTransportKind::Mock
+            || (!local_or_anonymous && !api_key_configured);
+        let needs_negotiation =
+            transport == ProviderTransportKind::Http && settings.active_adapter_profile().is_none();
         Self {
             id: settings.id.clone(),
-            kind: settings.kind.clone(),
+            kind: settings.kind,
+            transport,
+            auth,
+            adapter,
             base_url: settings.base_url.clone(),
             model: settings.model.clone(),
             api_key_source: settings.api_key_source.clone(),
             api_key_configured,
             using_mock,
-            status: if codex_app_server {
+            status: if transport == ProviderTransportKind::CodexAppServer {
                 "local_codex".to_string()
             } else if using_mock {
                 "mock_or_unconfigured".to_string()
+            } else if needs_negotiation {
+                "needs_negotiation".to_string()
             } else {
-                "configured".to_string()
+                "ready".to_string()
             },
         }
     }
@@ -1405,44 +2079,6 @@ mod tests {
         }
         for value in ["0", "false", "no", "off", "invalid"] {
             assert!(!enterprise_enabled_from_env_value(Some(value)));
-        }
-    }
-
-    #[test]
-    fn reasoning_models_do_not_accept_a_temperature() {
-        for model in [
-            "o1",
-            "o3-mini",
-            "o4-mini",
-            "gpt-5",
-            "gpt-5.6-sol",
-            "openai/gpt-5.6",
-            "azure.o3-mini",
-        ] {
-            assert!(
-                !model_accepts_temperature(model),
-                "{model} should reject temperature"
-            );
-        }
-    }
-
-    #[test]
-    fn ordinary_models_still_accept_a_temperature() {
-        // `olmo` and `openai` must not be mistaken for the o-series, and a
-        // version dot must not be mistaken for a vendor prefix.
-        for model in [
-            "gpt-4.1-mini",
-            "gpt-4o",
-            "claude-sonnet-4-5",
-            "kimi-k2.5-turbo",
-            "deepseek-chat",
-            "olmo-2-13b",
-            "openai-mirror",
-        ] {
-            assert!(
-                model_accepts_temperature(model),
-                "{model} should accept temperature"
-            );
         }
     }
 
@@ -1763,21 +2399,28 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatibility_report_round_trips_and_rejects_stale_settings() {
+    fn adapter_profiles_round_trip_per_model_and_reject_stale_settings() {
         let mut provider = ProviderSettings::default();
         provider.base_url = "https://relay.example/v1".to_string();
         provider.model = "relay-model".to_string();
-        provider.openai_compatibility = Some(OpenAiCompatibilityReport {
+        provider.apply_openai_compatibility_report(OpenAiCompatibilityReport {
             base_url: provider.base_url.clone(),
             model: provider.model.clone(),
             selected_protocol: OpenAiProtocol::ChatCompletions,
             chat_completions: ProviderFeatureSupport::Supported,
             chat_function_tools: ProviderFeatureSupport::Supported,
             chat_strict_function_tools: ProviderFeatureSupport::Unsupported,
+            chat_streaming_tools: ProviderFeatureSupport::Supported,
+            chat_parallel_tool_calls: ProviderFeatureSupport::Unsupported,
+            chat_json_schema_output: ProviderFeatureSupport::Unsupported,
+            chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
             responses: ProviderFeatureSupport::Unsupported,
             responses_native_tools: ProviderFeatureSupport::Unsupported,
             responses_function_tools: ProviderFeatureSupport::Unknown,
             responses_strict_function_tools: ProviderFeatureSupport::Unknown,
+            responses_streaming_tools: ProviderFeatureSupport::Unknown,
+            responses_parallel_tool_calls: ProviderFeatureSupport::Unknown,
+            responses_json_schema_output: ProviderFeatureSupport::Unknown,
             responses_custom_tools: ProviderFeatureSupport::Unknown,
             responses_apply_patch: ProviderFeatureSupport::Unknown,
             developer_messages: ProviderFeatureSupport::Unsupported,
@@ -1785,14 +2428,244 @@ mod tests {
             checked_at: Utc::now(),
             notes: vec!["developer messages: HTTP 400".to_string()],
         });
+        provider.apply_openai_compatibility_report(OpenAiCompatibilityReport {
+            base_url: provider.base_url.clone(),
+            model: "responses-model".to_string(),
+            selected_protocol: OpenAiProtocol::Responses,
+            chat_completions: ProviderFeatureSupport::Supported,
+            chat_function_tools: ProviderFeatureSupport::Supported,
+            chat_strict_function_tools: ProviderFeatureSupport::Unsupported,
+            chat_streaming_tools: ProviderFeatureSupport::Supported,
+            chat_parallel_tool_calls: ProviderFeatureSupport::Unsupported,
+            chat_json_schema_output: ProviderFeatureSupport::Unsupported,
+            chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
+            responses: ProviderFeatureSupport::Supported,
+            responses_native_tools: ProviderFeatureSupport::Supported,
+            responses_function_tools: ProviderFeatureSupport::Supported,
+            responses_strict_function_tools: ProviderFeatureSupport::Supported,
+            responses_streaming_tools: ProviderFeatureSupport::Supported,
+            responses_parallel_tool_calls: ProviderFeatureSupport::Supported,
+            responses_json_schema_output: ProviderFeatureSupport::Supported,
+            responses_custom_tools: ProviderFeatureSupport::Supported,
+            responses_apply_patch: ProviderFeatureSupport::Supported,
+            developer_messages: ProviderFeatureSupport::Unsupported,
+            message_compatibility: false,
+            checked_at: Utc::now(),
+            notes: Vec::new(),
+        });
 
         let encoded = serde_json::to_string(&provider).unwrap();
         let restored: ProviderSettings = serde_json::from_str(&encoded).unwrap();
-        let report = restored.openai_compatibility.unwrap();
+        let chat = restored.active_adapter_profile().unwrap();
 
-        assert!(report.applies_to("https://relay.example/v1/", "relay-model"));
-        assert!(!report.applies_to("https://other.example/v1", "relay-model"));
-        assert!(!report.applies_to("https://relay.example/v1", "other-model"));
+        assert_eq!(chat.adapter, ProviderAdapterKind::OpenAiChat);
+        assert_eq!(
+            chat.instruction_encoding,
+            ProviderInstructionEncoding::PortableChatEnvelope
+        );
+        assert!(chat.applies_to("https://relay.example/v1/", "relay-model"));
+        assert!(!chat.applies_to("https://other.example/v1", "relay-model"));
+
+        let responses = restored.with_model_override(Some("responses-model"), None);
+        assert_eq!(
+            responses.kind,
+            ProviderKind::OpenAiCompatible,
+            "protocol negotiation must not rewrite the connection preset"
+        );
+        assert_eq!(
+            responses.active_adapter_profile().unwrap().adapter,
+            ProviderAdapterKind::OpenAiResponses
+        );
+        assert!(responses
+            .adapter_profile_for_model_and_adapter(
+                "responses-model",
+                ProviderAdapterKind::OpenAiChat,
+            )
+            .is_some());
+        assert!(responses
+            .adapter_profile_for_model_and_adapter(
+                "responses-model",
+                ProviderAdapterKind::OpenAiResponses,
+            )
+            .is_some());
+        assert!(restored.adapter_profile_for_model("other-model").is_none());
+
+        let legacy_chat_profile = provider
+            .adapter_profile_for_model_and_adapter("relay-model", ProviderAdapterKind::OpenAiChat)
+            .unwrap();
+        let mut legacy_encoded = serde_json::to_value(&provider).unwrap();
+        legacy_encoded["adapterProfiles"] = serde_json::json!({
+            "relay-model": legacy_chat_profile
+        });
+        let migrated: ProviderSettings = serde_json::from_value(legacy_encoded).unwrap();
+        assert!(migrated
+            .adapter_profile_for_model_and_adapter("relay-model", ProviderAdapterKind::OpenAiChat,)
+            .is_some());
+    }
+
+    #[test]
+    fn connection_auth_and_thread_adapter_are_independent_from_legacy_kind() {
+        let mut connection = ProviderSettings::default();
+        connection.kind = ProviderKind::OpenAiCompatible;
+        connection.transport = Some(ProviderTransportKind::Http);
+        connection.auth = Some(ProviderAuthKind::Bearer);
+        connection.allowed_adapters = vec![
+            ProviderAdapterKind::OpenAiChat,
+            ProviderAdapterKind::OpenAiResponses,
+            ProviderAdapterKind::AnthropicMessages,
+        ];
+
+        let anthropic_route = connection.with_model_route_override(
+            Some("claude-relay"),
+            None,
+            Some(ProviderAdapterKind::AnthropicMessages),
+        );
+        assert_eq!(anthropic_route.effective_auth(), ProviderAuthKind::Bearer);
+        assert_eq!(
+            anthropic_route.resolved_route().adapter,
+            ProviderAdapterKind::AnthropicMessages
+        );
+        assert_eq!(connection.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(
+            connection.resolved_adapter_for_model(&connection.model),
+            ProviderAdapterKind::OpenAiChat
+        );
+    }
+
+    #[test]
+    fn legacy_provider_kind_materializes_independent_connection_axes() {
+        let mut provider: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "id": "legacy-anthropic",
+            "name": "Legacy Anthropic",
+            "kind": "anthropic",
+            "baseUrl": "https://api.anthropic.com",
+            "model": "claude-test",
+            "apiKeySource": "ANTHROPIC_API_KEY",
+            "apiKeyConfigured": true,
+            "healthStatus": null
+        }))
+        .unwrap();
+
+        assert_eq!(provider.effective_transport(), ProviderTransportKind::Http);
+        assert_eq!(provider.effective_auth(), ProviderAuthKind::XApiKey);
+        provider.migrate_legacy_connection_axes();
+        assert_eq!(provider.transport, Some(ProviderTransportKind::Http));
+        assert_eq!(provider.auth, Some(ProviderAuthKind::XApiKey));
+        assert_eq!(
+            provider.allowed_adapters,
+            vec![ProviderAdapterKind::AnthropicMessages]
+        );
+
+        provider.apply_legacy_kind_preset(ProviderKind::OpenAiResponses);
+        assert_eq!(provider.transport, Some(ProviderTransportKind::Http));
+        assert_eq!(provider.auth, Some(ProviderAuthKind::Bearer));
+        assert_eq!(
+            provider.allowed_adapters,
+            vec![
+                ProviderAdapterKind::OpenAiChat,
+                ProviderAdapterKind::OpenAiResponses,
+            ]
+        );
+        assert_eq!(
+            provider.preferred_adapter,
+            Some(ProviderAdapterKind::OpenAiResponses)
+        );
+    }
+
+    #[test]
+    fn trusted_chat_message_contract_is_scoped_to_the_exact_vendor_endpoint() {
+        assert!(
+            trusted_chat_message_protocol_contract(
+                "https://api.deepseek.com/v1",
+                "deepseek-v4-flash-0731"
+            )
+            .unwrap()
+            .requires_reasoning_content_for_tool_calls
+        );
+        assert!(
+            trusted_chat_message_protocol_contract(
+                "https://api.deepseek.com/v1/",
+                "deepseek/deepseek-reasoner"
+            )
+            .unwrap()
+            .requires_reasoning_content_for_tool_calls
+        );
+        assert!(trusted_chat_message_protocol_contract(
+            "https://relay.example/v1",
+            "deepseek-v4-flash"
+        )
+        .is_none());
+        assert!(
+            !trusted_chat_message_protocol_contract(
+                "https://api.openai.com/v1",
+                "opaque-chat-model"
+            )
+            .unwrap()
+            .requires_reasoning_content_for_tool_calls
+        );
+    }
+
+    #[test]
+    fn legacy_chat_profiles_require_a_trusted_contract_or_renegotiation() {
+        let legacy_profile = |base_url: &str, model: &str| ProviderAdapterProfile {
+            profile_version: PREVIOUS_PROVIDER_ADAPTER_PROFILE_VERSION,
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            adapter: ProviderAdapterKind::OpenAiChat,
+            instruction_encoding: ProviderInstructionEncoding::PortableChatEnvelope,
+            reasoning_protocol: ProviderReasoningProtocol::ReasoningEffort,
+            message_protocol: ProviderMessageProtocolCapabilities::default(),
+            output_protocol: ProviderOutputProtocolCapabilities::default(),
+            tool_protocol: ProviderToolProtocolCapabilities::default(),
+            checked_at: Utc::now(),
+        };
+
+        let mut direct = ProviderSettings {
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            ..ProviderSettings::default()
+        };
+        direct.apply_adapter_profile(legacy_profile(&direct.base_url, &direct.model));
+        let migrated = direct.active_adapter_profile().unwrap();
+        assert_eq!(migrated.profile_version, PROVIDER_ADAPTER_PROFILE_VERSION);
+        assert!(
+            migrated
+                .message_protocol
+                .requires_reasoning_content_for_tool_calls
+        );
+
+        let mut relay = ProviderSettings {
+            base_url: "https://relay.example/v1".to_string(),
+            model: "opaque-model".to_string(),
+            ..ProviderSettings::default()
+        };
+        relay.apply_adapter_profile(legacy_profile(&relay.base_url, &relay.model));
+        relay.openai_compatibility = Some(OpenAiCompatibilityReport {
+            base_url: relay.base_url.clone(),
+            model: relay.model.clone(),
+            selected_protocol: OpenAiProtocol::ChatCompletions,
+            chat_completions: ProviderFeatureSupport::Supported,
+            chat_function_tools: ProviderFeatureSupport::Supported,
+            chat_strict_function_tools: ProviderFeatureSupport::Unknown,
+            chat_streaming_tools: ProviderFeatureSupport::Unknown,
+            chat_parallel_tool_calls: ProviderFeatureSupport::Unknown,
+            chat_json_schema_output: ProviderFeatureSupport::Unknown,
+            chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
+            responses: ProviderFeatureSupport::Unknown,
+            responses_native_tools: ProviderFeatureSupport::Unknown,
+            responses_function_tools: ProviderFeatureSupport::Unknown,
+            responses_strict_function_tools: ProviderFeatureSupport::Unknown,
+            responses_streaming_tools: ProviderFeatureSupport::Unknown,
+            responses_parallel_tool_calls: ProviderFeatureSupport::Unknown,
+            responses_json_schema_output: ProviderFeatureSupport::Unknown,
+            responses_custom_tools: ProviderFeatureSupport::Unknown,
+            responses_apply_patch: ProviderFeatureSupport::Unknown,
+            developer_messages: ProviderFeatureSupport::Unknown,
+            message_compatibility: true,
+            checked_at: Utc::now(),
+            notes: Vec::new(),
+        });
+        assert!(relay.active_adapter_profile().is_none());
     }
 
     #[test]
@@ -1958,7 +2831,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_tool_capabilities_use_matching_probe_without_model_name_mapping() {
+    fn legacy_report_is_migrated_before_runtime_capabilities_are_resolved() {
         let mut provider = ProviderSettings::default();
         provider.kind = ProviderKind::OpenAiResponses;
         provider.base_url = "https://relay.example/v1".to_string();
@@ -1970,10 +2843,17 @@ mod tests {
             chat_completions: ProviderFeatureSupport::Unknown,
             chat_function_tools: ProviderFeatureSupport::Unknown,
             chat_strict_function_tools: ProviderFeatureSupport::Unknown,
+            chat_streaming_tools: ProviderFeatureSupport::Unknown,
+            chat_parallel_tool_calls: ProviderFeatureSupport::Unknown,
+            chat_json_schema_output: ProviderFeatureSupport::Unknown,
+            chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
             responses: ProviderFeatureSupport::Supported,
             responses_native_tools: ProviderFeatureSupport::Supported,
             responses_function_tools: ProviderFeatureSupport::Supported,
             responses_strict_function_tools: ProviderFeatureSupport::Supported,
+            responses_streaming_tools: ProviderFeatureSupport::Supported,
+            responses_parallel_tool_calls: ProviderFeatureSupport::Supported,
+            responses_json_schema_output: ProviderFeatureSupport::Unknown,
             responses_custom_tools: ProviderFeatureSupport::Supported,
             responses_apply_patch: ProviderFeatureSupport::Unsupported,
             developer_messages: ProviderFeatureSupport::Unknown,
@@ -1982,6 +2862,12 @@ mod tests {
             notes: Vec::new(),
         });
 
+        assert_eq!(
+            provider.capabilities().tool_protocol.freeform_tools,
+            ProviderFeatureSupport::Unknown,
+            "diagnostic reports are not a runtime capability source"
+        );
+        provider.migrate_legacy_openai_compatibility_report();
         let capabilities = provider.capabilities().tool_protocol;
         assert_eq!(
             capabilities.freeform_tools,

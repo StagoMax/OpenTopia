@@ -206,7 +206,7 @@ impl GuardianApprovalAction {
                         .map(str::to_string),
                 }
             }
-            "list_files" | "read_file" | "write_file" | "search" | "spreadsheet" => {
+            "filesystem" | "spreadsheet" => {
                 let path = call
                     .arguments
                     .get("path")
@@ -689,7 +689,7 @@ async fn run_review_model(
         // thread/turn ids remain control-plane correlation only.
         prompt_cache_key: Some("guardian-policy-v1".to_string()),
     };
-    let gateway = ProviderModelGateway::new(provider);
+    let gateway = ProviderModelGateway::from_provider(provider);
     let assembler = DefaultContextAssembler;
     for _ in 0..=GUARDIAN_MAX_TOOL_ROUNDS {
         let canonical = assembler.compile(ContextAssemblyInput {
@@ -1532,9 +1532,13 @@ mod tests {
             Uuid::new_v4(),
             "write requires review",
             GuardianApprovalAction::FileOperation {
-                tool: "write_file".to_string(),
+                tool: "filesystem".to_string(),
                 path: Some(workspace.join("target.txt")),
-                arguments: json!({ "path": "target.txt", "content": "updated" }),
+                arguments: json!({
+                    "operation": "write",
+                    "path": "target.txt",
+                    "content": "updated"
+                }),
             },
         );
         let result = manager.review(&request, context, None).await;

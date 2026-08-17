@@ -22,7 +22,20 @@ const DEFAULT_READ_WINDOW_CHARS: usize = 64_000;
 const MAX_READ_WINDOW_CHARS: usize = 256_000;
 const DEFAULT_LIST_ENTRIES: usize = 200;
 const MAX_LIST_ENTRIES: usize = 1_000;
+const DEFAULT_FIND_DEPTH: usize = 16;
+const MAX_FIND_DEPTH: usize = 64;
+const MAX_FIND_QUERY_CHARS: usize = 256;
+const MAX_FIND_VISITED_ENTRIES: usize = 100_000;
 const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum FilesystemFindKind {
+    #[default]
+    Any,
+    File,
+    Directory,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(
@@ -51,6 +64,7 @@ pub(super) enum FilesystemInput {
         /// Optional optimistic-concurrency token returned by read/stat. Use
         /// `missing` to require that the target does not already exist.
         #[serde(default)]
+        #[schemars(rename = "expectedHash")]
         expected_hash: Option<String>,
     },
     List {
@@ -58,6 +72,29 @@ pub(super) enum FilesystemInput {
         #[serde(default)]
         path: Option<String>,
         /// Maximum number of direct children to return.
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 1000))]
+        limit: Option<usize>,
+    },
+    Find {
+        /// Directory to search recursively. Defaults to the workspace root.
+        #[serde(default)]
+        path: Option<String>,
+        /// Literal substring matched against each entry's file name.
+        #[schemars(rename = "nameContains", length(min = 1, max = 256))]
+        name_contains: String,
+        /// Match file names case-sensitively. Defaults to false.
+        #[serde(default)]
+        #[schemars(rename = "caseSensitive")]
+        case_sensitive: bool,
+        /// Restrict matches to files or directories. Defaults to any entry kind.
+        #[serde(default)]
+        kind: FilesystemFindKind,
+        /// Maximum directory depth below path. One searches direct children only.
+        #[serde(default)]
+        #[schemars(rename = "maxDepth", range(min = 1, max = 64))]
+        max_depth: Option<usize>,
+        /// Maximum matches to return. Defaults to 200 and is capped at 1000.
         #[serde(default)]
         #[schemars(range(min = 1, max = 1000))]
         limit: Option<usize>,
@@ -95,7 +132,7 @@ impl FilesystemInput {
     fn read_paths(&self) -> Vec<PathBuf> {
         match self {
             Self::Read { path, .. } | Self::Stat { path } => vec![PathBuf::from(path)],
-            Self::List { path, .. } => {
+            Self::List { path, .. } | Self::Find { path, .. } => {
                 vec![PathBuf::from(path.as_deref().unwrap_or("."))]
             }
             Self::Copy { source, .. } | Self::Move { source, .. } => {
@@ -114,14 +151,16 @@ impl FilesystemInput {
                 destination,
                 ..
             } => vec![PathBuf::from(source), PathBuf::from(destination)],
-            Self::Read { .. } | Self::List { .. } | Self::Stat { .. } => Vec::new(),
+            Self::Read { .. } | Self::List { .. } | Self::Find { .. } | Self::Stat { .. } => {
+                Vec::new()
+            }
         }
     }
 
     fn is_read_only(&self) -> bool {
         matches!(
             self,
-            Self::Read { .. } | Self::List { .. } | Self::Stat { .. }
+            Self::Read { .. } | Self::List { .. } | Self::Find { .. } | Self::Stat { .. }
         )
     }
 
@@ -131,7 +170,7 @@ impl FilesystemInput {
             | Self::Write { path, .. }
             | Self::Stat { path }
             | Self::Delete { path } => vec![tool_resource_key("file", path)],
-            Self::List { path, .. } => {
+            Self::List { path, .. } | Self::Find { path, .. } => {
                 vec![tool_resource_key("tree", path.as_deref().unwrap_or("."))]
             }
             Self::Copy {
@@ -162,7 +201,7 @@ impl TypedTool for FilesystemTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured filesystem operations under the active workspace policy. Supports bounded UTF-8 read, optimistic full-file write, direct-child list, stat, and transactional file copy/move/delete. Prefer apply_patch for ordinary source edits and shell for search, tests, generators, directory operations, or bulk transformations. Absolute paths are accepted only when the behavior permission gateway authorizes their exact scope."
+        "Perform structured filesystem operations under the active workspace policy. Supports bounded UTF-8 read, optimistic full-file write, direct-child list, bounded recursive find by literal file-name substring, stat, and transactional file copy/move/delete. Prefer apply_patch for ordinary source edits and shell with rg for content search, tests, generators, directory operations, or bulk transformations. Absolute paths are accepted only when the behavior permission gateway authorizes their exact scope."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -220,6 +259,26 @@ impl TypedTool for FilesystemTool {
             } => write_file(call_id, &path, content, expected_hash.as_deref(), &ctx).await,
             FilesystemInput::List { path, limit } => {
                 list_directory(call_id, path.as_deref().unwrap_or("."), limit, &ctx).await
+            }
+            FilesystemInput::Find {
+                path,
+                name_contains,
+                case_sensitive,
+                kind,
+                max_depth,
+                limit,
+            } => {
+                find_entries(
+                    call_id,
+                    path.as_deref().unwrap_or("."),
+                    &name_contains,
+                    case_sensitive,
+                    kind,
+                    max_depth,
+                    limit,
+                    &ctx,
+                )
+                .await
             }
             FilesystemInput::Stat { path } => stat_path(call_id, &path, &ctx).await,
             FilesystemInput::Copy {
@@ -313,13 +372,12 @@ async fn write_file(
     verify_expected_hash(&path, original.as_deref(), expected_hash)?;
     let contents = content.into_bytes();
     let hash = content_fingerprint(&contents);
-    FileMutationBatch::new(vec![PreparedFileMutation::write(
+    let batch = FileMutationBatch::new(vec![PreparedFileMutation::write(
         path.clone(),
         original,
         contents.clone(),
-    )])?
-    .commit(ctx.environment.as_ref())
-    .await?;
+    )])?;
+    ctx.commit_file_mutations(&batch).await?;
     Ok(ToolResult::text(
         call_id,
         format!("Wrote {} bytes to {}", contents.len(), path.display()),
@@ -393,6 +451,157 @@ async fn list_directory(
     ))
 }
 
+async fn find_entries(
+    call_id: Uuid,
+    raw_path: &str,
+    raw_name_contains: &str,
+    case_sensitive: bool,
+    kind: FilesystemFindKind,
+    max_depth: Option<usize>,
+    limit: Option<usize>,
+    ctx: &ToolInvocationContext,
+) -> anyhow::Result<ToolResult> {
+    let name_contains = raw_name_contains.trim();
+    anyhow::ensure!(
+        !name_contains.is_empty(),
+        "filesystem find requires a non-empty nameContains value"
+    );
+    anyhow::ensure!(
+        name_contains.chars().count() <= MAX_FIND_QUERY_CHARS,
+        "filesystem find nameContains exceeds {MAX_FIND_QUERY_CHARS} characters"
+    );
+    let max_depth = max_depth.unwrap_or(DEFAULT_FIND_DEPTH);
+    anyhow::ensure!(
+        (1..=MAX_FIND_DEPTH).contains(&max_depth),
+        "filesystem find maxDepth must be between 1 and {MAX_FIND_DEPTH}"
+    );
+    let limit = limit
+        .unwrap_or(DEFAULT_LIST_ENTRIES)
+        .clamp(1, MAX_LIST_ENTRIES);
+
+    let logical = normalized_path(ctx, raw_path)?;
+    let root = ctx.environment.resolve_read_path(&logical)?;
+    anyhow::ensure!(
+        tokio::fs::metadata(&root).await?.is_dir(),
+        "filesystem find path is not a directory: {}",
+        root.display()
+    );
+
+    let match_query = if case_sensitive {
+        name_contains.to_string()
+    } else {
+        name_contains.to_lowercase()
+    };
+    let mut pending = vec![(root.clone(), 0usize)];
+    let mut matches = Vec::new();
+    let mut visited_entries = 0usize;
+    let mut skipped_directories = 0usize;
+    let mut truncation_reason = None;
+
+    'search: while let Some((directory_path, directory_depth)) = pending.pop() {
+        let mut directory = match tokio::fs::read_dir(&directory_path).await {
+            Ok(directory) => directory,
+            Err(error) if directory_depth > 0 => {
+                let _ = error;
+                skipped_directories += 1;
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to search {}", directory_path.display()));
+            }
+        };
+        let mut children = Vec::new();
+        let remaining_visit_budget = MAX_FIND_VISITED_ENTRIES - visited_entries;
+        let mut directory_truncated = false;
+        while let Some(entry) = directory.next_entry().await? {
+            if children.len() == remaining_visit_budget {
+                truncation_reason = Some("visit_limit");
+                directory_truncated = true;
+                break;
+            }
+            children.push(entry);
+        }
+        children.sort_by_key(|entry| entry.file_name().to_string_lossy().into_owned());
+
+        let entry_depth = directory_depth + 1;
+        let mut descendant_directories = Vec::new();
+        for entry in children {
+            visited_entries += 1;
+
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            let entry_path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let candidate = if case_sensitive {
+                name.clone()
+            } else {
+                name.to_lowercase()
+            };
+            if candidate.contains(&match_query) && kind.matches(&file_type) {
+                if matches.len() == limit {
+                    truncation_reason = Some("match_limit");
+                    break 'search;
+                }
+                let metadata = if file_type.is_file() {
+                    entry.metadata().await.ok()
+                } else {
+                    None
+                };
+                matches.push(FilesystemFindEntry {
+                    path: model_visible_path(ctx, &entry_path),
+                    name,
+                    kind: filesystem_entry_kind(&file_type),
+                    bytes: metadata.map(|item| item.len()),
+                });
+            }
+            if file_type.is_dir() && entry_depth < max_depth {
+                descendant_directories.push(entry_path);
+            }
+        }
+        descendant_directories.reverse();
+        pending.extend(
+            descendant_directories
+                .into_iter()
+                .map(|path| (path, entry_depth)),
+        );
+        if directory_truncated {
+            break 'search;
+        }
+    }
+
+    let count = matches.len();
+    let root_display = model_visible_path(ctx, &root);
+    let truncated = truncation_reason.is_some();
+    let value = json!({
+        "path": root_display,
+        "nameContains": name_contains,
+        "caseSensitive": case_sensitive,
+        "kind": kind.as_str(),
+        "maxDepth": max_depth,
+        "entries": matches,
+        "visitedEntries": visited_entries,
+        "truncated": truncated,
+        "truncationReason": truncation_reason,
+        "skippedDirectories": skipped_directories
+    });
+    Ok(ToolResult::text(
+        call_id,
+        serde_json::to_string_pretty(&value)?,
+        json!({
+            "toolName": "filesystem",
+            "operation": "find",
+            "path": root_display,
+            "count": count,
+            "visitedEntries": visited_entries,
+            "truncated": truncated,
+            "truncationReason": truncation_reason,
+            "success": true
+        }),
+    ))
+}
+
 async fn stat_path(
     call_id: Uuid,
     raw_path: &str,
@@ -457,13 +666,12 @@ async fn copy_file(
         "filesystem copy destination already exists: {}",
         destination.display()
     );
-    FileMutationBatch::new(vec![PreparedFileMutation::write(
+    let batch = FileMutationBatch::new(vec![PreparedFileMutation::write(
         destination.clone(),
         destination_original,
         source_bytes.clone(),
-    )])?
-    .commit(ctx.environment.as_ref())
-    .await?;
+    )])?;
+    ctx.commit_file_mutations(&batch).await?;
     Ok(file_transfer_result(
         call_id,
         "copy",
@@ -497,16 +705,15 @@ async fn move_file(
         "filesystem move destination already exists: {}",
         destination.display()
     );
-    FileMutationBatch::new(vec![
+    let batch = FileMutationBatch::new(vec![
         PreparedFileMutation::write(
             destination.clone(),
             destination_original,
             source_bytes.clone(),
         ),
         PreparedFileMutation::delete(source.clone(), source_bytes.clone()),
-    ])?
-    .commit(ctx.environment.as_ref())
-    .await?;
+    ])?;
+    ctx.commit_file_mutations(&batch).await?;
     Ok(file_transfer_result(
         call_id,
         "move",
@@ -527,9 +734,8 @@ async fn delete_file(
         .read_file(FileReadRequest::new(&path))
         .await?
         .bytes;
-    FileMutationBatch::new(vec![PreparedFileMutation::delete(path.clone(), original)])?
-        .commit(ctx.environment.as_ref())
-        .await?;
+    let batch = FileMutationBatch::new(vec![PreparedFileMutation::delete(path.clone(), original)])?;
+    ctx.commit_file_mutations(&batch).await?;
     Ok(ToolResult::text(
         call_id,
         format!("Deleted {}", path.display()),
@@ -548,6 +754,54 @@ fn normalized_path(ctx: &ToolInvocationContext, raw_path: &str) -> anyhow::Resul
     normalize_workspace_path(&ctx.workspace_root, raw_path)
 }
 
+impl FilesystemFindKind {
+    fn matches(self, file_type: &std::fs::FileType) -> bool {
+        match self {
+            Self::Any => true,
+            Self::File => file_type.is_file(),
+            Self::Directory => file_type.is_dir(),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::File => "file",
+            Self::Directory => "directory",
+        }
+    }
+}
+
+fn filesystem_entry_kind(file_type: &std::fs::FileType) -> &'static str {
+    if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "file"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    }
+}
+
+fn model_visible_path(ctx: &ToolInvocationContext, path: &Path) -> String {
+    let workspace_root = ctx
+        .environment
+        .workspace_root()
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.workspace_root.clone());
+    let visible = path
+        .strip_prefix(&workspace_root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or(path);
+    if path == workspace_root {
+        ".".to_string()
+    } else {
+        visible.to_string_lossy().replace('\\', "/")
+    }
+}
+
 fn verify_expected_hash(
     path: &Path,
     original: Option<&[u8]>,
@@ -557,6 +811,11 @@ fn verify_expected_hash(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
+        anyhow::ensure!(
+            original.is_none(),
+            "filesystem write requires expectedHash when replacing existing file {}; reread it and retry",
+            path.display()
+        );
         return Ok(());
     };
     let actual = original
@@ -605,6 +864,16 @@ fn file_transfer_result(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FilesystemListEntry {
+    name: String,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FilesystemFindEntry {
+    path: String,
     name: String,
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -732,6 +1001,86 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn find_matches_file_name_substrings_recursively_with_bounds() {
+        let (root, context) = fixture();
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/alpha.rs"), "alpha").unwrap();
+        fs::write(root.join("src/nested/ALPHA.md"), "alpha").unwrap();
+        fs::write(root.join("src/nested/beta.txt"), "beta").unwrap();
+
+        let found = FilesystemTool
+            .execute(
+                ToolCall::new(
+                    "filesystem",
+                    json!({
+                        "operation": "find",
+                        "path": "src",
+                        "nameContains": "alpha",
+                        "caseSensitive": false,
+                        "kind": "file",
+                        "maxDepth": 3,
+                        "limit": 10
+                    }),
+                ),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&found.output).unwrap();
+        let paths = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["src/alpha.rs", "src/nested/ALPHA.md"]);
+        assert_eq!(value["truncated"], false);
+
+        let shallow = FilesystemTool
+            .execute(
+                ToolCall::new(
+                    "filesystem",
+                    json!({
+                        "operation": "find",
+                        "path": "src",
+                        "nameContains": "alpha",
+                        "kind": "file",
+                        "maxDepth": 1,
+                        "limit": 10
+                    }),
+                ),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&shallow.output).unwrap();
+        assert_eq!(value["entries"].as_array().unwrap().len(), 1);
+
+        let limited = FilesystemTool
+            .execute(
+                ToolCall::new(
+                    "filesystem",
+                    json!({
+                        "operation": "find",
+                        "path": "src",
+                        "nameContains": "a",
+                        "kind": "file",
+                        "maxDepth": 3,
+                        "limit": 1
+                    }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&limited.output).unwrap();
+        assert_eq!(value["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["truncationReason"], "match_limit");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn delete_is_always_an_approval_boundary() {
         let (root, context) = fixture();
@@ -744,5 +1093,32 @@ mod tests {
             Some(PolicyDecision::Ask { .. })
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_schema_and_serde_accept_the_same_camel_case_write_input() {
+        let input = json!({
+            "operation": "write",
+            "path": "value.txt",
+            "content": "replacement",
+            "expectedHash": "missing"
+        });
+        assert_eq!(Tool::input_error(&FilesystemTool, &input), None);
+        assert!(serde_json::from_value::<FilesystemInput>(input).is_ok());
+    }
+
+    #[test]
+    fn provider_schema_and_serde_accept_the_same_camel_case_find_input() {
+        let input = json!({
+            "operation": "find",
+            "path": ".",
+            "nameContains": "policy",
+            "caseSensitive": false,
+            "kind": "file",
+            "maxDepth": 8,
+            "limit": 200
+        });
+        assert_eq!(Tool::input_error(&FilesystemTool, &input), None);
+        assert!(serde_json::from_value::<FilesystemInput>(input).is_ok());
     }
 }

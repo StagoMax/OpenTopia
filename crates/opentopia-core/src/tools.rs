@@ -10,6 +10,10 @@ use crate::browser::{
     BrowserObservationId, BrowserObserveOptions, BrowserRuntime, BrowserSelector, BrowserSessionId,
     BrowserWaitCondition, BrowserWaitRequest,
 };
+use crate::collaboration::{
+    AgentCollaborationInvocation, AgentWorkspaceMode, ForkTurns, SpawnChildAgentRequest,
+    WaitAgentRequest as CollaborationWaitAgentRequest,
+};
 use crate::computer::{
     ComputerAccessPolicy, ComputerAction, ComputerMouseButton, ComputerPolicyContext,
     ComputerRuntime, ComputerSessionId, ObserveOptions, WindowTarget,
@@ -20,27 +24,31 @@ use crate::context_sources::{
 use crate::enterprise::{CapabilityProjection, DataClassification};
 use crate::execution::{
     shell_command_compatibility_error, ExecRequest, ExecutionContext, ExecutionEnvironment,
-    FileReadRequest, FileWriteRequest, LocalExecutionEnvironment, ShellDialect,
+    FileDeleteRequest, FileReadRequest, FileWriteRequest, LocalExecutionEnvironment, ShellDialect,
 };
 use crate::execution_authorization::{
     ApprovalEscalation, ExecutionGrant, FilesystemAccess, NetworkAccess, ProcessLifetime,
     ToolExecutionIntent,
 };
-use crate::file_mutation::{read_optional, FileMutationBatch, PreparedFileMutation};
+use crate::file_mutation::{
+    lock_mutation_paths, read_optional, FileMutationBatch, FileMutationBatchResult,
+    FileMutationObserver, FileMutationScope, FileMutationTarget, PreparedFileMutation,
+};
 use crate::flow_runtime::FlowNodeHarness;
-use crate::git_workflow::isolated_subagent_worktree_request;
 use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{
     Artifact, ArtifactStorage, CollaborationMode, MessagePart, ModelContentPart, ToolCall,
     ToolResult, UserInputOption, UserInputQuestion, UserInputRequest,
 };
+#[cfg(test)]
+use crate::model_context::content_fingerprint;
 use crate::model_context::CompiledModelContext;
 use crate::policy::{
     ApprovalRequired, PermissionMode, PolicyDecision, PolicyEngine, ToolPermissionDescriptor,
 };
-use crate::provider::{ModelConversationMessage, ModelConversationRole};
-use crate::sandbox::{LocalSandboxConfig, SandboxMode};
+use crate::provider::ModelConversationMessage;
+use crate::sandbox::LocalSandboxConfig;
 use crate::shell_analysis::{analyze_shell_command, ShellCapability, ShellCommandAnalysis};
 use crate::skill_authoring::{
     create_skill_from_draft, preview_skill_draft, skill_target_path, SkillDraft, SkillResourceDraft,
@@ -54,17 +62,16 @@ use crate::spreadsheet::{
     SpreadsheetRequest, SpreadsheetResult, SpreadsheetTextMatchMode, WriteWorkbookRequest,
     MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
-use crate::subagents::{
-    SpawnSubagentRequest, SubagentExecutionContract, SubagentRun, SubagentRunStatus,
-    SubagentScheduler, SubagentScope, SubagentWorkspaceAssignment, SubagentWorkspaceMode,
-};
+use crate::subagents::SubagentScheduler;
 use crate::tool_state::ToolStateStore;
 use crate::work_form::WorkForm;
 use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine as _;
+#[cfg(test)]
 use futures_util::stream::FuturesUnordered;
-use futures_util::{FutureExt, StreamExt};
+#[cfg(test)]
+use futures_util::StreamExt;
 use schemars::{gen::SchemaSettings, JsonSchema};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -94,10 +101,17 @@ pub struct ToolInvocationContext {
     pub state: Option<ToolStateStore>,
     pub thread_id: Option<Uuid>,
     pub cancel: Option<CancellationToken>,
+    /// Caller-bound multi-Agent capability. Session, AgentThread, Turn, and
+    /// Runtime Snapshot identity are captured by the runtime and cannot be
+    /// supplied or overridden by model tool arguments.
+    pub collaboration: Option<AgentCollaborationInvocation>,
     pub subagents: Option<SubagentScheduler>,
     /// Commands that outlive the tool call that started them.
     pub background: Option<BackgroundProcessRegistry>,
     pub parent_turn_id: Option<Uuid>,
+    /// Process-shared sink for exact, committed file mutations. The server uses
+    /// it to build per-Turn diffs without scanning the workspace at Turn start.
+    pub file_mutation_observer: Option<Arc<dyn FileMutationObserver>>,
     pub subagent_depth: u8,
     pub agent_path: String,
     pub browser: Option<Arc<dyn BrowserRuntime>>,
@@ -155,9 +169,11 @@ impl ToolInvocationContext {
             state: None,
             thread_id: None,
             cancel: None,
+            collaboration: None,
             subagents: None,
             background: None,
             parent_turn_id: None,
+            file_mutation_observer: None,
             subagent_depth: 0,
             agent_path: "/root".to_string(),
             browser: None,
@@ -192,9 +208,11 @@ impl ToolInvocationContext {
             state: None,
             thread_id: None,
             cancel: None,
+            collaboration: None,
             subagents: None,
             background: None,
             parent_turn_id: None,
+            file_mutation_observer: None,
             subagent_depth: 0,
             agent_path: "/root".to_string(),
             browser: None,
@@ -220,6 +238,39 @@ impl ToolInvocationContext {
         match &self.cancel {
             Some(cancel) => context.with_cancel(cancel.clone()),
             None => context,
+        }
+    }
+
+    pub(super) async fn commit_file_mutations(
+        &self,
+        batch: &FileMutationBatch,
+    ) -> anyhow::Result<FileMutationBatchResult> {
+        let scope = self.file_mutation_scope()?;
+        batch
+            .commit_observed(
+                self.environment.as_ref(),
+                self.file_mutation_observer.as_deref(),
+                scope.as_ref(),
+            )
+            .await
+    }
+
+    fn file_mutation_scope(&self) -> anyhow::Result<Option<FileMutationScope>> {
+        match (
+            self.file_mutation_observer.as_deref(),
+            self.thread_id,
+            self.parent_turn_id,
+        ) {
+            (Some(_), Some(thread_id), Some(turn_id)) => Ok(Some(FileMutationScope {
+                thread_id,
+                turn_id,
+                agent_path: self.agent_path.clone(),
+                workspace_root: self.workspace_root.clone(),
+            })),
+            (Some(_), _, _) => {
+                anyhow::bail!("file mutation journaling requires thread and turn identity")
+            }
+            (None, _, _) => Ok(None),
         }
     }
 
@@ -579,7 +630,7 @@ impl ToolExecutionPolicy {
 }
 
 mod registry;
-pub use registry::{ToolRegistry, ToolSource};
+pub use registry::{ToolClass, ToolRegistry, ToolSource};
 
 fn truncate_chars(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
@@ -1633,7 +1684,7 @@ const MAX_USER_INPUT_DESCRIPTION_CHARS: usize = 500;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RequestUserInputInput {
-    /// One to three concise planning decisions.
+    /// One to three concise user decisions.
     #[schemars(length(min = 1, max = 3))]
     questions: Vec<RequestUserInputQuestionInput>,
 }
@@ -1646,7 +1697,7 @@ struct RequestUserInputQuestionInput {
     /// Short card heading.
     header: String,
     question: String,
-    #[schemars(length(min = 2, max = 4))]
+    #[schemars(length(min = 2, max = 3))]
     options: Vec<RequestUserInputOptionInput>,
     /// Allow the user to enter a different answer. Defaults to true.
     #[serde(default = "default_allow_custom")]
@@ -1679,13 +1730,17 @@ impl TypedTool for RequestUserInputTool {
     }
 
     fn description(&self) -> &str {
-        "Pause the current Turn when several materially different approaches require a user choice. Use one to three concise questions with two to three concrete options each. The same Turn resumes and continues execution after the answer."
+        "In Plan mode, pause the current Turn when several materially different approaches require a user choice. Use one to three concise questions with two to three concrete options each. The same Turn resumes and continues execution after the answer."
     }
 
     fn validate_context(&self, ctx: &ToolInvocationContext) -> anyhow::Result<()> {
         anyhow::ensure!(
             ctx.agent_path == "/root",
-            "only the root agent may ask the user a Plan question"
+            "only the root agent may ask the user a structured decision question"
+        );
+        anyhow::ensure!(
+            ctx.collaboration_mode == CollaborationMode::Plan,
+            "request_user_input is only available in Plan mode"
         );
         Ok(())
     }
@@ -3134,15 +3189,6 @@ enum ForkTurnsLabel {
     All,
 }
 
-impl ForkTurnsLabel {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::All => "all",
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum ForkTurnsInput {
@@ -3151,10 +3197,11 @@ enum ForkTurnsInput {
 }
 
 impl ForkTurnsInput {
-    fn into_string(self) -> String {
+    fn into_collaboration(self) -> ForkTurns {
         match self {
-            Self::Label(value) => value.as_str().to_string(),
-            Self::Count(value) => value.to_string(),
+            Self::Label(ForkTurnsLabel::None) => ForkTurns::None,
+            Self::Label(ForkTurnsLabel::All) => ForkTurns::All,
+            Self::Count(value) => ForkTurns::Count(value.get() as usize),
         }
     }
 }
@@ -3170,12 +3217,12 @@ enum SubagentWorkspaceModeInput {
 }
 
 impl SubagentWorkspaceModeInput {
-    fn as_str(self) -> &'static str {
+    fn into_collaboration(self) -> AgentWorkspaceMode {
         match self {
-            Self::Auto => "auto",
-            Self::SharedReadOnly => "shared_read_only",
-            Self::SharedCoordinated => "shared_coordinated",
-            Self::IsolatedWorktree => "isolated_worktree",
+            Self::Auto => AgentWorkspaceMode::Auto,
+            Self::SharedReadOnly => AgentWorkspaceMode::SharedReadOnly,
+            Self::SharedCoordinated => AgentWorkspaceMode::SharedCoordinated,
+            Self::IsolatedWorktree => AgentWorkspaceMode::IsolatedWorktree,
         }
     }
 }
@@ -3202,6 +3249,10 @@ struct SpawnAgentInput {
     /// Harness workspace contract.
     #[serde(default)]
     workspace_mode: SubagentWorkspaceModeInput,
+    /// Whether the child may recursively create children. Session and parent
+    /// policy can still reject or further narrow this request.
+    #[serde(default)]
+    allow_child_spawns: bool,
 }
 
 pub struct SpawnAgentTool;
@@ -3242,24 +3293,18 @@ impl TypedTool for SpawnAgentTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        let scheduler = ctx
-            .subagents
+        let collaboration = ctx
+            .collaboration
             .as_ref()
-            .context("subagent runtime is unavailable")?;
-        let thread_id = ctx
-            .thread_id
-            .context("subagent parent thread is unavailable")?;
-        let parent_turn_id = ctx
-            .parent_turn_id
-            .context("subagent parent turn is unavailable")?;
+            .context("agent collaboration runtime is unavailable")?;
         let name = input.task_name.trim().to_string();
         anyhow::ensure!(!name.is_empty(), "task_name must be a non-empty string");
         let message = input.message.trim().to_string();
         anyhow::ensure!(!message.is_empty(), "message must be a non-empty string");
         let fork_turns = input
             .fork_turns
-            .map(ForkTurnsInput::into_string)
-            .unwrap_or_else(|| "all".to_string());
+            .map(ForkTurnsInput::into_collaboration)
+            .unwrap_or(ForkTurns::None);
         let agent_type = input.agent_type;
         let profiles = AgentProfileRegistry::load(&ctx.workspace_root);
         if profiles.get(&agent_type).is_none() {
@@ -3267,43 +3312,32 @@ impl TypedTool for SpawnAgentTool {
                 "unknown agent_type `{agent_type}`; call list_agents to inspect available profiles"
             );
         }
-        let profile = profiles
-            .get(&agent_type)
-            .context("validated agent profile disappeared")?;
-        let workspace_mode = input.workspace_mode.as_str();
-        let execution_contract = subagent_execution_contract(
-            &ctx,
-            &name,
-            workspace_mode,
-            profile.sandbox_mode == Some(SandboxMode::ReadOnly),
-        )
-        .await?;
-        let initial_conversation = select_fork_conversation(&ctx.fork_conversation, &fork_turns);
-        let run = scheduler.spawn_with_contract(
-            SpawnSubagentRequest {
-                parent_thread_id: thread_id,
-                parent_turn_id,
-                parent_agent_path: ctx.agent_path.clone(),
-                name,
+        let outcome = collaboration
+            .spawn_agent(SpawnChildAgentRequest {
+                task_name: name,
+                message,
                 agent_type,
-                input: message,
                 fork_turns,
-                depth: ctx.subagent_depth.saturating_add(1),
-                initial_conversation,
-                initial_model_context: ctx.fork_model_context.clone(),
-            },
-            execution_contract.clone(),
-        )?;
+                workspace_mode: input.workspace_mode.into_collaboration(),
+                allow_child_spawns: input.allow_child_spawns,
+            })
+            .await?;
         Ok(ToolResult {
             call_id,
-            output: serde_json::to_string(&run)?,
-            content: Vec::new(),
+            output: serde_json::to_string(&json!({
+                "agent": outcome.agent,
+                "turn": outcome.turn,
+            }))?,
+            content: vec![ModelContentPart::json(json!({
+                "agent": outcome.agent,
+                "turn": outcome.turn,
+            }))],
             metadata: json!({
                 "toolName": "spawn_agent",
-                "runId": run.id,
-                "agentPath": run.agent_path,
-                "status": run.status,
-                "executionContract": execution_contract,
+                "agentThreadId": outcome.agent.id,
+                "agentTurnId": outcome.turn.id,
+                "agentPath": outcome.agent.path,
+                "status": outcome.turn.status,
                 "success": true
             }),
         })
@@ -3311,114 +3345,6 @@ impl TypedTool for SpawnAgentTool {
 }
 
 impl_typed_tool!(SpawnAgentTool);
-
-async fn subagent_execution_contract(
-    ctx: &ToolInvocationContext,
-    task_name: &str,
-    requested: &str,
-    profile_read_only: bool,
-) -> anyhow::Result<SubagentExecutionContract> {
-    let mode = match requested {
-        "auto" if profile_read_only => SubagentWorkspaceMode::SharedReadOnly,
-        "auto" => SubagentWorkspaceMode::SharedCoordinated,
-        "shared_read_only" => SubagentWorkspaceMode::SharedReadOnly,
-        "shared_coordinated" => SubagentWorkspaceMode::SharedCoordinated,
-        "isolated_worktree" => SubagentWorkspaceMode::IsolatedWorktree,
-        other => anyhow::bail!("unknown spawn_agent workspace_mode `{other}`"),
-    };
-    if mode != SubagentWorkspaceMode::IsolatedWorktree {
-        return Ok(SubagentExecutionContract {
-            workspace: SubagentWorkspaceAssignment {
-                mode,
-                root: Some(ctx.workspace_root.clone()),
-                branch: None,
-                base_commit: None,
-            },
-            require_structured_delivery: false,
-        });
-    }
-
-    let head = ctx
-        .environment
-        .exec(
-            ExecRequest::new("git")
-                .args(["rev-parse", "--verify", "HEAD"])
-                .cwd(&ctx.workspace_root),
-            ctx.execution_context(Duration::from_secs(15)),
-        )
-        .await
-        .context("isolated subagent requires a Git repository with a HEAD commit")?;
-    if !head.success {
-        anyhow::bail!(
-            "isolated subagent could not resolve HEAD: {}",
-            truncate(&String::from_utf8_lossy(&head.stderr), 2_000)
-        );
-    }
-    let base_commit = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    if base_commit.is_empty() {
-        anyhow::bail!("isolated subagent resolved an empty HEAD commit");
-    }
-    let suffix = Uuid::new_v4().simple().to_string();
-    let suffix = &suffix[..12];
-    let branch = format!("codex/subagent/{task_name}-{suffix}");
-    let root = ctx
-        .workspace_root
-        .join(".opentopia")
-        .join("worktrees")
-        .join(format!("{task_name}-{suffix}"));
-    let request = isolated_subagent_worktree_request(
-        ctx.workspace_root.clone(),
-        root.clone(),
-        branch.clone(),
-        base_commit.clone(),
-    )?;
-    let command = format!(
-        "git worktree add -b {} {} {}",
-        branch,
-        root.display(),
-        base_commit
-    );
-    enforce_policy_decision(ctx.policy.inspect_command(&command), ctx.approval_granted)?;
-    drop(request);
-
-    Ok(SubagentExecutionContract {
-        workspace: SubagentWorkspaceAssignment {
-            mode,
-            root: Some(root),
-            branch: Some(branch),
-            base_commit: Some(base_commit),
-        },
-        require_structured_delivery: true,
-    })
-}
-
-fn select_fork_conversation(
-    conversation: &[ModelConversationMessage],
-    fork_turns: &str,
-) -> Vec<ModelConversationMessage> {
-    if fork_turns == "none" {
-        return Vec::new();
-    }
-    if fork_turns == "all" {
-        return conversation.to_vec();
-    }
-    let turns = fork_turns.parse::<usize>().unwrap_or_default();
-    if turns == 0 {
-        return conversation.to_vec();
-    }
-    let user_indexes = conversation
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            (message.role == ModelConversationRole::User).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let start = user_indexes
-        .get(user_indexes.len().saturating_sub(turns))
-        .copied()
-        .unwrap_or_default();
-    conversation[start..].to_vec()
-}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -3442,22 +3368,6 @@ struct ListAgentsInput {
     /// Optional canonical path prefix.
     #[serde(default)]
     path_prefix: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AgentRunInput {
-    /// Child run UUID.
-    run_id: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AgentRunMessageInput {
-    /// Child run UUID.
-    run_id: String,
-    /// Additional instructions.
-    input: String,
 }
 
 fn agent_control_policy(target: &str) -> ToolExecutionPolicy {
@@ -3499,21 +3409,24 @@ impl TypedTool for SendAgentMessageTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        let scheduler = subagent_scheduler(&ctx)?;
+        let collaboration = collaboration_runtime(&ctx)?;
         let target = input.target.trim();
         anyhow::ensure!(!target.is_empty(), "target must be a non-empty string");
         let message = input.message.trim().to_string();
         anyhow::ensure!(!message.is_empty(), "message must be a non-empty string");
-        let delivery = scheduler.send_message_scoped(subagent_scope(&ctx)?, target, message)?;
+        let delivery = collaboration
+            .send_message(target, message, Some(call_id))
+            .await?;
         Ok(ToolResult {
             call_id,
             output: serde_json::to_string(&delivery)?,
-            content: Vec::new(),
+            content: vec![ModelContentPart::json(serde_json::to_value(&delivery)?)],
             metadata: json!({
                 "toolName": "send_message",
-                "runId": delivery.target_id,
-                "agentPath": delivery.agent_path,
-                "queued": delivery.queued,
+                "messageId": delivery.id,
+                "targetAgentThreadId": delivery.to_agent_thread_id,
+                "sequence": delivery.sequence,
+                "queued": true,
                 "success": true
             }),
         })
@@ -3546,18 +3459,24 @@ impl TypedTool for FollowupAgentTaskTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        let scheduler = subagent_scheduler(&ctx)?;
+        let collaboration = collaboration_runtime(&ctx)?;
         let target = input.target.trim();
         anyhow::ensure!(!target.is_empty(), "target must be a non-empty string");
         let message = input.message.trim().to_string();
         anyhow::ensure!(!message.is_empty(), "message must be a non-empty string");
-        let run = scheduler.followup_task_scoped(subagent_scope(&ctx)?, target, message)?;
-        Ok(agent_tool_result(
+        let turn = collaboration.followup_task(target, message).await?;
+        Ok(ToolResult {
             call_id,
-            "followup_task",
-            &run,
-            format!("Follow-up delivered to {}.", run.agent_path),
-        ))
+            output: serde_json::to_string(&turn)?,
+            content: vec![ModelContentPart::json(serde_json::to_value(&turn)?)],
+            metadata: json!({
+                "toolName": "followup_task",
+                "agentThreadId": turn.agent_thread_id,
+                "agentTurnId": turn.id,
+                "status": turn.status,
+                "success": true
+            }),
+        })
     }
 }
 
@@ -3587,17 +3506,25 @@ impl TypedTool for InterruptAgentTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        let scheduler = subagent_scheduler(&ctx)?;
+        let collaboration = collaboration_runtime(&ctx)?;
         let target = input.target.trim();
         anyhow::ensure!(!target.is_empty(), "target must be a non-empty string");
-        let run = scheduler.resolve_scoped(subagent_scope(&ctx)?, target)?;
-        scheduler.cancel_scoped(subagent_scope(&ctx)?, run.id)?;
-        Ok(agent_tool_result(
+        let turn = collaboration.interrupt_agent(target).await?;
+        let value = json!({
+            "target": target,
+            "turn": turn,
+            "interruptRequested": turn.as_ref().is_some_and(|turn| !turn.status.is_terminal())
+        });
+        Ok(ToolResult {
             call_id,
-            "interrupt_agent",
-            &run,
-            format!("Interrupt requested for {}.", run.agent_path),
-        ))
+            output: serde_json::to_string(&value)?,
+            content: vec![ModelContentPart::json(value)],
+            metadata: json!({
+                "toolName": "interrupt_agent",
+                "agentTurnId": turn.as_ref().map(|turn| turn.id),
+                "success": true
+            }),
+        })
     }
 }
 
@@ -3627,12 +3554,14 @@ impl TypedTool for ListAgentsTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        let scheduler = subagent_scheduler(&ctx)?;
-        let runs = scheduler.list_scoped(subagent_scope(&ctx)?, input.path_prefix.as_deref());
-        let run_count = runs.len();
+        let collaboration = collaboration_runtime(&ctx)?;
+        let agents = collaboration
+            .list_agents(input.path_prefix.as_deref())
+            .await?;
+        let agent_count = agents.len();
         let profiles = AgentProfileRegistry::load(&ctx.workspace_root);
         let value = json!({
-            "agents": runs,
+            "agents": agents,
             "availableAgentTypes": profiles.list(),
             "profileWarnings": profiles.warnings()
         });
@@ -3641,107 +3570,35 @@ impl TypedTool for ListAgentsTool {
             call_id,
             output,
             content: vec![ModelContentPart::json(value)],
-            metadata: json!({ "toolName": "list_agents", "count": run_count, "success": true }),
+            metadata: json!({ "toolName": "list_agents", "count": agent_count, "success": true }),
         })
     }
 }
 
 impl_typed_tool!(ListAgentsTool);
 
-pub struct SendAgentInputTool;
-
-#[async_trait]
-impl TypedTool for SendAgentInputTool {
-    type Input = AgentRunMessageInput;
-
-    fn name(&self) -> &str {
-        "send_input"
-    }
-
-    fn description(&self) -> &str {
-        "Send additional input to an active child agent."
-    }
-
-    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        agent_control_policy(&input.run_id)
-    }
-
-    async fn execute_typed(
-        &self,
-        call_id: Uuid,
-        input: Self::Input,
-        ctx: ToolInvocationContext,
-    ) -> anyhow::Result<ToolResult> {
-        let scheduler = ctx
-            .subagents
-            .as_ref()
-            .context("subagent runtime is unavailable")?;
-        let run_id = Uuid::parse_str(input.run_id.trim()).context("runId must be a UUID")?;
-        let message = input.input.trim().to_string();
-        anyhow::ensure!(!message.is_empty(), "input must be a non-empty string");
-        scheduler.send_input_scoped(subagent_scope(&ctx)?, run_id, message)?;
-        Ok(ToolResult {
-            call_id,
-            output: format!("Input delivered to subagent {run_id}."),
-            content: Vec::new(),
-            metadata: json!({ "toolName": "send_input", "runId": run_id, "success": true }),
-        })
-    }
-}
-
-impl_typed_tool!(SendAgentInputTool);
-
-pub struct CancelAgentTool;
-
-#[async_trait]
-impl TypedTool for CancelAgentTool {
-    type Input = AgentRunInput;
-
-    fn name(&self) -> &str {
-        "cancel_agent"
-    }
-
-    fn description(&self) -> &str {
-        "Cancel an active child agent."
-    }
-
-    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        agent_control_policy(&input.run_id)
-    }
-
-    async fn execute_typed(
-        &self,
-        call_id: Uuid,
-        input: Self::Input,
-        ctx: ToolInvocationContext,
-    ) -> anyhow::Result<ToolResult> {
-        let scheduler = ctx
-            .subagents
-            .as_ref()
-            .context("subagent runtime is unavailable")?;
-        let run_id = Uuid::parse_str(input.run_id.trim()).context("runId must be a UUID")?;
-        scheduler.cancel_scoped(subagent_scope(&ctx)?, run_id)?;
-        Ok(ToolResult {
-            call_id,
-            output: format!("Cancellation requested for subagent {run_id}."),
-            content: Vec::new(),
-            metadata: json!({ "toolName": "cancel_agent", "runId": run_id, "success": true }),
-        })
-    }
-}
-
-impl_typed_tool!(CancelAgentTool);
-
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WaitAgentInput {
     /// Optional agent UUID or canonical path.
-    #[serde(default, alias = "runId")]
+    #[serde(default)]
     target: Option<String>,
-    /// How long to block, up to one hour.
+    /// Durable event cursor returned by the previous call.
+    #[serde(default)]
+    after_cursor: Option<i64>,
+    /// How long to block, up to one hour. Zero reads immediately.
     #[serde(default, alias = "timeoutMs")]
-    #[schemars(range(min = 1, max = 3600000))]
+    #[schemars(range(min = 0, max = 3600000))]
     timeout_ms: Option<u64>,
+    /// Maximum reasoning tail characters returned.
+    #[serde(default)]
+    reasoning_tail_chars: Option<usize>,
+    /// Maximum characters in each Tool Result projection.
+    #[serde(default)]
+    tool_result_chars: Option<usize>,
+    /// Maximum recent lifecycle events and Tool Results returned.
+    #[serde(default)]
+    event_limit: Option<usize>,
 }
 
 pub struct WaitAgentTool;
@@ -3755,7 +3612,7 @@ impl TypedTool for WaitAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Wait for agent mailbox activity. With target/runId, wait for that agent's current turn and return its messages with the terminal result; without one, return the next mailbox or terminal update in the visible task tree."
+        "Read or wait for agent activity derived from reasoning deltas, model/tool lifecycle events, actual tool results, durable turn status, and mailbox messages. A zero timeout reads immediately and never changes the target agent."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -3771,58 +3628,40 @@ impl TypedTool for WaitAgentTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        let scheduler = ctx
-            .subagents
-            .as_ref()
-            .context("subagent runtime is unavailable")?;
+        let collaboration = collaboration_runtime(&ctx)?;
         let timeout_ms = input
             .timeout_ms
-            .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
-            .clamp(1, MAX_WAIT_TIMEOUT_MS);
-        let scope = subagent_scope(&ctx)?;
-        if let Some(target) = input.target.as_deref() {
-            let run = scheduler.resolve_scoped(scope.clone(), target)?;
-            let run = await_cancellable(
-                ctx.cancel.as_ref(),
-                scheduler.wait_scoped(scope.clone(), run.id, Duration::from_millis(timeout_ms)),
-            )
-            .await??;
-            let messages = scheduler.drain_mailbox_from_scoped(&scope, &run.agent_path);
-            let message_count = messages.len();
-            let value = json!({
-                "agent": run,
-                "messages": messages,
-            });
-            return Ok(ToolResult {
-                call_id,
-                output: serde_json::to_string_pretty(&value)?,
-                content: vec![ModelContentPart::json(value)],
-                metadata: json!({
-                    "toolName": "wait_agent",
-                    "runId": run.id,
-                    "agentPath": run.agent_path,
-                    "status": run.status,
-                    "terminal": run.status.is_terminal(),
-                    "success": run.status == SubagentRunStatus::Completed,
-                    "messageCount": message_count
-                }),
-            });
-        }
-        let activity = await_cancellable(
+            .unwrap_or_default()
+            .min(MAX_WAIT_TIMEOUT_MS);
+        let outcome = await_cancellable(
             ctx.cancel.as_ref(),
-            scheduler.wait_for_activity_scoped(scope, Duration::from_millis(timeout_ms)),
+            collaboration.wait_agent(CollaborationWaitAgentRequest {
+                target: input.target,
+                after_cursor: input.after_cursor,
+                timeout: Duration::from_millis(timeout_ms),
+                reasoning_tail_chars: input.reasoning_tail_chars.unwrap_or(2_000),
+                tool_result_chars: input.tool_result_chars.unwrap_or(4_000),
+                event_limit: input.event_limit.unwrap_or(12),
+            }),
         )
         .await??;
-        let update_count = activity.agents.len();
-        let message_count = activity.messages.len();
-        let value = serde_json::to_value(activity)?;
+        let cursor = outcome
+            .activity
+            .as_ref()
+            .map(|activity| activity.cursor)
+            .unwrap_or_default();
+        let message_count = outcome.messages.len();
+        let value = serde_json::to_value(&outcome)?;
         Ok(ToolResult {
             call_id,
             output: serde_json::to_string_pretty(&value)?,
-            content: vec![ModelContentPart::json(value)],
+            content: vec![ModelContentPart::json(value.clone())],
             metadata: json!({
                 "toolName": "wait_agent",
-                "updateCount": update_count,
+                "agentThreadId": outcome.agent.id,
+                "agentTurnId": outcome.turn.as_ref().map(|turn| turn.id),
+                "cursor": cursor,
+                "timedOut": outcome.timed_out,
                 "messageCount": message_count,
                 "success": true
             }),
@@ -3832,206 +3671,6 @@ impl TypedTool for WaitAgentTool {
 
 impl_typed_tool!(WaitAgentTool);
 
-const MAX_BATCH_WAIT_AGENTS: usize = 8;
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WaitAgentsInput {
-    /// Child run UUIDs.
-    #[schemars(length(min = 1, max = 8))]
-    run_ids: Vec<String>,
-    /// How long to block, up to one hour.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 3600000))]
-    timeout_ms: Option<u64>,
-}
-
-pub struct WaitAgentsTool;
-
-#[async_trait]
-impl TypedTool for WaitAgentsTool {
-    type Input = WaitAgentsInput;
-
-    fn name(&self) -> &str {
-        "wait_agents"
-    }
-
-    fn description(&self) -> &str {
-        "Wait on several child agents at once and return as soon as the first one finishes, together with any other agent that is already done. Agents still working are reported in stillRunning and keep going; their results arrive on their own once they finish."
-    }
-
-    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        let mut resource_keys = input
-            .run_ids
-            .iter()
-            .map(|run_id| tool_resource_key("agent", run_id))
-            .collect::<Vec<_>>();
-        resource_keys.sort();
-        resource_keys.dedup();
-        if resource_keys.is_empty() {
-            resource_keys.push("*".to_string());
-        }
-        ToolExecutionPolicy {
-            read_only: false,
-            idempotent: false,
-            parallel_safe: true,
-            side_effect: ToolSideEffect::ControlPlane,
-            resource_keys,
-        }
-    }
-
-    async fn execute_typed(
-        &self,
-        call_id: Uuid,
-        input: Self::Input,
-        ctx: ToolInvocationContext,
-    ) -> anyhow::Result<ToolResult> {
-        let scheduler = ctx
-            .subagents
-            .as_ref()
-            .context("subagent runtime is unavailable")?;
-        if input.run_ids.is_empty() || input.run_ids.len() > MAX_BATCH_WAIT_AGENTS {
-            anyhow::bail!("wait_agents requires between 1 and {MAX_BATCH_WAIT_AGENTS} run IDs");
-        }
-        let mut unique = HashSet::new();
-        let mut run_ids = Vec::with_capacity(input.run_ids.len());
-        for raw in &input.run_ids {
-            let run_id = Uuid::parse_str(raw).context("wait_agents received an invalid run ID")?;
-            if !unique.insert(run_id) {
-                anyhow::bail!("wait_agents received duplicate run ID {run_id}");
-            }
-            run_ids.push(run_id);
-        }
-
-        let timeout_ms = input
-            .timeout_ms
-            .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
-            .clamp(1, MAX_WAIT_TIMEOUT_MS);
-        let timeout = Duration::from_millis(timeout_ms);
-        let scope = subagent_scope(&ctx)?;
-        let mut inflight = run_ids
-            .iter()
-            .map(|run_id| {
-                let scope = scope.clone();
-                let run_id = *run_id;
-                async move { (run_id, scheduler.wait_scoped(scope, run_id, timeout).await) }
-            })
-            .collect::<FuturesUnordered<_>>();
-
-        // Return as soon as one agent reaches a terminal state, then harvest every
-        // other agent that is already done. Blocking until the slowest child of the
-        // batch finishes would withhold results the caller could act on immediately.
-        let mut settled: HashMap<Uuid, SubagentRun> = HashMap::new();
-        let mut wait_errors: HashMap<Uuid, String> = HashMap::new();
-        await_cancellable(ctx.cancel.as_ref(), async {
-            while let Some((run_id, outcome)) = inflight.next().await {
-                match outcome {
-                    Ok(run) => {
-                        settled.insert(run_id, run);
-                        break;
-                    }
-                    Err(error) => {
-                        wait_errors.insert(run_id, error.to_string());
-                    }
-                }
-            }
-        })
-        .await?;
-        while let Some(Some((run_id, outcome))) = inflight.next().now_or_never() {
-            match outcome {
-                Ok(run) => {
-                    settled.insert(run_id, run);
-                }
-                Err(error) => {
-                    wait_errors.insert(run_id, error.to_string());
-                }
-            }
-        }
-        // Cancels the remaining waits, not the agents behind them: those keep running
-        // and report back on their own.
-        drop(inflight);
-
-        let mut still_running = Vec::new();
-        let runs = run_ids
-            .iter()
-            .map(|run_id| {
-                if let Some(run) = settled.get(run_id) {
-                    return json!({
-                        "runId": run_id,
-                        "agentPath": run.agent_path,
-                        "status": run.status,
-                        "result": run.result,
-                        "error": run.error,
-                        "terminal": run.status.is_terminal(),
-                        "success": run.status == SubagentRunStatus::Completed
-                    });
-                }
-                let current = scheduler
-                    .resolve_scoped(scope.clone(), &run_id.to_string())
-                    .ok();
-                still_running.push(*run_id);
-                json!({
-                    "runId": run_id,
-                    "agentPath": current.as_ref().map(|run| run.agent_path.clone()),
-                    "status": current.as_ref().map(|run| run.status),
-                    "terminal": false,
-                    "success": false,
-                    "waitError": wait_errors.get(run_id),
-                })
-            })
-            .collect::<Vec<_>>();
-        let all_terminal = runs
-            .iter()
-            .all(|run| run.get("terminal").and_then(Value::as_bool) == Some(true));
-        let all_succeeded = runs
-            .iter()
-            .all(|run| run.get("success").and_then(Value::as_bool) == Some(true));
-        let mut messages = Vec::new();
-        for run_id in &run_ids {
-            let agent_path = settled
-                .get(run_id)
-                .map(|run| run.agent_path.clone())
-                .or_else(|| {
-                    scheduler
-                        .resolve_scoped(scope.clone(), &run_id.to_string())
-                        .ok()
-                        .map(|run| run.agent_path)
-                });
-            if let Some(agent_path) = agent_path {
-                messages.extend(scheduler.drain_mailbox_from_scoped(&scope, &agent_path));
-            }
-        }
-        let value = json!({
-            "runs": runs,
-            "messages": messages,
-            "allTerminal": all_terminal,
-            "allSucceeded": all_succeeded,
-            "stillRunning": still_running,
-            "note": if still_running.is_empty() {
-                "Every requested agent reached a terminal state."
-            } else {
-                "This call returned as soon as the first agent finished. The agents in stillRunning are unaffected and keep working; their results reach you automatically once they finish."
-            },
-        });
-        Ok(ToolResult {
-            call_id,
-            output: serde_json::to_string_pretty(&value)?,
-            content: vec![ModelContentPart::json(value.clone())],
-            metadata: json!({
-                "toolName": "wait_agents",
-                "runCount": run_ids.len(),
-                "settledCount": settled.len(),
-                "stillRunningCount": still_running.len(),
-                "allTerminal": all_terminal,
-                "allSucceeded": all_succeeded,
-                "success": !settled.is_empty() || run_ids.is_empty()
-            }),
-        })
-    }
-}
-
-impl_typed_tool!(WaitAgentsTool);
-
 /// Longest a wait tool may block.
 ///
 /// Waiting is the cheap way to wait: a blocked tool call burns no tokens, while a
@@ -4039,7 +3678,6 @@ impl_typed_tool!(WaitAgentsTool);
 /// exists only so a wait cannot outlive any plausible turn, and it matches the
 /// ceiling the interactive terminal already allows.
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
-const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 
 /// Runs a future while staying responsive to turn cancellation.
 ///
@@ -4062,43 +3700,12 @@ where
     }
 }
 
-fn subagent_scope(ctx: &ToolInvocationContext) -> anyhow::Result<SubagentScope> {
-    Ok(SubagentScope {
-        thread_id: ctx
-            .thread_id
-            .context("subagent parent thread is unavailable")?,
-        parent_turn_id: ctx
-            .parent_turn_id
-            .context("subagent parent turn is unavailable")?,
-        depth: ctx.subagent_depth,
-        agent_path: ctx.agent_path.clone(),
-    })
-}
-
-fn subagent_scheduler(ctx: &ToolInvocationContext) -> anyhow::Result<&SubagentScheduler> {
-    ctx.subagents
+fn collaboration_runtime(
+    ctx: &ToolInvocationContext,
+) -> anyhow::Result<&AgentCollaborationInvocation> {
+    ctx.collaboration
         .as_ref()
-        .context("subagent runtime is unavailable")
-}
-
-fn agent_tool_result(
-    call_id: Uuid,
-    tool_name: &str,
-    run: &crate::subagents::SubagentRun,
-    output: String,
-) -> ToolResult {
-    ToolResult {
-        call_id,
-        output,
-        content: Vec::new(),
-        metadata: json!({
-            "toolName": tool_name,
-            "runId": run.id,
-            "agentPath": run.agent_path,
-            "status": run.status,
-            "success": true
-        }),
-    }
+        .context("agent collaboration runtime is unavailable")
 }
 
 fn required_typed_string(input: Option<&str>, key: &str) -> anyhow::Result<String> {
@@ -4109,6 +3716,7 @@ fn required_typed_string(input: Option<&str>, key: &str) -> anyhow::Result<Strin
         .with_context(|| format!("{key} must be a non-empty string"))
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ListFilesInput {
@@ -4116,8 +3724,10 @@ struct ListFilesInput {
     path: String,
 }
 
-pub struct ListFilesTool;
+#[cfg(test)]
+struct ListFilesTool;
 
+#[cfg(test)]
 #[async_trait]
 impl TypedTool for ListFilesTool {
     type Input = ListFilesInput;
@@ -4165,6 +3775,7 @@ impl TypedTool for ListFilesTool {
     }
 }
 
+#[cfg(test)]
 impl_typed_tool!(ListFilesTool);
 
 const ATTACHMENT_RESULT_BOUNDARY: &str = "Attachment content:";
@@ -4976,9 +4587,12 @@ async fn attachment_image_bytes(
     }
 }
 
+#[cfg(test)]
 const READ_FILE_ARTIFACT_THRESHOLD: usize = 64_000;
+#[cfg(test)]
 const READ_FILE_WINDOW_CHARS: usize = 16_000;
 
+#[cfg(test)]
 #[derive(Debug, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileReadInput {
@@ -4989,6 +4603,7 @@ struct FileReadInput {
     window: Option<FileReadWindow>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
 enum FileReadWindow {
@@ -5011,6 +4626,7 @@ enum FileReadWindow {
     },
 }
 
+#[cfg(test)]
 impl<'de> Deserialize<'de> for FileReadInput {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -5080,6 +4696,7 @@ impl<'de> Deserialize<'de> for FileReadInput {
     }
 }
 
+#[cfg(test)]
 impl FileReadInput {
     fn is_line_window(&self) -> bool {
         matches!(self.window, Some(FileReadWindow::Lines { .. }))
@@ -5106,8 +4723,10 @@ impl FileReadInput {
     }
 }
 
-pub struct ReadFileTool;
+#[cfg(test)]
+struct ReadFileTool;
 
+#[cfg(test)]
 #[async_trait]
 impl TypedTool for ReadFileTool {
     type Input = FileReadInput;
@@ -5138,6 +4757,7 @@ impl TypedTool for ReadFileTool {
     }
 }
 
+#[cfg(test)]
 async fn execute_read_file_with_cap(
     call_id: Uuid,
     input: FileReadInput,
@@ -5156,6 +4776,7 @@ async fn execute_read_file_with_cap(
         .await?;
     let contents = String::from_utf8(read.bytes)
         .with_context(|| format!("failed to read {} as UTF-8", read.path.display()))?;
+    let content_hash = content_fingerprint(contents.as_bytes());
     let bytes = contents.len();
     let total_chars = contents.chars().count();
     let cap = max_chars.clamp(1, READ_FILE_WINDOW_CHARS);
@@ -5289,6 +4910,9 @@ async fn execute_read_file_with_cap(
             )
         }
     };
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("contentHash".to_string(), json!(content_hash));
+    }
 
     if bytes > READ_FILE_ARTIFACT_THRESHOLD {
         if let Some(ref store) = ctx.state {
@@ -5330,7 +4954,38 @@ async fn execute_read_file_with_cap(
     })
 }
 
+#[cfg(test)]
 impl_typed_tool!(ReadFileTool);
+
+#[cfg(test)]
+fn verify_write_precondition(
+    path: &Path,
+    original: Option<&[u8]>,
+    expected_hash: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(expected_hash) = expected_hash
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        anyhow::ensure!(
+            original.is_none(),
+            "write_file requires expectedHash when replacing existing file {}; reread it and retry",
+            path.display()
+        );
+        return Ok(());
+    };
+    let actual = original
+        .map(content_fingerprint)
+        .unwrap_or_else(|| "missing".to_string());
+    anyhow::ensure!(
+        actual.eq_ignore_ascii_case(expected_hash),
+        "write_file precondition failed for {}: expected hash {}, actual {}; reread and retry",
+        path.display(),
+        expected_hash,
+        actual
+    );
+    Ok(())
+}
 
 const READ_ARTIFACT_WINDOW_CHARS: usize = 16_000;
 
@@ -5441,11 +5096,15 @@ impl TypedTool for ReadArtifactTool {
 
 impl_typed_tool!(ReadArtifactTool);
 
-pub struct ReadFilesTool;
+#[cfg(test)]
+struct ReadFilesTool;
 
+#[cfg(test)]
 const READ_FILES_MAX_ITEMS: usize = 8;
+#[cfg(test)]
 const READ_FILES_TOTAL_CHARS: usize = 64_000;
 
+#[cfg(test)]
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadFilesInput {
@@ -5453,6 +5112,7 @@ struct ReadFilesInput {
     files: Vec<FileReadInput>,
 }
 
+#[cfg(test)]
 #[async_trait]
 impl TypedTool for ReadFilesTool {
     type Input = ReadFilesInput;
@@ -5556,8 +5216,10 @@ impl TypedTool for ReadFilesTool {
     }
 }
 
+#[cfg(test)]
 impl_typed_tool!(ReadFilesTool);
 
+#[cfg(test)]
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WriteFileInput {
@@ -5565,10 +5227,17 @@ struct WriteFileInput {
     path: String,
     /// Full file contents to write.
     content: String,
+    /// Optional content hash returned by read_file. Use `missing` when the
+    /// target must not already exist.
+    #[serde(default, rename = "expectedHash")]
+    #[schemars(rename = "expectedHash")]
+    expected_hash: Option<String>,
 }
 
-pub struct WriteFileTool;
+#[cfg(test)]
+struct WriteFileTool;
 
+#[cfg(test)]
 #[async_trait]
 impl TypedTool for WriteFileTool {
     type Input = WriteFileInput;
@@ -5578,7 +5247,7 @@ impl TypedTool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "Write a UTF-8 text file inside the workspace."
+        "Write a UTF-8 text file inside the workspace. For a file read earlier, pass its contentHash as expectedHash; use `missing` when creating a path that must not already exist. A stale precondition is rejected before writing."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -5606,29 +5275,32 @@ impl TypedTool for WriteFileTool {
         let path = normalize_workspace_path(&ctx.workspace_root, relative)?;
         enforce_policy_decision(ctx.policy.inspect_write(&path), ctx.approval_granted)?;
 
-        let written = ctx
-            .environment
-            .write_file(FileWriteRequest::new(&path, input.content.into_bytes()))
-            .await?;
+        let original = read_optional(ctx.environment.as_ref(), &path).await?;
+        verify_write_precondition(&path, original.as_deref(), input.expected_hash.as_deref())?;
+        let contents = input.content.into_bytes();
+        let bytes_written = contents.len();
+        let batch = FileMutationBatch::new(vec![PreparedFileMutation::write(
+            path.clone(),
+            original,
+            contents,
+        )])?;
+        ctx.commit_file_mutations(&batch).await?;
         Ok(ToolResult {
             call_id,
-            output: format!(
-                "Wrote {} bytes to {}",
-                written.bytes_written,
-                written.path.display()
-            ),
+            output: format!("Wrote {} bytes to {}", bytes_written, path.display()),
             content: Vec::new(),
             metadata: json!({
-                "changedPath": written.path.display().to_string(),
-                "bytes": written.bytes_written
+                "changedPath": path.display().to_string(),
+                "bytes": bytes_written
             }),
         })
     }
 }
 
+#[cfg(test)]
 impl_typed_tool!(WriteFileTool);
 
-pub struct SearchTool;
+pub struct WorkspaceSearchTool;
 
 const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
 const SEARCH_MAX_RESULTS_LIMIT: usize = 1_000;
@@ -5659,15 +5331,15 @@ struct SearchInput {
 }
 
 #[async_trait]
-impl TypedTool for SearchTool {
+impl TypedTool for WorkspaceSearchTool {
     type Input = SearchInput;
 
     fn name(&self) -> &str {
-        "search"
+        "workspace_search"
     }
 
     fn description(&self) -> &str {
-        "Recursively search workspace text for candidate definitions and references with ripgrep, falling back to a literal scan. Set contextLines (0-20) to include numbered surrounding source lines and structured match locations that can be passed directly to read_file's lines window. Text matches are evidence to confirm by reading code, not semantic symbol resolution."
+        "Recursively search workspace text for candidate definitions and references with ripgrep, falling back to a literal scan. Set contextLines (0-20) to include numbered surrounding source lines and structured match locations that can be passed to filesystem read. Text matches are evidence to confirm by reading code, not semantic symbol resolution."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -5764,7 +5436,7 @@ impl TypedTool for SearchTool {
     }
 }
 
-impl_typed_tool!(SearchTool);
+impl_typed_tool!(WorkspaceSearchTool);
 
 pub struct ShellTool;
 
@@ -6467,8 +6139,10 @@ fn unreviewable_shell_action_result(call_id: Uuid, command: &str) -> ToolResult 
     }
 }
 
-pub struct GitDiffTool;
+#[cfg(test)]
+struct GitDiffTool;
 
+#[cfg(test)]
 #[async_trait]
 impl TypedTool for GitDiffTool {
     type Input = EmptyToolInput;
@@ -6522,6 +6196,7 @@ impl TypedTool for GitDiffTool {
     }
 }
 
+#[cfg(test)]
 impl_typed_tool!(GitDiffTool);
 
 pub struct ApplyPatchTool;
@@ -6696,6 +6371,18 @@ async fn execute_portable_patch(
             .inspect_command("git apply --whitespace=nowarn -"),
         ctx.approval_granted,
     )?;
+    let mutation_scope = ctx.file_mutation_scope()?;
+
+    let changed_paths = unified_diff_paths(patch);
+    let mutation_paths = changed_paths
+        .iter()
+        .map(|path| normalize_workspace_path(&ctx.workspace_root, path))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let _locks = lock_mutation_paths(mutation_paths.clone()).await;
+    let mut originals = Vec::with_capacity(mutation_paths.len());
+    for path in &mutation_paths {
+        originals.push(read_optional(ctx.environment.as_ref(), path).await?);
+    }
 
     let result = ctx
         .environment
@@ -6720,7 +6407,30 @@ async fn execute_portable_patch(
         );
     }
 
-    let changed_paths = unified_diff_paths(patch);
+    let mut mutations = Vec::new();
+    for (path, original) in mutation_paths.into_iter().zip(originals) {
+        let current = read_optional(ctx.environment.as_ref(), &path).await?;
+        if current == original {
+            continue;
+        }
+        mutations.push(match current {
+            Some(contents) => PreparedFileMutation::write(path, original, contents),
+            None => PreparedFileMutation {
+                path,
+                original,
+                target: FileMutationTarget::Delete,
+            },
+        });
+    }
+    if let (Some(observer), Some(scope)) = (
+        ctx.file_mutation_observer.as_deref(),
+        mutation_scope.as_ref(),
+    ) {
+        if let Err(error) = observer.record_file_mutations(scope, &mutations).await {
+            rollback_external_mutations(ctx.environment.as_ref(), &mutations).await?;
+            return Err(error.context("failed to persist applied unified diff"));
+        }
+    }
     Ok(ToolResult {
         call_id,
         output: format!(
@@ -6736,6 +6446,37 @@ async fn execute_portable_patch(
             "sandbox": output.sandbox
         }),
     })
+}
+
+async fn rollback_external_mutations(
+    environment: &dyn ExecutionEnvironment,
+    mutations: &[PreparedFileMutation],
+) -> anyhow::Result<()> {
+    for mutation in mutations.iter().rev() {
+        let current = read_optional(environment, &mutation.path).await?;
+        let expected = match &mutation.target {
+            FileMutationTarget::Write(contents) => Some(contents.as_slice()),
+            FileMutationTarget::Delete => None,
+        };
+        anyhow::ensure!(
+            current.as_deref() == expected,
+            "cannot roll back unjournaled patch because {} changed again",
+            mutation.path.display()
+        );
+        match &mutation.original {
+            Some(contents) => {
+                environment
+                    .write_file(FileWriteRequest::new(&mutation.path, contents.clone()))
+                    .await?;
+            }
+            None => {
+                environment
+                    .delete_file(FileDeleteRequest::new(&mutation.path))
+                    .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Execute one normalized native operation. This is public for transport
@@ -6861,9 +6602,8 @@ async fn execute_native_patch_batch(
         }
     }
 
-    let committed = FileMutationBatch::new(mutations)?
-        .commit(ctx.environment.as_ref())
-        .await?;
+    let batch = FileMutationBatch::new(mutations)?;
+    let committed = ctx.commit_file_mutations(&batch).await?;
     Ok(NativePatchBatchOutcome {
         outputs,
         reports,
@@ -7844,6 +7584,7 @@ fn display_workspace_path(workspace_root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn list_dir_entries(path: &Path) -> anyhow::Result<Vec<String>> {
     let mut entries = Vec::new();
     for entry in
@@ -8114,10 +7855,6 @@ mod tests {
     use crate::model::{ContextSourceRef, Message, MessageRole};
     use crate::policy::{BasicPolicyEngine, PermissionMode};
     use crate::store::{SessionStore, SqliteSessionStore};
-    use crate::subagents::{
-        NoopSubagentObserver, SubagentExecutor, SubagentRun, SubagentSchedulerConfig,
-    };
-    use tokio::sync::mpsc;
 
     #[derive(Clone)]
     struct ComputerRuntimeFixture {
@@ -8431,7 +8168,17 @@ mod tests {
                 plugin_name: "spreadsheet".to_string(),
             })
         );
-        assert_eq!(defaults.source("read_file"), Some(ToolSource::Core));
+        for removed in [
+            "list_files",
+            "read_file",
+            "read_files",
+            "write_file",
+            "search",
+            "git_diff",
+        ] {
+            assert_eq!(defaults.source(removed), None);
+            assert!(defaults.get(removed).is_none());
+        }
     }
 
     #[test]
@@ -8448,6 +8195,30 @@ mod tests {
                     }),
                 "built-in tool name `{name}` is not provider-safe"
             );
+        }
+    }
+
+    #[test]
+    fn collaboration_surface_exposes_exactly_the_six_canonical_tools() {
+        let registry = ToolRegistry::with_core_tools();
+        let collaboration_tools = registry
+            .list()
+            .into_iter()
+            .filter(|name| registry.class(name) == Some(ToolClass::Subagent))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collaboration_tools,
+            vec![
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent",
+            ]
+        );
+        for removed in ["send_input", "cancel_agent", "wait_agents"] {
+            assert!(registry.get(removed).is_none(), "{removed}");
         }
     }
 
@@ -8816,7 +8587,7 @@ mod tests {
                 .as_deref(),
             Some("arguments.unexpected is not allowed")
         );
-        assert!(SearchTool
+        assert!(WorkspaceSearchTool
             .input_error(&json!({
                 "query": "TypedTool",
                 "fixedStrings": true,
@@ -8839,106 +8610,6 @@ mod tests {
         assert_eq!(schema["properties"]["path"]["type"], "string");
     }
 
-    struct PendingExecutor;
-
-    struct ImmediateExecutor;
-
-    #[async_trait]
-    impl SubagentExecutor for PendingExecutor {
-        async fn execute(
-            &self,
-            _run: SubagentRun,
-            _input: mpsc::UnboundedReceiver<String>,
-            cancellation: CancellationToken,
-        ) -> anyhow::Result<String> {
-            cancellation.cancelled().await;
-            anyhow::bail!("cancelled")
-        }
-    }
-
-    #[async_trait]
-    impl SubagentExecutor for ImmediateExecutor {
-        async fn execute(
-            &self,
-            run: SubagentRun,
-            _input: mpsc::UnboundedReceiver<String>,
-            _cancellation: CancellationToken,
-        ) -> anyhow::Result<String> {
-            Ok(format!("completed {}", run.input))
-        }
-    }
-
-    fn test_scheduler() -> SubagentScheduler {
-        SubagentScheduler::new(
-            SubagentSchedulerConfig {
-                max_concurrency_per_parent: 1,
-                max_threads: 6,
-                max_depth: 2,
-            },
-            Arc::new(PendingExecutor),
-            Arc::new(NoopSubagentObserver),
-        )
-    }
-
-    fn tool_context(
-        scheduler: SubagentScheduler,
-        thread_id: Uuid,
-        parent_turn_id: Uuid,
-    ) -> ToolInvocationContext {
-        let workspace_root = std::env::current_dir().unwrap();
-        let policy = Arc::new(BasicPolicyEngine::new(
-            workspace_root.clone(),
-            PermissionMode::FullAccess,
-        ));
-        let mut context = ToolInvocationContext::local(workspace_root, policy);
-        context.subagents = Some(scheduler);
-        context.thread_id = Some(thread_id);
-        context.parent_turn_id = Some(parent_turn_id);
-        context
-    }
-
-    #[test]
-    fn fork_conversation_selects_complete_recent_turns() {
-        let message = |role, content: &str| ModelConversationMessage {
-            role,
-            content: content.to_string(),
-            content_parts: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-        };
-        let conversation = vec![
-            message(ModelConversationRole::User, "first user"),
-            message(ModelConversationRole::Assistant, "first assistant"),
-            message(ModelConversationRole::User, "second user"),
-            message(ModelConversationRole::Assistant, "second assistant"),
-        ];
-
-        assert!(select_fork_conversation(&conversation, "none").is_empty());
-        assert_eq!(select_fork_conversation(&conversation, "all"), conversation);
-        assert_eq!(
-            select_fork_conversation(&conversation, "1"),
-            vec![
-                message(ModelConversationRole::User, "second user"),
-                message(ModelConversationRole::Assistant, "second assistant"),
-            ]
-        );
-        assert_eq!(select_fork_conversation(&conversation, "2"), conversation);
-    }
-
-    #[tokio::test]
-    async fn automatic_subagent_workspace_contract_keeps_read_only_profiles_shared() {
-        let context = tool_context(test_scheduler(), Uuid::new_v4(), Uuid::new_v4());
-        let contract = subagent_execution_contract(&context, "research", "auto", true)
-            .await
-            .unwrap();
-        assert_eq!(
-            contract.workspace.mode,
-            SubagentWorkspaceMode::SharedReadOnly
-        );
-        assert_eq!(contract.workspace.root, Some(context.workspace_root));
-        assert!(!contract.require_structured_delivery);
-    }
-
     #[test]
     fn detects_common_cross_platform_sandbox_denials() {
         assert!(looks_like_sandbox_denial("Access is denied."));
@@ -8954,7 +8625,7 @@ mod tests {
 
     #[test]
     fn search_tool_exposes_exact_symbol_controls() {
-        let schema = SearchTool.schema();
+        let schema = WorkspaceSearchTool.schema();
         let properties = schema["properties"]
             .as_object()
             .expect("search schema properties");
@@ -8963,7 +8634,7 @@ mod tests {
         assert_eq!(properties["wordMatch"]["type"], "boolean");
         assert_eq!(properties["contextLines"]["minimum"].as_f64(), Some(0.0));
         assert_eq!(properties["contextLines"]["maximum"].as_f64(), Some(20.0));
-        assert!(Tool::description(&SearchTool).contains("not semantic symbol resolution"));
+        assert!(Tool::description(&WorkspaceSearchTool).contains("not semantic symbol resolution"));
     }
 
     #[test]
@@ -9061,10 +8732,10 @@ mod tests {
             sandbox,
         );
 
-        let searched = SearchTool
+        let searched = WorkspaceSearchTool
             .execute(
                 ToolCall::new(
-                    "search",
+                    "workspace_search",
                     json!({
                         "query": "load",
                         "path": "src",
@@ -9089,10 +8760,10 @@ mod tests {
         assert_eq!(searched.metadata["fixedStrings"], true);
         assert_eq!(searched.metadata["wordMatch"], true);
 
-        let literal = SearchTool
+        let literal = WorkspaceSearchTool
             .execute(
                 ToolCall::new(
-                    "search",
+                    "workspace_search",
                     json!({
                         "query": "service.load",
                         "path": "literal.txt",
@@ -9126,10 +8797,10 @@ mod tests {
         ));
         let context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
-        let searched = SearchTool
+        let searched = WorkspaceSearchTool
             .execute(
                 ToolCall::new(
-                    "search",
+                    "workspace_search",
                     json!({
                         "query": "目标",
                         "path": "context.txt",
@@ -9247,10 +8918,10 @@ mod tests {
             .to_string()
             .contains("no readable root authorized"));
 
-        let search_error = SearchTool
+        let search_error = WorkspaceSearchTool
             .execute(
                 ToolCall::new(
-                    "search",
+                    "workspace_search",
                     json!({ "query": "marker", "path": outside.display().to_string() }),
                 ),
                 context,
@@ -9532,10 +9203,10 @@ mod tests {
             .unwrap();
         assert!(read.output.contains("configured marker"));
 
-        let searched = SearchTool
+        let searched = WorkspaceSearchTool
             .execute(
                 ToolCall::new(
-                    "search",
+                    "workspace_search",
                     json!({ "query": "configured marker", "path": outside.display().to_string() }),
                 ),
                 context,
@@ -9589,6 +9260,51 @@ mod tests {
 
         fs::remove_dir_all(workspace_root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_a_hash_from_a_stale_model_read() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-stale-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let target = workspace_root.join("shared.txt");
+        fs::write(&target, "version one").unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy);
+
+        let read = ReadFileTool
+            .execute(
+                ToolCall::new("read_file", json!({ "path": "shared.txt" })),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let expected_hash = read.metadata["contentHash"].as_str().unwrap().to_string();
+        fs::write(&target, "version from another conversation").unwrap();
+
+        let error = WriteFileTool
+            .execute(
+                ToolCall::new(
+                    "write_file",
+                    json!({
+                        "path": "shared.txt",
+                        "content": "stale replacement",
+                        "expectedHash": expected_hash
+                    }),
+                ),
+                context,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("precondition failed"));
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "version from another conversation"
+        );
+        fs::remove_dir_all(workspace_root).unwrap();
     }
 
     #[test]
@@ -9711,47 +9427,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_agent_tools_isolate_root_tasks_and_allow_same_tree_peers() {
-        let scheduler = test_scheduler();
-        let target_thread = Uuid::new_v4();
-        let target_parent = Uuid::new_v4();
-        let run = scheduler
-            .spawn(SpawnSubagentRequest {
-                parent_thread_id: target_thread,
-                parent_turn_id: target_parent,
-                parent_agent_path: "/root".to_string(),
-                name: "owned".to_string(),
-                agent_type: "default".to_string(),
-                input: "work".to_string(),
-                fork_turns: "all".to_string(),
-                depth: 1,
-                initial_conversation: Vec::new(),
-                initial_model_context: None,
-            })
-            .unwrap();
-
-        let cross_thread = tool_context(scheduler.clone(), Uuid::new_v4(), target_parent);
-        let error = SendAgentInputTool
-            .execute(
-                ToolCall::new("send_input", json!({ "runId": run.id, "input": "intrude" })),
-                cross_thread,
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("subagent run not found"));
-
-        scheduler.cancel(run.id).unwrap();
-        let peer = tool_context(scheduler.clone(), target_thread, Uuid::new_v4());
-        WaitAgentTool
-            .execute(
-                ToolCall::new("wait_agent", json!({ "runId": run.id, "timeoutMs": 1_000 })),
-                peer,
-            )
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn request_user_input_builds_a_valid_plan_decision_request() {
         let workspace_root = std::env::current_dir().unwrap();
         let policy = Arc::new(BasicPolicyEngine::new(
@@ -9759,7 +9434,7 @@ mod tests {
             PermissionMode::FullAccess,
         ));
         let mut context = ToolInvocationContext::local(workspace_root, policy);
-        context.collaboration_mode = CollaborationMode::Default;
+        context.collaboration_mode = CollaborationMode::Plan;
         let result = RequestUserInputTool
             .execute(
                 ToolCall::new(
@@ -9798,149 +9473,26 @@ mod tests {
         assert!(request.questions[0].allow_custom);
     }
 
-    #[tokio::test]
-    async fn wait_agents_collects_parallel_child_results() {
-        let scheduler = SubagentScheduler::new(
-            SubagentSchedulerConfig {
-                max_concurrency_per_parent: 2,
-                max_threads: 6,
-                max_depth: 2,
-            },
-            Arc::new(ImmediateExecutor),
-            Arc::new(NoopSubagentObserver),
-        );
-        let thread_id = Uuid::new_v4();
-        let parent_turn_id = Uuid::new_v4();
-        let first = scheduler
-            .spawn(SpawnSubagentRequest {
-                parent_thread_id: thread_id,
-                parent_turn_id,
-                parent_agent_path: "/root".to_string(),
-                name: "first".to_string(),
-                agent_type: "default".to_string(),
-                input: "alpha".to_string(),
-                fork_turns: "all".to_string(),
-                depth: 1,
-                initial_conversation: Vec::new(),
-                initial_model_context: None,
-            })
-            .unwrap();
-        let second = scheduler
-            .spawn(SpawnSubagentRequest {
-                parent_thread_id: thread_id,
-                parent_turn_id,
-                parent_agent_path: "/root".to_string(),
-                name: "second".to_string(),
-                agent_type: "default".to_string(),
-                input: "beta".to_string(),
-                fork_turns: "all".to_string(),
-                depth: 1,
-                initial_conversation: Vec::new(),
-                initial_model_context: None,
-            })
-            .unwrap();
+    #[test]
+    fn request_user_input_rejects_non_plan_contexts() {
+        let workspace_root = std::env::current_dir().unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
 
-        let result = WaitAgentsTool
-            .execute(
-                ToolCall::new(
-                    "wait_agents",
-                    json!({
-                        "runIds": [first.id, second.id],
-                        "timeoutMs": 1_000
-                    }),
-                ),
-                tool_context(scheduler, thread_id, parent_turn_id),
+        for mode in [CollaborationMode::Default, CollaborationMode::Goal] {
+            let mut context = ToolInvocationContext::local(workspace_root.clone(), policy.clone());
+            context.collaboration_mode = mode;
+            let error = <RequestUserInputTool as TypedTool>::validate_context(
+                &RequestUserInputTool,
+                &context,
             )
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(value["allTerminal"], true);
-        assert_eq!(value["allSucceeded"], true);
-        assert_eq!(value["runs"].as_array().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn wait_agents_only_consumes_messages_from_requested_agents() {
-        let scheduler = SubagentScheduler::new(
-            SubagentSchedulerConfig {
-                max_concurrency_per_parent: 2,
-                max_threads: 6,
-                max_depth: 2,
-            },
-            Arc::new(ImmediateExecutor),
-            Arc::new(NoopSubagentObserver),
-        );
-        let thread_id = Uuid::new_v4();
-        let parent_turn_id = Uuid::new_v4();
-        let first = scheduler
-            .spawn(SpawnSubagentRequest {
-                parent_thread_id: thread_id,
-                parent_turn_id,
-                parent_agent_path: "/root".to_string(),
-                name: "first_mailbox".to_string(),
-                agent_type: "default".to_string(),
-                input: "alpha".to_string(),
-                fork_turns: "all".to_string(),
-                depth: 1,
-                initial_conversation: Vec::new(),
-                initial_model_context: None,
-            })
-            .unwrap();
-        let second = scheduler
-            .spawn(SpawnSubagentRequest {
-                parent_thread_id: thread_id,
-                parent_turn_id,
-                parent_agent_path: "/root".to_string(),
-                name: "second_mailbox".to_string(),
-                agent_type: "default".to_string(),
-                input: "beta".to_string(),
-                fork_turns: "all".to_string(),
-                depth: 1,
-                initial_conversation: Vec::new(),
-                initial_model_context: None,
-            })
-            .unwrap();
-        let scope = SubagentScope {
-            thread_id,
-            parent_turn_id,
-            depth: 0,
-            agent_path: "/root".to_string(),
-        };
-        scheduler
-            .wait_scoped(scope.clone(), first.id, Duration::from_secs(1))
-            .await
-            .unwrap();
-        scheduler
-            .wait_scoped(scope.clone(), second.id, Duration::from_secs(1))
-            .await
-            .unwrap();
-
-        let result = WaitAgentsTool
-            .execute(
-                ToolCall::new(
-                    "wait_agents",
-                    json!({
-                        "runIds": [first.id],
-                        "timeoutMs": 1_000
-                    }),
-                ),
-                tool_context(scheduler.clone(), thread_id, parent_turn_id),
-            )
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_str(&result.output).unwrap();
-        let delivered = value["messages"].as_array().unwrap();
-        assert!(delivered.iter().all(|message| {
-            message["fromAgentPath"].as_str() == Some(first.agent_path.as_str())
-        }));
-
-        let remaining = scheduler.mailbox_snapshot_scoped(&scope);
-        assert!(remaining
-            .iter()
-            .any(|message| message.from_agent_path == second.agent_path));
-        assert!(remaining
-            .iter()
-            .all(|message| message.from_agent_path != first.agent_path));
+            .expect_err("non-Plan mode must reject structured user input");
+            assert!(error
+                .to_string()
+                .contains("request_user_input is only available in Plan mode"));
+        }
     }
 
     #[tokio::test]
@@ -10484,8 +10036,11 @@ mod tests {
     #[test]
     fn tool_execution_policy_marks_observations_as_parallel_safe() {
         let registry = ToolRegistry::with_core_tools();
-        let read = ToolCall::new("read_file", json!({ "path": "src/lib.rs" }));
-        let policy = registry.execution_policy("read_file", &read).unwrap();
+        let read = ToolCall::new(
+            "filesystem",
+            json!({ "operation": "read", "path": "src/lib.rs" }),
+        );
+        let policy = registry.execution_policy("filesystem", &read).unwrap();
         assert!(policy.read_only);
         assert!(policy.idempotent);
         assert!(policy.parallel_safe);
@@ -10689,6 +10244,7 @@ mod tests {
                 fork_turns: None,
                 agent_type: "default".to_string(),
                 workspace_mode: SubagentWorkspaceModeInput::IsolatedWorktree,
+                allow_child_spawns: false,
             },
         );
         assert!(isolated_spawn.parallel_safe);

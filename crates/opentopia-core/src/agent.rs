@@ -3,6 +3,7 @@ use crate::background::{BackgroundProcessRegistry, BackgroundScope};
 use crate::base_prompt::{base_agent_prompt, base_prompt_module_ids};
 use crate::browser::BrowserRuntime;
 use crate::bundled_plugins::bundled_plugin_catalog;
+use crate::collaboration::AgentCollaborationInvocation;
 use crate::completion_runtime::{
     CompletionGate, CompletionRegistry, DefaultCompletionGate, DefaultCompletionRegistry,
 };
@@ -18,6 +19,7 @@ use crate::execution::ShellDialect;
 #[cfg(test)]
 use crate::execution::{ExecutionFailure, ExecutionStage};
 use crate::execution_authorization::ExecutionGrant;
+use crate::file_mutation::FileMutationObserver;
 use crate::flow::GraphNodeKindV1;
 use crate::flow_runtime::{
     FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness,
@@ -76,7 +78,7 @@ use crate::tool_surface::{bundle_is_visible, external_namespace, tool_bundle};
 #[cfg(test)]
 use crate::tools::ToolSideEffect;
 use crate::tools::{
-    browser_handoff_required, mcp_tool_declares_image_inspection, McpToolWrapper, Tool,
+    browser_handoff_required, mcp_tool_declares_image_inspection, McpToolWrapper, Tool, ToolClass,
     ToolInvocationContext, ToolRegistry, ToolSource,
 };
 use crate::turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
@@ -199,6 +201,7 @@ pub enum AgentTurnOutcome {
         action: String,
         reason: String,
         url: Option<String>,
+        continuation: AgentContinuation,
     },
 }
 
@@ -512,6 +515,8 @@ pub struct AgentCore {
     completion_gate: Arc<dyn CompletionGate>,
     completion_registry: Arc<dyn CompletionRegistry>,
     turn_inbox: Arc<dyn TurnInbox>,
+    collaboration: Option<AgentCollaborationInvocation>,
+    file_mutation_observer: Option<Arc<dyn FileMutationObserver>>,
     subagent_depth: u8,
     subagent_parent_turn_id: Option<Uuid>,
     invocation_id: u64,
@@ -555,7 +560,9 @@ impl Default for AgentCore {
             completion_gate: Arc::new(DefaultCompletionGate),
             completion_registry: Arc::new(DefaultCompletionRegistry),
             turn_inbox: Arc::new(BufferedTurnInbox::default()),
-            model_gateway: Arc::new(ProviderModelGateway::new(provider)),
+            collaboration: None,
+            file_mutation_observer: None,
+            model_gateway: Arc::new(ProviderModelGateway::from_provider(provider)),
             subagent_depth: 0,
             subagent_parent_turn_id: None,
             invocation_id: 1,
@@ -600,7 +607,9 @@ impl AgentCore {
             completion_gate: Arc::new(DefaultCompletionGate),
             completion_registry: Arc::new(DefaultCompletionRegistry),
             turn_inbox: Arc::new(BufferedTurnInbox::default()),
-            model_gateway: Arc::new(ProviderModelGateway::new(provider)),
+            collaboration: None,
+            file_mutation_observer: None,
+            model_gateway: Arc::new(ProviderModelGateway::from_provider(provider)),
             subagent_depth: 0,
             subagent_parent_turn_id: None,
             invocation_id: 1,
@@ -639,7 +648,9 @@ impl AgentCore {
             completion_gate: Arc::new(DefaultCompletionGate),
             completion_registry: Arc::new(DefaultCompletionRegistry),
             turn_inbox: Arc::new(BufferedTurnInbox::default()),
-            model_gateway: Arc::new(ProviderModelGateway::new(provider)),
+            collaboration: None,
+            file_mutation_observer: None,
+            model_gateway: Arc::new(ProviderModelGateway::from_provider(provider)),
             subagent_depth: 0,
             subagent_parent_turn_id: None,
             invocation_id: 1,
@@ -675,7 +686,9 @@ impl AgentCore {
             completion_gate: Arc::new(DefaultCompletionGate),
             completion_registry: Arc::new(DefaultCompletionRegistry),
             turn_inbox: Arc::new(BufferedTurnInbox::default()),
-            model_gateway: Arc::new(ProviderModelGateway::new(provider)),
+            collaboration: None,
+            file_mutation_observer: None,
+            model_gateway: Arc::new(ProviderModelGateway::from_provider(provider)),
             subagent_depth: 0,
             subagent_parent_turn_id: None,
             invocation_id: 1,
@@ -836,12 +849,20 @@ impl AgentCore {
         self.tool_host.background = registry;
     }
 
+    pub fn set_file_mutation_observer(&mut self, observer: Arc<dyn FileMutationObserver>) {
+        self.file_mutation_observer = Some(observer);
+    }
+
     pub fn background_processes(&self) -> BackgroundProcessRegistry {
         self.tool_host.background.clone()
     }
 
     pub fn set_subagent_scheduler(&mut self, scheduler: SubagentScheduler) {
         self.tool_host.subagents = Some(scheduler);
+    }
+
+    pub fn set_agent_collaboration(&mut self, collaboration: AgentCollaborationInvocation) {
+        self.collaboration = Some(collaboration);
     }
 
     /// Supplies the broader server-owned Harness used by Flow nodes. The Flow
@@ -885,7 +906,7 @@ impl AgentCore {
     ) -> PromptRuntimeCapabilities {
         PromptRuntimeCapabilities {
             surface,
-            multi_agent_available: self.tool_host.subagents.is_some(),
+            multi_agent_available: self.collaboration.is_some(),
             max_parallel_agents: self
                 .tool_host
                 .subagents
@@ -977,17 +998,27 @@ impl AgentCore {
         mode: CollaborationMode,
         goal: Option<GoalRecord>,
     ) -> anyhow::Result<()> {
-        if mode == CollaborationMode::Goal {
-            let goal = goal
-                .as_ref()
-                .context("goal mode requires a server-assigned goal")?;
-            let mode_instructions = format!(
-                r#"[Goal collaboration mode]
+        let mode_instructions = match mode {
+            CollaborationMode::Default => None,
+            CollaborationMode::Plan => Some(
+                r#"[Plan interaction mode]
+Use the ordinary executable Agent loop. When several materially different directions remain and workspace evidence cannot choose between them, call request_user_input so the user can select an option. After the answer, continue executing the original task in the same Turn. Plan mode is an interaction preference only: it does not create, require, or imply a WorkForm."#
+                    .to_string(),
+            ),
+            CollaborationMode::Goal => {
+                let goal = goal
+                    .as_ref()
+                    .context("goal mode requires a server-assigned goal")?;
+                Some(format!(
+                    r#"[Goal collaboration mode]
 You are executing persistent goal {goal_id}: {objective}
-The server owns this exact goal id and its durable Goal WorkForm. If no work items exist, call set_plan with goal_id "{goal_id}" to initialize that form. Keep committed work current with set_plan/update_plan, respect explicit dependencies, and revise stale work when evidence changes the approach. A blocking active item prevents Goal completion; advisory items and long-running background jobs may remain while the current invocation ends. Mark work completed, blocked, paused/deferred, or cancelled explicitly. No separate complete_task call is required."#,
-                goal_id = goal.id,
-                objective = goal.objective,
-            );
+The server owns this exact goal id and its durable Goal WorkForm. The WorkForm tools automatically target this active Goal; never pass runtime control IDs in their arguments. If no work items exist, call set_plan to initialize the form. Keep committed work current with set_plan/update_plan, respect explicit dependencies, and revise stale work when evidence changes the approach. A blocking active item prevents Goal completion; advisory items and long-running background jobs may remain while the current invocation ends. Mark work completed, blocked, paused/deferred, or cancelled explicitly. No separate complete_task call is required."#,
+                    goal_id = goal.id,
+                    objective = goal.objective,
+                ))
+            }
+        };
+        if let Some(mode_instructions) = mode_instructions {
             self.additional_developer_instructions =
                 Some(match self.additional_developer_instructions.take() {
                     Some(existing) if !existing.trim().is_empty() => {
@@ -1020,13 +1051,16 @@ The server owns this exact goal id and its durable Goal WorkForm. If no work ite
         let connection =
             settings.provider_by_id_or_active(selection.map(|value| value.connection_id.as_str()));
         let resolved = match selection {
-            Some(selection) => connection.with_model_override(
+            Some(selection) => connection.with_model_route_override(
                 Some(selection.model_id.as_str()),
                 Some(selection.reasoning_effort.as_deref()),
+                selection.adapter,
             ),
             None => connection.clone(),
         };
-        self.model_gateway = Arc::new(ProviderModelGateway::new(provider_from_settings(&resolved)));
+        self.model_gateway = Arc::new(ProviderModelGateway::from_provider(provider_from_settings(
+            &resolved,
+        )));
         self.tool_host
             .runtime
             .set_guardian_provider(guardian_provider_from_settings(&resolved));
@@ -1037,9 +1071,11 @@ The server owns this exact goal id and its durable Goal WorkForm. If no work ite
     }
 
     fn apply_subagent_context(&self, context: &mut ToolInvocationContext, fallback_turn_id: Uuid) {
+        context.collaboration = self.collaboration.clone();
         context.subagents = self.tool_host.subagents.clone();
         context.background = Some(self.tool_host.background.clone());
         context.parent_turn_id = Some(self.subagent_parent_turn_id.unwrap_or(fallback_turn_id));
+        context.file_mutation_observer = self.file_mutation_observer.clone();
         context.subagent_depth = self.subagent_depth;
         context.agent_path = self.agent_path.clone();
         context.browser = Some(self.tool_host.browser.clone());
@@ -2083,6 +2119,29 @@ The server owns this exact goal id and its durable Goal WorkForm. If no work ite
                             metadata.insert("waitingForUserInput".to_string(), json!(false));
                         }
                     }
+                    crate::agent_runtime::AgentResumeSignal::ExternalAction { observation } => {
+                        let call = pending_tool_calls
+                            .first()
+                            .cloned()
+                            .context("external-action continuation has no pending tool call")?;
+                        pending_tool_calls.remove(0);
+                        let payload = json!({
+                            "completed": true,
+                            "observation": observation,
+                            "next": "Re-observe the external surface before taking another action.",
+                        });
+                        provider_tool_results.push(ProviderToolResult {
+                            call_id: call.id,
+                            name: call.name,
+                            output: serde_json::to_string_pretty(&payload)?,
+                            content: vec![ModelContentPart::json(payload)],
+                            is_error: false,
+                            metadata: json!({
+                                "externalActionCompleted": true,
+                                "executedBy": "user",
+                            }),
+                        });
+                    }
                 }
 
                 let mut context_budget = continuation.context_budget;
@@ -2641,6 +2700,36 @@ The server owns this exact goal id and its durable Goal WorkForm. If no work ite
                                 action: handoff.action.clone(),
                                 reason: handoff.reason.clone(),
                                 url: handoff.url.clone(),
+                                continuation: AgentContinuation {
+                                    thread_id,
+                                    turn_id: self.turn_id(user_message_id),
+                                    invocation_id: self.invocation_id,
+                                    user_message_id,
+                                    workspace_root,
+                                    context_summary,
+                                    conversation,
+                                    permission_mode,
+                                    context_budget: budget,
+                                    rollout_budget,
+                                    model_context,
+                                    collaboration_mode: self.collaboration_mode,
+                                    goal: self.goal.clone(),
+                                    state: AgentContinuationState::Provider {
+                                        model_user_message,
+                                        model_user_content,
+                                        tool_candidates,
+                                        provider_tool_calls,
+                                        provider_tool_results,
+                                        pending_tool_calls,
+                                        compacted_tool_history,
+                                        provider_response_items,
+                                        model_rounds,
+                                        rollout_reviews,
+                                        runtime_state: runtime_state.clone(),
+                                        branch_developer_instructions,
+                                        provider_compatibility_hash: compatibility_hash,
+                                    },
+                                },
                             },
                             provider_cursor: None,
                         });
@@ -3311,36 +3400,26 @@ The server owns this exact goal id and its durable Goal WorkForm. If no work ite
     }
 
     fn eligible_provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
-        let subagents_available = self.tool_host.subagents.is_some()
+        let subagents_available = self.collaboration.is_some()
             && self.agent_runtime_settings.multi_agent != MultiAgentMode::Off;
         let structured_input_available = self.request_user_input_is_available();
-        let canonical_filesystem_available = self.tool_host.catalog.get("filesystem").is_some()
-            && self.tool_is_allowed("filesystem");
-        let canonical_shell_available =
-            self.tool_host.catalog.get("shell").is_some() && self.tool_is_allowed("shell");
         self.tool_host
             .catalog
             .list()
             .into_iter()
-            // Keep narrow legacy tools executable for persisted calls and
-            // restricted profiles, but prefer one structured filesystem tool
-            // plus shell/apply_patch on the ordinary model-facing surface.
             .filter(|name| {
-                !canonical_filesystem_available
-                    || !matches!(
-                        name.as_str(),
-                        "list_files" | "read_file" | "read_files" | "write_file"
-                    )
+                subagents_available
+                    || self.tool_host.catalog.class(name) != Some(ToolClass::Subagent)
             })
             .filter(|name| {
-                !canonical_shell_available || !matches!(name.as_str(), "search" | "git_diff")
+                structured_input_available
+                    || self.tool_host.catalog.class(name) != Some(ToolClass::StructuredInput)
             })
-            .filter(|name| subagents_available || !is_subagent_tool(name))
-            .filter(|name| structured_input_available || name.as_str() != "request_user_input")
             // The root agent owns the shared task plan. Children report results
             // to the parent instead of mutating the parent's plan namespace.
             .filter(|name| {
-                self.subagent_depth == 0 || !matches!(name.as_str(), "set_plan" | "update_plan")
+                self.subagent_depth == 0
+                    || self.tool_host.catalog.class(name) != Some(ToolClass::WorkForm)
             })
             .filter(|name| {
                 let source = self
@@ -3349,7 +3428,13 @@ The server owns this exact goal id and its durable Goal WorkForm. If no work ite
                     .source(name)
                     .unwrap_or(ToolSource::Core);
                 bundle_is_visible(
-                    tool_bundle(name, &source),
+                    tool_bundle(
+                        self.tool_host
+                            .catalog
+                            .class(name)
+                            .unwrap_or(ToolClass::Standard),
+                        &source,
+                    ),
                     self.experience_mode,
                     self.collaboration_mode,
                 )
@@ -3602,10 +3687,11 @@ The server owns this exact goal id and its durable Goal WorkForm. If no work ite
         changed
     }
 
-    /// Structured user decisions are model-driven and are not tied to a forced
-    /// read-only mode. Only the root agent owns the interactive boundary.
+    /// Structured user decisions belong to Plan mode. Only the root agent owns
+    /// the interactive boundary.
     fn request_user_input_is_available(&self) -> bool {
-        self.subagent_depth == 0
+        self.collaboration_mode == CollaborationMode::Plan
+            && self.subagent_depth == 0
             && self.tool_host.catalog.get("request_user_input").is_some()
             && self.tool_is_allowed("request_user_input")
     }
@@ -4673,6 +4759,14 @@ fn provider_compatibility_hash(
         prompt_cache_lineage_key(model_context, context_summary, tool_candidates).as_bytes(),
     );
     bytes.push(0);
+    // Provider cursors must still be invalidated when the executable catalog
+    // changes, even though that volatile catalog no longer rewrites the prompt
+    // cache lineage.
+    bytes.extend_from_slice(
+        canonical_json_string(&serde_json::to_value(tool_candidates).unwrap_or(Value::Null))
+            .as_bytes(),
+    );
+    bytes.push(0);
     bytes.extend_from_slice(branch_developer_instructions.unwrap_or_default().as_bytes());
     crate::model_context::content_fingerprint(&bytes)
 }
@@ -5061,21 +5155,6 @@ fn workspace_scope_instruction(
     )
 }
 
-fn is_subagent_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "spawn_agent"
-            | "send_message"
-            | "followup_task"
-            | "interrupt_agent"
-            | "list_agents"
-            | "send_input"
-            | "cancel_agent"
-            | "wait_agent"
-            | "wait_agents"
-    )
-}
-
 fn sandbox_rank(mode: SandboxMode) -> u8 {
     match mode {
         SandboxMode::ReadOnly => 0,
@@ -5086,6 +5165,21 @@ fn sandbox_rank(mode: SandboxMode) -> u8 {
 
 fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
     match call.name.as_str() {
+        "filesystem" => {
+            let operation = call
+                .arguments
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or("operation");
+            let paths = ["path", "source", "destination"]
+                .into_iter()
+                .filter_map(|key| call.arguments.get(key).and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            format!("filesystem:{operation} {paths}")
+                .trim_end()
+                .to_string()
+        }
         "list_files" => format!(
             "/list {}",
             call.arguments
@@ -5322,7 +5416,7 @@ mod tests {
     use crate::store::SqliteSessionStore;
     use crate::subagents::{
         NoopSubagentObserver, SpawnSubagentRequest, SubagentExecutor, SubagentRun,
-        SubagentRunStatus, SubagentSchedulerConfig,
+        SubagentSchedulerConfig,
     };
     use crate::tools::{Tool, ToolExecutionPolicy};
     use async_trait::async_trait;
@@ -5380,14 +5474,14 @@ mod tests {
     }
 
     #[test]
-    fn cache_lineage_ignores_turn_context_but_changes_with_header_and_tools() {
+    fn cache_lineage_ignores_turn_context_and_tool_catalog_but_cursor_compatibility_does_not() {
         let workspace = test_workspace("cache-lineage");
         let mut context =
             default_agent_model_context(&workspace, &LocalSandboxConfig::danger_full_access());
         context.prompt_cache_key = Some("custom-routing-namespace".to_string());
         let tools = vec![ProviderToolCandidate::direct(
-            "read_file",
-            "Read a file",
+            "filesystem",
+            "Perform structured filesystem operations",
             json!({ "type": "object" }),
         )];
         let baseline = prompt_cache_lineage_key(&context, None, &tools);
@@ -5447,16 +5541,29 @@ mod tests {
             baseline_compatibility,
             provider_compatibility_hash(&context, None, &tools, None)
         );
-        assert_ne!(
+        assert_eq!(
             prompt_cache_lineage_key(&context, None, &tools),
             prompt_cache_lineage_key(
                 &context,
                 None,
                 &[ProviderToolCandidate::direct(
-                    "write_file",
-                    "Write a file",
+                    "apply_patch",
+                    "Apply a workspace patch",
                     json!({ "type": "object" }),
                 )],
+            )
+        );
+        assert_ne!(
+            provider_compatibility_hash(&context, None, &tools, None),
+            provider_compatibility_hash(
+                &context,
+                None,
+                &[ProviderToolCandidate::direct(
+                    "apply_patch",
+                    "Apply a workspace patch",
+                    json!({ "type": "object" }),
+                )],
+                None,
             )
         );
 
@@ -5949,7 +6056,7 @@ mod tests {
         code.apply_experience_mode(ExperienceMode::Code);
         let code_names = names(&code);
         assert!(!code_names.iter().any(|name| name.starts_with("flow_")));
-        assert!(code_names.contains("request_user_input"));
+        assert!(!code_names.contains("request_user_input"));
         assert!(code_names.contains("set_plan"));
         assert!(code_names.contains("update_plan"));
         assert!(!code_names.contains("complete_task"));
@@ -5979,7 +6086,13 @@ mod tests {
         assert!(goal_names.contains("set_plan"));
         assert!(goal_names.contains("update_plan"));
         assert!(!goal_names.contains("complete_task"));
-        assert!(goal_names.contains("request_user_input"));
+        assert!(!goal_names.contains("request_user_input"));
+
+        let mut plan_agent = AgentCore::default();
+        plan_agent
+            .apply_collaboration_mode(CollaborationMode::Plan, None)
+            .expect("Plan mode");
+        assert!(names(&plan_agent).contains("request_user_input"));
     }
 
     #[test]
@@ -6234,7 +6347,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_exposes_structured_filesystem_and_patch_as_canonical_file_tools() {
+    fn registry_contains_only_canonical_file_tools() {
         let agent = AgentCore::default();
         let tools = agent
             .provider_tool_catalog()
@@ -6244,10 +6357,17 @@ mod tests {
 
         assert!(tools.contains("apply_patch"));
         assert!(tools.contains("filesystem"));
-        assert!(!tools.contains("write_file"));
-        assert!(!tools.contains("read_file"));
-        assert!(agent.tool_host.catalog.get("write_file").is_some());
-        assert!(agent.tool_host.catalog.get("read_file").is_some());
+        for removed in [
+            "list_files",
+            "read_file",
+            "read_files",
+            "write_file",
+            "search",
+            "git_diff",
+        ] {
+            assert!(!tools.contains(removed));
+            assert!(agent.tool_host.catalog.get(removed).is_none());
+        }
     }
 
     #[test]
@@ -6347,7 +6467,7 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_exposes_model_driven_questions_and_work_memory() {
+    fn default_mode_exposes_work_memory_without_plan_only_input() {
         let agent = AgentCore::default();
         let tools = agent
             .provider_tool_catalog()
@@ -6360,7 +6480,7 @@ mod tests {
         assert!(!tools.contains("read_files"));
         assert!(!tools.contains("search"));
         assert!(!tools.contains("git_diff"));
-        assert!(tools.contains("request_user_input"));
+        assert!(!tools.contains("request_user_input"));
         assert!(tools.contains("set_plan"));
         assert!(tools.contains("update_plan"));
         assert!(!tools.contains("complete_task"));
@@ -6371,10 +6491,10 @@ mod tests {
         assert!(!tools.contains("spawn_agent"));
     }
 
-    /// The model may discover a real decision in any root task; an explicit
-    /// Plan runtime is not the authorization boundary for structured input.
+    /// Structured user input is a Plan-mode interaction boundary. Default and
+    /// Goal turns must not expose it, and child agents never own that boundary.
     #[test]
-    fn request_user_input_is_model_driven_in_every_root_mode() {
+    fn request_user_input_is_available_only_to_the_root_plan_agent() {
         let default_agent = AgentCore::default();
         assert_eq!(default_agent.collaboration_mode, CollaborationMode::Default);
         let default_tools = default_agent
@@ -6382,44 +6502,87 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<HashSet<_>>();
-        assert!(default_tools.contains("request_user_input"));
+        assert!(!default_tools.contains("request_user_input"));
         assert!(
-            default_agent
+            !default_agent
                 .prompt_runtime_capabilities(RuntimeSurface::Desktop)
                 .request_user_input_available
         );
 
+        let mut plan_agent = AgentCore::default();
+        plan_agent
+            .apply_collaboration_mode(CollaborationMode::Plan, None)
+            .expect("apply plan interaction profile");
+        let plan_instructions = plan_agent
+            .additional_developer_instructions
+            .as_deref()
+            .expect("plan instructions");
+        assert!(plan_instructions.contains("ordinary executable Agent loop"));
+        assert!(plan_instructions.contains("does not create, require, or imply a WorkForm"));
+        assert!(plan_agent
+            .provider_tool_catalog()
+            .iter()
+            .any(|tool| tool.name == "request_user_input"));
         assert!(
-            default_agent
+            plan_agent
                 .prompt_runtime_capabilities(RuntimeSurface::Desktop)
                 .request_user_input_available
         );
 
-        let available = compile_runtime_prompt_modules(
+        let unavailable = compile_runtime_prompt_modules(
             &AgentRuntimeSettings::default(),
             default_agent.prompt_runtime_capabilities(RuntimeSurface::Desktop),
         );
-        let module = available
+        let unavailable_module = unavailable
             .iter()
             .find(|item| item.metadata["promptModuleId"] == "clarification_policy")
             .expect("clarification module");
-        assert_eq!(module.metadata["settingValue"], "available");
-        assert!(module.text_content().contains("request_user_input"));
+        assert_eq!(unavailable_module.metadata["settingValue"], "unavailable");
+
+        let available = compile_runtime_prompt_modules(
+            &AgentRuntimeSettings::default(),
+            plan_agent.prompt_runtime_capabilities(RuntimeSurface::Desktop),
+        );
+        let available_module = available
+            .iter()
+            .find(|item| item.metadata["promptModuleId"] == "clarification_policy")
+            .expect("clarification module");
+        assert_eq!(available_module.metadata["settingValue"], "available");
+        assert!(available_module
+            .text_content()
+            .contains("request_user_input"));
+
+        let thread_id = Uuid::new_v4();
+        let goal = GoalRecord::new(thread_id, "Execute a durable goal", None);
+        let mut goal_agent = AgentCore::default();
+        goal_agent
+            .apply_collaboration_mode(CollaborationMode::Goal, Some(goal))
+            .expect("Goal mode");
+        assert!(!goal_agent
+            .provider_tool_catalog()
+            .iter()
+            .any(|tool| tool.name == "request_user_input"));
+
+        let mut child_plan_agent = AgentCore::default();
+        child_plan_agent
+            .apply_collaboration_mode(CollaborationMode::Plan, None)
+            .expect("Plan mode");
+        child_plan_agent.set_subagent_context(Uuid::new_v4(), 1);
+        assert!(!child_plan_agent
+            .provider_tool_catalog()
+            .iter()
+            .any(|tool| tool.name == "request_user_input"));
     }
 
     #[test]
     fn tool_restrictions_can_only_narrow_the_provider_catalog() {
         let mut agent = AgentCore::default();
-        assert!(!agent
-            .provider_tool_candidates()
-            .iter()
-            .any(|candidate| candidate.name == "read_file"));
         assert!(agent
             .provider_tool_candidates()
             .iter()
             .any(|candidate| candidate.name == "filesystem"));
 
-        agent.restrict_to_tools(["read_file", "shell"]);
+        agent.restrict_to_tools(["filesystem", "shell"]);
         let names = agent
             .provider_tool_candidates()
             .into_iter()
@@ -6427,18 +6590,18 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(
             names,
-            HashSet::from(["read_file".to_string(), "shell".to_string()])
+            HashSet::from(["filesystem".to_string(), "shell".to_string()])
         );
 
         agent.restrict_to_tools(["shell"]);
         assert!(agent.tool_is_allowed("shell"));
-        assert!(!agent.tool_is_allowed("read_file"));
+        assert!(!agent.tool_is_allowed("filesystem"));
     }
 
     #[test]
     fn execution_context_projection_filters_catalog_and_execution_guard() {
         let mut agent = AgentCore::default();
-        agent.restrict_capabilities(&CapabilityProjection::only_tools(["read_file", "shell"]));
+        agent.restrict_capabilities(&CapabilityProjection::only_tools(["filesystem", "shell"]));
         let names = agent
             .provider_tool_catalog()
             .into_iter()
@@ -6446,17 +6609,17 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(
             names,
-            HashSet::from(["read_file".to_string(), "shell".to_string()])
+            HashSet::from(["filesystem".to_string(), "shell".to_string()])
         );
         assert!(!agent.tool_is_allowed("apply_patch"));
 
         agent.restrict_capabilities(&CapabilityProjection::only_tools(["shell"]));
-        assert!(!agent.tool_is_allowed("read_file"));
+        assert!(!agent.tool_is_allowed("filesystem"));
         assert!(agent.tool_is_allowed("shell"));
     }
 
     #[test]
-    fn multi_agent_setting_controls_tool_visibility_and_prompt_capabilities() {
+    fn legacy_scheduler_does_not_authorize_the_new_collaboration_tool_surface() {
         let scheduler = completion_guard_scheduler(Arc::new(ImmediateSubagentExecutor));
         let mut agent = AgentCore::default();
         agent.set_subagent_scheduler(scheduler);
@@ -6471,7 +6634,7 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(!disabled_tools.contains("spawn_agent"));
         assert!(
-            agent
+            !agent
                 .prompt_runtime_capabilities(RuntimeSurface::Desktop)
                 .multi_agent_available
         );
@@ -6483,8 +6646,8 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<HashSet<_>>();
-        assert!(enabled_tools.contains("spawn_agent"));
-        assert!(enabled_tools.contains("wait_agent"));
+        assert!(!enabled_tools.contains("spawn_agent"));
+        assert!(!enabled_tools.contains("wait_agent"));
     }
     use std::fs;
     use std::sync::Mutex;
@@ -6534,8 +6697,8 @@ mod tests {
             text: String::new(),
             tool_calls: vec![ProviderToolCall {
                 id: format!("rollout-list-{round}"),
-                name: "list_files".to_string(),
-                arguments: json!({ "path": "." }),
+                name: "filesystem".to_string(),
+                arguments: json!({ "operation": "list", "path": "." }),
             }],
             usage: None,
             response_id: None,
@@ -6582,8 +6745,12 @@ mod tests {
                     text: String::new(),
                     tool_calls: vec![ProviderToolCall {
                         id: "discarded-write".into(),
-                        name: "write_file".into(),
-                        arguments: json!({"path": "must-not-exist.txt", "content": "stale"}),
+                        name: "filesystem".into(),
+                        arguments: json!({
+                            "operation": "write",
+                            "path": "must-not-exist.txt",
+                            "content": "stale"
+                        }),
                     }],
                     usage: None,
                     response_id: None,
@@ -6621,8 +6788,8 @@ mod tests {
         let agent = AgentCore::new(Arc::new(MockProvider), registry);
         let read = |id: &str, path: &str| ProviderToolCall {
             id: id.to_string(),
-            name: "read_file".to_string(),
-            arguments: json!({ "path": path }),
+            name: "filesystem".to_string(),
+            arguments: json!({ "operation": "read", "path": path }),
         };
 
         assert_eq!(
@@ -6677,13 +6844,21 @@ mod tests {
                 &[
                     ProviderToolCall {
                         id: "write-a".to_string(),
-                        name: "write_file".to_string(),
-                        arguments: json!({ "path": "a.txt", "content": "changed" }),
+                        name: "filesystem".to_string(),
+                        arguments: json!({
+                            "operation": "write",
+                            "path": "a.txt",
+                            "content": "changed"
+                        }),
                     },
                     ProviderToolCall {
                         id: "write-b".to_string(),
-                        name: "write_file".to_string(),
-                        arguments: json!({ "path": "b.txt", "content": "changed" }),
+                        name: "filesystem".to_string(),
+                        arguments: json!({
+                            "operation": "write",
+                            "path": "b.txt",
+                            "content": "changed"
+                        }),
                     },
                 ],
                 &workspace,
@@ -6696,13 +6871,21 @@ mod tests {
                 &[
                     ProviderToolCall {
                         id: "write-a".to_string(),
-                        name: "write_file".to_string(),
-                        arguments: json!({ "path": "same.txt", "content": "a" }),
+                        name: "filesystem".to_string(),
+                        arguments: json!({
+                            "operation": "write",
+                            "path": "same.txt",
+                            "content": "a"
+                        }),
                     },
                     ProviderToolCall {
                         id: "write-b".to_string(),
-                        name: "write_file".to_string(),
-                        arguments: json!({ "path": "same.txt", "content": "b" }),
+                        name: "filesystem".to_string(),
+                        arguments: json!({
+                            "operation": "write",
+                            "path": "same.txt",
+                            "content": "b"
+                        }),
                     },
                 ],
                 &workspace,
@@ -6748,8 +6931,11 @@ mod tests {
             .with_sandbox_config(LocalSandboxConfig::enforce());
         let call = ProviderToolCall {
             id: "approved-read".to_string(),
-            name: "read_file".to_string(),
-            arguments: json!({ "path": approved.display().to_string() }),
+            name: "filesystem".to_string(),
+            arguments: json!({
+                "operation": "read",
+                "path": approved.display().to_string()
+            }),
         };
         let mut runtime_state = TurnRuntimeState::default();
         agent
@@ -7032,7 +7218,10 @@ mod tests {
             ModelResponse::text("The plan uses SQLite as selected."),
         ]));
         let workspace = test_workspace("plan-user-input");
-        let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+        let mut agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+        agent
+            .apply_collaboration_mode(CollaborationMode::Plan, None)
+            .expect("Plan mode");
         let catalog = agent.provider_tool_catalog();
         assert!(catalog.iter().any(|tool| tool.name == "request_user_input"));
         assert!(catalog.iter().any(|tool| tool.name == "set_plan"));
@@ -7078,6 +7267,7 @@ mod tests {
                             custom_text: None,
                         }],
                         skipped: false,
+                        cancelled: false,
                     },
                 },
                 None,
@@ -7355,93 +7545,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_guard_defers_final_until_active_descendant_is_resolved() {
-        let workspace = test_workspace("active-agent-completion-guard");
-        let thread_id = Uuid::new_v4();
-        let user_message_id = Uuid::new_v4();
-        let scheduler = completion_guard_scheduler(Arc::new(BlockingSubagentExecutor));
-        let child =
-            spawn_completion_guard_child(&scheduler, thread_id, user_message_id, "reviewer");
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            ModelResponse::text("Premature final response."),
-            ModelResponse {
-                text: String::new(),
-                tool_calls: vec![
-                    ProviderToolCall {
-                        id: "call_interrupt_child".to_string(),
-                        name: "interrupt_agent".to_string(),
-                        arguments: json!({ "target": child.agent_path }),
-                    },
-                    ProviderToolCall {
-                        id: "call_wait_child".to_string(),
-                        name: "wait_agent".to_string(),
-                        arguments: json!({
-                            "target": child.agent_path,
-                            "timeout_ms": 1_000
-                        }),
-                    },
-                ],
-                usage: None,
-                response_id: None,
-                provider_items: Vec::new(),
-                finish_reason: ModelFinishReason::Stop,
-            },
-            ModelResponse::text("All child work is resolved."),
-        ]));
-        let mut agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
-        agent.set_subagent_scheduler(scheduler.clone());
-
-        let result = agent
-            .run_turn_detailed_streaming(
-                AgentTurnInput {
-                    thread_id,
-                    user_message_id,
-                    workspace_root: workspace.clone(),
-                    content: "Coordinate the child and finish.".to_string(),
-                    user_content: Vec::new(),
-                    context_summary: None,
-                    conversation: Vec::new(),
-                    permission_mode: PermissionMode::FullAccess,
-                    context_budget: None,
-                    provider_cursor: None,
-                    store: None,
-                    cancellation: None,
-                },
-                None,
-            )
-            .await
-            .expect("completion guard allows a resolved turn to finish");
-
-        assert_eq!(
-            assistant_text(&result.events),
-            "All child work is resolved."
-        );
-        assert_eq!(
-            scheduler.get(child.id).unwrap().status,
-            SubagentRunStatus::Cancelled
-        );
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 3);
-        let guard_result = requests[1]
-            .input
-            .tool_results
-            .iter()
-            .find(|result| result.name == FINALIZATION_GUARD_TOOL_NAME)
-            .expect("guard result is returned to the parent model");
-        assert!(guard_result.output.contains(&child.agent_path));
-        assert!(result.events.iter().any(|event| matches!(
-            event,
-            AgentEventPayload::ContextWarning { stage, .. }
-                if stage == "finalization_guard"
-        )));
-        assert!(requests[2].input.tool_results.iter().any(|result| {
-            result.name == "wait_agent" && result.output.contains("\"messages\"")
-        }));
-
-        let _ = fs::remove_dir_all(workspace);
-    }
-
-    #[tokio::test]
     async fn an_unread_child_result_is_delivered_before_the_model_answers() {
         let workspace = test_workspace("unread-agent-completion-guard");
         let thread_id = Uuid::new_v4();
@@ -7659,8 +7762,8 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_read_status".to_string(),
-                    name: "read_file".to_string(),
-                    arguments: json!({ "path": "status.txt" }),
+                    name: "filesystem".to_string(),
+                    arguments: json!({ "operation": "read", "path": "status.txt" }),
                 }],
                 usage: None,
                 response_id: None,
@@ -7766,8 +7869,8 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_read_without_path".to_string(),
-                    name: "read_file".to_string(),
-                    arguments: json!({}),
+                    name: "filesystem".to_string(),
+                    arguments: json!({ "operation": "read" }),
                 }],
                 usage: None,
                 response_id: None,
@@ -7959,8 +8062,8 @@ mod tests {
         };
         let valid = ProviderToolCall {
             id: "call_valid".to_string(),
-            name: "list_files".to_string(),
-            arguments: json!({ "path": "." }),
+            name: "filesystem".to_string(),
+            arguments: json!({ "operation": "list", "path": "." }),
         };
         let mut runtime = TurnRuntimeState::default();
 
@@ -8099,8 +8202,8 @@ mod tests {
             text: String::new(),
             tool_calls: vec![ProviderToolCall {
                 id: "call_list".to_string(),
-                name: "list_files".to_string(),
-                arguments: json!({ "path": "." }),
+                name: "filesystem".to_string(),
+                arguments: json!({ "operation": "list", "path": "." }),
             }],
             usage: Some(ModelUsage {
                 input_tokens: 20,
@@ -8198,8 +8301,8 @@ mod tests {
         fn listing(path: &str) -> Vec<ProviderToolCall> {
             vec![ProviderToolCall {
                 id: format!("call-{path}"),
-                name: "list_files".to_string(),
-                arguments: json!({ "path": path }),
+                name: "filesystem".to_string(),
+                arguments: json!({ "operation": "list", "path": path }),
             }]
         }
 
@@ -8213,7 +8316,7 @@ mod tests {
         let repeated = repeating.repeated_tool_call_counts();
         assert_eq!(repeated.len(), 1);
         let (signature, count) = repeated[0];
-        assert!(signature.contains("list_files"));
+        assert!(signature.contains("filesystem"));
         assert_eq!(count, REPEATED_TOOL_CALL_REPORT_THRESHOLD);
 
         // Counts describe canonical calls only; they do not label distinct calls
@@ -8885,8 +8988,11 @@ mod tests {
         let mut calls = (0..6)
             .map(|index| ProviderToolCall {
                 id: format!("call_{index}"),
-                name: "read_file".to_string(),
-                arguments: json!({ "path": format!("file-{index}.txt") }),
+                name: "filesystem".to_string(),
+                arguments: json!({
+                    "operation": "read",
+                    "path": format!("file-{index}.txt")
+                }),
             })
             .collect::<Vec<_>>();
         let mut results = (0..6)
@@ -8899,7 +9005,7 @@ mod tests {
                 let output = format!("{prefix}{}", "x".repeat(800));
                 ProviderToolResult {
                     call_id: format!("call_{index}"),
-                    name: "read_file".to_string(),
+                    name: "filesystem".to_string(),
                     content: vec![ModelContentPart::text(output.clone())],
                     output,
                     is_error: false,
@@ -8912,8 +9018,8 @@ mod tests {
                 json!({
                     "type": "function_call",
                     "call_id": format!("call_{index}"),
-                    "name": "read_file",
-                    "arguments": "{}",
+                    "name": "filesystem",
+                    "arguments": "{\"operation\":\"read\"}",
                 })
             })
             .collect::<Vec<_>>();
@@ -9094,8 +9200,8 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_list".to_string(),
-                    name: "list_files".to_string(),
-                    arguments: json!({ "path": "." }),
+                    name: "filesystem".to_string(),
+                    arguments: json!({ "operation": "list", "path": "." }),
                 }],
                 usage: Some(ModelUsage {
                     input_tokens: 0,
@@ -9161,8 +9267,8 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: format!("call_read_{index}"),
-                    name: "read_file".to_string(),
-                    arguments: json!({ "path": "sample.txt" }),
+                    name: "filesystem".to_string(),
+                    arguments: json!({ "operation": "read", "path": "sample.txt" }),
                 }],
                 usage: None,
                 response_id: None,
@@ -9211,7 +9317,7 @@ mod tests {
             .input
             .tool_results
             .iter()
-            .filter(|result| result.name == "read_file")
+            .filter(|result| result.name == "filesystem")
             .collect::<Vec<_>>();
         assert_eq!(completed_reads.len(), 4);
         assert!(completed_reads
@@ -9229,8 +9335,12 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_write".to_string(),
-                    name: "write_file".to_string(),
-                    arguments: json!({ "path": "approved.txt", "content": "approved once" }),
+                    name: "filesystem".to_string(),
+                    arguments: json!({
+                        "operation": "write",
+                        "path": "approved.txt",
+                        "content": "approved once"
+                    }),
                 }],
                 usage: None,
                 response_id: None,
@@ -9326,8 +9436,9 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_write_metadata".to_string(),
-                    name: "write_file".to_string(),
+                    name: "filesystem".to_string(),
                     arguments: json!({
+                        "operation": "write",
                         "path": ".codex/config.toml",
                         "content": "approved metadata"
                     }),
@@ -9411,8 +9522,9 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_approved_path".to_string(),
-                    name: "write_file".to_string(),
+                    name: "filesystem".to_string(),
                     arguments: json!({
+                        "operation": "write",
                         "path": approved_path,
                         "content": "approved once"
                     }),
@@ -9426,8 +9538,9 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_sibling_path".to_string(),
-                    name: "write_file".to_string(),
+                    name: "filesystem".to_string(),
                     arguments: json!({
+                        "operation": "write",
                         "path": sibling_path,
                         "content": "must require its own approval"
                     }),
@@ -9614,8 +9727,9 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_denied_write".to_string(),
-                    name: "write_file".to_string(),
+                    name: "filesystem".to_string(),
                     arguments: json!({
+                        "operation": "write",
                         "path": ".codex/denied.txt",
                         "content": "never written"
                     }),
@@ -9691,8 +9805,9 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_write".to_string(),
-                    name: "write_file".to_string(),
+                    name: "filesystem".to_string(),
                     arguments: json!({
+                        "operation": "write",
                         "path": ".codex/denied-provider.txt",
                         "content": "must not exist"
                     }),
@@ -9779,8 +9894,9 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_auto_write".to_string(),
-                    name: "write_file".to_string(),
+                    name: "filesystem".to_string(),
                     arguments: json!({
+                        "operation": "write",
                         "path": ".codex/auto-approved.txt",
                         "content": "reviewed once"
                     }),
@@ -9946,8 +10062,9 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_auto_denied".to_string(),
-                    name: "write_file".to_string(),
+                    name: "filesystem".to_string(),
                     arguments: json!({
+                        "operation": "write",
                         "path": ".codex/auto-denied.txt",
                         "content": "must not exist"
                     }),
@@ -10016,8 +10133,9 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: "call_auto_needs_user".to_string(),
-                    name: "write_file".to_string(),
+                    name: "filesystem".to_string(),
                     arguments: json!({
+                        "operation": "write",
                         "path": ".codex/auto-needs-user.txt",
                         "content": "must wait"
                     }),
@@ -10197,8 +10315,9 @@ mod tests {
             text: String::new(),
             tool_calls: vec![ProviderToolCall {
                 id: "call_auto_invalid_reviewer".to_string(),
-                name: "write_file".to_string(),
+                name: "filesystem".to_string(),
                 arguments: json!({
+                    "operation": "write",
                     "path": ".codex/auto-invalid-reviewer.txt",
                     "content": "must not execute"
                 }),
@@ -10468,8 +10587,11 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: format!("call_{index}"),
-                    name: "read_file".to_string(),
-                    arguments: json!({ "path": format!("sample-{index}.txt") }),
+                    name: "filesystem".to_string(),
+                    arguments: json!({
+                        "operation": "read",
+                        "path": format!("sample-{index}.txt")
+                    }),
                 }],
                 usage: None,
                 response_id: None,
@@ -10534,8 +10656,11 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![ProviderToolCall {
                     id: format!("call_{index}"),
-                    name: "read_file".to_string(),
-                    arguments: json!({ "path": format!("sample-{index}.txt") }),
+                    name: "filesystem".to_string(),
+                    arguments: json!({
+                        "operation": "read",
+                        "path": format!("sample-{index}.txt")
+                    }),
                 }],
                 usage: None,
                 response_id: None,
@@ -10599,8 +10724,11 @@ mod tests {
                 tool_calls: (0..10)
                     .map(|index| ProviderToolCall {
                         id: format!("call_{index}"),
-                        name: "read_file".to_string(),
-                        arguments: json!({ "path": format!("large-{index}.txt") }),
+                        name: "filesystem".to_string(),
+                        arguments: json!({
+                            "operation": "read",
+                            "path": format!("large-{index}.txt")
+                        }),
                     })
                     .collect(),
                 usage: None,
@@ -10964,7 +11092,8 @@ mod tests {
 
         assert!(!events.iter().any(|event| matches!(
             event,
-            AgentEventPayload::ToolCallStarted { call } if call.name == "list_files"
+            AgentEventPayload::ToolCallStarted { call }
+                if call.name == "filesystem" && call.input["operation"] == "list"
         )));
         let requests = provider.requests();
         assert_eq!(requests.len(), 1);
@@ -11045,7 +11174,7 @@ mod tests {
 
         agent
             .execute_tool_call(
-                ToolCall::new("list_files", json!({"path": "."})),
+                ToolCall::new("filesystem", json!({"operation": "list", "path": "."})),
                 ToolInvocationContext::local(workspace.clone(), policy.clone()),
                 &mut events,
                 None,
@@ -11054,7 +11183,7 @@ mod tests {
             .expect("first tool call is inside budget");
         let error = agent
             .execute_tool_call(
-                ToolCall::new("list_files", json!({"path": "."})),
+                ToolCall::new("filesystem", json!({"operation": "list", "path": "."})),
                 ToolInvocationContext::local(workspace.clone(), policy),
                 &mut events,
                 None,
@@ -11069,7 +11198,7 @@ mod tests {
 
     #[test]
     fn flow_transcript_keeps_tool_activity_without_hidden_reasoning() {
-        let call = ToolCall::new("list_files", json!({"path": "."}));
+        let call = ToolCall::new("filesystem", json!({"operation": "list", "path": "."}));
         let events = vec![
             AgentEventPayload::ReasoningDelta {
                 text: "private reasoning must not be persisted".to_string(),
@@ -11158,7 +11287,8 @@ mod tests {
         assert!(!workspace.join("must-not-exist.txt").exists());
         assert!(!result.events.iter().any(|event| matches!(
             event,
-            AgentEventPayload::ToolCallStarted { call } if call.name == "write_file"
+            AgentEventPayload::ToolCallStarted { call }
+                if call.name == "filesystem" && call.input["operation"] == "write"
         )));
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);

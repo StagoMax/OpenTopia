@@ -9,6 +9,7 @@ pub mod browser_router;
 pub mod bundled_plugins;
 pub mod capabilities;
 pub mod chrome_extension_browser;
+pub mod collaboration;
 pub mod completion_runtime;
 pub mod computer;
 pub mod context_runtime;
@@ -52,6 +53,7 @@ mod skill_authoring;
 pub mod skills;
 pub mod spreadsheet;
 pub mod store;
+mod store_migrations;
 pub mod subagents;
 mod tool_adapter;
 mod tool_error;
@@ -65,12 +67,13 @@ pub mod work_form;
 pub mod workspace;
 
 pub use agent::{
-    agent_model_context_with_runtime, default_agent_model_context, AgentContinuation, AgentCore,
-    AgentEventSender, AgentTurnInput, AgentTurnOutcome, AgentTurnResult,
-    ContextBudget as AgentContextBudget, ProviderConversationCursor,
+    agent_model_context_with_runtime, default_agent_model_context, AgentContinuation,
+    AgentContinuationState, AgentCore, AgentEventSender, AgentTurnInput, AgentTurnOutcome,
+    AgentTurnResult, ContextBudget as AgentContextBudget, ProviderConversationCursor,
+    ToolExposurePolicy,
 };
 pub use agent_profiles::{AgentProfile, AgentProfileRegistry};
-pub use agent_runtime::{AgentResumeSignal, AgentTurnDriver, TurnKernel};
+pub use agent_runtime::{AgentResumeSignal, AgentTurnDriver};
 pub use artifact_runtime::{
     ArtifactRuntime, ArtifactRuntimeError, HayroPdfBackend, PdfBackend, RenderedPage,
     ValidationIssue, ValidationReport, ValidationSeverity, MAX_ARTIFACT_INPUT_BYTES,
@@ -165,7 +168,8 @@ pub use execution_authorization::{
     ToolExecutionIntent,
 };
 pub use file_mutation::{
-    FileMutationBatch, FileMutationBatchResult, FileMutationTarget, PreparedFileMutation,
+    FileMutationBatch, FileMutationBatchResult, FileMutationObserver, FileMutationScope,
+    FileMutationTarget, PreparedFileMutation,
 };
 pub use flow::{
     compile_flow, definition_from_draft, flow_content_hash, normalize_flow_spec, simulate_flow,
@@ -231,10 +235,7 @@ pub use model_context::{
     InstructionSnapshotRef, ModelContextItem, ThreadContextSnapshot, TokenEstimateBreakdown,
     TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
 };
-pub use model_gateway::{
-    LegacyProviderCodec, LegacyProviderTransport, ModelGateway, ProviderCodec,
-    ProviderModelGateway, ProviderTransport,
-};
+pub use model_gateway::{ModelGateway, ProviderCodec, ProviderModelGateway, ProviderTransport};
 pub use pdf::{
     extract_pdf_text, inspect_pdf, validate_pdf, PdfError, PdfExtraction, PdfInspection,
     PdfPageText, PdfValidation, MAX_PDF_EXTRACT_CHARACTERS,
@@ -270,13 +271,14 @@ pub use prompt_runtime::{
 };
 pub use provider::{
     configured_provider_from_settings, estimate_provider_tool_surface_tokens,
-    guardian_provider_from_settings, provider_from_settings, redact_model_observation,
-    AnthropicMessagesProvider, CodexAccountManager, CodexAccountStatus, CodexAppServerProvider,
-    CodexLoginStart, IncompleteReason, MockProvider, ModelConversationMessage,
-    ModelConversationRole, ModelDecision, ModelFinishReason, ModelInputContent, ModelProvider,
-    ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider,
-    OpenAiResponsesProvider, PreparedProviderRequest, PromptCacheBreakpointPolicy,
-    ProviderDriverDescriptor, ProviderDriverRegistry, ProviderDriverTrust, ProviderToolCall,
+    guardian_provider_from_settings, negotiate_provider_settings, provider_from_settings,
+    redact_model_observation, AnthropicMessagesProvider, CodexAccountManager, CodexAccountStatus,
+    CodexAppServerProvider, CodexLoginStart, IncompleteReason, MockProvider,
+    ModelConversationMessage, ModelConversationRole, ModelDecision, ModelFinishReason,
+    ModelInputContent, ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
+    OpenAiCompatibleProvider, OpenAiResponsesProvider, PreparedProviderRequest,
+    PromptCacheBreakpointPolicy, ProviderAdapterError, ProviderDriverDescriptor,
+    ProviderDriverRegistry, ProviderDriverTrust, ProviderNegotiationResult, ProviderToolCall,
     ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
     ProviderTransportEvent,
 };
@@ -299,10 +301,12 @@ pub use scm_connector::{
 };
 pub use settings::{
     AppSettings, EnterpriseSettings, NativeCompactionProtocol, OpenAiCompatibilityReport,
-    OpenAiProtocol, ProviderCapabilities, ProviderFeatureSupport, ProviderHealth,
-    ProviderHealthCheck, ProviderKind, ProviderModelCapabilities, ProviderModelSettings,
-    ProviderSettings, RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
-    MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
+    OpenAiProtocol, ProviderAdapterKind, ProviderAdapterProfile, ProviderAuthKind,
+    ProviderCapabilities, ProviderFeatureSupport, ProviderHealth, ProviderHealthCheck,
+    ProviderInstructionEncoding, ProviderKind, ProviderMessageProtocolCapabilities,
+    ProviderModelCapabilities, ProviderModelSettings, ProviderSettings, ProviderTransportKind,
+    ResolvedProviderRoute, RolloutBudgetSettings, SandboxEnforcement, SandboxSettings,
+    MIN_PROVIDER_CONTEXT_WINDOW_TOKENS, PROVIDER_ADAPTER_PROFILE_VERSION,
 };
 pub use shell_analysis::{
     analyze_shell_command, ShellAnalysisConfidence, ShellCapability, ShellCommandAnalysis,
@@ -338,7 +342,7 @@ pub use subagents::{
 };
 pub use tool_result_ingress::tool_result_is_error;
 pub use tool_runtime::{
-    AcceptedToolResult, AsyncToolResult, DefaultToolRuntime, DurableAsyncToolResultSink,
+    AcceptedToolResult, AsyncToolResult, DurableAsyncToolResultSink, LocalToolRuntime,
     ProviderToolExecutionInput, ProviderToolExecutionReport, ToolApprovalCandidate,
     ToolExecutionInput, ToolExecutionReport, ToolReviewInput, ToolRuntime, ToolRuntimeCatalog,
     ToolSchedulingInput,
@@ -346,11 +350,11 @@ pub use tool_runtime::{
 pub use tool_state::ToolStateStore;
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
-    BrowserTool, ComputerTool, DocumentTool, GitDiffTool, ListFilesTool, ListSkillsTool,
-    McpToolWrapper, NativePatchOperation, PdfTool, ReadArtifactTool, ReadFileTool, ReadSkillTool,
-    RequestUserInputTool, SearchTool, SetPlanTool, ShellTool, SpreadsheetTool, Tool,
-    ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy, ToolInvocationContext,
-    ToolRegistry, ToolRiskLevel, ToolSource, UpdatePlanTool, WaitAgentsTool, WriteFileTool,
+    BrowserTool, ComputerTool, DocumentTool, ListSkillsTool, McpToolWrapper, NativePatchOperation,
+    PdfTool, ReadArtifactTool, ReadSkillTool, RequestUserInputTool, SetPlanTool, ShellTool,
+    SpreadsheetTool, Tool, ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy,
+    ToolInvocationContext, ToolRegistry, ToolRiskLevel, ToolSource, UpdatePlanTool,
+    WorkspaceSearchTool,
 };
 pub use turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
 pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScope};

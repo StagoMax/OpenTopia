@@ -486,7 +486,7 @@ fn inferred_semantics(
     match kind {
         ContextItemKind::BaseInstructions => (ContextAuthority::System, ContextLifecycle::Build),
         ContextItemKind::WorldState => (ContextAuthority::Data, ContextLifecycle::Turn),
-        ContextItemKind::CapabilityCatalog => (ContextAuthority::Data, ContextLifecycle::Thread),
+        ContextItemKind::CapabilityCatalog => (ContextAuthority::Data, placement_lifecycle),
         ContextItemKind::SkillInstructions | ContextItemKind::Skill => {
             (ContextAuthority::Developer, ContextLifecycle::Turn)
         }
@@ -805,7 +805,11 @@ pub struct WorldStateSkill {
 pub struct ThreadContextSnapshot {
     pub captured_at: DateTime<Utc>,
     pub provider_id: String,
+    /// Deprecated connection preset retained for event compatibility.
     pub provider_kind: String,
+    /// Concrete protocol contract used by this thread snapshot.
+    #[serde(default)]
+    pub provider_adapter: String,
     pub model: String,
     pub workspace_root: PathBuf,
     pub cwd: PathBuf,
@@ -889,7 +893,7 @@ pub fn world_state_catalog_item(world_state: &WorldStateSnapshot) -> ModelContex
         ContextRole::Developer,
         "opentopia:skill_catalog",
         world_state.render_skill_catalog_for_model(),
-        ContextCacheScope::Thread,
+        ContextCacheScope::Turn,
         ContextSensitivity::Workspace,
     )
     .with_metadata(json!({
@@ -1167,11 +1171,11 @@ mod tests {
         let catalog_text = catalog.text_content();
         let dynamic_text = dynamic.text_content();
 
-        assert_eq!(catalog.cache_scope, ContextCacheScope::Thread);
+        assert_eq!(catalog.cache_scope, ContextCacheScope::Turn);
         assert_eq!(dynamic.cache_scope, ContextCacheScope::Turn);
         assert_eq!(catalog.kind, ContextItemKind::CapabilityCatalog);
         assert_eq!(catalog.authority, ContextAuthority::Data);
-        assert_eq!(catalog.lifecycle, ContextLifecycle::Thread);
+        assert_eq!(catalog.lifecycle, ContextLifecycle::Turn);
         assert_eq!(dynamic.authority, ContextAuthority::Data);
         assert_eq!(dynamic.lifecycle, ContextLifecycle::Turn);
         assert!(catalog.classification_errors().is_empty());
@@ -1208,19 +1212,19 @@ mod tests {
     }
 
     #[test]
-    fn selected_skill_is_turn_lived_even_when_placed_in_the_thread_prefix() {
+    fn selected_skill_is_turn_lived_and_placed_in_the_dynamic_tail() {
         let skill = ModelContextItem::text(
             ContextItemKind::SkillInstructions,
             ContextRole::Developer,
             "skills/review/SKILL.md",
             "Review the requested artifact.",
-            ContextCacheScope::Thread,
+            ContextCacheScope::Turn,
             ContextSensitivity::Workspace,
         );
 
         assert_eq!(skill.authority, ContextAuthority::Developer);
         assert_eq!(skill.lifecycle, ContextLifecycle::Turn);
-        assert_eq!(skill.cache_scope, ContextCacheScope::Thread);
+        assert_eq!(skill.cache_scope, ContextCacheScope::Turn);
         assert!(skill.classification_errors().is_empty());
     }
 

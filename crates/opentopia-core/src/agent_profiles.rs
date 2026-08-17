@@ -61,7 +61,6 @@ impl AgentProfile {
             developer_instructions: "Explore and analyze without modifying files or external state. Return concrete evidence with paths, symbols, and unresolved uncertainty.".to_string(),
             sandbox_mode: Some(SandboxMode::ReadOnly),
             denied_tools: vec![
-                "write_file".to_string(),
                 "apply_patch".to_string(),
                 "create_skill".to_string(),
                 "spreadsheet".to_string(),

@@ -1,5 +1,5 @@
 use crate::model::{CollaborationMode, ExperienceMode};
-use crate::tools::ToolSource;
+use crate::tools::{ToolClass, ToolSource};
 
 /// Product-level tool bundles. Availability is decided only from the selected
 /// work/flow and collaboration modes; individual tools do not own ad-hoc gates.
@@ -11,17 +11,16 @@ pub enum ToolBundle {
     External,
 }
 
-pub fn tool_bundle(name: &str, source: &ToolSource) -> ToolBundle {
+pub fn tool_bundle(class: ToolClass, source: &ToolSource) -> ToolBundle {
     if !matches!(source, ToolSource::Core) {
         return ToolBundle::External;
     }
-    if name.starts_with("flow_") {
-        return ToolBundle::Flow;
-    }
-    match name {
-        "request_user_input" => ToolBundle::Common,
-        "set_plan" | "update_plan" => ToolBundle::Task,
-        _ => ToolBundle::Common,
+    match class {
+        ToolClass::Flow => ToolBundle::Flow,
+        ToolClass::WorkForm => ToolBundle::Task,
+        ToolClass::Standard | ToolClass::Subagent | ToolClass::StructuredInput => {
+            ToolBundle::Common
+        }
     }
 }
 
@@ -66,14 +65,17 @@ mod tests {
     #[test]
     fn mode_bundles_are_orthogonal() {
         assert_eq!(
-            tool_bundle("request_user_input", &ToolSource::Core),
+            tool_bundle(ToolClass::StructuredInput, &ToolSource::Core),
             ToolBundle::Common
         );
         assert_eq!(
-            tool_bundle("update_plan", &ToolSource::Core),
+            tool_bundle(ToolClass::WorkForm, &ToolSource::Core),
             ToolBundle::Task
         );
-        assert_eq!(tool_bundle("set_plan", &ToolSource::Core), ToolBundle::Task);
+        assert_eq!(
+            tool_bundle(ToolClass::WorkForm, &ToolSource::Core),
+            ToolBundle::Task
+        );
         assert!(bundle_is_visible(
             ToolBundle::Common,
             ExperienceMode::Code,

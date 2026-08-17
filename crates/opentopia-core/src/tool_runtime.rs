@@ -41,7 +41,9 @@ use crate::tool_result_ingress::{
     tool_result_is_error,
 };
 use crate::tool_state::ToolStateStore;
-use crate::tools::{Tool, ToolInvocationContext, ToolRegistry, ToolSideEffect, ToolSource};
+use crate::tools::{
+    Tool, ToolClass, ToolInvocationContext, ToolRegistry, ToolSideEffect, ToolSource,
+};
 use crate::turn_inbox::{TurnInbox, TurnInboxItem};
 use crate::work_form::{WorkForm, WorkItemStatus};
 use async_trait::async_trait;
@@ -86,7 +88,7 @@ impl ToolRuntimeHost {
         sandbox_config: LocalSandboxConfig,
     ) -> Self {
         Self {
-            runtime: Arc::new(DefaultToolRuntime::new(guardian_provider)),
+            runtime: Arc::new(LocalToolRuntime::new(guardian_provider)),
             catalog,
             mcp_host: None,
             active_mcp_tools: Vec::new(),
@@ -578,14 +580,14 @@ pub trait ToolRuntime: Send + Sync {
     ) -> Vec<ProviderToolExecutionReport>;
 }
 
-/// Compatibility adapter for the existing `Tool` implementations.
+/// Local implementation of the provider-neutral tool runtime port.
 #[derive(Clone)]
-pub struct DefaultToolRuntime {
+pub struct LocalToolRuntime {
     guardian: Arc<RwLock<GuardianReviewSessionManager>>,
 }
 
-/// Constructor-injected compatibility executor for the existing Tool trait.
-/// The wide ToolInvocationContext is captured once at the runtime edge; legacy tools
+/// Constructor-injected executor for the local Tool trait. The wide
+/// ToolInvocationContext is captured once at the runtime edge; individual tools
 /// cannot reach AgentCore or any mutable turn-loop state during execution.
 struct ToolExecutor {
     tool: Arc<dyn Tool>,
@@ -602,7 +604,7 @@ impl ToolExecutor {
     }
 }
 
-impl DefaultToolRuntime {
+impl LocalToolRuntime {
     pub fn new(guardian_provider: Arc<dyn ModelProvider>) -> Self {
         Self {
             guardian: Arc::new(RwLock::new(GuardianReviewSessionManager::new(
@@ -613,7 +615,7 @@ impl DefaultToolRuntime {
 }
 
 #[async_trait]
-impl ToolRuntime for DefaultToolRuntime {
+impl ToolRuntime for LocalToolRuntime {
     fn set_guardian_provider(&self, provider: Arc<dyn ModelProvider>) {
         *self
             .guardian
@@ -923,6 +925,10 @@ impl ToolRuntime for DefaultToolRuntime {
             metadata_overlay,
         } = input;
         let name = call.name.clone();
+        let tool_class = catalog
+            .registry()
+            .class(&name)
+            .unwrap_or(ToolClass::Standard);
         let result_store = context.state.clone();
         let result_thread_id = context.thread_id;
         let approval_granted = context.approval_granted;
@@ -1045,7 +1051,7 @@ impl ToolRuntime for DefaultToolRuntime {
             result_store.as_ref(),
             result_thread_id,
         );
-        if matches!(name.as_str(), "set_plan" | "update_plan") {
+        if tool_class == ToolClass::WorkForm {
             let persistence = (|| -> anyhow::Result<()> {
                 if let (Some(store), Some(form)) = (
                     result_store.as_ref(),
@@ -1071,7 +1077,7 @@ impl ToolRuntime for DefaultToolRuntime {
         events.push(AgentEventPayload::ToolCallFinished {
             result: result.clone(),
         });
-        if matches!(name.as_str(), "set_plan" | "update_plan") {
+        if tool_class == ToolClass::WorkForm {
             if let Some(form) = result
                 .metadata
                 .get("workForm")
@@ -1490,7 +1496,7 @@ mod tests {
 
     #[test]
     fn default_runtime_implements_the_object_safe_tool_port() {
-        accepts_object_safe_runtime(&DefaultToolRuntime::new(Arc::new(
+        accepts_object_safe_runtime(&LocalToolRuntime::new(Arc::new(
             crate::provider::MockProvider,
         )));
     }
@@ -1615,7 +1621,7 @@ mod tests {
             background: background.clone(),
             turn_inbox: Arc::clone(&inbox),
         };
-        let runtime = DefaultToolRuntime::new(Arc::new(crate::provider::MockProvider));
+        let runtime = LocalToolRuntime::new(Arc::new(crate::provider::MockProvider));
 
         let reports = runtime
             .execute_provider_batch(vec![

@@ -142,7 +142,7 @@ impl ContextAssembler for DefaultContextAssembler {
                     ContextRole::Developer,
                     "opentopia:execution_lineage",
                     instructions,
-                    ContextCacheScope::Thread,
+                    ContextCacheScope::Turn,
                     ContextSensitivity::Workspace,
                 )
                 .with_metadata(json!({
@@ -210,7 +210,7 @@ impl ContextAssembler for DefaultContextAssembler {
                 ContextRole::Developer,
                 "opentopia:execution_branch",
                 branch,
-                ContextCacheScope::Thread,
+                ContextCacheScope::Turn,
                 ContextSensitivity::Workspace,
             ));
         }
@@ -382,13 +382,6 @@ fn context_manifest(
         stable_bytes.extend_from_slice(content.as_bytes());
         stable_bytes.push(b'\n');
     }
-    stable_bytes.extend_from_slice(
-        canonical_json_string(
-            &serde_json::to_value(&request.tool_candidates).unwrap_or(Value::Null),
-        )
-        .as_bytes(),
-    );
-
     // Transport cursors, request ids, round numbers, and timestamps are
     // intentionally absent. Tool call ids remain only in the volatile typed
     // protocol because providers require them to correlate outputs.
@@ -396,6 +389,7 @@ fn context_manifest(
         "input": request.input,
         "previousResponseItems": request.previous_response_items,
         "finalOutputJsonSchema": request.final_output_json_schema,
+        "toolCandidates": request.tool_candidates,
         "volatileContext": materialized.items.iter().filter(|item| {
             !matches!(item.cache_scope, ContextCacheScope::Stable | ContextCacheScope::Thread)
         }).collect::<Vec<_>>(),
@@ -419,7 +413,7 @@ fn context_manifest(
     items.push(ContextManifestItem {
         source: "provider:tool_catalog".to_string(),
         kind: "tool_catalog".to_string(),
-        cache_scope: ContextCacheScope::Thread.as_str().to_string(),
+        cache_scope: ContextCacheScope::Turn.as_str().to_string(),
         content_hash: content_fingerprint(
             canonical_json_string(
                 &serde_json::to_value(&request.tool_candidates).unwrap_or(Value::Null),
@@ -457,7 +451,7 @@ fn context_manifest(
 pub fn prompt_cache_lineage_key(
     model_context: &CompiledModelContext,
     context_summary: Option<&str>,
-    tool_candidates: &[ProviderToolCandidate],
+    _tool_candidates: &[ProviderToolCandidate],
 ) -> String {
     let namespace = model_context
         .prompt_cache_key
@@ -484,11 +478,6 @@ pub fn prompt_cache_lineage_key(
     }
     bytes.extend_from_slice(durable_checkpoint_lineage(context_summary).as_bytes());
     bytes.push(0);
-    let mut candidates = tool_candidates.to_vec();
-    sort_tool_candidates(&mut candidates);
-    bytes.extend_from_slice(
-        canonical_json_string(&serde_json::to_value(candidates).unwrap_or(Value::Null)).as_bytes(),
-    );
     format!("opentopia-{}", content_fingerprint(&bytes))
 }
 
@@ -535,7 +524,7 @@ fn tool_search_runtime_module(
             ContextRole::Developer,
             "opentopia:tool_search_protocol",
             instruction,
-            ContextCacheScope::Thread,
+            ContextCacheScope::Turn,
             ContextSensitivity::Public,
         )
         .with_metadata(json!({
@@ -721,6 +710,77 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alpha", "zeta"]
         );
+    }
+
+    #[test]
+    fn changing_tool_catalog_changes_only_the_dynamic_tail() {
+        let context = CompiledModelContext {
+            items: vec![ModelContextItem::text(
+                ContextItemKind::BaseInstructions,
+                ContextRole::System,
+                "opentopia:base",
+                "Stable instructions",
+                ContextCacheScope::Stable,
+                ContextSensitivity::Public,
+            )],
+            prompt_cache_key: Some("stable-lineage".to_string()),
+        };
+        let tool = |name: &str| ProviderToolCandidate::direct(name, name, json!({"type":"object"}));
+        let mut first_input = input(&context, "question");
+        first_input.tool_candidates = vec![tool("read_file")];
+        let mut second_input = input(&context, "question");
+        second_input.tool_candidates = vec![tool("read_file"), tool("mcp_dynamic")];
+
+        let first = DefaultContextAssembler.compile(first_input).expect("first");
+        let second = DefaultContextAssembler
+            .compile(second_input)
+            .expect("second");
+        assert_eq!(
+            first.manifest().stable_prefix_hash,
+            second.manifest().stable_prefix_hash
+        );
+        assert_ne!(
+            first.manifest().dynamic_tail_hash,
+            second.manifest().dynamic_tail_hash
+        );
+    }
+
+    #[test]
+    fn changing_branch_instructions_changes_only_the_dynamic_tail() {
+        let context = CompiledModelContext {
+            items: vec![ModelContextItem::text(
+                ContextItemKind::BaseInstructions,
+                ContextRole::System,
+                "opentopia:base",
+                "Stable instructions",
+                ContextCacheScope::Stable,
+                ContextSensitivity::Public,
+            )],
+            prompt_cache_key: Some("stable-lineage".to_string()),
+        };
+        let mut first_input = input(&context, "question");
+        first_input.branch_developer_instructions = Some("Plan interaction profile".to_string());
+        let mut second_input = input(&context, "question");
+        second_input.branch_developer_instructions = Some("Goal interaction profile".to_string());
+
+        let first = DefaultContextAssembler.compile(first_input).expect("first");
+        let second = DefaultContextAssembler
+            .compile(second_input)
+            .expect("second");
+        assert_eq!(
+            first.manifest().stable_prefix_hash,
+            second.manifest().stable_prefix_hash
+        );
+        assert_ne!(
+            first.manifest().dynamic_tail_hash,
+            second.manifest().dynamic_tail_hash
+        );
+        assert!(first
+            .materialized_context()
+            .items
+            .iter()
+            .any(|item| item.source == "opentopia:execution_branch"
+                && item.cache_scope == ContextCacheScope::Turn));
     }
 
     #[test]

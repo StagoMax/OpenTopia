@@ -109,7 +109,7 @@ fn resolve_executable(
             cwd.join(requested)
         };
         if candidate.is_file() {
-            return Ok(executable_path(&candidate));
+            return Ok(normalized_canonical_path(&candidate));
         }
         return Err(ExecutionFailure::without_os_error(
             ExecutionStage::ResolveRuntime,
@@ -136,7 +136,7 @@ fn resolve_executable(
             }
             let candidate = directory.join(name);
             if candidate.is_file() {
-                return Ok(executable_path(&candidate));
+                return Ok(normalized_canonical_path(&candidate));
             }
         }
     }
@@ -168,7 +168,9 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn executable_path(path: &Path) -> PathBuf {
+/// Canonicalizes a host path without leaking Windows' verbatim-path spelling
+/// into runtime roots, executable paths, or child-process environment values.
+fn normalized_canonical_path(path: &Path) -> PathBuf {
     let path = canonical_or_original(path);
     #[cfg(windows)]
     {
@@ -247,7 +249,7 @@ fn resolve_execution_environment(
         for entry in std::env::split_paths(&value) {
             if let Ok(entry) = entry.canonicalize() {
                 if entry.is_dir() {
-                    resolved.push(executable_path(&entry));
+                    resolved.push(normalized_canonical_path(&entry));
                 }
             }
         }
@@ -274,7 +276,11 @@ fn resolve_execution_environment(
             Some(path) => {
                 environment.insert(
                     normalized,
-                    (key, executable_path(&path).into_os_string(), explicit),
+                    (
+                        key,
+                        normalized_canonical_path(&path).into_os_string(),
+                        explicit,
+                    ),
                 );
             }
             None if explicit => {
@@ -396,7 +402,12 @@ fn runtime_roots_from_environment(
             ));
         }
     }
-    Ok(roots.into_iter().collect())
+    Ok(roots
+        .into_iter()
+        .map(|root| normalized_canonical_path(&root))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
 }
 
 fn effective_environment_policy(request: &ExecutionSpec) -> EnvironmentPolicy {
@@ -474,7 +485,7 @@ pub(crate) fn configure_stdio(command: &mut Command, request: &ExecutionSpec) {
 #[cfg(test)]
 mod tests {
     use super::{
-        executable_path, is_sensitive_environment_key, resolve_executable,
+        is_sensitive_environment_key, normalized_canonical_path, resolve_executable,
         resolve_execution_environment, runtime_roots_from_environment,
     };
     use crate::execution_spec::ExecutionSpec;
@@ -520,7 +531,7 @@ mod tests {
     #[test]
     fn runtime_roots_are_inferred_without_tool_specific_adapters() {
         let root = std::env::current_dir().expect("current directory");
-        let root = root.canonicalize().expect("canonical root");
+        let canonical_root = normalized_canonical_path(&root);
         let path = std::env::join_paths([root.clone()]).expect("join PATH fixture");
         let roots = runtime_roots_from_environment(&[
             (OsString::from("PATH"), path),
@@ -531,7 +542,7 @@ mod tests {
             ),
         ])
         .expect("runtime roots");
-        assert_eq!(roots, vec![root]);
+        assert_eq!(roots, vec![canonical_root]);
     }
 
     #[test]
@@ -540,7 +551,7 @@ mod tests {
             .expect("current directory")
             .canonicalize()
             .expect("canonical root");
-        let root = executable_path(&root);
+        let root = normalized_canonical_path(&root);
         let missing = std::env::temp_dir().join("opentopia-missing-runtime-path-entry");
         let path = std::env::join_paths([missing, root.clone()]).expect("join PATH fixture");
         let request = ExecutionSpec::new("tool").env_clear().env("PATH", path);
@@ -571,8 +582,8 @@ mod tests {
         let second = fixture.join("a-second");
         std::fs::create_dir_all(&first).expect("create first PATH directory");
         std::fs::create_dir_all(&second).expect("create second PATH directory");
-        let first = executable_path(&first.canonicalize().expect("canonical first directory"));
-        let second = executable_path(&second.canonicalize().expect("canonical second directory"));
+        let first = normalized_canonical_path(&first);
+        let second = normalized_canonical_path(&second);
         let path = std::env::join_paths([first.clone(), second.clone(), first.clone()])
             .expect("join ordered PATH fixture");
         let request = ExecutionSpec::new("tool").env_clear().env("PATH", path);

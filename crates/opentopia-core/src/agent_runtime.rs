@@ -33,6 +33,9 @@ pub enum AgentResumeSignal {
         request_id: Uuid,
         response: UserInputResponse,
     },
+    ExternalAction {
+        observation: String,
+    },
 }
 
 /// Trusted, object-safe entry point for starting and resuming one agent turn.
@@ -85,59 +88,6 @@ impl AgentTurnDriver for AgentCore {
     }
 }
 
-/// Thin, product-neutral facade over the active turn driver.
-///
-/// During migration this wraps the legacy [`AgentCore`] adapter. The server
-/// depends on this facade rather than on the concrete loop, so the legacy
-/// driver can later be replaced without changing HTTP, persistence, or SSE
-/// lifecycle code.
-#[derive(Debug, Clone)]
-pub struct TurnKernel<D> {
-    driver: D,
-}
-
-impl<D> TurnKernel<D> {
-    pub fn new(driver: D) -> Self {
-        Self { driver }
-    }
-
-    pub fn driver(&self) -> &D {
-        &self.driver
-    }
-
-    pub fn into_driver(self) -> D {
-        self.driver
-    }
-}
-
-#[async_trait]
-impl<D> AgentTurnDriver for TurnKernel<D>
-where
-    D: AgentTurnDriver,
-{
-    async fn run_turn(
-        &self,
-        input: AgentTurnInput,
-        model_context: Option<CompiledModelContext>,
-        sender: Option<AgentEventSender>,
-    ) -> anyhow::Result<AgentTurnResult> {
-        self.driver.run_turn(input, model_context, sender).await
-    }
-
-    async fn resume_turn(
-        &self,
-        continuation: AgentContinuation,
-        signal: AgentResumeSignal,
-        store: Option<Arc<dyn SessionStore>>,
-        cancellation: Option<CancellationToken>,
-        sender: Option<AgentEventSender>,
-    ) -> anyhow::Result<AgentTurnResult> {
-        self.driver
-            .resume_turn(continuation, signal, store, cancellation, sender)
-            .await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,14 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_kernel_preserves_the_object_safe_driver_boundary() {
-        let kernel = TurnKernel::new(AgentCore::default());
-        accepts_object_safe_driver(&kernel);
-        let _driver = kernel.into_driver();
-    }
-
-    #[test]
-    fn thin_kernel_does_not_import_concrete_product_runtimes() {
+    fn turn_driver_boundary_does_not_import_concrete_product_runtimes() {
         let source = include_str!("agent_runtime.rs");
         let production_source = source
             .split("#[cfg(test)]")
@@ -178,7 +121,7 @@ mod tests {
         ] {
             assert!(
                 !production_source.contains(forbidden),
-                "thin kernel must not depend on {forbidden}"
+                "turn driver boundary must not depend on {forbidden}"
             );
         }
     }
@@ -207,29 +150,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn driver_event_sequence_is_preserved_behind_the_kernel() {
-        let kernel = TurnKernel::new(AgentCore::default());
-        let result = kernel
-            .run_turn(
-                AgentTurnInput {
-                    thread_id: Uuid::from_u128(1),
-                    user_message_id: Uuid::from_u128(2),
-                    workspace_root: std::env::temp_dir(),
-                    content: "event-sequence-golden".to_string(),
-                    user_content: Vec::new(),
-                    context_summary: None,
-                    conversation: Vec::new(),
-                    permission_mode: PermissionMode::FullAccess,
-                    context_budget: None,
-                    provider_cursor: None,
-                    store: None,
-                    cancellation: None,
-                },
-                None,
-                None,
-            )
-            .await
-            .expect("legacy driver completes behind the kernel");
+    async fn driver_event_sequence_is_preserved_behind_the_port() {
+        let driver = AgentCore::default();
+        let result = AgentTurnDriver::run_turn(
+            &driver,
+            AgentTurnInput {
+                thread_id: Uuid::from_u128(1),
+                user_message_id: Uuid::from_u128(2),
+                workspace_root: std::env::temp_dir(),
+                content: "event-sequence-golden".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("turn driver completes behind the port");
 
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
         let sequence = result

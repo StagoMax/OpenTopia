@@ -357,10 +357,8 @@ impl TypedTool for UpdatePlanTool {
                 }
                 if let Some(status) = update.status {
                     anyhow::ensure!(
-                        status != WorkFormStatus::Completed
-                            || (!work_form.items.is_empty()
-                                && work_form.items.iter().all(|item| item.status.is_resolved())),
-                        "a completed WorkForm cannot contain actionable items"
+                        status != WorkFormStatus::Completed || work_form.blocking_items_complete(),
+                        "a completed WorkForm cannot contain unresolved blocking items"
                     );
                     work_form.set_status(status);
                 }

@@ -1,16 +1,16 @@
 //! Provider-neutral model execution boundary used by the turn runtime.
 //!
-//! Provider selection and construction remain compatibility concerns while the
-//! legacy `AgentCore` is migrated. The loop itself depends on [`ModelGateway`]
-//! and no longer owns transport selection directly.
+//! The loop depends on [`ModelGateway`] and does not own provider selection,
+//! wire encoding, authentication, retries, or response normalization.
 
 use crate::context_runtime::CanonicalModelRequest;
 use crate::provider::{
     ModelProvider, ModelRequest, ModelResponse, ModelStreamCallback, ModelStreamDelta,
-    PreparedProviderRequest, ProviderTransportCallback,
+    PreparedProviderRequest, ProviderResponseCommitMode, ProviderTransportCallback,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::sync::Mutex;
 use uuid::Uuid;
 
 #[async_trait]
@@ -37,24 +37,11 @@ pub trait ProviderCodec: Send + Sync {
         request_id: Uuid,
         request: ModelRequest,
     ) -> anyhow::Result<PreparedProviderRequest>;
-
-    /// Normalize one provider stream event into the canonical delta protocol.
-    /// Legacy codecs are identity adapters because their old driver already
-    /// performed wire parsing before yielding the event.
-    fn decode_delta(&self, delta: ModelStreamDelta) -> anyhow::Result<ModelStreamDelta> {
-        Ok(delta)
-    }
-
-    /// Normalize finish reason, usage, tool calls, and provider state after the
-    /// transport reaches a terminal response.
-    fn decode_response(&self, response: ModelResponse) -> anyhow::Result<ModelResponse> {
-        Ok(response)
-    }
 }
 
 /// Provider transport boundary. It receives an already encoded request and is
-/// solely responsible for retries, I/O, and delivering normalized stream
-/// events. Legacy drivers retain their parsing internally behind this facade.
+/// solely responsible for authentication, retries, I/O, and delivering
+/// provider-neutral stream events and terminal responses.
 #[async_trait]
 pub trait ProviderTransport: Send + Sync {
     async fn send(
@@ -65,18 +52,15 @@ pub trait ProviderTransport: Send + Sync {
     ) -> anyhow::Result<ModelResponse>;
 }
 
+/// Adapts the built-in provider driver to the two gateway ports. Keeping this
+/// private prevents the combined driver interface from leaking back into the
+/// agent runtime while providers are free to split their internals further.
 #[derive(Clone)]
-pub struct LegacyProviderCodec {
+struct ModelProviderPorts {
     provider: Arc<dyn ModelProvider>,
 }
 
-impl LegacyProviderCodec {
-    pub fn new(provider: Arc<dyn ModelProvider>) -> Self {
-        Self { provider }
-    }
-}
-
-impl ProviderCodec for LegacyProviderCodec {
+impl ProviderCodec for ModelProviderPorts {
     fn encode(
         &self,
         request_id: Uuid,
@@ -86,19 +70,8 @@ impl ProviderCodec for LegacyProviderCodec {
     }
 }
 
-#[derive(Clone)]
-pub struct LegacyProviderTransport {
-    provider: Arc<dyn ModelProvider>,
-}
-
-impl LegacyProviderTransport {
-    pub fn new(provider: Arc<dyn ModelProvider>) -> Self {
-        Self { provider }
-    }
-}
-
 #[async_trait]
-impl ProviderTransport for LegacyProviderTransport {
+impl ProviderTransport for ModelProviderPorts {
     async fn send(
         &self,
         prepared: PreparedProviderRequest,
@@ -111,8 +84,6 @@ impl ProviderTransport for LegacyProviderTransport {
     }
 }
 
-/// Compatibility adapter that keeps provider construction outside the model
-/// execution port while preserving every existing codec and transport behavior.
 #[derive(Clone)]
 pub struct ProviderModelGateway {
     codec: Arc<dyn ProviderCodec>,
@@ -120,10 +91,11 @@ pub struct ProviderModelGateway {
 }
 
 impl ProviderModelGateway {
-    pub fn new(provider: Arc<dyn ModelProvider>) -> Self {
+    pub fn from_provider(provider: Arc<dyn ModelProvider>) -> Self {
+        let ports = Arc::new(ModelProviderPorts { provider });
         Self {
-            codec: Arc::new(LegacyProviderCodec::new(Arc::clone(&provider))),
-            transport: Arc::new(LegacyProviderTransport::new(provider)),
+            codec: ports.clone(),
+            transport: ports,
         }
     }
 
@@ -151,13 +123,48 @@ impl ModelGateway for ProviderModelGateway {
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
-        let codec = Arc::clone(&self.codec);
-        let mut decoded_delta = |delta| on_delta(codec.decode_delta(delta)?);
+        if prepared.response_commit == ProviderResponseCommitMode::Streaming {
+            return self.transport.send(prepared, on_delta, on_transport).await;
+        }
+
+        // A tool-capable model turn is one semantic transaction. Transport
+        // fragments are provisional until the adapter has assembled and
+        // validated the terminal response; otherwise a malformed tool call can
+        // leak its accompanying text into durable conversation events before
+        // the turn is rejected. Retries clear the fragments from the abandoned
+        // attempt, and only the successfully decoded attempt is committed.
+        let pending_deltas = Arc::new(Mutex::new(Vec::<ModelStreamDelta>::new()));
+        let delta_buffer = Arc::clone(&pending_deltas);
+        let mut buffered_delta = move |delta| {
+            delta_buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta);
+            Ok(())
+        };
+        let retry_buffer = Arc::clone(&pending_deltas);
+        let mut observed_transport = |event| {
+            if matches!(event, crate::provider::ProviderTransportEvent::Retry { .. }) {
+                retry_buffer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+            }
+            on_transport(event)
+        };
         let response = self
             .transport
-            .send(prepared, &mut decoded_delta, on_transport)
+            .send(prepared, &mut buffered_delta, &mut observed_transport)
             .await?;
-        self.codec.decode_response(response)
+        let deltas = std::mem::take(
+            &mut *pending_deltas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for delta in deltas {
+            on_delta(delta)?;
+        }
+        Ok(response)
     }
 }
 
@@ -165,22 +172,42 @@ impl ModelGateway for ProviderModelGateway {
 mod tests {
     use super::*;
     use crate::context_runtime::{ContextAssembler, ContextAssemblyInput, DefaultContextAssembler};
+    use crate::model::ProviderRetryKind;
     use crate::model_context::CompiledModelContext;
-    use crate::provider::{MockProvider, ModelFinishReason};
+    use crate::provider::{MockProvider, ModelFinishReason, ProviderTransportEvent};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn accepts_object_safe_gateway(_gateway: &dyn ModelGateway) {}
 
+    fn canonical_request() -> CanonicalModelRequest {
+        DefaultContextAssembler
+            .compile(ContextAssemblyInput {
+                model_context: &CompiledModelContext::default(),
+                context_summary: None,
+                conversation: Vec::new(),
+                user_message: "hello".to_string(),
+                user_content: Vec::new(),
+                tool_candidates: Vec::new(),
+                previous_tool_calls: Vec::new(),
+                tool_results: Vec::new(),
+                previous_response_items: Vec::new(),
+                previous_response_id: None,
+                branch_developer_instructions: None,
+                prompt_cache_breakpoint_policy:
+                    crate::provider::PromptCacheBreakpointPolicy::AppendOnlyUsers,
+                final_output_json_schema: None,
+            })
+            .expect("canonical request")
+    }
+
     #[test]
     fn provider_adapter_implements_the_object_safe_gateway_port() {
-        let gateway = ProviderModelGateway::new(Arc::new(MockProvider));
+        let gateway = ProviderModelGateway::from_provider(Arc::new(MockProvider));
         accepts_object_safe_gateway(&gateway);
     }
 
     struct RecordingCodec {
         called: Arc<AtomicBool>,
-        decoded_delta: Arc<AtomicBool>,
-        decoded_response: Arc<AtomicBool>,
     }
 
     impl ProviderCodec for RecordingCodec {
@@ -198,17 +225,8 @@ mod tests {
                 body: serde_json::json!({"encoded": request.input.current_user.message}),
                 observation_body: serde_json::json!({"encoded": true}),
                 logical_request: request,
+                response_commit: ProviderResponseCommitMode::Streaming,
             })
-        }
-
-        fn decode_delta(&self, delta: ModelStreamDelta) -> anyhow::Result<ModelStreamDelta> {
-            self.decoded_delta.store(true, Ordering::SeqCst);
-            Ok(delta)
-        }
-
-        fn decode_response(&self, response: ModelResponse) -> anyhow::Result<ModelResponse> {
-            self.decoded_response.store(true, Ordering::SeqCst);
-            Ok(response)
         }
     }
 
@@ -249,37 +267,16 @@ mod tests {
     #[tokio::test]
     async fn gateway_composes_distinct_codec_and_transport_ports() {
         let codec_called = Arc::new(AtomicBool::new(false));
-        let delta_decoded = Arc::new(AtomicBool::new(false));
-        let response_decoded = Arc::new(AtomicBool::new(false));
         let transport_called = Arc::new(AtomicBool::new(false));
         let gateway = ProviderModelGateway::from_parts(
             Arc::new(RecordingCodec {
                 called: Arc::clone(&codec_called),
-                decoded_delta: Arc::clone(&delta_decoded),
-                decoded_response: Arc::clone(&response_decoded),
             }),
             Arc::new(RecordingTransport {
                 called: Arc::clone(&transport_called),
             }),
         );
-        let canonical = DefaultContextAssembler
-            .compile(ContextAssemblyInput {
-                model_context: &CompiledModelContext::default(),
-                context_summary: None,
-                conversation: Vec::new(),
-                user_message: "hello".to_string(),
-                user_content: Vec::new(),
-                tool_candidates: Vec::new(),
-                previous_tool_calls: Vec::new(),
-                tool_results: Vec::new(),
-                previous_response_items: Vec::new(),
-                previous_response_id: None,
-                branch_developer_instructions: None,
-                prompt_cache_breakpoint_policy:
-                    crate::provider::PromptCacheBreakpointPolicy::AppendOnlyUsers,
-                final_output_json_schema: None,
-            })
-            .expect("canonical request");
+        let canonical = canonical_request();
         let prepared = gateway
             .prepare(Uuid::from_u128(1), canonical)
             .expect("codec encodes");
@@ -299,13 +296,141 @@ mod tests {
             .expect("transport sends");
 
         assert!(codec_called.load(Ordering::SeqCst));
-        assert!(delta_decoded.load(Ordering::SeqCst));
-        assert!(response_decoded.load(Ordering::SeqCst));
         assert!(transport_called.load(Ordering::SeqCst));
         assert_eq!(reasoning, "thinking");
         assert_eq!(
             response.finish_reason,
             ModelFinishReason::Incomplete("test boundary".to_string())
+        );
+    }
+
+    struct AtomicCodec;
+
+    impl ProviderCodec for AtomicCodec {
+        fn encode(
+            &self,
+            request_id: Uuid,
+            request: ModelRequest,
+        ) -> anyhow::Result<PreparedProviderRequest> {
+            Ok(PreparedProviderRequest {
+                request_id,
+                adapter: "atomic-test".to_string(),
+                method: "POST".to_string(),
+                endpoint: "provider://atomic-test".to_string(),
+                body: serde_json::json!({}),
+                observation_body: serde_json::json!({}),
+                logical_request: request,
+                response_commit: ProviderResponseCommitMode::Atomic,
+            })
+        }
+    }
+
+    struct FailingAtomicTransport;
+
+    #[async_trait]
+    impl ProviderTransport for FailingAtomicTransport {
+        async fn send(
+            &self,
+            _prepared: PreparedProviderRequest,
+            on_delta: &mut ModelStreamCallback<'_>,
+            _on_transport: &mut ProviderTransportCallback<'_>,
+        ) -> anyhow::Result<ModelResponse> {
+            on_delta(ModelStreamDelta::Text {
+                text: "provisional".to_string(),
+            })?;
+            anyhow::bail!("terminal tool protocol validation failed")
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_response_discards_deltas_when_terminal_validation_fails() {
+        let gateway = ProviderModelGateway::from_parts(
+            Arc::new(AtomicCodec),
+            Arc::new(FailingAtomicTransport),
+        );
+        let prepared = gateway
+            .prepare(Uuid::from_u128(2), canonical_request())
+            .unwrap();
+        let mut committed = Vec::new();
+
+        gateway
+            .stream_prepared(
+                prepared,
+                &mut |delta| {
+                    committed.push(delta);
+                    Ok(())
+                },
+                &mut |_| Ok(()),
+            )
+            .await
+            .expect_err("invalid atomic response must fail");
+
+        assert!(committed.is_empty());
+    }
+
+    struct RetryingAtomicTransport;
+
+    #[async_trait]
+    impl ProviderTransport for RetryingAtomicTransport {
+        async fn send(
+            &self,
+            _prepared: PreparedProviderRequest,
+            on_delta: &mut ModelStreamCallback<'_>,
+            on_transport: &mut ProviderTransportCallback<'_>,
+        ) -> anyhow::Result<ModelResponse> {
+            on_delta(ModelStreamDelta::Text {
+                text: "discarded-attempt".to_string(),
+            })?;
+            on_transport(ProviderTransportEvent::Retry {
+                attempt: 2,
+                retry_kind: ProviderRetryKind::StateRecovery,
+                retry_index: None,
+                retry_limit: None,
+                reason: "retry transaction".to_string(),
+                body: serde_json::json!({}),
+            })?;
+            on_delta(ModelStreamDelta::Text {
+                text: "committed-attempt".to_string(),
+            })?;
+            Ok(ModelResponse {
+                text: "committed-attempt".to_string(),
+                tool_calls: Vec::new(),
+                usage: None,
+                response_id: Some("response-2".to_string()),
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::Stop,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_response_clears_abandoned_attempt_before_commit() {
+        let gateway = ProviderModelGateway::from_parts(
+            Arc::new(AtomicCodec),
+            Arc::new(RetryingAtomicTransport),
+        );
+        let prepared = gateway
+            .prepare(Uuid::from_u128(3), canonical_request())
+            .unwrap();
+        let mut committed = Vec::new();
+
+        gateway
+            .stream_prepared(
+                prepared,
+                &mut |delta| {
+                    committed.push(delta);
+                    Ok(())
+                },
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            committed,
+            vec![ModelStreamDelta::Text {
+                text: "committed-attempt".to_string()
+            }]
         );
     }
 }

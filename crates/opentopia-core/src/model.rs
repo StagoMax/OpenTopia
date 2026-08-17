@@ -7,6 +7,7 @@ use crate::model_context::{
     ModelContextItem, ThreadContextSnapshot, TokenEstimateBreakdown, TurnContextSnapshot,
 };
 use crate::provider::ModelUsage;
+use crate::settings::ProviderAdapterKind;
 use crate::skills::LoadedSkill;
 use crate::subagents::SubagentRun;
 use crate::work_form::{WorkForm, WorkFormStatus};
@@ -70,6 +71,8 @@ pub struct ThreadModelSelection {
     pub connection_id: String,
     pub model_id: String,
     #[serde(default)]
+    pub adapter: Option<ProviderAdapterKind>,
+    #[serde(default)]
     pub reasoning_effort: Option<String>,
 }
 
@@ -106,6 +109,7 @@ impl ExperienceMode {
 pub enum CollaborationMode {
     #[default]
     Default,
+    Plan,
     Goal,
 }
 
@@ -113,6 +117,7 @@ impl CollaborationMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Plan => "plan",
             Self::Goal => "goal",
         }
     }
@@ -120,9 +125,7 @@ impl CollaborationMode {
     pub fn from_str(value: &str) -> anyhow::Result<Self> {
         match value {
             "default" => Ok(Self::Default),
-            // P6 removes the fixed Plan runtime. Persisted clients that still
-            // send `plan` enter the normal executable collaboration path.
-            "plan" => Ok(Self::Default),
+            "plan" => Ok(Self::Plan),
             "goal" => Ok(Self::Goal),
             other => anyhow::bail!("unknown collaboration mode: {other}"),
         }
@@ -341,10 +344,10 @@ impl ToolCall {
 
 /// A typed unit of model input or tool output.
 ///
-/// Text remains the compatibility path for existing providers and tools, while
-/// the other variants retain information that would otherwise be flattened into
-/// a prompt string. `Image` stores the original bytes so provider adapters can
-/// choose their native multimodal representation at the last possible point.
+/// Text is the portable baseline for providers and tools, while the other
+/// variants retain information that would otherwise be flattened into a prompt
+/// string. `Image` stores the original bytes so provider adapters can choose
+/// their native multimodal representation at the last possible point.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelContentPart {
@@ -931,10 +934,14 @@ pub struct UserInputAnswer {
 #[serde(rename_all = "camelCase")]
 pub struct UserInputResponse {
     pub answers: Vec<UserInputAnswer>,
-    /// The user may deliberately skip Plan's optional clarification step.
-    /// The model then continues with explicit, reasonable assumptions.
+    /// Skip the optional decision and let the same Turn continue with a
+    /// reasonable assumption.
     #[serde(default)]
     pub skipped: bool,
+    /// Dismiss the decision boundary and end the waiting Turn without another
+    /// model invocation. A later user message starts a new Turn normally.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -996,6 +1003,7 @@ impl Approval {
 pub enum TurnStatus {
     Running,
     WaitingApproval,
+    WaitingUserInput,
     WaitingUserAction,
     Cancelling,
     Succeeded,
@@ -1009,6 +1017,7 @@ impl TurnStatus {
         match self {
             Self::Running => "running",
             Self::WaitingApproval => "waiting_approval",
+            Self::WaitingUserInput => "waiting_user_input",
             Self::WaitingUserAction => "waiting_user_action",
             Self::Cancelling => "cancelling",
             Self::Succeeded => "succeeded",
@@ -1022,6 +1031,7 @@ impl TurnStatus {
         match value {
             "running" => Ok(Self::Running),
             "waiting_approval" => Ok(Self::WaitingApproval),
+            "waiting_user_input" => Ok(Self::WaitingUserInput),
             "waiting_user_action" => Ok(Self::WaitingUserAction),
             "cancelling" => Ok(Self::Cancelling),
             "succeeded" => Ok(Self::Succeeded),
@@ -1502,8 +1512,9 @@ pub enum ModelCallPurpose {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderRetryKind {
     #[default]
-    Compatibility,
     Network,
+    #[serde(alias = "compatibility")]
+    StateRecovery,
 }
 
 impl AgentEventPayload {
@@ -1554,6 +1565,18 @@ impl AgentEventPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn plan_collaboration_mode_round_trips_without_becoming_default() {
+        assert_eq!(
+            CollaborationMode::from_str("plan").expect("parse plan mode"),
+            CollaborationMode::Plan
+        );
+        assert_eq!(
+            serde_json::to_value(CollaborationMode::Plan).expect("serialize plan mode"),
+            json!("plan")
+        );
+    }
 
     #[test]
     fn legacy_context_compacted_events_deserialize_without_details() {

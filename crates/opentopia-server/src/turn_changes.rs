@@ -1,17 +1,22 @@
 use anyhow::Context;
+use async_trait::async_trait;
 use chrono::Utc;
 use opentopia_core::{
-    normalize_workspace_key, SessionStore, SqliteSessionStore, TurnChangeSet, TurnChangeSetStatus,
+    normalize_workspace_key, FileMutationObserver, FileMutationScope, FileMutationTarget,
+    PreparedFileMutation, SessionStore, SqliteSessionStore, TurnChangeSet, TurnChangeSetStatus,
     TurnFileChange, TurnFileChangeKind, GIT_NONINTERACTIVE_ENVIRONMENT,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -23,6 +28,7 @@ const GIT_FAILURE_DETAIL_CHARS: usize = 600;
 pub struct TurnChangeManager {
     store: Arc<SqliteSessionStore>,
     workspace_locks: Arc<Mutex<HashMap<String, Weak<AsyncRwLock<()>>>>>,
+    journal_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -140,6 +146,7 @@ impl TurnChangeManager {
         Self {
             store,
             workspace_locks: Arc::new(Mutex::new(HashMap::new())),
+            journal_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -176,21 +183,19 @@ impl TurnChangeManager {
         thread_id: Uuid,
         workspace_root: &Path,
     ) -> anyhow::Result<TurnChangeSet> {
+        let started = Instant::now();
         let mut change_set =
             TurnChangeSet::capturing(turn_id, thread_id, canonical_or_original(workspace_root));
         let capture = async {
             let repo = discover_repo(workspace_root).await?;
-            let reference = turn_snapshot_ref(turn_id, "before");
-            let tree = capture_tree(&repo, Some(&reference)).await?;
-            anyhow::Ok((repo, tree))
+            anyhow::Ok(repo)
         }
         .await;
 
         match capture {
-            Ok((repo, tree)) => {
+            Ok(repo) => {
                 change_set.repo_root = Some(repo.repo_root);
                 change_set.workspace_prefix = Some(repo.workspace_prefix);
-                change_set.before_tree = Some(tree);
             }
             Err(error) => {
                 change_set.status = TurnChangeSetStatus::Failed;
@@ -199,6 +204,12 @@ impl TurnChangeManager {
             }
         }
         self.store.upsert_turn_change_set(&change_set)?;
+        info!(
+            %turn_id,
+            elapsed_ms = elapsed_millis(started),
+            status = ?change_set.status,
+            "turn change journal started"
+        );
         Ok(change_set)
     }
 
@@ -233,8 +244,7 @@ impl TurnChangeManager {
         if change_set.status != TurnChangeSetStatus::Capturing {
             return Ok(change_set);
         }
-        if changed_paths.is_some_and(|paths| paths.is_empty()) {
-            change_set.after_tree = change_set.before_tree.clone();
+        if change_set.files.is_empty() && changed_paths.is_some_and(|paths| paths.is_empty()) {
             change_set.status = TurnChangeSetStatus::Empty;
             change_set.files.clear();
             change_set.additions = 0;
@@ -249,48 +259,65 @@ impl TurnChangeManager {
             );
             return Ok(change_set);
         }
+        if change_set.files.is_empty() && changed_paths.is_some_and(|paths| !paths.is_empty()) {
+            let repo = repo_from_change_set(&change_set)?;
+            let reported = normalized_changed_paths(
+                &change_set,
+                changed_paths.expect("checked non-empty changed paths"),
+            );
+            let mut has_unjournaled_change = false;
+            for path in reported {
+                if !git_path_is_ignored(&repo.repo_root, &repo_path(&repo, &path)).await? {
+                    has_unjournaled_change = true;
+                    break;
+                }
+            }
+            if !has_unjournaled_change {
+                change_set.status = TurnChangeSetStatus::Empty;
+                change_set.error = None;
+                change_set.finalized_at = Some(Utc::now());
+                self.store.upsert_turn_change_set(&change_set)?;
+                return Ok(change_set);
+            }
+            change_set.status = TurnChangeSetStatus::Failed;
+            change_set.error = Some(
+                "workspace-write tools reported changed paths, but no exact file mutations were journaled; shell or external writes are not safely undoable"
+                    .to_string(),
+            );
+            change_set.finalized_at = Some(Utc::now());
+            self.store.upsert_turn_change_set(&change_set)?;
+            return Ok(change_set);
+        }
         let result = async {
             let repo = repo_from_change_set(&change_set)?;
-            let before_tree = change_set
-                .before_tree
-                .as_deref()
-                .context("before tree is unavailable")?;
-            let allowed = changed_paths
-                .map(|paths| normalized_changed_paths(&change_set, paths))
-                .unwrap_or_default();
-            let reference = turn_snapshot_ref(turn_id, "after");
-            let after_tree = if changed_paths.is_some() {
-                capture_tree_for_paths(
-                    &repo,
-                    before_tree,
-                    &allowed,
-                    IgnoredPathMode::Skip,
-                    Some(&reference),
-                )
-                .await?
-            } else {
-                capture_tree(&repo, Some(&reference)).await?
-            };
-            let mut files = diff_trees(&repo, before_tree, &after_tree).await?;
-            if changed_paths.is_some() {
-                files.retain(|file| {
-                    file.old_path
-                        .iter()
-                        .chain(file.new_path.iter())
-                        .any(|path| {
-                            allowed
-                                .iter()
-                                .any(|allowed| same_change_path(path, allowed))
-                        })
-                });
-            }
-            anyhow::Ok((after_tree, files))
+            let before_reference = turn_snapshot_ref(turn_id, "before");
+            let after_reference = turn_snapshot_ref(turn_id, "after");
+            let before_tree = capture_journal_tree(
+                &repo,
+                &change_set.files,
+                JournalTreeSide::Before,
+                Some(&before_reference),
+            )
+            .await?;
+            let after_tree = capture_journal_tree(
+                &repo,
+                &change_set.files,
+                JournalTreeSide::After,
+                Some(&after_reference),
+            )
+            .await?;
+            // The write-boundary journal is authoritative. Tool-result path
+            // metadata is only a compatibility signal for unjournaled writers
+            // and must not discard an exact mutation record.
+            let files = diff_trees(&repo, &before_tree, &after_tree).await?;
+            anyhow::Ok((before_tree, after_tree, files))
         }
         .await;
 
         change_set.finalized_at = Some(Utc::now());
         match result {
-            Ok((after_tree, files)) => {
+            Ok((before_tree, after_tree, files)) => {
+                change_set.before_tree = Some(before_tree);
                 change_set.after_tree = Some(after_tree);
                 change_set.additions = files.iter().filter_map(|file| file.additions).sum();
                 change_set.deletions = files.iter().filter_map(|file| file.deletions).sum();
@@ -556,6 +583,273 @@ impl TurnChangeManager {
             repo,
         })
     }
+}
+
+#[async_trait]
+impl FileMutationObserver for TurnChangeManager {
+    async fn record_file_mutations(
+        &self,
+        scope: &FileMutationScope,
+        mutations: &[PreparedFileMutation],
+    ) -> anyhow::Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        // Different files may be written concurrently, but their per-Turn net
+        // journal is one record. Serialize only this small merge/persist step.
+        let _journal_guard = self.journal_lock.lock().await;
+        let mut change_set = self
+            .store
+            .get_turn_change_set(scope.turn_id)?
+            .context("turn change set was not started before a file mutation")?;
+        anyhow::ensure!(
+            change_set.thread_id == scope.thread_id,
+            "file mutation thread does not match the active turn"
+        );
+        anyhow::ensure!(
+            normalize_workspace_key(&change_set.workspace_root)
+                == normalize_workspace_key(&scope.workspace_root),
+            "file mutation workspace does not match the active turn"
+        );
+        anyhow::ensure!(
+            change_set.status == TurnChangeSetStatus::Capturing,
+            "turn file mutation arrived after capture finalized"
+        );
+        let repo = repo_from_change_set(&change_set)?;
+
+        for mutation in mutations {
+            let relative = normalize_reported_change_path(&change_set, &mutation.path)
+                .with_context(|| {
+                    format!(
+                        "mutation path is outside the active workspace: {}",
+                        mutation.path.display()
+                    )
+                })?;
+            validate_workspace_relative_path(&relative)?;
+            let before_contents = mutation.original.as_deref();
+            let after_contents = match &mutation.target {
+                FileMutationTarget::Write(contents) => Some(contents.as_slice()),
+                FileMutationTarget::Delete => None,
+            };
+            let existing_index = change_set.files.iter().position(|change| {
+                change
+                    .old_path
+                    .iter()
+                    .chain(change.new_path.iter())
+                    .any(|path| same_change_path(path, &relative))
+            });
+            let existing = existing_index.map(|index| change_set.files[index].clone());
+            if existing.is_none()
+                && git_path_is_ignored(&repo.repo_root, &repo_path(&repo, &relative)).await?
+            {
+                continue;
+            }
+
+            let before_oid = match existing.as_ref() {
+                Some(change) => change.before_oid.clone(),
+                None => match before_contents {
+                    Some(contents) => Some(write_git_blob(&repo.repo_root, contents).await?),
+                    None => None,
+                },
+            };
+            let before_mode = existing
+                .as_ref()
+                .and_then(|change| change.before_mode.clone())
+                .or_else(|| before_oid.as_ref().map(|_| "100644".to_string()));
+            let after_oid = match after_contents {
+                Some(contents) => Some(write_git_blob(&repo.repo_root, contents).await?),
+                None => None,
+            };
+            let after_mode = after_oid.as_ref().map(|_| "100644".to_string());
+
+            if before_oid == after_oid && before_mode == after_mode {
+                if let Some(index) = existing_index {
+                    change_set.files.remove(index);
+                }
+                continue;
+            }
+
+            let kind = match (before_oid.is_some(), after_oid.is_some()) {
+                (false, true) => TurnFileChangeKind::Added,
+                (true, false) => TurnFileChangeKind::Deleted,
+                (true, true) => TurnFileChangeKind::Modified,
+                (false, false) => continue,
+            };
+            let binary = existing.as_ref().is_some_and(|change| change.binary)
+                || before_contents
+                    .into_iter()
+                    .chain(after_contents)
+                    .any(|contents| contents.contains(&0));
+            let change = TurnFileChange {
+                kind,
+                old_path: before_oid.as_ref().map(|_| relative.clone()),
+                new_path: after_oid.as_ref().map(|_| relative.clone()),
+                before_oid,
+                after_oid,
+                before_mode,
+                after_mode,
+                additions: None,
+                deletions: None,
+                binary,
+            };
+            match existing_index {
+                Some(index) => change_set.files[index] = change,
+                None => change_set.files.push(change),
+            }
+        }
+
+        change_set.files.sort_by(|left, right| {
+            left.display_path()
+                .map(|path| normalized_path_text(path))
+                .cmp(&right.display_path().map(|path| normalized_path_text(path)))
+        });
+        self.store.upsert_turn_change_set(&change_set)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JournalTreeSide {
+    Before,
+    After,
+}
+
+async fn capture_journal_tree(
+    repo: &RepoContext,
+    changes: &[TurnFileChange],
+    side: JournalTreeSide,
+    reference: Option<&str>,
+) -> anyhow::Result<String> {
+    let temp_index = std::env::temp_dir().join(format!("opentopia-index-{}", Uuid::new_v4()));
+    let verify = git_output(
+        &repo.repo_root,
+        &["rev-parse", "--verify", "HEAD"],
+        Some(&temp_index),
+    )
+    .await?;
+    let read_args = if verify.status.success() {
+        vec!["read-tree".to_string(), "HEAD".to_string()]
+    } else {
+        vec!["read-tree".to_string(), "--empty".to_string()]
+    };
+
+    let result = async {
+        run_git_strings(&repo.repo_root, &read_args, Some(&temp_index)).await?;
+        let mut entries = BTreeMap::<String, Option<TreeEntry>>::new();
+        for change in changes {
+            let (keep_path, keep_oid, keep_mode, remove_path) = match side {
+                JournalTreeSide::Before => (
+                    change.old_path.as_ref(),
+                    change.before_oid.as_ref(),
+                    change.before_mode.as_ref(),
+                    change
+                        .new_path
+                        .as_ref()
+                        .filter(|path| Some(*path) != change.old_path.as_ref()),
+                ),
+                JournalTreeSide::After => (
+                    change.new_path.as_ref(),
+                    change.after_oid.as_ref(),
+                    change.after_mode.as_ref(),
+                    change
+                        .old_path
+                        .as_ref()
+                        .filter(|path| Some(*path) != change.new_path.as_ref()),
+                ),
+            };
+            if let Some(path) = remove_path {
+                entries.insert(repo_path(repo, path), None);
+            }
+            if let Some(path) = keep_path {
+                let entry = match (keep_oid, keep_mode) {
+                    (Some(oid), Some(mode)) => Some(TreeEntry {
+                        mode: mode.clone(),
+                        oid: oid.clone(),
+                    }),
+                    (None, None) => None,
+                    _ => anyhow::bail!(
+                        "journal entry has incomplete object metadata: {}",
+                        path.display()
+                    ),
+                };
+                entries.insert(repo_path(repo, path), entry);
+            }
+        }
+
+        for (path, entry) in entries {
+            match entry {
+                Some(entry) => {
+                    run_git_strings(
+                        &repo.repo_root,
+                        &[
+                            "update-index".to_string(),
+                            "--add".to_string(),
+                            "--cacheinfo".to_string(),
+                            format!("{},{},{}", entry.mode, entry.oid, path),
+                        ],
+                        Some(&temp_index),
+                    )
+                    .await?;
+                }
+                None => {
+                    run_git_strings(
+                        &repo.repo_root,
+                        &[
+                            "update-index".to_string(),
+                            "--force-remove".to_string(),
+                            "--".to_string(),
+                            path,
+                        ],
+                        Some(&temp_index),
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        let output = git_output(&repo.repo_root, &["write-tree"], Some(&temp_index)).await?;
+        ensure_git_success(&output, "git write-tree")?;
+        let tree = String::from_utf8(output.stdout)?.trim().to_string();
+        if let Some(reference) = reference {
+            run_git_strings(
+                &repo.repo_root,
+                &[
+                    "update-ref".to_string(),
+                    reference.to_string(),
+                    tree.clone(),
+                ],
+                None,
+            )
+            .await?;
+        }
+        anyhow::Ok(tree)
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&temp_index).await;
+    let _ = tokio::fs::remove_file(temp_index.with_extension("lock")).await;
+    result
+}
+
+async fn write_git_blob(repo_root: &Path, contents: &[u8]) -> anyhow::Result<String> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo_root)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.envs(GIT_NONINTERACTIVE_ENVIRONMENT.iter().copied());
+    let mut child = command.spawn().context("failed to start git hash-object")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("git hash-object stdin unavailable")?;
+    stdin.write_all(contents).await?;
+    drop(stdin);
+    let output = child.wait_with_output().await?;
+    ensure_git_success(&output, "git hash-object")?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 async fn plan_file_undo(
@@ -928,58 +1222,6 @@ fn comparable_path_text(path: &str) -> String {
     } else {
         path.to_string()
     }
-}
-
-async fn capture_tree(repo: &RepoContext, reference: Option<&str>) -> anyhow::Result<String> {
-    let temp_index = std::env::temp_dir().join(format!("opentopia-index-{}", Uuid::new_v4()));
-    let verify = git_output(
-        &repo.repo_root,
-        &["rev-parse", "--verify", "HEAD"],
-        Some(&temp_index),
-    )
-    .await?;
-    let read_args = if verify.status.success() {
-        vec!["read-tree".to_string(), "HEAD".to_string()]
-    } else {
-        vec!["read-tree".to_string(), "--empty".to_string()]
-    };
-
-    let result = async {
-        run_git_strings(&repo.repo_root, &read_args, Some(&temp_index)).await?;
-        let _add = git_output_strings(
-            &repo.repo_root,
-            &[
-                "add".to_string(),
-                "-A".to_string(),
-                "--ignore-errors".to_string(),
-                "--".to_string(),
-                git_path(&repo.workspace_prefix),
-            ],
-            Some(&temp_index),
-        )
-        .await?;
-        let output = git_output(&repo.repo_root, &["write-tree"], Some(&temp_index)).await?;
-        ensure_git_success(&output, "git write-tree")?;
-        let tree = String::from_utf8(output.stdout)?.trim().to_string();
-        if let Some(reference) = reference {
-            run_git_strings(
-                &repo.repo_root,
-                &[
-                    "update-ref".to_string(),
-                    reference.to_string(),
-                    tree.clone(),
-                ],
-                None,
-            )
-            .await?;
-        }
-        anyhow::Ok(tree)
-    }
-    .await;
-
-    let _ = tokio::fs::remove_file(&temp_index).await;
-    let _ = tokio::fs::remove_file(temp_index.with_extension("lock")).await;
-    result
 }
 
 async fn capture_tree_for_paths(
@@ -1765,6 +2007,72 @@ mod tests {
             .turn_id
     }
 
+    async fn journal_mutations(
+        manager: &TurnChangeManager,
+        repo: &TestRepo,
+        thread_id: Uuid,
+        turn_id: Uuid,
+        mutations: Vec<PreparedFileMutation>,
+    ) {
+        manager
+            .record_file_mutations(
+                &FileMutationScope {
+                    thread_id,
+                    turn_id,
+                    agent_path: "/root".to_string(),
+                    workspace_root: repo.root.clone(),
+                },
+                &mutations,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn journal_write(
+        manager: &TurnChangeManager,
+        repo: &TestRepo,
+        thread_id: Uuid,
+        turn_id: Uuid,
+        path: &str,
+        contents: &str,
+    ) {
+        let target = repo.root.join(path);
+        let original = fs::read(&target).ok();
+        repo.write(path, contents);
+        journal_mutations(
+            manager,
+            repo,
+            thread_id,
+            turn_id,
+            vec![PreparedFileMutation::write(
+                target,
+                original,
+                contents.as_bytes().to_vec(),
+            )],
+        )
+        .await;
+    }
+
+    async fn journal_delete(
+        manager: &TurnChangeManager,
+        repo: &TestRepo,
+        thread_id: Uuid,
+        turn_id: Uuid,
+        path: &str,
+    ) {
+        let target = repo.root.join(path);
+        let original = fs::read(&target).unwrap();
+        fs::remove_file(&target).unwrap();
+        journal_mutations(
+            manager,
+            repo,
+            thread_id,
+            turn_id,
+            vec![PreparedFileMutation::delete(target, original)],
+        )
+        .await;
+    }
+
     #[test]
     fn git_failure_detail_prefers_actionable_errors_over_noisy_warnings() {
         let stderr = format!(
@@ -1818,7 +2126,7 @@ mod tests {
             .begin_capture(turn_id, thread_id, &repo.root)
             .await
             .unwrap();
-        repo.write("sample.txt", "after\n");
+        journal_write(&manager, &repo, thread_id, turn_id, "sample.txt", "after\n").await;
         let change_set = manager.finalize_capture(turn_id).await.unwrap();
 
         let _active_turn = manager.lock_workspace_shared(&repo.root).await;
@@ -1845,7 +2153,7 @@ mod tests {
             .begin_capture(turn_id, thread_id, &repo.root)
             .await
             .unwrap();
-        repo.write("owned.txt", "after\n");
+        journal_write(&manager, &repo, thread_id, turn_id, "owned.txt", "after\n").await;
         repo.write("unrelated.txt", "changed elsewhere\n");
 
         let changes = manager
@@ -1907,7 +2215,15 @@ mod tests {
             .begin_capture(turn_id, thread_id, &repo.root)
             .await
             .unwrap();
-        repo.write("ignored.txt", "generated output\n");
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "ignored.txt",
+            "generated output\n",
+        )
+        .await;
 
         let changes = manager
             .finalize_capture_for_paths(turn_id, &[PathBuf::from("ignored.txt")])
@@ -1938,7 +2254,7 @@ mod tests {
             .begin_capture(turn_id, thread_id, &repo.root)
             .await
             .unwrap();
-        fs::remove_file(repo.root.join("sample.txt")).unwrap();
+        journal_delete(&manager, &repo, thread_id, turn_id, "sample.txt").await;
         let change_set = manager.finalize_capture(turn_id).await.unwrap();
         repo.write("sample.txt", "later ignored contents\n");
 
@@ -1967,7 +2283,7 @@ mod tests {
             "start\n{}\nend\n",
             "x".repeat(TURN_FILE_DIFF_PAGE_BYTES + 16_000)
         );
-        repo.write("sample.txt", &after);
+        journal_write(&manager, &repo, thread_id, turn_id, "sample.txt", &after).await;
         let change_set = manager.finalize_capture(turn_id).await.unwrap();
 
         let mut offset = 0;
@@ -2018,7 +2334,15 @@ mod tests {
             .begin_capture(first, thread_id, &repo.root)
             .await
             .unwrap();
-        repo.write("sample.txt", "ONE\ntwo\nthree\n");
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            first,
+            "sample.txt",
+            "ONE\ntwo\nthree\n",
+        )
+        .await;
         manager.finalize_capture(first).await.unwrap();
         store
             .update_turn_status(first, TurnStatus::Succeeded, None)
@@ -2029,7 +2353,15 @@ mod tests {
             .begin_capture(second, thread_id, &repo.root)
             .await
             .unwrap();
-        repo.write("sample.txt", "ONE\ntwo\nTHREE\n");
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            second,
+            "sample.txt",
+            "ONE\ntwo\nTHREE\n",
+        )
+        .await;
         manager.finalize_capture(second).await.unwrap();
 
         let first_changes = store.get_turn_change_set(first).unwrap().unwrap();
@@ -2052,7 +2384,15 @@ mod tests {
             .begin_capture(turn_id, thread_id, &repo.root)
             .await
             .unwrap();
-        repo.write("sample.txt", "one\nTWO\nthree\n");
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "sample.txt",
+            "one\nTWO\nthree\n",
+        )
+        .await;
         manager.finalize_capture(turn_id).await.unwrap();
         repo.write("sample.txt", "one\nTWO LATER\nthree\n");
 
@@ -2080,8 +2420,24 @@ mod tests {
             .begin_capture(turn_id, thread_id, &repo.root)
             .await
             .unwrap();
-        repo.write("sample.txt", "agent result\n");
-        repo.write("draft.txt", "agent changed draft\n");
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "sample.txt",
+            "agent result\n",
+        )
+        .await;
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "draft.txt",
+            "agent changed draft\n",
+        )
+        .await;
         manager.finalize_capture(turn_id).await.unwrap();
 
         let changes = store.get_turn_change_set(turn_id).unwrap().unwrap();
@@ -2110,13 +2466,31 @@ mod tests {
             .begin_capture(turn_id, thread_id, &repo.root)
             .await
             .unwrap();
-        fs::remove_file(repo.root.join("deleted.txt")).unwrap();
-        fs::rename(
-            repo.root.join("old-name.txt"),
-            repo.root.join("new-name.txt"),
+        journal_delete(&manager, &repo, thread_id, turn_id, "deleted.txt").await;
+        let old_path = repo.root.join("old-name.txt");
+        let new_path = repo.root.join("new-name.txt");
+        let renamed_contents = fs::read(&old_path).unwrap();
+        fs::rename(&old_path, &new_path).unwrap();
+        journal_mutations(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            vec![
+                PreparedFileMutation::delete(&old_path, renamed_contents.clone()),
+                PreparedFileMutation::write(&new_path, None, renamed_contents),
+            ],
         )
-        .unwrap();
-        repo.write("added.txt", "remove me\n");
+        .await;
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "added.txt",
+            "remove me\n",
+        )
+        .await;
         let change_set = manager.finalize_capture(turn_id).await.unwrap();
 
         assert_eq!(change_set.status, TurnChangeSetStatus::Ready);

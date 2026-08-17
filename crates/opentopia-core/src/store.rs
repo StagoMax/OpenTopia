@@ -20,6 +20,9 @@ use crate::model::{
 };
 use crate::provider::ModelConversationMessage;
 use crate::settings::AppSettings;
+#[cfg(test)]
+use crate::store_migrations::CURRENT_DATABASE_SCHEMA_VERSION;
+use crate::store_migrations::{self, LEGACY_DATABASE_SCHEMA_VERSION};
 use crate::subagents::{SubagentExecutionContract, SubagentRun, SubagentRunStatus};
 use crate::work_form::{WorkForm, WorkFormStatus, WorkItemStatus, WorkScope};
 use anyhow::Context;
@@ -128,6 +131,14 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         thread_id: Uuid,
         goal_id: Uuid,
         status: GoalStatus,
+    ) -> anyhow::Result<Option<GoalSnapshot>>;
+    fn update_goal_definition(
+        &self,
+        thread_id: Uuid,
+        goal_id: Uuid,
+        objective: Option<String>,
+        constraints: Option<Vec<String>>,
+        acceptance: Option<Vec<String>>,
     ) -> anyhow::Result<Option<GoalSnapshot>>;
     fn upsert_work_form(&self, form: &WorkForm) -> anyhow::Result<WorkForm>;
     fn get_work_form(&self, form_id: Uuid) -> anyhow::Result<Option<WorkForm>>;
@@ -286,6 +297,21 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         thread_id: Uuid,
         response: &UserInputResponse,
     ) -> anyhow::Result<Option<UserInputRecord>>;
+    fn put_turn_checkpoint(
+        &self,
+        turn_id: Uuid,
+        thread_id: Uuid,
+        wait_kind: &str,
+        checkpoint: Value,
+    ) -> anyhow::Result<()>;
+    fn get_turn_checkpoint(
+        &self,
+        turn_id: Uuid,
+        thread_id: Uuid,
+    ) -> anyhow::Result<Option<(String, Value)>>;
+    fn delete_turn_checkpoint(&self, turn_id: Uuid, thread_id: Uuid) -> anyhow::Result<bool>;
+    fn put_turn_checkpoint_blob(&self, kind: &str, payload: Value) -> anyhow::Result<String>;
+    fn get_turn_checkpoint_blob(&self, content_hash: &str) -> anyhow::Result<Option<Value>>;
     fn get_published_agent_template_version(
         &self,
         template_id: &str,
@@ -535,11 +561,208 @@ fn open_read_connection(path: &Path) -> anyhow::Result<Connection> {
     Ok(connection)
 }
 
+fn turns_table_supports_waiting_boundaries(conn: &Connection) -> anyhow::Result<bool> {
+    let sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'turns'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Ok(["waiting_user_input", "waiting_user_action"]
+        .iter()
+        .all(|status| sql.contains(status)))
+}
+
+fn rebuild_turns_with_waiting_boundaries(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migration = conn.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+        DROP TABLE IF EXISTS turns_waiting_migration;
+        CREATE TABLE turns_waiting_migration (
+            turn_id TEXT PRIMARY KEY,
+            invocation_id INTEGER NOT NULL DEFAULT 1,
+            thread_id TEXT NOT NULL,
+            user_message_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            error TEXT,
+            CHECK(status IN (
+                'running', 'waiting_approval', 'waiting_user_input',
+                'waiting_user_action', 'cancelling', 'succeeded',
+                'failed', 'cancelled', 'interrupted'
+            )),
+            FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+        );
+        INSERT INTO turns_waiting_migration (
+            turn_id, invocation_id, thread_id, user_message_id, status,
+            started_at, updated_at, completed_at, error
+        )
+        SELECT turn_id, invocation_id, thread_id, user_message_id, status,
+               started_at, updated_at, completed_at, error
+        FROM turns;
+        DROP TABLE turns;
+        ALTER TABLE turns_waiting_migration RENAME TO turns;
+        CREATE INDEX IF NOT EXISTS idx_turns_thread_started
+            ON turns(thread_id, started_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_thread_active
+            ON turns(thread_id)
+            WHERE status IN ('running', 'cancelling');
+        COMMIT;
+        "#,
+    );
+    if migration.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    let foreign_keys = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    migration?;
+    foreign_keys?;
+
+    let foreign_key_error: Option<String> = conn
+        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+        .optional()?;
+    if let Some(table) = foreign_key_error {
+        anyhow::bail!("turns waiting-boundary migration failed for table {table}");
+    }
+    Ok(())
+}
+
+fn goals_table_has_retired_columns(conn: &Connection) -> anyhow::Result<bool> {
+    for column in ["status", "plan_revision", "completed_at"] {
+        if table_has_column(conn, "goals", column)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rebuild_goals_without_retired_columns(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migration = conn.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+        DROP TABLE IF EXISTS goals_v15;
+        CREATE TABLE goals_v15 (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            token_budget INTEGER,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            time_used_seconds INTEGER NOT NULL DEFAULT 0,
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+        );
+        INSERT INTO goals_v15 (
+            id, thread_id, objective, token_budget, tokens_used,
+            time_used_seconds, version, created_at, updated_at
+        )
+        SELECT id, thread_id, objective, token_budget, tokens_used,
+               time_used_seconds, version, created_at, updated_at
+        FROM goals;
+        DROP TABLE goals;
+        ALTER TABLE goals_v15 RENAME TO goals;
+        CREATE INDEX idx_goals_thread_updated
+            ON goals(thread_id, updated_at DESC);
+        COMMIT;
+        "#,
+    );
+    if migration.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    let foreign_keys = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    migration?;
+    foreign_keys?;
+
+    let foreign_key_error: Option<String> = conn
+        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+        .optional()?;
+    if let Some(table) = foreign_key_error {
+        anyhow::bail!("retired goal schema reconciliation failed for table {table}");
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct SqliteSessionStore {
     conn: Mutex<Connection>,
     read_connections: Vec<Mutex<Connection>>,
     next_read_connection: AtomicUsize,
+}
+
+struct CanonicalSchemaManifests {
+    legacy: store_migrations::SchemaManifest,
+    current: store_migrations::SchemaManifest,
+}
+
+fn canonical_schema_manifests() -> anyhow::Result<CanonicalSchemaManifests> {
+    let reference = SqliteSessionStore {
+        conn: Mutex::new(Connection::open_in_memory()?),
+        read_connections: Vec::new(),
+        next_read_connection: AtomicUsize::new(0),
+    };
+    reference.migrate_legacy_database()?;
+    let mut conn = reference.conn.lock().expect("sqlite mutex poisoned");
+    let legacy = store_migrations::inspect_schema(&conn)?;
+    store_migrations::validate_frozen_legacy_manifest(&legacy)?;
+    store_migrations::initialize_legacy_baseline(&mut conn)?;
+    store_migrations::apply_pending_migrations(&mut conn)?;
+    let current = store_migrations::inspect_schema(&conn)?;
+    Ok(CanonicalSchemaManifests { legacy, current })
+}
+
+fn recover_interrupted_runtime_state(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute(
+        r#"
+        UPDATE flow_runs
+        SET status = 'paused',
+            revision = revision + 1,
+            document_json = json_set(
+                document_json,
+                '$.status', 'paused',
+                '$.error', 'server restarted at a node boundary; resume after inspection',
+                '$.revision', revision + 1,
+                '$.updatedAt', ?1
+            ),
+            updated_at = ?1
+        WHERE status IN ('queued', 'running', 'pause_requested')
+        "#,
+        params![Utc::now().to_rfc3339()],
+    )?;
+    let recoverable_forms = {
+        let mut stmt =
+            conn.prepare("SELECT form_json FROM work_forms WHERE scope_kind = 'goal'")?;
+        let forms = collect_rows(stmt.query_map([], |row| {
+            let raw: String = row.get(0)?;
+            serde_json::from_str::<WorkForm>(&raw)
+                .map_err(|error| invalid_column(0, error.to_string()))
+        })?)?;
+        forms
+    };
+    for mut form in recoverable_forms {
+        let mut interrupted = false;
+        for item in &mut form.items {
+            if item.status == WorkItemStatus::InProgress {
+                item.status = WorkItemStatus::Blocked;
+                item.note = Some("server restarted during task execution".to_string());
+                interrupted = true;
+            }
+        }
+        if !interrupted {
+            continue;
+        }
+        form.status = WorkFormStatus::Blocked;
+        form.updated_at = Utc::now();
+        upsert_work_form_conn(conn, &form)?;
+    }
+    Ok(())
 }
 
 impl SqliteSessionStore {
@@ -582,9 +805,58 @@ impl SqliteSessionStore {
             .expect("sqlite read mutex poisoned")
     }
 
+    pub(crate) fn with_collaboration_read<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let connection = self.read_connection();
+        operation(&connection)
+    }
+
+    pub(crate) fn with_collaboration_write<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut connection = self.conn.lock().expect("sqlite mutex poisoned");
+        operation(&mut connection)
+    }
+
     fn migrate(&self) -> anyhow::Result<()> {
+        let has_ledger = {
+            let conn = self.conn.lock().expect("sqlite mutex poisoned");
+            let has_ledger = store_migrations::has_migration_ledger(&conn)?;
+            if has_ledger {
+                store_migrations::validate_managed_database_before_migration(&conn)?;
+            } else {
+                store_migrations::preflight_unmanaged_database(&conn)?;
+            }
+            has_ledger
+        };
+
+        if !has_ledger {
+            self.migrate_legacy_database()?;
+        }
+
+        let expected_schemas = canonical_schema_manifests()?;
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        if !has_ledger {
+            store_migrations::validate_schema_manifest(&conn, &expected_schemas.legacy)?;
+            store_migrations::validate_database_integrity(&conn)?;
+            store_migrations::initialize_legacy_baseline(&mut conn)?;
+        }
+        store_migrations::apply_pending_migrations(&mut conn)?;
+        store_migrations::verify_current_database(&conn, &expected_schemas.current)?;
+        recover_interrupted_runtime_state(&conn)?;
+        Ok(())
+    }
+
+    fn migrate_legacy_database(&self) -> anyhow::Result<()> {
         let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
         let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            schema_version <= LEGACY_DATABASE_SCHEMA_VERSION,
+            "legacy database schema version {schema_version} is newer than supported legacy version {LEGACY_DATABASE_SCHEMA_VERSION}"
+        );
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -635,8 +907,9 @@ impl SqliteSessionStore {
                 completed_at TEXT,
                 error TEXT,
                 CHECK(status IN (
-                    'running', 'waiting_approval', 'cancelling', 'succeeded',
-                    'failed', 'cancelled', 'interrupted'
+                    'running', 'waiting_approval', 'waiting_user_input',
+                    'waiting_user_action', 'cancelling', 'succeeded', 'failed',
+                    'cancelled', 'interrupted'
                 )),
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
             );
@@ -866,6 +1139,28 @@ impl SqliteSessionStore {
                 FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS turn_checkpoints (
+                turn_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                wait_kind TEXT NOT NULL CHECK(wait_kind IN (
+                    'approval', 'user_input', 'external_action'
+                )),
+                checkpoint_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE,
+                FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS turn_checkpoint_blobs (
+                content_hash TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN (
+                    'conversation', 'model_context', 'tool_catalog'
+                )),
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS app_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 settings_json TEXT NOT NULL,
@@ -1020,6 +1315,9 @@ impl SqliteSessionStore {
 
             CREATE INDEX IF NOT EXISTS idx_user_input_thread_status_created
                 ON user_input_requests(thread_id, status, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_turn_checkpoints_thread
+                ON turn_checkpoints(thread_id, updated_at DESC);
 
             CREATE INDEX IF NOT EXISTS idx_thread_mcp_servers_thread
                 ON thread_mcp_servers(thread_id, updated_at);
@@ -1314,101 +1612,51 @@ impl SqliteSessionStore {
                 "#,
             )?;
         }
+        let goals_have_retired_columns = goals_table_has_retired_columns(&conn)?;
         if schema_version < 15 {
-            if table_has_column(&conn, "goals", "status")? {
-                conn.execute_batch(
-                    r#"
-                    PRAGMA foreign_keys = OFF;
-                    DROP TABLE IF EXISTS goal_task_attempts;
-                    DROP TABLE IF EXISTS goal_tasks;
-                    DROP TABLE IF EXISTS goal_plan_revisions;
-                    CREATE TABLE goals_v15 (
-                        id TEXT PRIMARY KEY,
-                        thread_id TEXT NOT NULL,
-                        objective TEXT NOT NULL,
-                        token_budget INTEGER,
-                        tokens_used INTEGER NOT NULL DEFAULT 0,
-                        time_used_seconds INTEGER NOT NULL DEFAULT 0,
-                        version INTEGER NOT NULL DEFAULT 1,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
-                    );
-                    INSERT INTO goals_v15 (
-                        id, thread_id, objective, token_budget, tokens_used,
-                        time_used_seconds, version, created_at, updated_at
-                    )
-                    SELECT id, thread_id, objective, token_budget, tokens_used,
-                           time_used_seconds, version, created_at, updated_at
-                    FROM goals;
-                    DROP TABLE goals;
-                    ALTER TABLE goals_v15 RENAME TO goals;
-                    CREATE INDEX IF NOT EXISTS idx_goals_thread_updated
-                        ON goals(thread_id, updated_at DESC);
-                    PRAGMA foreign_keys = ON;
-                    PRAGMA user_version = 15;
-                    "#,
-                )?;
-            } else {
-                conn.execute_batch(
-                    r#"
-                    DROP TABLE IF EXISTS goal_task_attempts;
-                    DROP TABLE IF EXISTS goal_tasks;
-                    DROP TABLE IF EXISTS goal_plan_revisions;
-                    PRAGMA user_version = 15;
-                    "#,
-                )?;
+            conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS goal_task_attempts;
+                DROP TABLE IF EXISTS goal_tasks;
+                DROP TABLE IF EXISTS goal_plan_revisions;
+                "#,
+            )?;
+            if goals_have_retired_columns {
+                rebuild_goals_without_retired_columns(&conn)?;
             }
+            conn.pragma_update(None, "user_version", 15)?;
             let foreign_key_error: Option<String> = conn
                 .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
                 .optional()?;
             if let Some(table) = foreign_key_error {
                 anyhow::bail!("schema v15 foreign-key check failed for table {table}");
             }
+        } else if goals_have_retired_columns {
+            // Several development builds wrote v19 to the version pragma while
+            // retaining the pre-v15 goals table. Reconcile the actual invariant
+            // before accepting the verified baseline; the retired companion
+            // tables remain preserved as opaque historical data.
+            rebuild_goals_without_retired_columns(&conn)?;
         }
-        conn.execute(
-            r#"
-            UPDATE flow_runs
-            SET status = 'paused',
-                revision = revision + 1,
-                document_json = json_set(
-                    document_json,
-                    '$.status', 'paused',
-                    '$.error', 'server restarted at a node boundary; resume after inspection',
-                    '$.revision', revision + 1,
-                    '$.updatedAt', ?1
-                ),
-                updated_at = ?1
-            WHERE status IN ('queued', 'running', 'pause_requested')
-            "#,
-            params![Utc::now().to_rfc3339()],
-        )?;
-        let recoverable_forms = {
-            let mut stmt =
-                conn.prepare("SELECT form_json FROM work_forms WHERE scope_kind = 'goal'")?;
-            let forms = collect_rows(stmt.query_map([], |row| {
-                let raw: String = row.get(0)?;
-                serde_json::from_str::<WorkForm>(&raw)
-                    .map_err(|error| invalid_column(0, error.to_string()))
-            })?)?;
-            forms
-        };
-        for mut form in recoverable_forms {
-            let mut interrupted = false;
-            for item in &mut form.items {
-                if item.status == WorkItemStatus::InProgress {
-                    item.status = WorkItemStatus::Blocked;
-                    item.note = Some("server restarted during task execution".to_string());
-                    interrupted = true;
-                }
+        if schema_version < 16 {
+            // SQLite cannot widen an existing CHECK constraint in place.
+            if !turns_table_supports_waiting_boundaries(&conn)? {
+                rebuild_turns_with_waiting_boundaries(&conn)?;
             }
-            if !interrupted {
-                continue;
-            }
-            form.status = WorkFormStatus::Blocked;
-            form.updated_at = Utc::now();
-            upsert_work_form_conn(&conn, &form)?;
+            conn.pragma_update(None, "user_version", 16)?;
         }
+        if schema_version < LEGACY_DATABASE_SCHEMA_VERSION
+            || !turns_table_supports_waiting_boundaries(&conn)?
+        {
+            // Some development databases reached v17/v18 while retaining the
+            // pre-waiting-boundary CHECK constraint. Reconcile the actual table
+            // invariant instead of trusting the version ledger alone.
+            if !turns_table_supports_waiting_boundaries(&conn)? {
+                rebuild_turns_with_waiting_boundaries(&conn)?;
+            }
+            conn.pragma_update(None, "user_version", LEGACY_DATABASE_SCHEMA_VERSION)?;
+        }
+        recover_interrupted_runtime_state(&conn)?;
         Ok(())
     }
 
@@ -1455,6 +1703,11 @@ impl SqliteSessionStore {
                     }
                 }
                 let migrated_parallel_tool_calls = !settings.parallel_tool_calls_migrated;
+                let migrated_provider_axes = settings.providers.iter().any(|provider| {
+                    provider.transport.is_none()
+                        || provider.auth.is_none()
+                        || provider.allowed_adapters.is_empty()
+                });
                 if migrated_parallel_tool_calls {
                     for provider in &mut settings.providers {
                         provider.parallel_tool_calls = true;
@@ -1462,7 +1715,7 @@ impl SqliteSessionStore {
                     settings.parallel_tool_calls_migrated = true;
                 }
                 settings.touch();
-                if migrated_parallel_tool_calls {
+                if migrated_parallel_tool_calls || migrated_provider_axes {
                     conn.execute(
                         "UPDATE app_settings SET settings_json = ?1, updated_at = ?2 WHERE id = 1",
                         params![
@@ -3198,6 +3451,53 @@ impl SessionStore for SqliteSessionStore {
         load_goal_snapshot(&conn, goal_id)
     }
 
+    fn update_goal_definition(
+        &self,
+        thread_id: Uuid,
+        goal_id: Uuid,
+        objective: Option<String>,
+        constraints: Option<Vec<String>>,
+        acceptance: Option<Vec<String>>,
+    ) -> anyhow::Result<Option<GoalSnapshot>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let Some(snapshot) = load_goal_snapshot(&conn, goal_id)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            snapshot.goal.thread_id == thread_id,
+            "goal {goal_id} does not belong to thread {thread_id}"
+        );
+        let mut form = snapshot.work_form;
+        if let Some(objective) = objective {
+            let objective = objective.trim().to_string();
+            anyhow::ensure!(!objective.is_empty(), "goal objective cannot be empty");
+            anyhow::ensure!(
+                objective.chars().count() <= 300,
+                "goal objective exceeds 300 characters"
+            );
+            form.objective = objective;
+        }
+        if let Some(constraints) = constraints {
+            form.constraints = validate_goal_definition_list("constraints", constraints)?;
+        }
+        if let Some(acceptance) = acceptance {
+            form.acceptance = validate_goal_definition_list("acceptance", acceptance)?;
+        }
+        form.revision = form
+            .revision
+            .checked_add(1)
+            .context("WorkForm revision overflow")?;
+        form.change_reason = Some("explicit goal definition edit".to_string());
+        form.updated_at = Utc::now();
+        form.validate()?;
+        upsert_work_form_conn(&conn, &form)?;
+        conn.execute(
+            "UPDATE goals SET updated_at = ?2, version = version + 1 WHERE id = ?1",
+            params![goal_id.to_string(), form.updated_at.to_rfc3339()],
+        )?;
+        load_goal_snapshot(&conn, goal_id)
+    }
+
     fn upsert_work_form(&self, form: &WorkForm) -> anyhow::Result<WorkForm> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         anyhow::ensure!(
@@ -3461,7 +3761,9 @@ impl SessionStore for SqliteSessionStore {
             UPDATE turns
             SET invocation_id = invocation_id + 1, status = 'running',
                 updated_at = ?2, completed_at = NULL, error = NULL
-            WHERE turn_id = ?1 AND status IN ('waiting_approval', 'waiting_user_action')
+            WHERE turn_id = ?1 AND status IN (
+                'waiting_approval', 'waiting_user_input', 'waiting_user_action'
+            )
             "#,
             params![turn_id.to_string(), now.to_rfc3339()],
         )?;
@@ -4551,6 +4853,109 @@ impl SessionStore for SqliteSessionStore {
         drop(conn);
         self.get_user_input_request(request_id)
     }
+
+    fn put_turn_checkpoint(
+        &self,
+        turn_id: Uuid,
+        thread_id: Uuid,
+        wait_kind: &str,
+        checkpoint: Value,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(wait_kind, "approval" | "user_input" | "external_action"),
+            "unsupported turn checkpoint kind: {wait_kind}"
+        );
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            INSERT INTO turn_checkpoints (
+                turn_id, thread_id, wait_kind, checkpoint_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(turn_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                wait_kind = excluded.wait_kind,
+                checkpoint_json = excluded.checkpoint_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                turn_id.to_string(),
+                thread_id.to_string(),
+                wait_kind,
+                serde_json::to_string(&checkpoint)?,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_turn_checkpoint(
+        &self,
+        turn_id: Uuid,
+        thread_id: Uuid,
+    ) -> anyhow::Result<Option<(String, Value)>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let row = conn
+            .query_row(
+                r#"
+                SELECT wait_kind, checkpoint_json
+                FROM turn_checkpoints
+                WHERE turn_id = ?1 AND thread_id = ?2
+                "#,
+                params![turn_id.to_string(), thread_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        row.map(|(wait_kind, checkpoint)| {
+            Ok((wait_kind, serde_json::from_str::<Value>(&checkpoint)?))
+        })
+        .transpose()
+    }
+
+    fn delete_turn_checkpoint(&self, turn_id: Uuid, thread_id: Uuid) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        Ok(conn.execute(
+            "DELETE FROM turn_checkpoints WHERE turn_id = ?1 AND thread_id = ?2",
+            params![turn_id.to_string(), thread_id.to_string()],
+        )? > 0)
+    }
+
+    fn put_turn_checkpoint_blob(&self, kind: &str, payload: Value) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            matches!(kind, "conversation" | "model_context" | "tool_catalog"),
+            "unsupported turn checkpoint blob kind: {kind}"
+        );
+        let payload_json = serde_json::to_string(&payload)?;
+        // Domain-separate checkpoint blobs by kind. Conversation and tool
+        // catalogs can both legitimately serialize to `[]`; sharing a raw
+        // payload hash would let one blob silently acquire the other's type.
+        let hash_input = format!("{kind}\0{payload_json}");
+        let content_hash = crate::model_context::content_fingerprint(hash_input.as_bytes());
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT OR IGNORE INTO turn_checkpoint_blobs (
+                content_hash, kind, payload_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![content_hash, kind, payload_json, Utc::now().to_rfc3339(),],
+        )?;
+        Ok(content_hash)
+    }
+
+    fn get_turn_checkpoint_blob(&self, content_hash: &str) -> anyhow::Result<Option<Value>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let payload = conn
+            .query_row(
+                "SELECT payload_json FROM turn_checkpoint_blobs WHERE content_hash = ?1",
+                params![content_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        payload
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .transpose()
+    }
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
@@ -5177,6 +5582,25 @@ fn valid_goal_transition(from: GoalStatus, to: GoalStatus) -> bool {
     }
 }
 
+fn validate_goal_definition_list(field: &str, values: Vec<String>) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        values.len() <= 20,
+        "goal {field} may contain at most 20 entries"
+    );
+    values
+        .into_iter()
+        .map(|value| {
+            let value = value.trim().to_string();
+            anyhow::ensure!(!value.is_empty(), "goal {field} entries cannot be empty");
+            anyhow::ensure!(
+                value.chars().count() <= 300,
+                "goal {field} entry exceeds 300 characters"
+            );
+            Ok(value)
+        })
+        .collect()
+}
+
 fn query_goal(conn: &Connection, id: Uuid) -> anyhow::Result<Option<GoalRecord>> {
     conn.query_row(
         r#"
@@ -5193,11 +5617,15 @@ fn query_goal(conn: &Connection, id: Uuid) -> anyhow::Result<Option<GoalRecord>>
 }
 
 fn load_goal_snapshot(conn: &Connection, id: Uuid) -> anyhow::Result<Option<GoalSnapshot>> {
-    let Some(goal) = query_goal(conn, id)? else {
+    let Some(mut goal) = query_goal(conn, id)? else {
         return Ok(None);
     };
     let work_form = query_work_form_for_scope(conn, WorkScope::Goal(id))?
         .with_context(|| format!("goal {id} is missing its WorkForm"))?;
+    // The WorkForm is authoritative. Keep the legacy GoalRecord field only as
+    // a derived API projection until the persisted column can be removed by a
+    // dedicated data migration.
+    goal.objective = work_form.objective.clone();
     Ok(Some(GoalSnapshot { goal, work_form }))
 }
 
@@ -6178,6 +6606,13 @@ mod tests {
             conn.execute_batch(
                 r#"
                 DROP TABLE mcp_server_tools;
+                DROP TABLE agent_mailbox_messages;
+                DROP TABLE agent_ledger_items;
+                DROP TABLE agent_turns;
+                DROP TABLE agent_threads;
+                DROP TABLE agent_runtime_snapshots;
+                DROP TABLE agent_sessions;
+                DROP TABLE schema_migrations;
                 CREATE TABLE mcp_server_tools (
                     server_id TEXT NOT NULL,
                     public_name TEXT NOT NULL,
@@ -6190,6 +6625,7 @@ mod tests {
                     PRIMARY KEY(server_id, public_name),
                     FOREIGN KEY(server_id) REFERENCES mcp_servers(server_id) ON DELETE CASCADE
                 );
+                PRAGMA user_version = 8;
                 "#,
             )
             .expect("restore legacy MCP tool table");
@@ -6304,6 +6740,7 @@ mod tests {
                 custom_text: None,
             }],
             skipped: false,
+            cancelled: false,
         };
         let answered = store
             .resolve_user_input_request(request.request_id, thread.id, &response)
@@ -6319,6 +6756,512 @@ mod tests {
             .get_user_input_continuation(request.request_id, thread.id)
             .expect("continuation cleared")
             .is_none());
+    }
+
+    #[test]
+    fn turn_checkpoint_keeps_control_state_separate_from_deduplicated_blobs() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/checkpoint"))
+            .expect("create thread");
+        let turn = store
+            .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+            .expect("insert turn");
+        let blob = serde_json::json!([{"role": "user", "content": "stable ledger"}]);
+        let first_ref = store
+            .put_turn_checkpoint_blob("conversation", blob.clone())
+            .expect("persist blob");
+        let second_ref = store
+            .put_turn_checkpoint_blob("conversation", blob.clone())
+            .expect("deduplicate blob");
+        assert_eq!(first_ref, second_ref);
+        let other_kind_ref = store
+            .put_turn_checkpoint_blob("tool_catalog", blob.clone())
+            .expect("domain-separate blob kind");
+        assert_ne!(first_ref, other_kind_ref);
+        assert_eq!(
+            store
+                .get_turn_checkpoint_blob(&first_ref)
+                .expect("load blob"),
+            Some(blob)
+        );
+
+        let checkpoint = serde_json::json!({
+            "turnId": turn.turn_id,
+            "phase": "external_action",
+            "conversationRef": first_ref,
+        });
+        store
+            .put_turn_checkpoint(
+                turn.turn_id,
+                thread.id,
+                "external_action",
+                checkpoint.clone(),
+            )
+            .expect("persist checkpoint");
+        assert_eq!(
+            store
+                .get_turn_checkpoint(turn.turn_id, thread.id)
+                .expect("load checkpoint"),
+            Some(("external_action".to_string(), checkpoint))
+        );
+        assert!(store
+            .delete_turn_checkpoint(turn.turn_id, thread.id)
+            .expect("delete checkpoint"));
+        assert!(store
+            .get_turn_checkpoint(turn.turn_id, thread.id)
+            .expect("checkpoint deleted")
+            .is_none());
+    }
+
+    #[test]
+    fn structured_input_and_external_action_resume_the_same_turn() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/resume-boundaries"))
+            .expect("create thread");
+        let turn = store
+            .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+            .expect("insert turn");
+        store
+            .update_turn_status(turn.turn_id, TurnStatus::WaitingUserInput, None)
+            .expect("wait for input");
+        let resumed = store
+            .resume_turn_invocation(turn.turn_id)
+            .expect("resume input")
+            .expect("resumable turn");
+        assert_eq!(resumed.turn_id, turn.turn_id);
+        assert_eq!(resumed.invocation_id, 2);
+        store
+            .update_turn_status(turn.turn_id, TurnStatus::WaitingUserAction, None)
+            .expect("wait for action");
+        let resumed = store
+            .resume_turn_invocation(turn.turn_id)
+            .expect("resume action")
+            .expect("resumable turn");
+        assert_eq!(resumed.turn_id, turn.turn_id);
+        assert_eq!(resumed.invocation_id, 3);
+    }
+
+    #[test]
+    fn migration_repairs_v18_turn_constraints_without_losing_turns() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/v18-turn-migration"))
+            .expect("create thread");
+        let turn = store
+            .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+            .expect("insert turn");
+        {
+            let conn = store.conn.lock().expect("lock store");
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = OFF;
+                CREATE TABLE turns_legacy_v18 (
+                    turn_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    user_message_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    error TEXT,
+                    invocation_id INTEGER NOT NULL DEFAULT 1,
+                    CHECK(status IN (
+                        'running', 'waiting_approval', 'cancelling', 'succeeded',
+                        'failed', 'cancelled', 'interrupted'
+                    )),
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                );
+                INSERT INTO turns_legacy_v18 (
+                    turn_id, thread_id, user_message_id, status, started_at,
+                    updated_at, completed_at, error, invocation_id
+                )
+                SELECT turn_id, thread_id, user_message_id, status, started_at,
+                       updated_at, completed_at, error, invocation_id
+                FROM turns;
+                DROP TABLE turns;
+                ALTER TABLE turns_legacy_v18 RENAME TO turns;
+                CREATE INDEX idx_turns_thread_started
+                    ON turns(thread_id, started_at DESC);
+                CREATE UNIQUE INDEX idx_turns_thread_active
+                    ON turns(thread_id)
+                    WHERE status IN ('running', 'cancelling');
+                DROP TABLE agent_mailbox_messages;
+                DROP TABLE agent_ledger_items;
+                DROP TABLE agent_turns;
+                DROP TABLE agent_threads;
+                DROP TABLE agent_runtime_snapshots;
+                DROP TABLE agent_sessions;
+                DROP TABLE schema_migrations;
+                PRAGMA user_version = 18;
+                PRAGMA foreign_keys = ON;
+                "#,
+            )
+            .expect("restore v18 ledger with legacy turns constraint");
+            assert!(!turns_table_supports_waiting_boundaries(&conn)
+                .expect("inspect legacy turns table"));
+        }
+
+        store.migrate().expect("reconcile v18 turns schema");
+
+        let restored = store
+            .get_turn(turn.turn_id)
+            .expect("read preserved turn")
+            .expect("turn remains after migration");
+        assert_eq!(restored.user_message_id, turn.user_message_id);
+        store
+            .update_turn_status(turn.turn_id, TurnStatus::WaitingUserInput, None)
+            .expect("new waiting status is accepted");
+        let conn = store.conn.lock().expect("lock reconciled store");
+        let schema_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(schema_version, CURRENT_DATABASE_SCHEMA_VERSION);
+        assert!(
+            turns_table_supports_waiting_boundaries(&conn).expect("inspect reconciled turns table")
+        );
+    }
+
+    #[test]
+    fn schema_manifest_compares_indexes_by_column_identity_not_legacy_ordinal() {
+        let canonical = Connection::open_in_memory().expect("open canonical schema");
+        canonical
+            .execute_batch(
+                r#"
+                CREATE TABLE sample (a TEXT PRIMARY KEY, b TEXT, c TEXT);
+                CREATE INDEX idx_sample_a_c ON sample(a, c DESC);
+                "#,
+            )
+            .expect("create canonical schema");
+        let reordered = Connection::open_in_memory().expect("open reordered schema");
+        reordered
+            .execute_batch(
+                r#"
+                CREATE TABLE sample (c TEXT, b TEXT, a TEXT PRIMARY KEY);
+                CREATE INDEX idx_sample_a_c ON sample(a, c DESC);
+                "#,
+            )
+            .expect("create reordered schema");
+
+        assert_eq!(
+            store_migrations::inspect_schema(&canonical).expect("inspect canonical schema"),
+            store_migrations::inspect_schema(&reordered).expect("inspect reordered schema")
+        );
+    }
+
+    #[test]
+    fn migration_reconciles_mislabeled_v19_goals_and_preserves_retired_data() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/v19-goal-migration"))
+            .expect("create thread");
+        let created = store
+            .create_goal(thread.id, "Preserve the current goal".into(), Some(4096))
+            .expect("create goal");
+        {
+            let conn = store.conn.lock().expect("lock store");
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = OFF;
+                CREATE TABLE goals_legacy_v19 (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'draft', 'ready', 'active', 'paused', 'completed',
+                        'blocked', 'cancelled', 'failed'
+                    )),
+                    plan_revision INTEGER NOT NULL DEFAULT 0,
+                    token_budget INTEGER,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    time_used_seconds INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                );
+                INSERT INTO goals_legacy_v19 (
+                    id, thread_id, objective, status, plan_revision, token_budget,
+                    tokens_used, time_used_seconds, version, created_at, updated_at,
+                    completed_at
+                )
+                SELECT id, thread_id, objective, 'active', 3, token_budget,
+                       tokens_used, time_used_seconds, version, created_at, updated_at,
+                       NULL
+                FROM goals;
+                DROP TABLE goals;
+                ALTER TABLE goals_legacy_v19 RENAME TO goals;
+                CREATE INDEX idx_goals_thread_updated
+                    ON goals(thread_id, updated_at DESC);
+                CREATE TABLE evaluation_runs (
+                    run_id TEXT PRIMARY KEY,
+                    legacy_payload TEXT NOT NULL
+                );
+                INSERT INTO evaluation_runs (run_id, legacy_payload)
+                VALUES ('legacy-run', 'preserve-me');
+                DROP TABLE agent_mailbox_messages;
+                DROP TABLE agent_ledger_items;
+                DROP TABLE agent_turns;
+                DROP TABLE agent_threads;
+                DROP TABLE agent_runtime_snapshots;
+                DROP TABLE agent_sessions;
+                DROP TABLE schema_migrations;
+                PRAGMA user_version = 19;
+                PRAGMA foreign_keys = ON;
+                "#,
+            )
+            .expect("restore mislabeled v19 schema");
+        }
+
+        store.migrate().expect("reconcile mislabeled v19 schema");
+
+        let restored = store
+            .get_thread_goal(thread.id)
+            .expect("read restored goal")
+            .expect("goal remains after migration");
+        assert_eq!(restored.goal.id, created.goal.id);
+        assert_eq!(restored.goal.objective, "Preserve the current goal");
+        assert_eq!(restored.goal.token_budget, Some(4096));
+        let conn = store.conn.lock().expect("lock migrated store");
+        assert!(!table_has_column(&conn, "goals", "status").expect("inspect goal status"));
+        assert!(
+            !table_has_column(&conn, "goals", "plan_revision").expect("inspect goal plan revision")
+        );
+        assert!(!table_has_column(&conn, "goals", "completed_at").expect("inspect goal completion"));
+        let legacy_payload: String = conn
+            .query_row(
+                "SELECT legacy_payload FROM evaluation_runs WHERE run_id = 'legacy-run'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read preserved legacy evaluation");
+        assert_eq!(legacy_payload, "preserve-me");
+        let schema_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(schema_version, CURRENT_DATABASE_SCHEMA_VERSION);
+        drop(conn);
+
+        store.migrate().expect("reopen managed migrated schema");
+    }
+
+    #[test]
+    fn opening_a_future_database_version_fails_before_mutating_it() {
+        let path = temporary_db_path("future-schema");
+        {
+            let conn = Connection::open(&path).expect("create future database");
+            conn.pragma_update(None, "user_version", CURRENT_DATABASE_SCHEMA_VERSION + 1)
+                .expect("mark future schema");
+        }
+
+        let error = SqliteSessionStore::open(&path)
+            .expect_err("an older binary must not rewrite a newer database");
+        assert!(error.to_string().contains("newer than supported version"));
+
+        let conn = Connection::open(&path).expect("reopen untouched future database");
+        let schema_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read untouched schema version");
+        assert_eq!(schema_version, CURRENT_DATABASE_SCHEMA_VERSION + 1);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_ledger_records_verified_baseline_and_current_version() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let conn = store.conn.lock().expect("lock store");
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT version, name, checksum, schema_fingerprint, app_build
+                FROM schema_migrations
+                ORDER BY version
+                "#,
+            )
+            .expect("prepare migration ledger query");
+        let records = collect_rows(
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .expect("query migration ledger"),
+        )
+        .expect("read migration ledger");
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].0, LEGACY_DATABASE_SCHEMA_VERSION);
+        assert_eq!(records[0].1, "legacy_baseline_v19");
+        assert_eq!(records[1].0, 20);
+        assert_eq!(records[1].1, "verified_migration_ledger");
+        assert_eq!(records[2].0, CURRENT_DATABASE_SCHEMA_VERSION);
+        assert_eq!(records[2].1, "agent_collaboration_domain");
+        assert!(records.iter().all(|record| record.2.starts_with("sha256:")));
+        assert!(records.iter().all(|record| !record.3.is_empty()));
+        assert!(records
+            .iter()
+            .all(|record| record.4 == env!("CARGO_PKG_VERSION")));
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user version mirror");
+        assert_eq!(user_version, CURRENT_DATABASE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_ledger_is_idempotent_across_reopen() {
+        let path = temporary_db_path("migration-idempotency");
+        let before = {
+            let store = SqliteSessionStore::open(&path).expect("create managed database");
+            let conn = store.conn.lock().expect("lock store");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT version, checksum, schema_fingerprint, applied_at FROM schema_migrations ORDER BY version",
+                )
+                .expect("prepare ledger snapshot");
+            collect_rows(
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .expect("query first ledger snapshot"),
+            )
+            .expect("read first ledger snapshot")
+        };
+
+        let after = {
+            let store = SqliteSessionStore::open(&path).expect("reopen managed database");
+            let conn = store.conn.lock().expect("lock reopened store");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT version, checksum, schema_fingerprint, applied_at FROM schema_migrations ORDER BY version",
+                )
+                .expect("prepare reopened ledger snapshot");
+            collect_rows(
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .expect("query reopened ledger snapshot"),
+            )
+            .expect("read reopened ledger snapshot")
+        };
+
+        assert_eq!(before, after);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_checksum_mismatch_fails_before_mutating_database() {
+        let path = temporary_db_path("migration-checksum");
+        {
+            let store = SqliteSessionStore::open(&path).expect("create managed database");
+            drop(store);
+        }
+        {
+            let conn = Connection::open(&path).expect("open database for corruption fixture");
+            conn.execute(
+                "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = ?1",
+                params![CURRENT_DATABASE_SCHEMA_VERSION],
+            )
+            .expect("tamper migration checksum");
+        }
+
+        let error = SqliteSessionStore::open(&path)
+            .expect_err("checksum mismatch must fail before startup mutation");
+        assert!(error.to_string().contains("migration checksum mismatch"));
+
+        let conn = Connection::open(&path).expect("reopen rejected database");
+        let checksum: String = conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = ?1",
+                params![CURRENT_DATABASE_SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .expect("read untouched checksum");
+        assert_eq!(checksum, "tampered");
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_schema_drift_fails_closed_without_silent_repair() {
+        let path = temporary_db_path("schema-drift");
+        {
+            let store = SqliteSessionStore::open(&path).expect("create managed database");
+            drop(store);
+        }
+        {
+            let conn = Connection::open(&path).expect("open database for drift fixture");
+            conn.execute_batch("DROP INDEX idx_messages_thread_created;")
+                .expect("remove managed index");
+        }
+
+        let error = SqliteSessionStore::open(&path)
+            .expect_err("managed schema drift must not be silently repaired");
+        assert!(error.to_string().contains("database schema drift detected"));
+
+        let conn = Connection::open(&path).expect("reopen rejected database");
+        let index_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = 'idx_messages_thread_created')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect rejected schema");
+        assert!(
+            !index_exists,
+            "startup must not repair drift before failing"
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unknown_legacy_schema_is_not_baselined() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        {
+            let conn = store.conn.lock().expect("lock store");
+            conn.execute_batch(
+                r#"
+                DROP TABLE agent_mailbox_messages;
+                DROP TABLE agent_ledger_items;
+                DROP TABLE agent_turns;
+                DROP TABLE agent_threads;
+                DROP TABLE agent_runtime_snapshots;
+                DROP TABLE agent_sessions;
+                DROP TABLE schema_migrations;
+                CREATE TABLE unexpected_legacy_table (id TEXT PRIMARY KEY);
+                PRAGMA user_version = 19;
+                "#,
+            )
+            .expect("create unknown legacy profile");
+        }
+
+        let error = store
+            .migrate()
+            .expect_err("unknown legacy shape must not become a trusted baseline");
+        assert!(error.to_string().contains("canonical manifest"));
+        let conn = store.conn.lock().expect("lock rejected legacy store");
+        assert!(!store_migrations::has_migration_ledger(&conn).expect("inspect migration ledger"));
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read rejected legacy version");
+        assert_eq!(user_version, LEGACY_DATABASE_SCHEMA_VERSION);
     }
 
     #[test]
@@ -6515,8 +7458,19 @@ mod tests {
             let conn = store.conn.lock().expect("lock store");
             conn.execute("DELETE FROM conversation_events", [])
                 .expect("remove projected rows");
-            conn.execute_batch("PRAGMA user_version = 8;")
-                .expect("restore previous schema version");
+            conn.execute_batch(
+                r#"
+                DROP TABLE agent_mailbox_messages;
+                DROP TABLE agent_ledger_items;
+                DROP TABLE agent_turns;
+                DROP TABLE agent_threads;
+                DROP TABLE agent_runtime_snapshots;
+                DROP TABLE agent_sessions;
+                DROP TABLE schema_migrations;
+                PRAGMA user_version = 8;
+                "#,
+            )
+            .expect("restore previous schema version");
         }
 
         store.migrate().expect("rerun migration");
@@ -7514,7 +8468,7 @@ mod tests {
         let mut form = WorkForm::new(
             thread.id,
             scope,
-            created.goal.objective.clone(),
+            created.work_form.objective.clone(),
             vec![crate::work_form::WorkItem {
                 id: "implement".into(),
                 title: "Implement".into(),
@@ -7536,6 +8490,21 @@ mod tests {
         assert_eq!(snapshot.work_form.items.len(), 1);
         assert_eq!(snapshot.work_form.items[0].id, "implement");
         assert_eq!(snapshot.work_form.revision, 1);
+
+        let edited = store
+            .update_goal_definition(
+                thread.id,
+                created.goal.id,
+                Some("Ship the revised goal".into()),
+                Some(vec!["Preserve compatibility".into()]),
+                Some(vec!["All blocking work is verified".into()]),
+            )
+            .expect("edit goal definition")
+            .expect("goal");
+        assert_eq!(edited.work_form.objective, "Ship the revised goal");
+        assert_eq!(edited.goal.objective, edited.work_form.objective);
+        assert_eq!(edited.work_form.constraints.len(), 1);
+        assert_eq!(edited.work_form.acceptance.len(), 1);
 
         let paused = store
             .update_goal_status(thread.id, created.goal.id, GoalStatus::Paused)

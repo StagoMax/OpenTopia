@@ -572,7 +572,6 @@ fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-#[cfg(windows)]
 fn windows_comparison_path(path: &Path) -> String {
     let value = path_to_string(path).replace('/', "\\");
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
@@ -1240,9 +1239,10 @@ fn build_windows_sandbox_command_with_binary(
 }
 
 fn windows_path_starts_with(path: &Path, root: &Path) -> bool {
-    let path = path_to_string(path).replace('/', "\\").to_ascii_lowercase();
-    let root = path_to_string(root)
-        .replace('/', "\\")
+    let path = canonicalize_existing_ancestor(&absolute_path(path));
+    let root = canonicalize_existing_ancestor(&absolute_path(root));
+    let path = windows_comparison_path(&path).to_ascii_lowercase();
+    let root = windows_comparison_path(&root)
         .trim_end_matches('\\')
         .to_ascii_lowercase();
     path == root
@@ -1690,15 +1690,12 @@ fn seatbelt_escape(path: &Path) -> String {
 
 fn sandbox_capabilities(mode: SandboxMode) -> Vec<String> {
     let mut capabilities = vec![
-        "read_file".to_string(),
-        "search".to_string(),
+        "filesystem".to_string(),
         "shell".to_string(),
-        "git_diff".to_string(),
         "spawn_stdio".to_string(),
         "os_sandbox_preflight".to_string(),
     ];
     if mode != SandboxMode::ReadOnly {
-        capabilities.push("write_file".to_string());
         capabilities.push("apply_patch".to_string());
     }
     capabilities
@@ -2090,6 +2087,56 @@ mod tests {
         .expect("build Windows sandbox plan");
         assert!(!plan.args.windows(2).any(|args| {
             args[0] == "--runtime-root" && windows_path_starts_with(Path::new(&args[1]), &runtime)
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_containment_normalizes_verbatim_namespaces() {
+        let native_root = Path::new(r"J:\Project\OpenTopia");
+        let verbatim_root = Path::new(r"\\?\J:\Project\OpenTopia");
+        let native_runtime = Path::new(r"J:\Project\OpenTopia\apps\desktop\node_modules\.bin");
+        let verbatim_runtime =
+            Path::new(r"\\?\J:\Project\OpenTopia\apps\desktop\node_modules\.bin");
+
+        assert!(windows_path_starts_with(native_runtime, verbatim_root));
+        assert!(windows_path_starts_with(verbatim_runtime, native_root));
+        assert!(!windows_path_starts_with(
+            Path::new(r"J:\Project\OpenTopia2\node_modules\.bin"),
+            verbatim_root,
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_runtime_inside_verbatim_workspace_is_managed() {
+        let root = std::env::temp_dir().join(format!("opentopia-runtime-plan-{}", Uuid::new_v4()));
+        let runtime = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&runtime).expect("create workspace runtime");
+        let verbatim_root = root.canonicalize().expect("canonical workspace root");
+        let native_runtime = PathBuf::from(windows_comparison_path(&runtime));
+
+        assert!(verbatim_root.to_string_lossy().starts_with(r"\\?\"));
+        assert!(!native_runtime.to_string_lossy().starts_with(r"\\?\"));
+
+        let plan = build_windows_sandbox_command_with_binary(
+            std::env::current_exe().expect("current executable"),
+            "node.exe",
+            &sample_args(),
+            &verbatim_root,
+            &verbatim_root,
+            &LocalSandboxConfig::enforce(),
+            &SandboxLaunchOptions {
+                runtime_read_roots: vec![native_runtime.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("build Windows sandbox plan");
+
+        assert!(!plan.args.windows(2).any(|args| {
+            args[0] == "--runtime-root"
+                && windows_path_starts_with(Path::new(&args[1]), &native_runtime)
         }));
         let _ = std::fs::remove_dir_all(root);
     }

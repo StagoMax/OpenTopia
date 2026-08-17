@@ -96,7 +96,7 @@ impl WorkItemStatus {
     }
 
     pub fn is_resolved(self) -> bool {
-        !self.is_actionable()
+        self == Self::Completed
     }
 
     pub fn requires_note(self) -> bool {
@@ -205,31 +205,41 @@ impl WorkForm {
     }
 
     pub fn recalculate_status(&mut self) {
-        self.status =
-            if self.items.is_empty() || self.items.iter().any(|item| item.status.is_actionable()) {
-                WorkFormStatus::Active
-            } else if self
-                .items
-                .iter()
-                .any(|item| item.status == WorkItemStatus::Blocked)
-            {
-                WorkFormStatus::Blocked
-            } else if self
-                .items
-                .iter()
-                .any(|item| item.status == WorkItemStatus::Deferred)
-            {
-                WorkFormStatus::Paused
-            } else if self
-                .items
-                .iter()
-                .all(|item| item.status == WorkItemStatus::Cancelled)
-            {
-                WorkFormStatus::Cancelled
-            } else {
-                WorkFormStatus::Completed
-            };
+        let blocking = self
+            .items
+            .iter()
+            .filter(|item| item.completion_disposition == CompletionDisposition::Blocking)
+            .collect::<Vec<_>>();
+        self.status = if self.items.is_empty() {
+            WorkFormStatus::Active
+        } else if blocking.iter().any(|item| {
+            matches!(
+                item.status,
+                WorkItemStatus::Blocked | WorkItemStatus::Cancelled
+            )
+        }) {
+            WorkFormStatus::Blocked
+        } else if blocking
+            .iter()
+            .any(|item| item.status == WorkItemStatus::Deferred)
+        {
+            WorkFormStatus::Paused
+        } else if blocking.iter().any(|item| item.status.is_actionable()) {
+            WorkFormStatus::Active
+        } else {
+            // Advisory work may remain visible and continue to emit reminders;
+            // it never prevents the blocking contract from completing.
+            WorkFormStatus::Completed
+        };
         self.updated_at = Utc::now();
+    }
+
+    pub fn blocking_items_complete(&self) -> bool {
+        !self.items.is_empty()
+            && self.items.iter().all(|item| {
+                item.completion_disposition == CompletionDisposition::Advisory
+                    || item.status == WorkItemStatus::Completed
+            })
     }
 
     pub fn set_status(&mut self, status: WorkFormStatus) {
@@ -241,6 +251,10 @@ impl WorkForm {
         anyhow::ensure!(
             !self.objective.trim().is_empty(),
             "work form objective cannot be empty"
+        );
+        anyhow::ensure!(
+            self.status != WorkFormStatus::Completed || self.blocking_items_complete(),
+            "completed work form still has unresolved blocking items"
         );
         let mut ids = HashSet::new();
         let mut titles = HashSet::new();
@@ -378,7 +392,10 @@ impl WorkForm {
     }
 
     pub fn completion_signals(&self) -> Vec<CompletionSignal> {
-        if self.status != WorkFormStatus::Active {
+        if matches!(
+            self.status,
+            WorkFormStatus::Blocked | WorkFormStatus::Paused | WorkFormStatus::Cancelled
+        ) {
             return Vec::new();
         }
         if self.items.is_empty() {
@@ -447,5 +464,54 @@ mod tests {
         assert_eq!(form.completion_signals().len(), 1);
         form.status = WorkFormStatus::Blocked;
         assert!(form.completion_signals().is_empty());
+    }
+
+    #[test]
+    fn only_completed_blocking_items_satisfy_form_completion() {
+        let mut form = WorkForm::new(
+            Uuid::new_v4(),
+            WorkScope::Turn(Uuid::new_v4()),
+            "ship",
+            vec![
+                WorkItem {
+                    id: "blocking".into(),
+                    title: "Blocking".into(),
+                    status: WorkItemStatus::Cancelled,
+                    completion_disposition: CompletionDisposition::Blocking,
+                    depends_on: Vec::new(),
+                    note: Some("cannot proceed".into()),
+                    acceptance: vec!["verified".into()],
+                    evidence_refs: Vec::new(),
+                },
+                WorkItem {
+                    id: "advisory".into(),
+                    title: "Advisory".into(),
+                    status: WorkItemStatus::Pending,
+                    completion_disposition: CompletionDisposition::Advisory,
+                    depends_on: Vec::new(),
+                    note: None,
+                    acceptance: Vec::new(),
+                    evidence_refs: Vec::new(),
+                },
+            ],
+        );
+        form.recalculate_status();
+        assert_eq!(form.status, WorkFormStatus::Blocked);
+        assert!(!form.blocking_items_complete());
+
+        let blocking = form
+            .items
+            .iter_mut()
+            .find(|item| item.id == "blocking")
+            .expect("blocking item");
+        blocking.status = WorkItemStatus::Completed;
+        blocking.note = None;
+        blocking.evidence_refs = vec!["test:passed".into()];
+        form.recalculate_status();
+        assert_eq!(form.status, WorkFormStatus::Completed);
+        assert!(form.blocking_items_complete());
+        let signals = form.completion_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].disposition, CompletionDisposition::Advisory);
     }
 }

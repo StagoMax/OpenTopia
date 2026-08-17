@@ -163,10 +163,9 @@ impl Default for PromptRuntimeCapabilities {
             multi_agent_available: false,
             max_parallel_agents: 0,
             max_agent_depth: 0,
-            // Every field here describes the absence of a capability, and the
-            // structured ask is only reachable in plan mode, which is never the
-            // default. Defaulting this to `true` would make the clarification
-            // module promise a channel the runtime rejects.
+            // Every field here describes the absence of a capability.
+            // Structured decisions are model-driven in every root mode, but a
+            // runtime that did not install the tool must not promise the channel.
             request_user_input_available: false,
         }
     }
@@ -287,7 +286,7 @@ pub fn permission_policy_module(
         ContextRole::Developer,
         "opentopia:permissions",
         content,
-        ContextCacheScope::Thread,
+        ContextCacheScope::Turn,
         ContextSensitivity::Workspace,
     )
     .with_metadata(json!({
@@ -311,7 +310,10 @@ fn prompt_module(
     let cache_scope = if assembly_class == "fixed" {
         ContextCacheScope::Stable
     } else {
-        ContextCacheScope::Thread
+        // Editable and conditional modules are an epoch/tail concern. Keeping
+        // them out of the reusable prefix prevents a settings or mode change
+        // from rewriting previously cacheable bytes.
+        ContextCacheScope::Turn
     };
     ModelContextItem::text(
         ContextItemKind::DeveloperInstructions,
