@@ -1,6 +1,7 @@
 import {
   Fragment,
   memo,
+  startTransition,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -326,6 +327,7 @@ import type {
   WorkspaceTree,
   WindowsSandboxSetupStatus,
 } from "./types";
+import { reuseUnchangedAgentList } from "./agentListState";
 
 type ServerStatus = "checking" | "online" | "offline";
 
@@ -1010,7 +1012,7 @@ export function App() {
   const taskNotificationPreferencesRef = useRef(taskNotificationPreferences);
   const ingestedEventIdsRef = useRef(new Set<string>());
   const pendingEventRenderRef = useRef<AgentEvent[]>([]);
-  const eventRenderFrameRef = useRef<number | null>(null);
+  const eventRenderTimerRef = useRef<number | null>(null);
   const pendingEventCommitTraceRef = useRef(
     new Map<
       string,
@@ -1366,9 +1368,9 @@ export function App() {
 
   useEffect(
     () => () => {
-      if (eventRenderFrameRef.current !== null) {
-        window.cancelAnimationFrame(eventRenderFrameRef.current);
-        eventRenderFrameRef.current = null;
+      if (eventRenderTimerRef.current !== null) {
+        window.clearTimeout(eventRenderTimerRef.current);
+        eventRenderTimerRef.current = null;
       }
       pendingEventRenderRef.current = [];
       pendingEventCommitTraceRef.current.clear();
@@ -1697,9 +1699,9 @@ export function App() {
       }
 
       pendingEventRenderRef.current.push(event);
-      if (eventRenderFrameRef.current === null) {
-        eventRenderFrameRef.current = window.requestAnimationFrame(() => {
-          eventRenderFrameRef.current = null;
+      if (eventRenderTimerRef.current === null) {
+        eventRenderTimerRef.current = window.setTimeout(() => {
+          eventRenderTimerRef.current = null;
           const pending = pendingEventRenderRef.current.filter(
             (queuedEvent) => queuedEvent.threadId === activeThreadIdRef.current,
           );
@@ -1707,17 +1709,19 @@ export function App() {
           if (pending.length === 0) return;
 
           // Streaming events can arrive faster than the renderer can paint.
-          setEvents((current) => {
-            const merged = mergeConversationEvents(current, pending);
-            const retainedIds = new Set(merged.map((event) => event.id));
-            for (const queuedEvent of pending) {
-              if (!retainedIds.has(queuedEvent.id)) {
-                pendingEventCommitTraceRef.current.delete(queuedEvent.id);
+          startTransition(() => {
+            setEvents((current) => {
+              const merged = mergeConversationEvents(current, pending);
+              const retainedIds = new Set(merged.map((event) => event.id));
+              for (const queuedEvent of pending) {
+                if (!retainedIds.has(queuedEvent.id)) {
+                  pendingEventCommitTraceRef.current.delete(queuedEvent.id);
+                }
               }
-            }
-            return merged;
+              return merged;
+            });
           });
-        });
+        }, 32);
       }
 
       if (event.payload.type === "assistant_message") {
@@ -2214,6 +2218,8 @@ export function App() {
     let source: StreamHandle | null = null;
     let agentSource: StreamHandle | null = null;
     let agentRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let agentRefreshInFlight = false;
+    let agentRefreshQueued = false;
     const controller = new AbortController();
     const openAgentStream = (items: AgentListItem[]) => {
       if (agentSource || items.length === 0) return;
@@ -2228,11 +2234,16 @@ export function App() {
       );
     };
     const refreshAgents = () => {
+      if (agentRefreshInFlight) {
+        agentRefreshQueued = true;
+        return;
+      }
+      agentRefreshInFlight = true;
       void client
         .listAgents(threadId, controller.signal)
         .then((items) => {
           if (cancelled) return;
-          setAgentItems(items);
+          setAgentItems((current) => reuseUnchangedAgentList(current, items));
           openAgentStream(items);
         })
         .catch((error) => {
@@ -2240,6 +2251,13 @@ export function App() {
             setServerError(
               error instanceof Error ? error.message : String(error),
             );
+          }
+        })
+        .finally(() => {
+          agentRefreshInFlight = false;
+          if (agentRefreshQueued && !cancelled) {
+            agentRefreshQueued = false;
+            scheduleAgentRefresh();
           }
         });
     };
@@ -2311,7 +2329,9 @@ export function App() {
           nextEvents.at(-1)?.seq,
           (event) => {
             ingestEvent(event);
-            scheduleAgentRefresh();
+            if (!agentSource && event.payload.type === "turn_started") {
+              scheduleAgentRefresh();
+            }
           },
         );
       })
@@ -2369,7 +2389,9 @@ export function App() {
             pendingApprovals.map((approval) => approval.approvalId),
           );
           setPendingUserInput(pendingPlanningInput);
-          setAgentItems(loadedAgents);
+          setAgentItems((current) =>
+            reuseUnchangedAgentList(current, loadedAgents),
+          );
           openAgentStream(loadedAgents);
           setGoalSnapshot(loadedGoal);
         },

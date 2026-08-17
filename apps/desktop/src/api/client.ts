@@ -1,6 +1,7 @@
 import type {
   AgentInstance,
   AgentInstanceStatus,
+  AgentActivityNotification,
   AgentModelPolicy,
   AgentTemplateSpec,
   AgentTemplateVersionView,
@@ -184,6 +185,17 @@ export class ApiClient {
     ok: boolean;
     service: string;
     apiVersion: number;
+    shellRuntime: {
+      runtime: {
+        program: string;
+        dialect: "power_shell7" | "windows_power_shell51" | "posix_sh";
+        version: string | null;
+        source: "configured" | "managed" | "standard_install" | "path" | "system";
+      };
+      managedVersion: string;
+      managedStatus: "not_required" | "pending" | "downloading" | "ready" | "disabled" | "failed";
+      managedError?: string;
+    };
   }> {
     return this.get("/health");
   }
@@ -732,7 +744,8 @@ export class ApiClient {
     input: {
       operation: MediaHandlerOperation;
       contributionId?: string;
-      path: string;
+      path?: string;
+      resourceId?: string;
       contentType?: string;
       options?: Record<string, unknown>;
     },
@@ -1654,12 +1667,13 @@ export class ApiClient {
   openAgentEventStream(
     threadId: string,
     since: number | undefined,
-    onEvent: (event: AgentEvent) => void,
+    onEvent: (notification: AgentActivityNotification) => void,
   ): StreamHandle {
     const query = queryString({ since });
     return this.openAuthenticatedSse(
       `/api/threads/${threadId}/agents/events/stream${query}`,
-      (data) => onEvent(JSON.parse(data) as AgentEvent),
+      (data) => onEvent(JSON.parse(data) as AgentActivityNotification),
+      "projected",
     );
   }
 

@@ -60,8 +60,12 @@ export type MarkdownContentProps = {
   text: string;
   className?: string;
   streaming?: boolean;
+  /** Resource path used to resolve relative links and images. */
+  baseResourcePath?: string | null;
+  /** @deprecated Use baseResourcePath for new resource-backed views. */
   baseWorkspacePath?: string | null;
   onOpenLink?(href: string): void;
+  onResolveImage?(href: string): Promise<Blob | null>;
   attachmentSources?: readonly ContextSourceRef[];
   onOpenAttachment?(source: ContextSourceRef): void;
   renderTrace?: ConversationMarkdownTraceContext;
@@ -72,9 +76,11 @@ type RemarkPlugins = Options["remarkPlugins"];
 type MarkdownLinkContextValue = Pick<
   MarkdownContentProps,
   | "attachmentSources"
+  | "baseResourcePath"
   | "baseWorkspacePath"
   | "onOpenAttachment"
   | "onOpenLink"
+  | "onResolveImage"
   | "streaming"
 >;
 
@@ -90,8 +96,10 @@ export function MarkdownContent({
   text,
   className = "",
   streaming = false,
+  baseResourcePath,
   baseWorkspacePath,
   onOpenLink,
+  onResolveImage,
   attachmentSources = [],
   onOpenAttachment,
   renderTrace,
@@ -106,9 +114,11 @@ export function MarkdownContent({
     <MarkdownLinkContext.Provider
       value={{
         attachmentSources,
+        baseResourcePath,
         baseWorkspacePath,
         onOpenAttachment,
         onOpenLink,
+        onResolveImage,
         streaming,
       }}
     >
@@ -221,6 +231,7 @@ function MarkdownAnchor({
 }: AnchorHTMLAttributes<HTMLAnchorElement>) {
   const {
     attachmentSources = [],
+    baseResourcePath,
     baseWorkspacePath,
     onOpenAttachment,
     onOpenLink,
@@ -231,7 +242,7 @@ function MarkdownAnchor({
     : undefined;
   const detectedLinkInfo = href ? decodeFilePathHref(href) : null;
   const linkInfo = href
-    ? resolveMarkdownFileLink(href, baseWorkspacePath)
+    ? resolveMarkdownFileLink(href, baseResourcePath ?? baseWorkspacePath)
     : null;
   const workspaceLinkPath =
     linkInfo?.kind === "workspace" ? linkInfo.path : null;
@@ -401,7 +412,40 @@ function MarkdownImage({
   alt,
   ...props
 }: ImgHTMLAttributes<HTMLImageElement>) {
-  const safeSrc = src ? defaultUrlTransform(src) : "";
+  const { baseResourcePath, baseWorkspacePath, onResolveImage } =
+    useContext(MarkdownLinkContext);
+  const basePath = baseResourcePath ?? baseWorkspacePath;
+  const fileTarget = src ? resolveMarkdownFileLink(src, basePath) : null;
+  const [resolvedSrc, setResolvedSrc] = useState<string | null>(null);
+  const shouldResolve = Boolean(src && fileTarget && onResolveImage);
+
+  useEffect(() => {
+    let disposed = false;
+    let objectUrl: string | null = null;
+    setResolvedSrc(null);
+    if (!src || !shouldResolve || !onResolveImage) return;
+
+    void onResolveImage(src)
+      .then((blob) => {
+        if (!blob || disposed) return;
+        objectUrl = URL.createObjectURL(blob);
+        setResolvedSrc(objectUrl);
+      })
+      .catch(() => {
+        // Broken relative images degrade to their alt text. The surrounding
+        // document remains readable and explicit file links stay actionable.
+      });
+    return () => {
+      disposed = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [onResolveImage, shouldResolve, src]);
+
+  const safeSrc = shouldResolve
+    ? (resolvedSrc ?? "")
+    : src
+      ? defaultUrlTransform(src)
+      : "";
   if (!safeSrc) return <span className="markdown-image-alt">{alt}</span>;
   return (
     <img

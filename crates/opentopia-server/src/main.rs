@@ -23,22 +23,23 @@ use opentopia_core::AgentResumeSignal;
 use opentopia_core::PreviewTarget;
 use opentopia_core::{
     agent_model_context_with_runtime, browser_handoff_for_node, configured_provider_from_settings,
-    content_fingerprint, discover_plugins, discover_skills, execute_git_workflow,
-    experience_mode_module, install_plugin, load_context_source_metadata, load_plugin_mcp_servers,
-    load_selected_skills, negotiate_provider_settings, permission_policy_module,
-    redact_model_observation, remove_windows_sandbox, resolve_instruction_documents,
-    setup_windows_sandbox, tool_result_is_error, uninstall_plugin, windows_sandbox_setup_status,
-    world_state_catalog_item, AgentContextBudget, AgentContinuation, AgentContinuationState,
-    AgentCore, AgentEvent, AgentEventPayload, AgentInstanceStatusV1, AgentInstanceV1,
-    AgentProfileRegistry, AgentRuntimeSettings, AgentTemplateVersionV1, AgentTurnInput,
-    AgentTurnOutcome, AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    BasicPolicyEngine, BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
-    BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
-    BrowserObserveOptions, BrowserOutput, BrowserRuntimeRoute, BrowserSelector, BrowserSessionId,
-    BrowserSessionSpec, BrowserTargetRef, BrowserWaitCondition, BrowserWaitRequest,
-    CanonicalModelRequest, ChangedFile, CodexAccountStatus, CodexLoginStart, CollaborationMode,
-    CompiledModelContext, ComputerSessionId, ContextAssembler, ContextAssemblyInput,
-    ContextCacheScope, ContextCheckpoint, ContextCheckpointArtifact, ContextCheckpointCommand,
+    content_fingerprint, current_shell_runtime, current_shell_runtime_status, discover_plugins,
+    discover_skills, execute_git_workflow, experience_mode_module, install_plugin,
+    load_context_source_metadata, load_plugin_mcp_servers, load_selected_skills,
+    negotiate_provider_settings, permission_policy_module, redact_model_observation,
+    remove_windows_sandbox, resolve_instruction_documents, setup_windows_sandbox,
+    tool_result_is_error, uninstall_plugin, windows_sandbox_setup_status, world_state_catalog_item,
+    AgentContextBudget, AgentContinuation, AgentContinuationState, AgentCore, AgentEvent,
+    AgentEventPayload, AgentInstanceStatusV1, AgentInstanceV1, AgentProfileRegistry,
+    AgentRuntimeSettings, AgentTemplateVersionV1, AgentTurnInput, AgentTurnOutcome, AppSettings,
+    Approval, ApprovalStatus, Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserAction,
+    BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
+    BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
+    BrowserRuntimeRoute, BrowserSelector, BrowserSessionId, BrowserSessionSpec, BrowserTargetRef,
+    BrowserWaitCondition, BrowserWaitRequest, CanonicalModelRequest, ChangedFile,
+    CodexAccountStatus, CodexLoginStart, CollaborationMode, CompiledModelContext,
+    ComputerSessionId, ContextAssembler, ContextAssemblyInput, ContextCacheScope,
+    ContextCheckpoint, ContextCheckpointArtifact, ContextCheckpointCommand,
     ContextCheckpointCoverage, ContextCheckpointFact, ContextCheckpointInteraction,
     ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
     ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextItemKind,
@@ -56,8 +57,8 @@ use opentopia_core::{
     ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck, ProviderKind,
     ProviderModelGateway, ProviderSettings, ProviderToolCall, ProviderToolResult,
     ProviderTransportEvent, ProviderTransportKind, ResolvedPreview, ResourceLimit, RuntimeSurface,
-    SandboxDescriptor, SandboxSettings, SessionStore, SkillDescriptor, SkillRef,
-    SqliteSessionStore, StoreError, TerminalCommandHistory, TerminalCommandStatus,
+    SandboxDescriptor, SandboxSettings, SessionStore, ShellRuntimeStatus, SkillDescriptor,
+    SkillRef, SqliteSessionStore, StoreError, TerminalCommandHistory, TerminalCommandStatus,
     ThreadContextSnapshot, ThreadMcpServer, ThreadModelSelection, Tool, ToolCall,
     ToolInvocationContext, ToolPermissionDescriptor, ToolResult, ToolStateStore, TurnChangeSet,
     TurnChangeSetStatus, TurnContextSnapshot, TurnInboxItem, TurnRecord, TurnStatus,
@@ -70,7 +71,7 @@ use opentopia_core::{
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::path::{Path as FsPath, PathBuf};
@@ -541,6 +542,7 @@ async fn health() -> Json<HealthResponse> {
         ok: true,
         service: "opentopia-server",
         api_version: 1,
+        shell_runtime: current_shell_runtime_status(),
     })
 }
 
@@ -1979,6 +1981,7 @@ async fn delete_thread(
             "thread not found: {thread_id}"
         )));
     }
+    state.resources.release_thread(thread_id);
     Ok(Json(DeleteResponse { deleted }))
 }
 
@@ -4973,54 +4976,57 @@ async fn stream_agent_events(
         .collaboration_repository
         .find_session_by_user_task_id(thread_id)?
         .ok_or_else(|| ApiError::not_found("collaboration session has not started"))?;
-    let history = state
-        .collaboration_repository
-        .list_session_activity_events(session.id, query.since)?;
-    let cursor = history
-        .last()
-        .map(|event| event.seq)
-        .unwrap_or_else(|| query.since.unwrap_or_default());
-    let stream_state = (state, session.id, cursor, VecDeque::from(history));
-    let event_stream = stream::unfold(
-        stream_state,
-        |(state, session_id, mut cursor, mut pending)| async move {
-            loop {
-                if let Some(event) = pending.pop_front() {
-                    cursor = cursor.max(event.seq);
+    let cursor = query.since.unwrap_or_default();
+    let stream_state = (state, session.id, cursor);
+    let event_stream = stream::unfold(stream_state, |(state, session_id, mut cursor)| async move {
+        loop {
+            let changed = state
+                .agent_activity
+                .wait_for_change(session_id, None, Some(cursor), Duration::from_secs(30))
+                .await;
+            match changed {
+                Ok(Some(agent_thread_id)) => {
+                    let next_cursor = match state
+                        .collaboration_repository
+                        .latest_session_activity_cursor(session_id)
+                    {
+                        Ok(next_cursor) if next_cursor > cursor => next_cursor,
+                        Ok(_) => continue,
+                        Err(error) => {
+                            let sse = Event::default().event("error").data(error.to_string());
+                            return Some((Ok(sse), (state, session_id, cursor)));
+                        }
+                    };
+                    cursor = next_cursor;
+                    let notification = AgentActivityNotification {
+                        seq: cursor,
+                        agent_thread_id,
+                    };
                     let sse = Event::default()
-                        .id(event.seq.to_string())
-                        .event(sse_event_name(event.kind()))
-                        .json_data(event)
-                        .expect("Agent event should serialize");
-                    return Some((Ok(sse), (state, session_id, cursor, pending)));
+                        .id(cursor.to_string())
+                        .event("activity")
+                        .json_data(notification)
+                        .expect("Agent activity notification should serialize");
+                    return Some((Ok(sse), (state, session_id, cursor)));
                 }
-                let changed = state
-                    .agent_activity
-                    .wait_for_change(session_id, None, Some(cursor), Duration::from_secs(30))
-                    .await;
-                match changed {
-                    Ok(Some(_)) => {
-                        pending = VecDeque::from(
-                            state
-                                .collaboration_repository
-                                .list_session_activity_events(session_id, Some(cursor))
-                                .unwrap_or_default(),
-                        );
-                    }
-                    Ok(None) => continue,
-                    Err(error) => {
-                        let sse = Event::default().event("error").data(error.to_string());
-                        return Some((Ok(sse), (state, session_id, cursor, pending)));
-                    }
+                Ok(None) => continue,
+                Err(error) => {
+                    let sse = Event::default().event("error").data(error.to_string());
+                    return Some((Ok(sse), (state, session_id, cursor)));
                 }
             }
-        },
-    );
+        }
+    });
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
 fn project_conversation_event(mut event: AgentEvent) -> Option<AgentEvent> {
-    match &mut event.payload {
+    event.payload = project_conversation_payload(event.payload)?;
+    Some(event)
+}
+
+fn project_conversation_payload(mut payload: AgentEventPayload) -> Option<AgentEventPayload> {
+    match &mut payload {
         AgentEventPayload::ReasoningDelta { .. } => return None,
         AgentEventPayload::ModelContextBuilt { items, .. } => items.clear(),
         AgentEventPayload::ModelRequest { request, .. } => *request = Value::Null,
@@ -5030,7 +5036,7 @@ fn project_conversation_event(mut event: AgentEvent) -> Option<AgentEvent> {
         AgentEventPayload::ToolCallFinished { result } => result.content.clear(),
         _ => {}
     }
-    Some(event)
+    Some(payload)
 }
 
 fn replay_then_live_events(
@@ -5333,7 +5339,11 @@ fn spawn_pty_session(
 
 fn interactive_shell() -> (String, Vec<String>) {
     if cfg!(windows) {
-        ("powershell.exe".to_string(), vec!["-NoProfile".to_string()])
+        let runtime = current_shell_runtime();
+        (
+            runtime.program.to_string_lossy().into_owned(),
+            vec!["-NoProfile".to_string()],
+        )
     } else {
         (
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
@@ -5387,8 +5397,9 @@ async fn start_terminal_command(
     // environment and its sandbox; wrapping the user's terminal here only adds
     // ACL setup latency and can serialize it behind unrelated agent work.
     let (program, args) = if cfg!(windows) {
+        let runtime = current_shell_runtime();
         (
-            "powershell.exe",
+            runtime.program.to_string_lossy().into_owned(),
             vec![
                 "-NoProfile".to_string(),
                 "-ExecutionPolicy".to_string(),
@@ -5398,7 +5409,7 @@ async fn start_terminal_command(
             ],
         )
     } else {
-        ("sh", vec!["-lc".to_string(), command.clone()])
+        ("sh".to_string(), vec!["-lc".to_string(), command.clone()])
     };
     let mut process = Command::new(program);
     for key in SENSITIVE_CHILD_ENV_KEYS {
@@ -6779,6 +6790,7 @@ fn publish_payloads(
     // The Agent activity ledger is the durable execution event source. The
     // product conversation event stream is a root-only UI/SSE projection and
     // is therefore appended after the canonical event batch.
+    let mut canonical_activity_persisted = false;
     if let Some(turn_id) = turn_id {
         let collaboration_turn_id = AgentTurnId::from_uuid(turn_id);
         match state
@@ -6793,7 +6805,10 @@ fn publish_payloads(
                 payloads.clone(),
                 None,
             ) {
-                Ok(_) => state.agent_activity.notify(turn.agent_thread_id),
+                Ok(_) => {
+                    canonical_activity_persisted = true;
+                    state.agent_activity.notify(turn.agent_thread_id);
+                }
                 Err(error) => error!(
                     ?error,
                     agent_turn_id = %turn.id,
@@ -6810,6 +6825,13 @@ fn publish_payloads(
     }
     let events = payloads
         .into_iter()
+        .filter_map(|payload| {
+            if canonical_activity_persisted {
+                project_conversation_payload(payload)
+            } else {
+                Some(payload)
+            }
+        })
         .map(|payload| AgentEvent::new(thread_id, turn_id, 0, payload))
         .collect();
     match state.store.append_events(events) {
@@ -7464,7 +7486,8 @@ async fn run_new_agent_turn(
                         payloads,
                         &mut deferred_wait_events,
                         true,
-                    );
+                    )
+                    .await;
                 }
                 finalize_turn_change_capture(&state, thread_id, turn_id).await;
                 finalize_goal_after_turn(
@@ -7494,7 +7517,8 @@ async fn run_new_agent_turn(
                         payloads,
                         &mut deferred_wait_events,
                         false,
-                    );
+                    )
+                    .await;
                 }
             }
         }
@@ -7511,7 +7535,8 @@ async fn run_new_agent_turn(
             payloads,
             &mut deferred_wait_events,
             false,
-        );
+        )
+        .await;
     }
     let approval_persistence =
         persist_deferred_approval_records(&state, thread_id, &deferred_wait_events);
@@ -7704,7 +7729,8 @@ async fn run_resumed_agent_turn(
                         payloads,
                         &mut deferred_wait_events,
                         true,
-                    );
+                    )
+                    .await;
                 }
                 finalize_turn_change_capture(&state, thread_id, turn_id).await;
                 finalize_goal_after_turn(
@@ -7734,7 +7760,8 @@ async fn run_resumed_agent_turn(
                         payloads,
                         &mut deferred_wait_events,
                         false,
-                    );
+                    )
+                    .await;
                 }
             }
         }
@@ -7751,7 +7778,8 @@ async fn run_resumed_agent_turn(
             payloads,
             &mut deferred_wait_events,
             false,
-        );
+        )
+        .await;
     }
     let approval_persistence =
         persist_deferred_approval_records(&state, thread_id, &deferred_wait_events);
@@ -8463,6 +8491,7 @@ fn persist_and_publish_payloads(
 }
 
 const EVENT_PERSIST_BATCH_SIZE: usize = 256;
+const STREAM_EVENT_CHUNK_BYTES: usize = 8 * 1024;
 
 fn take_available_payload_batch(
     receiver: &mut mpsc::UnboundedReceiver<AgentEventPayload>,
@@ -8481,7 +8510,7 @@ fn take_available_payload_batch(
     payloads
 }
 
-fn persist_received_payload_batch(
+async fn persist_received_payload_batch(
     state: &AppState,
     thread_id: Uuid,
     turn_id: Uuid,
@@ -8505,7 +8534,45 @@ fn persist_received_payload_batch(
             durable_payloads.push(payload);
         }
     }
-    persist_and_publish_payloads(state, thread_id, turn_id, durable_payloads);
+    let durable_payloads = compact_stream_payload_batch(durable_payloads);
+    if durable_payloads.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        persist_and_publish_payloads(&state, thread_id, turn_id, durable_payloads);
+    })
+    .await
+    {
+        error!(?error, %thread_id, %turn_id, "event persistence worker failed");
+    }
+}
+
+fn compact_stream_payload_batch(payloads: Vec<AgentEventPayload>) -> Vec<AgentEventPayload> {
+    let mut compacted = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let merged = match (compacted.last_mut(), &payload) {
+            (
+                Some(AgentEventPayload::ModelDelta { text: current }),
+                AgentEventPayload::ModelDelta { text },
+            ) if current.len().saturating_add(text.len()) <= STREAM_EVENT_CHUNK_BYTES => {
+                current.push_str(text);
+                true
+            }
+            (
+                Some(AgentEventPayload::ReasoningDelta { text: current }),
+                AgentEventPayload::ReasoningDelta { text },
+            ) if current.len().saturating_add(text.len()) <= STREAM_EVENT_CHUNK_BYTES => {
+                current.push_str(text);
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            compacted.push(payload);
+        }
+    }
+    compacted
 }
 
 fn is_wait_boundary(payload: &AgentEventPayload) -> bool {
@@ -12298,6 +12365,7 @@ struct HealthResponse {
     service: &'static str,
     #[serde(rename = "apiVersion")]
     api_version: u32,
+    shell_runtime: ShellRuntimeStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -12710,6 +12778,13 @@ enum EventView {
 struct EventQuery {
     since: Option<i64>,
     view: Option<EventView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentActivityNotification {
+    seq: i64,
+    agent_thread_id: AgentThreadId,
 }
 
 #[derive(Debug, Deserialize)]
@@ -14863,6 +14938,22 @@ mod tests {
     }
 
     #[test]
+    fn resource_resolve_contract_accepts_an_absolute_local_path_at_registration() {
+        let path = PathBuf::from(r"C:\Users\Stargo\Downloads\说明.md");
+        let request: ResourceResolveRequest = serde_json::from_value(json!({
+            "source": "local",
+            "path": path,
+        }))
+        .expect("deserialize local resource request");
+        assert_eq!(
+            request.into_locator(),
+            ResourceLocator::Local {
+                path: PathBuf::from(r"C:\Users\Stargo\Downloads\说明.md"),
+            }
+        );
+    }
+
+    #[test]
     fn project_patch_distinguishes_missing_null_and_value_workspace() {
         let missing: UpdateProjectRequest =
             serde_json::from_value(json!({})).expect("deserialize missing workspace");
@@ -15246,6 +15337,34 @@ mod tests {
         );
 
         assert!(project_conversation_event(event).is_none());
+    }
+
+    #[test]
+    fn stream_payload_batches_merge_only_adjacent_compatible_deltas() {
+        let payloads = compact_stream_payload_batch(vec![
+            AgentEventPayload::ModelDelta {
+                text: "hello ".to_string(),
+            },
+            AgentEventPayload::ModelDelta {
+                text: "world".to_string(),
+            },
+            AgentEventPayload::Error {
+                message: "boundary".to_string(),
+            },
+            AgentEventPayload::ModelDelta {
+                text: "after boundary".to_string(),
+            },
+        ]);
+
+        assert_eq!(payloads.len(), 3);
+        assert!(matches!(
+            &payloads[0],
+            AgentEventPayload::ModelDelta { text } if text == "hello world"
+        ));
+        assert!(matches!(
+            &payloads[2],
+            AgentEventPayload::ModelDelta { text } if text == "after boundary"
+        ));
     }
 
     #[test]

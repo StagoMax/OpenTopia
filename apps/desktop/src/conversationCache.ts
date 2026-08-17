@@ -26,30 +26,50 @@ export function mergeConversationEvents(
   incoming: AgentEvent[],
 ): AgentEvent[] {
   if (incoming.length === 0) return current;
+  const currentTailSeq = current.at(-1)?.seq ?? Number.NEGATIVE_INFINITY;
+  let previousSeq = currentTailSeq;
+  const appendOnly = incoming.every((event) => {
+    const ordered = event.seq > previousSeq;
+    previousSeq = event.seq;
+    return ordered;
+  });
+  if (appendOnly) {
+    const compacted = [...current];
+    for (const event of incoming) appendCompactedEvent(compacted, event);
+    return compacted;
+  }
+
   const byId = new Map(current.map((event) => [event.id, event]));
   for (const event of incoming) byId.set(event.id, event);
-  const ordered = [...byId.values()].sort((left, right) => left.seq - right.seq);
+  const ordered = [...byId.values()].sort(
+    (left, right) => left.seq - right.seq,
+  );
   const compacted: AgentEvent[] = [];
-  for (const event of ordered) {
-    const previous = compacted.at(-1);
-    if (
-      previous?.payload.type === "model_delta" &&
-      event.payload.type === "model_delta" &&
-      previous.threadId === event.threadId &&
-      previous.turnId === event.turnId
-    ) {
-      compacted[compacted.length - 1] = {
-        ...event,
-        payload: {
-          type: "model_delta",
-          text: previous.payload.text + event.payload.text,
-        },
-      };
-      continue;
-    }
-    compacted.push(event);
-  }
+  for (const event of ordered) appendCompactedEvent(compacted, event);
   return compacted;
+}
+
+function appendCompactedEvent(
+  compacted: AgentEvent[],
+  event: AgentEvent,
+): void {
+  const previous = compacted.at(-1);
+  if (
+    previous?.payload.type === "model_delta" &&
+    event.payload.type === "model_delta" &&
+    previous.threadId === event.threadId &&
+    previous.turnId === event.turnId
+  ) {
+    compacted[compacted.length - 1] = {
+      ...event,
+      payload: {
+        type: "model_delta",
+        text: previous.payload.text + event.payload.text,
+      },
+    };
+    return;
+  }
+  compacted.push(event);
 }
 
 export function cacheConversation(

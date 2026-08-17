@@ -1399,6 +1399,46 @@ mod tests {
     }
 
     #[test]
+    fn registered_media_source_brokers_local_bytes_without_exposing_the_path() {
+        let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
+        let workspace = std::env::temp_dir().join(format!(
+            "opentopia-media-handler-resource-workspace-{}",
+            Uuid::new_v4()
+        ));
+        let local_root = std::env::temp_dir().join(format!(
+            "opentopia-media-handler-resource-local-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&local_root).expect("create local directory");
+        let local_path = local_root.join("outside.md");
+        std::fs::write(&local_path, b"local resource").expect("write local resource");
+        let thread = store
+            .create_thread(Some("resource".to_string()), workspace.clone())
+            .expect("create thread");
+        let state = test_state(store);
+        let lease = state.resources.register(
+            thread.id,
+            crate::resource_registry::ResourceLocator::Local {
+                path: local_path.clone(),
+            },
+        );
+        let resource_id = crate::resource_registry::resource_preview_id(lease.id);
+
+        let source = resolve_registered_media_source(&state, thread.id, &resource_id)
+            .expect("resolve registered source");
+        assert_eq!(
+            source.brokered_content.as_deref(),
+            Some(b"local resource".as_slice())
+        );
+        assert_eq!(path_for_protocol(&source.protocol_path), "outside.md");
+        assert!(!path_for_protocol(&source.protocol_path).contains(&path_for_protocol(&local_root)));
+
+        std::fs::remove_dir_all(workspace).unwrap();
+        std::fs::remove_dir_all(local_root).unwrap();
+    }
+
+    #[test]
     fn mcp_media_handler_requires_explicit_workspace_read_permission() {
         let mut handler = contribution(
             ContributionKind::ContextLoader,

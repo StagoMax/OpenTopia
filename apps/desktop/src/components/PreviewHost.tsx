@@ -1,4 +1,12 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   AlertCircle,
   ExternalLink,
@@ -14,6 +22,7 @@ import {
 } from "lucide-react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { ApiResponseError, type ApiClient } from "../api/client";
+import { resolveMarkdownLink } from "../markdownLinks";
 import { openPath } from "../platform";
 import type {
   InlineImageAttachment,
@@ -110,7 +119,11 @@ export function PreviewHost({
 
     return () => {
       disposed = true;
-      if (resolved) void client.closePreview(resolved.threadId, resolved.id);
+      if (resolved) {
+        void client
+          .closePreview(resolved.threadId, resolved.id)
+          .catch(() => undefined);
+      }
     };
   }, [client, reloadKey, target, threadId]);
 
@@ -262,7 +275,15 @@ function PreviewRenderer({
         </Suspense>
       );
     case "unsupported":
-      return <UnsupportedPreview descriptor={descriptor} />;
+      return descriptor.handlerId ? (
+        <PluginPreview
+          client={client}
+          descriptor={descriptor}
+          onOpenMarkdownLink={onOpenMarkdownLink}
+        />
+      ) : (
+        <UnsupportedPreview descriptor={descriptor} />
+      );
     case "web":
       return (
         <PreviewStatus icon="empty" title="Open this URL in the browser tab." />
@@ -406,6 +427,12 @@ function MarkdownDocumentView({
   const [message, setMessage] = useState<string | null>(null);
   const currentRef = useRef({ draft, baseline, revision });
   const dirty = draft !== baseline;
+
+  const resolveImage = useResourceImageResolver(
+    client,
+    descriptor.threadId,
+    baseResourcePath,
+  );
 
   useEffect(() => {
     currentRef.current = { draft, baseline, revision };
@@ -621,11 +648,12 @@ function MarkdownDocumentView({
         {showPreview ? (
           <section className="markdown-preview-pane" aria-label="Markdown 预览">
             <MarkdownContent
-              baseWorkspacePath={baseResourcePath}
+              baseResourcePath={baseResourcePath}
               className="preview-markdown"
               onOpenLink={(href) =>
                 onOpenMarkdownLink?.(href, baseResourcePath)
               }
+              onResolveImage={resolveImage}
               text={draft}
             />
           </section>
@@ -946,6 +974,188 @@ function UnsupportedPreview({ descriptor }: { descriptor: PreviewDescriptor }) {
         </button>
       )}
     </div>
+  );
+}
+
+function PluginPreview({
+  client,
+  descriptor,
+  onOpenMarkdownLink,
+}: {
+  client: ApiClient;
+  descriptor: PreviewDescriptor;
+  onOpenMarkdownLink?(href: string, baseResourcePath?: string | null): void;
+}) {
+  const [state, setState] = useState<LoadState<unknown>>({ status: "loading" });
+
+  useEffect(() => {
+    let disposed = false;
+    setState({ status: "loading" });
+    void client
+      .invokeMediaHandler(descriptor.threadId, {
+        operation: "preview",
+        contributionId: descriptor.handlerId ?? undefined,
+        resourceId: descriptor.id,
+        contentType: descriptor.contentType,
+      })
+      .then((response) => {
+        if (!disposed)
+          setState({ status: "ready", value: response.output.payload });
+      })
+      .catch((cause) => {
+        if (!disposed) {
+          setState({ status: "error", message: errorMessage(cause) });
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [
+    client,
+    descriptor.contentType,
+    descriptor.handlerId,
+    descriptor.id,
+    descriptor.threadId,
+  ]);
+
+  if (state.status === "loading") {
+    return <PreviewStatus icon="loading" title="Loading plugin preview" />;
+  }
+  if (state.status === "error") {
+    return (
+      <PreviewStatus
+        icon="error"
+        title="Plugin preview failed"
+        detail={state.message}
+      />
+    );
+  }
+  return (
+    <PluginPreviewPayload
+      client={client}
+      descriptor={descriptor}
+      onOpenMarkdownLink={onOpenMarkdownLink}
+      payload={state.value}
+    />
+  );
+}
+
+function PluginPreviewPayload({
+  client,
+  descriptor,
+  onOpenMarkdownLink,
+  payload,
+}: {
+  client: ApiClient;
+  descriptor: PreviewDescriptor;
+  onOpenMarkdownLink?(href: string, baseResourcePath?: string | null): void;
+  payload: unknown;
+}) {
+  const record = isRecord(payload) ? payload : null;
+  const type = typeof record?.type === "string" ? record.type : null;
+  const text = typeof record?.text === "string" ? record.text : null;
+  const baseResourcePath =
+    descriptor.target.type === "workspace" || descriptor.target.type === "local"
+      ? descriptor.target.path
+      : descriptor.externalPath;
+  const resolveImage = useResourceImageResolver(
+    client,
+    descriptor.threadId,
+    baseResourcePath ?? null,
+  );
+
+  if (type === "markdown" && text !== null) {
+    return (
+      <MarkdownContent
+        baseResourcePath={baseResourcePath}
+        className="preview-markdown"
+        onOpenLink={(href) => onOpenMarkdownLink?.(href, baseResourcePath)}
+        onResolveImage={resolveImage}
+        text={text}
+      />
+    );
+  }
+  if ((type === "text" || type === "code") && text !== null) {
+    return (
+      <div className="preview-code">
+        <MonacoEditor
+          language={
+            type === "code" && typeof record?.language === "string"
+              ? record.language
+              : "plaintext"
+          }
+          readOnly
+          theme="vs"
+          value={text}
+        />
+      </div>
+    );
+  }
+  if (
+    type === "image" &&
+    typeof record?.contentType === "string" &&
+    isSafePluginImageType(record.contentType) &&
+    typeof record?.contentBase64 === "string"
+  ) {
+    return (
+      <ImagePreviewSurface
+        objectUrl={`data:${record.contentType};base64,${record.contentBase64}`}
+        title={descriptor.title}
+      />
+    );
+  }
+
+  const serialized =
+    typeof payload === "string"
+      ? payload
+      : (JSON.stringify(payload, null, 2) ?? "No preview output");
+  return (
+    <div className="preview-code">
+      <MonacoEditor
+        language={typeof payload === "string" ? "plaintext" : "json"}
+        readOnly
+        theme="vs"
+        value={serialized}
+      />
+    </div>
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSafePluginImageType(contentType: string): boolean {
+  return /^(?:image\/(?:png|jpeg|gif|webp|avif)|image\/x-icon)$/i.test(
+    contentType,
+  );
+}
+
+function useResourceImageResolver(
+  client: ApiClient,
+  threadId: string,
+  baseResourcePath: string | null,
+) {
+  return useCallback(
+    async (href: string): Promise<Blob | null> => {
+      const target = resolveMarkdownLink(href, baseResourcePath);
+      if (target.kind !== "workspace" && target.kind !== "local") return null;
+      const image = await client.resolvePreview(
+        threadId,
+        target.kind === "local"
+          ? { type: "local", path: target.path }
+          : { type: "workspace", path: target.path },
+      );
+      try {
+        if (!image.contentType.toLowerCase().startsWith("image/")) return null;
+        return await client.getPreviewContent(image.threadId, image.id);
+      } finally {
+        await client
+          .closePreview(image.threadId, image.id)
+          .catch(() => undefined);
+      }
+    },
+    [baseResourcePath, client, threadId],
   );
 }
 

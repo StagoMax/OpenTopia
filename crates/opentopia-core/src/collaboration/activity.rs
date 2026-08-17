@@ -36,7 +36,7 @@ impl Default for ActivityQuery {
 }
 
 impl ActivityQuery {
-    fn bounded(&self) -> Self {
+    pub(crate) fn bounded(&self) -> Self {
         Self {
             after_cursor: self.after_cursor,
             reasoning_tail_chars: self.reasoning_tail_chars.clamp(1, MAX_REASONING_TAIL_CHARS),
@@ -242,7 +242,7 @@ fn current_model_round(events: &[&AgentEvent]) -> (Option<usize>, Option<i64>) {
     })
 }
 
-fn tool_names_by_invocation(events: &[&AgentEvent]) -> HashMap<Uuid, String> {
+pub(super) fn tool_names_by_invocation(events: &[&AgentEvent]) -> HashMap<Uuid, String> {
     events
         .iter()
         .filter_map(|event| match &event.payload {
@@ -252,7 +252,10 @@ fn tool_names_by_invocation(events: &[&AgentEvent]) -> HashMap<Uuid, String> {
         .collect()
 }
 
-fn project_event(event: &AgentEvent, tool_names: &HashMap<Uuid, String>) -> Option<ActivityEvent> {
+pub(super) fn project_event(
+    event: &AgentEvent,
+    tool_names: &HashMap<Uuid, String>,
+) -> Option<ActivityEvent> {
     let details = match &event.payload {
         AgentEventPayload::ModelContextBuilt { round, .. }
         | AgentEventPayload::ModelRequest { round, .. } => {
@@ -299,11 +302,18 @@ fn project_event(event: &AgentEvent, tool_names: &HashMap<Uuid, String>) -> Opti
     })
 }
 
-fn project_tool_result(
+pub(super) fn project_tool_result(
     result: &ToolResult,
     tool_name: Option<String>,
     max_chars: usize,
 ) -> ToolResultProjection {
+    let tool_name = tool_name.or_else(|| {
+        result
+            .metadata
+            .get("toolName")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     let (kind, value) = result_value(result);
     let (preview, truncated) = bounded_value(redact_model_observation(&value), max_chars);
     ToolResultProjection {

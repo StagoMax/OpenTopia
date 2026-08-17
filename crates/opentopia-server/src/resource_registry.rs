@@ -71,6 +71,13 @@ impl ResourceRegistry {
             false
         }
     }
+
+    pub(super) fn release_thread(&self, thread_id: Uuid) -> usize {
+        let mut leases = self.leases.write().expect("resource registry poisoned");
+        let before = leases.len();
+        leases.retain(|_, lease| lease.thread_id != thread_id);
+        before - leases.len()
+    }
 }
 
 pub(super) fn resource_preview_id(id: Uuid) -> String {
@@ -104,5 +111,33 @@ mod tests {
         assert!(registry.get(other, lease.id).is_none());
         assert!(!registry.release(other, lease.id));
         assert!(registry.release(owner, lease.id));
+    }
+
+    #[test]
+    fn deleting_a_task_releases_all_of_its_resource_leases() {
+        let registry = ResourceRegistry::default();
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        registry.register(
+            owner,
+            ResourceLocator::Workspace {
+                path: PathBuf::from("one.md"),
+            },
+        );
+        registry.register(
+            owner,
+            ResourceLocator::Workspace {
+                path: PathBuf::from("two.md"),
+            },
+        );
+        let retained = registry.register(
+            other,
+            ResourceLocator::Workspace {
+                path: PathBuf::from("other.md"),
+            },
+        );
+
+        assert_eq!(registry.release_thread(owner), 2);
+        assert!(registry.get(other, retained.id).is_some());
     }
 }

@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub(crate) const LEGACY_DATABASE_SCHEMA_VERSION: i64 = 19;
-pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 23;
+pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 24;
 
 const LEGACY_BASELINE_NAME: &str = "legacy_baseline_v19";
 const MIGRATION_LEDGER_SQL: &str = include_str!("migrations/0019_legacy_baseline.sql");
@@ -91,6 +91,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "agent_turn_checkpoints",
         sql: include_str!("migrations/0023_agent_turn_checkpoints.sql"),
         verify: verify_v23,
+    },
+    Migration {
+        version: 24,
+        name: "agent_activity_projection",
+        sql: include_str!("migrations/0024_agent_activity_projection.sql"),
+        verify: verify_v24,
     },
 ];
 
@@ -529,6 +535,23 @@ fn verify_v23(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn verify_v24(conn: &Connection) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        table_exists(conn, "agent_activity_state")?,
+        "agent_activity_state table is missing"
+    );
+    for index in [
+        "idx_agent_activity_state_session_cursor",
+        "idx_agent_events_activity_visible",
+        "idx_agent_events_reasoning_tail",
+        "idx_agent_events_tool_results",
+        "idx_agent_events_model_round",
+    ] {
+        anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
+    }
+    Ok(())
+}
+
 fn validate_ledger_shape(conn: &Connection) -> anyhow::Result<()> {
     anyhow::ensure!(
         table_exists(conn, "schema_migrations")?,
@@ -740,6 +763,17 @@ fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
         .query_row(
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
             params![table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn index_exists(conn: &Connection, index: &str) -> anyhow::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+            params![index],
             |_| Ok(()),
         )
         .optional()?

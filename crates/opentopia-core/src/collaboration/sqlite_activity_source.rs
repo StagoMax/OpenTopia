@@ -1,8 +1,10 @@
+use super::activity::{project_event, project_tool_result, tool_names_by_invocation};
 use super::{
-    ActivityQuery, AgentActivityReader, AgentActivitySource, AgentActivitySourceError,
-    AgentActivityWindow, AgentThreadId, AgentTurnId, AgentTurnStatus, CollaborationRegistry,
-    CollaborationSessionId, SqliteCollaborationRepository,
+    ActivityQuery, AgentActivitySource, AgentActivitySourceError, AgentActivityWindow,
+    AgentThreadId, AgentTurnId, AgentTurnStatus, CollaborationRegistry, CollaborationSessionId,
+    SqliteCollaborationRepository,
 };
+use crate::model::AgentEventPayload;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +37,7 @@ impl SqliteAgentActivitySource {
         agent_turn_id: AgentTurnId,
     ) -> Result<i64, AgentActivitySourceError> {
         self.repository
-            .list_activity_events(agent_thread_id, agent_turn_id, None)
-            .map(|events| events.last().map_or(0, |event| event.seq))
+            .latest_activity_cursor(agent_thread_id, agent_turn_id)
             .map_err(|error| AgentActivitySourceError::Unavailable(error.to_string()))
     }
 
@@ -87,11 +88,64 @@ impl AgentActivitySource for SqliteAgentActivitySource {
         turn_status: AgentTurnStatus,
         query: ActivityQuery,
     ) -> Result<AgentActivityWindow, AgentActivitySourceError> {
+        let query = query.bounded();
+        let summary = self
+            .repository
+            .activity_summary(
+                agent_thread_id,
+                agent_turn_id,
+                query.after_cursor,
+                query.reasoning_tail_chars,
+            )
+            .map_err(|error| AgentActivitySourceError::Unavailable(error.to_string()))?;
         let events = self
             .repository
-            .list_activity_events(agent_thread_id, agent_turn_id, None)
+            .list_projectable_activity_events(
+                agent_thread_id,
+                agent_turn_id,
+                query.after_cursor,
+                query.event_limit,
+            )
             .map_err(|error| AgentActivitySourceError::Unavailable(error.to_string()))?;
-        Ok(AgentActivityReader.read(agent_thread_id, agent_turn_id, turn_status, &events, &query))
+        let tool_result_events = self
+            .repository
+            .list_activity_tool_result_events(
+                agent_thread_id,
+                agent_turn_id,
+                query.after_cursor,
+                query.event_limit,
+            )
+            .map_err(|error| AgentActivitySourceError::Unavailable(error.to_string()))?;
+        let event_refs = events
+            .iter()
+            .chain(tool_result_events.iter())
+            .collect::<Vec<_>>();
+        let tool_names = tool_names_by_invocation(&event_refs);
+        let recent_events = events
+            .iter()
+            .filter_map(|event| project_event(event, &tool_names))
+            .collect();
+        let recent_tool_results = tool_result_events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AgentEventPayload::ToolCallFinished { result } => Some(project_tool_result(
+                    result,
+                    tool_names.get(&result.call_id).cloned(),
+                    query.tool_result_chars,
+                )),
+                _ => None,
+            })
+            .collect();
+        Ok(AgentActivityWindow {
+            agent_thread_id,
+            agent_turn_id,
+            turn_status,
+            model_round: summary.model_round,
+            cursor: summary.cursor,
+            reasoning_tail: summary.reasoning_tail,
+            recent_events,
+            recent_tool_results,
+        })
     }
 
     async fn wait_for_change(

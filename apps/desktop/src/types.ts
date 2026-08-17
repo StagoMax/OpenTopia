@@ -2880,6 +2880,11 @@ export type AgentActivityWindow = {
   recentToolResults: AgentToolResultProjection[];
 };
 
+export type AgentActivityNotification = {
+  seq: number;
+  agentThreadId: string;
+};
+
 export type AgentListItem = {
   agent: AgentThread;
   latestTurn?: AgentTurn | null;

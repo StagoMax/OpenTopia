@@ -6128,6 +6128,7 @@ mod tests {
     fn remove_post_legacy_agent_runtime_tables(conn: &Connection) {
         conn.execute_batch(
             r#"
+            DROP TABLE IF EXISTS agent_activity_state;
             DROP TABLE IF EXISTS agent_turn_checkpoints;
             DROP TABLE IF EXISTS agent_provider_states;
             DROP TABLE IF EXISTS agent_events;
@@ -6935,7 +6936,7 @@ mod tests {
         )
         .expect("read migration ledger");
 
-        assert_eq!(records.len(), 5);
+        assert_eq!(records.len(), 6);
         assert_eq!(records[0].0, LEGACY_DATABASE_SCHEMA_VERSION);
         assert_eq!(records[0].1, "legacy_baseline_v19");
         assert_eq!(records[1].0, 20);
@@ -6944,8 +6945,10 @@ mod tests {
         assert_eq!(records[2].1, "agent_collaboration_domain");
         assert_eq!(records[3].0, 22);
         assert_eq!(records[3].1, "agent_runtime_cutover");
-        assert_eq!(records[4].0, CURRENT_DATABASE_SCHEMA_VERSION);
+        assert_eq!(records[4].0, 23);
         assert_eq!(records[4].1, "agent_turn_checkpoints");
+        assert_eq!(records[5].0, CURRENT_DATABASE_SCHEMA_VERSION);
+        assert_eq!(records[5].1, "agent_activity_projection");
         assert!(records.iter().all(|record| record.2.starts_with("sha256:")));
         assert!(records.iter().all(|record| !record.3.is_empty()));
         assert!(records
@@ -6965,7 +6968,13 @@ mod tests {
             let conn = store.conn.lock().expect("lock current database");
             conn.execute_batch(
                 r#"
+                DROP TABLE agent_activity_state;
                 DROP TABLE agent_turn_checkpoints;
+                DROP INDEX idx_agent_events_activity_visible;
+                DROP INDEX idx_agent_events_reasoning_tail;
+                DROP INDEX idx_agent_events_tool_results;
+                DROP INDEX idx_agent_events_model_round;
+                DELETE FROM schema_migrations WHERE version = 24;
                 DELETE FROM schema_migrations WHERE version = 23;
                 PRAGMA user_version = 22;
                 "#,
