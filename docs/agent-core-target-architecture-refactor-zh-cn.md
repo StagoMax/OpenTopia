@@ -1850,6 +1850,62 @@ Verification Snapshot（验证快照，2026-08-16）：
 - Provider 设置阶段把探测结果一次性物化为版本化 `ProviderAdapterProfile（供应商适配档案）`。运行时只读取该档案，不再读取诊断报告、按模型名重新猜测协议，也不再通过删除字段、改写消息或切换流式模式来做隐藏兼容重试；档案与真实端点不一致时返回 `CapabilityProfileStale（能力档案过期）`，由设置/重新协商边界处理。
 - 删除 Chat/Responses 的 strict、parallel、enhanced-tools 进程内“不支持”缓存，以及流式工具调用失败后的非流式二次请求。Transport（传输层）仅保留网络重试与明确的 Provider State Recovery（供应商状态恢复）；Codec（编解码器）只做确定性协议编码。
 
+#### Composition Root Decoupling（组合根解耦）
+
+Core 与 Server 的装配责任进一步从业务执行代码中拆出：
+
+- `AgentCoreComposition（Agent Core 组合对象）` 是 Core 唯一默认装配边界，负责选择主 Provider、Guardian Provider、Model Gateway、Context Assembler、Tool Runtime Host、Completion Gate、Completion Registry 与 Turn Inbox。`agent.rs` 的 Turn Execution（轮次执行）不再读取环境变量、解析 `AppSettings（应用设置）` 或调用 Provider Factory（供应商工厂）。
+- `AgentProviderBinding（Agent 供应商绑定）` 把连接/模型选择解析为已经规范化的运行时端口。线程切换模型时，Agent Core 只安装绑定结果，不知道连接配置、协议选择或 Guardian Provider 的构造过程。
+- `Server Bootstrap（服务器启动装配）` 独立负责持久化恢复、MCP Host、浏览器/计算机运行时、协作调度器、Agent Turn Coordinator 和后台 Worker；`main.rs` 只负责进程入口。
+- `AgentFactory（Agent 工厂）` 同时服务首次启动与 Settings Hot Reload（设置热刷新）。共享 Browser、Computer、Background Registry、Turn Inbox 与 File Mutation Observer 只定义一次，避免重建 Agent 时出现依赖漂移。
+- `Route Graph（路由图）` 按 Platform、Conversation、Execution 与 Integration 四个域组合；认证、CORS 和 Trace Middleware 只在最外层安装一次。
+- `AppState Contract（应用状态契约）` 独立成模块，由 Bootstrap 创建、由 HTTP Adapter 消费；它不再由路由模块或某个业务 Handler 临时拼装。
+
+```mermaid
+flowchart LR
+    subgraph Core["Core Composition（Core 组合边界）"]
+        CS["AppSettings / Environment（设置 / 环境）"] --> CC["AgentCoreComposition（Agent Core 组合对象）"]
+        CC --> MG["ModelGateway（模型网关）"]
+        CC --> TH["ToolRuntimeHost（工具运行时宿主）"]
+        CC --> CG["Completion Ports（完成端口）"]
+        CS --> PB["AgentProviderBinding（供应商绑定）"]
+        PB --> AC["AgentCore（轮次执行）"]
+        MG --> AC
+        TH --> AC
+        CG --> AC
+    end
+
+    subgraph Server["Server Composition（Server 组合边界）"]
+        BOOT["Bootstrap（启动装配）"] --> AF["AgentFactory（Agent 工厂）"]
+        BOOT --> AS["AppState Contract（应用状态契约）"]
+        AF --> AC
+        AS --> RG["Route Graph（路由图）"]
+        RG --> PA["Platform API（平台接口）"]
+        RG --> CA["Conversation API（会话接口）"]
+        RG --> EA["Execution API（执行接口）"]
+        RG --> IA["Integration API（集成接口）"]
+    end
+```
+
+Settings Hot Reload（设置热刷新）流程：
+
+```mermaid
+sequenceDiagram
+    participant API as Settings API（设置接口）
+    participant DB as Settings Store（设置存储）
+    participant F as AgentFactory（Agent 工厂）
+    participant A as AgentCore（智能体核心）
+
+    API->>DB: persist one normalized snapshot（持久化单一规范快照）
+    DB-->>API: saved AppSettings（已保存设置）
+    API->>F: build(saved settings)（按已保存设置重建）
+    F->>F: reuse Inbox / Browser / Computer / Background（复用共享运行时）
+    F-->>A: fully composed AgentCore（完整装配的智能体核心）
+    API->>A: atomic replacement（原子替换）
+```
+
+架构守卫测试保证 `agent.rs` 不再直接构造 Provider 依赖，`main.rs` 不再包含 Router、Scheduler、Coordinator 或 Agent 的装配表达式。
+
 #### P6 模块边界
 
 ```mermaid
