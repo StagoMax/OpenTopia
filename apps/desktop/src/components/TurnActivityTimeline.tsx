@@ -47,6 +47,7 @@ import {
   type ToolActivityGroup as ToolGroupKey,
   type ToolActivityIconKind,
 } from "../toolActivity";
+import { toolExecutionDurationMs } from "../toolExecutionTiming";
 import {
   rendererTraceTime,
   type ConversationRenderTrace,
@@ -1234,6 +1235,7 @@ function ToolExecutionItem({
     execution.finishedAt,
     running,
     now,
+    toolExecutionDurationMs(execution.result),
   );
 
   return (
@@ -2226,7 +2228,15 @@ function formatActivityTiming(
   finishedAt?: string | null,
   running = false,
   now = Date.now(),
+  recordedDurationMs?: number | null,
 ) {
+  if (
+    !running &&
+    recordedDurationMs !== null &&
+    recordedDurationMs !== undefined
+  ) {
+    return `耗时 ${formatElapsed(recordedDurationMs)}`;
+  }
   const start = parseTimestamp(startedAt);
   if (start === null) return "";
   const finish = running ? now : parseTimestamp(finishedAt);
@@ -2239,6 +2249,16 @@ function formatExecutionGroupTiming(
   running: boolean,
   now: number,
 ) {
+  if (!running) {
+    const recordedDurations = executions.map((execution) =>
+      toolExecutionDurationMs(execution.result),
+    );
+    if (recordedDurations.every((duration) => duration !== null)) {
+      return `耗时 ${formatElapsed(
+        recordedDurations.reduce((total, duration) => total + duration, 0),
+      )}`;
+    }
+  }
   const starts = executions
     .map((execution) => parseTimestamp(execution.startedAt))
     .filter((value): value is number => value !== null);

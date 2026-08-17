@@ -6,6 +6,7 @@ import type {
   ThreadModelSelection,
   TokenEstimateBreakdown,
 } from "./types";
+import { toolExecutionDurationMs } from "./toolExecutionTiming.ts";
 
 export type UsageCallStatus = "running" | "succeeded" | "failed";
 
@@ -443,7 +444,10 @@ export function aggregateUsageEvents(
       case "tool_call_finished": {
         const completedAt = timestampMs(event.createdAt);
         const startedAt = toolStarts.get(payload.result.callId);
-        if (startedAt !== undefined && completedAt !== null) {
+        const recordedDurationMs = toolExecutionDurationMs(payload.result);
+        if (recordedDurationMs !== null) {
+          toolDurations.push(recordedDurationMs);
+        } else if (startedAt !== undefined && completedAt !== null) {
           toolDurations.push(Math.max(0, completedAt - startedAt));
         }
         if (toolResultIsError(payload.result.metadata)) toolErrorCount += 1;

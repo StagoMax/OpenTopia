@@ -183,6 +183,26 @@ test("aggregates API token, prompt cache, latency, retry, and tool metrics", () 
   assert.equal(result.summary.totalToolDurationMs, 300);
 });
 
+test("prefers runtime-recorded tool duration over batched event timestamps", () => {
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.500Z", {
+      type: "tool_call_started",
+      call: { id: "tool-1", name: "shell", input: {} },
+    }),
+    event(2, "2026-08-05T00:00:00.500Z", {
+      type: "tool_call_finished",
+      result: {
+        callId: "tool-1",
+        output: "ok",
+        metadata: { success: true, durationMs: 1_234 },
+      },
+    }),
+  ]);
+
+  assert.equal(result.summary.averageToolDurationMs, 1_234);
+  assert.equal(result.summary.totalToolDurationMs, 1_234);
+});
+
 test("correlates usage by request id and attributes token modules and waste signals", () => {
   const breakdown = {
     baseInstructions: 40,

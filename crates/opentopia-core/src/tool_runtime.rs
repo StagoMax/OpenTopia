@@ -53,10 +53,12 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+const TOOL_EXECUTION_DURATION_MS_KEY: &str = "durationMs";
 
 /// Owns every concrete tool-side service behind one AgentCore boundary.
 ///
@@ -946,6 +948,7 @@ impl ToolRuntime for LocalToolRuntime {
     }
 
     async fn execute_call(&self, input: ToolExecutionInput) -> ToolExecutionReport {
+        let execution_started_at = Instant::now();
         let ToolExecutionInput {
             catalog,
             call,
@@ -987,6 +990,7 @@ impl ToolRuntime for LocalToolRuntime {
             insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&error));
             merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
             insert_work_item_metadata(&mut metadata, active_work_item_id.as_deref());
+            insert_tool_execution_duration(&mut metadata, &execution_started_at);
             events.push(AgentEventPayload::ToolCallFinished {
                 result: ToolResult {
                     call_id: call.id,
@@ -1020,6 +1024,7 @@ impl ToolRuntime for LocalToolRuntime {
             insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&error));
             merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
             insert_work_item_metadata(&mut metadata, active_work_item_id.as_deref());
+            insert_tool_execution_duration(&mut metadata, &execution_started_at);
             events.push(AgentEventPayload::ToolCallFinished {
                 result: ToolResult {
                     call_id: call.id,
@@ -1058,6 +1063,7 @@ impl ToolRuntime for LocalToolRuntime {
                 insert_approval_execution_metadata(&mut metadata, approval_granted, Some(&error));
                 merge_metadata_overlay(&mut metadata, metadata_overlay.as_ref());
                 insert_work_item_metadata(&mut metadata, active_work_item_id.as_deref());
+                insert_tool_execution_duration(&mut metadata, &execution_started_at);
                 events.push(AgentEventPayload::ToolCallFinished {
                     result: ToolResult {
                         call_id: call.id,
@@ -1107,6 +1113,7 @@ impl ToolRuntime for LocalToolRuntime {
                 }
             }
         }
+        insert_tool_execution_duration(&mut result.metadata, &execution_started_at);
         crate::tool_error::ensure_tool_error_record(&mut result);
         events.push(AgentEventPayload::ToolCallFinished {
             result: result.clone(),
@@ -1521,6 +1528,19 @@ fn provider_result_events(call: ToolCall, result: &ProviderToolResult) -> Vec<Ag
     ]
 }
 
+fn insert_tool_execution_duration(metadata: &mut Value, started_at: &Instant) {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            TOOL_EXECUTION_DURATION_MS_KEY.to_string(),
+            json!(duration_ms),
+        );
+    }
+}
+
 fn scheduling_conflicts(
     resource_keys: &mut HashMap<String, bool>,
     policy: &crate::tools::ToolExecutionPolicy,
@@ -1820,6 +1840,21 @@ mod tests {
         );
         assert_eq!(reports[0].events.len(), 2);
         assert_eq!(reports[1].events.len(), 2);
+        let recorded_duration_ms = |report: &ProviderToolExecutionReport| {
+            report
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    AgentEventPayload::ToolCallFinished { result } => result
+                        .metadata
+                        .get(TOOL_EXECUTION_DURATION_MS_KEY)
+                        .and_then(Value::as_u64),
+                    _ => None,
+                })
+                .expect("finished tool event records its execution duration")
+        };
+        assert!(recorded_duration_ms(&reports[0]) >= 25);
+        assert!(recorded_duration_ms(&reports[1]) >= 1);
     }
 
     #[test]
