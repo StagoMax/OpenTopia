@@ -78,6 +78,16 @@ test("keeps Windows drive paths absolute", () => {
     path: "J:/Project/OpenTopia/README.md",
     fragment: null,
   });
+  assert.deepEqual(
+    resolveMarkdownLink(
+      "C:/Users/Stargo/Downloads/%E8%B4%A7%E7%89%A9%E8%AE%A2%E5%8D%95.xlsx",
+    ),
+    {
+      kind: "workspace",
+      path: "C:/Users/Stargo/Downloads/货物订单.xlsx",
+      fragment: null,
+    },
+  );
 });
 
 test("derives a filename label from explicit local file links", () => {

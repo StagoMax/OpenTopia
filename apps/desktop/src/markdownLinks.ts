@@ -128,7 +128,14 @@ function resolveLiteralFilePath(
   rawPath: string,
   fragment: string | null,
 ): MarkdownLinkTarget {
-  const normalized = rawPath.trim().replaceAll("\\", "/");
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(rawPath);
+  } catch {
+    return { kind: "blocked", reason: "Link path is not valid UTF-8." };
+  }
+
+  const normalized = decodedPath.trim().replaceAll("\\", "/");
   if (!normalized) return { kind: "blocked", reason: "Link target is empty." };
 
   const drive = /^[A-Za-z]:/.exec(normalized)?.[0] ?? null;
