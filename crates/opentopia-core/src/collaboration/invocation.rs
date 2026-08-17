@@ -120,6 +120,13 @@ pub struct WaitAgentOutcome {
     pub messages: Vec<AgentMailboxMessage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCompletionSnapshot {
+    pub active_descendants: Vec<AgentListItem>,
+    pub pending_messages: Vec<AgentMailboxMessage>,
+}
+
 #[derive(Debug, Error)]
 pub enum AgentCollaborationInvocationError {
     #[error(transparent)]
@@ -168,6 +175,80 @@ impl AgentCollaborationInvocation {
 
     pub fn identity(&self) -> AgentInvocationIdentity {
         self.identity
+    }
+
+    pub async fn pending_messages(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AgentMailboxMessage>, AgentCollaborationInvocationError> {
+        let caller = self.validated_caller().await?;
+        self.runtime
+            .mailbox()
+            .snapshot(caller.session_id, caller.id, None, limit)
+            .await
+            .map_err(AgentCollaborationRuntimeError::from)
+            .map_err(Into::into)
+    }
+
+    pub async fn completion_snapshot(
+        &self,
+    ) -> Result<AgentCompletionSnapshot, AgentCollaborationInvocationError> {
+        let caller = self.validated_caller().await?;
+        let mut active_descendants = Vec::new();
+        for agent in self
+            .runtime
+            .registry()
+            .list_threads(caller.session_id)
+            .await?
+            .into_iter()
+            .filter(|agent| agent.path.is_descendant_of(&caller.path))
+        {
+            let latest_turn = self.runtime.registry().latest_turn(agent.id).await?;
+            if latest_turn
+                .as_ref()
+                .is_some_and(|turn| !turn.status.is_terminal())
+            {
+                active_descendants.push(AgentListItem {
+                    availability: AgentAvailability::derive(&agent, latest_turn.as_ref()),
+                    agent,
+                    latest_turn,
+                    activity: None,
+                });
+            }
+        }
+        let pending_messages = self
+            .runtime
+            .mailbox()
+            .snapshot(caller.session_id, caller.id, None, 256)
+            .await
+            .map_err(AgentCollaborationRuntimeError::from)?;
+        Ok(AgentCompletionSnapshot {
+            active_descendants,
+            pending_messages,
+        })
+    }
+
+    /// This is invoked only after the provider round carrying the synthetic
+    /// mailbox Call/Result pair has completed. A crash before the durable ack
+    /// simply causes an idempotent redelivery on the next invocation.
+    pub async fn acknowledge_messages(
+        &self,
+        messages: &[AgentMailboxMessage],
+    ) -> Result<(), AgentCollaborationInvocationError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let target = self.identity.agent_thread_id;
+        let ids = messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        self.runtime
+            .mailbox()
+            .acknowledge(target, &ids)
+            .await
+            .map_err(AgentCollaborationRuntimeError::from)?;
+        Ok(())
     }
 
     pub async fn spawn_agent(
@@ -536,6 +617,7 @@ mod tests {
             let (_, root, root_turn) = registry
                 .create_session(CreateCollaborationSession {
                     user_task_id: Uuid::new_v4(),
+                    root_turn_id: AgentTurnId::new(),
                     root_task_message: "root task".to_string(),
                     root_agent_type: "default".to_string(),
                     root_runtime_snapshot: RuntimeSnapshotSeed::new(
@@ -704,6 +786,7 @@ mod tests {
         let (_, other_root, _) = other_registry
             .create_session(CreateCollaborationSession {
                 user_task_id: Uuid::new_v4(),
+                root_turn_id: AgentTurnId::new(),
                 root_task_message: "other".to_string(),
                 root_agent_type: "default".to_string(),
                 root_runtime_snapshot: RuntimeSnapshotSeed::new(None, json!({})),

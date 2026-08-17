@@ -18,7 +18,7 @@ use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 
 const MAX_FILESYSTEM_READ_BYTES: u64 = 16 * 1024 * 1024;
-const DEFAULT_READ_WINDOW_CHARS: usize = 64_000;
+const DEFAULT_READ_WINDOW_CHARS: usize = 12_000;
 const MAX_READ_WINDOW_CHARS: usize = 256_000;
 const DEFAULT_LIST_ENTRIES: usize = 200;
 const MAX_LIST_ENTRIES: usize = 1_000;
@@ -338,6 +338,7 @@ async fn read_file(
         .saturating_add(output.chars().count())
         .lt(&total_chars)
         .then_some(offset.saturating_add(output.chars().count()));
+    let visible_path = model_visible_path(ctx, &read.path);
     Ok(ToolResult {
         call_id,
         output,
@@ -345,7 +346,7 @@ async fn read_file(
         metadata: json!({
             "toolName": "filesystem",
             "operation": "read",
-            "path": read.path.display().to_string(),
+            "path": visible_path,
             "contentHash": hash,
             "offset": offset,
             "nextOffset": next_offset,
@@ -378,13 +379,14 @@ async fn write_file(
         contents.clone(),
     )])?;
     ctx.commit_file_mutations(&batch).await?;
+    let visible_path = model_visible_path(ctx, &path);
     Ok(ToolResult::text(
         call_id,
-        format!("Wrote {} bytes to {}", contents.len(), path.display()),
+        format!("Wrote {} bytes to {visible_path}", contents.len()),
         json!({
             "toolName": "filesystem",
             "operation": "write",
-            "changedPath": path.display().to_string(),
+            "changedPath": visible_path,
             "bytes": contents.len(),
             "contentHash": hash,
             "success": true
@@ -432,18 +434,14 @@ async fn list_directory(
         });
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    let value = json!({
-        "path": path.display().to_string(),
-        "entries": entries,
-        "truncated": truncated
-    });
+    let value = json!({ "entries": entries, "truncated": truncated });
     Ok(ToolResult::text(
         call_id,
         serde_json::to_string_pretty(&value)?,
         json!({
             "toolName": "filesystem",
             "operation": "list",
-            "path": path.display().to_string(),
+            "path": model_visible_path(ctx, &path),
             "count": entries.len(),
             "truncated": truncated,
             "success": true
@@ -551,7 +549,6 @@ async fn find_entries(
                 };
                 matches.push(FilesystemFindEntry {
                     path: model_visible_path(ctx, &entry_path),
-                    name,
                     kind: filesystem_entry_kind(&file_type),
                     bytes: metadata.map(|item| item.len()),
                 });
@@ -575,11 +572,6 @@ async fn find_entries(
     let root_display = model_visible_path(ctx, &root);
     let truncated = truncation_reason.is_some();
     let value = json!({
-        "path": root_display,
-        "nameContains": name_contains,
-        "caseSensitive": case_sensitive,
-        "kind": kind.as_str(),
-        "maxDepth": max_depth,
         "entries": matches,
         "visitedEntries": visited_entries,
         "truncated": truncated,
@@ -627,7 +619,6 @@ async fn stat_path(
         None
     };
     let value = json!({
-        "path": path.display().to_string(),
         "kind": if metadata.is_file() { "file" } else if metadata.is_dir() { "directory" } else { "other" },
         "bytes": metadata.len(),
         "readonly": metadata.permissions().readonly(),
@@ -678,6 +669,7 @@ async fn copy_file(
         &source,
         &destination,
         source_bytes.len(),
+        &ctx,
     ))
 }
 
@@ -720,6 +712,7 @@ async fn move_file(
         &source,
         &destination,
         source_bytes.len(),
+        &ctx,
     ))
 }
 
@@ -736,13 +729,14 @@ async fn delete_file(
         .bytes;
     let batch = FileMutationBatch::new(vec![PreparedFileMutation::delete(path.clone(), original)])?;
     ctx.commit_file_mutations(&batch).await?;
+    let visible_path = model_visible_path(ctx, &path);
     Ok(ToolResult::text(
         call_id,
-        format!("Deleted {}", path.display()),
+        format!("Deleted {visible_path}"),
         json!({
             "toolName": "filesystem",
             "operation": "delete",
-            "changedPath": path.display().to_string(),
+            "changedPath": visible_path,
             "success": true
         }),
     ))
@@ -762,14 +756,6 @@ impl FilesystemFindKind {
             Self::Directory => file_type.is_dir(),
         }
     }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Any => "any",
-            Self::File => "file",
-            Self::Directory => "directory",
-        }
-    }
 }
 
 fn filesystem_entry_kind(file_type: &std::fs::FileType) -> &'static str {
@@ -785,20 +771,22 @@ fn filesystem_entry_kind(file_type: &std::fs::FileType) -> &'static str {
 }
 
 fn model_visible_path(ctx: &ToolInvocationContext, path: &Path) -> String {
-    let workspace_root = ctx
-        .environment
-        .workspace_root()
-        .canonicalize()
-        .unwrap_or_else(|_| ctx.workspace_root.clone());
-    let visible = path
-        .strip_prefix(&workspace_root)
+    let relative = path
+        .strip_prefix(&ctx.workspace_root)
         .ok()
-        .filter(|relative| !relative.as_os_str().is_empty())
-        .unwrap_or(path);
-    if path == workspace_root {
-        ".".to_string()
-    } else {
-        visible.to_string_lossy().replace('\\', "/")
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let workspace_root = ctx.workspace_root.canonicalize().ok()?;
+            let canonical_path = path.canonicalize().ok()?;
+            canonical_path
+                .strip_prefix(workspace_root)
+                .ok()
+                .map(Path::to_path_buf)
+        });
+    match relative {
+        Some(path) if path.as_os_str().is_empty() => ".".to_string(),
+        Some(path) => path.to_string_lossy().replace('\\', "/"),
+        None => path.to_string_lossy().replace('\\', "/"),
     }
 }
 
@@ -837,7 +825,10 @@ fn file_transfer_result(
     source: &Path,
     destination: &Path,
     bytes: usize,
+    ctx: &ToolInvocationContext,
 ) -> ToolResult {
+    let source = model_visible_path(ctx, source);
+    let destination = model_visible_path(ctx, destination);
     ToolResult::text(
         call_id,
         format!(
@@ -847,14 +838,14 @@ fn file_transfer_result(
             } else {
                 "Moved"
             },
-            source.display(),
-            destination.display()
+            source,
+            destination
         ),
         json!({
             "toolName": "filesystem",
             "operation": operation,
-            "source": source.display().to_string(),
-            "destination": destination.display().to_string(),
+            "source": source,
+            "destination": destination,
             "bytes": bytes,
             "success": true
         }),
@@ -874,7 +865,6 @@ struct FilesystemListEntry {
 #[serde(rename_all = "camelCase")]
 struct FilesystemFindEntry {
     path: String,
-    name: String,
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes: Option<u64>,
@@ -923,6 +913,7 @@ mod tests {
             written.metadata["contentHash"],
             content_fingerprint(b"alpha")
         );
+        assert_eq!(written.metadata["changedPath"], "notes/a.txt");
 
         let copied = FilesystemTool
             .execute(
@@ -939,6 +930,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(copied.metadata["operation"], "copy");
+        assert_eq!(copied.metadata["source"], "notes/a.txt");
+        assert_eq!(copied.metadata["destination"], "notes/b.txt");
 
         FilesystemTool
             .execute(
@@ -971,6 +964,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.output, "alpha");
+        assert_eq!(read.metadata["path"], "notes/c.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_read_window_is_token_bounded_and_pageable() {
+        let (root, context) = fixture();
+        fs::write(
+            root.join("long.txt"),
+            "x".repeat(DEFAULT_READ_WINDOW_CHARS + 10),
+        )
+        .unwrap();
+        let read = FilesystemTool
+            .execute(
+                ToolCall::new(
+                    "filesystem",
+                    json!({ "operation": "read", "path": "long.txt" }),
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(read.output.chars().count(), DEFAULT_READ_WINDOW_CHARS);
+        assert_eq!(read.metadata["nextOffset"], DEFAULT_READ_WINDOW_CHARS);
+        assert_eq!(read.metadata["path"], "long.txt");
         fs::remove_dir_all(root).unwrap();
     }
 

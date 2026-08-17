@@ -18,9 +18,7 @@ pub fn tool_bundle(class: ToolClass, source: &ToolSource) -> ToolBundle {
     match class {
         ToolClass::Flow => ToolBundle::Flow,
         ToolClass::WorkForm => ToolBundle::Task,
-        ToolClass::Standard | ToolClass::Subagent | ToolClass::StructuredInput => {
-            ToolBundle::Common
-        }
+        ToolClass::Standard | ToolClass::Agent | ToolClass::StructuredInput => ToolBundle::Common,
     }
 }
 

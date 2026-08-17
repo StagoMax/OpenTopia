@@ -17,7 +17,7 @@ impl AgentCore {
     ///
     /// This is deliberately separate from the provider loop: model completion is
     /// only a proposal, while the harness owns readiness and evidence invariants.
-    pub(super) fn apply_finalization_guard(
+    pub(super) async fn apply_finalization_guard(
         &self,
         thread_id: Uuid,
         fallback_turn_id: Uuid,
@@ -47,7 +47,7 @@ impl AgentCore {
             }
         }
 
-        let turn_id = self.subagent_parent_turn_id.unwrap_or(fallback_turn_id);
+        let turn_id = self.agent_turn_id.unwrap_or(fallback_turn_id);
         let mut registered_forms = Vec::new();
         if let Some(store) = store {
             if let Some(form) = store.get_work_form_for_scope(WorkScope::Turn(turn_id))? {
@@ -69,32 +69,16 @@ impl AgentCore {
             }
         }
         let mut agent_delivery = None;
-        if let Some(scheduler) = self.tool_host.subagents.as_ref() {
-            let scope = self.subagent_scope(thread_id, fallback_turn_id);
-            let active_agents = scheduler
-                .list_descendants_scoped(&scope)
-                .into_iter()
-                .filter(|run| !run.status.is_terminal())
-                .map(|run| {
-                    json!({
-                        "id": run.id,
-                        "agentPath": run.agent_path,
-                        "status": run.status,
-                        "agentType": run.agent_type,
-                        "latestTask": run.last_task_message,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let mailbox_snapshot = scheduler.mailbox_snapshot_scoped(&scope);
-            if !active_agents.is_empty() || !mailbox_snapshot.is_empty() {
+        if let Some(collaboration) = self.collaboration.as_ref() {
+            let snapshot = collaboration.completion_snapshot().await?;
+            if !snapshot.active_descendants.is_empty() || !snapshot.pending_messages.is_empty() {
                 blockers.push(json!({
                     "kind": "descendant_agents_unresolved",
-                    "activeAgents": active_agents,
-                    "messages": mailbox_snapshot,
+                    "activeAgents": snapshot.active_descendants,
+                    "messages": &snapshot.pending_messages,
                 }));
                 agent_delivery = Some(AgentCompletionGuardDelivery {
-                    scope,
-                    messages: mailbox_snapshot,
+                    messages: snapshot.pending_messages,
                 });
             }
         }

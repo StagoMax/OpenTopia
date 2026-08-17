@@ -203,7 +203,6 @@ try {
   $activeProvider.contextWindowTokens = $ContextWindowTokens
   $activeProvider.maxOutputTokens = $MaxOutputTokens
   $activeProvider.reasoningEffort = "none"
-  $activeProvider.supportsVision = $false
   Invoke-TestApi "Patch" "/api/settings" @{
     providers = @($settings.providers)
     activeProviderId = $settings.activeProviderId

@@ -380,7 +380,10 @@ fn runtime_roots_from_environment(
     for (key, value) in environment {
         let key = key.to_string_lossy().to_ascii_uppercase();
         if key == "PATH" {
-            roots.extend(std::env::split_paths(value));
+            // PATH is a lookup list, not a declaration that every entry is a
+            // dependency of this launch. The resolved executable's parent is
+            // already included above; recursively provisioning every PATH
+            // directory on Windows is both over-broad and prohibitively slow.
             continue;
         }
         // Keep this to SDK/runtime roots, not arbitrary *_HOME values. For
@@ -546,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_path_entries_are_removed_from_execution_and_sandbox_grants() {
+    fn unavailable_path_entries_are_removed_without_becoming_sandbox_grants() {
         let root = std::env::current_dir()
             .expect("current directory")
             .canonicalize()
@@ -566,10 +569,9 @@ mod tests {
             std::env::split_paths(resolved_path).collect::<Vec<_>>(),
             vec![root.clone()]
         );
-        assert_eq!(
-            runtime_roots_from_environment(&environment).expect("runtime roots"),
-            vec![root]
-        );
+        assert!(runtime_roots_from_environment(&environment)
+            .expect("runtime roots")
+            .is_empty());
     }
 
     #[test]

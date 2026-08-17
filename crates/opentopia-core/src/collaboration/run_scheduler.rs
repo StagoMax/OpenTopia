@@ -1,4 +1,5 @@
 use super::{AgentThreadId, AgentTurnId, CollaborationSessionId};
+use crate::{AgentResumeSignal, UserInputResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -21,12 +22,53 @@ pub enum AgentRunCommand {
         agent_thread_id: AgentThreadId,
         agent_turn_id: AgentTurnId,
         invocation_id: u64,
+        signal: AgentRunResumeSignal,
     },
     Cancel {
         session_id: CollaborationSessionId,
         agent_thread_id: AgentThreadId,
         agent_turn_id: AgentTurnId,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentRunResumeSignal {
+    Approval {
+        approval_id: Option<uuid::Uuid>,
+        approved: bool,
+    },
+    UserInput {
+        request_id: uuid::Uuid,
+        response: UserInputResponse,
+    },
+    ExternalAction {
+        observation: String,
+    },
+}
+
+impl From<AgentRunResumeSignal> for AgentResumeSignal {
+    fn from(value: AgentRunResumeSignal) -> Self {
+        match value {
+            AgentRunResumeSignal::Approval {
+                approval_id,
+                approved,
+            } => Self::Approval {
+                approval_id,
+                approved,
+            },
+            AgentRunResumeSignal::UserInput {
+                request_id,
+                response,
+            } => Self::UserInput {
+                request_id,
+                response,
+            },
+            AgentRunResumeSignal::ExternalAction { observation } => {
+                Self::ExternalAction { observation }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub(crate) const LEGACY_DATABASE_SCHEMA_VERSION: i64 = 19;
-pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 21;
+pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 23;
 
 const LEGACY_BASELINE_NAME: &str = "legacy_baseline_v19";
 const MIGRATION_LEDGER_SQL: &str = include_str!("migrations/0019_legacy_baseline.sql");
@@ -79,6 +79,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "agent_collaboration_domain",
         sql: include_str!("migrations/0021_agent_collaboration_domain.sql"),
         verify: verify_v21,
+    },
+    Migration {
+        version: 22,
+        name: "agent_runtime_cutover",
+        sql: include_str!("migrations/0022_agent_runtime_cutover.sql"),
+        verify: verify_v22,
+    },
+    Migration {
+        version: 23,
+        name: "agent_turn_checkpoints",
+        sql: include_str!("migrations/0023_agent_turn_checkpoints.sql"),
+        verify: verify_v23,
     },
 ];
 
@@ -481,6 +493,39 @@ fn verify_v21(conn: &Connection) -> anyhow::Result<()> {
     ] {
         anyhow::ensure!(table_exists(conn, table)?, "{table} table is missing");
     }
+    Ok(())
+}
+
+fn verify_v22(conn: &Connection) -> anyhow::Result<()> {
+    for table in ["agent_events", "agent_provider_states"] {
+        anyhow::ensure!(table_exists(conn, table)?, "{table} table is missing");
+    }
+    for removed in ["subagent_conversations", "subagent_runs"] {
+        anyhow::ensure!(
+            !table_exists(conn, removed)?,
+            "legacy table {removed} must be removed"
+        );
+    }
+    let mut columns = BTreeSet::new();
+    let mut statement = conn.prepare("PRAGMA table_info(agent_mailbox_messages)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        columns.insert(row?);
+    }
+    for required in ["delivery_state", "delivered_at", "acknowledged_at"] {
+        anyhow::ensure!(
+            columns.contains(required),
+            "agent_mailbox_messages.{required} is missing"
+        );
+    }
+    Ok(())
+}
+
+fn verify_v23(conn: &Connection) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        table_exists(conn, "agent_turn_checkpoints")?,
+        "agent_turn_checkpoints table is missing"
+    );
     Ok(())
 }
 

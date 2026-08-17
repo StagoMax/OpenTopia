@@ -2,9 +2,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use opentopia_core::{
-    normalize_workspace_key, FileMutationObserver, FileMutationScope, FileMutationTarget,
-    PreparedFileMutation, SessionStore, SqliteSessionStore, TurnChangeSet, TurnChangeSetStatus,
-    TurnFileChange, TurnFileChangeKind, GIT_NONINTERACTIVE_ENVIRONMENT,
+    lock_mutation_paths, normalize_workspace_key, FileMutationObserver, FileMutationScope,
+    FileMutationTarget, PreparedFileMutation, SessionStore, SqliteSessionStore, TurnChangeSet,
+    TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, GIT_NONINTERACTIVE_ENVIRONMENT,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -123,6 +123,7 @@ struct UndoPlan {
     preview: TurnUndoPreview,
     actions: Vec<UndoAction>,
     observed: BTreeMap<String, Option<TreeEntry>>,
+    external_observed: BTreeMap<PathBuf, Option<String>>,
     repo: RepoContext,
 }
 
@@ -267,7 +268,9 @@ impl TurnChangeManager {
             );
             let mut has_unjournaled_change = false;
             for path in reported {
-                if !git_path_is_ignored(&repo.repo_root, &repo_path(&repo, &path)).await? {
+                if path.is_absolute()
+                    || !git_path_is_ignored(&repo.repo_root, &repo_path(&repo, &path)).await?
+                {
                     has_unjournaled_change = true;
                     break;
                 }
@@ -290,26 +293,65 @@ impl TurnChangeManager {
         }
         let result = async {
             let repo = repo_from_change_set(&change_set)?;
+            let journaled_external = change_set
+                .files
+                .iter()
+                .filter(|change| change_is_external(change))
+                .cloned()
+                .collect::<Vec<_>>();
+            let journaled_workspace = change_set
+                .files
+                .iter()
+                .filter(|change| !change_is_external(change))
+                .cloned()
+                .collect::<Vec<_>>();
             let before_reference = turn_snapshot_ref(turn_id, "before");
             let after_reference = turn_snapshot_ref(turn_id, "after");
             let before_tree = capture_journal_tree(
                 &repo,
-                &change_set.files,
+                &journaled_workspace,
                 JournalTreeSide::Before,
                 Some(&before_reference),
             )
             .await?;
             let after_tree = capture_journal_tree(
                 &repo,
-                &change_set.files,
+                &journaled_workspace,
                 JournalTreeSide::After,
                 Some(&after_reference),
+            )
+            .await?;
+            protect_external_blobs(
+                &repo.repo_root,
+                &journaled_external,
+                JournalTreeSide::Before,
+                &turn_snapshot_ref(turn_id, "external-before"),
+            )
+            .await?;
+            protect_external_blobs(
+                &repo.repo_root,
+                &journaled_external,
+                JournalTreeSide::After,
+                &turn_snapshot_ref(turn_id, "external-after"),
             )
             .await?;
             // The write-boundary journal is authoritative. Tool-result path
             // metadata is only a compatibility signal for unjournaled writers
             // and must not discard an exact mutation record.
-            let files = diff_trees(&repo, &before_tree, &after_tree).await?;
+            let mut files = diff_trees(&repo, &before_tree, &after_tree).await?;
+            for mut change in journaled_external {
+                let (additions, deletions, binary) =
+                    external_file_stats(&repo.repo_root, &change).await?;
+                change.additions = additions;
+                change.deletions = deletions;
+                change.binary = binary;
+                files.push(change);
+            }
+            files.sort_by(|left, right| {
+                left.display_path()
+                    .map(|path| normalized_path_text(path))
+                    .cmp(&right.display_path().map(|path| normalized_path_text(path)))
+            });
             anyhow::Ok((before_tree, after_tree, files))
         }
         .await;
@@ -370,8 +412,7 @@ impl TurnChangeManager {
         requested_offset: usize,
     ) -> anyhow::Result<TurnFileDiffPreview> {
         let repo = repo_from_change_set(change_set)?;
-        validate_workspace_relative_path(requested_path)?;
-        let requested = git_path(requested_path);
+        validate_recorded_change_path(requested_path)?;
         let change = change_set
             .files
             .iter()
@@ -380,7 +421,7 @@ impl TurnChangeManager {
                     .old_path
                     .iter()
                     .chain(change.new_path.iter())
-                    .any(|path| git_path(path) == requested)
+                    .any(|path| same_change_path(path, requested_path))
             })
             .with_context(|| {
                 format!(
@@ -405,6 +446,17 @@ impl TurnChangeManager {
                 next_offset: None,
                 total_bytes: 0,
             });
+        }
+
+        if change_is_external(change) {
+            let diff = external_blob_diff(&repo.repo_root, change, &path).await?;
+            return Ok(paginate_file_diff(
+                change_set.turn_id,
+                change,
+                path,
+                diff,
+                requested_offset,
+            ));
         }
 
         let before_tree = change_set
@@ -440,37 +492,20 @@ impl TurnChangeManager {
         }
         let output = git_output_strings(&repo.repo_root, &args, None).await?;
         ensure_git_success(&output, "git diff for turn file preview")?;
-        let diff = String::from_utf8_lossy(&output.stdout);
-        let total_bytes = diff.len();
-        let mut offset = requested_offset.min(total_bytes);
-        while offset > 0 && !diff.is_char_boundary(offset) {
-            offset -= 1;
-        }
-        let mut end = offset
-            .saturating_add(TURN_FILE_DIFF_PAGE_BYTES)
-            .min(total_bytes);
-        while end > offset && !diff.is_char_boundary(end) {
-            end -= 1;
-        }
-        let next_offset = (end < total_bytes).then_some(end);
-
-        Ok(TurnFileDiffPreview {
-            turn_id: change_set.turn_id,
+        Ok(paginate_file_diff(
+            change_set.turn_id,
+            change,
             path,
-            old_path: change.old_path.clone(),
-            new_path: change.new_path.clone(),
-            binary: false,
-            diff: diff[offset..end].to_string(),
-            offset,
-            next_offset,
-            total_bytes,
-        })
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            requested_offset,
+        ))
     }
 
     pub async fn undo(&self, change_set: TurnChangeSet) -> anyhow::Result<TurnUndoResult> {
         let started = Instant::now();
         let turn_id = change_set.turn_id;
         let _guard = self.lock_workspace(&change_set.workspace_root).await;
+        let _path_guards = lock_mutation_paths(change_set_mutation_paths(&change_set)).await;
         let plan = self.build_undo_plan(change_set).await?;
         if !plan.preview.can_undo {
             return Ok(TurnUndoResult {
@@ -534,6 +569,7 @@ impl TurnChangeManager {
         let repo = repo_from_change_set(&change_set)?;
         let mut actions = Vec::new();
         let mut observed = BTreeMap::new();
+        let mut external_observed = BTreeMap::new();
 
         if conflicts.is_empty() {
             let after_tree = change_set
@@ -555,15 +591,26 @@ impl TurnChangeManager {
                 .collect::<Vec<_>>();
             let current_entries = tree_entries(&repo.repo_root, &current_tree, &repo_paths).await?;
             for file in &change_set.files {
-                plan_file_undo(
-                    &repo,
-                    &current_entries,
-                    file,
-                    &mut actions,
-                    &mut observed,
-                    &mut conflicts,
-                )
-                .await?;
+                if change_is_external(file) {
+                    plan_external_file_undo(
+                        &repo,
+                        file,
+                        &mut actions,
+                        &mut external_observed,
+                        &mut conflicts,
+                    )
+                    .await?;
+                } else {
+                    plan_file_undo(
+                        &repo,
+                        &current_entries,
+                        file,
+                        &mut actions,
+                        &mut observed,
+                        &mut conflicts,
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -580,6 +627,7 @@ impl TurnChangeManager {
             preview,
             actions,
             observed,
+            external_observed,
             repo,
         })
     }
@@ -618,14 +666,8 @@ impl FileMutationObserver for TurnChangeManager {
         let repo = repo_from_change_set(&change_set)?;
 
         for mutation in mutations {
-            let relative = normalize_reported_change_path(&change_set, &mutation.path)
-                .with_context(|| {
-                    format!(
-                        "mutation path is outside the active workspace: {}",
-                        mutation.path.display()
-                    )
-                })?;
-            validate_workspace_relative_path(&relative)?;
+            let recorded_path = normalize_recorded_change_path(&change_set, &mutation.path)?;
+            let external = recorded_path.is_absolute();
             let before_contents = mutation.original.as_deref();
             let after_contents = match &mutation.target {
                 FileMutationTarget::Write(contents) => Some(contents.as_slice()),
@@ -636,11 +678,12 @@ impl FileMutationObserver for TurnChangeManager {
                     .old_path
                     .iter()
                     .chain(change.new_path.iter())
-                    .any(|path| same_change_path(path, &relative))
+                    .any(|path| same_change_path(path, &recorded_path))
             });
             let existing = existing_index.map(|index| change_set.files[index].clone());
-            if existing.is_none()
-                && git_path_is_ignored(&repo.repo_root, &repo_path(&repo, &relative)).await?
+            if !external
+                && existing.is_none()
+                && git_path_is_ignored(&repo.repo_root, &repo_path(&repo, &recorded_path)).await?
             {
                 continue;
             }
@@ -682,8 +725,8 @@ impl FileMutationObserver for TurnChangeManager {
                     .any(|contents| contents.contains(&0));
             let change = TurnFileChange {
                 kind,
-                old_path: before_oid.as_ref().map(|_| relative.clone()),
-                new_path: after_oid.as_ref().map(|_| relative.clone()),
+                old_path: before_oid.as_ref().map(|_| recorded_path.clone()),
+                new_path: after_oid.as_ref().map(|_| recorded_path.clone()),
                 before_oid,
                 after_oid,
                 before_mode,
@@ -705,6 +748,38 @@ impl FileMutationObserver for TurnChangeManager {
         });
         self.store.upsert_turn_change_set(&change_set)?;
         Ok(())
+    }
+}
+
+fn paginate_file_diff(
+    turn_id: Uuid,
+    change: &TurnFileChange,
+    path: PathBuf,
+    diff: String,
+    requested_offset: usize,
+) -> TurnFileDiffPreview {
+    let total_bytes = diff.len();
+    let mut offset = requested_offset.min(total_bytes);
+    while offset > 0 && !diff.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let mut end = offset
+        .saturating_add(TURN_FILE_DIFF_PAGE_BYTES)
+        .min(total_bytes);
+    while end > offset && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    let next_offset = (end < total_bytes).then_some(end);
+    TurnFileDiffPreview {
+        turn_id,
+        path,
+        old_path: change.old_path.clone(),
+        new_path: change.new_path.clone(),
+        binary: false,
+        diff: diff[offset..end].to_string(),
+        offset,
+        next_offset,
+        total_bytes,
     }
 }
 
@@ -831,6 +906,61 @@ async fn capture_journal_tree(
     result
 }
 
+async fn protect_external_blobs(
+    repo_root: &Path,
+    changes: &[TurnFileChange],
+    side: JournalTreeSide,
+    reference: &str,
+) -> anyhow::Result<()> {
+    let mut oids = BTreeMap::new();
+    for oid in changes.iter().filter_map(|change| match side {
+        JournalTreeSide::Before => change.before_oid.as_deref(),
+        JournalTreeSide::After => change.after_oid.as_deref(),
+    }) {
+        oids.entry(oid.to_string()).or_insert(());
+    }
+    if oids.is_empty() {
+        return Ok(());
+    }
+
+    let temp_index = std::env::temp_dir().join(format!("opentopia-index-{}", Uuid::new_v4()));
+    let result = async {
+        run_git_strings(
+            repo_root,
+            &["read-tree".to_string(), "--empty".to_string()],
+            Some(&temp_index),
+        )
+        .await?;
+        for (index, oid) in oids.keys().enumerate() {
+            run_git_strings(
+                repo_root,
+                &[
+                    "update-index".to_string(),
+                    "--add".to_string(),
+                    "--cacheinfo".to_string(),
+                    format!("100644,{oid},blob/{index:08}"),
+                ],
+                Some(&temp_index),
+            )
+            .await?;
+        }
+        let output = git_output(repo_root, &["write-tree"], Some(&temp_index)).await?;
+        ensure_git_success(&output, "git write-tree for external turn blobs")?;
+        let tree = String::from_utf8(output.stdout)?.trim().to_string();
+        run_git_strings(
+            repo_root,
+            &["update-ref".to_string(), reference.to_string(), tree],
+            None,
+        )
+        .await?;
+        anyhow::Ok(())
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temp_index).await;
+    let _ = tokio::fs::remove_file(temp_index.with_extension("lock")).await;
+    result
+}
+
 async fn write_git_blob(repo_root: &Path, contents: &[u8]) -> anyhow::Result<String> {
     let mut command = Command::new("git");
     command
@@ -847,6 +977,241 @@ async fn write_git_blob(repo_root: &Path, contents: &[u8]) -> anyhow::Result<Str
         .context("git hash-object stdin unavailable")?;
     stdin.write_all(contents).await?;
     drop(stdin);
+    let output = child.wait_with_output().await?;
+    ensure_git_success(&output, "git hash-object")?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+async fn external_file_stats(
+    repo_root: &Path,
+    change: &TurnFileChange,
+) -> anyhow::Result<(Option<u64>, Option<u64>, bool)> {
+    let before = read_optional_raw_blob(repo_root, change.before_oid.as_deref()).await?;
+    let after = read_optional_raw_blob(repo_root, change.after_oid.as_deref()).await?;
+    if [&before, &after]
+        .into_iter()
+        .any(|contents| contents.contains(&0))
+    {
+        return Ok((None, None, true));
+    }
+    let before_oid = blob_oid_or_empty(repo_root, change.before_oid.as_deref()).await?;
+    let after_oid = blob_oid_or_empty(repo_root, change.after_oid.as_deref()).await?;
+    file_stats(repo_root, &before_oid, &after_oid, None, None).await
+}
+
+async fn external_blob_diff(
+    repo_root: &Path,
+    change: &TurnFileChange,
+    path: &Path,
+) -> anyhow::Result<String> {
+    let before_oid = blob_oid_or_empty(repo_root, change.before_oid.as_deref()).await?;
+    let after_oid = blob_oid_or_empty(repo_root, change.after_oid.as_deref()).await?;
+    let output = git_output_strings(
+        repo_root,
+        &[
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-color".to_string(),
+            "--unified=3".to_string(),
+            before_oid.clone(),
+            after_oid.clone(),
+        ],
+        None,
+    )
+    .await?;
+    ensure_git_success(&output, "git diff for external turn file preview")?;
+    let label = normalized_path_text(path);
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .replace(&format!("a/{before_oid}"), &format!("a/{label}"))
+        .replace(&format!("b/{after_oid}"), &format!("b/{label}")))
+}
+
+async fn blob_oid_or_empty(repo_root: &Path, oid: Option<&str>) -> anyhow::Result<String> {
+    match oid {
+        Some(oid) => Ok(oid.to_string()),
+        None => write_git_blob(repo_root, &[]).await,
+    }
+}
+
+async fn read_optional_raw_blob(repo_root: &Path, oid: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    match oid {
+        Some(oid) => read_raw_blob(repo_root, oid).await,
+        None => Ok(Vec::new()),
+    }
+}
+
+async fn read_raw_blob(repo_root: &Path, oid: &str) -> anyhow::Result<Vec<u8>> {
+    let output = git_output_strings(
+        repo_root,
+        &["cat-file".to_string(), "blob".to_string(), oid.to_string()],
+        None,
+    )
+    .await?;
+    ensure_git_success(&output, "git cat-file external blob")?;
+    Ok(output.stdout)
+}
+
+async fn plan_external_file_undo(
+    repo: &RepoContext,
+    change: &TurnFileChange,
+    actions: &mut Vec<UndoAction>,
+    observed: &mut BTreeMap<PathBuf, Option<String>>,
+    conflicts: &mut Vec<TurnUndoConflict>,
+) -> anyhow::Result<()> {
+    let path = change
+        .display_path()
+        .context("external file change has no path")?;
+    validate_external_absolute_path(path)?;
+    let current = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_file() => Some(tokio::fs::read(path).await?),
+        Ok(_) => {
+            conflicts.push(file_conflict(
+                path,
+                TurnUndoConflictKind::UnsupportedFileType,
+                "the external path is no longer a regular file",
+            ));
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let current_oid = match current.as_deref() {
+        Some(contents) => Some(hash_git_blob(&repo.repo_root, contents).await?),
+        None => None,
+    };
+    observed.insert(path.clone(), current_oid.clone());
+
+    match change.kind {
+        TurnFileChangeKind::Added => {
+            let after = change
+                .after_oid
+                .as_deref()
+                .context("external added file snapshot is missing")?;
+            if current_oid.as_deref() == Some(after) {
+                actions.push(UndoAction::Delete { path: path.clone() });
+            } else {
+                conflicts.push(file_conflict(
+                    path,
+                    TurnUndoConflictKind::WorkspaceChanged,
+                    "the external file created by this turn was changed or replaced later",
+                ));
+            }
+        }
+        TurnFileChangeKind::Deleted => {
+            let before = change
+                .before_oid
+                .as_deref()
+                .context("external deleted file snapshot is missing")?;
+            if current.is_none() {
+                actions.push(UndoAction::Write {
+                    path: path.clone(),
+                    contents: read_raw_blob(&repo.repo_root, before).await?,
+                    mode: change
+                        .before_mode
+                        .clone()
+                        .unwrap_or_else(|| "100644".to_string()),
+                });
+            } else if current_oid.as_deref() != Some(before) {
+                conflicts.push(file_conflict(
+                    path,
+                    TurnUndoConflictKind::PathConflict,
+                    "the deleted external path is occupied by a different file",
+                ));
+            }
+        }
+        TurnFileChangeKind::Modified => {
+            let before_oid = change
+                .before_oid
+                .as_deref()
+                .context("external before snapshot is missing")?;
+            let after_oid = change
+                .after_oid
+                .as_deref()
+                .context("external after snapshot is missing")?;
+            let Some(current_contents) = current else {
+                conflicts.push(file_conflict(
+                    path,
+                    TurnUndoConflictKind::WorkspaceChanged,
+                    "the external file no longer exists",
+                ));
+                return Ok(());
+            };
+            let before_contents = read_raw_blob(&repo.repo_root, before_oid).await?;
+            let contents = if current_oid.as_deref() == Some(after_oid) {
+                before_contents
+            } else {
+                if change.binary || current_contents.contains(&0) {
+                    conflicts.push(file_conflict(
+                        path,
+                        TurnUndoConflictKind::BinaryChanged,
+                        "a binary external file changed after this turn and cannot be merged",
+                    ));
+                    return Ok(());
+                }
+                let after_contents = read_raw_blob(&repo.repo_root, after_oid).await?;
+                if [
+                    current_contents.len(),
+                    after_contents.len(),
+                    before_contents.len(),
+                ]
+                .into_iter()
+                .any(|size| size > MAX_MERGE_FILE_BYTES)
+                {
+                    conflicts.push(file_conflict(
+                        path,
+                        TurnUndoConflictKind::TooLarge,
+                        "the external file is too large for a safe three-way merge",
+                    ));
+                    return Ok(());
+                }
+                match merge_contents(&current_contents, &after_contents, &before_contents).await? {
+                    Ok(merged) => merged,
+                    Err(()) => {
+                        conflicts.push(file_conflict(
+                            path,
+                            TurnUndoConflictKind::MergeConflict,
+                            "later edits overlap the external lines changed by this turn",
+                        ));
+                        return Ok(());
+                    }
+                }
+            };
+            actions.push(UndoAction::Write {
+                path: path.clone(),
+                contents,
+                mode: change
+                    .before_mode
+                    .clone()
+                    .unwrap_or_else(|| "100644".to_string()),
+            });
+        }
+        TurnFileChangeKind::Renamed => {
+            conflicts.push(file_conflict(
+                path,
+                TurnUndoConflictKind::UnsupportedFileType,
+                "external rename records are not supported",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn hash_git_blob(repo_root: &Path, contents: &[u8]) -> anyhow::Result<String> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo_root)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(GIT_NONINTERACTIVE_ENVIRONMENT.iter().copied());
+    let mut child = command.spawn().context("failed to start git hash-object")?;
+    child
+        .stdin
+        .take()
+        .context("git hash-object stdin unavailable")?
+        .write_all(contents)
+        .await?;
     let output = child.wait_with_output().await?;
     ensure_git_success(&output, "git hash-object")?;
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
@@ -1175,15 +1540,28 @@ fn normalize_reported_change_path(change_set: &TurnChangeSet, reported: &Path) -
         .map(|relative| PathBuf::from(&reported[reported.len() - relative.len()..]))
 }
 
+fn normalize_recorded_change_path(
+    change_set: &TurnChangeSet,
+    reported: &Path,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !reported.as_os_str().is_empty(),
+        "file mutation path is empty"
+    );
+    if let Some(relative) = normalize_reported_change_path(change_set, reported) {
+        validate_workspace_relative_path(&relative)?;
+        return Ok(relative);
+    }
+    validate_external_absolute_path(reported)?;
+    Ok(reported.to_path_buf())
+}
+
 fn normalized_changed_paths(change_set: &TurnChangeSet, reported: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = BTreeMap::new();
     for path in reported {
-        let Some(path) = normalize_reported_change_path(change_set, path) else {
+        let Ok(path) = normalize_recorded_change_path(change_set, path) else {
             continue;
         };
-        if validate_workspace_relative_path(&path).is_err() {
-            continue;
-        }
         let key = comparable_path_text(&normalized_path_text(&path));
         paths.entry(key).or_insert(path);
     }
@@ -1197,10 +1575,39 @@ fn change_set_workspace_paths(change_set: &TurnChangeSet) -> Vec<PathBuf> {
         .iter()
         .flat_map(|file| file.old_path.iter().chain(file.new_path.iter()))
     {
+        if path.is_absolute() {
+            continue;
+        }
         let key = comparable_path_text(&normalized_path_text(path));
         paths.entry(key).or_insert_with(|| path.clone());
     }
     paths.into_values().collect()
+}
+
+fn change_set_mutation_paths(change_set: &TurnChangeSet) -> Vec<PathBuf> {
+    let mut paths = BTreeMap::new();
+    for path in change_set
+        .files
+        .iter()
+        .flat_map(|file| file.old_path.iter().chain(file.new_path.iter()))
+    {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            change_set.workspace_root.join(path)
+        };
+        let key = comparable_path_text(&normalized_path_text(&absolute));
+        paths.entry(key).or_insert(absolute);
+    }
+    paths.into_values().collect()
+}
+
+fn change_is_external(change: &TurnFileChange) -> bool {
+    change
+        .old_path
+        .iter()
+        .chain(change.new_path.iter())
+        .any(|path| path.is_absolute())
 }
 
 fn same_change_path(left: &Path, right: &Path) -> bool {
@@ -1630,6 +2037,29 @@ async fn verify_observed_entries(plan: &UndoPlan) -> anyhow::Result<Option<TurnU
             }));
         }
     }
+    for (path, expected) in &plan.external_observed {
+        let actual = match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                Some(hash_git_blob(&plan.repo.repo_root, &tokio::fs::read(path).await?).await?)
+            }
+            Ok(_) => {
+                return Ok(Some(file_conflict(
+                    path,
+                    TurnUndoConflictKind::UnsupportedFileType,
+                    "the external path changed type while undo was being prepared",
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if &actual != expected {
+            return Ok(Some(file_conflict(
+                path,
+                TurnUndoConflictKind::WorkspaceChanged,
+                "the external file changed while undo was being prepared; retry",
+            )));
+        }
+    }
     Ok(None)
 }
 
@@ -1642,8 +2072,8 @@ async fn apply_actions(workspace_root: &Path, actions: &[UndoAction]) -> anyhow:
         };
         paths.insert(relative.clone(), ());
     }
-    for relative in paths.keys() {
-        let path = safe_workspace_path(workspace_root, relative)?;
+    for recorded in paths.keys() {
+        let path = safe_recorded_path(workspace_root, recorded)?;
         let state = match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) if metadata.file_type().is_file() => BackupState::File {
                 contents: tokio::fs::read(&path).await?,
@@ -1664,12 +2094,12 @@ async fn apply_actions(workspace_root: &Path, actions: &[UndoAction]) -> anyhow:
                     contents,
                     mode,
                 } => {
-                    let path = safe_workspace_path(workspace_root, path)?;
+                    let path = safe_recorded_path(workspace_root, path)?;
                     write_file_atomic(&path, contents).await?;
                     apply_git_mode(&path, mode).await?;
                 }
                 UndoAction::Delete { path } => {
-                    let path = safe_workspace_path(workspace_root, path)?;
+                    let path = safe_recorded_path(workspace_root, path)?;
                     match tokio::fs::remove_file(&path).await {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1762,6 +2192,61 @@ fn safe_workspace_path(workspace_root: &Path, relative: &Path) -> anyhow::Result
         }
     }
     Ok(workspace_root.join(relative))
+}
+
+fn safe_recorded_path(workspace_root: &Path, recorded: &Path) -> anyhow::Result<PathBuf> {
+    if recorded.is_relative() {
+        return safe_workspace_path(workspace_root, recorded);
+    }
+    validate_external_absolute_path(recorded)?;
+    let components = recorded.components().collect::<Vec<_>>();
+    let mut current = PathBuf::new();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        if !matches!(component, Component::Normal(_)) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "external undo path traverses a symbolic link: {}",
+                    current.display()
+                )
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                anyhow::bail!(
+                    "external undo path parent is not a directory: {}",
+                    current.display()
+                )
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(recorded.to_path_buf())
+}
+
+fn validate_recorded_change_path(path: &Path) -> anyhow::Result<()> {
+    if path.is_absolute() {
+        validate_external_absolute_path(path)
+    } else {
+        validate_workspace_relative_path(path)
+    }
+}
+
+fn validate_external_absolute_path(path: &Path) -> anyhow::Result<()> {
+    let components = path.components().collect::<Vec<_>>();
+    if !path.is_absolute()
+        || components.is_empty()
+        || !matches!(components.last(), Some(Component::Normal(_)))
+        || components
+            .iter()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        anyhow::bail!("invalid external absolute file path: {}", path.display());
+    }
+    Ok(())
 }
 
 fn validate_workspace_relative_path(relative: &Path) -> anyhow::Result<()> {
@@ -2520,5 +3005,136 @@ mod tests {
             repo.read("old-name.txt").replace("\r\n", "\n"),
             "renamed contents\n"
         );
+    }
+
+    #[tokio::test]
+    async fn external_absolute_file_is_journaled_previewed_and_undone() {
+        let repo = TestRepo::new();
+        repo.write("tracked.txt", "baseline\n");
+        repo.commit_all();
+        let (manager, store, thread_id) = manager(&repo);
+        let external_root =
+            std::env::temp_dir().join(format!("opentopia-external-turn-{}", Uuid::new_v4()));
+        fs::create_dir_all(&external_root).unwrap();
+        let external = external_root.join("settings.txt");
+        fs::write(&external, "before\n").unwrap();
+        let turn_id = insert_turn(&store, thread_id);
+
+        manager
+            .begin_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        fs::write(&external, "after\n").unwrap();
+        journal_mutations(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            vec![PreparedFileMutation::write(
+                external.clone(),
+                Some(b"before\n".to_vec()),
+                b"after\n".to_vec(),
+            )],
+        )
+        .await;
+        let change_set = manager
+            .finalize_capture_for_paths(turn_id, std::slice::from_ref(&external))
+            .await
+            .unwrap();
+
+        assert_eq!(change_set.status, TurnChangeSetStatus::Ready);
+        assert_eq!(change_set.files.len(), 1);
+        assert_eq!(
+            change_set.files[0].new_path.as_deref(),
+            Some(external.as_path())
+        );
+        assert_eq!(change_set.files[0].additions, Some(1));
+        assert_eq!(change_set.files[0].deletions, Some(1));
+        let protected_ref = turn_snapshot_ref(turn_id, "external-after");
+        let protected = StdCommand::new("git")
+            .current_dir(&repo.root)
+            .args(["show-ref", "--verify", "--quiet", &protected_ref])
+            .status()
+            .unwrap();
+        assert!(protected.success(), "external blob snapshot ref is missing");
+        let preview = manager
+            .preview_file_diff(&change_set, &external, 0)
+            .await
+            .unwrap();
+        assert!(preview.diff.contains("-before"));
+        assert!(preview.diff.contains("+after"));
+
+        let result = manager.undo(change_set).await.unwrap();
+        assert!(result.applied, "conflicts: {:?}", result.preview.conflicts);
+        assert_eq!(fs::read_to_string(&external).unwrap(), "before\n");
+        fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_file_undo_across_threads_preserves_later_non_overlapping_turn() {
+        let repo = TestRepo::new();
+        repo.write("tracked.txt", "baseline\n");
+        repo.commit_all();
+        let store = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
+        let first_thread = store.create_thread(None, repo.root.clone()).unwrap();
+        let second_thread = store.create_thread(None, repo.root.clone()).unwrap();
+        let manager = TurnChangeManager::new(store.clone());
+        let external_root =
+            std::env::temp_dir().join(format!("opentopia-external-merge-{}", Uuid::new_v4()));
+        fs::create_dir_all(&external_root).unwrap();
+        let external = external_root.join("shared.txt");
+        fs::write(&external, "one\ntwo\nthree\n").unwrap();
+
+        let first_turn = insert_turn(&store, first_thread.id);
+        manager
+            .begin_capture(first_turn, first_thread.id, &repo.root)
+            .await
+            .unwrap();
+        fs::write(&external, "ONE\ntwo\nthree\n").unwrap();
+        journal_mutations(
+            &manager,
+            &repo,
+            first_thread.id,
+            first_turn,
+            vec![PreparedFileMutation::write(
+                external.clone(),
+                Some(b"one\ntwo\nthree\n".to_vec()),
+                b"ONE\ntwo\nthree\n".to_vec(),
+            )],
+        )
+        .await;
+        manager.finalize_capture(first_turn).await.unwrap();
+        store
+            .update_turn_status(first_turn, TurnStatus::Succeeded, None)
+            .unwrap();
+
+        let second_turn = insert_turn(&store, second_thread.id);
+        manager
+            .begin_capture(second_turn, second_thread.id, &repo.root)
+            .await
+            .unwrap();
+        fs::write(&external, "ONE\ntwo\nTHREE\n").unwrap();
+        journal_mutations(
+            &manager,
+            &repo,
+            second_thread.id,
+            second_turn,
+            vec![PreparedFileMutation::write(
+                external.clone(),
+                Some(b"ONE\ntwo\nthree\n".to_vec()),
+                b"ONE\ntwo\nTHREE\n".to_vec(),
+            )],
+        )
+        .await;
+        manager.finalize_capture(second_turn).await.unwrap();
+
+        let first_changes = store.get_turn_change_set(first_turn).unwrap().unwrap();
+        let result = manager.undo(first_changes).await.unwrap();
+        assert!(result.applied, "conflicts: {:?}", result.preview.conflicts);
+        assert_eq!(
+            fs::read_to_string(&external).unwrap().replace("\r\n", "\n"),
+            "one\ntwo\nTHREE\n"
+        );
+        fs::remove_dir_all(external_root).unwrap();
     }
 }

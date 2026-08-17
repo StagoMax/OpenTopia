@@ -63,7 +63,7 @@ impl AgentCore {
             .approved_parallel_call_indices(&catalog, calls)
     }
 
-    pub(super) fn automatic_review_batch_candidates(
+    pub(super) fn approval_candidates(
         &self,
         calls: &[ProviderToolCall],
         workspace_root: &Path,
@@ -73,7 +73,7 @@ impl AgentCore {
         let catalog = self.tool_runtime_catalog();
         self.tool_host
             .runtime
-            .automatic_review_candidates(ToolSchedulingInput {
+            .approval_candidates(ToolSchedulingInput {
                 catalog: &catalog,
                 calls,
                 workspace_root,

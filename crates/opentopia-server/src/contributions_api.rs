@@ -921,8 +921,8 @@ struct AppMessageRequest {
 mod tests {
     use super::*;
     use crate::{
-        auth::ApiAuth, EventBus, PtyManager, ServerSubagentExecutor, StoreSubagentObserver,
-        TerminalBus, TurnChangeManager, TurnManager,
+        auth::ApiAuth, turn_changes::TurnChangeManager, turns::RootTurnLifecycle, EventBus,
+        PtyManager, TerminalBus,
     };
     use async_trait::async_trait;
     use axum::body::to_bytes;
@@ -932,12 +932,11 @@ mod tests {
         McpChildProcess, McpExtensionHost, McpHostError, McpProcessSpawner, McpSpawnedProcess,
     };
     use opentopia_core::{
-        AgentCore, AppSettings, AppViewSessionStatus, BackgroundProcessRegistry,
-        BrowserRuntimeConfig, CodexAccountManager, ComputerRuntime, ComputerRuntimeConfig,
-        ContributionOrigin, LocalBrowserRuntime, LocalComputerRuntime, PermissionMode,
-        PluginControlScope, PluginDescriptor, PluginPermission, PluginPermissionGrantStatus,
-        SessionStore, SqliteSessionStore, SubagentScheduler, SubagentSchedulerConfig,
-        MEDIA_HANDLER_RESULT_API_VERSION,
+        AppSettings, AppViewSessionStatus, BackgroundProcessRegistry, BrowserRuntimeConfig,
+        CodexAccountManager, ComputerRuntime, ComputerRuntimeConfig, ContributionOrigin,
+        LocalBrowserRuntime, LocalComputerRuntime, PermissionMode, PluginControlScope,
+        PluginDescriptor, PluginPermission, PluginPermissionGrantStatus, SessionStore,
+        SqliteSessionStore, MEDIA_HANDLER_RESULT_API_VERSION,
     };
     use serde_json::json;
     use std::fs;
@@ -1084,21 +1083,34 @@ mod tests {
         let settings = Arc::new(RwLock::new(loaded_settings.clone()));
         let turn_inbox: Arc<dyn opentopia_core::TurnInbox> =
             Arc::new(opentopia_core::BufferedTurnInbox::default());
-        let agent = Arc::new(RwLock::new(
-            AgentCore::from_settings(&loaded_settings).with_turn_inbox(turn_inbox.clone()),
-        ));
         let background = BackgroundProcessRegistry::default();
-        let subagents = SubagentScheduler::new(
-            SubagentSchedulerConfig::default(),
-            Arc::new(ServerSubagentExecutor {
-                store: store.clone(),
-                agent: agent.clone(),
-                settings: settings.clone(),
-                mcp_host: mcp_host.clone(),
-            }),
-            Arc::new(StoreSubagentObserver {
-                store: store.clone(),
-            }),
+        let collaboration_repository = Arc::new(
+            opentopia_core::collaboration::SqliteCollaborationRepository::new(store.clone())
+                .expect("collaboration repository"),
+        );
+        let agent_activity = Arc::new(
+            opentopia_core::collaboration::SqliteAgentActivitySource::new(
+                collaboration_repository.clone(),
+            ),
+        );
+        let snapshot_deriver: Arc<dyn opentopia_core::collaboration::RuntimeSnapshotDeriver> =
+            Arc::new(opentopia_core::collaboration::AttenuatingRuntimeSnapshotDeriver);
+        let agent_run_scheduler = crate::agent_runs::ServerAgentRunScheduler::new(
+            collaboration_repository.clone(),
+            turn_inbox.clone(),
+            4,
+        );
+        let collaboration_runtime = opentopia_core::collaboration::AgentCollaborationRuntime::new(
+            collaboration_repository.clone(),
+            agent_run_scheduler.clone(),
+            collaboration_repository.clone(),
+        )
+        .with_mailbox_notifier(agent_run_scheduler.clone());
+        let turns = RootTurnLifecycle::new(
+            store.clone(),
+            collaboration_repository.clone(),
+            agent_activity.clone(),
+            agent_run_scheduler.clone(),
         );
         let (turn_queue, _turn_queue_rx) = mpsc::unbounded_channel();
         let browser = Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default()));
@@ -1108,9 +1120,19 @@ mod tests {
         ));
         let computer: Arc<dyn ComputerRuntime> =
             Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default()));
+        let turn_changes = TurnChangeManager::new(store.clone());
+        let agent_factory = crate::agent_factory::AgentFactory::new(
+            turn_inbox.clone(),
+            browser.clone(),
+            computer.clone(),
+            background.clone(),
+            turn_changes.clone(),
+        );
+        let agent = Arc::new(RwLock::new(agent_factory.build(&loaded_settings)));
         AppState {
             store: store.clone(),
             agent,
+            agent_factory,
             settings,
             codex_account: Arc::new(CodexAccountManager::default()),
             events: EventBus::default(),
@@ -1121,11 +1143,15 @@ mod tests {
             computer,
             mcp_host,
             auth: ApiAuth::for_tests(),
-            turns: TurnManager::new(store.clone()),
-            turn_changes: TurnChangeManager::new(store),
+            turns,
+            turn_changes,
             turn_queue,
             turn_inbox,
-            subagents,
+            collaboration_repository,
+            collaboration_runtime,
+            agent_activity,
+            snapshot_deriver,
+            agent_run_scheduler,
             background,
             app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
             library_providers: Arc::new(crate::library_api::LibraryProviderRegistry::for_tests()),

@@ -116,7 +116,7 @@ mod tests {
             "crate::computer",
             "crate::guardian",
             "crate::mcp",
-            "crate::subagents",
+            "crate::collaboration",
             "crate::tools",
         ] {
             assert!(
@@ -147,6 +147,27 @@ mod tests {
         }
         assert!(production_source.contains("execute_provider_batch(inputs)"));
         assert!(production_source.contains("context_assembler.compile(ContextAssemblyInput"));
+    }
+
+    #[test]
+    fn agent_execution_module_does_not_assemble_provider_dependencies() {
+        let execution = include_str!("agent.rs");
+        let composition = include_str!("agent_composition.rs");
+        for forbidden in [
+            "provider_from_settings(",
+            "guardian_provider_from_settings(",
+            "OpenAiCompatibleProvider::from_env(",
+            "ProviderSettings::from_env(",
+        ] {
+            assert!(
+                !execution.contains(forbidden),
+                "turn execution must not assemble provider dependency `{forbidden}`"
+            );
+            assert!(
+                composition.contains(forbidden),
+                "composition boundary must own provider dependency `{forbidden}`"
+            );
+        }
     }
 
     #[tokio::test]

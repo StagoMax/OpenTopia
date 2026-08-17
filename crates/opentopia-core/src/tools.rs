@@ -21,7 +21,7 @@ use crate::computer::{
 use crate::context_sources::{
     load_context_sources, ContextSourceKind, ContextSourcePolicy, LoadedContextSource,
 };
-use crate::enterprise::{CapabilityProjection, DataClassification};
+use crate::enterprise::CapabilityProjection;
 use crate::execution::{
     shell_command_compatibility_error, ExecRequest, ExecutionContext, ExecutionEnvironment,
     FileDeleteRequest, FileReadRequest, FileWriteRequest, LocalExecutionEnvironment, ShellDialect,
@@ -62,7 +62,6 @@ use crate::spreadsheet::{
     SpreadsheetRequest, SpreadsheetResult, SpreadsheetTextMatchMode, WriteWorkbookRequest,
     MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
-use crate::subagents::SubagentScheduler;
 use crate::tool_state::ToolStateStore;
 use crate::work_form::WorkForm;
 use anyhow::Context;
@@ -105,14 +104,13 @@ pub struct ToolInvocationContext {
     /// Runtime Snapshot identity are captured by the runtime and cannot be
     /// supplied or overridden by model tool arguments.
     pub collaboration: Option<AgentCollaborationInvocation>,
-    pub subagents: Option<SubagentScheduler>,
     /// Commands that outlive the tool call that started them.
     pub background: Option<BackgroundProcessRegistry>,
-    pub parent_turn_id: Option<Uuid>,
+    pub agent_turn_id: Option<Uuid>,
     /// Process-shared sink for exact, committed file mutations. The server uses
     /// it to build per-Turn diffs without scanning the workspace at Turn start.
     pub file_mutation_observer: Option<Arc<dyn FileMutationObserver>>,
-    pub subagent_depth: u8,
+    pub agent_depth: u8,
     pub agent_path: String,
     pub browser: Option<Arc<dyn BrowserRuntime>>,
     pub computer: Option<Arc<dyn ComputerRuntime>>,
@@ -170,11 +168,10 @@ impl ToolInvocationContext {
             thread_id: None,
             cancel: None,
             collaboration: None,
-            subagents: None,
             background: None,
-            parent_turn_id: None,
+            agent_turn_id: None,
             file_mutation_observer: None,
-            subagent_depth: 0,
+            agent_depth: 0,
             agent_path: "/root".to_string(),
             browser: None,
             computer: None,
@@ -209,11 +206,10 @@ impl ToolInvocationContext {
             thread_id: None,
             cancel: None,
             collaboration: None,
-            subagents: None,
             background: None,
-            parent_turn_id: None,
+            agent_turn_id: None,
             file_mutation_observer: None,
-            subagent_depth: 0,
+            agent_depth: 0,
             agent_path: "/root".to_string(),
             browser: None,
             computer: None,
@@ -259,7 +255,7 @@ impl ToolInvocationContext {
         match (
             self.file_mutation_observer.as_deref(),
             self.thread_id,
-            self.parent_turn_id,
+            self.agent_turn_id,
         ) {
             (Some(_), Some(thread_id), Some(turn_id)) => Ok(Some(FileMutationScope {
                 thread_id,
@@ -557,39 +553,6 @@ pub struct ToolExecutionPolicy {
     pub resource_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolRiskLevel {
-    Low,
-    Medium,
-    High,
-    Critical,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolApprovalMode {
-    Never,
-    PolicyControlled,
-    Always,
-}
-
-/// Registry metadata is control-plane data. It is intentionally kept out of
-/// the provider function schema so governance does not consume model tokens.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolCapabilityDescriptor {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-    pub source: String,
-    pub risk: ToolRiskLevel,
-    pub potential_side_effects: Vec<ToolSideEffect>,
-    pub approval: ToolApprovalMode,
-    pub max_data_classification: DataClassification,
-}
-
 impl ToolExecutionPolicy {
     pub fn conservative() -> Self {
         Self {
@@ -629,8 +592,13 @@ impl ToolExecutionPolicy {
     }
 }
 
+mod descriptor;
+pub(crate) use descriptor::{RegisteredTool, ToolGovernance};
+pub use descriptor::{
+    ToolApprovalMode, ToolCapabilityDescriptor, ToolClass, ToolRiskLevel, ToolSource,
+};
 mod registry;
-pub use registry::{ToolClass, ToolRegistry, ToolSource};
+pub use registry::ToolRegistry;
 
 fn truncate_chars(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
@@ -714,7 +682,8 @@ enum SpreadsheetBatchOperation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SpreadsheetToolInput {
     action: SpreadsheetToolAction,
-    /// Workspace-relative XLSX path for inspect/list/read.
+    /// Workspace-relative XLSX path. For mutations this is the destination and,
+    /// when it exists, the workbook updated in place.
     #[serde(default)]
     path: Option<String>,
     /// Opaque user attachment ID for inspect/list/read. Provide either this or path.
@@ -765,6 +734,30 @@ struct SpreadsheetToolInput {
     #[serde(default)]
     #[schemars(range(min = 1, max = 1000))]
     max_results: Option<usize>,
+    /// Start cell for compact write_rows/write_columns calls.
+    #[serde(default)]
+    start: Option<CellAddress>,
+    /// Matrix for compact write_rows calls.
+    #[serde(default)]
+    #[schemars(length(max = 10000))]
+    rows: Vec<Vec<SpreadsheetCellInput>>,
+    /// Matrix for compact write_columns calls.
+    #[serde(default)]
+    #[schemars(length(max = 256))]
+    columns: Vec<Vec<SpreadsheetCellInput>>,
+    /// Source workbook for compact copy_rows/copy_columns calls.
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    source_sheet: Option<String>,
+    #[serde(default)]
+    source_start: Option<CellAddress>,
+    #[serde(default)]
+    destination_sheet: Option<String>,
+    #[serde(default)]
+    destination_start: Option<CellAddress>,
+    #[serde(default)]
+    content_mode: SpreadsheetCopyContentMode,
     /// Optional existing XLSX to update. Compatible cell-only changes preserve
     /// untouched template parts; structural workbook changes rebuild it.
     #[serde(default)]
@@ -787,6 +780,84 @@ struct SpreadsheetToolInput {
     atomic: Option<bool>,
 }
 
+impl SpreadsheetToolInput {
+    fn mutation_output_path(&self) -> Option<&str> {
+        self.output_path.as_deref().or(self.path.as_deref())
+    }
+
+    fn compact_direct_operation(&self) -> anyhow::Result<Option<SpreadsheetBatchOperation>> {
+        let operation = match self.action {
+            SpreadsheetToolAction::WriteRows => Some(SpreadsheetBatchOperation::WriteRows {
+                sheet: required_typed_string(self.sheet.as_deref(), "sheet")?,
+                start: self
+                    .start
+                    .context("spreadsheet write_rows requires start")?,
+                rows: self.rows.clone(),
+            }),
+            SpreadsheetToolAction::WriteColumns => Some(SpreadsheetBatchOperation::WriteColumns {
+                sheet: required_typed_string(self.sheet.as_deref(), "sheet")?,
+                start: self
+                    .start
+                    .context("spreadsheet write_columns requires start")?,
+                columns: self.columns.clone(),
+            }),
+            SpreadsheetToolAction::CopyRows | SpreadsheetToolAction::CopyColumns => {
+                let source_path = required_typed_string(self.from.as_deref(), "from")?;
+                let source_sheet =
+                    required_typed_string(self.source_sheet.as_deref(), "sourceSheet")?;
+                let source_start = self
+                    .source_start
+                    .context("spreadsheet copy requires sourceStart")?;
+                let row_count = self
+                    .row_count
+                    .context("spreadsheet copy requires rowCount")?;
+                let column_count = self
+                    .column_count
+                    .context("spreadsheet copy requires columnCount")?;
+                let destination_sheet =
+                    required_typed_string(self.destination_sheet.as_deref(), "destinationSheet")?;
+                let destination_start = self
+                    .destination_start
+                    .context("spreadsheet copy requires destinationStart")?;
+                Some(if self.action == SpreadsheetToolAction::CopyRows {
+                    SpreadsheetBatchOperation::CopyRows {
+                        source_path,
+                        source_sheet,
+                        source_start,
+                        row_count,
+                        column_count,
+                        destination_sheet,
+                        destination_start,
+                        content_mode: self.content_mode,
+                    }
+                } else {
+                    SpreadsheetBatchOperation::CopyColumns {
+                        source_path,
+                        source_sheet,
+                        source_start,
+                        row_count,
+                        column_count,
+                        destination_sheet,
+                        destination_start,
+                        content_mode: self.content_mode,
+                    }
+                })
+            }
+            SpreadsheetToolAction::Inspect
+            | SpreadsheetToolAction::ListSheets
+            | SpreadsheetToolAction::ReadRange
+            | SpreadsheetToolAction::ReadRanges
+            | SpreadsheetToolAction::ReadRows
+            | SpreadsheetToolAction::ReadColumns
+            | SpreadsheetToolAction::Find
+            | SpreadsheetToolAction::FilterRows
+            | SpreadsheetToolAction::Write
+            | SpreadsheetToolAction::Batch => None,
+        };
+        Ok(operation)
+    }
+}
+
 pub struct SpreadsheetTool;
 
 #[async_trait]
@@ -798,7 +869,7 @@ impl TypedTool for SpreadsheetTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect, find, filter, and manipulate bounded XLSX workbooks with zero-based coordinates. Supports batched ranges, row/column reads, conditional row filtering, matrix writes, internal row/column copies, and atomic multi-operation writes. Existing templates use a preservation path when the requested mutation can be applied without rebuilding workbook objects."
+        "Inspect, find, filter, and manipulate bounded XLSX workbooks with zero-based coordinates. Direct mutations use path plus top-level sheet/start/rows/columns or copy fields; batch keeps typed operations. Mutations are always atomic, and an existing path is updated in place when preservation is possible."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -834,6 +905,8 @@ impl TypedTool for SpreadsheetTool {
                     .source_path
                     .iter()
                     .chain(input.output_path.iter())
+                    .chain(input.path.iter())
+                    .chain(input.from.iter())
                     .map(|path| tool_resource_key("file", path))
                     .collect::<Vec<_>>();
                 resource_keys.extend(
@@ -878,16 +951,24 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::CopyRows
             | SpreadsheetToolAction::CopyColumns
             | SpreadsheetToolAction::Batch => {
-                let read_paths = input.source_path.iter().map(PathBuf::from).chain(
-                    input
-                        .operation
-                        .iter()
-                        .chain(input.operations.iter())
-                        .filter_map(spreadsheet_operation_source_path)
-                        .map(PathBuf::from),
-                );
-                ToolExecutionIntent::workspace_mutation(input.output_path.iter().map(PathBuf::from))
-                    .with_read_paths(read_paths)
+                let read_paths = input
+                    .source_path
+                    .iter()
+                    .chain(input.path.iter())
+                    .chain(input.from.iter())
+                    .map(PathBuf::from)
+                    .chain(
+                        input
+                            .operation
+                            .iter()
+                            .chain(input.operations.iter())
+                            .filter_map(spreadsheet_operation_source_path)
+                            .map(PathBuf::from),
+                    );
+                ToolExecutionIntent::workspace_mutation(
+                    input.mutation_output_path().map(PathBuf::from),
+                )
+                .with_read_paths(read_paths)
             }
         }
     }
@@ -1131,11 +1212,10 @@ async fn execute_spreadsheet_write(
     ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     let output_relative = input
-        .output_path
-        .as_deref()
+        .mutation_output_path()
         .map(str::trim)
         .filter(|path| !path.is_empty())
-        .context("spreadsheet write requires outputPath")?;
+        .context("spreadsheet write requires path")?;
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
     ensure_xlsx_path(&output_path)?;
     enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
@@ -1156,7 +1236,13 @@ async fn execute_spreadsheet_write(
                 .await?,
         )
     } else {
-        None
+        enforce_read_policy(&ctx, &output_path)?;
+        read_optional(ctx.environment.as_ref(), &output_path)
+            .await?
+            .map(|bytes| crate::execution::FileReadResult {
+                path: output_path.clone(),
+                bytes,
+            })
     };
 
     let sheets = input.sheets;
@@ -1211,17 +1297,24 @@ async fn execute_spreadsheet_mutations(
         "spreadsheet mutations are always atomic; atomic=false is not supported"
     );
     let output_relative = input
-        .output_path
-        .as_deref()
+        .mutation_output_path()
         .map(str::trim)
         .filter(|path| !path.is_empty())
-        .context("spreadsheet mutation requires outputPath")?;
+        .context("spreadsheet mutation requires path")?;
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
     ensure_xlsx_path(&output_path)?;
     enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
 
-    let operations =
-        spreadsheet_operations_for_action(input.action, input.operation, input.operations)?;
+    let compact_operation = if input.operation.is_none() {
+        input.compact_direct_operation()?
+    } else {
+        None
+    };
+    let operations = spreadsheet_operations_for_action(
+        input.action,
+        input.operation.or(compact_operation),
+        input.operations,
+    )?;
     let base_source = if let Some(relative) = input
         .source_path
         .as_deref()
@@ -1238,7 +1331,13 @@ async fn execute_spreadsheet_mutations(
                 .await?,
         )
     } else {
-        None
+        enforce_read_policy(&ctx, &output_path)?;
+        read_optional(ctx.environment.as_ref(), &output_path)
+            .await?
+            .map(|bytes| crate::execution::FileReadResult {
+                path: output_path.clone(),
+                bytes,
+            })
     };
 
     let mut copy_sources = BTreeMap::<String, (PathBuf, Vec<u8>)>::new();
@@ -1692,14 +1791,18 @@ struct RequestUserInputInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RequestUserInputQuestionInput {
-    /// Stable snake_case identifier.
-    id: String,
+    /// Legacy caller-supplied identifier. New calls receive a compact stable ID.
+    #[serde(default)]
+    id: Option<String>,
     /// Short card heading.
     header: String,
     question: String,
     #[schemars(length(min = 2, max = 3))]
     options: Vec<RequestUserInputOptionInput>,
-    /// Allow the user to enter a different answer. Defaults to true.
+    /// Zero-based recommended option index. Omit when no option is preferred.
+    #[serde(default)]
+    recommended: Option<usize>,
+    /// Legacy override. New calls always allow a custom answer.
     #[serde(default = "default_allow_custom")]
     allow_custom: bool,
 }
@@ -1707,10 +1810,12 @@ struct RequestUserInputQuestionInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RequestUserInputOptionInput {
-    /// Stable snake_case identifier.
-    id: String,
+    /// Legacy caller-supplied identifier. New calls receive a compact stable ID.
+    #[serde(default)]
+    id: Option<String>,
     label: String,
     description: String,
+    /// Legacy per-option recommendation flag.
     #[serde(default)]
     recommended: bool,
 }
@@ -1730,7 +1835,7 @@ impl TypedTool for RequestUserInputTool {
     }
 
     fn description(&self) -> &str {
-        "In Plan mode, pause the current Turn when several materially different approaches require a user choice. Use one to three concise questions with two to three concrete options each. The same Turn resumes and continues execution after the answer."
+        "In Plan mode, pause the current Turn when materially different approaches require a user choice. Provide one to three concise questions with two to three labeled options; IDs and custom-answer support are generated automatically. Set an optional zero-based recommended index on a question. The same Turn resumes after the answer."
     }
 
     fn validate_context(&self, ctx: &ToolInvocationContext) -> anyhow::Result<()> {
@@ -1758,8 +1863,12 @@ impl TypedTool for RequestUserInputTool {
 
         let mut question_ids = HashSet::new();
         let mut questions = Vec::with_capacity(input.questions.len());
-        for question in input.questions {
-            let id = validate_user_input_id("question id", question.id)?;
+        for (question_index, question) in input.questions.into_iter().enumerate() {
+            let id = question
+                .id
+                .map(|id| validate_user_input_id("question id", id))
+                .transpose()?
+                .unwrap_or_else(|| format!("q{}", question_index + 1));
             anyhow::ensure!(
                 question_ids.insert(id.clone()),
                 "duplicate question id: {id}"
@@ -1778,10 +1887,20 @@ impl TypedTool for RequestUserInputTool {
 
             let mut option_ids = HashSet::new();
             let mut option_labels = HashSet::new();
+            if let Some(recommended) = question.recommended {
+                anyhow::ensure!(
+                    recommended < question.options.len(),
+                    "question {id} recommended index {recommended} is out of range"
+                );
+            }
             let mut recommended_count = 0usize;
             let mut options = Vec::with_capacity(question.options.len());
             for (option_index, option) in question.options.into_iter().enumerate() {
-                let option_id = validate_user_input_id("option id", option.id)?;
+                let option_id = option
+                    .id
+                    .map(|id| validate_user_input_id("option id", id))
+                    .transpose()?
+                    .unwrap_or_else(|| format!("o{}", option_index + 1));
                 anyhow::ensure!(
                     option_ids.insert(option_id.clone()),
                     "question {id} contains duplicate option id: {option_id}"
@@ -1800,16 +1919,16 @@ impl TypedTool for RequestUserInputTool {
                     option.description,
                     MAX_USER_INPUT_DESCRIPTION_CHARS,
                 )?;
-                recommended_count += usize::from(option.recommended);
-                anyhow::ensure!(
-                    !option.recommended || option_index == 0,
-                    "question {id} must place its recommended option first"
-                );
+                let recommended = question
+                    .recommended
+                    .map(|index| index == option_index)
+                    .unwrap_or(option.recommended);
+                recommended_count += usize::from(recommended);
                 options.push(UserInputOption {
                     id: option_id,
                     label,
                     description,
-                    recommended: option.recommended,
+                    recommended,
                 });
             }
             anyhow::ensure!(
@@ -3208,7 +3327,7 @@ impl ForkTurnsInput {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum SubagentWorkspaceModeInput {
+enum AgentWorkspaceModeInput {
     #[default]
     Auto,
     SharedReadOnly,
@@ -3216,7 +3335,7 @@ enum SubagentWorkspaceModeInput {
     IsolatedWorktree,
 }
 
-impl SubagentWorkspaceModeInput {
+impl AgentWorkspaceModeInput {
     fn into_collaboration(self) -> AgentWorkspaceMode {
         match self {
             Self::Auto => AgentWorkspaceMode::Auto,
@@ -3248,7 +3367,7 @@ struct SpawnAgentInput {
     agent_type: String,
     /// Harness workspace contract.
     #[serde(default)]
-    workspace_mode: SubagentWorkspaceModeInput,
+    workspace_mode: AgentWorkspaceModeInput,
     /// Whether the child may recursively create children. Session and parent
     /// policy can still reject or further narrow this request.
     #[serde(default)]
@@ -3272,7 +3391,7 @@ impl TypedTool for SpawnAgentTool {
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
         let resource_keys = if matches!(
             input.workspace_mode,
-            SubagentWorkspaceModeInput::IsolatedWorktree
+            AgentWorkspaceModeInput::IsolatedWorktree
         ) {
             vec!["git:index-and-worktree".to_string()]
         } else {
@@ -6252,7 +6371,7 @@ impl TypedTool for ApplyPatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply workspace edits. Portable callers pass exactly one `patch` string using a `*** Begin Patch` ... `*** End Patch` envelope; update sections use `*** Update File: relative/path` plus unified `@@` hunks. Native providers may instead pass one structured create_file/update_file/delete_file operation. Structured SEARCH/REPLACE updates must use the exact `<<<<<<< SEARCH`, `=======`, and `>>>>>>> REPLACE` markers."
+        "Apply file edits under the active workspace policy. Portable callers pass exactly one `patch` string using a `*** Begin Patch` ... `*** End Patch` envelope; update sections use `*** Update File: path` plus unified `@@` hunks. Native providers may instead pass one structured create_file/update_file/delete_file operation. Absolute paths outside the workspace require approval for that exact path. Structured SEARCH/REPLACE updates must use the exact `<<<<<<< SEARCH`, `=======`, and `>>>>>>> REPLACE` markers."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -6534,8 +6653,8 @@ async fn execute_native_patch_batch(
     // Complete parsing, path validation, authorization, and content generation
     // before the first filesystem mutation is attempted.
     for operation in operations {
-        let relative = validate_native_patch_path(operation.path())?;
-        let target = normalize_workspace_path(&ctx.workspace_root, &relative)?;
+        let logical_path = validate_patch_operation_path(operation.path())?;
+        let target = normalize_workspace_path(&ctx.workspace_root, &logical_path)?;
         enforce_policy_decision(ctx.policy.inspect_write(&target), ctx.approval_granted)?;
         if matches!(&operation, NativePatchOperation::DeleteFile { .. }) {
             enforce_policy_decision(
@@ -6552,8 +6671,9 @@ async fn execute_native_patch_batch(
 
         match operation {
             NativePatchOperation::DeleteFile { .. } => {
-                let original = original
-                    .with_context(|| format!("delete_file target does not exist: {relative}"))?;
+                let original = original.with_context(|| {
+                    format!("delete_file target does not exist: {logical_path}")
+                })?;
                 mutations.push(PreparedFileMutation::delete(&target, original));
                 outputs.push(format!("Deleted {}", target.display()));
                 reports.push(NativePatchReport {
@@ -6564,7 +6684,7 @@ async fn execute_native_patch_batch(
             NativePatchOperation::CreateFile { diff, .. } => {
                 anyhow::ensure!(
                     original.is_none(),
-                    "create_file target already exists: {relative}"
+                    "create_file target already exists: {logical_path}"
                 );
                 let contents = create_file_contents_from_diff(&diff)?.into_bytes();
                 let bytes = contents.len();
@@ -6576,15 +6696,19 @@ async fn execute_native_patch_batch(
                 });
             }
             NativePatchOperation::UpdateFile { diff, .. } => {
-                let original_bytes = original
-                    .with_context(|| format!("update_file target does not exist: {relative}"))?;
-                let original_text = String::from_utf8(original_bytes.clone())
-                    .with_context(|| format!("update_file target is not UTF-8 text: {relative}"))?;
-                let updated = apply_text_patch(&original_text, &diff)
-                    .with_context(|| format!("failed to apply update_file patch to {relative}"))?;
+                let original_bytes = original.with_context(|| {
+                    format!("update_file target does not exist: {logical_path}")
+                })?;
+                let original_text =
+                    String::from_utf8(original_bytes.clone()).with_context(|| {
+                        format!("update_file target is not UTF-8 text: {logical_path}")
+                    })?;
+                let updated = apply_text_patch(&original_text, &diff).with_context(|| {
+                    format!("failed to apply update_file patch to {logical_path}")
+                })?;
                 anyhow::ensure!(
                     updated != original_text,
-                    "update_file patch made no changes: {relative}"
+                    "update_file patch made no changes: {logical_path}"
                 );
                 let contents = updated.into_bytes();
                 let bytes = contents.len();
@@ -6676,7 +6800,7 @@ fn parse_apply_patch_envelope(patch: &str) -> anyhow::Result<Option<Vec<NativePa
         } else {
             anyhow::bail!("unsupported apply patch directive: {line}");
         };
-        validate_native_patch_path(path)?;
+        validate_patch_operation_path(path)?;
         if kind == "delete" {
             operations.push(NativePatchOperation::DeleteFile {
                 path: path.to_string(),
@@ -6924,24 +7048,27 @@ fn line_offset(text: &str, line_index: usize) -> usize {
 }
 
 fn validate_native_patch_path(path: &str) -> anyhow::Result<String> {
-    let path = path.trim();
-    if path.is_empty() || path.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
-        anyhow::bail!("native patch path must be a non-empty single line")
-    }
-    let candidate = Path::new(path);
-    if candidate.is_absolute()
-        || candidate.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        anyhow::bail!("native patch path must be workspace-relative: {path}")
+    let path = validate_patch_operation_path(path)?;
+    let candidate = Path::new(&path);
+    if candidate.is_absolute() {
+        anyhow::bail!("unified diff conversion requires a workspace-relative path: {path}")
     }
     Ok(path.replace('\\', "/"))
+}
+
+fn validate_patch_operation_path(path: &str) -> anyhow::Result<String> {
+    let path = path.trim();
+    if path.is_empty() || path.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        anyhow::bail!("patch path must be a non-empty single line")
+    }
+    let candidate = Path::new(path);
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("patch path cannot contain '..': {path}")
+    }
+    Ok(path.to_string())
 }
 
 fn extract_native_hunks(diff: &str) -> Option<String> {
@@ -8204,7 +8331,7 @@ mod tests {
         let collaboration_tools = registry
             .list()
             .into_iter()
-            .filter(|name| registry.class(name) == Some(ToolClass::Subagent))
+            .filter(|name| registry.class(name) == Some(ToolClass::Agent))
             .collect::<Vec<_>>();
         assert_eq!(
             collaboration_tools,
@@ -8855,7 +8982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_observation_tools_reject_parent_traversal_and_absolute_parent_paths() {
+    async fn file_observation_tools_reject_parent_traversal_but_allow_absolute_host_paths() {
         let id = Uuid::new_v4();
         let workspace_root = std::env::temp_dir().join(format!("opentopia-tools-root-{id}"));
         let outside = std::env::temp_dir().join(format!("opentopia-tools-outside-{id}"));
@@ -8866,7 +8993,7 @@ mod tests {
             workspace_root.clone(),
             PermissionMode::FullAccess,
         ));
-        let mut context = ToolInvocationContext::local(workspace_root.clone(), policy);
+        let context = ToolInvocationContext::local(workspace_root.clone(), policy);
 
         let traversal = ListFilesTool
             .execute(
@@ -8878,7 +9005,7 @@ mod tests {
         assert!(traversal.to_string().contains("cannot contain '..'"));
 
         let outside_path = outside.display().to_string();
-        let approval_error = ReadFileTool
+        let read = ReadFileTool
             .execute(
                 ToolCall::new(
                     "read_file",
@@ -8887,24 +9014,19 @@ mod tests {
                 context.clone(),
             )
             .await
-            .unwrap_err();
-        assert!(approval_error
-            .to_string()
-            .contains("no readable root authorized"));
+            .expect("read absolute host file");
+        assert!(read.output.contains("outside marker"));
 
-        context.approval_granted = true;
-        let list_error = ListFilesTool
+        let list = ListFilesTool
             .execute(
                 ToolCall::new("list_files", json!({ "path": outside_path })),
                 context.clone(),
             )
             .await
-            .unwrap_err();
-        assert!(list_error
-            .to_string()
-            .contains("no readable root authorized"));
+            .expect("list absolute host directory");
+        assert!(list.output.contains("secret.txt"));
 
-        let read_error = ReadFileTool
+        let read_again = ReadFileTool
             .execute(
                 ToolCall::new(
                     "read_file",
@@ -8913,12 +9035,10 @@ mod tests {
                 context.clone(),
             )
             .await
-            .unwrap_err();
-        assert!(read_error
-            .to_string()
-            .contains("no readable root authorized"));
+            .expect("repeat absolute host read without approval");
+        assert!(read_again.output.contains("outside marker"));
 
-        let search_error = WorkspaceSearchTool
+        let search = WorkspaceSearchTool
             .execute(
                 ToolCall::new(
                     "workspace_search",
@@ -8927,10 +9047,8 @@ mod tests {
                 context,
             )
             .await
-            .unwrap_err();
-        assert!(search_error
-            .to_string()
-            .contains("no readable root authorized"));
+            .expect("search absolute host directory");
+        assert!(search.output.contains("outside marker"));
 
         fs::remove_dir_all(workspace_root).unwrap();
         fs::remove_dir_all(outside).unwrap();
@@ -9473,6 +9591,49 @@ mod tests {
         assert!(request.questions[0].allow_custom);
     }
 
+    #[tokio::test]
+    async fn request_user_input_compact_shape_generates_ids_and_recommendation() {
+        let workspace_root = std::env::current_dir().unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let mut context = ToolInvocationContext::local(workspace_root, policy);
+        context.collaboration_mode = CollaborationMode::Plan;
+        let result = RequestUserInputTool
+            .execute(
+                ToolCall::new(
+                    "request_user_input",
+                    json!({
+                        "questions": [{
+                            "header": "Storage",
+                            "question": "Which persistence strategy should the plan use?",
+                            "recommended": 0,
+                            "options": [
+                                { "label": "SQLite", "description": "Durable local state." },
+                                { "label": "Memory", "description": "Process-local state." }
+                            ]
+                        }]
+                    }),
+                ),
+                context,
+            )
+            .await
+            .expect("compact request user input");
+
+        let request: UserInputRequest =
+            serde_json::from_value(result.metadata["userInputRequest"].clone()).unwrap();
+        assert_eq!(request.questions[0].id, "q1");
+        assert_eq!(request.questions[0].options[0].id, "o1");
+        assert!(request.questions[0].options[0].recommended);
+        assert!(request.questions[0].allow_custom);
+
+        let schema = RequestUserInputTool.schema();
+        let encoded = schema.to_string();
+        assert!(encoded.contains("recommended"));
+        assert!(encoded.contains("allow_custom"));
+    }
+
     #[test]
     fn request_user_input_rejects_non_plan_contexts() {
         let workspace_root = std::env::current_dir().unwrap();
@@ -9511,7 +9672,7 @@ mod tests {
                     "spreadsheet",
                     json!({
                         "action": "write",
-                        "outputPath": "report.xlsx",
+                        "path": "report.xlsx",
                         "sheets": [{
                             "name": "Summary",
                             "cells": [{
@@ -9528,6 +9689,23 @@ mod tests {
         assert_eq!(written.metadata["success"], true);
         assert!(workspace_root.join("report.xlsx").is_file());
 
+        SpreadsheetTool
+            .execute(
+                ToolCall::new(
+                    "spreadsheet",
+                    json!({
+                        "action": "write_rows",
+                        "path": "report.xlsx",
+                        "sheet": "Summary",
+                        "start": { "row": 1, "column": 0 },
+                        "rows": [[{ "type": "string", "value": "compact" }]]
+                    }),
+                ),
+                ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
+            )
+            .await
+            .expect("compact direct spreadsheet mutation");
+
         let read = SpreadsheetTool
             .execute(
                 ToolCall::new(
@@ -9538,7 +9716,7 @@ mod tests {
                         "sheet": "Summary",
                         "range": {
                             "start": { "row": 0, "column": 0 },
-                            "end": { "row": 0, "column": 0 }
+                            "end": { "row": 1, "column": 0 }
                         }
                     }),
                 ),
@@ -9547,6 +9725,17 @@ mod tests {
             .await
             .unwrap();
         assert!(read.output.contains("ready"));
+        assert!(read.output.contains("compact"));
+
+        let schema = SpreadsheetTool.schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("spreadsheet properties");
+        assert!(properties.contains_key("path"));
+        assert!(properties.contains_key("rows"));
+        assert!(properties.contains_key("outputPath"));
+        assert!(properties.contains_key("operation"));
+        assert!(properties.contains_key("atomic"));
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
@@ -9781,6 +9970,89 @@ mod tests {
             .await
             .expect("full-access session must preserve exact external read capability");
         assert_eq!(read.output, "allowed");
+        fs::remove_dir_all(workspace_root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_patch_external_path_requires_and_honors_exact_approval() {
+        let id = Uuid::new_v4();
+        let workspace_root = std::env::temp_dir().join(format!("opentopia-patch-workspace-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-patch-outside-{id}"));
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("approved.txt");
+        let sibling = outside.join("sibling.txt");
+        fs::write(&target, "before\n").unwrap();
+        fs::write(&sibling, "sibling before\n").unwrap();
+        let patch_for = |path: &Path, before: &str, after: &str| {
+            format!(
+                "*** Begin Patch\n*** Update File: {}\n@@\n-{before}\n+{after}\n*** End Patch",
+                path.display()
+            )
+        };
+
+        let base_sandbox = LocalSandboxConfig::default();
+        let base_policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+            workspace_root.clone(),
+            PermissionMode::Approve,
+            &base_sandbox,
+        ));
+        let error = ApplyPatchTool
+            .execute(
+                ToolCall::new(
+                    "apply_patch",
+                    json!({ "patch": patch_for(&target, "before", "after") }),
+                ),
+                ToolInvocationContext::local_with_sandbox_config(
+                    workspace_root.clone(),
+                    base_policy,
+                    base_sandbox,
+                ),
+            )
+            .await
+            .expect_err("external patch must request approval");
+        assert!(crate::policy::approval_required(&error).is_some());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before\n");
+
+        let mut approved_sandbox = LocalSandboxConfig::default();
+        approved_sandbox.grant_write_path(target.clone());
+        let approved_policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+            workspace_root.clone(),
+            PermissionMode::Approve,
+            &approved_sandbox,
+        ));
+        let mut approved = ToolInvocationContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            approved_policy,
+            approved_sandbox,
+        );
+        approved.approval_granted = true;
+        ApplyPatchTool
+            .execute(
+                ToolCall::new(
+                    "apply_patch",
+                    json!({ "patch": patch_for(&target, "before", "after") }),
+                ),
+                approved.clone(),
+            )
+            .await
+            .expect("approved external patch");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "after\n");
+
+        let sibling_error = ApplyPatchTool
+            .execute(
+                ToolCall::new(
+                    "apply_patch",
+                    json!({ "patch": patch_for(&sibling, "sibling before", "sibling after") }),
+                ),
+                approved,
+            )
+            .await
+            .expect_err("exact target approval must not authorize a sibling");
+        assert!(format!("{sibling_error:#}").contains("escapes workspace"));
+        assert_eq!(fs::read_to_string(&sibling).unwrap(), "sibling before\n");
+
         fs::remove_dir_all(workspace_root).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }
@@ -10094,6 +10366,15 @@ mod tests {
                 conditions: Vec::new(),
                 filter_match_mode: None,
                 max_results: None,
+                start: None,
+                rows: Vec::new(),
+                columns: Vec::new(),
+                from: None,
+                source_sheet: None,
+                source_start: None,
+                destination_sheet: None,
+                destination_start: None,
+                content_mode: SpreadsheetCopyContentMode::Values,
                 source_path: None,
                 output_path: None,
                 sheets: Vec::new(),
@@ -10127,6 +10408,15 @@ mod tests {
                 conditions: Vec::new(),
                 filter_match_mode: None,
                 max_results: None,
+                start: None,
+                rows: Vec::new(),
+                columns: Vec::new(),
+                from: None,
+                source_sheet: None,
+                source_start: None,
+                destination_sheet: None,
+                destination_start: None,
+                content_mode: SpreadsheetCopyContentMode::Values,
                 source_path: None,
                 output_path: None,
                 sheets: Vec::new(),
@@ -10160,6 +10450,15 @@ mod tests {
                 conditions: Vec::new(),
                 filter_match_mode: None,
                 max_results: None,
+                start: None,
+                rows: Vec::new(),
+                columns: Vec::new(),
+                from: None,
+                source_sheet: None,
+                source_start: None,
+                destination_sheet: None,
+                destination_start: None,
+                content_mode: SpreadsheetCopyContentMode::Values,
                 source_path: Some("reports/source.xlsx".to_string()),
                 output_path: Some("reports/output.xlsx".to_string()),
                 sheets: Vec::new(),
@@ -10243,7 +10542,7 @@ mod tests {
                 message: "check".to_string(),
                 fork_turns: None,
                 agent_type: "default".to_string(),
-                workspace_mode: SubagentWorkspaceModeInput::IsolatedWorktree,
+                workspace_mode: AgentWorkspaceModeInput::IsolatedWorktree,
                 allow_child_spawns: false,
             },
         );
@@ -10598,7 +10897,7 @@ mod tests {
             diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
         })
         .unwrap_err();
-        assert!(error.to_string().contains("workspace-relative"));
+        assert!(error.to_string().contains("cannot contain '..'"));
 
         let patch = native_patch_operation_to_unified_diff(&NativePatchOperation::UpdateFile {
             path: "safe.txt".to_string(),

@@ -12,6 +12,8 @@ mod mailbox;
 mod registry;
 mod run_scheduler;
 mod service;
+mod snapshot_deriver;
+mod sqlite_activity_source;
 mod sqlite_repository;
 
 pub use activity::{
@@ -25,19 +27,23 @@ pub use domain::{
     CollaborationSessionRecord, RuntimeSnapshotId, RuntimeSnapshotSeed,
 };
 pub use invocation::{
-    AgentCollaborationInvocation, AgentCollaborationInvocationError, AgentInvocationIdentity,
-    AgentListItem, AgentWorkspaceMode, ChildRuntimeSnapshotRequest, DerivedChildRuntime, ForkTurns,
-    RuntimeSnapshotDerivationError, RuntimeSnapshotDeriver, SpawnChildAgentRequest,
-    WaitAgentOutcome, WaitAgentRequest,
+    AgentCollaborationInvocation, AgentCollaborationInvocationError, AgentCompletionSnapshot,
+    AgentInvocationIdentity, AgentListItem, AgentWorkspaceMode, ChildRuntimeSnapshotRequest,
+    DerivedChildRuntime, ForkTurns, RuntimeSnapshotDerivationError, RuntimeSnapshotDeriver,
+    SpawnChildAgentRequest, WaitAgentOutcome, WaitAgentRequest,
 };
 pub use mailbox::{
     AgentMailbox, AgentMailboxError, AgentMailboxMessage, AgentMailboxMessageKind,
-    EnqueueAgentMessage, InMemoryAgentMailbox,
+    AgentMailboxNotifier, EnqueueAgentMessage, InMemoryAgentMailbox, NoopAgentMailboxNotifier,
 };
 pub use registry::{
     CollaborationRegistry, CreateCollaborationSession, FollowupAgentTurn,
     InMemoryCollaborationRegistry, SpawnAgentThread,
 };
-pub use run_scheduler::{AgentRunCommand, AgentRunScheduler, AgentRunSchedulerError};
+pub use run_scheduler::{
+    AgentRunCommand, AgentRunResumeSignal, AgentRunScheduler, AgentRunSchedulerError,
+};
 pub use service::{AgentCollaborationRuntime, AgentCollaborationRuntimeError, SpawnAgentOutcome};
+pub use snapshot_deriver::AttenuatingRuntimeSnapshotDeriver;
+pub use sqlite_activity_source::SqliteAgentActivitySource;
 pub use sqlite_repository::SqliteCollaborationRepository;

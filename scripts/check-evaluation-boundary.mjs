@@ -14,6 +14,9 @@ const forbiddenProductPatterns = [
   ["EvaluationTaskResult", "product evaluation result model"],
   ["EvaluationRun", "product evaluation run model"]
 ];
+const legacyCompatibilityAllowlist = new Map([
+  ["evaluation_runs", new Set(["crates/opentopia-core/src/store_migrations.rs"])]
+]);
 
 async function filesUnder(relativeRoot) {
   const files = [];
@@ -33,8 +36,10 @@ const violations = [];
 for (const root of productRoots) {
   for (const filePath of await filesUnder(root)) {
     const content = await readFile(filePath, "utf8");
+    const relativePath = path.relative(repoRoot, filePath).replaceAll("\\", "/");
     for (const [pattern, label] of forbiddenProductPatterns) {
-      if (content.includes(pattern)) {
+      const allowedFiles = legacyCompatibilityAllowlist.get(pattern);
+      if (content.includes(pattern) && !allowedFiles?.has(relativePath)) {
         violations.push(`${path.relative(repoRoot, filePath)} contains ${label} (${pattern})`);
       }
     }

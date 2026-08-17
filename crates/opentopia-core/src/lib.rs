@@ -1,4 +1,5 @@
 pub mod agent;
+mod agent_composition;
 pub mod agent_profiles;
 pub mod agent_runtime;
 pub mod artifact_runtime;
@@ -15,6 +16,7 @@ pub mod computer;
 pub mod context_runtime;
 pub mod context_sources;
 pub mod contribution_hosts;
+pub mod database_maintenance;
 pub mod desktop_browser;
 pub mod document;
 pub mod effect_journal;
@@ -54,7 +56,6 @@ pub mod skills;
 pub mod spreadsheet;
 pub mod store;
 mod store_migrations;
-pub mod subagents;
 mod tool_adapter;
 mod tool_error;
 mod tool_result_ingress;
@@ -140,6 +141,7 @@ pub use contribution_hosts::{
     MAX_MEDIA_HANDLER_OUTPUT_BYTES, MEDIA_HANDLER_INVOCATION_API_VERSION,
     MEDIA_HANDLER_RESULT_API_VERSION,
 };
+pub use database_maintenance::{compact_database_copy, DatabaseCompactionReport};
 pub use desktop_browser::{DesktopBrowserRuntime, DesktopBrowserRuntimeConfig};
 pub use document::{
     extract_document_text, inspect_document, validate_document, DocumentError, DocumentExtraction,
@@ -168,8 +170,8 @@ pub use execution_authorization::{
     ToolExecutionIntent,
 };
 pub use file_mutation::{
-    FileMutationBatch, FileMutationBatchResult, FileMutationObserver, FileMutationScope,
-    FileMutationTarget, PreparedFileMutation,
+    lock_mutation_paths, FileMutationBatch, FileMutationBatchResult, FileMutationObserver,
+    FileMutationScope, FileMutationTarget, PreparedFileMutation,
 };
 pub use flow::{
     compile_flow, definition_from_draft, flow_content_hash, normalize_flow_spec, simulate_flow,
@@ -187,7 +189,7 @@ pub use flow_runtime::{
     FlowTranscriptEntryV1,
 };
 pub use git_workflow::{
-    execute_git_workflow, isolated_subagent_compare_request, isolated_subagent_worktree_request,
+    execute_git_workflow, isolated_agent_compare_request, isolated_agent_worktree_request,
     AheadBehind, CommitRequest, CompareMode, CompareRequest, CreateBranchRequest,
     CreateWorktreeRequest, FetchRequest, GitBranchInfo, GitPathsRequest, GitRemoteInfo,
     GitStatusRequest, GitWorkflowAction, GitWorkflowActionKind, GitWorkflowError,
@@ -332,20 +334,12 @@ pub use store::{
     ProviderContextStateKind, ProviderConversationState, SessionStore, SqliteSessionStore,
     StoreError,
 };
-pub use subagents::{
-    AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDelivery, AgentWaitActivity,
-    NoopSubagentObserver, SpawnSubagentRequest, SubagentDeliverable, SubagentDeliverableKind,
-    SubagentError, SubagentEvent, SubagentExecutionContract, SubagentExecutor,
-    SubagentIntegrationMetadata, SubagentObserver, SubagentRun, SubagentRunStatus,
-    SubagentScheduler, SubagentSchedulerConfig, SubagentScope, SubagentVerificationEvidence,
-    SubagentWorkspaceAssignment, SubagentWorkspaceMode,
-};
 pub use tool_result_ingress::tool_result_is_error;
 pub use tool_runtime::{
     AcceptedToolResult, AsyncToolResult, DurableAsyncToolResultSink, LocalToolRuntime,
-    ProviderToolExecutionInput, ProviderToolExecutionReport, ToolApprovalCandidate,
-    ToolExecutionInput, ToolExecutionReport, ToolReviewInput, ToolRuntime, ToolRuntimeCatalog,
-    ToolSchedulingInput,
+    ProviderToolExecutionInput, ProviderToolExecutionReport, ToolApprovalBoundary,
+    ToolApprovalCandidate, ToolExecutionInput, ToolExecutionOutcome, ToolExecutionReport,
+    ToolReviewInput, ToolRuntime, ToolRuntimeCatalog, ToolSchedulingInput,
 };
 pub use tool_state::ToolStateStore;
 pub use tools::{

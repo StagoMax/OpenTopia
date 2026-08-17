@@ -149,36 +149,52 @@ pub(crate) fn normalize_tool_result_at_ingress(
     result
 }
 
+/// Keep the stored/UI representation untouched, but minify JSON before it
+/// reaches the model so pretty-printing whitespace is not paid on every replay.
+pub(crate) fn provider_tool_result_output(result: &ToolResult) -> String {
+    serde_json::from_str::<Value>(&result.output)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| result.output.clone())
+}
+
 /// Provider adapters serialize `output`, `content`, and `metadata` together.
-/// Avoid sending an identical legacy text part a second time.
+/// Avoid sending typed copies that carry the same value as the legacy output.
 pub(crate) fn provider_tool_result_content(result: &ToolResult) -> Vec<ModelContentPart> {
     let artifact_backed = result
         .metadata
         .pointer(&format!("/{ENVELOPE_KEY}/storage"))
         .and_then(Value::as_str)
         == Some("artifact_backed");
+    let output_json = serde_json::from_str::<Value>(&result.output).ok();
+    let tool_name = result.metadata.get("toolName").and_then(Value::as_str);
     result
         .content
         .iter()
-        .filter(|part| {
-            !matches!(
-                part,
-                ModelContentPart::Text { text }
-                    if text.is_empty() || artifact_backed || result.output.contains(text)
-            )
+        .filter(|part| match part {
+            ModelContentPart::Text { text } => {
+                !(text.is_empty() || artifact_backed || result.output.contains(text))
+            }
+            ModelContentPart::Json { value } => {
+                output_json.as_ref() != Some(value)
+                    && !matches!(tool_name, Some("set_plan" | "update_plan"))
+            }
+            ModelContentPart::Image { .. } | ModelContentPart::Resource { .. } => true,
         })
         .cloned()
         .collect()
 }
 
-/// Keeps event metadata useful for the desktop while removing fields that are
-/// already represented in the provider-visible output. The returned value is
-/// created once with the ProviderToolResult and then replayed byte-for-byte.
+/// Builds provider-facing metadata without mutating the stored/UI ToolResult.
+/// The returned value is created once with the ProviderToolResult and then
+/// replayed byte-for-byte.
 pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -> Value {
     let mut metadata = metadata.clone();
     let Some(object) = metadata.as_object_mut() else {
         return metadata;
     };
+    object.remove("toolName");
+    object.remove("providerToolCallId");
+    object.remove("success");
     match tool_name {
         "shell" => {
             object.remove("stdout");
@@ -186,6 +202,25 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
         }
         "search" => {
             object.remove("locations");
+        }
+        "filesystem" => compact_filesystem_metadata(object),
+        "set_plan" | "update_plan" => {
+            object.remove("workForm");
+            object.remove("formId");
+            object.remove("completed");
+            object.remove("resolved");
+            object.remove("total");
+            object.remove("revision");
+            object.remove("status");
+            object.remove("nextRunnableItem");
+            object.remove("currentItemIndex");
+            object.remove("changedItemId");
+        }
+        "list_skills" | "list_agents" => {
+            object.remove("count");
+        }
+        "document" | "pdf" | "spreadsheet" => {
+            object.remove("action");
         }
         _ => {}
     }
@@ -195,9 +230,10 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
         object.remove("raw");
     }
     bound_metadata_error_strings(object);
-    if serde_json::to_vec(&metadata)
-        .map(|encoded| encoded.len() > PROVIDER_METADATA_MAX_BYTES)
-        .unwrap_or(false)
+    if tool_name != "request_user_input"
+        && serde_json::to_vec(&metadata)
+            .map(|encoded| encoded.len() > PROVIDER_METADATA_MAX_BYTES)
+            .unwrap_or(false)
     {
         metadata = compact_provider_metadata(&metadata);
     }
@@ -209,7 +245,7 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
 /// accounting and are governed by the multimodal input policy instead.
 pub(crate) fn provider_visible_tool_result_bytes(result: &ToolResult) -> usize {
     let content = provider_tool_result_content(result);
-    result.output.len()
+    provider_tool_result_output(result).len()
         + serde_json::to_vec(&provider_tool_result_metadata(
             result
                 .metadata
@@ -229,6 +265,35 @@ pub(crate) fn provider_visible_tool_result_bytes(result: &ToolResult) -> usize {
                     .unwrap_or_default(),
             })
             .sum::<usize>()
+}
+
+fn compact_filesystem_metadata(metadata: &mut serde_json::Map<String, Value>) {
+    let operation = metadata
+        .get("operation")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    metadata.remove("operation");
+    match operation.as_deref() {
+        Some("list" | "find" | "stat") => {
+            for key in [
+                "path",
+                "count",
+                "visitedEntries",
+                "truncated",
+                "truncationReason",
+                "result",
+            ] {
+                metadata.remove(key);
+            }
+        }
+        Some("write" | "copy" | "move" | "delete") => {
+            metadata.remove("changedPath");
+            metadata.remove("source");
+            metadata.remove("destination");
+            metadata.remove("bytes");
+        }
+        Some("read") | None | Some(_) => {}
+    }
 }
 
 fn bound_structured_content(
@@ -867,6 +932,97 @@ mod tests {
         assert!(metadata.get("stdout").is_none());
         assert!(metadata.get("stderr").is_none());
         assert_eq!(metadata["exitCode"], 0);
+    }
+
+    #[test]
+    fn provider_projection_minifies_json_and_removes_duplicate_structured_copies() {
+        let value = json!({
+            "entries": [
+                { "path": "src/lib.rs", "kind": "file" },
+                { "path": "src/main.rs", "kind": "file" }
+            ],
+            "truncated": false
+        });
+        let result = ToolResult {
+            call_id: Uuid::new_v4(),
+            output: serde_json::to_string_pretty(&value).unwrap(),
+            content: vec![ModelContentPart::json(value.clone())],
+            metadata: json!({
+                "toolName": "filesystem",
+                "operation": "list",
+                "path": ".",
+                "count": 2,
+                "truncated": false,
+                "success": true
+            }),
+        };
+
+        assert_eq!(provider_tool_result_output(&result), value.to_string());
+        assert!(provider_tool_result_content(&result).is_empty());
+        assert_eq!(
+            provider_tool_result_metadata("filesystem", &result.metadata),
+            json!({})
+        );
+        assert!(provider_visible_tool_result_bytes(&result) < result.output.len());
+    }
+
+    #[test]
+    fn work_form_projection_keeps_the_compact_render_only() {
+        let result = ToolResult {
+            call_id: Uuid::new_v4(),
+            output: "Objective: ship\nWork form revision: 2\nStatus: Active".to_string(),
+            content: vec![ModelContentPart::json(json!({
+                "objective": "ship",
+                "revision": 2,
+                "status": "active"
+            }))],
+            metadata: json!({
+                "toolName": "update_plan",
+                "workForm": { "objective": "ship", "revision": 2 },
+                "formId": Uuid::new_v4(),
+                "revision": 2,
+                "status": "active",
+                "success": true
+            }),
+        };
+
+        assert!(provider_tool_result_content(&result).is_empty());
+        assert_eq!(
+            provider_tool_result_metadata("update_plan", &result.metadata),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn provider_projection_preserves_large_user_input_control_metadata() {
+        let metadata = json!({
+            "toolName": "request_user_input",
+            "success": true,
+            "userInputRequest": {
+                "requestId": Uuid::new_v4(),
+                "questions": [{
+                    "id": "q1",
+                    "header": "Choice",
+                    "question": "Choose an approach",
+                    "options": [{
+                        "id": "o1",
+                        "label": "First",
+                        "description": "x".repeat(PROVIDER_METADATA_MAX_BYTES),
+                        "recommended": true
+                    }, {
+                        "id": "o2",
+                        "label": "Second",
+                        "description": "y".repeat(PROVIDER_METADATA_MAX_BYTES),
+                        "recommended": false
+                    }],
+                    "allowCustom": true
+                }]
+            }
+        });
+
+        let projected = provider_tool_result_metadata("request_user_input", &metadata);
+        assert!(projected.get("userInputRequest").is_some());
+        assert!(projected.get("metadataTruncated").is_none());
     }
 
     #[test]

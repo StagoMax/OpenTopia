@@ -222,8 +222,9 @@ pub struct LocalSandboxConfig {
     pub sandbox_home: Option<PathBuf>,
     #[serde(default)]
     pub windows_backend: WindowsSandboxBackend,
-    /// Exact read paths approved by the active authorization scope. The holder
-    /// decides the lifetime: a one-call replay or a turn-scoped path lease.
+    /// Exact read paths projected into the active authorization scope. Reads
+    /// do not require approval, but Windows needs these call-scoped paths to
+    /// provision access for its dedicated low-privilege user.
     #[serde(skip)]
     pub approved_read_paths: Vec<PathBuf>,
     /// Exact write paths approved by the active authorization scope. The holder
@@ -504,17 +505,6 @@ impl LocalSandboxConfig {
                 .chain(self.approved_read_paths.iter().cloned())
                 .chain(self.approved_write_paths.iter().cloned())
                 .chain(self.effective_writable_roots(workspace_root)),
-        )
-    }
-
-    pub(crate) fn configured_readable_roots(&self, workspace_root: &Path) -> Vec<PathBuf> {
-        if self.sandbox_mode == SandboxMode::DangerFullAccess {
-            return Vec::new();
-        }
-        dedup_paths(
-            std::iter::once(workspace_root.to_path_buf())
-                .chain(self.read_paths.iter().cloned())
-                .chain(self.configured_writable_roots(workspace_root)),
         )
     }
 }
@@ -930,6 +920,11 @@ fn build_bubblewrap_command(
         "--unshare-pid".to_string(),
         "--unshare-ipc".to_string(),
         "--unshare-uts".to_string(),
+        // Codex-style restricted modes expose the host filesystem read-only,
+        // then overlay only the configured writable roots below.
+        "--ro-bind".to_string(),
+        "/".to_string(),
+        "/".to_string(),
         "--proc".to_string(),
         "/proc".to_string(),
         "--dev".to_string(),
@@ -940,19 +935,6 @@ fn build_bubblewrap_command(
 
     if config.network == NetworkPolicy::Deny {
         args.push("--unshare-net".to_string());
-    }
-
-    for path in default_system_read_paths() {
-        args.push("--ro-bind".to_string());
-        args.push(path.to_string());
-        args.push(path.to_string());
-    }
-
-    for path in config.effective_readable_roots(&workspace_root) {
-        let path = absolute_path(&path);
-        args.push("--ro-bind".to_string());
-        args.push(path_to_string(&path));
-        args.push(path_to_string(&path));
     }
 
     for path in config.effective_writable_roots(&workspace_root) {
@@ -1109,22 +1091,41 @@ fn build_windows_sandbox_command_with_binary(
     if let Some(bytes) = options.max_output_bytes {
         sandbox_args.extend(["--max-output-bytes".to_string(), bytes.to_string()]);
     }
-    let managed_read_roots = config
-        .effective_command_readable_roots(&workspace_root)
-        .into_iter()
-        .filter(|root| root.exists())
+    // Restricted modes intentionally allow host reads. Runtime roots resolved
+    // from PATH/SDK metadata therefore belong to the managed read capability,
+    // too: the dedicated Windows account may need an explicit RX ACE even when
+    // the interactive user can already execute them. Keep only the fixed OS
+    // runtime roots immutable (`--runtime-root`).
+    let immutable_runtime_roots = windows_minimal_runtime_roots()
         .map(|root| absolute_path(root))
         .collect::<Vec<_>>();
+    let configured_managed_roots = config.effective_command_readable_roots(&workspace_root);
+    let managed_read_roots = dedup_paths(
+        configured_managed_roots.iter().cloned().chain(
+            options
+                .runtime_read_roots
+                .iter()
+                .filter(|runtime| {
+                    !immutable_runtime_roots
+                        .iter()
+                        .any(|root| windows_path_starts_with(runtime, root))
+                        && !configured_managed_roots
+                            .iter()
+                            .any(|root| windows_path_starts_with(runtime, root))
+                })
+                .cloned(),
+        ),
+    )
+    .into_iter()
+    .filter(|root| root.exists())
+    .map(|root| absolute_path(root))
+    .collect::<Vec<_>>();
     for root in &managed_read_roots {
         sandbox_args.extend(["--read-root".to_string(), path_to_string(root)]);
     }
-    for root in options
-        .runtime_read_roots
-        .iter()
-        .cloned()
-        .chain(windows_minimal_runtime_roots())
+    for root in immutable_runtime_roots
+        .into_iter()
         .filter(|root| root.exists())
-        .map(|root| absolute_path(root))
         .filter(|runtime| {
             !managed_read_roots
                 .iter()
@@ -1604,12 +1605,6 @@ fn env_path_list(name: &str) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn default_system_read_paths() -> Vec<&'static str> {
-    vec![
-        "/bin", "/etc", "/lib", "/lib64", "/opt", "/usr", "/sbin", "/var",
-    ]
-}
-
 fn seatbelt_profile(workspace_root: &Path, config: &LocalSandboxConfig) -> String {
     let workspace_root = absolute_path(workspace_root);
     let mut profile = vec![
@@ -1619,23 +1614,8 @@ fn seatbelt_profile(workspace_root: &Path, config: &LocalSandboxConfig) -> Strin
         "(allow signal (target self))".to_string(),
         "(allow sysctl-read)".to_string(),
         "(allow file-read-metadata)".to_string(),
-        "(allow file-read*".to_string(),
-        "  (subpath \"/bin\")".to_string(),
-        "  (subpath \"/dev\")".to_string(),
-        "  (subpath \"/etc\")".to_string(),
-        "  (subpath \"/Library\")".to_string(),
-        "  (subpath \"/System\")".to_string(),
-        "  (subpath \"/usr\")".to_string(),
-        format!("  (subpath \"{}\")", seatbelt_escape(&workspace_root)),
+        "(allow file-read*)".to_string(),
     ];
-
-    for path in &config.read_paths {
-        profile.push(format!(
-            "  (subpath \"{}\")",
-            seatbelt_escape(&absolute_path(path))
-        ));
-    }
-    profile.push(")".to_string());
 
     if config.sandbox_mode == SandboxMode::WorkspaceWrite {
         profile.push("(allow file-write*".to_string());
@@ -1886,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_read_only_uses_only_read_only_workspace_bind() {
+    fn linux_read_only_exposes_host_as_read_only_without_write_binds() {
         let config = LocalSandboxConfig::enforce().with_sandbox_mode(SandboxMode::ReadOnly);
         let plan = build_local_sandbox_command_for_platform(
             OsSandboxPlatform::Linux,
@@ -1898,11 +1878,11 @@ mod tests {
         )
         .expect("build read-only plan");
 
-        let workspace = path_to_string(&absolute_path("/workspace"));
         assert!(!plan.args.iter().any(|arg| arg == "--bind"));
-        assert!(plan.args.windows(3).any(|args| {
-            args[0] == "--ro-bind" && args[1] == workspace && args[2] == workspace
-        }));
+        assert!(plan
+            .args
+            .windows(3)
+            .any(|args| { args[0] == "--ro-bind" && args[1] == "/" && args[2] == "/" }));
     }
 
     #[test]
@@ -1961,6 +1941,7 @@ mod tests {
         )
         .expect("build read-only profile");
 
+        assert!(plan.args[1].contains("(allow file-read*)"));
         assert!(!plan.args[1].contains("allow file-write"));
     }
 
@@ -1988,11 +1969,13 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".git")).expect("create workspace");
         std::fs::create_dir_all(&shared).expect("create shared root");
         std::fs::create_dir_all(&runtime_home).expect("create runtime home");
+        let external_read = root.join("read-only.txt");
+        std::fs::write(&external_read, "readable").expect("create external read fixture");
 
         let mut config = LocalSandboxConfig::enforce();
         config.sandbox_home = Some(runtime_home.clone());
         config.writable_roots = vec![shared.clone()];
-        config.grant_read_path(root.join("read-only.txt"));
+        config.grant_read_path(external_read.clone());
         let plan = build_windows_sandbox_command_with_binary(
             std::env::current_exe().expect("current executable"),
             "powershell.exe",
@@ -2019,6 +2002,9 @@ mod tests {
             .args
             .windows(2)
             .any(|args| args[0] == "--write-root" && args[1] == shared_path));
+        assert!(plan.args.windows(2).any(|args| {
+            args[0] == "--read-root" && args[1] == path_to_string(&absolute_path(&external_read))
+        }));
         assert!(plan.args.windows(2).any(|args| {
             args[0] == "--runtime-home" && args[1] == path_to_string(&absolute_path(&runtime_home))
         }));
@@ -2085,6 +2071,40 @@ mod tests {
             },
         )
         .expect("build Windows sandbox plan");
+        assert!(!plan.args.windows(2).any(|args| {
+            args[0] == "--runtime-root" && windows_path_starts_with(Path::new(&args[1]), &runtime)
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_external_runtime_is_provisioned_as_a_managed_read_root() {
+        let root = std::env::temp_dir().join(format!(
+            "opentopia-external-runtime-plan-{}",
+            Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let runtime = root.join("user-runtime");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&runtime).expect("create external runtime");
+
+        let plan = build_windows_sandbox_command_with_binary(
+            std::env::current_exe().expect("current executable"),
+            "runtime.exe",
+            &sample_args(),
+            &workspace,
+            &workspace,
+            &LocalSandboxConfig::enforce(),
+            &SandboxLaunchOptions {
+                runtime_read_roots: vec![runtime.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("build Windows sandbox plan");
+
+        assert!(plan.args.windows(2).any(|args| {
+            args[0] == "--read-root" && windows_path_starts_with(Path::new(&args[1]), &runtime)
+        }));
         assert!(!plan.args.windows(2).any(|args| {
             args[0] == "--runtime-root" && windows_path_starts_with(Path::new(&args[1]), &runtime)
         }));

@@ -1,8 +1,8 @@
 use super::{
-    AgentMailbox, AgentMailboxError, AgentMailboxMessage, AgentMailboxMessageKind, AgentRunCommand,
-    AgentRunScheduler, AgentRunSchedulerError, AgentThreadId, AgentThreadRecord, AgentTurnRecord,
-    CollaborationDomainError, CollaborationRegistry, EnqueueAgentMessage, FollowupAgentTurn,
-    SpawnAgentThread,
+    AgentMailbox, AgentMailboxError, AgentMailboxMessage, AgentMailboxMessageKind,
+    AgentMailboxNotifier, AgentRunCommand, AgentRunScheduler, AgentRunSchedulerError,
+    AgentThreadId, AgentThreadRecord, AgentTurnId, AgentTurnRecord, CollaborationDomainError,
+    CollaborationRegistry, EnqueueAgentMessage, FollowupAgentTurn, SpawnAgentThread,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ pub enum AgentCollaborationRuntimeError {
     Mailbox(#[from] AgentMailboxError),
     #[error("agent run command for {agent_turn_id} could not be submitted: {source}")]
     RunSubmission {
-        agent_turn_id: super::AgentTurnId,
+        agent_turn_id: AgentTurnId,
         #[source]
         source: AgentRunSchedulerError,
     },
@@ -39,6 +39,7 @@ pub struct AgentCollaborationRuntime {
     registry: Arc<dyn CollaborationRegistry>,
     run_scheduler: Arc<dyn AgentRunScheduler>,
     mailbox: Arc<dyn AgentMailbox>,
+    mailbox_notifier: Arc<dyn AgentMailboxNotifier>,
 }
 
 impl AgentCollaborationRuntime {
@@ -51,7 +52,13 @@ impl AgentCollaborationRuntime {
             registry,
             run_scheduler,
             mailbox,
+            mailbox_notifier: Arc::new(super::NoopAgentMailboxNotifier),
         }
+    }
+
+    pub fn with_mailbox_notifier(mut self, notifier: Arc<dyn AgentMailboxNotifier>) -> Self {
+        self.mailbox_notifier = notifier;
+        self
     }
 
     pub fn registry(&self) -> &Arc<dyn CollaborationRegistry> {
@@ -94,7 +101,7 @@ impl AgentCollaborationRuntime {
         if caller.session_id != target.session_id {
             return Err(CollaborationDomainError::AgentThreadNotFound(target.id).into());
         }
-        Ok(self
+        let message = self
             .mailbox
             .enqueue(EnqueueAgentMessage {
                 session_id: caller.session_id,
@@ -104,7 +111,9 @@ impl AgentCollaborationRuntime {
                 payload,
                 causation_id,
             })
-            .await?)
+            .await?;
+        self.mailbox_notifier.message_enqueued(&message);
+        Ok(message)
     }
 
     /// Requests cancellation at the whole-Agent-Run boundary. Descendant
@@ -120,17 +129,33 @@ impl AgentCollaborationRuntime {
         if turn.status.is_terminal() {
             return Ok(Some(turn));
         }
-        self.run_scheduler
-            .submit(AgentRunCommand::Cancel {
-                session_id: target.session_id,
-                agent_thread_id: target.id,
-                agent_turn_id: turn.id,
-            })
-            .await
-            .map_err(|source| AgentCollaborationRuntimeError::RunSubmission {
-                agent_turn_id: turn.id,
-                source,
-            })?;
+        let mut subtree = self
+            .registry
+            .list_threads(target.session_id)
+            .await?
+            .into_iter()
+            .filter(|agent| agent.id == target.id || agent.path.is_descendant_of(&target.path))
+            .collect::<Vec<_>>();
+        subtree.sort_by_key(|agent| std::cmp::Reverse(agent.path.depth()));
+        for agent in subtree {
+            let Some(agent_turn) = self.registry.latest_turn(agent.id).await? else {
+                continue;
+            };
+            if agent_turn.status.is_terminal() {
+                continue;
+            }
+            self.run_scheduler
+                .submit(AgentRunCommand::Cancel {
+                    session_id: agent.session_id,
+                    agent_thread_id: agent.id,
+                    agent_turn_id: agent_turn.id,
+                })
+                .await
+                .map_err(|source| AgentCollaborationRuntimeError::RunSubmission {
+                    agent_turn_id: agent_turn.id,
+                    source,
+                })?;
+        }
         Ok(Some(turn))
     }
 
@@ -194,6 +219,7 @@ mod tests {
         let (_, root, root_turn) = registry
             .create_session(CreateCollaborationSession {
                 user_task_id: Uuid::new_v4(),
+                root_turn_id: super::AgentTurnId::new(),
                 root_task_message: "root".to_string(),
                 root_agent_type: "default".to_string(),
                 root_runtime_snapshot: RuntimeSnapshotSeed::new(

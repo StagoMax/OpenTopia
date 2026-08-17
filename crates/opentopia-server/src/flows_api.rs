@@ -423,7 +423,7 @@ async fn flow_runtime_context(
     }
     agent.restrict_capabilities(&capabilities);
     agent.set_mcp_host(state.mcp_host.clone());
-    agent.set_subagent_context(parent_run_id, 0);
+    agent.set_agent_context(parent_run_id, 0);
     if capabilities.allow_all_plugins || !capabilities.plugins.is_empty() {
         sync_thread_bundled_plugin_activations(&state.store, thread.id, &mut agent);
     } else {
@@ -446,8 +446,7 @@ async fn flow_runtime_context(
     context.permission_mode = settings.permission_mode;
     context.state = Some(ToolStateStore::new(state.store.clone()));
     context.thread_id = Some(thread.id);
-    context.parent_turn_id = Some(parent_run_id);
-    context.subagents = Some(state.subagents.clone());
+    context.agent_turn_id = Some(parent_run_id);
     context.background = Some(state.background.clone());
     context.browser = Some(state.browser.clone());
     context.computer = Some(state.computer.clone());

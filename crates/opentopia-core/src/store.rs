@@ -18,12 +18,10 @@ use crate::model::{
     Thread, ThreadModelSelection, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnRecord,
     TurnStatus, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
 };
-use crate::provider::ModelConversationMessage;
 use crate::settings::AppSettings;
 #[cfg(test)]
 use crate::store_migrations::CURRENT_DATABASE_SCHEMA_VERSION;
 use crate::store_migrations::{self, LEGACY_DATABASE_SCHEMA_VERSION};
-use crate::subagents::{SubagentExecutionContract, SubagentRun, SubagentRunStatus};
 use crate::work_form::{WorkForm, WorkFormStatus, WorkItemStatus, WorkScope};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -31,7 +29,7 @@ use rusqlite::types::Type;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -176,6 +174,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         reverted_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<TurnChangeSet>>;
     fn append_event(&self, event: AgentEvent) -> anyhow::Result<AgentEvent>;
+    fn append_events(&self, events: Vec<AgentEvent>) -> anyhow::Result<Vec<AgentEvent>>;
     fn list_events(
         &self,
         thread_id: Uuid,
@@ -213,19 +212,6 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     fn insert_artifact(&self, artifact: Artifact) -> anyhow::Result<Artifact>;
     fn list_artifacts(&self, thread_id: Uuid) -> anyhow::Result<Vec<ArtifactMetadata>>;
     fn get_artifact(&self, thread_id: Uuid, artifact_id: Uuid) -> anyhow::Result<Option<Artifact>>;
-    fn upsert_subagent_run(&self, run: &SubagentRun) -> anyhow::Result<()>;
-    fn get_subagent_run(&self, run_id: Uuid) -> anyhow::Result<Option<SubagentRun>>;
-    fn list_subagent_runs(&self, thread_id: Uuid) -> anyhow::Result<Vec<SubagentRun>>;
-    fn list_all_subagent_runs(&self) -> anyhow::Result<Vec<SubagentRun>>;
-    fn save_subagent_conversation(
-        &self,
-        run_id: Uuid,
-        conversation: &[ModelConversationMessage],
-    ) -> anyhow::Result<()>;
-    fn load_subagent_conversation(
-        &self,
-        run_id: Uuid,
-    ) -> anyhow::Result<Option<Vec<ModelConversationMessage>>>;
     fn save_provider_conversation_state(
         &self,
         state: &ProviderConversationState,
@@ -245,7 +231,6 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         thread_id: Uuid,
         agent_path: &str,
     ) -> anyhow::Result<bool>;
-    fn fail_interrupted_subagent_runs(&self) -> anyhow::Result<usize>;
     fn insert_approval(&self, approval: Approval) -> anyhow::Result<Approval>;
     fn get_approval(&self, approval_id: Uuid) -> anyhow::Result<Option<Approval>>;
     fn list_approvals(
@@ -3914,53 +3899,91 @@ impl SessionStore for SqliteSessionStore {
         .map_err(Into::into)
     }
 
-    fn append_event(&self, mut event: AgentEvent) -> anyhow::Result<AgentEvent> {
+    fn append_event(&self, event: AgentEvent) -> anyhow::Result<AgentEvent> {
+        self.append_events(vec![event])?
+            .into_iter()
+            .next()
+            .context("single-event append returned no event")
+    }
+
+    fn append_events(&self, mut events: Vec<AgentEvent>) -> anyhow::Result<Vec<AgentEvent>> {
+        let Some(thread_id) = events.first().map(|event| event.thread_id) else {
+            return Ok(events);
+        };
+        anyhow::ensure!(
+            events.iter().all(|event| event.thread_id == thread_id),
+            "an event batch must belong to one thread"
+        );
+
         let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
         let tx = conn.transaction()?;
-        let seq: i64 = tx.query_row(
+        let first_seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE thread_id = ?1",
-            params![event.thread_id.to_string()],
+            params![thread_id.to_string()],
             |row| row.get(0),
         )?;
-        event.seq = seq;
-        let payload_json = serde_json::to_string(&event.payload)?;
-        let conversation_payload_json = conversation_payload_json(&event.payload, &payload_json)?;
-        tx.execute(
-            r#"
-            INSERT INTO events (id, thread_id, turn_id, seq, kind, payload_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            params![
-                event.id.to_string(),
-                event.thread_id.to_string(),
-                event.turn_id.as_ref().map(|id| id.to_string()),
-                event.seq,
-                event.kind(),
-                payload_json,
-                event.created_at.to_rfc3339(),
-            ],
-        )?;
-        if let Some(conversation_payload_json) = conversation_payload_json {
+        let mut completed_stream_turn_ids = HashSet::new();
+        for (offset, event) in events.iter_mut().enumerate() {
+            event.seq = first_seq + i64::try_from(offset)?;
+            let payload_json = serde_json::to_string(&event.payload)?;
+            let conversation_payload_json =
+                conversation_payload_json(&event.payload, &payload_json)?;
             tx.execute(
                 r#"
-                INSERT INTO conversation_events (
-                    id, thread_id, turn_id, seq, payload_json, created_at
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                INSERT INTO events (id, thread_id, turn_id, seq, kind, payload_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 "#,
                 params![
                     event.id.to_string(),
                     event.thread_id.to_string(),
                     event.turn_id.as_ref().map(|id| id.to_string()),
                     event.seq,
-                    conversation_payload_json,
+                    event.kind(),
+                    payload_json,
                     event.created_at.to_rfc3339(),
                 ],
             )?;
+            if let Some(conversation_payload_json) = conversation_payload_json {
+                tx.execute(
+                    r#"
+                    INSERT INTO conversation_events (
+                        id, thread_id, turn_id, seq, payload_json, created_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        event.id.to_string(),
+                        event.thread_id.to_string(),
+                        event.turn_id.as_ref().map(|id| id.to_string()),
+                        event.seq,
+                        conversation_payload_json,
+                        event.created_at.to_rfc3339(),
+                    ],
+                )?;
+            }
+            if matches!(&event.payload, AgentEventPayload::AssistantMessage { .. }) {
+                if let Some(turn_id) = event.turn_id {
+                    completed_stream_turn_ids.insert(turn_id);
+                }
+            }
         }
-        touch_thread(&tx, event.thread_id)?;
+        // The assistant message is the durable snapshot of a completed model
+        // stream. Historical deltas remain in the diagnostic event log, while
+        // the conversation projection stays small and quick to restore.
+        for turn_id in completed_stream_turn_ids {
+            tx.execute(
+                r#"
+                DELETE FROM conversation_events
+                WHERE thread_id = ?1
+                  AND turn_id = ?2
+                  AND id IN (SELECT id FROM events WHERE kind = 'model_delta')
+                "#,
+                params![thread_id.to_string(), turn_id.to_string()],
+            )?;
+        }
+        touch_thread(&tx, thread_id)?;
         tx.commit()?;
-        Ok(event)
+        Ok(events)
     }
 
     fn list_events(
@@ -4308,138 +4331,6 @@ impl SessionStore for SqliteSessionStore {
         Ok(artifact)
     }
 
-    fn upsert_subagent_run(&self, run: &SubagentRun) -> anyhow::Result<()> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        conn.execute(
-            r#"
-            INSERT INTO subagent_runs (
-                id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
-                name, agent_type, input, fork_turns, last_task_message, depth, status,
-                result, error, created_at, started_at, completed_at, execution_contract_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-            ON CONFLICT(id) DO UPDATE SET
-                parent_turn_id = excluded.parent_turn_id,
-                last_task_message = excluded.last_task_message,
-                status = excluded.status,
-                result = excluded.result,
-                error = excluded.error,
-                started_at = excluded.started_at,
-                completed_at = excluded.completed_at,
-                execution_contract_json = excluded.execution_contract_json
-            "#,
-            params![
-                run.id.to_string(),
-                run.parent_thread_id.to_string(),
-                run.parent_turn_id.to_string(),
-                &run.agent_path,
-                &run.parent_agent_path,
-                &run.name,
-                &run.agent_type,
-                &run.input,
-                &run.fork_turns,
-                &run.last_task_message,
-                i64::from(run.depth),
-                run.status.as_str(),
-                run.result.as_deref(),
-                run.error.as_deref(),
-                run.created_at.to_rfc3339(),
-                run.started_at.as_ref().map(DateTime::to_rfc3339),
-                run.completed_at.as_ref().map(DateTime::to_rfc3339),
-                serde_json::to_string(&run.execution_contract)?,
-            ],
-        )?;
-        touch_thread(&conn, run.parent_thread_id)?;
-        Ok(())
-    }
-
-    fn get_subagent_run(&self, run_id: Uuid) -> anyhow::Result<Option<SubagentRun>> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        Ok(conn
-            .query_row(
-                r#"
-                SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
-                       name, agent_type, input, fork_turns, last_task_message, depth, status,
-                       result, error, created_at, started_at, completed_at, execution_contract_json
-                FROM subagent_runs
-                WHERE id = ?1
-                "#,
-                params![run_id.to_string()],
-                map_subagent_run,
-            )
-            .optional()?)
-    }
-
-    fn list_subagent_runs(&self, thread_id: Uuid) -> anyhow::Result<Vec<SubagentRun>> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let mut statement = conn.prepare(
-            r#"
-            SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
-                   name, agent_type, input, fork_turns, last_task_message, depth, status,
-                   result, error, created_at, started_at, completed_at, execution_contract_json
-            FROM subagent_runs
-            WHERE parent_thread_id = ?1
-            ORDER BY created_at DESC
-            "#,
-        )?;
-        let rows = statement.query_map(params![thread_id.to_string()], map_subagent_run)?;
-        collect_rows(rows)
-    }
-
-    fn list_all_subagent_runs(&self) -> anyhow::Result<Vec<SubagentRun>> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let mut statement = conn.prepare(
-            r#"
-            SELECT id, parent_thread_id, parent_turn_id, agent_path, parent_agent_path,
-                   name, agent_type, input, fork_turns, last_task_message, depth, status,
-                   result, error, created_at, started_at, completed_at, execution_contract_json
-            FROM subagent_runs
-            ORDER BY created_at ASC
-            "#,
-        )?;
-        let rows = statement.query_map([], map_subagent_run)?;
-        collect_rows(rows)
-    }
-
-    fn save_subagent_conversation(
-        &self,
-        run_id: Uuid,
-        conversation: &[ModelConversationMessage],
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        conn.execute(
-            r#"
-            INSERT INTO subagent_conversations (run_id, conversation_json, updated_at)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(run_id) DO UPDATE SET
-                conversation_json = excluded.conversation_json,
-                updated_at = excluded.updated_at
-            "#,
-            params![
-                run_id.to_string(),
-                serde_json::to_string(conversation)?,
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn load_subagent_conversation(
-        &self,
-        run_id: Uuid,
-    ) -> anyhow::Result<Option<Vec<ModelConversationMessage>>> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let value = conn
-            .query_row(
-                "SELECT conversation_json FROM subagent_conversations WHERE run_id = ?1",
-                params![run_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        value
-            .map(|value| serde_json::from_str(&value).map_err(Into::into))
-            .transpose()
-    }
-
     fn save_provider_conversation_state(
         &self,
         state: &ProviderConversationState,
@@ -4518,21 +4409,6 @@ impl SessionStore for SqliteSessionStore {
             "DELETE FROM provider_conversation_states WHERE thread_id = ?1 AND agent_path = ?2",
             params![thread_id.to_string(), agent_path],
         )? > 0)
-    }
-
-    fn fail_interrupted_subagent_runs(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let now = Utc::now().to_rfc3339();
-        Ok(conn.execute(
-            r#"
-            UPDATE subagent_runs
-            SET status = 'failed',
-                error = 'OpenTopia restarted before this subagent completed.',
-                completed_at = ?1
-            WHERE status IN ('queued', 'running')
-            "#,
-            params![now],
-        )?)
     }
 
     fn insert_approval(&self, approval: Approval) -> anyhow::Result<Approval> {
@@ -5985,57 +5861,6 @@ fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
     })
 }
 
-fn map_subagent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentRun> {
-    let depth_value: i64 = row.get(10)?;
-    let depth = u8::try_from(depth_value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(10, Type::Integer, Box::new(error))
-    })?;
-    let status_value: String = row.get(11)?;
-    let status = SubagentRunStatus::parse(&status_value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            11,
-            Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                error.to_string(),
-            )),
-        )
-    })?;
-    let started_at: Option<String> = row.get(15)?;
-    let completed_at: Option<String> = row.get(16)?;
-    let execution_contract_json: String = row.get(17)?;
-    let execution_contract: SubagentExecutionContract =
-        serde_json::from_str(&execution_contract_json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(17, Type::Text, Box::new(error))
-        })?;
-    Ok(SubagentRun {
-        id: parse_uuid(row.get(0)?, 0)?,
-        parent_thread_id: parse_uuid(row.get(1)?, 1)?,
-        parent_turn_id: parse_uuid(row.get(2)?, 2)?,
-        agent_path: row.get(3)?,
-        parent_agent_path: row.get(4)?,
-        name: row.get(5)?,
-        agent_type: row.get(6)?,
-        input: row.get(7)?,
-        fork_turns: row.get(8)?,
-        last_task_message: row.get(9)?,
-        depth,
-        status,
-        result: row.get(12)?,
-        error: row.get(13)?,
-        created_at: parse_datetime(row.get(14)?, 14)?,
-        started_at: started_at
-            .map(|value| parse_datetime(value, 15))
-            .transpose()?,
-        completed_at: completed_at
-            .map(|value| parse_datetime(value, 16))
-            .transpose()?,
-        execution_contract,
-        initial_conversation: Vec::new(),
-        initial_model_context: None,
-    })
-}
-
 fn map_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
     let status_value: String = row.get(4)?;
     let status = ApprovalStatus::from_str(&status_value).map_err(|err| {
@@ -6298,6 +6123,17 @@ mod tests {
             std::process::id(),
             Uuid::new_v4()
         ))
+    }
+
+    fn remove_post_legacy_agent_runtime_tables(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS agent_turn_checkpoints;
+            DROP TABLE IF EXISTS agent_provider_states;
+            DROP TABLE IF EXISTS agent_events;
+            "#,
+        )
+        .expect("remove post-legacy agent runtime tables");
     }
 
     #[test]
@@ -6603,6 +6439,7 @@ mod tests {
         let store = SqliteSessionStore::open(":memory:").expect("open memory store");
         {
             let conn = store.conn.lock().expect("lock store");
+            remove_post_legacy_agent_runtime_tables(&conn);
             conn.execute_batch(
                 r#"
                 DROP TABLE mcp_server_tools;
@@ -6854,6 +6691,7 @@ mod tests {
             .expect("insert turn");
         {
             let conn = store.conn.lock().expect("lock store");
+            remove_post_legacy_agent_runtime_tables(&conn);
             conn.execute_batch(
                 r#"
                 PRAGMA foreign_keys = OFF;
@@ -6961,6 +6799,7 @@ mod tests {
             .expect("create goal");
         {
             let conn = store.conn.lock().expect("lock store");
+            remove_post_legacy_agent_runtime_tables(&conn);
             conn.execute_batch(
                 r#"
                 PRAGMA foreign_keys = OFF;
@@ -6995,11 +6834,11 @@ mod tests {
                 ALTER TABLE goals_legacy_v19 RENAME TO goals;
                 CREATE INDEX idx_goals_thread_updated
                     ON goals(thread_id, updated_at DESC);
-                CREATE TABLE evaluation_runs (
+                CREATE TABLE harness_learning_cases (
                     run_id TEXT PRIMARY KEY,
                     legacy_payload TEXT NOT NULL
                 );
-                INSERT INTO evaluation_runs (run_id, legacy_payload)
+                INSERT INTO harness_learning_cases (run_id, legacy_payload)
                 VALUES ('legacy-run', 'preserve-me');
                 DROP TABLE agent_mailbox_messages;
                 DROP TABLE agent_ledger_items;
@@ -7032,7 +6871,7 @@ mod tests {
         assert!(!table_has_column(&conn, "goals", "completed_at").expect("inspect goal completion"));
         let legacy_payload: String = conn
             .query_row(
-                "SELECT legacy_payload FROM evaluation_runs WHERE run_id = 'legacy-run'",
+                "SELECT legacy_payload FROM harness_learning_cases WHERE run_id = 'legacy-run'",
                 [],
                 |row| row.get(0),
             )
@@ -7096,13 +6935,17 @@ mod tests {
         )
         .expect("read migration ledger");
 
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 5);
         assert_eq!(records[0].0, LEGACY_DATABASE_SCHEMA_VERSION);
         assert_eq!(records[0].1, "legacy_baseline_v19");
         assert_eq!(records[1].0, 20);
         assert_eq!(records[1].1, "verified_migration_ledger");
-        assert_eq!(records[2].0, CURRENT_DATABASE_SCHEMA_VERSION);
+        assert_eq!(records[2].0, 21);
         assert_eq!(records[2].1, "agent_collaboration_domain");
+        assert_eq!(records[3].0, 22);
+        assert_eq!(records[3].1, "agent_runtime_cutover");
+        assert_eq!(records[4].0, CURRENT_DATABASE_SCHEMA_VERSION);
+        assert_eq!(records[4].1, "agent_turn_checkpoints");
         assert!(records.iter().all(|record| record.2.starts_with("sha256:")));
         assert!(records.iter().all(|record| !record.3.is_empty()));
         assert!(records
@@ -7112,6 +6955,41 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user version mirror");
         assert_eq!(user_version, CURRENT_DATABASE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_upgrades_pre_checkpoint_v22_database() {
+        let path = temporary_db_path("migration-v22-checkpoints");
+        {
+            let store = SqliteSessionStore::open(&path).expect("create current database");
+            let conn = store.conn.lock().expect("lock current database");
+            conn.execute_batch(
+                r#"
+                DROP TABLE agent_turn_checkpoints;
+                DELETE FROM schema_migrations WHERE version = 23;
+                PRAGMA user_version = 22;
+                "#,
+            )
+            .expect("restore the pre-checkpoint v22 schema");
+        }
+
+        let migrated = SqliteSessionStore::open(&path).expect("upgrade v22 database");
+        let conn = migrated.conn.lock().expect("lock migrated database");
+        let schema_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(schema_version, CURRENT_DATABASE_SCHEMA_VERSION);
+        let checkpoint_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'agent_turn_checkpoints')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect checkpoint table");
+        assert!(checkpoint_table_exists);
+        drop(conn);
+        drop(migrated);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -7236,6 +7114,7 @@ mod tests {
         let store = SqliteSessionStore::open(":memory:").expect("open memory store");
         {
             let conn = store.conn.lock().expect("lock store");
+            remove_post_legacy_agent_runtime_tables(&conn);
             conn.execute_batch(
                 r#"
                 DROP TABLE agent_mailbox_messages;
@@ -7292,6 +7171,87 @@ mod tests {
             }
             payload => panic!("unexpected payload: {payload:?}"),
         }
+    }
+
+    #[test]
+    fn sqlite_store_appends_event_batches_with_contiguous_sequences() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/event-batches"))
+            .expect("create thread");
+        let turn_id = Uuid::new_v4();
+        let stored = store
+            .append_events(vec![
+                AgentEvent::new(
+                    thread.id,
+                    Some(turn_id),
+                    0,
+                    AgentEventPayload::ReasoningDelta {
+                        text: "first".to_string(),
+                    },
+                ),
+                AgentEvent::new(
+                    thread.id,
+                    Some(turn_id),
+                    0,
+                    AgentEventPayload::ModelDelta {
+                        text: "second".to_string(),
+                    },
+                ),
+            ])
+            .expect("append event batch");
+
+        assert_eq!(
+            stored.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let listed = store
+            .list_events(thread.id, None)
+            .expect("list event batch");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, stored[0].id);
+        assert_eq!(listed[1].id, stored[1].id);
+    }
+
+    #[test]
+    fn completed_assistant_message_replaces_historical_stream_in_conversation_view() {
+        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+        let thread = store
+            .create_thread(None, PathBuf::from("C:/workspace/conversation-snapshot"))
+            .expect("create thread");
+        let turn_id = Uuid::new_v4();
+        let message = Message::text(thread.id, MessageRole::Assistant, "complete answer");
+        store
+            .append_events(vec![
+                AgentEvent::new(
+                    thread.id,
+                    Some(turn_id),
+                    0,
+                    AgentEventPayload::ModelDelta {
+                        text: "partial ".to_string(),
+                    },
+                ),
+                AgentEvent::new(
+                    thread.id,
+                    Some(turn_id),
+                    0,
+                    AgentEventPayload::AssistantMessage { message },
+                ),
+            ])
+            .expect("append completed stream");
+
+        let diagnostic_events = store
+            .list_events(thread.id, None)
+            .expect("list full events");
+        assert_eq!(diagnostic_events.len(), 2);
+        let conversation_events = store
+            .list_conversation_events(thread.id, None)
+            .expect("list conversation projection");
+        assert_eq!(conversation_events.len(), 1);
+        assert!(matches!(
+            conversation_events[0].payload,
+            AgentEventPayload::AssistantMessage { .. }
+        ));
     }
 
     #[test]
@@ -7456,6 +7416,7 @@ mod tests {
             .expect("append event");
         {
             let conn = store.conn.lock().expect("lock store");
+            remove_post_legacy_agent_runtime_tables(&conn);
             conn.execute("DELETE FROM conversation_events", [])
                 .expect("remove projected rows");
             conn.execute_batch(
@@ -8115,70 +8076,6 @@ mod tests {
             .expect("thread exists");
         assert!(detached.project_id.is_none());
         assert_eq!(detached.workspace_root, moved.workspace_root);
-    }
-
-    #[test]
-    fn sqlite_store_persists_and_recovers_subagent_runs() {
-        let store = SqliteSessionStore::open(":memory:").expect("open memory store");
-        let thread = store
-            .create_thread(Some("Parent".to_string()), PathBuf::from("."))
-            .expect("create thread");
-        let execution_contract = SubagentExecutionContract {
-            workspace: crate::subagents::SubagentWorkspaceAssignment {
-                mode: crate::subagents::SubagentWorkspaceMode::IsolatedWorktree,
-                root: Some(PathBuf::from(".opentopia/worktrees/reviewer")),
-                branch: Some("codex/subagent/reviewer".to_string()),
-                base_commit: Some("abc123".to_string()),
-            },
-            require_structured_delivery: true,
-        };
-        let run = SubagentRun {
-            id: Uuid::new_v4(),
-            parent_thread_id: thread.id,
-            parent_turn_id: Uuid::new_v4(),
-            agent_path: "/root/reviewer".to_string(),
-            parent_agent_path: "/root".to_string(),
-            name: "reviewer".to_string(),
-            agent_type: "default".to_string(),
-            input: "review changes".to_string(),
-            fork_turns: "all".to_string(),
-            last_task_message: "review changes".to_string(),
-            depth: 1,
-            status: SubagentRunStatus::Running,
-            result: None,
-            error: None,
-            created_at: Utc::now(),
-            started_at: Some(Utc::now()),
-            completed_at: None,
-            execution_contract: execution_contract.clone(),
-            initial_conversation: Vec::new(),
-            initial_model_context: None,
-        };
-        store.upsert_subagent_run(&run).expect("persist run");
-        let conversation = vec![ModelConversationMessage {
-            role: crate::provider::ModelConversationRole::User,
-            content: "continue".to_string(),
-            content_parts: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-        }];
-        store
-            .save_subagent_conversation(run.id, &conversation)
-            .expect("persist agent conversation");
-        assert_eq!(
-            store.load_subagent_conversation(run.id).unwrap().unwrap(),
-            conversation
-        );
-        let persisted = store.get_subagent_run(run.id).unwrap().unwrap();
-        assert_eq!(persisted.status, SubagentRunStatus::Running);
-        assert_eq!(persisted.execution_contract, execution_contract);
-        assert_eq!(store.list_subagent_runs(thread.id).unwrap().len(), 1);
-        assert_eq!(store.fail_interrupted_subagent_runs().unwrap(), 1);
-        let recovered = store.get_subagent_run(run.id).unwrap().unwrap();
-        assert_eq!(recovered.status, SubagentRunStatus::Failed);
-        assert_eq!(recovered.execution_contract, execution_contract);
-        assert!(recovered.error.unwrap().contains("restarted"));
-        assert!(recovered.completed_at.is_some());
     }
 
     #[test]

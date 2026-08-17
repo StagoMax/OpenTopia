@@ -7,9 +7,7 @@ use crate::model_context::{
     ModelContextItem, ThreadContextSnapshot, TokenEstimateBreakdown, TurnContextSnapshot,
 };
 use crate::provider::ModelUsage;
-use crate::settings::ProviderAdapterKind;
 use crate::skills::LoadedSkill;
-use crate::subagents::SubagentRun;
 use crate::work_form::{WorkForm, WorkFormStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -70,8 +68,6 @@ pub struct Thread {
 pub struct ThreadModelSelection {
     pub connection_id: String,
     pub model_id: String,
-    #[serde(default)]
-    pub adapter: Option<ProviderAdapterKind>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 }
@@ -1467,9 +1463,6 @@ pub enum AgentEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_breakdown: Option<TokenEstimateBreakdown>,
     },
-    SubagentUpdated {
-        run: SubagentRun,
-    },
     TurnFinished {
         summary: String,
     },
@@ -1549,7 +1542,6 @@ impl AgentEventPayload {
             Self::ProviderContextStateInvalidated { .. } => "provider_context_state_invalidated",
             Self::ContextWarning { .. } => "context_warning",
             Self::TokenUsage { .. } => "token_usage",
-            Self::SubagentUpdated { .. } => "subagent_updated",
             Self::TurnFinished { .. } => "turn_finished",
             Self::TurnSuspended { .. } => "turn_suspended",
             Self::BrowserHandoffRequired { .. } => "browser_handoff_required",

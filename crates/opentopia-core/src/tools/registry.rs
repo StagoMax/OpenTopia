@@ -1,10 +1,11 @@
 use super::{
     ApplyPatchTool, BackgroundOutputTool, BrowserTool, ComputerTool, CreateSkillTool, DocumentTool,
     FilesystemTool, FollowupAgentTaskTool, InterruptAgentTool, ListAgentsTool, ListSkillsTool,
-    PdfTool, ReadArtifactTool, ReadAttachmentTool, ReadSkillTool, RequestUserInputTool,
-    SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool, SpreadsheetTool, Tool,
-    ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy, ToolRiskLevel, ToolSideEffect,
-    UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
+    PdfTool, ReadArtifactTool, ReadAttachmentTool, ReadSkillTool, RegisteredTool,
+    RequestUserInputTool, SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool,
+    SpreadsheetTool, Tool, ToolApprovalMode, ToolCapabilityDescriptor, ToolClass,
+    ToolExecutionPolicy, ToolGovernance, ToolRiskLevel, ToolSideEffect, ToolSource, UpdatePlanTool,
+    ViewAttachmentTool, WaitAgentTool,
 };
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::enterprise::DataClassification;
@@ -12,34 +13,14 @@ use crate::model::ToolCall;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Immutable, clone-cheap catalog of tools available to an agent runtime.
+/// Immutable, clone-cheap catalog of complete tool registration records.
 ///
-/// Composition lives in this module so individual tool implementations remain
-/// independent from the product's default tool surface. Runtime policy and
-/// capability projection can then reason over one consistent catalog.
+/// A record owns the implementation, source, class, and governance metadata.
+/// The tool implementation remains the sole source of its ID, description,
+/// Schema, execution intent, and execution behavior.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: Arc<BTreeMap<String, Arc<dyn Tool>>>,
-    sources: Arc<BTreeMap<String, ToolSource>>,
-    classes: Arc<BTreeMap<String, ToolClass>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolSource {
-    Core,
-    BundledPlugin { plugin_name: String },
-    Mcp,
-}
-
-/// Product-neutral scheduling and visibility class carried by the catalog.
-/// The turn driver consumes this metadata instead of recognizing tool names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolClass {
-    Standard,
-    Subagent,
-    StructuredInput,
-    WorkForm,
-    Flow,
+    entries: Arc<BTreeMap<String, RegisteredTool>>,
 }
 
 impl ToolRegistry {
@@ -52,269 +33,365 @@ impl ToolRegistry {
 
     /// Compose the trusted kernel tools without optional bundled plugins.
     pub fn with_core_tools() -> Self {
-        let mut tools: BTreeMap<String, Arc<dyn Tool>> = BTreeMap::new();
-        tools.insert("read_attachment".to_string(), Arc::new(ReadAttachmentTool));
-        tools.insert("view_attachment".to_string(), Arc::new(ViewAttachmentTool));
-        tools.insert("read_artifact".to_string(), Arc::new(ReadArtifactTool));
-        tools.insert("filesystem".to_string(), Arc::new(FilesystemTool));
-        tools.insert("shell".to_string(), Arc::new(ShellTool));
-        tools.insert(
-            "background_output".to_string(),
+        let mut registry = Self::default();
+        registry.register_core(
+            Arc::new(ReadAttachmentTool),
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::Low,
+                ToolSideEffect::None,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
+        );
+        registry.register_core(
+            Arc::new(ViewAttachmentTool),
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::High,
+                ToolSideEffect::External,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
+        );
+        registry.register_core(
+            Arc::new(ReadArtifactTool),
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::Low,
+                ToolSideEffect::None,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
+        );
+        registry.register_core(
+            Arc::new(FilesystemTool),
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::High,
+                ToolSideEffect::WorkspaceWrite,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
+        );
+        registry.register_core(
+            Arc::new(ShellTool),
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::High,
+                ToolSideEffect::Process,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
+        );
+        registry.register_core(
             Arc::new(BackgroundOutputTool),
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::Low,
+                ToolSideEffect::None,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
         );
-        tools.insert("apply_patch".to_string(), Arc::new(ApplyPatchTool));
-        tools.insert("spawn_agent".to_string(), Arc::new(SpawnAgentTool));
-        tools.insert("send_message".to_string(), Arc::new(SendAgentMessageTool));
-        tools.insert("followup_task".to_string(), Arc::new(FollowupAgentTaskTool));
-        tools.insert("interrupt_agent".to_string(), Arc::new(InterruptAgentTool));
-        tools.insert("list_agents".to_string(), Arc::new(ListAgentsTool));
-        tools.insert("wait_agent".to_string(), Arc::new(WaitAgentTool));
-        tools.insert(
-            "request_user_input".to_string(),
+        registry.register_core(
+            Arc::new(ApplyPatchTool),
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::High,
+                ToolSideEffect::WorkspaceWrite,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
+        );
+
+        for tool in [
+            Arc::new(SpawnAgentTool) as Arc<dyn Tool>,
+            Arc::new(SendAgentMessageTool),
+            Arc::new(FollowupAgentTaskTool),
+            Arc::new(InterruptAgentTool),
+        ] {
+            registry.register_core(
+                tool,
+                ToolClass::Agent,
+                governed(
+                    ToolRiskLevel::Medium,
+                    ToolSideEffect::ControlPlane,
+                    ToolApprovalMode::PolicyControlled,
+                    DataClassification::Confidential,
+                ),
+            );
+        }
+        for tool in [
+            Arc::new(ListAgentsTool) as Arc<dyn Tool>,
+            Arc::new(WaitAgentTool),
+        ] {
+            registry.register_core(
+                tool,
+                ToolClass::Agent,
+                governed(
+                    ToolRiskLevel::Low,
+                    ToolSideEffect::None,
+                    ToolApprovalMode::PolicyControlled,
+                    DataClassification::Restricted,
+                ),
+            );
+        }
+        registry.register_core(
             Arc::new(RequestUserInputTool),
+            ToolClass::StructuredInput,
+            governed(
+                ToolRiskLevel::Medium,
+                ToolSideEffect::SessionMutation,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Confidential,
+            ),
         );
-        tools.insert("set_plan".to_string(), Arc::new(SetPlanTool));
-        tools.insert("update_plan".to_string(), Arc::new(UpdatePlanTool));
-        tools.insert("list_skills".to_string(), Arc::new(ListSkillsTool));
-        tools.insert("read_skill".to_string(), Arc::new(ReadSkillTool));
-        tools.insert("create_skill".to_string(), Arc::new(CreateSkillTool));
-        for (name, tool) in crate::flow_tools::flow_tools() {
-            tools.insert(name, tool);
+        for tool in [
+            Arc::new(SetPlanTool) as Arc<dyn Tool>,
+            Arc::new(UpdatePlanTool),
+        ] {
+            registry.register_core(
+                tool,
+                ToolClass::WorkForm,
+                governed(
+                    ToolRiskLevel::Medium,
+                    ToolSideEffect::SessionMutation,
+                    ToolApprovalMode::PolicyControlled,
+                    DataClassification::Confidential,
+                ),
+            );
         }
-        let sources = tools
-            .keys()
-            .cloned()
-            .map(|name| (name, ToolSource::Core))
-            .collect();
-        let classes = tools
-            .keys()
-            .cloned()
-            .map(|name| {
-                let class = core_tool_class(&name);
-                (name, class)
-            })
-            .collect();
-        Self {
-            tools: Arc::new(tools),
-            sources: Arc::new(sources),
-            classes: Arc::new(classes),
+        for tool in [
+            Arc::new(ListSkillsTool) as Arc<dyn Tool>,
+            Arc::new(ReadSkillTool),
+        ] {
+            registry.register_core(
+                tool,
+                ToolClass::Standard,
+                governed(
+                    ToolRiskLevel::Low,
+                    ToolSideEffect::None,
+                    ToolApprovalMode::PolicyControlled,
+                    DataClassification::Restricted,
+                ),
+            );
         }
+        registry.register_core(
+            Arc::new(CreateSkillTool),
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::High,
+                ToolSideEffect::WorkspaceWrite,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
+        );
+        for registration in crate::flow_tools::flow_tool_registrations() {
+            registry.register_entry(registration);
+        }
+        registry
     }
 
     fn register_bundled_plugins(&mut self) {
         for plugin in bundled_plugin_catalog() {
             for capability in plugin.native_capabilities {
-                let tool: Arc<dyn Tool> = match *capability {
-                    "browser" => Arc::new(BrowserTool),
-                    "computer" => Arc::new(ComputerTool),
-                    "document" => Arc::new(DocumentTool),
-                    "pdf" => Arc::new(PdfTool),
-                    "spreadsheet" => Arc::new(SpreadsheetTool),
+                let (tool, governance): (Arc<dyn Tool>, ToolGovernance) = match *capability {
+                    "browser" => (
+                        Arc::new(BrowserTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::External,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Public,
+                        ),
+                    ),
+                    "computer" => (
+                        Arc::new(ComputerTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::External,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Public,
+                        ),
+                    ),
+                    "document" => (
+                        Arc::new(DocumentTool),
+                        governed(
+                            ToolRiskLevel::Medium,
+                            ToolSideEffect::Process,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "pdf" => (
+                        Arc::new(PdfTool),
+                        governed(
+                            ToolRiskLevel::Low,
+                            ToolSideEffect::None,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet" => (
+                        Arc::new(SpreadsheetTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
                     _ => continue,
                 };
-                self.insert_with_source(
-                    (*capability).to_string(),
+                self.register_entry(RegisteredTool::new(
                     tool,
                     ToolSource::BundledPlugin {
                         plugin_name: plugin.name.to_string(),
                     },
-                );
+                    ToolClass::Standard,
+                    governance,
+                ));
             }
         }
     }
 
+    fn register_core(&mut self, tool: Arc<dyn Tool>, class: ToolClass, governance: ToolGovernance) {
+        self.register_entry(RegisteredTool::core(tool, class, governance));
+    }
+
+    fn register_entry(&mut self, entry: RegisteredTool) {
+        let name = entry.name().to_string();
+        Arc::make_mut(&mut self.entries).insert(name, entry);
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        self.entries.get(name).map(|entry| Arc::clone(&entry.tool))
     }
 
+    /// Registers a server-composed local tool without repeating its ID. When a
+    /// tool replaces an existing record, its static class and governance stay
+    /// attached to that registry slot.
+    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        let name = tool.name();
+        let (class, governance) = self
+            .entries
+            .get(name)
+            .map(|entry| (entry.class, entry.governance.clone()))
+            .unwrap_or((ToolClass::Standard, ToolGovernance::unknown()));
+        self.register_core(tool, class, governance);
+    }
+
+    /// Compatibility entry point for callers that still pass a duplicate ID.
+    /// The assertion turns silent registry drift into an immediate failure.
     pub fn insert(&mut self, name: String, tool: Arc<dyn Tool>) {
-        self.insert_with_source(name, tool, ToolSource::Core);
+        assert_eq!(
+            name,
+            tool.name(),
+            "registered tool ID must match Tool::name()"
+        );
+        self.register(tool);
     }
 
+    pub fn register_mcp(&mut self, tool: Arc<dyn Tool>) {
+        self.register_entry(RegisteredTool::new(
+            tool,
+            ToolSource::Mcp,
+            ToolClass::Standard,
+            governed(
+                ToolRiskLevel::High,
+                ToolSideEffect::External,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Public,
+            ),
+        ));
+    }
+
+    /// Compatibility entry point for older callers. New code should use
+    /// register_mcp so the implementation remains the only source of its ID.
     pub fn insert_mcp(&mut self, name: String, tool: Arc<dyn Tool>) {
-        self.insert_with_source(name, tool, ToolSource::Mcp);
+        assert_eq!(
+            name,
+            tool.name(),
+            "registered MCP ID must match Tool::name()"
+        );
+        self.register_mcp(tool);
     }
 
     /// Atomically removes the previously synchronized MCP surface while
-    /// preserving core and bundled tools. AgentCore calls this before replacing
-    /// the enabled server set so stale wrappers cannot remain model-visible.
+    /// preserving core and bundled tools.
     pub fn clear_mcp(&mut self) {
-        let mcp_names = self
-            .sources
-            .iter()
-            .filter_map(|(name, source)| matches!(source, &ToolSource::Mcp).then(|| name.clone()))
-            .collect::<Vec<_>>();
-        if mcp_names.is_empty() {
-            return;
-        }
-        let tools = Arc::make_mut(&mut self.tools);
-        let sources = Arc::make_mut(&mut self.sources);
-        let classes = Arc::make_mut(&mut self.classes);
-        for name in mcp_names {
-            tools.remove(&name);
-            sources.remove(&name);
-            classes.remove(&name);
-        }
-    }
-
-    fn insert_with_source(&mut self, name: String, tool: Arc<dyn Tool>, source: ToolSource) {
-        let class = if matches!(source, ToolSource::Core) {
-            core_tool_class(&name)
-        } else {
-            ToolClass::Standard
-        };
-        Arc::make_mut(&mut self.tools).insert(name.clone(), tool);
-        Arc::make_mut(&mut self.sources).insert(name.clone(), source);
-        Arc::make_mut(&mut self.classes).insert(name, class);
+        Arc::make_mut(&mut self.entries)
+            .retain(|_, entry| !matches!(entry.source, ToolSource::Mcp));
     }
 
     pub fn list(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        self.entries.keys().cloned().collect()
     }
 
     pub fn source(&self, name: &str) -> Option<ToolSource> {
-        self.sources.get(name).cloned()
+        self.entries.get(name).map(|entry| entry.source.clone())
     }
 
     pub fn class(&self, name: &str) -> Option<ToolClass> {
-        self.classes.get(name).copied()
+        self.entries.get(name).map(|entry| entry.class)
     }
 
     pub fn execution_policy(&self, name: &str, call: &ToolCall) -> Option<ToolExecutionPolicy> {
-        self.tools.get(name).map(|tool| tool.execution_policy(call))
+        self.entries
+            .get(name)
+            .map(|entry| entry.tool.execution_policy(call))
     }
 
     pub fn capability_catalog(&self) -> Vec<ToolCapabilityDescriptor> {
-        self.tools
-            .iter()
-            .map(|(name, tool)| {
-                let source = self.sources.get(name).cloned().unwrap_or(ToolSource::Core);
-                let (risk, potential_side_effects, approval, max_data_classification) =
-                    tool_governance_metadata(name, &source);
-                ToolCapabilityDescriptor {
-                    name: name.clone(),
-                    description: tool.description().to_string(),
-                    input_schema: tool.schema(),
-                    source: match &source {
-                        ToolSource::Core => "core".to_string(),
-                        ToolSource::BundledPlugin { plugin_name } => {
-                            format!("bundled_plugin:{plugin_name}")
-                        }
-                        ToolSource::Mcp => "mcp".to_string(),
-                    },
-                    risk,
-                    potential_side_effects,
-                    approval,
-                    max_data_classification,
-                }
-            })
+        self.entries
+            .values()
+            .map(RegisteredTool::capability_descriptor)
             .collect()
     }
 }
 
-fn core_tool_class(name: &str) -> ToolClass {
-    match name {
-        "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent" | "list_agents"
-        | "wait_agent" => ToolClass::Subagent,
-        "request_user_input" => ToolClass::StructuredInput,
-        "set_plan" | "update_plan" => ToolClass::WorkForm,
-        name if name.starts_with("flow_") => ToolClass::Flow,
-        _ => ToolClass::Standard,
-    }
+fn governed(
+    risk: ToolRiskLevel,
+    side_effect: ToolSideEffect,
+    approval: ToolApprovalMode,
+    max_data_classification: DataClassification,
+) -> ToolGovernance {
+    ToolGovernance::new(risk, side_effect, approval, max_data_classification)
 }
 
-fn tool_governance_metadata(
-    name: &str,
-    source: &ToolSource,
-) -> (
-    ToolRiskLevel,
-    Vec<ToolSideEffect>,
-    ToolApprovalMode,
-    DataClassification,
-) {
-    if matches!(source, ToolSource::Mcp) {
-        return (
-            ToolRiskLevel::High,
-            vec![ToolSideEffect::External],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Public,
-        );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_keys_are_derived_from_tool_implementations() {
+        let registry = ToolRegistry::with_builtins();
+        for name in registry.list() {
+            let tool = registry.get(&name).expect("registered tool");
+            assert_eq!(name, tool.name());
+            assert!(registry.source(&name).is_some());
+            assert!(registry.class(&name).is_some());
+        }
     }
-    match name {
-        "read_attachment" | "read_artifact" | "background_output" | "list_agents"
-        | "wait_agent" | "list_skills" | "read_skill" | "flow_search" | "flow_inspect"
-        | "library_search" | "pdf" => (
-            ToolRiskLevel::Low,
-            vec![ToolSideEffect::None],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Restricted,
-        ),
-        "view_attachment" => (
-            ToolRiskLevel::High,
-            vec![ToolSideEffect::External],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Restricted,
-        ),
-        "filesystem" | "apply_patch" | "create_skill" | "spreadsheet" => (
-            ToolRiskLevel::High,
-            vec![ToolSideEffect::WorkspaceWrite],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Restricted,
-        ),
-        "shell" => (
-            ToolRiskLevel::High,
-            vec![ToolSideEffect::Process],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Restricted,
-        ),
-        "document" => (
-            ToolRiskLevel::Medium,
-            vec![ToolSideEffect::Process],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Restricted,
-        ),
-        "browser" | "computer" => (
-            ToolRiskLevel::High,
-            vec![ToolSideEffect::External],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Public,
-        ),
-        "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent" => (
-            ToolRiskLevel::Medium,
-            vec![ToolSideEffect::ControlPlane],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Confidential,
-        ),
-        "request_user_input" | "set_plan" | "update_plan" => (
-            ToolRiskLevel::Medium,
-            vec![ToolSideEffect::SessionMutation],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Confidential,
-        ),
-        "flow_validate" | "flow_simulate" => (
-            ToolRiskLevel::Medium,
-            vec![ToolSideEffect::SessionMutation],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Confidential,
-        ),
-        "flow_create" | "flow_update" | "flow_publish" | "flow_run" | "flow_pause"
-        | "flow_resume" | "flow_cancel" => (
-            ToolRiskLevel::Medium,
-            vec![ToolSideEffect::ControlPlane],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Confidential,
-        ),
-        "flow_status" => (
-            ToolRiskLevel::Low,
-            vec![ToolSideEffect::None],
-            ToolApprovalMode::Never,
-            DataClassification::Confidential,
-        ),
-        _ => (
-            ToolRiskLevel::Unknown,
-            vec![ToolSideEffect::Unknown],
-            ToolApprovalMode::PolicyControlled,
-            DataClassification::Public,
-        ),
+
+    #[test]
+    #[should_panic(expected = "registered tool ID must match Tool::name()")]
+    fn compatibility_registration_rejects_a_drifting_id() {
+        let mut registry = ToolRegistry::default();
+        registry.insert("wrong_name".to_string(), Arc::new(ReadArtifactTool));
+    }
+
+    #[test]
+    fn clearing_mcp_preserves_non_mcp_registration_records() {
+        let mut registry = ToolRegistry::with_core_tools();
+        registry.register_mcp(Arc::new(ReadArtifactTool));
+        assert_eq!(registry.source("read_artifact"), Some(ToolSource::Mcp));
+
+        registry.clear_mcp();
+
+        assert!(registry.get("read_artifact").is_none());
+        assert!(registry.get("filesystem").is_some());
+        assert_eq!(registry.source("filesystem"), Some(ToolSource::Core));
     }
 }

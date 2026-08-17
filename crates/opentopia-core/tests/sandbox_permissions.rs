@@ -16,7 +16,7 @@ fn lease_fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 #[test]
-fn exact_path_approval_does_not_authorize_siblings() {
+fn ordinary_reads_are_global_but_exact_write_approval_does_not_authorize_siblings() {
     let (workspace, outside) = lease_fixture("policy-lease");
     let approved_read = outside.join("approved-read.txt");
     let approved_write = outside.join("approved-write.txt");
@@ -42,7 +42,7 @@ fn exact_path_approval_does_not_authorize_siblings() {
     ));
     assert!(matches!(
         policy.inspect_read(&sibling),
-        PolicyDecision::Ask { .. }
+        PolicyDecision::Allow
     ));
     assert!(matches!(
         policy.inspect_write(&sibling),

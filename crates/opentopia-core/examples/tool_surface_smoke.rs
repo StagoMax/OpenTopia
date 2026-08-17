@@ -254,7 +254,7 @@ impl ModelProvider for SmokeProvider {
                 json!({
                     "expected_revision": 0,
                     "objective": "Exercise every default model-facing OpenTopia tool.",
-                    "change_reason": "Create the smoke-test WorkForm.",
+                    "explanation": "Create the smoke-test WorkForm.",
                     "acceptance": ["Every default tool is dispatched."],
                     "items": [{
                         "id": "exercise-tools",
@@ -269,7 +269,7 @@ impl ModelProvider for SmokeProvider {
                 json!({
                     "operation": "update_item",
                     "expected_revision": 1,
-                    "change_reason": "Record smoke-test evidence.",
+                    "explanation": "Record smoke-test evidence.",
                     "item_id": "exercise-tools",
                     "updates": {
                         "status": "completed",

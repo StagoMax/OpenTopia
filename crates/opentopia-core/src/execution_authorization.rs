@@ -45,8 +45,9 @@ pub enum ProcessLifetime {
     PersistentService,
 }
 
-/// How a user approval may widen the active session profile for this call.
-/// Tools declare semantic escalation needs; they never manipulate platform ACLs.
+/// How the authorization layer scopes extra per-call capabilities. Read paths
+/// are projected without approval; write or host access still requires it.
+/// Tools declare semantic needs and never manipulate platform ACLs directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalEscalation {
@@ -238,15 +239,19 @@ impl ExecutionGrant {
             }
         }
 
-        let exact_paths_are_authorized =
-            approval_granted || base.sandbox_mode == SandboxMode::DangerFullAccess;
         match intent.approval_escalation {
-            ApprovalEscalation::ExactPaths if exact_paths_are_authorized => {
+            ApprovalEscalation::ExactPaths => {
+                // Read access is part of both restricted sandbox profiles, not
+                // an approval escalation. Project only the paths declared by
+                // this call so Windows can provision normal-user ACL access
+                // without widening later shell/process calls.
                 for path in read_paths {
                     sandbox.grant_read_path(path);
                 }
-                for path in write_paths {
-                    sandbox.grant_write_path(path);
+                if approval_granted || base.sandbox_mode == SandboxMode::DangerFullAccess {
+                    for path in write_paths {
+                        sandbox.grant_write_path(path);
+                    }
                 }
             }
             ApprovalEscalation::CommandScopedHostAccess if approval_granted => {
@@ -254,9 +259,7 @@ impl ExecutionGrant {
                 // never persisted into the session profile or tool registry.
                 sandbox = LocalSandboxConfig::danger_full_access();
             }
-            ApprovalEscalation::None
-            | ApprovalEscalation::ExactPaths
-            | ApprovalEscalation::CommandScopedHostAccess => {}
+            ApprovalEscalation::None | ApprovalEscalation::CommandScopedHostAccess => {}
         }
 
         Ok(Self {
@@ -374,6 +377,49 @@ mod tests {
         .unwrap();
 
         assert_eq!(grant.sandbox.sandbox_mode, SandboxMode::ReadOnly);
+    }
+
+    #[test]
+    fn observation_projects_only_the_declared_external_read_without_approval() {
+        let id = uuid::Uuid::new_v4();
+        let workspace = std::env::temp_dir().join(format!("opentopia-grant-workspace-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-grant-outside-{id}"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let requested = outside.join("requested.txt");
+        let sibling = outside.join("sibling.txt");
+        std::fs::write(&requested, "requested").unwrap();
+        std::fs::write(&sibling, "sibling").unwrap();
+
+        let grant = ExecutionGrant::resolve(
+            &LocalSandboxConfig::enforce(),
+            &workspace,
+            &ToolExecutionIntent::observation([requested.clone()]),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(grant.sandbox.sandbox_mode, SandboxMode::ReadOnly);
+        assert!(grant.sandbox.is_within_approved_read_scope(&requested));
+        assert!(!grant.sandbox.is_within_approved_read_scope(&sibling));
+        assert!(grant.sandbox.approved_write_paths.is_empty());
+
+        std::fs::remove_dir_all(workspace).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn unapproved_mutation_projects_reads_but_not_external_writes() {
+        let base = LocalSandboxConfig::enforce();
+        let read = PathBuf::from("C:/outside/input.txt");
+        let write = PathBuf::from("C:/outside/output.txt");
+        let intent = ToolExecutionIntent::workspace_mutation([write.clone()])
+            .with_read_paths([read.clone()]);
+        let grant =
+            ExecutionGrant::resolve(&base, Path::new("C:/workspace"), &intent, false).unwrap();
+
+        assert!(grant.sandbox.is_within_approved_read_scope(&read));
+        assert!(!grant.sandbox.is_within_approved_write_scope(&write));
     }
 
     #[test]

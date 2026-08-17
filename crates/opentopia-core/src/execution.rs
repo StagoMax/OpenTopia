@@ -434,23 +434,9 @@ impl LocalExecutionEnvironment {
         let resolved = candidate
             .canonicalize()
             .with_context(|| format!("path does not exist: {}", candidate.display()))?;
-        if self.sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess {
-            return Ok(resolved);
-        }
-        let readable_roots = self.canonical_roots(
-            self.sandbox_config
-                .configured_readable_roots(&self.workspace_root),
-        );
-        let approved = self.sandbox_config.is_within_approved_read_scope(&resolved)
-            || self
-                .sandbox_config
-                .is_within_approved_write_scope(&resolved);
-        if !approved && !readable_roots.iter().any(|root| resolved.starts_with(root)) {
-            anyhow::bail!(
-                "path is outside the workspace and no readable root authorized it: {}",
-                path.display()
-            );
-        }
+        // Read-only and workspace-write describe mutation authority. They both
+        // permit host reads; command sandboxes receive the declared read paths
+        // through ExecutionGrant so a different OS identity can access them.
         Ok(resolved)
     }
 
@@ -1624,7 +1610,7 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
     }
 
     #[tokio::test]
-    async fn parent_paths_are_blocked_but_configured_readable_roots_remain_available() {
+    async fn parent_traversal_is_blocked_but_absolute_host_reads_remain_available() {
         let id = Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("opentopia-core-scope-root-{id}"));
         let outside = std::env::temp_dir().join(format!("opentopia-core-scope-outside-{id}"));
@@ -1642,26 +1628,22 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
         let absolute_parent = env
             .read_file(FileReadRequest::new(outside.join("allowed.txt")))
             .await
-            .expect_err("unconfigured absolute parent path must be rejected");
-        assert!(absolute_parent
-            .to_string()
-            .contains("no readable root authorized"));
+            .expect("ordinary absolute host read must be allowed");
+        assert_eq!(absolute_parent.bytes, b"allowed");
 
         let parent_cwd = env
             .exec(
                 ExecRequest::shell(if cfg!(windows) {
-                    "Write-Output blocked"
+                    "Write-Output allowed"
                 } else {
-                    "printf blocked"
+                    "printf allowed"
                 })
                 .cwd(&outside),
                 ExecutionContext::with_timeout(Duration::from_secs(30)),
             )
             .await
-            .expect_err("unconfigured shell cwd must be rejected");
-        assert!(parent_cwd
-            .to_string()
-            .contains("no readable root authorized"));
+            .expect("absolute host cwd must be allowed by the execution boundary");
+        assert!(parent_cwd.success);
 
         let mut config = LocalSandboxConfig::default();
         config.read_paths = vec![outside.clone()];
@@ -1840,6 +1822,115 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
         ));
 
         std::fs::remove_dir_all(root).expect("remove temp workspace");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_environment_windows_dedicated_user_command_matrix() {
+        if !crate::sandbox::dedicated_user_credentials_are_installed_for_tests() {
+            return;
+        }
+        let id = Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("opentopia-core-dedicated-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-core-host-read-{id}"));
+        let sandbox_home = std::env::temp_dir().join(format!("opentopia-core-home-{id}"));
+        std::fs::create_dir_all(&root).expect("create dedicated workspace");
+        std::fs::create_dir_all(&outside).expect("create host read fixture");
+        let external_read = outside.join("input.txt");
+        let external_write = outside.join("blocked.txt");
+        std::fs::write(&external_read, "external-readable").expect("write host read fixture");
+
+        let mut config = LocalSandboxConfig::enforce();
+        config.network = NetworkPolicy::Allow;
+        config.sandbox_home = Some(sandbox_home.clone());
+        config.grant_read_path(external_read.clone());
+        let env = LocalExecutionEnvironment::with_sandbox_config(root.clone(), config.clone());
+        let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
+
+        let read = env
+            .exec(
+                ExecRequest::shell(format!(
+                    "Get-Content -LiteralPath '{}'",
+                    quote(&external_read)
+                )),
+                ExecutionContext::with_timeout(Duration::from_secs(60)),
+            )
+            .await
+            .expect("dedicated-user external read command should start");
+        assert!(
+            read.success && String::from_utf8_lossy(&read.stdout).contains("external-readable"),
+            "dedicated-user external read failed: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+
+        let nested_runtime = env
+            .exec(
+                ExecRequest::shell("cargo --version"),
+                ExecutionContext::with_timeout(Duration::from_secs(60)),
+            )
+            .await
+            .expect("dedicated-user nested PATH runtime command should start");
+        assert!(
+            nested_runtime.success
+                && String::from_utf8_lossy(&nested_runtime.stdout).contains("cargo"),
+            "nested PATH runtime failed: {}",
+            String::from_utf8_lossy(&nested_runtime.stderr)
+        );
+
+        let inside = root.join("inside.txt");
+        let write_inside = env
+            .exec(
+                ExecRequest::shell(format!(
+                    "Set-Content -LiteralPath '{}' -Value allowed",
+                    quote(&inside)
+                )),
+                ExecutionContext::with_timeout(Duration::from_secs(60)),
+            )
+            .await
+            .expect("dedicated-user workspace write command should start");
+        assert!(write_inside.success, "workspace write should succeed");
+        assert!(inside.exists());
+
+        let write_outside = env
+            .exec(
+                ExecRequest::shell(format!(
+                    "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{}' -Value blocked",
+                    quote(&external_write)
+                )),
+                ExecutionContext::with_timeout(Duration::from_secs(60)),
+            )
+            .await
+            .expect("dedicated-user outside write command should start");
+        assert!(
+            !write_outside.success,
+            "outside write unexpectedly succeeded"
+        );
+        assert!(!external_write.exists());
+
+        let read_only = LocalExecutionEnvironment::with_sandbox_config(
+            root.clone(),
+            config.with_sandbox_mode(SandboxMode::ReadOnly),
+        );
+        let read_only_target = root.join("read-only-blocked.txt");
+        let read_only_write = read_only
+            .exec(
+                ExecRequest::shell(format!(
+                    "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{}' -Value blocked",
+                    quote(&read_only_target)
+                )),
+                ExecutionContext::with_timeout(Duration::from_secs(60)),
+            )
+            .await
+            .expect("read-only dedicated-user command should start");
+        assert!(
+            !read_only_write.success,
+            "read-only write unexpectedly succeeded"
+        );
+        assert!(!read_only_target.exists());
+
+        std::fs::remove_dir_all(root).expect("remove dedicated workspace");
+        std::fs::remove_dir_all(outside).expect("remove host read fixture");
+        let _ = std::fs::remove_dir_all(sandbox_home);
     }
 
     #[cfg(windows)]

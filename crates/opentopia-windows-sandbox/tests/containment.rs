@@ -1,14 +1,84 @@
 #![cfg(windows)]
 
+use std::ffi::{OsStr, OsString};
+use std::io;
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Output};
 use uuid::Uuid;
 
-fn sandbox_command(state_dir: &Path) -> Command {
+struct ProvisionedSandboxCommand {
+    command: Command,
+}
+
+fn sandbox_command(state_dir: &Path) -> ProvisionedSandboxCommand {
     let mut command = Command::new(env!("CARGO_BIN_EXE_opentopia-sandbox"));
     command.env("OPENTOPIA_SANDBOX_STATE_DIR", state_dir);
-    command
+    ProvisionedSandboxCommand { command }
+}
+
+impl ProvisionedSandboxCommand {
+    fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.command.env(key, value);
+        self
+    }
+
+    fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command.args(args);
+        self
+    }
+
+    fn output(&mut self) -> io::Result<Output> {
+        if let Some(prepared) = self.provision()? {
+            if !prepared.status.success() {
+                return Ok(prepared);
+            }
+        }
+        self.command.output()
+    }
+
+    fn status(&mut self) -> io::Result<ExitStatus> {
+        self.output().map(|output| output.status)
+    }
+
+    fn provision(&self) -> io::Result<Option<Output>> {
+        let mut args = self
+            .command
+            .get_args()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        if args.first().and_then(|arg| arg.to_str()) != Some("run") {
+            return Ok(None);
+        }
+        let target = args
+            .iter()
+            .position(|arg| arg == OsStr::new("--"))
+            .unwrap_or(args.len());
+        args.truncate(target);
+        args[0] = OsString::from("provision");
+
+        let mut provision = Command::new(self.command.get_program());
+        provision.args(args);
+        for (key, value) in self.command.get_envs() {
+            match value {
+                Some(value) => {
+                    provision.env(key, value);
+                }
+                None => {
+                    provision.env_remove(key);
+                }
+            }
+        }
+        Ok(Some(provision.output()?))
+    }
 }
 
 #[test]

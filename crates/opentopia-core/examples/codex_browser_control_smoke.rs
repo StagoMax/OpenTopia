@@ -2,8 +2,8 @@ use anyhow::Context;
 use opentopia_core::{
     AgentCore, AgentEventPayload, AgentProfile, AgentTurnInput, BrowserObserveOptions,
     BrowserRuntime, BrowserRuntimeConfig, BrowserSessionId, CodexAppServerProvider,
-    LocalBrowserRuntime, MessagePart, PermissionMode, ProviderKind, ProviderSettings, SessionStore,
-    SqliteSessionStore, ToolRegistry,
+    LocalBrowserRuntime, MessagePart, PermissionMode, ProviderKind, ProviderModelSettings,
+    ProviderSettings, SessionStore, SqliteSessionStore, ToolRegistry,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,7 +57,13 @@ async fn main() -> anyhow::Result<()> {
     let result = async {
         let mut settings = ProviderSettings::default();
         settings.kind = ProviderKind::CodexAppServer;
-        settings.supports_vision = true;
+        settings.model_settings.insert(
+            settings.model.clone(),
+            ProviderModelSettings {
+                supports_vision: Some(true),
+                ..ProviderModelSettings::default()
+            },
+        );
         let provider = Arc::new(
             CodexAppServerProvider::from_settings(&settings)
                 .context("Codex App Server provider is not configured")?,

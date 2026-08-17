@@ -34,9 +34,8 @@ pub enum ApprovalsReviewer {
 impl PermissionMode {
     pub fn approval_policy(self) -> ApprovalPolicy {
         match self {
-            Self::Chat | Self::ReadOnly | Self::Auto | Self::Approve | Self::FullAccess => {
-                ApprovalPolicy::OnRequest
-            }
+            Self::Auto | Self::Approve => ApprovalPolicy::OnRequest,
+            Self::Chat | Self::ReadOnly | Self::FullAccess => ApprovalPolicy::Never,
         }
     }
 
@@ -378,9 +377,7 @@ fn resolve_intent_path(workspace_root: &Path, path: &Path) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct BasicPolicyEngine {
     workspace_root: PathBuf,
-    readable_roots: Vec<PathBuf>,
     writable_roots: Vec<PathBuf>,
-    approved_read_paths: Vec<PathBuf>,
     approved_write_paths: Vec<PathBuf>,
     unrestricted_file_access: bool,
     mode: PermissionMode,
@@ -429,13 +426,10 @@ impl BasicPolicyEngine {
         config: PolicyConfig,
         sandbox_config: &LocalSandboxConfig,
     ) -> Self {
-        let readable_roots = sandbox_config.configured_readable_roots(&workspace_root);
         let writable_roots = sandbox_config.configured_writable_roots(&workspace_root);
         Self {
             workspace_root,
-            readable_roots,
             writable_roots,
-            approved_read_paths: sandbox_config.approved_read_paths.clone(),
             approved_write_paths: sandbox_config.approved_write_paths.clone(),
             unrestricted_file_access: mode == PermissionMode::FullAccess
                 || sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess,
@@ -592,17 +586,21 @@ impl PolicyEngine for BasicPolicyEngine {
             };
         }
 
-        if self.unrestricted_file_access
-            || self.inside_roots(path, &self.readable_roots)
-            || self.inside_approved_scope(path, &self.approved_read_paths)
-            || self.inside_approved_scope(path, &self.approved_write_paths)
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
         {
-            PolicyDecision::Allow
-        } else {
-            PolicyDecision::Ask {
-                reason: format!("Reading outside authorized roots: {}", path.display()),
-            }
+            return PolicyDecision::Deny {
+                reason: format!("Read path cannot contain '..': {}", path.display()),
+            };
         }
+
+        // Like Codex's read-only and workspace-write sandboxes, ordinary host
+        // reads are not an approval boundary. The execution grant still
+        // projects only declared paths into platforms such as the Windows
+        // dedicated-user sandbox, while write authority remains root- or
+        // approval-scoped below.
+        PolicyDecision::Allow
     }
 
     fn inspect_write(&self, path: &Path) -> PolicyDecision {
@@ -815,12 +813,103 @@ mod tests {
         );
         assert_eq!(
             PermissionMode::FullAccess.approval_policy(),
-            ApprovalPolicy::OnRequest
+            ApprovalPolicy::Never
         );
         assert_eq!(
             PermissionMode::FullAccess.approvals_reviewer(),
             ApprovalsReviewer::User
         );
+        assert_eq!(
+            PermissionMode::ReadOnly.approval_policy(),
+            ApprovalPolicy::Never
+        );
+        assert_eq!(
+            PermissionMode::Chat.approval_policy(),
+            ApprovalPolicy::Never
+        );
+    }
+
+    #[test]
+    fn permission_modes_apply_codex_style_read_write_and_command_boundaries() {
+        let id = Uuid::new_v4();
+        let workspace = std::env::temp_dir().join(format!("opentopia-mode-workspace-{id}"));
+        let outside = std::env::temp_dir().join(format!("opentopia-mode-outside-{id}"));
+        std::fs::create_dir_all(&workspace).expect("create mode workspace");
+        std::fs::create_dir_all(&outside).expect("create mode outside root");
+        let external_file = outside.join("input.txt");
+
+        for mode in [
+            PermissionMode::ReadOnly,
+            PermissionMode::Auto,
+            PermissionMode::Approve,
+            PermissionMode::FullAccess,
+        ] {
+            let policy = BasicPolicyEngine::new(workspace.clone(), mode);
+            assert!(matches!(
+                policy.inspect_execution_intent(
+                    &ToolExecutionIntent::observation([external_file.clone()]),
+                    &workspace,
+                ),
+                PolicyDecision::Allow
+            ));
+            assert!(matches!(
+                policy.inspect_command("Get-Content -LiteralPath 'C:\\Temp\\input.txt'"),
+                PolicyDecision::Allow
+            ));
+        }
+
+        let read_only = BasicPolicyEngine::new(workspace.clone(), PermissionMode::ReadOnly);
+        assert!(matches!(
+            read_only.inspect_execution_intent(
+                &ToolExecutionIntent::workspace_mutation([external_file.clone()]),
+                &workspace,
+            ),
+            PolicyDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            read_only.inspect_command("Set-Content -LiteralPath output.txt -Value changed"),
+            PolicyDecision::Deny { .. }
+        ));
+
+        for mode in [PermissionMode::Auto, PermissionMode::Approve] {
+            let policy = BasicPolicyEngine::new(workspace.clone(), mode);
+            assert!(matches!(
+                policy.inspect_execution_intent(
+                    &ToolExecutionIntent::workspace_mutation([external_file.clone()]),
+                    &workspace,
+                ),
+                PolicyDecision::Ask { .. }
+            ));
+            assert!(matches!(
+                policy.inspect_command("curl https://example.test/status"),
+                PolicyDecision::Ask { .. }
+            ));
+        }
+
+        let full_access = BasicPolicyEngine::new(workspace.clone(), PermissionMode::FullAccess);
+        assert!(matches!(
+            full_access.inspect_execution_intent(
+                &ToolExecutionIntent::workspace_mutation([external_file]),
+                &workspace,
+            ),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            full_access.inspect_command("curl https://example.test/status"),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            full_access.inspect_command("Remove-Item -Recurse -LiteralPath build"),
+            PolicyDecision::Ask { .. }
+        ));
+
+        let chat = BasicPolicyEngine::new(workspace.clone(), PermissionMode::Chat);
+        assert!(matches!(
+            chat.inspect_read(&outside),
+            PolicyDecision::Deny { .. }
+        ));
+        std::fs::remove_dir_all(workspace).expect("remove mode workspace");
+        std::fs::remove_dir_all(outside).expect("remove mode outside root");
     }
 
     #[test]
@@ -1118,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_capability_roots_control_read_and_write_access() {
+    fn configured_capability_roots_control_write_but_not_read_access() {
         let id = Uuid::new_v4();
         let workspace = std::env::temp_dir().join(format!("opentopia-policy-workspace-{id}"));
         let readable = std::env::temp_dir().join(format!("opentopia-policy-readable-{id}"));
@@ -1154,7 +1243,7 @@ mod tests {
         ));
         assert!(matches!(
             policy.inspect_read(&outside.join("unconfigured.txt")),
-            PolicyDecision::Ask { .. }
+            PolicyDecision::Allow
         ));
         assert!(matches!(
             policy.inspect_write(&outside.join("unconfigured.txt")),
@@ -1167,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn approved_file_paths_do_not_authorize_siblings() {
+    fn approved_write_paths_do_not_authorize_sibling_writes() {
         let id = Uuid::new_v4();
         let workspace = std::env::temp_dir().join(format!("opentopia-policy-lease-workspace-{id}"));
         let outside = std::env::temp_dir().join(format!("opentopia-policy-lease-outside-{id}"));
@@ -1196,7 +1285,7 @@ mod tests {
         ));
         assert!(matches!(
             policy.inspect_read(&outside.join("sibling.txt")),
-            PolicyDecision::Ask { .. }
+            PolicyDecision::Allow
         ));
         assert!(matches!(
             policy.inspect_write(&outside.join("sibling.txt")),

@@ -323,7 +323,7 @@ pub struct FlowTrialV1 {
 #[serde(rename_all = "snake_case")]
 pub enum HarnessNodeTargetV1 {
     AgentCore,
-    SubagentScheduler,
+    AgentRunScheduler,
     SkillRuntime,
     ToolRegistry,
     RuntimeCondition,
@@ -338,7 +338,7 @@ impl HarnessNodeTargetV1 {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AgentCore => "agent_core",
-            Self::SubagentScheduler => "subagent_scheduler",
+            Self::AgentRunScheduler => "agent_run_scheduler",
             Self::SkillRuntime => "skill_runtime",
             Self::ToolRegistry => "tool_registry",
             Self::RuntimeCondition => "runtime_condition",
@@ -860,7 +860,7 @@ pub fn compile_flow(
             let target = match node.kind {
                 GraphNodeKindV1::Agent => {
                     if node.config.get("delegate").and_then(Value::as_bool) == Some(true) {
-                        HarnessNodeTargetV1::SubagentScheduler
+                        HarnessNodeTargetV1::AgentRunScheduler
                     } else {
                         HarnessNodeTargetV1::AgentCore
                     }

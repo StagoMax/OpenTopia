@@ -7,6 +7,7 @@ use super::{
     CreateCollaborationSession, EnqueueAgentMessage, FollowupAgentTurn, RuntimeSnapshotId,
     SpawnAgentThread,
 };
+use crate::model::{AgentEvent, AgentEventPayload};
 use crate::store::SqliteSessionStore;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -29,6 +30,7 @@ impl SqliteCollaborationRepository {
                     "agent_threads",
                     "agent_turns",
                     "agent_mailbox_messages",
+                    "agent_events",
                 ] {
                     let exists: bool = connection.query_row(
                         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -41,6 +43,675 @@ impl SqliteCollaborationRepository {
             })
             .map_err(registry_persistence)?;
         Ok(Self { store })
+    }
+
+    pub fn find_session_by_user_task_id(
+        &self,
+        user_task_id: Uuid,
+    ) -> Result<Option<CollaborationSessionRecord>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_read(|connection| {
+                let id = connection
+                    .query_row(
+                        "SELECT id FROM agent_sessions WHERE user_task_id = ?1",
+                        params![user_task_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                id.map(|id| {
+                    read_session(
+                        connection,
+                        CollaborationSessionId::from_uuid(Uuid::parse_str(&id)?),
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("CollaborationSession was not found"))
+                })
+                .transpose()
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn find_turn(
+        &self,
+        turn_id: AgentTurnId,
+    ) -> Result<Option<AgentTurnRecord>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_read(|connection| read_turn(connection, turn_id))
+            .map_err(registry_persistence)
+    }
+
+    pub fn list_recoverable_turns(&self) -> Result<Vec<AgentTurnRecord>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_read(|connection| {
+                let mut statement = connection.prepare(
+                    r#"
+                    SELECT id, session_id, agent_thread_id, requested_by_agent_thread_id,
+                           requested_by_turn_id, sequence, task_message, status, invocation_id,
+                           outcome_ref, created_at, started_at, completed_at
+                    FROM agent_turns
+                    WHERE status IN ('queued', 'running')
+                    ORDER BY created_at
+                    "#,
+                )?;
+                let rows = statement.query_map([], raw_turn)?;
+                let mut turns = Vec::new();
+                for row in rows {
+                    turns.push(turn_from_raw(row?)?);
+                }
+                Ok(turns)
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn create_root_followup_turn(
+        &self,
+        session_id: CollaborationSessionId,
+        turn_id: AgentTurnId,
+        task_message: &str,
+    ) -> Result<(AgentThreadRecord, AgentTurnRecord), CollaborationDomainError> {
+        let task_message = task_message.trim();
+        if task_message.is_empty() {
+            return Err(CollaborationDomainError::EmptyTaskMessage);
+        }
+        self.store
+            .with_collaboration_write(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let root = read_thread_by_path(&transaction, session_id, &AgentPath::root())?
+                    .ok_or_else(|| anyhow::anyhow!("root AgentThread was not found"))?;
+                let latest = read_latest_turn(&transaction, root.id)?
+                    .ok_or_else(|| anyhow::anyhow!("root AgentTurn was not found"))?;
+                if !latest.status.is_terminal() {
+                    return Err(anyhow::anyhow!(
+                        CollaborationDomainError::AgentTurnAlreadyActive(root.id)
+                    ));
+                }
+                let turn = AgentTurnRecord {
+                    id: turn_id,
+                    session_id,
+                    agent_thread_id: root.id,
+                    requested_by_agent_thread_id: Some(root.id),
+                    requested_by_turn_id: Some(latest.id),
+                    sequence: latest.sequence + 1,
+                    task_message: task_message.to_string(),
+                    status: AgentTurnStatus::Queued,
+                    invocation_id: 1,
+                    outcome_ref: None,
+                    created_at: Utc::now(),
+                    started_at: None,
+                    completed_at: None,
+                };
+                insert_turn(&transaction, &turn)?;
+                transaction.commit()?;
+                Ok((root, turn))
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn resume_turn(
+        &self,
+        turn_id: AgentTurnId,
+    ) -> Result<AgentTurnRecord, CollaborationDomainError> {
+        self.store
+            .with_collaboration_write(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut turn = read_turn(&transaction, turn_id)?
+                    .ok_or_else(|| anyhow::anyhow!("AgentTurn was not found"))?;
+                anyhow::ensure!(
+                    turn.status.needs_attention(),
+                    "AgentTurn is not waiting for a resumable interaction"
+                );
+                turn.transition(AgentTurnStatus::Running, Utc::now())?;
+                turn.invocation_id = turn.invocation_id.saturating_add(1);
+                transaction.execute(
+                    r#"
+                    UPDATE agent_turns
+                    SET status = 'running', invocation_id = ?2, completed_at = NULL
+                    WHERE id = ?1
+                    "#,
+                    params![turn.id.to_string(), i64::try_from(turn.invocation_id)?],
+                )?;
+                transaction.commit()?;
+                Ok(turn)
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn append_activity_event(
+        &self,
+        session_id: CollaborationSessionId,
+        agent_thread_id: AgentThreadId,
+        agent_turn_id: AgentTurnId,
+        invocation_id: u64,
+        payload: AgentEventPayload,
+        causation_id: Option<Uuid>,
+    ) -> Result<AgentEvent, CollaborationDomainError> {
+        self.append_activity_events(
+            session_id,
+            agent_thread_id,
+            agent_turn_id,
+            invocation_id,
+            vec![payload],
+            causation_id,
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            registry_persistence(anyhow::anyhow!("single-event append returned no event"))
+        })
+    }
+
+    pub fn append_activity_events(
+        &self,
+        session_id: CollaborationSessionId,
+        agent_thread_id: AgentThreadId,
+        agent_turn_id: AgentTurnId,
+        invocation_id: u64,
+        payloads: Vec<AgentEventPayload>,
+        causation_id: Option<Uuid>,
+    ) -> Result<Vec<AgentEvent>, CollaborationDomainError> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.store
+            .with_collaboration_write(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let thread = read_thread(&transaction, agent_thread_id)?
+                    .ok_or_else(|| anyhow::anyhow!("AgentThread was not found"))?;
+                let turn = read_turn(&transaction, agent_turn_id)?
+                    .ok_or_else(|| anyhow::anyhow!("AgentTurn was not found"))?;
+                anyhow::ensure!(
+                    thread.session_id == session_id
+                        && turn.session_id == session_id
+                        && turn.agent_thread_id == agent_thread_id,
+                    "activity event identity does not belong to one Agent Turn"
+                );
+                let first_event_seq: i64 = transaction.query_row(
+                    "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM agent_events WHERE session_id = ?1",
+                    params![session_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let mut events = Vec::with_capacity(payloads.len());
+                for (offset, payload) in payloads.into_iter().enumerate() {
+                    let event = AgentEvent {
+                        id: Uuid::new_v4(),
+                        thread_id: agent_thread_id.as_uuid(),
+                        turn_id: Some(agent_turn_id.as_uuid()),
+                        seq: first_event_seq + i64::try_from(offset)?,
+                        created_at: Utc::now(),
+                        payload,
+                    };
+                    transaction.execute(
+                        r#"
+                        INSERT INTO agent_events (
+                            id, session_id, event_seq, agent_thread_id, agent_turn_id,
+                            invocation_id, event_kind, payload_json, causation_id, created_at
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                        "#,
+                        params![
+                            event.id.to_string(),
+                            session_id.to_string(),
+                            event.seq,
+                            agent_thread_id.to_string(),
+                            agent_turn_id.to_string(),
+                            i64::try_from(invocation_id.max(1))?,
+                            event.kind(),
+                            serde_json::to_string(&event.payload)?,
+                            causation_id.map(|id| id.to_string()),
+                            event.created_at.to_rfc3339(),
+                        ],
+                    )?;
+                    events.push(event);
+                }
+                transaction.commit()?;
+                Ok(events)
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn list_activity_events(
+        &self,
+        agent_thread_id: AgentThreadId,
+        agent_turn_id: AgentTurnId,
+        after_cursor: Option<i64>,
+    ) -> Result<Vec<AgentEvent>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_read(|connection| {
+                let mut statement = connection.prepare(
+                    r#"
+                    SELECT id, event_seq, payload_json, created_at
+                    FROM agent_events
+                    WHERE agent_thread_id = ?1 AND agent_turn_id = ?2 AND event_seq > ?3
+                    ORDER BY event_seq
+                    "#,
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        agent_thread_id.to_string(),
+                        agent_turn_id.to_string(),
+                        after_cursor.unwrap_or(0),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )?;
+                let mut events = Vec::new();
+                for row in rows {
+                    let (id, seq, payload, created_at) = row?;
+                    events.push(AgentEvent {
+                        id: Uuid::parse_str(&id)?,
+                        thread_id: agent_thread_id.as_uuid(),
+                        turn_id: Some(agent_turn_id.as_uuid()),
+                        seq,
+                        created_at: parse_time(&created_at)?,
+                        payload: serde_json::from_str(&payload)?,
+                    });
+                }
+                Ok(events)
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn list_session_activity_events(
+        &self,
+        session_id: CollaborationSessionId,
+        after_cursor: Option<i64>,
+    ) -> Result<Vec<AgentEvent>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_read(|connection| {
+                let mut statement = connection.prepare(
+                    r#"
+                    SELECT id, event_seq, agent_thread_id, agent_turn_id,
+                           payload_json, created_at
+                    FROM agent_events
+                    WHERE session_id = ?1 AND event_seq > ?2
+                    ORDER BY event_seq
+                    "#,
+                )?;
+                let rows = statement.query_map(
+                    params![session_id.to_string(), after_cursor.unwrap_or(0)],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                )?;
+                let mut events = Vec::new();
+                for row in rows {
+                    let (id, seq, thread_id, turn_id, payload, created_at) = row?;
+                    events.push(AgentEvent {
+                        id: Uuid::parse_str(&id)?,
+                        thread_id: Uuid::parse_str(&thread_id)?,
+                        turn_id: Some(Uuid::parse_str(&turn_id)?),
+                        seq,
+                        created_at: parse_time(&created_at)?,
+                        payload: serde_json::from_str(&payload)?,
+                    });
+                }
+                Ok(events)
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn append_ledger_item(
+        &self,
+        session_id: CollaborationSessionId,
+        agent_thread_id: AgentThreadId,
+        agent_turn_id: AgentTurnId,
+        item_kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, CollaborationDomainError> {
+        self.store
+            .with_collaboration_write(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let sequence: i64 = transaction.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_ledger_items WHERE agent_thread_id = ?1",
+                    params![agent_thread_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let id = Uuid::new_v4();
+                transaction.execute(
+                    r#"
+                    INSERT INTO agent_ledger_items (
+                        id, session_id, agent_thread_id, agent_turn_id,
+                        sequence, item_kind, payload_json, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#,
+                    params![
+                        id.to_string(),
+                        session_id.to_string(),
+                        agent_thread_id.to_string(),
+                        agent_turn_id.to_string(),
+                        sequence,
+                        item_kind,
+                        serde_json::to_string(payload)?,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok(id)
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn list_ledger_items(
+        &self,
+        agent_thread_id: AgentThreadId,
+        item_kind: &str,
+    ) -> Result<Vec<serde_json::Value>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_read(|connection| {
+                let mut statement = connection.prepare(
+                    r#"
+                    SELECT payload_json FROM agent_ledger_items
+                    WHERE agent_thread_id = ?1 AND item_kind = ?2
+                    ORDER BY sequence
+                    "#,
+                )?;
+                let rows = statement
+                    .query_map(params![agent_thread_id.to_string(), item_kind], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                let mut values = Vec::new();
+                for row in rows {
+                    values.push(serde_json::from_str(&row?)?);
+                }
+                Ok(values)
+            })
+            .map_err(registry_persistence)
+    }
+
+    /// Persists the Turn outcome, its ledger reference, and the parent mailbox
+    /// envelope in one transaction. Waiters can therefore never observe a
+    /// terminal child without its completion fact already being durable.
+    pub fn record_turn_state(
+        &self,
+        turn_id: AgentTurnId,
+        next: AgentTurnStatus,
+        payload: &serde_json::Value,
+    ) -> Result<Option<AgentMailboxMessage>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_write(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut turn = read_turn(&transaction, turn_id)?
+                    .ok_or_else(|| anyhow::anyhow!("AgentTurn was not found"))?;
+                if turn.status != next {
+                    turn.transition(next, Utc::now())?;
+                }
+                let ledger_sequence: i64 = transaction.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_ledger_items WHERE agent_thread_id = ?1",
+                    params![turn.agent_thread_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let outcome_id = turn.outcome_ref.unwrap_or_else(Uuid::new_v4);
+                transaction.execute(
+                    r#"
+                    INSERT INTO agent_ledger_items (
+                        id, session_id, agent_thread_id, agent_turn_id,
+                        sequence, item_kind, payload_json, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, 'turn_outcome', ?6, ?7)
+                    ON CONFLICT(id) DO UPDATE SET
+                        payload_json = excluded.payload_json
+                    "#,
+                    params![
+                        outcome_id.to_string(),
+                        turn.session_id.to_string(),
+                        turn.agent_thread_id.to_string(),
+                        turn.id.to_string(),
+                        ledger_sequence,
+                        serde_json::to_string(payload)?,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+                turn.outcome_ref = Some(outcome_id);
+
+                let agent = read_thread(&transaction, turn.agent_thread_id)?
+                    .ok_or_else(|| anyhow::anyhow!("AgentThread was not found"))?;
+                let mailbox_kind = if next.is_terminal() {
+                    Some(AgentMailboxMessageKind::Completion)
+                } else if next.needs_attention() {
+                    Some(AgentMailboxMessageKind::NeedsAttention)
+                } else {
+                    None
+                };
+                let mut envelope = None;
+                if let (Some(parent), Some(kind)) = (agent.parent_agent_thread_id, mailbox_kind) {
+                    let existing = transaction
+                        .query_row(
+                            r#"
+                            SELECT id, session_id, sequence, from_agent_thread_id,
+                                   to_agent_thread_id, kind, payload_json, causation_id,
+                                   created_at, delivered_at, acknowledged_at
+                            FROM agent_mailbox_messages
+                            WHERE session_id = ?1 AND to_agent_thread_id = ?2
+                              AND kind = ?3 AND causation_id = ?4
+                            "#,
+                            params![
+                                turn.session_id.to_string(),
+                                parent.to_string(),
+                                kind.as_str(),
+                                turn.id.to_string(),
+                            ],
+                            raw_mailbox_message,
+                        )
+                        .optional()?;
+                    envelope = match existing {
+                        Some(existing) => Some(
+                            mailbox_from_raw(existing).map_err(|error| anyhow::anyhow!(error))?,
+                        ),
+                        None => {
+                            let sequence: i64 = transaction.query_row(
+                                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_mailbox_messages WHERE session_id = ?1",
+                                params![turn.session_id.to_string()],
+                                |row| row.get(0),
+                            )?;
+                            let message = AgentMailboxMessage {
+                                id: AgentMailboxMessageId::new(),
+                                session_id: turn.session_id,
+                                sequence: u64::try_from(sequence)?,
+                                from_agent_thread_id: turn.agent_thread_id,
+                                to_agent_thread_id: parent,
+                                kind,
+                                payload: payload.clone(),
+                                causation_id: Some(turn.id.as_uuid()),
+                                created_at: Utc::now(),
+                                delivered_at: None,
+                                acknowledged_at: None,
+                            };
+                            transaction.execute(
+                                r#"
+                                INSERT INTO agent_mailbox_messages (
+                                    id, session_id, sequence, from_agent_thread_id,
+                                    to_agent_thread_id, kind, payload_json, causation_id,
+                                    created_at, delivery_state, delivered_at, acknowledged_at
+                                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', NULL, NULL)
+                                "#,
+                                params![
+                                    message.id.to_string(),
+                                    message.session_id.to_string(),
+                                    i64::try_from(message.sequence)?,
+                                    message.from_agent_thread_id.to_string(),
+                                    message.to_agent_thread_id.to_string(),
+                                    message.kind.as_str(),
+                                    serde_json::to_string(&message.payload)?,
+                                    turn.id.to_string(),
+                                    message.created_at.to_rfc3339(),
+                                ],
+                            )?;
+                            Some(message)
+                        }
+                    };
+                }
+                transaction.execute(
+                    r#"
+                    UPDATE agent_turns
+                    SET status = ?2, outcome_ref = ?3, started_at = ?4, completed_at = ?5
+                    WHERE id = ?1
+                    "#,
+                    params![
+                        turn.id.to_string(),
+                        turn.status.as_str(),
+                        outcome_id.to_string(),
+                        turn.started_at.map(|value| value.to_rfc3339()),
+                        turn.completed_at.map(|value| value.to_rfc3339()),
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok(envelope)
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn put_turn_checkpoint(
+        &self,
+        turn_id: AgentTurnId,
+        wait_kind: &str,
+        continuation: &serde_json::Value,
+    ) -> Result<(), CollaborationDomainError> {
+        if !matches!(wait_kind, "approval" | "user_input" | "external_action") {
+            return Err(CollaborationDomainError::Persistence(format!(
+                "unsupported checkpoint kind `{wait_kind}`"
+            )));
+        }
+        self.store
+            .with_collaboration_write(|connection| {
+                let now = Utc::now().to_rfc3339();
+                connection.execute(
+                    r#"
+                    INSERT INTO agent_turn_checkpoints (
+                        agent_turn_id, wait_kind, continuation_json, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?4)
+                    ON CONFLICT(agent_turn_id) DO UPDATE SET
+                        wait_kind = excluded.wait_kind,
+                        continuation_json = excluded.continuation_json,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![
+                        turn_id.to_string(),
+                        wait_kind,
+                        serde_json::to_string(continuation)?,
+                        now,
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn get_turn_checkpoint(
+        &self,
+        turn_id: AgentTurnId,
+    ) -> Result<Option<(String, serde_json::Value)>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_read(|connection| {
+                connection
+                    .query_row(
+                        "SELECT wait_kind, continuation_json FROM agent_turn_checkpoints WHERE agent_turn_id = ?1",
+                        params![turn_id.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?
+                    .map(|(kind, value)| Ok((kind, serde_json::from_str(&value)?)))
+                    .transpose()
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn delete_turn_checkpoint(
+        &self,
+        turn_id: AgentTurnId,
+    ) -> Result<(), CollaborationDomainError> {
+        self.store
+            .with_collaboration_write(|connection| {
+                connection.execute(
+                    "DELETE FROM agent_turn_checkpoints WHERE agent_turn_id = ?1",
+                    params![turn_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn load_provider_state(
+        &self,
+        agent_thread_id: AgentThreadId,
+        provider_id: &str,
+    ) -> Result<Option<(String, String, serde_json::Value)>, CollaborationDomainError> {
+        self.store
+            .with_collaboration_read(|connection| {
+                connection
+                    .query_row(
+                        r#"
+                        SELECT model, compatibility_hash, state_json
+                        FROM agent_provider_states
+                        WHERE agent_thread_id = ?1 AND provider_id = ?2
+                        "#,
+                        params![agent_thread_id.to_string(), provider_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .map(|(model, hash, state)| Ok((model, hash, serde_json::from_str(&state)?)))
+                    .transpose()
+            })
+            .map_err(registry_persistence)
+    }
+
+    pub fn save_provider_state(
+        &self,
+        agent_thread_id: AgentThreadId,
+        provider_id: &str,
+        model: &str,
+        response_id: &str,
+        compatibility_hash: &str,
+        state: &serde_json::Value,
+    ) -> Result<(), CollaborationDomainError> {
+        self.store
+            .with_collaboration_write(|connection| {
+                connection.execute(
+                    r#"
+                    INSERT INTO agent_provider_states (
+                        agent_thread_id, provider_id, model, response_id,
+                        compatibility_hash, state_json, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ON CONFLICT(agent_thread_id, provider_id) DO UPDATE SET
+                        model = excluded.model,
+                        response_id = excluded.response_id,
+                        compatibility_hash = excluded.compatibility_hash,
+                        state_json = excluded.state_json,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![
+                        agent_thread_id.to_string(),
+                        provider_id,
+                        model,
+                        response_id,
+                        compatibility_hash,
+                        serde_json::to_string(state)?,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(registry_persistence)
     }
 }
 
@@ -100,6 +771,7 @@ struct RawMailboxMessage {
     payload_json: String,
     causation_id: Option<String>,
     created_at: String,
+    delivered_at: Option<String>,
     acknowledged_at: Option<String>,
 }
 
@@ -516,7 +1188,7 @@ impl CollaborationRegistry for SqliteCollaborationRepository {
             archived_at: None,
         };
         let turn = AgentTurnRecord {
-            id: AgentTurnId::new(),
+            id: request.root_turn_id,
             session_id: session.id,
             agent_thread_id: root.id,
             requested_by_agent_thread_id: None,
@@ -895,7 +1567,8 @@ fn raw_mailbox_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMailboxMe
         payload_json: row.get(6)?,
         causation_id: row.get(7)?,
         created_at: row.get(8)?,
-        acknowledged_at: row.get(9)?,
+        delivered_at: row.get(9)?,
+        acknowledged_at: row.get(10)?,
     })
 }
 
@@ -919,6 +1592,10 @@ fn mailbox_from_raw(raw: RawMailboxMessage) -> Result<AgentMailboxMessage, Agent
             .map(|id| parse_uuid(&id).map_err(mailbox_persistence))
             .transpose()?,
         created_at: parse_time(&raw.created_at).map_err(mailbox_persistence)?,
+        delivered_at: raw
+            .delivered_at
+            .map(|value| parse_time(&value).map_err(mailbox_persistence))
+            .transpose()?,
         acknowledged_at: raw
             .acknowledged_at
             .map(|value| parse_time(&value).map_err(mailbox_persistence))
@@ -934,7 +1611,7 @@ fn read_mailbox_message(
         .query_row(
             r#"
             SELECT id, session_id, sequence, from_agent_thread_id, to_agent_thread_id,
-                   kind, payload_json, causation_id, created_at, acknowledged_at
+                   kind, payload_json, causation_id, created_at, delivered_at, acknowledged_at
             FROM agent_mailbox_messages WHERE id = ?1
             "#,
             params![message_id.to_string()],
@@ -968,7 +1645,7 @@ impl AgentMailbox for SqliteCollaborationRepository {
                         .query_row(
                             r#"
                             SELECT id, session_id, sequence, from_agent_thread_id, to_agent_thread_id,
-                                   kind, payload_json, causation_id, created_at, acknowledged_at
+                                   kind, payload_json, causation_id, created_at, delivered_at, acknowledged_at
                             FROM agent_mailbox_messages
                             WHERE session_id = ?1 AND to_agent_thread_id = ?2
                               AND kind = ?3 AND causation_id = ?4
@@ -1001,14 +1678,16 @@ impl AgentMailbox for SqliteCollaborationRepository {
                     payload: request.payload,
                     causation_id: request.causation_id,
                     created_at: Utc::now(),
+                    delivered_at: None,
                     acknowledged_at: None,
                 };
                 transaction.execute(
                     r#"
                     INSERT INTO agent_mailbox_messages (
                         id, session_id, sequence, from_agent_thread_id, to_agent_thread_id,
-                        kind, payload_json, causation_id, created_at, acknowledged_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)
+                        kind, payload_json, causation_id, created_at, delivery_state,
+                        delivered_at, acknowledged_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', NULL, NULL)
                     "#,
                     params![
                         message.id.to_string(),
@@ -1036,11 +1715,13 @@ impl AgentMailbox for SqliteCollaborationRepository {
         limit: usize,
     ) -> Result<Vec<AgentMailboxMessage>, AgentMailboxError> {
         self.store
-            .with_collaboration_read(|connection| {
-                let mut statement = connection.prepare(
+            .with_collaboration_write(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut statement = transaction.prepare(
                     r#"
                     SELECT id, session_id, sequence, from_agent_thread_id, to_agent_thread_id,
-                           kind, payload_json, causation_id, created_at, acknowledged_at
+                           kind, payload_json, causation_id, created_at, delivered_at, acknowledged_at
                     FROM agent_mailbox_messages
                     WHERE session_id = ?1 AND to_agent_thread_id = ?2
                       AND acknowledged_at IS NULL AND sequence > ?3
@@ -1060,6 +1741,24 @@ impl AgentMailbox for SqliteCollaborationRepository {
                 for row in rows {
                     messages.push(mailbox_from_raw(row?).map_err(|error| anyhow::anyhow!(error))?);
                 }
+                drop(statement);
+                let delivered_at = Utc::now();
+                for message in &mut messages {
+                    transaction.execute(
+                        r#"
+                        UPDATE agent_mailbox_messages
+                        SET delivery_state = CASE
+                                WHEN acknowledged_at IS NULL THEN 'delivered'
+                                ELSE 'acknowledged'
+                            END,
+                            delivered_at = COALESCE(delivered_at, ?2)
+                        WHERE id = ?1
+                        "#,
+                        params![message.id.to_string(), delivered_at.to_rfc3339()],
+                    )?;
+                    message.delivered_at.get_or_insert(delivered_at);
+                }
+                transaction.commit()?;
                 Ok(messages)
             })
             .map_err(mailbox_persistence)
@@ -1083,7 +1782,7 @@ impl AgentMailbox for SqliteCollaborationRepository {
                         "mailbox message belongs to another target"
                     );
                     transaction.execute(
-                        "UPDATE agent_mailbox_messages SET acknowledged_at = COALESCE(acknowledged_at, ?2) WHERE id = ?1",
+                        "UPDATE agent_mailbox_messages SET delivery_state = 'acknowledged', delivered_at = COALESCE(delivered_at, ?2), acknowledged_at = COALESCE(acknowledged_at, ?2) WHERE id = ?1",
                         params![message.id.to_string(), Utc::now().to_rfc3339()],
                     )?;
                 }
@@ -1117,6 +1816,7 @@ mod tests {
         let (session, root, root_turn) = repository
             .create_session(CreateCollaborationSession {
                 user_task_id: user_thread.id,
+                root_turn_id: AgentTurnId::new(),
                 root_task_message: "root task".to_string(),
                 root_agent_type: "default".to_string(),
                 root_runtime_snapshot: RuntimeSnapshotSeed::new(
@@ -1133,6 +1833,39 @@ mod tests {
             .await
             .unwrap();
         (store, repository, session, root, root_turn)
+    }
+
+    #[tokio::test]
+    async fn activity_event_batches_receive_contiguous_session_sequences() {
+        let (_store, repository, session, root, root_turn) = fixture().await;
+        let events = repository
+            .append_activity_events(
+                session.id,
+                root.id,
+                root_turn.id,
+                root_turn.invocation_id,
+                vec![
+                    AgentEventPayload::ReasoningDelta {
+                        text: "one".to_string(),
+                    },
+                    AgentEventPayload::ModelDelta {
+                        text: "two".to_string(),
+                    },
+                ],
+                None,
+            )
+            .expect("append activity batch");
+
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let listed = repository
+            .list_activity_events(root.id, root_turn.id, None)
+            .expect("list activity batch");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, events[0].id);
+        assert_eq!(listed[1].id, events[1].id);
     }
 
     #[tokio::test]
@@ -1221,6 +1954,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recoverable_turn_query_distinguishes_queued_work_from_interrupted_runs() {
+        let (_store, repository, _session, root, root_turn) = fixture().await;
+        repository
+            .transition_turn(root_turn.id, AgentTurnStatus::Running)
+            .await
+            .unwrap();
+        let (_child, child_turn) = repository
+            .spawn_agent(SpawnAgentThread {
+                parent_agent_thread_id: root.id,
+                requested_by_turn_id: root_turn.id,
+                task_name: "recoverable".to_string(),
+                agent_type: "worker".to_string(),
+                task_message: "resume after restart".to_string(),
+                runtime_snapshot: RuntimeSnapshotSeed::new(
+                    Some(root.runtime_snapshot_id),
+                    json!({ "agentType": "worker" }),
+                ),
+                spawn_policy: AgentSpawnPolicy::disabled(2),
+            })
+            .await
+            .unwrap();
+
+        let recoverable = repository.list_recoverable_turns().unwrap();
+        assert_eq!(
+            recoverable
+                .iter()
+                .map(|turn| (turn.id, turn.status))
+                .collect::<Vec<_>>(),
+            [
+                (root_turn.id, AgentTurnStatus::Running),
+                (child_turn.id, AgentTurnStatus::Queued)
+            ]
+        );
+
+        repository
+            .record_turn_state(
+                root_turn.id,
+                AgentTurnStatus::Interrupted,
+                &json!({ "reason": "simulated server restart" }),
+            )
+            .unwrap();
+        let recoverable = repository.list_recoverable_turns().unwrap();
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].id, child_turn.id);
+        assert_eq!(recoverable[0].status, AgentTurnStatus::Queued);
+    }
+
+    #[tokio::test]
     async fn sqlite_collaboration_state_survives_store_reopen() {
         let path =
             std::env::temp_dir().join(format!("opentopia-collaboration-{}.sqlite", Uuid::new_v4()));
@@ -1233,6 +2014,7 @@ mod tests {
             let (session, root, root_turn) = repository
                 .create_session(CreateCollaborationSession {
                     user_task_id: user_thread.id,
+                    root_turn_id: AgentTurnId::new(),
                     root_task_message: "root task".to_string(),
                     root_agent_type: "default".to_string(),
                     root_runtime_snapshot: RuntimeSnapshotSeed::new(

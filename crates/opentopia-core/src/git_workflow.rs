@@ -246,7 +246,7 @@ pub enum WorktreeTarget {
 /// Builds the mechanical Git request used to prepare an isolated child-agent
 /// worktree. Choosing whether work is independent enough to isolate remains a
 /// parent-agent decision; this helper only provides a validated execution plan.
-pub fn isolated_subagent_worktree_request(
+pub fn isolated_agent_worktree_request(
     repository: PathBuf,
     path: PathBuf,
     branch: String,
@@ -270,7 +270,7 @@ pub fn isolated_subagent_worktree_request(
 /// Builds a merge-base comparison for a completed isolated child. The parent
 /// consumes this diff and decides how to integrate it; children never merge one
 /// another's worktrees.
-pub fn isolated_subagent_compare_request(
+pub fn isolated_agent_compare_request(
     repository: PathBuf,
     base_commit: String,
     child_head: String,
@@ -1651,8 +1651,8 @@ mod tests {
     }
 
     #[test]
-    fn isolated_subagent_helpers_prepare_worktree_and_parent_comparison() {
-        let setup = isolated_subagent_worktree_request(
+    fn isolated_agent_helpers_prepare_worktree_and_parent_comparison() {
+        let setup = isolated_agent_worktree_request(
             PathBuf::from("C:/repo"),
             PathBuf::from("C:/worktrees/child"),
             "codex/child".to_string(),
@@ -1673,7 +1673,7 @@ mod tests {
             ])
         );
 
-        let compare = isolated_subagent_compare_request(
+        let compare = isolated_agent_compare_request(
             PathBuf::from("C:/repo"),
             "abc123".to_string(),
             "def456".to_string(),

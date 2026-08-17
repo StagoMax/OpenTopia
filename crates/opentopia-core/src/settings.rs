@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Legacy provider preset identity. New runtime code resolves transport,
 /// authentication, and adapter independently; this enum remains serialized for
@@ -719,10 +720,6 @@ pub struct ProviderSettings {
     pub responses_compaction_threshold_tokens: Option<u32>,
     #[serde(default)]
     pub rollout_budget: Option<RolloutBudgetSettings>,
-    /// Whether the selected model accepts image inputs. This is the only
-    /// capability users need to declare; transport support is probed at use.
-    #[serde(default = "default_provider_supports_vision")]
-    pub supports_vision: bool,
     /// Last explicit compatibility probe for an OpenAI-compatible `/v1`
     /// connection. The endpoint and model are included so stale results are
     /// ignored after either setting changes.
@@ -765,7 +762,6 @@ impl Default for ProviderSettings {
             prompt_cache_policy: None,
             responses_compaction_threshold_tokens: None,
             rollout_budget: None,
-            supports_vision: default_provider_supports_vision(),
             openai_compatibility: None,
             api_key_source: "OPENTOPIA_API_KEY".to_string(),
             api_key_configured: false,
@@ -1132,9 +1128,9 @@ impl ProviderSettings {
             .filter(|tokens| *tokens >= MIN_PROVIDER_CONTEXT_WINDOW_TOKENS)
     }
 
-    /// Resolves image-input support for the selected model. Legacy connections
-    /// fall back to the connection-wide setting until their catalog supplies
-    /// model-level metadata or the user creates an explicit override.
+    /// Resolves image-input support for the selected model. Explicit model
+    /// settings win over catalog metadata, which wins over the checked-in
+    /// model registry. Models absent from every source fail closed.
     pub fn supports_vision_for_model(&self) -> bool {
         self.current_model_settings()
             .and_then(|settings| settings.supports_vision)
@@ -1143,7 +1139,8 @@ impl ProviderSettings {
                     .get(self.model.trim())
                     .and_then(|capabilities| capabilities.supports_vision)
             })
-            .unwrap_or(self.supports_vision)
+            .or_else(|| known_model_supports_vision(&self.model))
+            .unwrap_or(false)
     }
 
     pub fn temperature_for_model(&self) -> Option<f64> {
@@ -1277,273 +1274,56 @@ impl ProviderSettings {
 /// Unmatched models deliberately return `None` so the caller applies its
 /// conservative default instead of guessing high and overflowing the context.
 pub fn known_model_context_window_tokens(model: &str) -> Option<usize> {
-    model_bases(model)
-        .iter()
-        .find_map(|base| context_window_for_base(base))
+    model_bases(model).iter().find_map(|base| {
+        known_model_capability_registry()
+            .models
+            .get(base)
+            .map(|capabilities| capabilities.context_window_tokens)
+    })
 }
 
-fn context_window_for_base(model: &str) -> Option<usize> {
-    // Snapshot from https://openrouter.ai/api/v1/models, verified 2026-08-02.
-    // Direct-provider aliases not currently present in that catalog are marked
-    // below. This is deliberately an exact-ID table: a model-family prefix is
-    // not a reliable context window contract.
-    const WINDOWS: &[(&str, usize)] = &[
-        // OpenAI (official docs and OpenRouter catalog)
-        ("gpt-3.5-turbo", 16_385),
-        ("gpt-3.5-turbo-0613", 4_095),
-        ("gpt-3.5-turbo-16k", 16_385),
-        ("gpt-3.5-turbo-instruct", 4_095),
-        ("gpt-4", 8_191),
-        ("gpt-4.1", 1_047_576),
-        ("gpt-4.1-mini", 1_047_576),
-        ("gpt-4.1-nano", 1_047_576),
-        ("gpt-4o", 128_000),
-        ("gpt-4o-2024-05-13", 128_000),
-        ("gpt-4o-2024-08-06", 128_000),
-        ("gpt-4o-2024-11-20", 128_000),
-        ("gpt-4o-mini", 128_000),
-        ("gpt-4o-mini-2024-07-18", 128_000),
-        ("gpt-4-turbo", 128_000),
-        ("gpt-4-turbo-preview", 128_000),
-        ("gpt-5", 400_000),
-        ("gpt-5-mini", 400_000),
-        ("gpt-5-nano", 400_000),
-        ("gpt-5-pro", 400_000),
-        ("gpt-5.1", 400_000),
-        ("gpt-5.1-codex", 400_000),
-        ("gpt-5.1-codex-max", 400_000),
-        ("gpt-5.1-codex-mini", 400_000),
-        ("gpt-5.2", 400_000),
-        ("gpt-5.2-chat", 128_000),
-        ("gpt-5.2-codex", 400_000),
-        ("gpt-5.2-pro", 400_000),
-        ("gpt-5.3-chat", 128_000),
-        ("gpt-5.3-codex", 400_000),
-        ("gpt-5.4", 1_050_000),
-        ("gpt-5.4-image-2", 272_000),
-        ("gpt-5.4-mini", 400_000),
-        ("gpt-5.4-nano", 400_000),
-        ("gpt-5.4-pro", 1_050_000),
-        ("gpt-5.5", 1_050_000),
-        ("gpt-5.5-pro", 1_050_000),
-        ("gpt-5.6", 1_050_000), // Direct-provider alias for GPT-5.6 Sol.
-        ("gpt-5.6-luna", 1_050_000),
-        ("gpt-5.6-luna-pro", 1_050_000),
-        ("gpt-5.6-sol", 1_050_000),
-        ("gpt-5.6-sol-pro", 1_050_000),
-        ("gpt-5.6-terra", 1_050_000),
-        ("gpt-5.6-terra-pro", 1_050_000),
-        ("gpt-5-image", 400_000),
-        ("gpt-5-image-mini", 400_000),
-        ("gpt-audio", 128_000),
-        ("gpt-audio-mini", 128_000),
-        ("gpt-chat-latest", 400_000),
-        ("gpt-oss-120b", 131_072),
-        ("gpt-oss-20b", 131_072),
-        ("gpt-oss-safeguard-20b", 131_072),
-        ("o1", 200_000),
-        ("o1-pro", 200_000),
-        ("o3", 200_000),
-        ("o3-mini", 200_000),
-        ("o3-mini-high", 200_000),
-        ("o3-pro", 200_000),
-        ("o4-mini", 200_000),
-        ("o4-mini-high", 200_000),
-        // Anthropic
-        ("claude-3-haiku", 200_000),
-        ("claude-3-5-haiku", 200_000), // Direct-provider historical ID.
-        ("claude-3-5-sonnet", 200_000), // Direct-provider historical ID.
-        ("claude-3-7-sonnet", 200_000), // Direct-provider historical ID.
-        ("claude-haiku-4.5", 200_000),
-        ("claude-opus-4", 200_000),
-        ("claude-opus-4.1", 200_000),
-        ("claude-opus-4.5", 200_000),
-        ("claude-opus-4-6", 1_000_000), // Direct-provider spelling.
-        ("claude-opus-4.6", 1_000_000),
-        ("claude-opus-4-7", 1_000_000), // Direct-provider spelling.
-        ("claude-opus-4.7", 1_000_000),
-        ("claude-opus-4.7-fast", 1_000_000),
-        ("claude-opus-4-8", 1_000_000), // Direct-provider spelling.
-        ("claude-opus-4.8", 1_000_000),
-        ("claude-opus-4.8-fast", 1_000_000),
-        ("claude-opus-5", 1_000_000),
-        ("claude-opus-5-fast", 1_000_000),
-        ("claude-sonnet-4", 1_000_000),
-        ("claude-sonnet-4-5", 1_000_000), // Direct-provider spelling.
-        ("claude-sonnet-4.5", 1_000_000),
-        ("claude-sonnet-4-6", 1_000_000), // Direct-provider spelling.
-        ("claude-sonnet-4.6", 1_000_000),
-        ("claude-sonnet-5", 1_000_000),
-        ("claude-fable-5", 1_000_000),
-        // Google
-        ("gemini-1.5-flash", 1_000_000), // Direct-provider historical ID.
-        ("gemini-1.5-pro", 1_000_000),   // Direct-provider historical ID.
-        ("gemini-2.0-flash", 1_000_000), // Direct-provider historical ID.
-        ("gemini-2.0-flash-lite", 1_000_000), // Direct-provider historical ID.
-        ("gemini-2.5-flash", 1_048_576),
-        ("gemini-2.5-flash-image", 32_768),
-        ("gemini-2.5-flash-lite", 1_048_576),
-        ("gemini-2.5-pro", 1_048_576),
-        ("gemini-2.5-pro-preview", 1_048_576),
-        ("gemini-2.5-pro-preview-05-06", 1_048_576),
-        ("gemini-3-flash-preview", 1_048_576),
-        ("gemini-3-pro-image", 131_072),
-        ("gemini-3-pro-image-preview", 65_536),
-        ("gemini-3.1-flash-image", 131_072),
-        ("gemini-3.1-flash-image-preview", 65_536),
-        ("gemini-3.1-flash-lite", 1_048_576),
-        ("gemini-3.1-flash-lite-image", 65_536),
-        ("gemini-3.1-flash-lite-preview", 1_048_576),
-        ("gemini-3.1-pro-preview", 1_048_576),
-        ("gemini-3.1-pro-preview-customtools", 1_048_576),
-        ("gemini-3.5-flash", 1_048_576),
-        ("gemini-3.5-flash-lite", 1_048_576),
-        ("gemini-3.6-flash", 1_048_576),
-        ("gemma-2-27b-it", 8_192),
-        ("gemma-3-4b-it", 131_072),
-        ("gemma-3-12b-it", 131_072),
-        ("gemma-3-27b-it", 262_144),
-        ("gemma-3n-e4b-it", 32_768),
-        ("gemma-4-26b-a4b-it", 262_144),
-        ("gemma-4-31b-it", 262_144),
-        // Moonshot / Kimi
-        ("moonshot-v1", 8_000), // Direct-provider base tier.
-        ("moonshot-v1-8k", 8_000),
-        ("moonshot-v1-32k", 32_000),
-        ("moonshot-v1-128k", 128_000),
-        ("k3", 1_000_000),    // Direct-provider alias.
-        ("k3-256k", 256_000), // Direct-provider tier.
-        ("kimi-k2", 131_072),
-        ("kimi-k2-0905", 262_144),
-        ("kimi-k2-thinking", 262_144),
-        ("kimi-k2.5", 262_144),
-        ("kimi-k2.6", 262_144),
-        ("kimi-k2.7-code", 262_144),
-        ("kimi-k3", 1_048_576),
-        ("kimi-k3-256k", 256_000), // Direct-provider tier.
-        // DeepSeek
-        ("deepseek-chat", 163_840),
-        ("deepseek-chat-v3.1", 163_840),
-        ("deepseek-chat-v3-0324", 163_840),
-        ("deepseek-r1", 163_840),
-        ("deepseek-r1-0528", 163_840),
-        ("deepseek-r1-distill-llama-70b", 8_192),
-        ("deepseek-reasoner", 163_840), // Direct-provider alias.
-        ("deepseek-v3.1-terminus", 163_840),
-        ("deepseek-v3.2", 163_840),
-        ("deepseek-v3.2-exp", 163_840),
-        ("deepseek-v4-flash", 1_048_576),
-        ("deepseek-v4-flash-0731", 1_048_576),
-        ("deepseek-v4-pro", 1_048_576),
-        // Qwen / Alibaba
-        ("qwen-2.5-7b-instruct", 32_768),
-        ("qwen-2.5-72b-instruct", 32_768),
-        ("qwen-2.5-coder-32b-instruct", 32_768),
-        ("qwen2.5-vl-72b-instruct", 128_000),
-        ("qwen-plus", 1_000_000),
-        ("qwen-plus-2025-07-28", 1_000_000),
-        ("qwen3-8b", 131_072),
-        ("qwen3-14b", 131_072),
-        ("qwen3-30b-a3b", 131_072),
-        ("qwen3-32b", 131_072),
-        ("qwen3-235b-a22b", 131_072),
-        ("qwen3-235b-a22b-2507", 262_144),
-        ("qwen3-235b-a22b-thinking-2507", 262_144),
-        ("qwen3-30b-a3b-instruct-2507", 262_144),
-        ("qwen3-30b-a3b-thinking-2507", 81_920),
-        ("qwen3-coder", 262_144),
-        ("qwen3-coder-30b-a3b-instruct", 262_144),
-        ("qwen3-coder-flash", 1_000_000),
-        ("qwen3-coder-next", 262_144),
-        ("qwen3-coder-plus", 1_000_000),
-        ("qwen3-max", 262_144),
-        ("qwen3-max-thinking", 262_144),
-        ("qwen3-next-80b-a3b-instruct", 262_144),
-        ("qwen3-next-80b-a3b-thinking", 262_144),
-        ("qwen3-vl-8b-instruct", 262_144),
-        ("qwen3-vl-8b-thinking", 131_072),
-        ("qwen3-vl-32b-instruct", 131_072),
-        ("qwen3-vl-30b-a3b-instruct", 262_144),
-        ("qwen3-vl-30b-a3b-thinking", 262_144),
-        ("qwen3-vl-235b-a22b-instruct", 262_144),
-        ("qwen3-vl-235b-a22b-thinking", 131_072),
-        ("qwen3.5-9b", 262_144),
-        ("qwen3.5-27b", 262_144),
-        ("qwen3.5-35b-a3b", 262_144),
-        ("qwen3.5-122b-a10b", 262_144),
-        ("qwen3.5-397b-a17b", 262_144),
-        ("qwen3.5-flash-02-23", 1_000_000),
-        ("qwen3.5-plus-02-15", 1_000_000),
-        ("qwen3.5-plus-20260420", 1_000_000),
-        ("qwen3.6-27b", 262_144),
-        ("qwen3.6-35b-a3b", 262_144),
-        ("qwen3.6-flash", 1_000_000),
-        ("qwen3.6-max-preview", 262_144),
-        ("qwen3.6-plus", 1_000_000),
-        ("qwen3.7-flash", 1_000_000),
-        ("qwen3.7-max", 1_000_000),
-        ("qwen3.7-plus", 1_000_000),
-        // Z.AI GLM
-        ("glm-4.5", 131_072),
-        ("glm-4.5-air", 131_072),
-        ("glm-4.5v", 65_536),
-        ("glm-4.6", 204_800),
-        ("glm-4.6v", 131_072),
-        ("glm-4.7", 204_800),
-        ("glm-4.7-flash", 202_752),
-        ("glm-5", 204_800),
-        ("glm-5-turbo", 202_752),
-        ("glm-5v-turbo", 202_752),
-        ("glm-5.1", 204_800),
-        ("glm-5.2", 1_048_576),
-        // xAI Grok
-        ("grok-4.20", 2_000_000),
-        ("grok-4.20-multi-agent", 2_000_000),
-        ("grok-4.3", 1_000_000),
-        ("grok-4.5", 500_000),
-        ("grok-build-0.1", 256_000),
-        // Mistral
-        ("codestral-2508", 256_000),
-        ("ministral-3b-2512", 131_072),
-        ("ministral-8b-2512", 262_144),
-        ("ministral-14b-2512", 262_144),
-        ("mistral-large", 128_000),
-        ("mistral-large-2407", 131_072),
-        ("mistral-large-2512", 262_144),
-        ("mistral-medium-3", 131_072),
-        ("mistral-medium-3.1", 131_072),
-        ("mistral-medium-3-5", 262_144),
-        ("mistral-nemo", 131_072),
-        ("mistral-saba", 32_768),
-        ("mistral-small-24b-instruct-2501", 32_768),
-        ("mistral-small-3.1-24b-instruct", 128_000),
-        ("mistral-small-3.2-24b-instruct", 256_000),
-        ("mistral-small-2603", 262_144),
-        ("mixtral-8x22b-instruct", 65_536),
-        ("voxtral-small-24b-2507", 32_000),
-        // Meta Llama
-        ("llama-3.1-8b-instruct", 131_072),
-        ("llama-3.1-70b-instruct", 131_072),
-        ("llama-3.2-1b-instruct", 60_000),
-        ("llama-3.2-3b-instruct", 131_072),
-        ("llama-3.3-70b-instruct", 131_072),
-        ("llama-4-maverick", 1_048_576),
-        ("llama-4-scout", 1_310_720),
-        ("llama-guard-4-12b", 1_048_576),
-        // MiniMax
-        ("minimax-01", 1_000_192),
-        ("minimax-m1", 1_000_000),
-        ("minimax-m2", 204_800),
-        ("minimax-m2.1", 204_800),
-        ("minimax-m2.5", 204_800),
-        ("minimax-m2.7", 204_800),
-        ("minimax-m2-her", 65_536),
-        ("minimax-m3", 1_048_576),
-    ];
+const KNOWN_MODEL_CAPABILITY_REGISTRY_JSON: &str = include_str!("../model-capabilities.json");
 
-    WINDOWS
-        .iter()
-        .find_map(|(id, context_window)| (*id == model).then_some(*context_window))
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnownModelCapabilityRegistry {
+    schema_version: u32,
+    models: BTreeMap<String, KnownModelCapabilities>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnownModelCapabilities {
+    context_window_tokens: usize,
+    supports_vision: bool,
+}
+
+fn known_model_capability_registry() -> &'static KnownModelCapabilityRegistry {
+    static REGISTRY: OnceLock<KnownModelCapabilityRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let registry: KnownModelCapabilityRegistry =
+            serde_json::from_str(KNOWN_MODEL_CAPABILITY_REGISTRY_JSON)
+                .expect("model-capabilities.json must be valid");
+        assert_eq!(
+            registry.schema_version, 1,
+            "unsupported shared model capability registry schema"
+        );
+        registry
+    })
+}
+
+/// Image-input support from the checked-in model registry.
+///
+/// Matching follows the same exact-ID and relay-prefix normalization used for
+/// context windows. A missing entry remains unknown so custom models fail
+/// closed instead of inheriting a family-wide guess.
+pub fn known_model_supports_vision(model: &str) -> Option<bool> {
+    model_bases(model).iter().find_map(|base| {
+        known_model_capability_registry()
+            .models
+            .get(base)
+            .map(|capabilities| capabilities.supports_vision)
+    })
 }
 
 /// Candidate model names after removing the vendor prefixes relays prepend.
@@ -1575,10 +1355,6 @@ fn model_bases(model: &str) -> Vec<String> {
 
 pub const MIN_PROVIDER_CONTEXT_WINDOW_TOKENS: usize = 4_096;
 pub const DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS: usize = 128_000;
-
-fn default_provider_supports_vision() -> bool {
-    true
-}
 
 fn default_parallel_tool_calls() -> bool {
     true
@@ -2211,10 +1987,9 @@ mod tests {
     }
 
     #[test]
-    fn model_vision_settings_override_catalog_detection_and_legacy_default() {
+    fn model_vision_settings_override_catalog_detection_and_unknown_fails_closed() {
         let mut provider = ProviderSettings {
             model: "text-only".to_string(),
-            supports_vision: true,
             ..ProviderSettings::default()
         };
         provider.model_capabilities.insert(
@@ -2235,7 +2010,80 @@ mod tests {
         assert!(provider.supports_vision_for_model());
 
         provider.model = "unknown".to_string();
+        assert!(!provider.supports_vision_for_model());
+    }
+
+    #[test]
+    fn vision_registry_covers_major_vendors_and_normalizes_relay_ids() {
+        for model in [
+            "openai/gpt-5.6-sol:batch",
+            "anthropic/claude-sonnet-4.6",
+            "google/gemini-3.5-flash",
+            "moonshotai/kimi-k2.5",
+            "kimi-for-coding",
+            "qwen/qwen3.7-plus",
+            "z-ai/glm-5v-turbo",
+            "x-ai/grok-4.5",
+            "mistralai/mistral-small-3.2-24b-instruct",
+            "meta-llama/llama-4-scout",
+            "minimax/minimax-m3",
+        ] {
+            assert_eq!(known_model_supports_vision(model), Some(true), "{model}");
+        }
+
+        for model in [
+            "moonshot-v1-128k",
+            "kimi-k2",
+            "deepseek-v4-flash",
+            "qwen3-coder-plus",
+            "glm-5",
+            "minimax-m2.5",
+        ] {
+            assert_eq!(known_model_supports_vision(model), Some(false), "{model}");
+        }
+        assert_eq!(known_model_supports_vision("custom/unknown-vlm"), None);
+    }
+
+    #[test]
+    fn catalog_metadata_outranks_the_vision_registry_and_manual_settings_outrank_both() {
+        let mut provider = ProviderSettings {
+            model: "kimi-k2.5".to_string(),
+            ..ProviderSettings::default()
+        };
         assert!(provider.supports_vision_for_model());
+
+        provider.model_capabilities.insert(
+            "kimi-k2.5".to_string(),
+            ProviderModelCapabilities {
+                supports_vision: Some(false),
+            },
+        );
+        assert!(!provider.supports_vision_for_model());
+
+        provider.model_settings.insert(
+            "kimi-k2.5".to_string(),
+            ProviderModelSettings {
+                supports_vision: Some(true),
+                ..ProviderModelSettings::default()
+            },
+        );
+        assert!(provider.supports_vision_for_model());
+    }
+
+    #[test]
+    fn legacy_connection_vision_default_is_ignored_and_not_reserialized() {
+        let mut value = serde_json::to_value(ProviderSettings::default()).unwrap();
+        value["model"] = serde_json::json!("unknown-model");
+        value["supportsVision"] = serde_json::json!(true);
+
+        let provider = serde_json::from_value::<ProviderSettings>(value)
+            .expect("legacy supportsVision should be ignored");
+
+        assert!(!provider.supports_vision_for_model());
+        assert!(serde_json::to_value(provider)
+            .unwrap()
+            .get("supportsVision")
+            .is_none());
     }
 
     #[test]
@@ -2790,7 +2638,6 @@ mod tests {
         assert!(health.api_key_configured);
         assert!(!health.using_mock);
         assert_eq!(health.status, "local_codex");
-        assert!(provider.supports_vision);
     }
 
     #[test]

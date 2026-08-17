@@ -49,6 +49,7 @@ pub struct AgentMailboxMessage {
     pub payload: Value,
     pub causation_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
     pub acknowledged_at: Option<DateTime<Utc>>,
 }
 
@@ -97,6 +98,19 @@ pub trait AgentMailbox: Send + Sync {
         target: AgentThreadId,
         message_ids: &[AgentMailboxMessageId],
     ) -> Result<(), AgentMailboxError>;
+}
+
+/// Best-effort live delivery after the durable enqueue commits. Missing a
+/// wake-up never loses data because the next invocation re-snapshots mailbox.
+pub trait AgentMailboxNotifier: Send + Sync {
+    fn message_enqueued(&self, message: &AgentMailboxMessage);
+}
+
+#[derive(Debug, Default)]
+pub struct NoopAgentMailboxNotifier;
+
+impl AgentMailboxNotifier for NoopAgentMailboxNotifier {
+    fn message_enqueued(&self, _message: &AgentMailboxMessage) {}
 }
 
 #[derive(Default)]
@@ -165,6 +179,7 @@ impl AgentMailbox for InMemoryAgentMailbox {
             payload: request.payload,
             causation_id: request.causation_id,
             created_at: Utc::now(),
+            delivered_at: None,
             acknowledged_at: None,
         };
         if let Some(causation_id) = message.causation_id {
@@ -189,10 +204,10 @@ impl AgentMailbox for InMemoryAgentMailbox {
         after_sequence: Option<u64>,
         limit: usize,
     ) -> Result<Vec<AgentMailboxMessage>, AgentMailboxError> {
-        let state = self.state.lock().map_err(|_| AgentMailboxError::Poisoned)?;
-        Ok(state
+        let mut state = self.state.lock().map_err(|_| AgentMailboxError::Poisoned)?;
+        let mut messages = state
             .messages
-            .iter()
+            .iter_mut()
             .filter(|message| {
                 message.session_id == session_id
                     && message.to_agent_thread_id == target
@@ -200,8 +215,13 @@ impl AgentMailbox for InMemoryAgentMailbox {
                     && after_sequence.is_none_or(|sequence| message.sequence > sequence)
             })
             .take(limit.clamp(1, 256))
-            .cloned()
-            .collect())
+            .map(|message| {
+                message.delivered_at.get_or_insert_with(Utc::now);
+                message.clone()
+            })
+            .collect::<Vec<_>>();
+        messages.sort_by_key(|message| message.sequence);
+        Ok(messages)
     }
 
     async fn acknowledge(

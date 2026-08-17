@@ -1,3 +1,4 @@
+use crate::enterprise::DataClassification;
 use crate::flow::{
     simulate_flow, validate_flow_spec, FlowDraftStatusV1, FlowDraftV1, FlowSourceV1, FlowSpecV1,
 };
@@ -5,7 +6,10 @@ use crate::flow_runtime::{
     prepare_flow_resume, resolve_flow_approval, spawn_flow_run, FlowRunStatusV1, FlowRunV1,
 };
 use crate::model::{ExperienceMode, ToolCall, ToolResult, TurnStatus};
-use crate::tools::{Tool, ToolExecutionPolicy, ToolInvocationContext, ToolSideEffect};
+use crate::tools::{
+    RegisteredTool, Tool, ToolApprovalMode, ToolClass, ToolExecutionPolicy, ToolGovernance,
+    ToolInvocationContext, ToolRiskLevel, ToolSideEffect,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
@@ -29,7 +33,7 @@ enum FlowToolAction {
     Cancel,
 }
 
-pub fn flow_tools() -> Vec<(String, Arc<dyn Tool>)> {
+pub(crate) fn flow_tool_registrations() -> Vec<RegisteredTool> {
     [
         FlowToolAction::Search,
         FlowToolAction::Create,
@@ -46,10 +50,48 @@ pub fn flow_tools() -> Vec<(String, Arc<dyn Tool>)> {
     ]
     .into_iter()
     .map(|action| {
+        let governance = action.governance();
         let tool = FlowTool { action };
-        (tool.name().to_string(), Arc::new(tool) as Arc<dyn Tool>)
+        RegisteredTool::core(Arc::new(tool), ToolClass::Flow, governance)
     })
     .collect()
+}
+
+impl FlowToolAction {
+    fn governance(self) -> ToolGovernance {
+        match self {
+            Self::Search | Self::Inspect => ToolGovernance::new(
+                ToolRiskLevel::Low,
+                ToolSideEffect::None,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Restricted,
+            ),
+            Self::Validate | Self::Simulate => ToolGovernance::new(
+                ToolRiskLevel::Medium,
+                ToolSideEffect::SessionMutation,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Confidential,
+            ),
+            Self::Create
+            | Self::Update
+            | Self::Publish
+            | Self::Run
+            | Self::Pause
+            | Self::Resume
+            | Self::Cancel => ToolGovernance::new(
+                ToolRiskLevel::Medium,
+                ToolSideEffect::ControlPlane,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Confidential,
+            ),
+            Self::Status => ToolGovernance::new(
+                ToolRiskLevel::Low,
+                ToolSideEffect::None,
+                ToolApprovalMode::Never,
+                DataClassification::Confidential,
+            ),
+        }
+    }
 }
 
 struct FlowTool {
@@ -238,7 +280,7 @@ impl Tool for FlowTool {
             FlowToolAction::Update => "Replace a FlowDraft specification using optimistic revision control after reviewing validation issues or user feedback.",
             FlowToolAction::Inspect => "Inspect a FlowDraft with its validation and simulation history, or inspect an immutable published Flow version.",
             FlowToolAction::Validate => "Statically validate graph topology, schemas, references, capability boundaries, risk gates, budgets, and bounded termination without calling another model.",
-            FlowToolAction::Simulate => "Compile and dry-run a valid FlowDraft against the existing Agent Harness, showing which AgentCore, SubagentScheduler, SkillRuntime, ToolRegistry, and runtime-control primitives each node will use. No business side effects are executed.",
+            FlowToolAction::Simulate => "Compile and dry-run a valid FlowDraft against the existing Agent Harness, showing which AgentCore, AgentRunScheduler, SkillRuntime, ToolRegistry, and runtime-control primitives each node will use. No business side effects are executed.",
             FlowToolAction::Publish => "Publish an immutable Flow version after current-revision validation and simulation pass. High-risk Flows require an independent approver.",
             FlowToolAction::Run => "Start an immutable published Flow in the durable Flow Runtime. The runtime schedules graph dependencies and control nodes, while Agent, Skill, and Tool nodes execute through the currently restricted Agent Harness.",
             FlowToolAction::Status => "Inspect one durable Flow run or list recent runs for the current Flow session, including node attempts, outputs, budgets, and pending control state.",

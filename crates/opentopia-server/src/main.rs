@@ -1,64 +1,64 @@
 use anyhow::Context;
-use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post, put};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use futures_util::stream::{self, StreamExt};
+use opentopia_core::collaboration::{
+    AgentActivitySource, AgentAvailability, AgentCollaborationInvocation, AgentInvocationIdentity,
+    AgentListItem, AgentMailboxNotifier, AgentRunCommand, AgentRunResumeSignal, AgentRunScheduler,
+    AgentSpawnPolicy, AgentThreadId, AgentThreadRecord, AgentTurnId,
+    AgentTurnRecord as CollaborationTurnRecord, AgentTurnStatus, CollaborationRegistry,
+    CollaborationSessionPolicy, CreateCollaborationSession, RuntimeSnapshotSeed,
+};
+#[cfg(test)]
+use opentopia_core::collaboration::{SqliteAgentActivitySource, SqliteCollaborationRepository};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::AgentResumeSignal;
 use opentopia_core::{
-    agent_model_context_with_runtime, browser_handoff_for_node, bundled_plugins_path,
-    configured_provider_from_settings, content_fingerprint, discover_plugins, discover_skills,
-    ensure_bundled_plugins_installed, execute_git_workflow, experience_mode_module, install_plugin,
-    isolated_subagent_worktree_request, load_context_source_metadata, load_plugin_mcp_servers,
+    agent_model_context_with_runtime, browser_handoff_for_node, configured_provider_from_settings,
+    content_fingerprint, discover_plugins, discover_skills, execute_git_workflow,
+    experience_mode_module, install_plugin, load_context_source_metadata, load_plugin_mcp_servers,
     load_selected_skills, negotiate_provider_settings, permission_policy_module,
     redact_model_observation, remove_windows_sandbox, resolve_instruction_documents,
     setup_windows_sandbox, tool_result_is_error, uninstall_plugin, windows_sandbox_setup_status,
     world_state_catalog_item, AgentContextBudget, AgentContinuation, AgentContinuationState,
     AgentCore, AgentEvent, AgentEventPayload, AgentInstanceStatusV1, AgentInstanceV1,
-    AgentProfileRegistry, AgentRuntimeSettings, AgentTemplateVersionV1, AgentTurnDriver,
-    AgentTurnInput, AgentTurnOutcome, AppSettings, Approval, ApprovalStatus, Artifact,
-    ArtifactMetadata, BackgroundProcessRegistry, BasicPolicyEngine, BrowserAction,
-    BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
-    BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
-    BrowserRuntime, BrowserRuntimeConfig, BrowserRuntimeRoute, BrowserRuntimeRouter,
-    BrowserSelector, BrowserSessionId, BrowserSessionSpec, BrowserTargetRef, BrowserWaitCondition,
-    BrowserWaitRequest, BufferedTurnInbox, CanonicalModelRequest, ChangedFile,
-    ChromeExtensionBrowserRuntime, ChromeExtensionBrowserRuntimeConfig, CodexAccountManager,
-    CodexAccountStatus, CodexLoginStart, CollaborationMode, CompiledModelContext, ComputerRuntime,
-    ComputerRuntimeConfig, ComputerSessionId, ContextAssembler, ContextAssemblyInput,
+    AgentProfileRegistry, AgentRuntimeSettings, AgentTemplateVersionV1, AgentTurnInput,
+    AgentTurnOutcome, AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
+    BasicPolicyEngine, BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
+    BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
+    BrowserObserveOptions, BrowserOutput, BrowserRuntimeRoute, BrowserSelector, BrowserSessionId,
+    BrowserSessionSpec, BrowserTargetRef, BrowserWaitCondition, BrowserWaitRequest,
+    CanonicalModelRequest, ChangedFile, CodexAccountStatus, CodexLoginStart, CollaborationMode,
+    CompiledModelContext, ComputerSessionId, ContextAssembler, ContextAssemblyInput,
     ContextCacheScope, ContextCheckpoint, ContextCheckpointArtifact, ContextCheckpointCommand,
     ContextCheckpointCoverage, ContextCheckpointFact, ContextCheckpointInteraction,
     ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
     ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextItemKind,
     ContextProjection, ContextRole, ContextSensitivity, ContextSourcePolicy, ContextSourceRef,
-    ContextSummary, ContributionKind, DefaultContextAssembler, DesktopBrowserRuntime,
-    ExecutionContext, ExperienceMode, ExperienceSurfaceProfile, GitWorkflowAction,
-    GitWorkflowRequest, GoalRecord, GoalSnapshot, GoalStatus, LoadedSkill, LocalBrowserRuntime,
-    LocalComputerRuntime, LocalExecutionEnvironment, LocalSandboxConfig, McpCallResult,
-    McpServerConfig, McpServerStatus, McpToolDescriptor, MediaHandlerSelection, Message,
-    MessagePart, MessageRole, ModelCallPurpose, ModelContentPart, ModelContextItem,
-    ModelConversationMessage, ModelConversationRole, ModelGateway, ModelStreamDelta,
-    ObserveOptions, PermissionMode, PluginControlScope, PluginDescriptor, PluginError,
-    PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange,
-    PreviewRangeRequest, PreviewTarget, PreviewWorkbook, PromptCacheBreakpointPolicy,
-    ProviderAdapterKind, ProviderAuthKind, ProviderConversationCursor, ProviderConversationState,
-    ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck,
-    ProviderKind, ProviderModelGateway, ProviderSettings, ProviderToolCall, ProviderToolResult,
+    ContextSummary, ContributionKind, DefaultContextAssembler, ExecutionContext, ExperienceMode,
+    ExperienceSurfaceProfile, GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalSnapshot,
+    GoalStatus, LoadedSkill, LocalExecutionEnvironment, McpCallResult, McpServerConfig,
+    McpServerStatus, McpToolDescriptor, MediaHandlerSelection, Message, MessagePart, MessageRole,
+    ModelCallPurpose, ModelContentPart, ModelContextItem, ModelConversationMessage,
+    ModelConversationRole, ModelGateway, ModelStreamDelta, ObserveOptions, PermissionMode,
+    PluginControlScope, PluginDescriptor, PluginError, PolicyDecision, PolicyEngine,
+    PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest, PreviewTarget,
+    PreviewWorkbook, PromptCacheBreakpointPolicy, ProviderAdapterKind, ProviderAuthKind,
+    ProviderConversationCursor, ProviderConversationState, ProviderDriverDescriptor,
+    ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck, ProviderKind,
+    ProviderModelGateway, ProviderSettings, ProviderToolCall, ProviderToolResult,
     ProviderTransportEvent, ProviderTransportKind, ResolvedPreview, ResourceLimit, RuntimeSurface,
-    SandboxDescriptor, SandboxMode, SandboxSettings, SessionStore, SkillDescriptor, SkillRef,
-    SpawnSubagentRequest, SqliteSessionStore, StoreError, SubagentExecutionContract,
-    SubagentExecutor, SubagentObserver, SubagentRun, SubagentScheduler, SubagentSchedulerConfig,
-    SubagentScope, SubagentWorkspaceMode, TerminalCommandHistory, TerminalCommandStatus,
+    SandboxDescriptor, SandboxSettings, SessionStore, SkillDescriptor, SkillRef,
+    SqliteSessionStore, StoreError, TerminalCommandHistory, TerminalCommandStatus,
     ThreadContextSnapshot, ThreadMcpServer, ThreadModelSelection, Tool, ToolCall,
     ToolInvocationContext, ToolPermissionDescriptor, ToolResult, ToolStateStore, TurnChangeSet,
-    TurnChangeSetStatus, TurnContextSnapshot, TurnInbox, TurnInboxItem, TurnRecord, TurnStatus,
+    TurnChangeSetStatus, TurnContextSnapshot, TurnInboxItem, TurnRecord, TurnStatus,
     UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
     WindowsSandboxSetupStatus, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope,
     WorkspaceEntry, WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceSearchTool, WorkspaceTree,
@@ -68,38 +68,43 @@ use opentopia_core::{
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod agent_factory;
+mod agent_runs;
 mod agent_templates_api;
+mod agent_turn_coordinator;
+mod app_state;
 mod auth;
+mod bootstrap;
 mod contributions_api;
 mod flows_api;
 mod library_api;
 mod plugins_api;
+mod routes;
 mod scm_api;
 mod turn_changes;
 mod turns;
 
-use auth::{ApiAuth, TURN_ID_HEADER};
-use turn_changes::{TurnChangeManager, TurnFileDiffPreview, TurnUndoPreview, TurnUndoResult};
-use turns::{TurnCancelResult, TurnHandle, TurnManager};
+use agent_turn_coordinator::{drive_agent_turn, resume_agent_turn};
+use app_state::AppState;
+use auth::TURN_ID_HEADER;
+use turn_changes::{TurnFileDiffPreview, TurnUndoPreview, TurnUndoResult};
+use turns::{TurnCancelResult, TurnHandle};
 
 #[derive(Debug, Parser)]
 #[command(name = "opentopia-server")]
@@ -110,6 +115,12 @@ struct Args {
     port: u16,
     #[arg(long, env = "OPENTOPIA_DB", default_value = ".opentopia/opentopia.db")]
     db: PathBuf,
+    /// Create a compact verified database copy and exit. The source is never replaced.
+    #[arg(long)]
+    compact_db_output: Option<PathBuf>,
+    /// ZIP archive for raw trace rows rewritten during compaction.
+    #[arg(long, requires = "compact_db_output")]
+    compact_trace_archive: Option<PathBuf>,
     #[arg(long, env = "OPENTOPIA_PERMISSION", default_value = "auto")]
     permission: PermissionMode,
 }
@@ -123,172 +134,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args = Args::parse();
-    let auth = ApiAuth::from_env()?;
-    for outcome in ensure_bundled_plugins_installed(&bundled_plugins_path())? {
-        info!(
-            plugin = %outcome.name,
-            version = %outcome.version,
-            status = ?outcome.status,
-            path = %outcome.path.display(),
-            "bundled plugin package ready"
-        );
-    }
-    let store = Arc::new(SqliteSessionStore::open(&args.db)?);
-    plugins_api::ensure_default_bundled_plugin_permissions(&store)?;
-    let indeterminate_effects = store.mark_running_effects_indeterminate()?;
-    if indeterminate_effects > 0 {
-        warn!(
-            indeterminate_effects,
-            "marked in-flight effects indeterminate for reconciliation"
-        );
-    }
-    let interrupted_turns = store.interrupt_active_turns()?;
-    if interrupted_turns > 0 {
-        info!(interrupted_turns, "recovered interrupted agent turns");
-    }
-    let interrupted_subagents = store.fail_interrupted_subagent_runs()?;
-    if interrupted_subagents > 0 {
-        info!(interrupted_subagents, "recovered interrupted subagent runs");
-    }
-    let loaded_settings = store.load_settings(args.permission)?;
-    let settings = Arc::new(RwLock::new(loaded_settings.clone()));
-    let mcp_settings = settings.clone();
-    let mcp_host = McpExtensionHost::with_execution_environment_factory(move |config| {
-        let workspace_root = config
-            .cwd
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let sandbox_config = mcp_settings
-            .read()
-            .expect("settings lock poisoned")
-            .sandbox
-            .to_local_sandbox_config();
-        Arc::new(LocalExecutionEnvironment::with_sandbox_config(
-            workspace_root,
-            sandbox_config,
-        ))
-    })
-    .with_tool_catalog_store(store.clone());
-    match mcp_host.warm_tool_cache().await {
-        Ok(0) => {}
-        Ok(tools) => info!(tools, "restored persisted MCP tool schema cache"),
-        Err(err) => warn!(?err, "failed to restore persisted MCP tool schema cache"),
-    }
-    restore_enabled_mcp_servers(store.clone(), mcp_host.clone());
-    let browser = initialize_browser_runtime().await;
-    let browser_runtime: Arc<dyn BrowserRuntime> = browser.clone();
-    let computer: Arc<dyn ComputerRuntime> =
-        Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default()));
-    // One registry for the whole process: a command left running in one turn has to
-    // still be readable in the next one, and rebuilding the agent must not orphan it.
-    let background = BackgroundProcessRegistry::default();
-    let turn_inbox: Arc<dyn TurnInbox> = Arc::new(BufferedTurnInbox::default());
-    let turn_changes = TurnChangeManager::new(store.clone());
-    let mut initial_agent =
-        AgentCore::from_settings(&loaded_settings).with_turn_inbox(turn_inbox.clone());
-    initial_agent.set_browser_runtime(browser_runtime.clone());
-    initial_agent.set_computer_runtime(computer.clone());
-    initial_agent.set_background_processes(background.clone());
-    initial_agent.set_file_mutation_observer(Arc::new(turn_changes.clone()));
-    apply_process_tool_policy(&mut initial_agent);
-    let agent = Arc::new(RwLock::new(initial_agent));
-    let subagents = SubagentScheduler::new(
-        SubagentSchedulerConfig::default(),
-        Arc::new(ServerSubagentExecutor {
-            store: store.clone(),
-            agent: agent.clone(),
-            settings: settings.clone(),
-            mcp_host: mcp_host.clone(),
-        }),
-        Arc::new(StoreSubagentObserver {
-            store: store.clone(),
-        }),
-    );
-    for run in store.list_all_subagent_runs()? {
-        if let Err(error) = subagents.restore(run.clone()) {
-            warn!(run_id = %run.id, ?error, "failed to restore persisted agent identity");
-        }
-    }
-    agent
-        .write()
-        .expect("agent lock poisoned")
-        .set_subagent_scheduler(subagents.clone());
-    let (turn_queue, mut queued_threads) = mpsc::unbounded_channel();
-    let state = AppState {
-        store: store.clone(),
-        agent,
-        settings,
-        codex_account: Arc::new(CodexAccountManager::default()),
-        events: EventBus::default(),
-        terminals: TerminalBus::default(),
-        ptys: PtyManager::default(),
-        browser: browser_runtime,
-        browser_router: browser,
-        computer,
-        mcp_host,
-        auth,
-        turns: TurnManager::new(store.clone()),
-        turn_changes,
-        turn_queue,
-        turn_inbox,
-        subagents,
-        background,
-        app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
-        library_providers: Arc::new(library_api::LibraryProviderRegistry::from_env()?),
-    };
-
-    let queue_state = state.clone();
-    tokio::spawn(async move {
-        while let Some(thread_id) = queued_threads.recv().await {
-            launch_next_queued_turn(&queue_state, thread_id);
-        }
-    });
-    for thread in store.list_threads_including_archived(true)? {
-        if !store.list_queued_turn_messages(thread.id)?.is_empty() {
-            let _ = state.turn_queue.send(thread.id);
-        }
-    }
-
-    let event_state = state.clone();
-    let mut subagent_events = state.subagents.subscribe();
-    tokio::spawn(async move {
-        while let Some(event) =
-            recv_broadcast_after_lag(&mut subagent_events, "subagent events").await
-        {
-            publish_payload(
-                &event_state,
-                event.run.parent_thread_id,
-                Some(event.run.parent_turn_id),
-                AgentEventPayload::SubagentUpdated { run: event.run },
-            );
-        }
-    });
-
-    let app = build_router(state);
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-    let listener = TcpListener::bind(addr).await?;
-    info!(%addr, db = %args.db.display(), "OpenTopia server listening");
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-fn restore_enabled_mcp_servers(store: Arc<SqliteSessionStore>, host: McpExtensionHost) {
-    tokio::spawn(async move {
-        let servers = match store.list_mcp_servers() {
-            Ok(servers) => servers,
-            Err(err) => {
-                error!(?err, "failed to restore MCP server configuration");
-                return;
-            }
-        };
-        for server in servers.into_iter().filter(|server| server.enabled) {
-            let server_id = server.server_id;
-            if let Err(err) = host.ensure_server(server).await {
-                warn!(?err, %server_id, "failed to restore MCP server");
-            }
-        }
-    });
+    bootstrap::run(Args::parse()).await
 }
 
 async fn ensure_mcp_server_status(
@@ -304,717 +150,7 @@ async fn ensure_mcp_server_status(
     }
 }
 
-async fn recv_broadcast_after_lag<T: Clone>(
-    receiver: &mut broadcast::Receiver<T>,
-    stream_name: &'static str,
-) -> Option<T> {
-    loop {
-        match receiver.recv().await {
-            Ok(value) => return Some(value),
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(
-                    stream_name,
-                    skipped, "broadcast receiver lagged; continuing"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => return None,
-        }
-    }
-}
-
-async fn initialize_browser_runtime() -> Arc<BrowserRuntimeRouter> {
-    let broker_url = std::env::var("OPENTOPIA_DESKTOP_BROWSER_BROKER_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let broker_token = std::env::var("OPENTOPIA_DESKTOP_BROWSER_BROKER_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-
-    match (broker_url, broker_token) {
-        (Some(url), Some(token)) => match DesktopBrowserRuntime::new(&url, &token) {
-            Ok(runtime) => match runtime.health_check().await {
-                Ok(()) => {
-                    info!("using the Electron desktop browser broker");
-                    let managed: Arc<dyn BrowserRuntime> = Arc::new(runtime);
-                    return Arc::new(BrowserRuntimeRouter::new(
-                        managed,
-                        initialize_chrome_browser_runtime().await,
-                    ));
-                }
-                Err(error) => {
-                    warn!(%error, "desktop browser broker health check failed; using local browser runtime");
-                }
-            },
-            Err(error) => {
-                warn!(%error, "desktop browser broker configuration is invalid; using local browser runtime");
-            }
-        },
-        (None, None) => {
-            info!("desktop browser broker is not configured; using local browser runtime");
-        }
-        _ => {
-            warn!(
-                "desktop browser broker requires both URL and token; using local browser runtime"
-            );
-        }
-    }
-
-    let mut config = BrowserRuntimeConfig::default();
-    if let Some(data_root) =
-        std::env::var_os("OPENTOPIA_BROWSER_DATA_ROOT").filter(|value| !value.is_empty())
-    {
-        config.data_root = PathBuf::from(data_root);
-        info!(path = %config.data_root.display(), "using configured local browser data root");
-    }
-    Arc::new(BrowserRuntimeRouter::new(
-        Arc::new(LocalBrowserRuntime::new(config)),
-        initialize_chrome_browser_runtime().await,
-    ))
-}
-
-async fn initialize_chrome_browser_runtime() -> Option<Arc<dyn BrowserRuntime>> {
-    let url = std::env::var("OPENTOPIA_CHROME_BRIDGE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let token = std::env::var("OPENTOPIA_CHROME_BRIDGE_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let (Some(url), Some(token)) = (url, token) else {
-        info!("Chrome extension bridge is not configured");
-        return None;
-    };
-    let runtime = match ChromeExtensionBrowserRuntime::new(ChromeExtensionBrowserRuntimeConfig {
-        bridge_url: url,
-        bridge_token: token,
-        browser: BrowserRuntimeConfig::default(),
-    }) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            warn!(%error, "Chrome extension browser configuration is invalid");
-            return None;
-        }
-    };
-    match runtime.health_check().await {
-        Ok(()) => {
-            info!("Chrome extension browser bridge is available");
-            Some(Arc::new(runtime))
-        }
-        Err(error) => {
-            warn!(%error, "Chrome extension browser bridge health check failed");
-            None
-        }
-    }
-}
-
-/// Applies a process-wide tool allowlist supplied by the trusted launcher. The
-/// allowlist is never accepted from a chat request.
-fn apply_process_tool_policy(agent: &mut AgentCore) {
-    let Some(raw) = std::env::var("OPENTOPIA_TOOL_ALLOWLIST")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return;
-    };
-    let tools = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|tool| !tool.is_empty())
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
-    if tools.is_empty() {
-        warn!(
-            "OPENTOPIA_TOOL_ALLOWLIST did not contain any tool names; ignoring process tool policy"
-        );
-        return;
-    }
-    info!(tools = ?tools, "restricting agent tools for this process");
-    agent.restrict_to_tools(tools);
-}
-
-fn build_router(state: AppState) -> Router {
-    let cors = state.auth.cors_layer();
-    let auth_state = state.clone();
-    Router::new()
-        .merge(agent_templates_api::router())
-        .merge(contributions_api::router())
-        .merge(flows_api::router())
-        .merge(library_api::router())
-        .merge(plugins_api::router())
-        .merge(scm_api::router())
-        .route("/health", get(health))
-        .route("/api/settings", get(get_settings).patch(update_settings))
-        .route(
-            "/api/sandbox/windows/setup",
-            get(get_windows_sandbox_setup)
-                .post(configure_windows_sandbox)
-                .delete(remove_windows_sandbox_configuration),
-        )
-        .route("/api/skills", get(list_skills))
-        .route("/api/plugins", get(list_plugins))
-        .route("/api/plugins/install", post(install_local_plugin))
-        .route("/api/plugins/uninstall", post(uninstall_local_plugin))
-        .route("/api/threads/:thread_id/plugins", put(set_thread_plugin))
-        .route("/api/provider/drivers", get(list_provider_drivers))
-        .route("/api/provider/health", get(provider_health))
-        .route("/api/provider/test", post(test_provider_connection))
-        .route("/api/codex/account", get(get_codex_account))
-        .route("/api/codex/account/login", post(start_codex_login))
-        .route("/api/codex/account/login/cancel", post(cancel_codex_login))
-        .route("/api/codex/account/logout", post(logout_codex_account))
-        .route(
-            "/api/provider/:provider_id/models/sync",
-            post(sync_provider_models),
-        )
-        .route("/api/threads/:thread_id/model", put(set_thread_model))
-        .route("/api/threads", get(list_threads).post(create_thread))
-        .route("/api/threads/:thread_id/title", post(generate_thread_title))
-        .route(
-            "/api/threads/:thread_id",
-            patch(update_thread).delete(delete_thread),
-        )
-        .route("/api/projects", get(list_projects).post(create_project))
-        .route(
-            "/api/projects/:project_id",
-            patch(update_project).delete(delete_project),
-        )
-        .route(
-            "/api/threads/:thread_id/messages",
-            get(list_messages)
-                .post(send_message)
-                .layer(DefaultBodyLimit::max(MAX_INLINE_IMAGE_BYTES * 5)),
-        )
-        .route("/api/threads/:thread_id/events", get(list_events))
-        .route("/api/threads/:thread_id/events/stream", get(stream_events))
-        .route("/api/threads/:thread_id/goal", get(get_thread_goal))
-        .route("/api/threads/:thread_id/goal/:goal_id", patch(update_goal))
-        .route("/api/threads/:thread_id/turn", get(get_turn_status))
-        .route(
-            "/api/threads/:thread_id/turns/:turn_id/changes",
-            get(get_turn_changes),
-        )
-        .route(
-            "/api/threads/:thread_id/turns/:turn_id/changes/preview",
-            get(get_turn_file_diff_preview),
-        )
-        .route(
-            "/api/threads/:thread_id/turns/:turn_id/undo/preview",
-            post(preview_turn_undo),
-        )
-        .route(
-            "/api/threads/:thread_id/turns/:turn_id/undo",
-            post(undo_turn_changes),
-        )
-        .route(
-            "/api/threads/:thread_id/subagents",
-            get(list_subagent_runs).post(spawn_subagent_run),
-        )
-        .route(
-            "/api/threads/:thread_id/subagents/:run_id/input",
-            post(send_subagent_input),
-        )
-        .route(
-            "/api/threads/:thread_id/subagents/:run_id/cancel",
-            post(cancel_subagent_run),
-        )
-        .route(
-            "/api/threads/:thread_id/subagents/:run_id/wait",
-            post(wait_subagent_run),
-        )
-        .route(
-            "/api/threads/:thread_id/turn/cancel",
-            post(cancel_agent_turn),
-        )
-        .route(
-            "/api/threads/:thread_id/terminal/commands",
-            post(start_terminal_command),
-        )
-        .route(
-            "/api/threads/:thread_id/terminal/cancel",
-            post(cancel_terminal_command),
-        )
-        .route(
-            "/api/threads/:thread_id/terminal/history",
-            get(list_terminal_history),
-        )
-        .route(
-            "/api/threads/:thread_id/terminal/stream",
-            get(stream_terminal_events),
-        )
-        .route(
-            "/api/threads/:thread_id/terminal/session",
-            get(get_terminal_session).post(ensure_terminal_session),
-        )
-        .route(
-            "/api/threads/:thread_id/terminal/session/input",
-            post(write_terminal_session),
-        )
-        .route(
-            "/api/threads/:thread_id/terminal/session/resize",
-            post(resize_terminal_session),
-        )
-        .route(
-            "/api/threads/:thread_id/terminal/session/close",
-            post(close_terminal_session),
-        )
-        .route(
-            "/api/threads/:thread_id/workspace/tree",
-            get(list_workspace_tree),
-        )
-        .route(
-            "/api/threads/:thread_id/workspace/file",
-            get(read_workspace_file),
-        )
-        .route(
-            "/api/threads/:thread_id/workspace/search",
-            post(search_workspace),
-        )
-        .route(
-            "/api/threads/:thread_id/workspace/diff",
-            get(get_workspace_diff),
-        )
-        .route(
-            "/api/threads/:thread_id/workspace/diff/revert",
-            post(revert_workspace_file),
-        )
-        .route(
-            "/api/threads/:thread_id/workspace/diff/hunk",
-            post(apply_workspace_diff_hunk),
-        )
-        .route("/api/threads/:thread_id/sandbox", get(get_sandbox))
-        .route("/api/threads/:thread_id/browser", post(run_browser_command))
-        .route(
-            "/api/threads/:thread_id/browser/runtime",
-            get(get_browser_runtime).post(bind_browser_runtime),
-        )
-        .route(
-            "/api/threads/:thread_id/computer/windows",
-            get(list_computer_windows),
-        )
-        .route(
-            "/api/threads/:thread_id/computer/observe",
-            post(observe_computer_window),
-        )
-        .route(
-            "/api/threads/:thread_id/computer/session",
-            post(close_computer_session),
-        )
-        .route("/api/threads/:thread_id/git", post(run_git_workflow))
-        .route("/api/threads/:thread_id/context", get(get_context_status))
-        .route(
-            "/api/threads/:thread_id/context/compact",
-            post(compact_context),
-        )
-        .route("/api/threads/:thread_id/trajectory", get(export_trajectory))
-        .route("/api/threads/:thread_id/artifacts", get(list_artifacts))
-        .route(
-            "/api/threads/:thread_id/artifacts/:artifact_id",
-            get(get_artifact),
-        )
-        .route(
-            "/api/threads/:thread_id/previews/resolve",
-            post(resolve_preview),
-        )
-        .route(
-            "/api/threads/:thread_id/previews/:preview_id/content",
-            get(read_preview_content),
-        )
-        .route(
-            "/api/threads/:thread_id/previews/:preview_id/workbook",
-            get(get_preview_workbook),
-        )
-        .route(
-            "/api/threads/:thread_id/previews/:preview_id/range",
-            get(read_preview_range),
-        )
-        .route("/api/threads/:thread_id/approvals", get(list_approvals))
-        .route(
-            "/api/threads/:thread_id/approvals/:approval_id/decision",
-            post(decide_approval),
-        )
-        .route(
-            "/api/threads/:thread_id/user-input",
-            get(list_user_input_requests),
-        )
-        .route(
-            "/api/threads/:thread_id/user-input/:request_id/response",
-            post(respond_to_user_input),
-        )
-        .route(
-            "/api/threads/:thread_id/turns/:turn_id/external-action/resume",
-            post(resume_external_action),
-        )
-        .route(
-            "/api/mcp/servers",
-            get(list_mcp_servers).post(create_mcp_server),
-        )
-        .route(
-            "/api/mcp/servers/:server_id",
-            patch(update_mcp_server).delete(delete_mcp_server),
-        )
-        .route(
-            "/api/mcp/servers/:server_id/restart",
-            post(restart_mcp_server),
-        )
-        .route("/api/mcp/servers/:server_id/tools", get(list_mcp_tools))
-        .route("/api/mcp/servers/:server_id/call-tool", post(call_mcp_tool))
-        .route("/api/threads/:thread_id/mcp", get(list_thread_mcp_servers))
-        .route(
-            "/api/threads/:thread_id/mcp/:server_id",
-            put(set_thread_mcp_server),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            auth_state,
-            auth::authorize,
-        ))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
-}
-
-#[derive(Clone)]
-struct AppState {
-    store: Arc<SqliteSessionStore>,
-    agent: Arc<RwLock<AgentCore>>,
-    settings: Arc<RwLock<AppSettings>>,
-    codex_account: Arc<CodexAccountManager>,
-    events: EventBus,
-    terminals: TerminalBus,
-    ptys: PtyManager,
-    browser: Arc<dyn BrowserRuntime>,
-    browser_router: Arc<BrowserRuntimeRouter>,
-    computer: Arc<dyn ComputerRuntime>,
-    mcp_host: McpExtensionHost,
-    auth: ApiAuth,
-    turns: TurnManager,
-    turn_changes: TurnChangeManager,
-    turn_queue: mpsc::UnboundedSender<Uuid>,
-    turn_inbox: Arc<dyn TurnInbox>,
-    subagents: SubagentScheduler,
-    background: BackgroundProcessRegistry,
-    app_views: Arc<Mutex<opentopia_core::AppViewHost>>,
-    library_providers: Arc<library_api::LibraryProviderRegistry>,
-}
-
-struct StoreSubagentObserver {
-    store: Arc<SqliteSessionStore>,
-}
-
-impl SubagentObserver for StoreSubagentObserver {
-    fn on_update(&self, run: &SubagentRun) {
-        if let Err(error) = self.store.upsert_subagent_run(run) {
-            error!(?error, run_id = %run.id, "failed to persist subagent run");
-        }
-    }
-}
-
-struct ServerSubagentExecutor {
-    store: Arc<SqliteSessionStore>,
-    agent: Arc<RwLock<AgentCore>>,
-    settings: Arc<RwLock<AppSettings>>,
-    mcp_host: McpExtensionHost,
-}
-
-impl ServerSubagentExecutor {
-    async fn prepare_workspace(
-        &self,
-        thread_root: &FsPath,
-        contract: &SubagentExecutionContract,
-    ) -> anyhow::Result<PathBuf> {
-        let requested_root = contract
-            .workspace
-            .root
-            .clone()
-            .unwrap_or_else(|| thread_root.to_path_buf());
-        let isolated_root = thread_root.join(".opentopia").join("worktrees");
-        let contains_parent_component = requested_root
-            .components()
-            .any(|component| component == std::path::Component::ParentDir);
-        if contains_parent_component
-            || (requested_root != thread_root && !requested_root.starts_with(&isolated_root))
-        {
-            anyhow::bail!(
-                "subagent workspace root is outside the thread isolation area: {}",
-                requested_root.display()
-            );
-        }
-        if contract.workspace.mode != SubagentWorkspaceMode::IsolatedWorktree {
-            return Ok(requested_root);
-        }
-
-        let branch = contract
-            .workspace
-            .branch
-            .clone()
-            .context("isolated subagent is missing its branch")?;
-        let base_commit = contract
-            .workspace
-            .base_commit
-            .clone()
-            .context("isolated subagent is missing its base commit")?;
-        if requested_root.join(".git").exists() {
-            return Ok(requested_root);
-        }
-        if let Some(parent) = requested_root.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create subagent worktree parent {}",
-                    parent.display()
-                )
-            })?;
-        }
-        let request = isolated_subagent_worktree_request(
-            thread_root.to_path_buf(),
-            requested_root.clone(),
-            branch,
-            base_commit,
-        )?;
-        let environment = LocalExecutionEnvironment::with_sandbox_config(
-            thread_root.to_path_buf(),
-            // The model-facing spawn tool already passed policy inspection and
-            // this control-plane command is fully constructed from validated
-            // refs plus a path confined under .opentopia/worktrees.
-            LocalSandboxConfig::danger_full_access(),
-        );
-        execute_git_workflow(
-            &environment,
-            &request,
-            ExecutionContext::with_timeout(Duration::from_secs(120)),
-        )
-        .await
-        .context("failed to prepare isolated subagent worktree")?;
-        Ok(requested_root)
-    }
-}
-
-#[async_trait]
-impl SubagentExecutor for ServerSubagentExecutor {
-    async fn execute(
-        &self,
-        run: SubagentRun,
-        input: mpsc::UnboundedReceiver<String>,
-        cancellation: tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<String> {
-        let contract = run.execution_contract.clone();
-        self.execute_with_contract(run, contract, input, cancellation)
-            .await
-    }
-
-    async fn execute_with_contract(
-        &self,
-        run: SubagentRun,
-        contract: SubagentExecutionContract,
-        mut input: mpsc::UnboundedReceiver<String>,
-        cancellation: tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<String> {
-        let thread = self
-            .store
-            .get_thread(run.parent_thread_id)?
-            .ok_or_else(|| anyhow::anyhow!("parent thread no longer exists"))?;
-        let workspace_root = self
-            .prepare_workspace(&thread.workspace_root, &contract)
-            .await?;
-        let registry = load_agent_profiles_for_thread(&self.store, &thread)?;
-        for warning in registry.warnings() {
-            warn!(agent_path = %run.agent_path, warning, "agent profile warning");
-        }
-        let mut profile = registry
-            .get(&run.agent_type)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown agent_type `{}`", run.agent_type))?;
-        if contract.require_structured_delivery {
-            let workspace = &contract.workspace;
-            profile.developer_instructions.push_str(&format!(
-                "\n\n[Subagent delivery contract]\nWork only in the assigned isolated worktree '{}'. Do not merge into the parent workspace and do not commit unless the delegated task explicitly authorizes a commit. The parent agent owns semantic integration. Your final response must be only one JSON object matching SubagentDeliverable: kind ('research', 'code_change', or 'review'), summary, findings, changedFiles, verification, integration, and remainingRisks. For code_change set integration.worktreeRoot='{}', branch='{}', baseCommit='{}', and headCommit to the current HEAD (it may equal baseCommit when changes are intentionally uncommitted).",
-                workspace_root.display(),
-                workspace_root.display(),
-                workspace.branch.as_deref().unwrap_or_default(),
-                workspace.base_commit.as_deref().unwrap_or_default(),
-            ));
-        }
-        let persisted_conversation = self.store.load_subagent_conversation(run.id)?;
-        let mut conversation = match persisted_conversation {
-            Some(conversation) => conversation,
-            None if !run.initial_conversation.is_empty() => run.initial_conversation.clone(),
-            None => forked_agent_conversation(&self.store, &run)?,
-        };
-        self.store
-            .save_subagent_conversation(run.id, &conversation)?;
-        let inherited_model_context = run.initial_model_context.clone();
-        let mut prompt = run.last_task_message.clone();
-        loop {
-            while let Ok(extra) = input.try_recv() {
-                prompt.push_str("\n\nAdditional parent input:\n");
-                prompt.push_str(&extra);
-            }
-            let mut settings = self
-                .settings
-                .read()
-                .expect("settings lock poisoned")
-                .clone();
-            let mut agent = self.agent.read().expect("agent lock poisoned").clone();
-            if profile.model.is_some() || profile.model_reasoning_effort.is_some() {
-                let provider = settings.active_provider_mut();
-                if let Some(model) = profile.model.as_deref() {
-                    provider.model = model.to_string();
-                }
-                if let Some(reasoning_effort) = profile.model_reasoning_effort.as_deref() {
-                    provider.reasoning_effort = Some(reasoning_effort.to_string());
-                }
-                agent.set_provider_from_settings(&settings);
-            }
-            agent.apply_agent_profile(&profile);
-            if contract.workspace.mode == SubagentWorkspaceMode::SharedReadOnly {
-                agent.set_sandbox_config(
-                    settings
-                        .sandbox
-                        .to_local_sandbox_config()
-                        .with_sandbox_mode(SandboxMode::ReadOnly),
-                );
-            }
-            agent.set_mcp_host(self.mcp_host.clone());
-            agent.set_subagent_identity(run.id, run.depth, run.agent_path.clone());
-            sync_thread_bundled_plugin_activations(&self.store, run.parent_thread_id, &mut agent);
-            sync_thread_attachment_tool_preloads(&self.store, run.parent_thread_id, &mut agent);
-            sync_thread_mcp_tools(
-                &self.store,
-                &self.mcp_host,
-                run.parent_thread_id,
-                &mut agent,
-            )
-            .await;
-            let provider_cursor = load_provider_cursor(
-                &self.store,
-                settings.active_provider(),
-                run.parent_thread_id,
-                &run.agent_path,
-            )?;
-            if let Some(invalidation) = provider_cursor.invalidation {
-                self.store.append_event(AgentEvent::new(
-                    run.parent_thread_id,
-                    None,
-                    0,
-                    AgentEventPayload::ProviderContextStateInvalidated {
-                        provider_id: Some(invalidation.provider_id),
-                        model: Some(invalidation.model),
-                        reason: invalidation.reason,
-                    },
-                ))?;
-            }
-            let result = AgentTurnDriver::run_turn(
-                &agent,
-                AgentTurnInput {
-                    thread_id: run.parent_thread_id,
-                    user_message_id: Uuid::new_v4(),
-                    workspace_root: workspace_root.clone(),
-                    content: prompt.clone(),
-                    user_content: Vec::new(),
-                    context_summary: None,
-                    conversation: conversation.clone(),
-                    permission_mode: if contract.workspace.mode
-                        == SubagentWorkspaceMode::SharedReadOnly
-                    {
-                        PermissionMode::ReadOnly
-                    } else {
-                        settings.permission_mode
-                    },
-                    context_budget: None,
-                    provider_cursor: provider_cursor.cursor,
-                    store: Some(self.store.clone()),
-                    cancellation: Some(cancellation.clone()),
-                },
-                inherited_model_context.clone(),
-                None,
-            )
-            .await;
-            if let Some(persisted) = persist_provider_cursor(
-                &self.store,
-                settings.active_provider(),
-                run.parent_thread_id,
-                &run.agent_path,
-                &result,
-            )? {
-                if let Some(summary) = persisted.native_checkpoint {
-                    self.store.append_event(AgentEvent::new(
-                        run.parent_thread_id,
-                        None,
-                        0,
-                        AgentEventPayload::ContextCompacted {
-                            summary,
-                            details: None,
-                        },
-                    ))?;
-                }
-            }
-            let result = result?;
-            if matches!(
-                result.outcome,
-                AgentTurnOutcome::Suspended { .. } | AgentTurnOutcome::AwaitingInput { .. }
-            ) {
-                anyhow::bail!(
-                    "subagent requires user interaction; the parent must perform this action directly"
-                );
-            }
-            let last_result = subagent_result_text(&result.events);
-            conversation.push(ModelConversationMessage {
-                role: ModelConversationRole::User,
-                content: prompt,
-                content_parts: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_results: Vec::new(),
-            });
-            conversation.push(ModelConversationMessage {
-                role: ModelConversationRole::Assistant,
-                content: last_result.clone(),
-                content_parts: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_results: Vec::new(),
-            });
-            self.store
-                .save_subagent_conversation(run.id, &conversation)?;
-
-            let follow_up = match timeout(Duration::from_millis(25), input.recv()).await {
-                Ok(Some(follow_up)) => follow_up,
-                _ => return Ok(last_result),
-            };
-            prompt = follow_up;
-        }
-    }
-}
-
-fn forked_agent_conversation(
-    store: &SqliteSessionStore,
-    run: &SubagentRun,
-) -> anyhow::Result<Vec<ModelConversationMessage>> {
-    forked_root_conversation(store, run.parent_thread_id, &run.fork_turns)
-}
-
-fn forked_root_conversation(
-    store: &SqliteSessionStore,
-    thread_id: Uuid,
-    fork_turns: &str,
-) -> anyhow::Result<Vec<ModelConversationMessage>> {
-    if fork_turns == "none" {
-        return Ok(Vec::new());
-    }
-    let messages = store.list_messages(thread_id)?;
-    let start = if fork_turns == "all" {
-        0
-    } else {
-        let turns = fork_turns.parse::<usize>().unwrap_or(0);
-        let user_indexes = messages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| (message.role == MessageRole::User).then_some(index))
-            .collect::<Vec<_>>();
-        user_indexes
-            .get(user_indexes.len().saturating_sub(turns))
-            .copied()
-            .unwrap_or(0)
-    };
-    Ok(project_model_conversation(&messages[start..], &[]))
-}
-
-fn subagent_result_text(events: &[AgentEventPayload]) -> String {
+fn agent_result_text(events: &[AgentEventPayload]) -> String {
     let messages = events
         .iter()
         .filter_map(|event| match event {
@@ -1035,7 +171,7 @@ fn subagent_result_text(events: &[AgentEventPayload]) -> String {
                 AgentEventPayload::TurnFinished { summary } => Some(summary.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| "Subagent completed without a text result.".to_string())
+            .unwrap_or_else(|| "Agent completed without a text result.".to_string())
     } else {
         messages.join("\n\n")
     }
@@ -1964,44 +1100,67 @@ async fn sync_provider_models(
     };
 
     let url = provider_model_catalog_url(&provider);
-    let mut request = reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(20));
-    request = match (provider.effective_auth(), api_key.as_deref()) {
-        (ProviderAuthKind::Bearer, Some(api_key)) => {
-            request.header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+    let client = reqwest::Client::new();
+    let mut rate_limit_retries = 0usize;
+    let (status, body, retry_after_seconds) = loop {
+        let mut request = client.get(&url).timeout(Duration::from_secs(20));
+        request = match (provider.effective_auth(), api_key.as_deref()) {
+            (ProviderAuthKind::Bearer, Some(api_key)) => {
+                request.header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+            }
+            (ProviderAuthKind::XApiKey, Some(api_key)) => request.header("x-api-key", api_key),
+            (ProviderAuthKind::CodexSession | ProviderAuthKind::None, _) => request,
+            _ => request,
+        };
+        if provider.resolved_adapter_for_model(&provider.model)
+            == ProviderAdapterKind::AnthropicMessages
+        {
+            request = request.header("anthropic-version", "2023-06-01");
         }
-        (ProviderAuthKind::XApiKey, Some(api_key)) => request.header("x-api-key", api_key),
-        (ProviderAuthKind::CodexSession | ProviderAuthKind::None, _) => request,
-        _ => request,
-    };
-    if provider.resolved_adapter_for_model(&provider.model)
-        == ProviderAdapterKind::AnthropicMessages
-    {
-        request = request.header("anthropic-version", "2023-06-01");
-    }
 
-    let response = request.send().await.map_err(|error| {
+        let response = request.send().await.map_err(|error| {
+            warn!(
+                provider_id = %provider.id,
+                transport = ?provider.effective_transport(),
+                auth = ?provider.effective_auth(),
+                adapter = ?provider.resolved_adapter_for_model(&provider.model),
+                "model discovery request failed"
+            );
+            ApiError::bad_gateway(format!("model list request failed: {error}"))
+        })?;
+        let status = response.status();
+        let retry_after_seconds = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let body = response.text().await.map_err(|error| {
+            warn!(
+                provider_id = %provider.id,
+                transport = ?provider.effective_transport(),
+                auth = ?provider.effective_auth(),
+                adapter = ?provider.resolved_adapter_for_model(&provider.model),
+                "model discovery response could not be read"
+            );
+            ApiError::bad_gateway(format!("model list read failed: {error}"))
+        })?;
+
+        let Some(delay) = provider_model_catalog_rate_limit_delay(
+            status,
+            retry_after_seconds,
+            rate_limit_retries,
+        ) else {
+            break (status, body, retry_after_seconds);
+        };
+        rate_limit_retries += 1;
         warn!(
             provider_id = %provider.id,
-            transport = ?provider.effective_transport(),
-            auth = ?provider.effective_auth(),
-            adapter = ?provider.resolved_adapter_for_model(&provider.model),
-            "model discovery request failed"
+            retry_index = rate_limit_retries,
+            delay_ms = delay.as_millis(),
+            "model discovery was rate-limited; retrying"
         );
-        ApiError::bad_gateway(format!("model list request failed: {error}"))
-    })?;
-    let status = response.status();
-    let body = response.text().await.map_err(|error| {
-        warn!(
-            provider_id = %provider.id,
-            transport = ?provider.effective_transport(),
-            auth = ?provider.effective_auth(),
-            adapter = ?provider.resolved_adapter_for_model(&provider.model),
-            "model discovery response could not be read"
-        );
-        ApiError::bad_gateway(format!("model list read failed: {error}"))
-    })?;
+        tokio::time::sleep(delay).await;
+    };
     if !status.is_success() {
         warn!(
             provider_id = %provider.id,
@@ -2011,6 +1170,15 @@ async fn sync_provider_models(
             %status,
             "model discovery endpoint returned a non-success status"
         );
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_hint = retry_after_seconds
+                .map(|seconds| format!(" Retry after {seconds} seconds."))
+                .unwrap_or_default();
+            return Err(ApiError::too_many_requests(format!(
+                "provider model list is rate-limited after {rate_limit_retries} retries.{retry_hint} {}",
+                truncate_chars(body.trim(), 300)
+            )));
+        }
         return Err(ApiError::bad_gateway(format!(
             "model list request returned {status}: {}",
             truncate_chars(body.trim(), 300)
@@ -2172,6 +1340,26 @@ async fn sync_provider_models(
         synced_at,
         provider: negotiated_provider,
     }))
+}
+
+const PROVIDER_MODEL_CATALOG_RATE_LIMIT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_secs(2), Duration::from_secs(5)];
+const PROVIDER_MODEL_CATALOG_MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(15);
+
+fn provider_model_catalog_rate_limit_delay(
+    status: StatusCode,
+    retry_after_seconds: Option<u64>,
+    retry_index: usize,
+) -> Option<Duration> {
+    if status != StatusCode::TOO_MANY_REQUESTS
+        || retry_index >= PROVIDER_MODEL_CATALOG_RATE_LIMIT_RETRY_DELAYS.len()
+    {
+        return None;
+    }
+    let delay = retry_after_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(PROVIDER_MODEL_CATALOG_RATE_LIMIT_RETRY_DELAYS[retry_index]);
+    (delay <= PROVIDER_MODEL_CATALOG_MAX_INLINE_RETRY_AFTER).then_some(delay)
 }
 
 fn provider_model_catalog_url(provider: &ProviderSettings) -> String {
@@ -2353,9 +1541,7 @@ async fn ensure_thread_model_adapter_ready(
     if connection.effective_transport() != ProviderTransportKind::Http {
         return Ok(());
     }
-    let adapter = selection
-        .adapter
-        .unwrap_or_else(|| connection.resolved_adapter_for_model(&selection.model_id));
+    let adapter = connection.resolved_adapter_for_model(&selection.model_id);
     if !connection.allows_adapter(adapter) {
         return Err(ApiError::bad_request(format!(
             "adapter '{}' is not enabled for connection '{}'",
@@ -2710,7 +1896,7 @@ fn provider_settings_for_thread(
         Some(selection) => connection.with_model_route_override(
             Some(selection.model_id.as_str()),
             Some(selection.reasoning_effort.as_deref()),
-            selection.adapter,
+            None,
         ),
         None => connection.clone(),
     }
@@ -3486,6 +2672,47 @@ async fn decide_approval(
     } else {
         continuation.turn_id
     };
+    if let Some(collaboration_turn) = state
+        .collaboration_repository
+        .find_turn(AgentTurnId::from_uuid(continuation_turn_id))?
+    {
+        let collaboration_thread = state
+            .collaboration_repository
+            .get_thread(collaboration_turn.agent_thread_id)
+            .await?;
+        if collaboration_thread.path.as_str() != "/root" {
+            let status = if request.approved {
+                ApprovalStatus::Approved
+            } else {
+                ApprovalStatus::Denied
+            };
+            state
+                .store
+                .update_approval_status(approval_id, status)?
+                .ok_or_else(|| ApiError::not_found(format!("approval not found: {approval_id}")))?;
+            state
+                .store
+                .delete_approval_continuation(approval_id, thread_id)?;
+            state
+                .agent_run_scheduler
+                .submit(AgentRunCommand::Resume {
+                    session_id: collaboration_turn.session_id,
+                    agent_thread_id: collaboration_turn.agent_thread_id,
+                    agent_turn_id: collaboration_turn.id,
+                    invocation_id: collaboration_turn.invocation_id.saturating_add(1),
+                    signal: AgentRunResumeSignal::Approval {
+                        approval_id: Some(approval_id),
+                        approved: request.approved,
+                    },
+                })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            return Ok(Json(ApprovalDecisionResponse {
+                accepted: true,
+                executed: request.approved,
+            }));
+        }
+    }
     let turn = state
         .turns
         .resume(
@@ -3604,6 +2831,60 @@ async fn respond_to_user_input(
     } else {
         continuation.turn_id
     };
+    if let Some(collaboration_turn) = state
+        .collaboration_repository
+        .find_turn(AgentTurnId::from_uuid(continuation_turn_id))?
+    {
+        let collaboration_thread = state
+            .collaboration_repository
+            .get_thread(collaboration_turn.agent_thread_id)
+            .await?;
+        if collaboration_thread.path.as_str() != "/root" {
+            state
+                .store
+                .resolve_user_input_request(request_id, thread_id, &response)?
+                .ok_or_else(|| {
+                    ApiError::conflict(format!(
+                        "user input request is no longer pending: {request_id}"
+                    ))
+                })?;
+            if response.cancelled {
+                if let Some(message) = state.collaboration_repository.record_turn_state(
+                    collaboration_turn.id,
+                    AgentTurnStatus::Cancelled,
+                    &json!({
+                        "status": "cancelled",
+                        "reason": "User dismissed the decision request.",
+                    }),
+                )? {
+                    state.agent_run_scheduler.message_enqueued(&message);
+                }
+                state.agent_activity.notify(collaboration_thread.id);
+                return Ok(Json(UserInputResponseAccepted {
+                    accepted: true,
+                    resumed: false,
+                }));
+            }
+            state
+                .agent_run_scheduler
+                .submit(AgentRunCommand::Resume {
+                    session_id: collaboration_turn.session_id,
+                    agent_thread_id: collaboration_turn.agent_thread_id,
+                    agent_turn_id: collaboration_turn.id,
+                    invocation_id: collaboration_turn.invocation_id.saturating_add(1),
+                    signal: AgentRunResumeSignal::UserInput {
+                        request_id,
+                        response,
+                    },
+                })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            return Ok(Json(UserInputResponseAccepted {
+                accepted: true,
+                resumed: true,
+            }));
+        }
+    }
     if response.cancelled {
         if state
             .store
@@ -3615,8 +2896,9 @@ async fn respond_to_user_input(
             )));
         }
         state
-            .store
-            .update_turn_status(continuation_turn_id, TurnStatus::Cancelled, None)?;
+            .turns
+            .finish(thread_id, continuation_turn_id, TurnStatus::Cancelled, None)?
+            .ok_or_else(|| ApiError::conflict("root Turn projection is no longer available"))?;
         if let Err(error) = state
             .store
             .delete_turn_checkpoint(continuation_turn_id, thread_id)
@@ -3704,10 +2986,50 @@ async fn resume_external_action(
     Json(request): Json<ExternalActionResumeRequest>,
 ) -> Result<Json<ExternalActionResumeResponse>, ApiError> {
     ensure_thread(&state, thread_id)?;
+    if let Some(collaboration_turn) = state
+        .collaboration_repository
+        .find_turn(AgentTurnId::from_uuid(turn_id))?
+    {
+        let collaboration_thread = state
+            .collaboration_repository
+            .get_thread(collaboration_turn.agent_thread_id)
+            .await?;
+        if collaboration_thread.path.as_str() != "/root" {
+            if collaboration_turn.status != AgentTurnStatus::WaitingAction {
+                return Err(ApiError::conflict(format!(
+                    "Agent Turn {turn_id} is not waiting for an external action"
+                )));
+            }
+            let observation = request
+                .observation
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    "The user reports that the requested external action is complete.".to_string()
+                });
+            let invocation_id = collaboration_turn.invocation_id.saturating_add(1);
+            state
+                .agent_run_scheduler
+                .submit(AgentRunCommand::Resume {
+                    session_id: collaboration_turn.session_id,
+                    agent_thread_id: collaboration_turn.agent_thread_id,
+                    agent_turn_id: collaboration_turn.id,
+                    invocation_id,
+                    signal: AgentRunResumeSignal::ExternalAction { observation },
+                })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            return Ok(Json(ExternalActionResumeResponse {
+                accepted: true,
+                resumed: true,
+                turn_id,
+                invocation_id,
+            }));
+        }
+    }
     let turn_record = state
-        .store
-        .get_turn(turn_id)?
-        .filter(|turn| turn.thread_id == thread_id)
+        .turns
+        .status(thread_id)?
+        .filter(|turn| turn.turn_id == turn_id)
         .ok_or_else(|| ApiError::not_found(format!("turn not found: {turn_id}")))?;
     if turn_record.status != TurnStatus::WaitingUserAction {
         return Err(ApiError::conflict(format!(
@@ -3962,137 +3284,7 @@ fn turn_change_set_for_thread(
         .ok_or_else(|| ApiError::not_found(format!("turn change set not found: {turn_id}")))
 }
 
-async fn list_subagent_runs(
-    State(state): State<AppState>,
-    Path(thread_id): Path<Uuid>,
-) -> Result<Json<Vec<SubagentRun>>, ApiError> {
-    ensure_thread(&state, thread_id)?;
-    Ok(Json(state.store.list_subagent_runs(thread_id)?))
-}
-
-async fn spawn_subagent_run(
-    State(state): State<AppState>,
-    Path(thread_id): Path<Uuid>,
-    Json(request): Json<SpawnSubagentRunRequest>,
-) -> Result<Json<SubagentRun>, ApiError> {
-    let thread = ensure_thread(&state, thread_id)?;
-    let latest_turn = state.turns.status(thread_id)?;
-    let parent_turn_id = request
-        .parent_turn_id
-        .or_else(|| latest_turn.map(|turn| turn.turn_id))
-        .unwrap_or_else(Uuid::new_v4);
-    let agent_type = request.agent_type.unwrap_or_else(|| "default".to_string());
-    if load_agent_profiles_for_thread(&state.store, &thread)?
-        .get(&agent_type)
-        .is_none()
-    {
-        return Err(ApiError::bad_request(format!(
-            "unknown agent_type `{agent_type}`"
-        )));
-    }
-    let fork_turns = request.fork_turns.unwrap_or_else(|| "all".to_string());
-    let initial_conversation = forked_root_conversation(&state.store, thread_id, &fork_turns)?;
-    let run = state
-        .subagents
-        .spawn(SpawnSubagentRequest {
-            parent_thread_id: thread_id,
-            parent_turn_id,
-            parent_agent_path: "/root".to_string(),
-            name: request.name,
-            agent_type,
-            input: request.input,
-            fork_turns,
-            depth: request.depth.unwrap_or(1),
-            initial_conversation,
-            initial_model_context: None,
-        })
-        .map_err(subagent_api_error)?;
-    Ok(Json(run))
-}
-
-async fn send_subagent_input(
-    State(state): State<AppState>,
-    Path((thread_id, run_id)): Path<(Uuid, Uuid)>,
-    Json(request): Json<SubagentInputRequest>,
-) -> Result<StatusCode, ApiError> {
-    let run = ensure_live_subagent(&state, thread_id, run_id)?;
-    if run.status.is_terminal() {
-        state
-            .subagents
-            .followup_task_scoped(
-                SubagentScope {
-                    thread_id,
-                    parent_turn_id: run.parent_turn_id,
-                    depth: 0,
-                    agent_path: "/root".to_string(),
-                },
-                &run_id.to_string(),
-                request.input,
-            )
-            .map_err(subagent_api_error)?;
-    } else {
-        state
-            .subagents
-            .send_input(run_id, request.input)
-            .map_err(subagent_api_error)?;
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn cancel_subagent_run(
-    State(state): State<AppState>,
-    Path((thread_id, run_id)): Path<(Uuid, Uuid)>,
-) -> Result<StatusCode, ApiError> {
-    ensure_live_subagent(&state, thread_id, run_id)?;
-    state.subagents.cancel(run_id).map_err(subagent_api_error)?;
-    Ok(StatusCode::ACCEPTED)
-}
-
-async fn wait_subagent_run(
-    State(state): State<AppState>,
-    Path((thread_id, run_id)): Path<(Uuid, Uuid)>,
-    Json(request): Json<WaitSubagentRunRequest>,
-) -> Result<Json<SubagentRun>, ApiError> {
-    ensure_live_subagent(&state, thread_id, run_id)?;
-    let wait_timeout =
-        Duration::from_millis(request.timeout_ms.unwrap_or(30_000).clamp(1, 120_000));
-    Ok(Json(
-        state
-            .subagents
-            .wait(run_id, wait_timeout)
-            .await
-            .map_err(subagent_api_error)?,
-    ))
-}
-
-fn ensure_live_subagent(
-    state: &AppState,
-    thread_id: Uuid,
-    run_id: Uuid,
-) -> Result<SubagentRun, ApiError> {
-    ensure_thread(state, thread_id)?;
-    let run = state
-        .subagents
-        .get(run_id)
-        .ok_or_else(|| ApiError::not_found(format!("active subagent run not found: {run_id}")))?;
-    if run.parent_thread_id != thread_id {
-        return Err(ApiError::bad_request(
-            "subagent run does not belong to this thread",
-        ));
-    }
-    Ok(run)
-}
-
-fn subagent_api_error(error: opentopia_core::SubagentError) -> ApiError {
-    match error {
-        opentopia_core::SubagentError::NotFound(_) => ApiError::not_found(error.to_string()),
-        opentopia_core::SubagentError::AlreadyTerminal(_)
-        | opentopia_core::SubagentError::InputClosed(_) => ApiError::conflict(error.to_string()),
-        _ => ApiError::bad_request(error.to_string()),
-    }
-}
-
-async fn cancel_agent_turn(
+async fn cancel_user_turn(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
     Json(request): Json<CancelAgentTurnRequest>,
@@ -4130,10 +3322,57 @@ async fn cancel_agent_turn(
             }
         }
         if let Some(parent_turn_id) = parent_turn_id {
-            state.subagents.cancel_parent(parent_turn_id);
+            cancel_collaboration_descendants(&state, thread_id, parent_turn_id).await;
         }
     }
     Ok(Json(result))
+}
+
+async fn cancel_collaboration_descendants(state: &AppState, thread_id: Uuid, _root_turn_id: Uuid) {
+    let Some(session) = state
+        .collaboration_repository
+        .find_session_by_user_task_id(thread_id)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Ok(Some(root)) = state
+        .collaboration_repository
+        .resolve_path(
+            session.id,
+            &opentopia_core::collaboration::AgentPath::root(),
+        )
+        .await
+    else {
+        return;
+    };
+    let Ok(agents) = state
+        .collaboration_repository
+        .list_threads(session.id)
+        .await
+    else {
+        return;
+    };
+    for agent in agents
+        .into_iter()
+        .filter(|agent| agent.path.is_descendant_of(&root.path))
+    {
+        let Ok(Some(turn)) = state.collaboration_repository.latest_turn(agent.id).await else {
+            continue;
+        };
+        if turn.status.is_terminal() {
+            continue;
+        }
+        let _ = state
+            .agent_run_scheduler
+            .submit(AgentRunCommand::Cancel {
+                session_id: session.id,
+                agent_thread_id: agent.id,
+                agent_turn_id: turn.id,
+            })
+            .await;
+    }
 }
 
 fn cancel_waiting_agent_turn(
@@ -4153,8 +3392,8 @@ fn cancel_waiting_agent_turn(
         ));
     }
     if state
-        .store
-        .update_turn_status(turn.turn_id, TurnStatus::Cancelled, None)?
+        .turns
+        .finish(thread_id, turn.turn_id, TurnStatus::Cancelled, None)?
         .is_none()
     {
         return Err(ApiError::conflict("waiting Turn is no longer available"));
@@ -5522,6 +4761,127 @@ async fn stream_events(
             Ok(sse)
         });
 
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+}
+
+async fn list_agent_threads(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+) -> Result<Json<Vec<AgentListItem>>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let Some(session) = state
+        .collaboration_repository
+        .find_session_by_user_task_id(thread_id)?
+    else {
+        return Ok(Json(Vec::new()));
+    };
+    let mut result = Vec::new();
+    for agent in state
+        .collaboration_repository
+        .list_threads(session.id)
+        .await?
+    {
+        let latest_turn = state.collaboration_repository.latest_turn(agent.id).await?;
+        let activity = match latest_turn.as_ref() {
+            Some(turn) => Some(
+                state
+                    .agent_activity
+                    .read_activity(
+                        agent.id,
+                        turn.id,
+                        turn.status,
+                        opentopia_core::collaboration::ActivityQuery::default(),
+                    )
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))?,
+            ),
+            None => None,
+        };
+        result.push(AgentListItem {
+            availability: AgentAvailability::derive(&agent, latest_turn.as_ref()),
+            agent,
+            latest_turn,
+            activity,
+        });
+    }
+    Ok(Json(result))
+}
+
+async fn interrupt_agent_thread(
+    State(state): State<AppState>,
+    Path((thread_id, agent_thread_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let session = state
+        .collaboration_repository
+        .find_session_by_user_task_id(thread_id)?
+        .ok_or_else(|| ApiError::not_found("collaboration session has not started"))?;
+    let agent = state
+        .collaboration_repository
+        .get_thread(AgentThreadId::from_uuid(agent_thread_id))
+        .await?;
+    if agent.session_id != session.id {
+        return Err(ApiError::not_found(
+            "agent thread was not found in this task",
+        ));
+    }
+    state.collaboration_runtime.interrupt_agent(&agent).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn stream_agent_events(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    Query(query): Query<EventQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let session = state
+        .collaboration_repository
+        .find_session_by_user_task_id(thread_id)?
+        .ok_or_else(|| ApiError::not_found("collaboration session has not started"))?;
+    let history = state
+        .collaboration_repository
+        .list_session_activity_events(session.id, query.since)?;
+    let cursor = history
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or_else(|| query.since.unwrap_or_default());
+    let stream_state = (state, session.id, cursor, VecDeque::from(history));
+    let event_stream = stream::unfold(
+        stream_state,
+        |(state, session_id, mut cursor, mut pending)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    cursor = cursor.max(event.seq);
+                    let sse = Event::default()
+                        .id(event.seq.to_string())
+                        .event(sse_event_name(event.kind()))
+                        .json_data(event)
+                        .expect("Agent event should serialize");
+                    return Some((Ok(sse), (state, session_id, cursor, pending)));
+                }
+                let changed = state
+                    .agent_activity
+                    .wait_for_change(session_id, None, Some(cursor), Duration::from_secs(30))
+                    .await;
+                match changed {
+                    Ok(Some(_)) => {
+                        pending = VecDeque::from(
+                            state
+                                .collaboration_repository
+                                .list_session_activity_events(session_id, Some(cursor))
+                                .unwrap_or_default(),
+                        );
+                    }
+                    Ok(None) => continue,
+                    Err(error) => {
+                        let sse = Event::default().event("error").data(error.to_string());
+                        return Some((Ok(sse), (state, session_id, cursor, pending)));
+                    }
+                }
+            }
+        },
+    );
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
@@ -7083,15 +6443,247 @@ fn load_agent_profiles_for_thread(
     ))
 }
 
+async fn bind_root_collaboration(
+    state: &AppState,
+    thread: &opentopia_core::Thread,
+    turn_id: Uuid,
+    invocation_id: u64,
+    task_message: &str,
+    selected_provider: &ProviderSettings,
+    agent: &mut AgentCore,
+) -> anyhow::Result<(AgentThreadRecord, CollaborationTurnRecord)> {
+    let collaboration_turn_id = AgentTurnId::from_uuid(turn_id);
+    let (root, collaboration_turn) = match state
+        .collaboration_repository
+        .find_session_by_user_task_id(thread.id)?
+    {
+        Some(session) => state.collaboration_repository.create_root_followup_turn(
+            session.id,
+            collaboration_turn_id,
+            task_message,
+        )?,
+        None => {
+            let profiles = load_agent_profiles_for_thread(&state.store, thread)?;
+            let agent_profiles = profiles.list();
+            let allowed_agent_types = agent_profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect::<Vec<_>>();
+            let spawn_policy = AgentSpawnPolicy::allows_children(4, 6);
+            let git_base_commit = frozen_git_head(&thread.workspace_root).await;
+            let tool_catalog = agent.provider_tool_catalog();
+            let tool_names = tool_catalog
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            let plugin_contributions =
+                plugins_api::active_contributions_for_thread(&state.store, thread)?;
+            let attachment_references = state
+                .store
+                .list_messages(thread.id)?
+                .into_iter()
+                .flat_map(|message| message.parts)
+                .filter_map(|part| match part {
+                    MessagePart::SourceRef { source } => Some(source),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let runtime_snapshot = RuntimeSnapshotSeed::new(
+                None,
+                json!({
+                    "schemaVersion": 1,
+                    "agentType": "default",
+                    "allowedAgentTypes": allowed_agent_types,
+                    "agentProfiles": agent_profiles,
+                    "workspaceRoot": thread.workspace_root,
+                    "workspaceMode": "shared_coordinated",
+                    "workspaceAssignment": {
+                        "mode": "shared_coordinated",
+                        "root": thread.workspace_root,
+                    },
+                    "gitBaseCommit": git_base_commit,
+                    "forkTurns": "all",
+                    "provider": selected_provider,
+                    "permissionMode": current_settings(state).permission_mode,
+                    "sandbox": current_settings(state).sandbox,
+                    "agentRuntime": current_settings(state).agent_runtime,
+                    "capabilityProjection": agent.capability_projection(),
+                    "tools": tool_names,
+                    "toolCatalog": tool_catalog,
+                    "pluginContributions": plugin_contributions,
+                    "attachmentReferences": attachment_references,
+                    "spawnPolicy": {
+                        "allowChildSpawns": spawn_policy.allow_child_spawns,
+                        "maxDepth": spawn_policy.max_depth,
+                        "maxDirectChildren": spawn_policy.max_direct_children,
+                    }
+                }),
+            );
+            let (_, root, turn) = state
+                .collaboration_repository
+                .create_session(CreateCollaborationSession {
+                    user_task_id: thread.id,
+                    root_turn_id: collaboration_turn_id,
+                    root_task_message: task_message.to_string(),
+                    root_agent_type: "default".to_string(),
+                    root_runtime_snapshot: runtime_snapshot,
+                    session_policy: CollaborationSessionPolicy {
+                        max_agents: 16,
+                        max_active_runs: 6,
+                        max_depth: 4,
+                    },
+                    root_spawn_policy: spawn_policy,
+                })
+                .await?;
+            (root, turn)
+        }
+    };
+    let collaboration_turn = state
+        .collaboration_repository
+        .transition_turn(collaboration_turn.id, AgentTurnStatus::Running)
+        .await?;
+    state.agent_activity.notify(root.id);
+    let invocation = AgentCollaborationInvocation::new(
+        state.collaboration_runtime.clone(),
+        state.agent_activity.clone(),
+        state.snapshot_deriver.clone(),
+        AgentInvocationIdentity {
+            session_id: root.session_id,
+            agent_thread_id: root.id,
+            agent_turn_id: collaboration_turn.id,
+            runtime_snapshot_id: root.runtime_snapshot_id,
+        },
+    );
+    agent.set_agent_execution_identity(collaboration_turn.id, invocation_id, &root.path);
+    agent.set_agent_collaboration(invocation.clone());
+    for message in invocation.pending_messages(256).await? {
+        state.turn_inbox.push(
+            collaboration_turn.id.as_uuid(),
+            TurnInboxItem::AgentMessage { message },
+        );
+    }
+    Ok((root, collaboration_turn))
+}
+
+async fn frozen_git_head(workspace_root: &FsPath) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["rev-parse", "HEAD"])
+        .envs(GIT_NONINTERACTIVE_ENVIRONMENT)
+        .output()
+        .await
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn bind_existing_collaboration_turn(
+    state: &AppState,
+    turn_id: Uuid,
+    invocation_id: u64,
+    agent: &mut AgentCore,
+) -> anyhow::Result<()> {
+    let turn = state
+        .collaboration_repository
+        .get_turn(AgentTurnId::from_uuid(turn_id))
+        .await?;
+    let thread = state
+        .collaboration_repository
+        .get_thread(turn.agent_thread_id)
+        .await?;
+    anyhow::ensure!(
+        turn.status == AgentTurnStatus::Running,
+        "canonical AgentTurn must be running before the root execution is rebound"
+    );
+    anyhow::ensure!(
+        turn.invocation_id == invocation_id,
+        "root product projection invocation does not match canonical AgentTurn"
+    );
+    let invocation = AgentCollaborationInvocation::new(
+        state.collaboration_runtime.clone(),
+        state.agent_activity.clone(),
+        state.snapshot_deriver.clone(),
+        AgentInvocationIdentity {
+            session_id: thread.session_id,
+            agent_thread_id: thread.id,
+            agent_turn_id: turn.id,
+            runtime_snapshot_id: thread.runtime_snapshot_id,
+        },
+    );
+    agent.set_agent_execution_identity(turn.id, invocation_id, &thread.path);
+    agent.set_agent_collaboration(invocation.clone());
+    for message in invocation.pending_messages(256).await? {
+        state
+            .turn_inbox
+            .push(turn.id.as_uuid(), TurnInboxItem::AgentMessage { message });
+    }
+    state.agent_activity.notify(thread.id);
+    Ok(())
+}
+
 fn publish_payload(
     state: &AppState,
     thread_id: Uuid,
     turn_id: Option<Uuid>,
     payload: AgentEventPayload,
 ) {
-    let event = AgentEvent::new(thread_id, turn_id, 0, payload);
-    match state.store.append_event(event) {
-        Ok(event) => state.events.publish(event),
+    publish_payloads(state, thread_id, turn_id, vec![payload]);
+}
+
+fn publish_payloads(
+    state: &AppState,
+    thread_id: Uuid,
+    turn_id: Option<Uuid>,
+    payloads: Vec<AgentEventPayload>,
+) {
+    if payloads.is_empty() {
+        return;
+    }
+    // The Agent activity ledger is the durable execution event source. The
+    // product conversation event stream is a root-only UI/SSE projection and
+    // is therefore appended after the canonical event batch.
+    if let Some(turn_id) = turn_id {
+        let collaboration_turn_id = AgentTurnId::from_uuid(turn_id);
+        match state
+            .collaboration_repository
+            .find_turn(collaboration_turn_id)
+        {
+            Ok(Some(turn)) => match state.collaboration_repository.append_activity_events(
+                turn.session_id,
+                turn.agent_thread_id,
+                turn.id,
+                turn.invocation_id,
+                payloads.clone(),
+                None,
+            ) {
+                Ok(_) => state.agent_activity.notify(turn.agent_thread_id),
+                Err(error) => error!(
+                    ?error,
+                    agent_turn_id = %turn.id,
+                    "failed to persist canonical AgentTurn activity"
+                ),
+            },
+            Ok(None) => {}
+            Err(error) => error!(
+                ?error,
+                %turn_id,
+                "failed to resolve canonical AgentTurn for product event projection"
+            ),
+        }
+    }
+    let events = payloads
+        .into_iter()
+        .map(|payload| AgentEvent::new(thread_id, turn_id, 0, payload))
+        .collect();
+    match state.store.append_events(events) {
+        Ok(events) => {
+            for event in events {
+                state.events.publish(event);
+            }
+        }
         Err(err) => error!(?err, "failed to persist event"),
     }
 }
@@ -7502,6 +7094,36 @@ async fn run_new_agent_turn(
         let flow_node_harness = Arc::new(agent.clone());
         agent.set_flow_node_harness(flow_node_harness);
     }
+    if let Err(error) = bind_root_collaboration(
+        &state,
+        &thread,
+        turn_id,
+        turn.invocation_id,
+        &content,
+        &selected_provider,
+        &mut agent,
+    )
+    .await
+    {
+        let message = format!("failed to bind root Agent Turn: {error}");
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        finalize_turn_change_capture(&state, thread_id, turn_id).await;
+        finish_turn(
+            &state,
+            thread_id,
+            turn_id,
+            TurnStatus::Failed,
+            Some(message),
+        );
+        return;
+    }
     let built_context = build_turn_model_context(
         &state,
         &settings,
@@ -7679,8 +7301,7 @@ async fn run_new_agent_turn(
         },
     );
     let (sender, mut receiver) = mpsc::unbounded_channel();
-    let future =
-        AgentTurnDriver::run_turn(&agent, input, Some(built_context.context), Some(sender));
+    let future = drive_agent_turn(&agent, input, Some(built_context.context), Some(sender));
     tokio::pin!(future);
     let mut deferred_wait_events = Vec::new();
 
@@ -7697,8 +7318,19 @@ async fn run_new_agent_turn(
                     },
                 );
                 let _ = timeout(Duration::from_secs(2), &mut future).await;
-                while let Ok(payload) = receiver.try_recv() {
-                    persist_and_publish_payload(&state, thread_id, turn_id, payload);
+                loop {
+                    let payloads = take_available_payload_batch(&mut receiver, None);
+                    if payloads.is_empty() {
+                        break;
+                    }
+                    persist_received_payload_batch(
+                        &state,
+                        thread_id,
+                        turn_id,
+                        payloads,
+                        &mut deferred_wait_events,
+                        true,
+                    );
                 }
                 finalize_turn_change_capture(&state, thread_id, turn_id).await;
                 finalize_goal_after_turn(
@@ -7720,21 +7352,32 @@ async fn run_new_agent_turn(
             result = &mut future => break result,
             payload = receiver.recv() => {
                 if let Some(payload) = payload {
-                    if is_wait_boundary(&payload) {
-                        deferred_wait_events.push(payload);
-                    } else {
-                        persist_and_publish_payload(&state, thread_id, turn_id, payload);
-                    }
+                    let payloads = take_available_payload_batch(&mut receiver, Some(payload));
+                    persist_received_payload_batch(
+                        &state,
+                        thread_id,
+                        turn_id,
+                        payloads,
+                        &mut deferred_wait_events,
+                        false,
+                    );
                 }
             }
         }
     };
-    while let Ok(payload) = receiver.try_recv() {
-        if is_wait_boundary(&payload) {
-            deferred_wait_events.push(payload);
-        } else {
-            persist_and_publish_payload(&state, thread_id, turn_id, payload);
+    loop {
+        let payloads = take_available_payload_batch(&mut receiver, None);
+        if payloads.is_empty() {
+            break;
         }
+        persist_received_payload_batch(
+            &state,
+            thread_id,
+            turn_id,
+            payloads,
+            &mut deferred_wait_events,
+            false,
+        );
     }
     let approval_persistence =
         persist_deferred_approval_records(&state, thread_id, &deferred_wait_events);
@@ -7864,12 +7507,34 @@ async fn run_resumed_agent_turn(
             provider,
         )));
     }
+    if let Err(error) =
+        bind_existing_collaboration_turn(&state, turn_id, turn.invocation_id, &mut agent).await
+    {
+        let message = format!("failed to resume collaboration Agent Turn: {error}");
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        finalize_turn_change_capture(&state, thread_id, turn_id).await;
+        finish_turn(
+            &state,
+            thread_id,
+            turn_id,
+            TurnStatus::Failed,
+            Some(message),
+        );
+        return;
+    }
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let resolved_approval_id = match &signal {
         AgentResumeSignal::Approval { approval_id, .. } => *approval_id,
         AgentResumeSignal::UserInput { .. } | AgentResumeSignal::ExternalAction { .. } => None,
     };
-    let future = AgentTurnDriver::resume_turn(
+    let future = resume_agent_turn(
         &agent,
         continuation,
         signal,
@@ -7893,8 +7558,19 @@ async fn run_resumed_agent_turn(
                     },
                 );
                 let _ = timeout(Duration::from_secs(2), &mut future).await;
-                while let Ok(payload) = receiver.try_recv() {
-                    persist_and_publish_payload(&state, thread_id, turn_id, payload);
+                loop {
+                    let payloads = take_available_payload_batch(&mut receiver, None);
+                    if payloads.is_empty() {
+                        break;
+                    }
+                    persist_received_payload_batch(
+                        &state,
+                        thread_id,
+                        turn_id,
+                        payloads,
+                        &mut deferred_wait_events,
+                        true,
+                    );
                 }
                 finalize_turn_change_capture(&state, thread_id, turn_id).await;
                 finalize_goal_after_turn(
@@ -7916,21 +7592,32 @@ async fn run_resumed_agent_turn(
             result = &mut future => break result,
             payload = receiver.recv() => {
                 if let Some(payload) = payload {
-                    if is_wait_boundary(&payload) {
-                        deferred_wait_events.push(payload);
-                    } else {
-                        persist_and_publish_payload(&state, thread_id, turn_id, payload);
-                    }
+                    let payloads = take_available_payload_batch(&mut receiver, Some(payload));
+                    persist_received_payload_batch(
+                        &state,
+                        thread_id,
+                        turn_id,
+                        payloads,
+                        &mut deferred_wait_events,
+                        false,
+                    );
                 }
             }
         }
     };
-    while let Ok(payload) = receiver.try_recv() {
-        if is_wait_boundary(&payload) {
-            deferred_wait_events.push(payload);
-        } else {
-            persist_and_publish_payload(&state, thread_id, turn_id, payload);
+    loop {
+        let payloads = take_available_payload_batch(&mut receiver, None);
+        if payloads.is_empty() {
+            break;
         }
+        persist_received_payload_batch(
+            &state,
+            thread_id,
+            turn_id,
+            payloads,
+            &mut deferred_wait_events,
+            false,
+        );
     }
     let approval_persistence =
         persist_deferred_approval_records(&state, thread_id, &deferred_wait_events);
@@ -8562,83 +8249,129 @@ fn decode_turn_checkpoint(
     Ok(continuation)
 }
 
-fn persist_and_publish_payload(
+fn persist_and_publish_payloads(
     state: &AppState,
     thread_id: Uuid,
     turn_id: Uuid,
-    payload: AgentEventPayload,
+    payloads: Vec<AgentEventPayload>,
 ) {
-    if let AgentEventPayload::AssistantMessage { message } = &payload {
-        if let Err(err) = state.store.append_message(message.clone()) {
-            error!(?err, "failed to persist assistant message");
-        }
-    }
-    let tool_message = match &payload {
-        AgentEventPayload::ToolCallStarted { call } => Some(Message {
-            id: Uuid::new_v4(),
-            thread_id,
-            role: MessageRole::Tool,
-            parts: vec![MessagePart::ToolCall { call: call.clone() }],
-            created_at: Utc::now(),
-        }),
-        AgentEventPayload::ToolCallFinished { result } => Some(Message {
-            id: Uuid::new_v4(),
-            thread_id,
-            role: MessageRole::Tool,
-            parts: vec![MessagePart::ToolResult {
-                result: result.clone(),
-            }],
-            created_at: Utc::now(),
-        }),
-        _ => None,
-    };
-    if let Some(message) = tool_message {
-        if let Err(err) = state.store.append_message(message) {
-            error!(?err, "failed to persist typed tool history");
-        }
-    }
-    if let AgentEventPayload::ApprovalRequested {
-        approval_id,
-        action,
-        reason,
-    } = &payload
-    {
-        let approval = Approval::pending(*approval_id, thread_id, action.clone(), reason.clone());
-        if let Err(err) = state.store.insert_approval(approval) {
-            error!(?err, %approval_id, "failed to persist approval request");
-        }
-    }
-    let goal_projection = match &payload {
-        AgentEventPayload::WorkFormUpdated { form } => match form.scope {
-            opentopia_core::WorkScope::Goal(goal_id) => {
-                state.store.get_goal(goal_id).ok().flatten()
+    let mut projected_payloads = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        if let AgentEventPayload::AssistantMessage { message } = &payload {
+            if let Err(err) = state.store.append_message(message.clone()) {
+                error!(?err, "failed to persist assistant message");
             }
-            opentopia_core::WorkScope::Turn(_) => None,
-        },
-        AgentEventPayload::TokenUsage { total_tokens, .. } => state
-            .store
-            .get_thread_goal(thread_id)
-            .ok()
-            .flatten()
-            .filter(|snapshot| !snapshot.status().is_terminal())
-            .and_then(|snapshot| {
-                state
-                    .store
-                    .add_goal_usage(snapshot.goal.id, *total_tokens as u64, 0)
-                    .ok()
-                    .flatten()
+        }
+        let tool_message = match &payload {
+            AgentEventPayload::ToolCallStarted { call } => Some(Message {
+                id: Uuid::new_v4(),
+                thread_id,
+                role: MessageRole::Tool,
+                parts: vec![MessagePart::ToolCall { call: call.clone() }],
+                created_at: Utc::now(),
             }),
-        _ => None,
-    };
-    publish_payload(state, thread_id, Some(turn_id), payload);
-    if let Some(snapshot) = goal_projection {
-        publish_payload(
-            state,
-            thread_id,
-            Some(turn_id),
-            AgentEventPayload::GoalUpdated { snapshot },
-        );
+            AgentEventPayload::ToolCallFinished { result } => Some(Message {
+                id: Uuid::new_v4(),
+                thread_id,
+                role: MessageRole::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    result: result.clone(),
+                }],
+                created_at: Utc::now(),
+            }),
+            _ => None,
+        };
+        if let Some(message) = tool_message {
+            if let Err(err) = state.store.append_message(message) {
+                error!(?err, "failed to persist typed tool history");
+            }
+        }
+        if let AgentEventPayload::ApprovalRequested {
+            approval_id,
+            action,
+            reason,
+        } = &payload
+        {
+            let approval =
+                Approval::pending(*approval_id, thread_id, action.clone(), reason.clone());
+            if let Err(err) = state.store.insert_approval(approval) {
+                error!(?err, %approval_id, "failed to persist approval request");
+            }
+        }
+        let goal_projection = match &payload {
+            AgentEventPayload::WorkFormUpdated { form } => match form.scope {
+                opentopia_core::WorkScope::Goal(goal_id) => {
+                    state.store.get_goal(goal_id).ok().flatten()
+                }
+                opentopia_core::WorkScope::Turn(_) => None,
+            },
+            AgentEventPayload::TokenUsage { total_tokens, .. } => state
+                .store
+                .get_thread_goal(thread_id)
+                .ok()
+                .flatten()
+                .filter(|snapshot| !snapshot.status().is_terminal())
+                .and_then(|snapshot| {
+                    state
+                        .store
+                        .add_goal_usage(snapshot.goal.id, *total_tokens as u64, 0)
+                        .ok()
+                        .flatten()
+                }),
+            _ => None,
+        };
+        projected_payloads.push(payload);
+        if let Some(snapshot) = goal_projection {
+            projected_payloads.push(AgentEventPayload::GoalUpdated { snapshot });
+        }
     }
+    publish_payloads(state, thread_id, Some(turn_id), projected_payloads);
+}
+
+const EVENT_PERSIST_BATCH_SIZE: usize = 256;
+
+fn take_available_payload_batch(
+    receiver: &mut mpsc::UnboundedReceiver<AgentEventPayload>,
+    first: Option<AgentEventPayload>,
+) -> Vec<AgentEventPayload> {
+    let mut payloads = Vec::with_capacity(EVENT_PERSIST_BATCH_SIZE);
+    if let Some(first) = first {
+        payloads.push(first);
+    }
+    while payloads.len() < EVENT_PERSIST_BATCH_SIZE {
+        let Ok(payload) = receiver.try_recv() else {
+            break;
+        };
+        payloads.push(payload);
+    }
+    payloads
+}
+
+fn persist_received_payload_batch(
+    state: &AppState,
+    thread_id: Uuid,
+    turn_id: Uuid,
+    payloads: Vec<AgentEventPayload>,
+    deferred_wait_events: &mut Vec<AgentEventPayload>,
+    discard_stream_deltas: bool,
+) {
+    let mut durable_payloads = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        if discard_stream_deltas
+            && matches!(
+                payload,
+                AgentEventPayload::ModelDelta { .. } | AgentEventPayload::ReasoningDelta { .. }
+            )
+        {
+            continue;
+        }
+        if is_wait_boundary(&payload) {
+            deferred_wait_events.push(payload);
+        } else {
+            durable_payloads.push(payload);
+        }
+    }
+    persist_and_publish_payloads(state, thread_id, turn_id, durable_payloads);
 }
 
 fn is_wait_boundary(payload: &AgentEventPayload) -> bool {
@@ -10530,14 +10263,7 @@ fn save_settings_and_refresh_runtime(
     }
     {
         let mut agent_guard = state.agent.write().expect("agent lock poisoned");
-        let mut agent = AgentCore::from_settings(&settings);
-        agent.set_browser_runtime(state.browser.clone());
-        agent.set_computer_runtime(state.computer.clone());
-        agent.set_subagent_scheduler(state.subagents.clone());
-        agent.set_background_processes(state.background.clone());
-        agent.set_file_mutation_observer(Arc::new(state.turn_changes.clone()));
-        apply_process_tool_policy(&mut agent);
-        *agent_guard = agent;
+        *agent_guard = state.agent_factory.build(&settings);
     }
     Ok(settings)
 }
@@ -12788,29 +12514,6 @@ struct CancelAgentTurnRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SpawnSubagentRunRequest {
-    name: String,
-    input: String,
-    agent_type: Option<String>,
-    fork_turns: Option<String>,
-    parent_turn_id: Option<Uuid>,
-    depth: Option<u8>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SubagentInputRequest {
-    input: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WaitSubagentRunRequest {
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct McpToolCallRequest {
     tool_name: String,
     arguments: Value,
@@ -13302,6 +13005,13 @@ impl ApiError {
         }
     }
 
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
+
     fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -13334,6 +13044,43 @@ impl From<anyhow::Error> for ApiError {
         Self {
             status,
             message: value.to_string(),
+        }
+    }
+}
+
+impl From<opentopia_core::collaboration::CollaborationDomainError> for ApiError {
+    fn from(error: opentopia_core::collaboration::CollaborationDomainError) -> Self {
+        match error {
+            opentopia_core::collaboration::CollaborationDomainError::AgentThreadNotFound(_)
+            | opentopia_core::collaboration::CollaborationDomainError::AgentTurnNotFound(_)
+            | opentopia_core::collaboration::CollaborationDomainError::SessionNotFound(_) => {
+                Self::not_found(error.to_string())
+            }
+            opentopia_core::collaboration::CollaborationDomainError::AgentTurnAlreadyActive(_)
+            | opentopia_core::collaboration::CollaborationDomainError::InvalidTurnTransition {
+                ..
+            } => Self::conflict(error.to_string()),
+            _ => Self::internal(error.to_string()),
+        }
+    }
+}
+
+impl From<opentopia_core::collaboration::AgentCollaborationRuntimeError> for ApiError {
+    fn from(error: opentopia_core::collaboration::AgentCollaborationRuntimeError) -> Self {
+        use opentopia_core::collaboration::{AgentCollaborationRuntimeError, AgentMailboxError};
+
+        match error {
+            AgentCollaborationRuntimeError::Domain(error) => error.into(),
+            AgentCollaborationRuntimeError::Mailbox(
+                error @ AgentMailboxError::MessageNotFound(_),
+            ) => Self::not_found(error.to_string()),
+            AgentCollaborationRuntimeError::Mailbox(
+                error @ AgentMailboxError::WrongTarget { .. },
+            ) => Self::forbidden(error.to_string()),
+            AgentCollaborationRuntimeError::Mailbox(error) => Self::internal(error.to_string()),
+            error @ AgentCollaborationRuntimeError::RunSubmission { .. } => {
+                Self::internal(error.to_string())
+            }
         }
     }
 }
@@ -13373,6 +13120,202 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentopia_core::collaboration::{
+        AgentMailbox, AgentMailboxMessage, AgentRunSchedulerError, SpawnAgentThread,
+    };
+
+    #[derive(Default)]
+    struct RecordingRecoveryScheduler {
+        commands: Mutex<Vec<AgentRunCommand>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRunScheduler for RecordingRecoveryScheduler {
+        async fn submit(&self, command: AgentRunCommand) -> Result<(), AgentRunSchedulerError> {
+            self.commands.lock().unwrap().push(command);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRecoveryNotifier {
+        messages: Mutex<Vec<AgentMailboxMessage>>,
+    }
+
+    impl AgentMailboxNotifier for RecordingRecoveryNotifier {
+        fn message_enqueued(&self, message: &AgentMailboxMessage) {
+            self.messages.lock().unwrap().push(message.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn collaboration_restart_interrupts_running_subtree_and_resubmits_queued_work() {
+        let store = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
+        let user_thread = store
+            .create_thread(None, PathBuf::from("C:/recovery-fixture"))
+            .unwrap();
+        let repository = Arc::new(SqliteCollaborationRepository::new(store.clone()).unwrap());
+        let (session, root, root_turn) = repository
+            .create_session(CreateCollaborationSession {
+                user_task_id: user_thread.id,
+                root_turn_id: AgentTurnId::new(),
+                root_task_message: "running root".to_string(),
+                root_agent_type: "default".to_string(),
+                root_runtime_snapshot: RuntimeSnapshotSeed::new(
+                    None,
+                    json!({ "agentType": "default" }),
+                ),
+                session_policy: CollaborationSessionPolicy {
+                    max_agents: 8,
+                    max_active_runs: 4,
+                    max_depth: 2,
+                },
+                root_spawn_policy: AgentSpawnPolicy::allows_children(2, 4),
+            })
+            .await
+            .unwrap();
+        repository
+            .transition_turn(root_turn.id, AgentTurnStatus::Running)
+            .await
+            .unwrap();
+        let (child, child_turn) = repository
+            .spawn_agent(SpawnAgentThread {
+                parent_agent_thread_id: root.id,
+                requested_by_turn_id: root_turn.id,
+                task_name: "running_child".to_string(),
+                agent_type: "default".to_string(),
+                task_message: "running child".to_string(),
+                runtime_snapshot: RuntimeSnapshotSeed::new(
+                    Some(root.runtime_snapshot_id),
+                    json!({ "agentType": "default" }),
+                ),
+                spawn_policy: AgentSpawnPolicy::allows_children(2, 2),
+            })
+            .await
+            .unwrap();
+        repository
+            .transition_turn(child_turn.id, AgentTurnStatus::Running)
+            .await
+            .unwrap();
+        let (leaf, leaf_turn) = repository
+            .spawn_agent(SpawnAgentThread {
+                parent_agent_thread_id: child.id,
+                requested_by_turn_id: child_turn.id,
+                task_name: "queued_leaf".to_string(),
+                agent_type: "default".to_string(),
+                task_message: "queued leaf".to_string(),
+                runtime_snapshot: RuntimeSnapshotSeed::new(
+                    Some(child.runtime_snapshot_id),
+                    json!({ "agentType": "default" }),
+                ),
+                spawn_policy: AgentSpawnPolicy::disabled(2),
+            })
+            .await
+            .unwrap();
+        let queued_root_thread = store
+            .create_thread(None, PathBuf::from("C:/queued-root-recovery-fixture"))
+            .unwrap();
+        let (_, _, queued_root_turn) = repository
+            .create_session(CreateCollaborationSession {
+                user_task_id: queued_root_thread.id,
+                root_turn_id: AgentTurnId::new(),
+                root_task_message: "queued root".to_string(),
+                root_agent_type: "default".to_string(),
+                root_runtime_snapshot: RuntimeSnapshotSeed::new(
+                    None,
+                    json!({ "agentType": "default" }),
+                ),
+                session_policy: CollaborationSessionPolicy::default(),
+                root_spawn_policy: AgentSpawnPolicy::default(),
+            })
+            .await
+            .unwrap();
+        let scheduler = RecordingRecoveryScheduler::default();
+        let notifier = RecordingRecoveryNotifier::default();
+        let activity = SqliteAgentActivitySource::new(repository.clone());
+
+        let report = bootstrap::recover_collaboration_runs(
+            repository.as_ref(),
+            &scheduler,
+            &notifier,
+            &activity,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report,
+            bootstrap::CollaborationRecoveryReport {
+                interrupted: 3,
+                resubmitted: 1
+            }
+        );
+        assert_eq!(
+            repository.get_turn(root_turn.id).await.unwrap().status,
+            AgentTurnStatus::Interrupted
+        );
+        assert_eq!(
+            repository.get_turn(child_turn.id).await.unwrap().status,
+            AgentTurnStatus::Interrupted
+        );
+        assert_eq!(
+            repository.get_turn(leaf_turn.id).await.unwrap().status,
+            AgentTurnStatus::Queued
+        );
+        assert_eq!(
+            repository
+                .get_turn(queued_root_turn.id)
+                .await
+                .unwrap()
+                .status,
+            AgentTurnStatus::Interrupted,
+            "queued roots require the product adapter and must not enter the descendant scheduler"
+        );
+        let commands = scheduler.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            AgentRunCommand::Start {
+                agent_thread_id,
+                agent_turn_id,
+                ..
+            } if agent_thread_id == leaf.id && agent_turn_id == leaf_turn.id
+        ));
+        let notifications = notifier.messages.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].from_agent_thread_id, child.id);
+        assert_eq!(notifications[0].to_agent_thread_id, root.id);
+        drop(notifications);
+        let parent_mailbox = repository
+            .snapshot(session.id, root.id, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(parent_mailbox.len(), 1);
+        assert_eq!(parent_mailbox[0].payload["status"], "interrupted");
+    }
+
+    #[test]
+    fn model_catalog_rate_limit_retry_is_bounded_and_honors_short_retry_after() {
+        assert_eq!(
+            provider_model_catalog_rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, None, 0,),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            provider_model_catalog_rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, Some(8), 1,),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            provider_model_catalog_rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, Some(60), 0,),
+            None
+        );
+        assert_eq!(
+            provider_model_catalog_rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, None, 2,),
+            None
+        );
+        assert_eq!(
+            provider_model_catalog_rate_limit_delay(StatusCode::BAD_GATEWAY, None, 0),
+            None
+        );
+    }
 
     fn model_catalog_summary(payload: &Value) -> Vec<(String, Option<usize>, Option<bool>)> {
         extract_model_catalog(payload)
@@ -13933,15 +13876,18 @@ mod tests {
         pinned.id = "pinned".to_string();
         pinned.model = "connection-default".to_string();
         pinned.base_url = "https://pinned.example/v1".to_string();
+        pinned.preferred_adapter = Some(ProviderAdapterKind::OpenAiChat);
 
         settings.active_provider_id = active.id.clone();
         settings.providers = vec![active, pinned];
-        let selection = ThreadModelSelection {
-            connection_id: "pinned".to_string(),
-            model_id: "thread-model".to_string(),
-            adapter: Some(ProviderAdapterKind::OpenAiResponses),
-            reasoning_effort: Some("high".to_string()),
-        };
+
+        let selection: ThreadModelSelection = serde_json::from_value(serde_json::json!({
+            "connectionId": "pinned",
+            "modelId": "thread-model",
+            "adapter": "open_ai_responses",
+            "reasoningEffort": "high"
+        }))
+        .expect("legacy thread model selection");
 
         let provider = provider_settings_for_thread(&settings, Some(&selection));
         assert_eq!(provider.id, "pinned");
@@ -13949,7 +13895,7 @@ mod tests {
         assert_eq!(provider.model, "thread-model");
         assert_eq!(
             provider.resolved_adapter_for_model(&provider.model),
-            ProviderAdapterKind::OpenAiResponses
+            ProviderAdapterKind::OpenAiChat
         );
         assert_eq!(
             provider.reasoning_effort_for_model(),
@@ -15094,23 +15040,6 @@ mod tests {
             .expect("live event timeout")
             .expect("live event");
         assert_eq!(next.seq, 2, "queued history event must be skipped");
-    }
-
-    #[tokio::test]
-    async fn broadcast_projection_continues_after_lag() {
-        let (sender, mut receiver) = broadcast::channel(1);
-        sender.send(1_u8).expect("send first value");
-        sender.send(2_u8).expect("send second value");
-
-        assert_eq!(
-            recv_broadcast_after_lag(&mut receiver, "test stream").await,
-            Some(2)
-        );
-        drop(sender);
-        assert_eq!(
-            recv_broadcast_after_lag(&mut receiver, "test stream").await,
-            None
-        );
     }
 
     #[test]

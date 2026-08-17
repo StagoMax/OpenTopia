@@ -13,6 +13,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct CreateCollaborationSession {
     pub user_task_id: Uuid,
+    pub root_turn_id: AgentTurnId,
     pub root_task_message: String,
     pub root_agent_type: String,
     pub root_runtime_snapshot: RuntimeSnapshotSeed,
@@ -224,7 +225,7 @@ impl CollaborationRegistry for InMemoryCollaborationRegistry {
             archived_at: None,
         };
         let root_turn = AgentTurnRecord {
-            id: AgentTurnId::new(),
+            id: request.root_turn_id,
             session_id: session.id,
             agent_thread_id: root.id,
             requested_by_agent_thread_id: None,
@@ -603,6 +604,7 @@ mod tests {
         let (session, root, turn) = registry
             .create_session(CreateCollaborationSession {
                 user_task_id: Uuid::new_v4(),
+                root_turn_id: AgentTurnId::new(),
                 root_task_message: "implement the feature".to_string(),
                 root_agent_type: "default".to_string(),
                 root_runtime_snapshot: RuntimeSnapshotSeed::new(

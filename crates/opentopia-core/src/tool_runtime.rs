@@ -25,7 +25,7 @@ use crate::model::{
 };
 use crate::model_context::content_fingerprint;
 use crate::policy::{
-    approval_required, ApprovalsReviewer, BasicPolicyEngine, PermissionMode, PolicyDecision,
+    approval_required, ApprovalRequired, BasicPolicyEngine, PermissionMode, PolicyDecision,
 };
 use crate::provider::{
     invalid_tool_arguments_json_details, ModelConversationMessage, ModelProvider, ProviderToolCall,
@@ -34,11 +34,10 @@ use crate::provider::{
 use crate::sandbox::LocalSandboxConfig;
 #[cfg(test)]
 use crate::store::SessionStore;
-use crate::subagents::SubagentScheduler;
 use crate::tool_error::{insert_classified_anyhow_error_record, insert_tool_error_record};
 use crate::tool_result_ingress::{
     normalize_tool_result_at_ingress, provider_tool_result_content, provider_tool_result_metadata,
-    tool_result_is_error,
+    provider_tool_result_output, tool_result_is_error,
 };
 use crate::tool_state::ToolStateStore;
 use crate::tools::{
@@ -76,7 +75,6 @@ pub struct ToolRuntimeHost {
     pub(crate) browser: Arc<dyn BrowserRuntime>,
     pub(crate) computer: Arc<dyn ComputerRuntime>,
     pub(crate) computer_access_policy: ComputerAccessPolicy,
-    pub(crate) subagents: Option<SubagentScheduler>,
     pub(crate) background: BackgroundProcessRegistry,
 }
 
@@ -97,7 +95,6 @@ impl ToolRuntimeHost {
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
             computer: Arc::new(LocalComputerRuntime::new(ComputerRuntimeConfig::default())),
             computer_access_policy: ComputerAccessPolicy::default(),
-            subagents: None,
             background: BackgroundProcessRegistry::default(),
         }
     }
@@ -491,11 +488,54 @@ pub struct ToolExecutionInput {
     pub metadata_overlay: Option<Value>,
 }
 
+/// A policy boundary is control flow, not a failed tool execution. The runtime
+/// preserves it explicitly so callers can review or suspend the exact call
+/// without publishing a synthetic failed result first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolApprovalBoundary {
+    pub logical_call_id: Uuid,
+    pub reason: String,
+}
+
+impl ToolApprovalBoundary {
+    fn from_error(logical_call_id: Uuid, error: &anyhow::Error) -> Option<Self> {
+        approval_required(error).map(|required| Self {
+            logical_call_id,
+            reason: required.reason().to_string(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum ToolExecutionOutcome<T> {
+    Completed(T),
+    NeedsApproval(ToolApprovalBoundary),
+    Failed(anyhow::Error),
+}
+
+impl<T> ToolExecutionOutcome<T> {
+    pub fn into_result(self) -> anyhow::Result<T> {
+        match self {
+            Self::Completed(value) => Ok(value),
+            Self::NeedsApproval(boundary) => Err(ApprovalRequired::new(boundary.reason).into()),
+            Self::Failed(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn as_completed(&self) -> Option<&T> {
+        match self {
+            Self::Completed(value) => Some(value),
+            Self::NeedsApproval(_) | Self::Failed(_) => None,
+        }
+    }
+}
+
 /// Execution always returns its local protocol events together with the
 /// outcome. Callers may delay publication to preserve provider call order even
 /// when the runtime executes independent calls concurrently.
 pub struct ToolExecutionReport {
-    pub result: anyhow::Result<ToolResult>,
+    pub outcome: ToolExecutionOutcome<ToolResult>,
     pub events: Vec<AgentEventPayload>,
 }
 
@@ -514,7 +554,7 @@ pub struct ProviderToolExecutionInput {
 
 pub struct ProviderToolExecutionReport {
     pub provider_call: ProviderToolCall,
-    pub result: anyhow::Result<ProviderToolResult>,
+    pub outcome: ToolExecutionOutcome<ProviderToolResult>,
     pub events: Vec<AgentEventPayload>,
 }
 
@@ -540,11 +580,9 @@ pub trait ToolRuntime: Send + Sync {
         calls: &[ProviderToolCall],
     ) -> Vec<usize>;
 
-    /// Detect a contiguous group of calls suitable for one automatic review.
-    fn automatic_review_candidates(
-        &self,
-        input: ToolSchedulingInput<'_>,
-    ) -> Vec<ToolApprovalCandidate>;
+    /// Detect the contiguous calls that reach a declared approval boundary.
+    /// The caller decides whether the configured reviewer is automatic or the user.
+    fn approval_candidates(&self, input: ToolSchedulingInput<'_>) -> Vec<ToolApprovalCandidate>;
 
     /// Convert the canonical executor result into the provider protocol exactly once.
     fn normalize_provider_result(
@@ -792,10 +830,7 @@ impl ToolRuntime for LocalToolRuntime {
         selected
     }
 
-    fn automatic_review_candidates(
-        &self,
-        input: ToolSchedulingInput<'_>,
-    ) -> Vec<ToolApprovalCandidate> {
+    fn approval_candidates(&self, input: ToolSchedulingInput<'_>) -> Vec<ToolApprovalCandidate> {
         let ToolSchedulingInput {
             catalog,
             calls,
@@ -803,9 +838,6 @@ impl ToolRuntime for LocalToolRuntime {
             permission_mode,
             sandbox_config,
         } = input;
-        if permission_mode.approvals_reviewer() != ApprovalsReviewer::AutoReview {
-            return Vec::new();
-        }
         let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
             workspace_root.to_path_buf(),
             permission_mode,
@@ -840,11 +872,7 @@ impl ToolRuntime for LocalToolRuntime {
                 Some(PolicyDecision::Allow | PolicyDecision::Deny { .. }) | None => break,
             }
         }
-        if candidates.len() >= 2 {
-            candidates
-        } else {
-            Vec::new()
-        }
+        candidates
     }
 
     fn normalize_provider_result(
@@ -861,7 +889,7 @@ impl ToolRuntime for LocalToolRuntime {
                 Ok(ProviderToolResult {
                     call_id: provider_call.id.clone(),
                     name: provider_call.name.clone(),
-                    output: result.output,
+                    output: provider_tool_result_output(&result),
                     content,
                     is_error,
                     metadata,
@@ -968,7 +996,7 @@ impl ToolRuntime for LocalToolRuntime {
                 },
             });
             return ToolExecutionReport {
-                result: Err(error),
+                outcome: ToolExecutionOutcome::Failed(error),
                 events,
             };
         }
@@ -1001,7 +1029,7 @@ impl ToolRuntime for LocalToolRuntime {
                 },
             });
             return ToolExecutionReport {
-                result: Err(error),
+                outcome: ToolExecutionOutcome::Failed(error),
                 events,
             };
         };
@@ -1013,6 +1041,12 @@ impl ToolRuntime for LocalToolRuntime {
         let mut result = match executor.execute(call.clone()).await {
             Ok(result) => result,
             Err(error) => {
+                if let Some(boundary) = ToolApprovalBoundary::from_error(call.id, &error) {
+                    return ToolExecutionReport {
+                        outcome: ToolExecutionOutcome::NeedsApproval(boundary),
+                        events: Vec::new(),
+                    };
+                }
                 let error_message = format!("{error:#}");
                 let mut metadata = json!({
                     "toolName": &name,
@@ -1033,7 +1067,7 @@ impl ToolRuntime for LocalToolRuntime {
                     },
                 });
                 return ToolExecutionReport {
-                    result: Err(error),
+                    outcome: ToolExecutionOutcome::Failed(error),
                     events,
                 };
             }
@@ -1087,7 +1121,7 @@ impl ToolRuntime for LocalToolRuntime {
             }
         }
         ToolExecutionReport {
-            result: Ok(result),
+            outcome: ToolExecutionOutcome::Completed(result),
             events,
         }
     }
@@ -1105,12 +1139,12 @@ impl ToolRuntime for LocalToolRuntime {
             background,
             turn_inbox,
         } = input;
-        let call = ToolCall::new(&provider_call.name, provider_call.arguments.clone());
+        let call = provider_event_call(&provider_call, user_message_id, &agent_path);
         if let Some(result) = self.validate_provider_call(&catalog, &provider_call) {
             return ProviderToolExecutionReport {
                 provider_call,
                 events: provider_result_events(call, &result),
-                result: Ok(result),
+                outcome: ToolExecutionOutcome::Completed(result),
             };
         }
 
@@ -1122,7 +1156,7 @@ impl ToolRuntime for LocalToolRuntime {
                 Err(error) => {
                     return ProviderToolExecutionReport {
                         provider_call,
-                        result: Err(error),
+                        outcome: ToolExecutionOutcome::Failed(error),
                         events: Vec::new(),
                     };
                 }
@@ -1186,7 +1220,7 @@ impl ToolRuntime for LocalToolRuntime {
                 Err(error) => {
                     return ProviderToolExecutionReport {
                         provider_call,
-                        result: Err(error),
+                        outcome: ToolExecutionOutcome::Failed(error),
                         events: Vec::new(),
                     };
                 }
@@ -1210,12 +1244,12 @@ impl ToolRuntime for LocalToolRuntime {
                         ProviderToolExecutionReport {
                             provider_call,
                             events: provider_result_events(call, &replayed),
-                            result: Ok(replayed),
+                            outcome: ToolExecutionOutcome::Completed(replayed),
                         }
                     }
                     Err(error) => ProviderToolExecutionReport {
                         provider_call,
-                        result: Err(error),
+                        outcome: ToolExecutionOutcome::Failed(error),
                         events: Vec::new(),
                     },
                 };
@@ -1254,7 +1288,7 @@ impl ToolRuntime for LocalToolRuntime {
                 return ProviderToolExecutionReport {
                     provider_call,
                     events: provider_result_events(call, &blocked),
-                    result: Ok(blocked),
+                    outcome: ToolExecutionOutcome::Completed(blocked),
                 };
             }
             match store.start_effect(prepared.effect_id) {
@@ -1264,7 +1298,7 @@ impl ToolRuntime for LocalToolRuntime {
                 Err(error) => {
                     return ProviderToolExecutionReport {
                         provider_call,
-                        result: Err(error),
+                        outcome: ToolExecutionOutcome::Failed(error),
                         events: Vec::new(),
                     };
                 }
@@ -1280,11 +1314,26 @@ impl ToolRuntime for LocalToolRuntime {
             })
             .await;
         let events = execution.events;
-        let mut provider_result =
-            self.normalize_provider_result(&catalog, &provider_call, execution.result);
+        let mut provider_outcome = match execution.outcome {
+            ToolExecutionOutcome::Completed(result) => self
+                .normalize_provider_result(&catalog, &provider_call, Ok(result))
+                .map_or_else(
+                    ToolExecutionOutcome::Failed,
+                    ToolExecutionOutcome::Completed,
+                ),
+            ToolExecutionOutcome::NeedsApproval(boundary) => {
+                ToolExecutionOutcome::NeedsApproval(boundary)
+            }
+            ToolExecutionOutcome::Failed(error) => self
+                .normalize_provider_result(&catalog, &provider_call, Err(error))
+                .map_or_else(
+                    ToolExecutionOutcome::Failed,
+                    ToolExecutionOutcome::Completed,
+                ),
+        };
 
-        if let (Ok(result), Some(sink), Some(scope)) =
-            (provider_result.as_mut(), completion_sink, completion_scope)
+        if let (ToolExecutionOutcome::Completed(result), Some(sink), Some(scope)) =
+            (&mut provider_outcome, completion_sink, completion_scope)
         {
             if let Some(accepted) = AcceptedToolResult::from_provider_result(result) {
                 let delivery =
@@ -1302,8 +1351,8 @@ impl ToolRuntime for LocalToolRuntime {
         }
 
         if let Some((store, effect_id, policy)) = journal {
-            let finish = match &provider_result {
-                Ok(result) if result.is_error => {
+            let finish = match &provider_outcome {
+                ToolExecutionOutcome::Completed(result) if result.is_error => {
                     let executed = result
                         .metadata
                         .get("errorRecord")
@@ -1332,15 +1381,19 @@ impl ToolRuntime for LocalToolRuntime {
                             store.finish_effect(effect_id, status, Some(value), Some(error))
                         })
                 }
-                Ok(result) => serde_json::to_value(result)
+                ToolExecutionOutcome::Completed(result) => serde_json::to_value(result)
                     .map_err(anyhow::Error::from)
                     .and_then(|value| {
                         store.finish_effect(effect_id, EffectStatus::Succeeded, Some(value), None)
                     }),
-                Err(error) => {
-                    let status = if approval_required(error).is_some()
-                        || policy.side_effect == ToolSideEffect::None
-                        || policy.idempotent
+                ToolExecutionOutcome::NeedsApproval(boundary) => store.finish_effect(
+                    effect_id,
+                    EffectStatus::Failed,
+                    None,
+                    Some(format!("approval required: {}", boundary.reason)),
+                ),
+                ToolExecutionOutcome::Failed(error) => {
+                    let status = if policy.side_effect == ToolSideEffect::None || policy.idempotent
                     {
                         EffectStatus::Failed
                     } else {
@@ -1350,12 +1403,12 @@ impl ToolRuntime for LocalToolRuntime {
                 }
             };
             if let Err(error) = finish {
-                provider_result = Err(error);
+                provider_outcome = ToolExecutionOutcome::Failed(error);
             }
         }
         ProviderToolExecutionReport {
             provider_call,
-            result: provider_result,
+            outcome: provider_outcome,
             events,
         }
     }
@@ -1431,6 +1484,19 @@ fn effect_side_effect_class(side_effect: ToolSideEffect) -> EffectSideEffectClas
     }
 }
 
+fn provider_event_call(
+    provider_call: &ProviderToolCall,
+    turn_id: Uuid,
+    agent_path: &str,
+) -> ToolCall {
+    let logical_name = format!("{agent_path}\0{}", provider_call.id);
+    ToolCall {
+        id: Uuid::new_v5(&turn_id, logical_name.as_bytes()),
+        name: provider_call.name.clone(),
+        input: provider_call.arguments.clone(),
+    }
+}
+
 fn provider_result_events(call: ToolCall, result: &ProviderToolResult) -> Vec<AgentEventPayload> {
     let mut metadata = result.metadata.clone();
     if !metadata.is_object() {
@@ -1489,6 +1555,7 @@ mod tests {
     use crate::model::TurnRecord;
     use crate::store::SqliteSessionStore;
     use crate::turn_inbox::BufferedTurnInbox;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -1567,6 +1634,115 @@ mod tests {
         }
     }
 
+    struct ApprovalBoundaryTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for ApprovalBoundaryTool {
+        fn name(&self) -> &str {
+            "approval_boundary"
+        }
+
+        fn description(&self) -> &str {
+            "test approval boundary"
+        }
+
+        fn schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": false})
+        }
+
+        async fn execute(
+            &self,
+            call: ToolCall,
+            context: ToolInvocationContext,
+        ) -> anyhow::Result<ToolResult> {
+            if !context.approval_granted {
+                return Err(ApprovalRequired::new("approve the exact test call").into());
+            }
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::text(
+                call.id,
+                "executed",
+                json!({"success": true}),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_boundary_is_not_published_as_failure_and_replay_keeps_logical_id() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::default();
+        registry.insert(
+            "approval_boundary".to_string(),
+            Arc::new(ApprovalBoundaryTool {
+                executions: Arc::clone(&executions),
+            }),
+        );
+        let catalog = ToolRuntimeCatalog::new(
+            registry,
+            vec![ProviderToolCandidate::direct(
+                "approval_boundary",
+                "test approval boundary",
+                json!({"type": "object", "additionalProperties": false}),
+            )],
+            CapabilityProjection::unrestricted(),
+            None,
+            HashSet::new(),
+            HashSet::new(),
+        );
+        let sandbox = LocalSandboxConfig::danger_full_access();
+        let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+            std::env::temp_dir(),
+            PermissionMode::Approve,
+            &sandbox,
+        ));
+        let context =
+            ToolInvocationContext::local_with_sandbox_config(std::env::temp_dir(), policy, sandbox);
+        let runtime = LocalToolRuntime::new(Arc::new(crate::provider::MockProvider));
+        let turn_id = Uuid::new_v4();
+        let provider_call = ProviderToolCall {
+            id: "provider-approval-1".to_string(),
+            name: "approval_boundary".to_string(),
+            arguments: json!({}),
+        };
+        let input = |context: ToolInvocationContext| ProviderToolExecutionInput {
+            catalog: catalog.clone(),
+            provider_call: provider_call.clone(),
+            user_message_id: turn_id,
+            agent_path: "/root".to_string(),
+            context,
+            background: BackgroundProcessRegistry::default(),
+            turn_inbox: Arc::new(BufferedTurnInbox::default()),
+        };
+
+        let blocked = runtime.execute_provider_call(input(context.clone())).await;
+        let logical_call_id = match blocked.outcome {
+            ToolExecutionOutcome::NeedsApproval(boundary) => boundary.logical_call_id,
+            other => panic!("expected approval boundary, got {other:?}"),
+        };
+        assert!(blocked.events.is_empty());
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        let mut approved_context = context;
+        approved_context.approval_granted = true;
+        let approved = runtime.execute_provider_call(input(approved_context)).await;
+        assert!(matches!(
+            approved.outcome,
+            ToolExecutionOutcome::Completed(_)
+        ));
+        assert_eq!(approved.events.len(), 2);
+        assert!(matches!(
+            &approved.events[0],
+            AgentEventPayload::ToolCallStarted { call } if call.id == logical_call_id
+        ));
+        assert!(matches!(
+            &approved.events[1],
+            AgentEventPayload::ToolCallFinished { result } if result.call_id == logical_call_id
+        ));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn runtime_executes_concurrently_but_returns_provider_results_in_order() {
         let completions = Arc::new(Mutex::new(Vec::new()));
@@ -1634,8 +1810,14 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].provider_call.id, "provider-1");
         assert_eq!(reports[1].provider_call.id, "provider-2");
-        assert_eq!(reports[0].result.as_ref().unwrap().call_id, "provider-1");
-        assert_eq!(reports[1].result.as_ref().unwrap().call_id, "provider-2");
+        assert_eq!(
+            reports[0].outcome.as_completed().unwrap().call_id,
+            "provider-1"
+        );
+        assert_eq!(
+            reports[1].outcome.as_completed().unwrap().call_id,
+            "provider-2"
+        );
         assert_eq!(reports[0].events.len(), 2);
         assert_eq!(reports[1].events.len(), 2);
     }
