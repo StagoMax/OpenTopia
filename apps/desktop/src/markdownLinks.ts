@@ -5,9 +5,11 @@ export type MarkdownLinkTarget =
   | { kind: "web"; url: string }
   | { kind: "email"; url: string }
   | { kind: "workspace"; path: string; fragment: string | null }
+  | { kind: "local"; path: string; fragment: string | null }
   | { kind: "blocked"; reason: string };
 
 export type MarkdownFileLinkTarget = {
+  kind: "workspace" | "local";
   path: string;
   fragment: string | null;
   fileName: string;
@@ -35,7 +37,13 @@ export function resolveMarkdownLink(
 
   if (isWindowsDrivePath(value)) {
     const { path, fragment } = splitRelativeReference(value);
-    return resolveLiteralFilePath(path, fragment);
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(path);
+    } catch {
+      return { kind: "blocked", reason: "Link path is not valid UTF-8." };
+    }
+    return resolveLiteralFilePath(decodedPath, fragment);
   }
 
   if (value.startsWith("//")) {
@@ -60,9 +68,12 @@ export function resolveMarkdownLink(
     return { kind: "blocked", reason: "Link path is not valid UTF-8." };
   }
 
+  const localBase = localBasePath(baseWorkspacePath);
   const absoluteFromWorkspaceRoot = decodedPath.startsWith("/");
   const baseSegments = absoluteFromWorkspaceRoot
-    ? []
+    ? localBase?.drive
+      ? [localBase.drive]
+      : []
     : workspaceBaseDirectory(baseWorkspacePath);
   const resolved = resolveWorkspaceSegments(baseSegments, decodedPath);
   if (!resolved) {
@@ -72,6 +83,13 @@ export function resolveMarkdownLink(
     };
   }
 
+  if (localBase) {
+    return {
+      kind: "local",
+      path: localBase.unixRoot ? `/${resolved}` : resolved,
+      fragment,
+    };
+  }
   return { kind: "workspace", path: resolved, fragment };
 }
 
@@ -81,10 +99,11 @@ export function resolveMarkdownFileLink(
   baseWorkspacePath?: string | null,
 ): MarkdownFileLinkTarget | null {
   const target = resolveMarkdownLink(href, baseWorkspacePath);
-  if (target.kind !== "workspace") return null;
+  if (target.kind !== "workspace" && target.kind !== "local") return null;
 
   const segments = target.path.replaceAll("\\", "/").split("/").filter(Boolean);
   return {
+    kind: target.kind,
     path: target.path,
     fragment: target.fragment,
     fileName: segments.at(-1) ?? target.path,
@@ -149,9 +168,9 @@ function resolveLiteralFilePath(
   }
 
   const joined = segments.join("/");
-  if (drive) return { kind: "workspace", path: `${drive}/${joined}`, fragment };
+  if (drive) return { kind: "local", path: `${drive}/${joined}`, fragment };
   if (body.startsWith("/"))
-    return { kind: "workspace", path: `/${joined}`, fragment };
+    return { kind: "local", path: `/${joined}`, fragment };
   return { kind: "workspace", path: joined, fragment };
 }
 
@@ -213,6 +232,18 @@ function workspaceBaseDirectory(path?: string | null): string[] {
   const normalized = path.replaceAll("\\", "/").replace(/^\/+/, "");
   const segments = normalized.split("/").filter(Boolean);
   return segments.slice(0, -1);
+}
+
+function localBasePath(
+  path?: string | null,
+): { drive: string | null; unixRoot: boolean } | null {
+  if (!path) return null;
+  const normalized = path.replaceAll("\\", "/");
+  const drive = /^[A-Za-z]:/.exec(normalized)?.[0] ?? null;
+  if (drive) return { drive, unixRoot: false };
+  return normalized.startsWith("/")
+    ? { drive: null, unixRoot: true }
+    : null;
 }
 
 function resolveWorkspaceSegments(base: string[], path: string): string | null {

@@ -233,14 +233,19 @@ function MarkdownAnchor({
   const linkInfo = href
     ? resolveMarkdownFileLink(href, baseWorkspacePath)
     : null;
-  const pathStatus = useWorkspacePathStatus(linkInfo?.path ?? null);
+  const workspaceLinkPath =
+    linkInfo?.kind === "workspace" ? linkInfo.path : null;
+  const workspacePathStatus = useWorkspacePathStatus(workspaceLinkPath);
+  const pathStatus = linkInfo?.kind === "local" ? "known" : workspacePathStatus;
   const fileLinkDisplayState = markdownFileLinkDisplayState(
     detectedLinkInfo !== null,
     pathStatus,
   );
-  const absolutePath = useWorkspaceAbsolutePath(linkInfo?.path ?? null);
+  const workspaceAbsolutePath = useWorkspaceAbsolutePath(workspaceLinkPath);
+  const absolutePath =
+    linkInfo?.kind === "local" ? linkInfo.path : workspaceAbsolutePath;
   const fileActionPath = markdownFileActionPath(linkInfo, absolutePath);
-  const readFileText = useWorkspaceFileTextReader(linkInfo?.path ?? null);
+  const readFileText = useWorkspaceFileTextReader(workspaceLinkPath);
   const anchorRef = useRef<HTMLAnchorElement>(null);
   const [contextMenuPoint, setContextMenuPoint] = useState<{
     x: number;

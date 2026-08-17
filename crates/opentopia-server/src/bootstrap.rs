@@ -206,6 +206,7 @@ async fn assemble_application(args: &Args) -> anyhow::Result<AppState> {
         background,
         app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
         library_providers: Arc::new(library_api::LibraryProviderRegistry::from_env()?),
+        resources: crate::resource_registry::ResourceRegistry::default(),
     };
     spawn_turn_queue_worker(state.clone(), queued_threads);
     Ok(state)

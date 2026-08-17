@@ -19,6 +19,8 @@ use opentopia_core::collaboration::{
 use opentopia_core::collaboration::{SqliteAgentActivitySource, SqliteCollaborationRepository};
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::AgentResumeSignal;
+#[cfg(test)]
+use opentopia_core::PreviewTarget;
 use opentopia_core::{
     agent_model_context_with_runtime, browser_handoff_for_node, configured_provider_from_settings,
     content_fingerprint, discover_plugins, discover_skills, execute_git_workflow,
@@ -48,7 +50,7 @@ use opentopia_core::{
     ModelCallPurpose, ModelContentPart, ModelContextItem, ModelConversationMessage,
     ModelConversationRole, ModelGateway, ModelStreamDelta, ObserveOptions, PermissionMode,
     PluginControlScope, PluginDescriptor, PluginError, PolicyDecision, PolicyEngine,
-    PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest, PreviewTarget,
+    PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest,
     PreviewWorkbook, PromptCacheBreakpointPolicy, ProviderAdapterKind, ProviderAuthKind,
     ProviderConversationCursor, ProviderConversationState, ProviderDriverDescriptor,
     ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck, ProviderKind,
@@ -95,6 +97,7 @@ mod contributions_api;
 mod flows_api;
 mod library_api;
 mod plugins_api;
+mod resource_registry;
 mod routes;
 mod scm_api;
 mod turn_changes;
@@ -103,6 +106,9 @@ mod turns;
 use agent_turn_coordinator::{drive_agent_turn, resume_agent_turn};
 use app_state::AppState;
 use auth::TURN_ID_HEADER;
+use resource_registry::{
+    parse_resource_preview_id, resource_preview_id, ResourceLease, ResourceLocator,
+};
 use turn_changes::{TurnFileDiffPreview, TurnUndoPreview, TurnUndoResult};
 use turns::{TurnCancelResult, TurnHandle};
 
@@ -3502,11 +3508,22 @@ async fn get_artifact(
 async fn resolve_preview(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
-    Json(target): Json<PreviewTarget>,
+    Json(target): Json<ResourceResolveRequest>,
 ) -> Result<Json<PreviewDescriptor>, ApiError> {
     let thread = ensure_thread(&state, thread_id)?;
-    let preview = resolve_preview_target(&state.store, &thread, &target)?;
+    let lease = state.resources.register(thread_id, target.into_locator());
+    let preview = match resolve_resource_lease(&state.store, &thread, &lease) {
+        Ok(preview) => preview,
+        Err(error) => {
+            state.resources.release(thread_id, lease.id);
+            return Err(error);
+        }
+    };
+    if let Some(normalized) = normalized_resource_locator(&lease.locator, &preview.descriptor) {
+        state.resources.replace_locator(lease.id, normalized);
+    }
     let mut descriptor = preview.descriptor;
+    descriptor.id = resource_preview_id(lease.id);
     if descriptor.kind != PreviewKind::Unsupported {
         return Ok(Json(descriptor));
     }
@@ -3528,6 +3545,49 @@ async fn resolve_preview(
         MediaHandlerSelection::None => {}
     }
     Ok(Json(descriptor))
+}
+
+async fn get_resource_metadata(
+    State(state): State<AppState>,
+    Path((thread_id, preview_id)): Path<(Uuid, String)>,
+) -> Result<Json<PreviewDescriptor>, ApiError> {
+    Ok(Json(
+        resolve_preview_id_for_thread(&state, thread_id, &preview_id)?.descriptor,
+    ))
+}
+
+async fn write_resource_content(
+    State(state): State<AppState>,
+    Path((thread_id, preview_id)): Path<(Uuid, String)>,
+    Json(request): Json<ResourceWriteRequest>,
+) -> Result<Json<PreviewDescriptor>, ApiError> {
+    let preview = resolve_preview_id_for_thread(&state, thread_id, &preview_id)?;
+    tokio::task::spawn_blocking(move || {
+        opentopia_core::write_preview_content(
+            &preview,
+            &request.expected_revision,
+            request.content.as_bytes(),
+            MAX_PREVIEW_CONTENT_BYTES,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("resource write worker failed: {error}")))?
+    .map_err(preview_api_error)?;
+    Ok(Json(
+        resolve_preview_id_for_thread(&state, thread_id, &preview_id)?.descriptor,
+    ))
+}
+
+async fn release_resource(
+    State(state): State<AppState>,
+    Path((thread_id, preview_id)): Path<(Uuid, String)>,
+) -> Result<Json<ResourceReleaseResponse>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let resource_id = parse_resource_preview_id(&preview_id)
+        .ok_or_else(|| ApiError::bad_request("invalid resource id"))?;
+    Ok(Json(ResourceReleaseResponse {
+        released: state.resources.release(thread_id, resource_id),
+    }))
 }
 
 async fn read_preview_content(
@@ -3679,16 +3739,85 @@ fn bundled_plugin_enabled_for_thread(
     }))
 }
 
-fn resolve_preview_id_for_thread(
+pub(crate) fn resolve_preview_id_for_thread(
     state: &AppState,
     thread_id: Uuid,
     preview_id: &str,
 ) -> Result<ResolvedPreview, ApiError> {
     let thread = ensure_thread(state, thread_id)?;
-    let target = opentopia_core::decode_preview_id(preview_id).map_err(preview_api_error)?;
-    resolve_preview_target(&state.store, &thread, &target)
+    let resource_id = parse_resource_preview_id(preview_id)
+        .ok_or_else(|| ApiError::bad_request("invalid resource id"))?;
+    let lease = state
+        .resources
+        .get(thread_id, resource_id)
+        .ok_or_else(|| ApiError::not_found("resource handle was not found or has expired"))?;
+    let mut preview = resolve_resource_lease(&state.store, &thread, &lease)?;
+    preview.descriptor.id = preview_id.to_string();
+    Ok(preview)
 }
 
+fn resolve_resource_lease(
+    store: &SqliteSessionStore,
+    thread: &opentopia_core::Thread,
+    lease: &ResourceLease,
+) -> Result<ResolvedPreview, ApiError> {
+    match &lease.locator {
+        ResourceLocator::Workspace { path } => {
+            opentopia_core::resolve_workspace_preview(&thread.workspace_root, path)
+                .map_err(preview_api_error)
+        }
+        ResourceLocator::Local { path } => {
+            opentopia_core::resolve_local_preview(lease.id, path).map_err(preview_api_error)
+        }
+        ResourceLocator::Artifact { artifact_id } => {
+            let artifact = store
+                .get_artifact(thread.id, *artifact_id)?
+                .ok_or_else(|| ApiError::not_found(format!("artifact not found: {artifact_id}")))?;
+            opentopia_core::resolve_artifact_preview(thread.id, &thread.workspace_root, &artifact)
+                .map_err(preview_api_error)
+        }
+        ResourceLocator::Attachment { attachment_id } => {
+            let attachment = store
+                .list_messages(thread.id)?
+                .into_iter()
+                .flat_map(|message| message.parts)
+                .find_map(|part| match part {
+                    MessagePart::SourceRef { source } if source.id == *attachment_id => {
+                        Some(source)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("attachment not found: {attachment_id}"))
+                })?;
+            opentopia_core::resolve_attachment_preview(&attachment).map_err(preview_api_error)
+        }
+    }
+}
+
+fn normalized_resource_locator(
+    original: &ResourceLocator,
+    descriptor: &PreviewDescriptor,
+) -> Option<ResourceLocator> {
+    match original {
+        ResourceLocator::Workspace { .. } => descriptor
+            .path
+            .clone()
+            .map(|path| ResourceLocator::Workspace { path }),
+        ResourceLocator::Local { .. } => descriptor
+            .path
+            .clone()
+            .map(|path| ResourceLocator::Local { path }),
+        ResourceLocator::Artifact { artifact_id } => Some(ResourceLocator::Artifact {
+            artifact_id: *artifact_id,
+        }),
+        ResourceLocator::Attachment { attachment_id } => Some(ResourceLocator::Attachment {
+            attachment_id: *attachment_id,
+        }),
+    }
+}
+
+#[cfg(test)]
 fn resolve_preview_target(
     store: &SqliteSessionStore,
     thread: &opentopia_core::Thread,
@@ -3699,6 +3828,9 @@ fn resolve_preview_target(
             opentopia_core::resolve_workspace_preview(&thread.workspace_root, path)
                 .map_err(preview_api_error)
         }
+        PreviewTarget::Local { .. } => Err(ApiError::bad_request(
+            "local resources must be resolved through the resource registry",
+        )),
         PreviewTarget::Artifact { artifact_id } => {
             let artifact = store
                 .get_artifact(thread.id, *artifact_id)?
@@ -3743,6 +3875,8 @@ fn preview_api_error(error: PreviewError) -> ApiError {
         }
         PreviewError::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         PreviewError::Delimited { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        PreviewError::RevisionConflict { .. } => StatusCode::CONFLICT,
+        PreviewError::ReadOnly(_) => StatusCode::FORBIDDEN,
         PreviewError::InvalidPreviewId(_)
         | PreviewError::ParentDirectoryNotAllowed
         | PreviewError::OutsideWorkspace(_)
@@ -12739,6 +12873,44 @@ struct PreviewRangeQuery {
     start_column: Option<u32>,
     row_count: Option<u32>,
     column_count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "source",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum ResourceResolveRequest {
+    Workspace { path: PathBuf },
+    Local { path: PathBuf },
+    Artifact { artifact_id: Uuid },
+    Attachment { attachment_id: Uuid },
+}
+
+impl ResourceResolveRequest {
+    fn into_locator(self) -> ResourceLocator {
+        match self {
+            Self::Workspace { path } => ResourceLocator::Workspace { path },
+            Self::Local { path } => ResourceLocator::Local { path },
+            Self::Artifact { artifact_id } => ResourceLocator::Artifact { artifact_id },
+            Self::Attachment { attachment_id } => ResourceLocator::Attachment { attachment_id },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResourceWriteRequest {
+    expected_revision: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceReleaseResponse {
+    released: bool,
 }
 
 #[derive(Debug, Deserialize)]

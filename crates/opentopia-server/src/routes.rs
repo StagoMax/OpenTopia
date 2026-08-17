@@ -235,6 +235,28 @@ fn execution_routes() -> Router<AppState> {
             "/api/threads/:thread_id/previews/:preview_id/range",
             get(read_preview_range),
         )
+        .route(
+            "/api/threads/:thread_id/resources/resolve",
+            post(resolve_preview),
+        )
+        .route(
+            "/api/threads/:thread_id/resources/:preview_id",
+            get(get_resource_metadata).delete(release_resource),
+        )
+        .route(
+            "/api/threads/:thread_id/resources/:preview_id/content",
+            get(read_preview_content)
+                .put(write_resource_content)
+                .layer(DefaultBodyLimit::max(MAX_PREVIEW_CONTENT_BYTES as usize)),
+        )
+        .route(
+            "/api/threads/:thread_id/resources/:preview_id/workbook",
+            get(get_preview_workbook),
+        )
+        .route(
+            "/api/threads/:thread_id/resources/:preview_id/range",
+            get(read_preview_range),
+        )
 }
 
 fn integration_routes() -> Router<AppState> {

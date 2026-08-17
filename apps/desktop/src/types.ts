@@ -1483,6 +1483,7 @@ export type PreviewRenderer =
 
 export type PreviewTarget =
   | { type: "workspace"; path: string }
+  | { type: "local"; path: string }
   | { type: "artifact"; artifactId: string }
   | { type: "attachment"; attachmentId: string }
   | { type: "url"; url: string };
@@ -1497,6 +1498,14 @@ export type PreviewDescriptor = {
   bytes?: number | null;
   revision: string;
   readonly: boolean;
+  capabilities: {
+    read: boolean;
+    write: boolean;
+    watch: boolean;
+    rangeRead: boolean;
+    openExternal: boolean;
+  };
+  handlerId?: string | null;
   truncated?: boolean;
   externalPath?: string | null;
 };

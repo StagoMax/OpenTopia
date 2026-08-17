@@ -68,13 +68,13 @@ test("opens detected filesystem paths in the workspace preview", () => {
   );
   assert.deepEqual(
     resolveMarkdownLink("opentopia-file:%2Fsrv%2Fapp%2Fmain.rs"),
-    { kind: "workspace", path: "/srv/app/main.rs", fragment: null },
+    { kind: "local", path: "/srv/app/main.rs", fragment: null },
   );
 });
 
 test("keeps Windows drive paths absolute", () => {
   assert.deepEqual(resolveMarkdownLink("J:\\Project\\OpenTopia\\README.md"), {
-    kind: "workspace",
+    kind: "local",
     path: "J:/Project/OpenTopia/README.md",
     fragment: null,
   });
@@ -83,7 +83,7 @@ test("keeps Windows drive paths absolute", () => {
       "C:/Users/Stargo/Downloads/%E8%B4%A7%E7%89%A9%E8%AE%A2%E5%8D%95.xlsx",
     ),
     {
-      kind: "workspace",
+      kind: "local",
       path: "C:/Users/Stargo/Downloads/货物订单.xlsx",
       fragment: null,
     },
@@ -92,6 +92,7 @@ test("keeps Windows drive paths absolute", () => {
 
 test("derives a filename label from explicit local file links", () => {
   assert.deepEqual(resolveMarkdownFileLink("apps/desktop/src/styles/app.css"), {
+    kind: "workspace",
     path: "apps/desktop/src/styles/app.css",
     fragment: null,
     fileName: "app.css",
@@ -99,12 +100,32 @@ test("derives a filename label from explicit local file links", () => {
   assert.deepEqual(
     resolveMarkdownFileLink("J:/Project/OpenTopia/apps/desktop/src/App.tsx:42"),
     {
+      kind: "local",
       path: "J:/Project/OpenTopia/apps/desktop/src/App.tsx",
       fragment: "L42",
       fileName: "App.tsx",
     },
   );
   assert.equal(resolveMarkdownFileLink("https://example.com/app.css"), null);
+});
+
+test("resolves links inside a local markdown file against its directory", () => {
+  assert.deepEqual(
+    resolveMarkdownLink("../images/diagram.png", "C:/Notes/docs/readme.md"),
+    {
+      kind: "local",
+      path: "C:/Notes/images/diagram.png",
+      fragment: null,
+    },
+  );
+  assert.deepEqual(
+    resolveMarkdownLink("../images/diagram.png", "/home/user/docs/readme.md"),
+    {
+      kind: "local",
+      path: "/home/user/images/diagram.png",
+      fragment: null,
+    },
+  );
 });
 
 test("keeps absolute file links actionable outside the workspace", () => {

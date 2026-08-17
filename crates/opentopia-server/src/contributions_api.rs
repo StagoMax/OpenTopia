@@ -72,13 +72,37 @@ async fn invoke_media_handler(
     let thread = ensure_thread(&state, thread_id)?;
     let active = active_contributions(&state, &thread)?;
     let (registry, _, _) = build_hosts(&active);
-    let source = resolve_workspace_media_source(&thread.workspace_root, &request.path)?;
-    let selection = match request.operation {
-        MediaHandlerOperation::Preview => {
-            registry.select_previewer(Some(&source.relative_path), request.content_type.as_deref())
+    let source = if let Some(resource_id) = request.resource_id.as_deref() {
+        if request.path.is_some() {
+            return Err(ApiError::bad_request(
+                "media handler request must use either resourceId or path",
+            ));
         }
-        MediaHandlerOperation::LoadContext => registry
-            .select_context_loader(Some(&source.relative_path), request.content_type.as_deref()),
+        resolve_registered_media_source(&state, thread_id, resource_id)?
+    } else {
+        resolve_workspace_media_source(
+            &thread.workspace_root,
+            request
+                .path
+                .as_deref()
+                .ok_or_else(|| ApiError::bad_request("media handler source is required"))?,
+        )?
+    };
+    let selection = match request.operation {
+        MediaHandlerOperation::Preview => registry.select_previewer(
+            Some(&source.protocol_path),
+            request
+                .content_type
+                .as_deref()
+                .or(source.content_type.as_deref()),
+        ),
+        MediaHandlerOperation::LoadContext => registry.select_context_loader(
+            Some(&source.protocol_path),
+            request
+                .content_type
+                .as_deref()
+                .or(source.content_type.as_deref()),
+        ),
     };
     let handler = selected_handler(selection)?;
     if request
@@ -97,6 +121,7 @@ async fn invoke_media_handler(
         .cloned()
         .ok_or_else(|| ApiError::bad_request("selected handler is no longer active"))?;
 
+    let content_type = request.content_type.or_else(|| source.content_type.clone());
     let result = invoke_active_media_handler(
         &state,
         thread_id,
@@ -104,7 +129,7 @@ async fn invoke_media_handler(
         &active,
         &contribution,
         source,
-        request.content_type,
+        content_type,
         request.options,
     )
     .await;
@@ -136,7 +161,7 @@ async fn invoke_active_media_handler(
     workspace_root: &FsPath,
     active: &[PluginContribution],
     contribution: &PluginContribution,
-    source: WorkspaceMediaSource,
+    source: MediaSource,
     content_type: Option<String>,
     options: Value,
 ) -> Result<MediaHandlerInvocationResponse, HandlerInvocationError> {
@@ -148,10 +173,12 @@ async fn invoke_active_media_handler(
         settings.permission_mode,
         &sandbox,
     );
-    enforce_handler_policy(
-        policy.inspect_read(&source.canonical_path),
-        "media handler source read",
-    )?;
+    if source.brokered_content.is_none() {
+        enforce_handler_policy(
+            policy.inspect_read(&source.canonical_path),
+            "media handler source read",
+        )?;
+    }
 
     let runtime = MediaHandlerRuntime::parse(
         &MediaHandlerDescriptor::from_contribution(contribution)
@@ -214,7 +241,10 @@ async fn invoke_active_media_handler(
         "media handler MCP tool call",
     )?;
 
-    let content = read_bounded_media_source(source.canonical_path.clone()).await?;
+    let content = match source.brokered_content {
+        Some(content) => content,
+        None => read_bounded_media_source(source.canonical_path.clone()).await?,
+    };
     let invocation = MediaHandlerInvocationV1::new(
         match contribution.kind {
             ContributionKind::Previewer => MediaHandlerOperation::Preview,
@@ -226,7 +256,7 @@ async fn invoke_active_media_handler(
             }
         },
         contribution.id.clone(),
-        path_for_protocol(&source.relative_path),
+        path_for_protocol(&source.protocol_path),
         content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
         &content,
         options,
@@ -584,7 +614,7 @@ fn selected_handler(selection: MediaHandlerSelection) -> Result<MediaHandlerDesc
 fn resolve_workspace_media_source(
     workspace_root: &FsPath,
     requested_path: &FsPath,
-) -> Result<WorkspaceMediaSource, ApiError> {
+) -> Result<MediaSource, ApiError> {
     if requested_path.as_os_str().is_empty()
         || requested_path.is_absolute()
         || requested_path.components().any(|component| {
@@ -624,9 +654,38 @@ fn resolve_workspace_media_source(
         .strip_prefix(&workspace_root)
         .map(PathBuf::from)
         .map_err(|_| ApiError::bad_request("media handler source escapes the thread workspace"))?;
-    Ok(WorkspaceMediaSource {
+    Ok(MediaSource {
         canonical_path,
-        relative_path,
+        protocol_path: relative_path,
+        content_type: None,
+        brokered_content: None,
+    })
+}
+
+fn resolve_registered_media_source(
+    state: &AppState,
+    thread_id: Uuid,
+    resource_id: &str,
+) -> Result<MediaSource, ApiError> {
+    let preview = super::resolve_preview_id_for_thread(state, thread_id, resource_id)?;
+    let descriptor = preview.descriptor.clone();
+    let content =
+        opentopia_core::read_preview_content(&preview, MAX_MEDIA_HANDLER_INPUT_BYTES as u64)
+            .map_err(super::preview_api_error)?;
+    let protocol_name = FsPath::new(&descriptor.name)
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("resource.bin"));
+    let canonical_path = match preview.content {
+        opentopia_core::PreviewContentSource::Path(path) => path,
+        opentopia_core::PreviewContentSource::Inline(_) => protocol_name.clone(),
+    };
+    Ok(MediaSource {
+        canonical_path,
+        protocol_path: protocol_name,
+        content_type: Some(descriptor.content_type),
+        brokered_content: Some(content),
     })
 }
 
@@ -834,9 +893,11 @@ impl HandlerInvocationError {
     }
 }
 
-struct WorkspaceMediaSource {
+struct MediaSource {
     canonical_path: PathBuf,
-    relative_path: PathBuf,
+    protocol_path: PathBuf,
+    content_type: Option<String>,
+    brokered_content: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -845,7 +906,10 @@ struct InvokeMediaHandlerRequest {
     operation: MediaHandlerOperation,
     #[serde(default)]
     contribution_id: Option<String>,
-    path: PathBuf,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    resource_id: Option<String>,
     #[serde(default)]
     content_type: Option<String>,
     #[serde(default = "empty_json_object")]
@@ -1155,6 +1219,7 @@ mod tests {
             background,
             app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
             library_providers: Arc::new(crate::library_api::LibraryProviderRegistry::for_tests()),
+            resources: crate::resource_registry::ResourceRegistry::default(),
         }
     }
 
@@ -1326,7 +1391,7 @@ mod tests {
         std::fs::write(root.join("docs/readme.md"), b"hello").unwrap();
 
         let source = resolve_workspace_media_source(&root, FsPath::new("docs/readme.md")).unwrap();
-        assert_eq!(path_for_protocol(&source.relative_path), "docs/readme.md");
+        assert_eq!(path_for_protocol(&source.protocol_path), "docs/readme.md");
         assert!(resolve_workspace_media_source(&root, FsPath::new("../secret.txt")).is_err());
         assert!(resolve_workspace_media_source(&root, &root.join("docs/readme.md")).is_err());
 
@@ -1404,7 +1469,8 @@ mod tests {
             Json(InvokeMediaHandlerRequest {
                 operation: MediaHandlerOperation::Preview,
                 contribution_id: None,
-                path: PathBuf::from("sample.txt"),
+                path: Some(PathBuf::from("sample.txt")),
+                resource_id: None,
                 content_type: Some("text/plain".to_string()),
                 options: json!({}),
             }),

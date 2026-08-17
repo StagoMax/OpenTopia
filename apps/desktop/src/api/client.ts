@@ -132,14 +132,16 @@ export class ApiResponseError extends Error {
 
 type PreviewDescriptorResponse = {
   id: string;
-  source: "workspace" | "artifact" | "attachment";
+  source: "workspace" | "local" | "artifact" | "attachment";
   path?: string | null;
   name: string;
   kind: "text" | "image" | "pdf" | "document" | "spreadsheet" | "unsupported";
   contentType: string;
   bytes: number;
   readonly: boolean;
+  capabilities?: PreviewDescriptor["capabilities"];
   revision: string;
+  handlerId?: string | null;
 };
 
 type SpreadsheetWorkbookResponse = {
@@ -170,7 +172,6 @@ type SpreadsheetRangeResponse = {
 
 export class ApiClient {
   private readonly apiToken: string;
-  private readonly legacyPreviewContent = new Map<string, Blob>();
 
   constructor(
     private readonly baseUrl: string,
@@ -1443,54 +1444,32 @@ export class ApiClient {
         contentType: "text/html",
         revision: target.url,
         readonly: true,
+        capabilities: {
+          read: true,
+          write: false,
+          watch: false,
+          rangeRead: false,
+          openExternal: false,
+        },
       };
     }
 
-    try {
-      const response = await this.post<PreviewDescriptorResponse>(
-        `/api/threads/${threadId}/previews/resolve`,
-        target.type === "workspace"
-          ? { source: "workspace", path: target.path }
+    const response = await this.post<PreviewDescriptorResponse>(
+      `/api/threads/${threadId}/resources/resolve`,
+      target.type === "workspace"
+        ? { source: "workspace", path: target.path }
+        : target.type === "local"
+          ? { source: "local", path: target.path }
           : target.type === "artifact"
             ? { source: "artifact", artifactId: target.artifactId }
             : { source: "attachment", attachmentId: target.attachmentId },
-      );
-      return {
-        id: response.id,
-        threadId,
-        target,
-        renderer:
-          response.kind === "text"
-            ? previewRenderer(response.name, response.contentType)
-            : response.kind,
-        title: response.name,
-        contentType: response.contentType,
-        bytes: response.bytes,
-        revision: response.revision,
-        readonly: response.readonly,
-        externalPath:
-          response.source === "artifact" || response.source === "attachment"
-            ? response.path
-            : undefined,
-      };
-    } catch (cause) {
-      if (
-        cause instanceof ApiResponseError &&
-        cause.status === 404 &&
-        target.type !== "attachment"
-      ) {
-        return this.resolveLegacyPreview(threadId, target);
-      }
-      throw cause;
-    }
+    );
+    return mapPreviewDescriptor(response, threadId, target);
   }
 
   async getPreviewContent(threadId: string, previewId: string): Promise<Blob> {
-    const legacy = this.legacyPreviewContent.get(previewId);
-    if (legacy) return legacy;
-
     const response = await fetch(
-      `${this.baseUrl}/api/threads/${threadId}/previews/${encodeURIComponent(previewId)}/content`,
+      `${this.baseUrl}/api/threads/${threadId}/resources/${encodeURIComponent(previewId)}/content`,
       { headers: this.authHeaders() },
     );
     if (!response.ok) {
@@ -1503,12 +1482,41 @@ export class ApiClient {
     return response.blob();
   }
 
+  async getResourceMetadata(
+    descriptor: PreviewDescriptor,
+  ): Promise<PreviewDescriptor> {
+    const response = await this.get<PreviewDescriptorResponse>(
+      `/api/threads/${descriptor.threadId}/resources/${encodeURIComponent(descriptor.id)}`,
+    );
+    return mapPreviewDescriptor(
+      response,
+      descriptor.threadId,
+      descriptor.target,
+    );
+  }
+
+  async writeResourceContent(
+    descriptor: PreviewDescriptor,
+    content: string,
+    expectedRevision: string,
+  ): Promise<PreviewDescriptor> {
+    const response = await this.put<PreviewDescriptorResponse>(
+      `/api/threads/${descriptor.threadId}/resources/${encodeURIComponent(descriptor.id)}/content`,
+      { content, expectedRevision },
+    );
+    return mapPreviewDescriptor(
+      response,
+      descriptor.threadId,
+      descriptor.target,
+    );
+  }
+
   async getSpreadsheetPreview(
     threadId: string,
     previewId: string,
   ): Promise<SpreadsheetPreview> {
     const workbook = await this.get<SpreadsheetWorkbookResponse>(
-      `/api/threads/${threadId}/previews/${encodeURIComponent(previewId)}/workbook`,
+      `/api/threads/${threadId}/resources/${encodeURIComponent(previewId)}/workbook`,
     );
     return {
       previewId: workbook.previewId,
@@ -1535,7 +1543,7 @@ export class ApiClient {
     signal?: AbortSignal,
   ): Promise<SpreadsheetPreviewRange> {
     const response = await this.get<SpreadsheetRangeResponse>(
-      `/api/threads/${threadId}/previews/${encodeURIComponent(previewId)}/range${queryString(
+      `/api/threads/${threadId}/resources/${encodeURIComponent(previewId)}/range${queryString(
         {
           sheet: sheetId,
           startRow: input.rowStart,
@@ -1565,8 +1573,11 @@ export class ApiClient {
     };
   }
 
-  async closePreview(previewId: string): Promise<void> {
-    this.legacyPreviewContent.delete(previewId);
+  async closePreview(threadId: string, previewId: string): Promise<void> {
+    if (!previewId.startsWith("resource.")) return;
+    await this.delete(
+      `/api/threads/${threadId}/resources/${encodeURIComponent(previewId)}`,
+    );
   }
 
   async listMcpServers(signal?: AbortSignal): Promise<McpServerView[]> {
@@ -1671,58 +1682,6 @@ export class ApiClient {
       signal,
     });
     return parseResponse<T>(response);
-  }
-
-  private async resolveLegacyPreview(
-    threadId: string,
-    target: Exclude<PreviewTarget, { type: "url" } | { type: "attachment" }>,
-  ): Promise<PreviewDescriptor> {
-    if (target.type === "workspace") {
-      const file = await this.readWorkspaceFile(threadId, target.path);
-      const id = `legacy-workspace:${threadId}:${target.path}`;
-      const contentType = previewContentType(target.path);
-      this.legacyPreviewContent.set(
-        id,
-        new Blob([file.content], { type: contentType }),
-      );
-      return {
-        id,
-        threadId,
-        target,
-        renderer: previewRenderer(target.path, contentType),
-        title: previewTitle(target.path),
-        contentType,
-        bytes: file.bytes,
-        revision: `${file.bytes}:${file.truncated ? "truncated" : "complete"}`,
-        readonly: file.readonly,
-        truncated: file.truncated,
-      };
-    }
-
-    const artifact = await this.getArtifact(threadId, target.artifactId);
-    const displayPath = artifact.filePath || target.artifactId;
-    const id = `legacy-artifact:${threadId}:${target.artifactId}`;
-    const contentType = previewContentType(displayPath);
-    const hasReadableContent = !artifact.filePath;
-    if (hasReadableContent) {
-      this.legacyPreviewContent.set(
-        id,
-        new Blob([artifact.content], { type: contentType }),
-      );
-    }
-    return {
-      id,
-      threadId,
-      target,
-      renderer: hasReadableContent
-        ? previewRenderer(displayPath, contentType)
-        : "unsupported",
-      title: previewTitle(displayPath),
-      contentType,
-      revision: id,
-      readonly: true,
-      externalPath: artifact.filePath,
-    };
   }
 
   private async post<T>(path: string, body: unknown): Promise<T> {
@@ -1929,9 +1888,40 @@ function queryString(
   return query ? `?${query}` : "";
 }
 
-function previewTitle(path: string): string {
-  const normalized = path.replace(/[\\/]+$/, "");
-  return normalized.split(/[\\/]/).at(-1) || path;
+function mapPreviewDescriptor(
+  response: PreviewDescriptorResponse,
+  threadId: string,
+  target: PreviewTarget,
+): PreviewDescriptor {
+  const capabilities = response.capabilities ?? {
+    read: true,
+    write: !response.readonly,
+    watch: false,
+    rangeRead: response.kind === "spreadsheet",
+    openExternal: Boolean(response.path),
+  };
+  return {
+    id: response.id,
+    threadId,
+    target,
+    renderer:
+      response.kind === "text"
+        ? previewRenderer(response.name, response.contentType)
+        : response.kind,
+    title: response.name,
+    contentType: response.contentType,
+    bytes: response.bytes,
+    revision: response.revision,
+    readonly: response.readonly,
+    capabilities,
+    handlerId: response.handlerId,
+    externalPath:
+      response.source === "local" ||
+      response.source === "artifact" ||
+      response.source === "attachment"
+        ? response.path
+        : undefined,
+  };
 }
 
 function previewRenderer(
@@ -1982,35 +1972,6 @@ function previewRenderer(
   }
   if (mediaType.startsWith("text/")) return "text";
   return "unsupported";
-}
-
-function previewContentType(path: string): string {
-  const extension = path.split(".").at(-1)?.toLocaleLowerCase() ?? "";
-  const known: Record<string, string> = {
-    bmp: "image/bmp",
-    css: "text/css",
-    csv: "text/csv",
-    gif: "image/gif",
-    html: "text/html",
-    jpeg: "image/jpeg",
-    jpg: "image/jpeg",
-    js: "text/javascript",
-    json: "application/json",
-    md: "text/markdown",
-    pdf: "application/pdf",
-    png: "image/png",
-    svg: "image/svg+xml",
-    ts: "text/typescript",
-    tsv: "text/tab-separated-values",
-    txt: "text/plain",
-    webp: "image/webp",
-    xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
-    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    xml: "application/xml",
-    yaml: "text/yaml",
-    yml: "text/yaml",
-  };
-  return known[extension] ?? "application/octet-stream";
 }
 
 function spreadsheetCellValue(value: {

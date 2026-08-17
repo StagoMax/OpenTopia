@@ -2,6 +2,7 @@ use super::agent_factory::AgentFactory;
 use super::agent_runs::ServerAgentRunScheduler;
 use super::auth::ApiAuth;
 use super::library_api;
+use super::resource_registry::ResourceRegistry;
 use super::turn_changes::TurnChangeManager;
 use super::turns::RootTurnLifecycle;
 use super::{EventBus, PtyManager, TerminalBus};
@@ -50,4 +51,5 @@ pub(super) struct AppState {
     pub(super) background: BackgroundProcessRegistry,
     pub(super) app_views: Arc<Mutex<opentopia_core::AppViewHost>>,
     pub(super) library_providers: Arc<library_api::LibraryProviderRegistry>,
+    pub(super) resources: ResourceRegistry,
 }

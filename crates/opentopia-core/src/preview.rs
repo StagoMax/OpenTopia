@@ -7,11 +7,19 @@ use crate::spreadsheet::{
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Read};
+use std::fs::OpenOptions;
+use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
 use uuid::Uuid;
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 
 pub const MAX_PREVIEW_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
 const DELIMITED_PREVIEW_SHEET: &str = "Data";
@@ -31,8 +39,21 @@ pub enum PreviewKind {
 #[serde(rename_all = "snake_case")]
 pub enum PreviewSource {
     Workspace,
+    Local,
     Artifact,
     Attachment,
+}
+
+/// Operations granted to a resolved resource. Renderers consume these
+/// capabilities instead of inferring authority from where a file came from.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewCapabilities {
+    pub read: bool,
+    pub write: bool,
+    pub watch: bool,
+    pub range_read: bool,
+    pub open_external: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +64,7 @@ pub enum PreviewSource {
 )]
 pub enum PreviewTarget {
     Workspace { path: PathBuf },
+    Local { resource_id: Uuid },
     Artifact { artifact_id: Uuid },
     Attachment { attachment_id: Uuid },
 }
@@ -58,6 +80,8 @@ pub struct PreviewDescriptor {
     pub content_type: String,
     pub bytes: u64,
     pub readonly: bool,
+    #[serde(default)]
+    pub capabilities: PreviewCapabilities,
     pub revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler_id: Option<String>,
@@ -126,6 +150,10 @@ pub enum PreviewError {
     OutsideWorkspace(PathBuf),
     #[error("preview path is not a file: {0}")]
     NotAFile(PathBuf),
+    #[error("preview resource is read-only: {0}")]
+    ReadOnly(String),
+    #[error("preview resource changed (expected {expected}, current {actual})")]
+    RevisionConflict { expected: String, actual: String },
     #[error("artifact {artifact_id} does not belong to thread {thread_id}")]
     ArtifactThreadMismatch { artifact_id: Uuid, thread_id: Uuid },
     #[error("preview content is {actual_bytes} bytes; limit is {limit_bytes} bytes")]
@@ -158,6 +186,7 @@ pub fn encode_preview_id(target: &PreviewTarget) -> String {
             let path = path.to_string_lossy();
             format!("workspace.{}", URL_SAFE_NO_PAD.encode(path.as_bytes()))
         }
+        PreviewTarget::Local { resource_id } => format!("local.{resource_id}"),
         PreviewTarget::Artifact { artifact_id } => format!("artifact.{artifact_id}"),
         PreviewTarget::Attachment { attachment_id } => {
             format!("attachment.{attachment_id}")
@@ -183,6 +212,11 @@ pub fn decode_preview_id(id: &str) -> Result<PreviewTarget, PreviewError> {
         let artifact_id =
             Uuid::parse_str(raw_id).map_err(|_| PreviewError::InvalidPreviewId(id.to_string()))?;
         return Ok(PreviewTarget::Artifact { artifact_id });
+    }
+    if let Some(raw_id) = id.strip_prefix("local.") {
+        let resource_id =
+            Uuid::parse_str(raw_id).map_err(|_| PreviewError::InvalidPreviewId(id.to_string()))?;
+        return Ok(PreviewTarget::Local { resource_id });
     }
     if let Some(raw_id) = id.strip_prefix("attachment.") {
         let attachment_id =
@@ -223,6 +257,8 @@ pub fn resolve_workspace_preview(
         .expect("workspace boundary checked")
         .to_path_buf();
     let content_type = infer_content_type(&resolved, None);
+    let kind = classify_preview(&content_type, &resolved);
+    let capabilities = file_capabilities(&metadata, kind);
     let target = PreviewTarget::Workspace {
         path: relative_path.clone(),
     };
@@ -231,11 +267,45 @@ pub fn resolve_workspace_preview(
         source: PreviewSource::Workspace,
         path: Some(relative_path),
         name: file_name(&resolved),
-        kind: classify_preview(&content_type, &resolved),
+        kind,
         content_type,
         bytes: metadata.len(),
-        readonly: true,
+        readonly: !capabilities.write,
+        capabilities,
         revision: file_revision("w", &metadata),
+        handler_id: None,
+    };
+    Ok(ResolvedPreview {
+        descriptor,
+        content: PreviewContentSource::Path(resolved),
+    })
+}
+
+/// Resolves a user-opened local file. The raw path is accepted only at the
+/// resource-registration boundary; subsequent operations use `resource_id`.
+pub fn resolve_local_preview(
+    resource_id: Uuid,
+    requested: &Path,
+) -> Result<ResolvedPreview, PreviewError> {
+    let resolved = requested
+        .canonicalize()
+        .map_err(|_| PreviewError::PathNotFound(requested.to_path_buf()))?;
+    let metadata = file_metadata(&resolved)?;
+    let content_type = infer_content_type(&resolved, None);
+    let kind = classify_preview(&content_type, &resolved);
+    let capabilities = file_capabilities(&metadata, kind);
+    let target = PreviewTarget::Local { resource_id };
+    let descriptor = PreviewDescriptor {
+        id: encode_preview_id(&target),
+        source: PreviewSource::Local,
+        path: Some(resolved.clone()),
+        name: file_name(&resolved),
+        kind,
+        content_type,
+        bytes: metadata.len(),
+        readonly: !capabilities.write,
+        capabilities,
+        revision: file_revision(&format!("l-{resource_id}"), &metadata),
         handler_id: None,
     };
     Ok(ResolvedPreview {
@@ -302,6 +372,7 @@ pub fn resolve_artifact_preview(
         }
     };
     let kind = classify_preview(&content_type, Path::new(&name));
+    let open_external = path.is_some();
     let descriptor = PreviewDescriptor {
         id: encode_preview_id(&target),
         source: PreviewSource::Artifact,
@@ -311,6 +382,12 @@ pub fn resolve_artifact_preview(
         content_type,
         bytes,
         readonly: true,
+        capabilities: PreviewCapabilities {
+            read: true,
+            open_external,
+            range_read: kind == PreviewKind::Spreadsheet,
+            ..PreviewCapabilities::default()
+        },
         revision,
         handler_id: None,
     };
@@ -335,6 +412,7 @@ pub fn resolve_attachment_preview(
         .map_err(|_| PreviewError::PathNotFound(attachment.path.clone()))?;
     let metadata = file_metadata(&resolved)?;
     let content_type = infer_content_type(&resolved, Some(&attachment.content_type));
+    let kind = classify_preview(&content_type, Path::new(&attachment.name));
     let target = PreviewTarget::Attachment {
         attachment_id: attachment.id,
     };
@@ -343,10 +421,16 @@ pub fn resolve_attachment_preview(
         source: PreviewSource::Attachment,
         path: Some(resolved.clone()),
         name: attachment.name.clone(),
-        kind: classify_preview(&content_type, Path::new(&attachment.name)),
+        kind,
         content_type,
         bytes: metadata.len(),
         readonly: true,
+        capabilities: PreviewCapabilities {
+            read: true,
+            range_read: kind == PreviewKind::Spreadsheet,
+            open_external: true,
+            ..PreviewCapabilities::default()
+        },
         revision: file_revision(&format!("u-{}", attachment.id), &metadata),
         handler_id: None,
     };
@@ -382,6 +466,51 @@ pub fn read_preview_content(
         });
     }
     Ok(bytes)
+}
+
+/// Commits edited content using optimistic concurrency and a same-directory
+/// atomic replacement. A UTF-8 BOM already present in the file is preserved.
+pub fn write_preview_content(
+    preview: &ResolvedPreview,
+    expected_revision: &str,
+    content: &[u8],
+    max_bytes: u64,
+) -> Result<(), PreviewError> {
+    if !preview.descriptor.capabilities.write {
+        return Err(PreviewError::ReadOnly(preview.descriptor.id.clone()));
+    }
+    if content.len() as u64 > max_bytes {
+        return Err(PreviewError::ContentTooLarge {
+            actual_bytes: content.len() as u64,
+            limit_bytes: max_bytes,
+        });
+    }
+    let path = match &preview.content {
+        PreviewContentSource::Path(path) => path,
+        PreviewContentSource::Inline(_) => {
+            return Err(PreviewError::ReadOnly(preview.descriptor.id.clone()))
+        }
+    };
+    let metadata = file_metadata(path)?;
+    let actual_revision = file_revision(revision_prefix(&preview.descriptor.revision), &metadata);
+    if actual_revision != expected_revision {
+        return Err(PreviewError::RevisionConflict {
+            expected: expected_revision.to_string(),
+            actual: actual_revision,
+        });
+    }
+    let preserve_utf8_bom = std::fs::File::open(path)
+        .and_then(|mut file| {
+            let mut bom = [0_u8; 3];
+            file.read_exact(&mut bom).map(|_| bom == [0xef, 0xbb, 0xbf])
+        })
+        .unwrap_or(false);
+    let mut bytes = Vec::with_capacity(content.len() + usize::from(preserve_utf8_bom) * 3);
+    if preserve_utf8_bom && !content.starts_with(&[0xef, 0xbb, 0xbf]) {
+        bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+    }
+    bytes.extend_from_slice(content);
+    atomic_replace(path, &bytes)
 }
 
 pub fn preview_workbook(preview: &ResolvedPreview) -> Result<PreviewWorkbook, PreviewError> {
@@ -687,6 +816,85 @@ fn file_metadata(path: &Path) -> Result<std::fs::Metadata, PreviewError> {
     Ok(metadata)
 }
 
+fn file_capabilities(metadata: &std::fs::Metadata, kind: PreviewKind) -> PreviewCapabilities {
+    PreviewCapabilities {
+        read: true,
+        write: !metadata.permissions().readonly(),
+        watch: true,
+        range_read: kind == PreviewKind::Spreadsheet,
+        open_external: true,
+    }
+}
+
+fn atomic_replace(path: &Path, content: &[u8]) -> Result<(), PreviewError> {
+    let parent = path.parent().ok_or_else(|| PreviewError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preview path has no parent directory",
+        ),
+    })?;
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_else(|| "resource".into());
+    let temporary = parent.join(format!(".{name}.opentopia-{}.tmp", Uuid::new_v4()));
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(content)?;
+        file.sync_all()
+    })();
+    if let Err(source) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(PreviewError::Io {
+            path: temporary,
+            source,
+        });
+    }
+    if let Err(source) = publish_atomic_replacement(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(PreviewError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_atomic_replacement(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn publish_atomic_replacement(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    let temporary_wide = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            temporary_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn file_revision(prefix: &str, metadata: &std::fs::Metadata) -> String {
     let modified = metadata
         .modified()
@@ -695,6 +903,14 @@ fn file_revision(prefix: &str, metadata: &std::fs::Metadata) -> String {
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     format!("{prefix}-{:x}-{modified:x}", metadata.len())
+}
+
+fn revision_prefix(revision: &str) -> &str {
+    revision
+        .rsplit_once('-')
+        .and_then(|(without_modified, _)| without_modified.rsplit_once('-'))
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(revision)
 }
 
 fn artifact_display_name(artifact: &Artifact, path: Option<&Path>) -> String {
@@ -891,6 +1107,79 @@ mod tests {
         let error = resolve_workspace_preview(directory.path(), Path::new("../outside.txt"))
             .expect_err("parent traversal must fail");
         assert!(matches!(error, PreviewError::ParentDirectoryNotAllowed));
+    }
+
+    #[test]
+    fn local_preview_uses_an_opaque_identity_and_can_write_with_a_revision() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("说明.md");
+        std::fs::write(&path, b"# Before\n").expect("write markdown fixture");
+        let resource_id = Uuid::new_v4();
+        let preview = resolve_local_preview(resource_id, &path).expect("resolve local preview");
+
+        assert_eq!(preview.descriptor.source, PreviewSource::Local);
+        assert_eq!(
+            decode_preview_id(&preview.descriptor.id).expect("decode local preview id"),
+            PreviewTarget::Local { resource_id }
+        );
+        assert!(preview.descriptor.capabilities.read);
+        assert!(preview.descriptor.capabilities.write);
+        assert!(preview.descriptor.capabilities.watch);
+
+        write_preview_content(
+            &preview,
+            &preview.descriptor.revision,
+            b"# After\n",
+            MAX_PREVIEW_CONTENT_BYTES,
+        )
+        .expect("commit local edit");
+        assert_eq!(std::fs::read(&path).unwrap(), b"# After\n");
+
+        let current = resolve_local_preview(resource_id, &path).expect("refresh local preview");
+        let error = write_preview_content(
+            &current,
+            &preview.descriptor.revision,
+            b"stale",
+            MAX_PREVIEW_CONTENT_BYTES,
+        )
+        .expect_err("stale revision must fail");
+        assert!(matches!(error, PreviewError::RevisionConflict { .. }));
+    }
+
+    #[test]
+    fn preview_write_rechecks_the_file_revision_at_commit_time() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("concurrent.md");
+        std::fs::write(&path, b"initial").expect("write initial fixture");
+        let preview = resolve_local_preview(Uuid::new_v4(), &path).unwrap();
+
+        std::fs::write(&path, b"external concurrent change").expect("change fixture externally");
+        let error = write_preview_content(
+            &preview,
+            &preview.descriptor.revision,
+            b"stale replacement",
+            MAX_PREVIEW_CONTENT_BYTES,
+        )
+        .expect_err("stale preview must not overwrite a newer file");
+
+        assert!(matches!(error, PreviewError::RevisionConflict { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), b"external concurrent change");
+    }
+
+    #[test]
+    fn preview_writes_preserve_an_existing_utf8_bom() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("bom.md");
+        std::fs::write(&path, b"\xef\xbb\xbf# Before\r\n").expect("write BOM fixture");
+        let preview = resolve_local_preview(Uuid::new_v4(), &path).unwrap();
+        write_preview_content(
+            &preview,
+            &preview.descriptor.revision,
+            b"# After\r\n",
+            MAX_PREVIEW_CONTENT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"\xef\xbb\xbf# After\r\n");
     }
 
     #[test]

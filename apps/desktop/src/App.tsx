@@ -110,6 +110,7 @@ import { PlanChoiceCard } from "./components/PlanChoiceCard";
 import {
   InlineImagePreview,
   type ImagePreviewSource,
+  type PreviewDocumentSession,
   PreviewHost,
 } from "./components/PreviewHost";
 import { FlowWorkspacePanel } from "./components/FlowWorkspacePanel";
@@ -426,6 +427,7 @@ type ToolTab = {
   imagePreview?: ImagePreviewSource;
   sideTaskThreadId?: string;
   previewTarget?: PreviewTarget;
+  previewSession?: PreviewDocumentSession;
   browserNavigation?: BrowserNavigationRequest;
 };
 
@@ -977,6 +979,15 @@ export function App() {
   );
   const [taskSearchOpen, setTaskSearchOpen] = useState(false);
   const [keyboardShortcutsOpen, setKeyboardShortcutsOpen] = useState(false);
+
+  useEffect(() => {
+    if (!toolTabs.some((tab) => tab.previewSession?.dirty)) return;
+    const confirmUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+    };
+    window.addEventListener("beforeunload", confirmUnload);
+    return () => window.removeEventListener("beforeunload", confirmUnload);
+  }, [toolTabs]);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [turnUndoDialog, setTurnUndoDialog] =
@@ -2852,11 +2863,13 @@ export function App() {
     const targetKey =
       target.type === "workspace"
         ? `workspace:${target.path}`
-        : target.type === "artifact"
-          ? `artifact:${target.artifactId}`
-          : target.type === "attachment"
-            ? `attachment:${target.attachmentId}`
-            : `url:${target.url}`;
+        : target.type === "local"
+          ? `local:${target.path}`
+          : target.type === "artifact"
+            ? `artifact:${target.artifactId}`
+            : target.type === "attachment"
+              ? `attachment:${target.attachmentId}`
+              : `url:${target.url}`;
     const id = `preview:${threadId}:${targetKey}`;
     setToolTabs((current) =>
       current.some((tab) => tab.id === id)
@@ -2913,6 +2926,14 @@ export function App() {
         );
         return;
       }
+      if (target.kind === "local") {
+        openPreviewTab(
+          activeThread.id,
+          { type: "local", path: target.path },
+          markdownLinkTitle(target.path),
+        );
+        return;
+      }
 
       const navigation: BrowserNavigationRequest = {
         id: `${activeThread.id}:${++markdownNavigationIdRef.current}`,
@@ -2944,6 +2965,13 @@ export function App() {
   );
 
   function closeToolTab(tabId: string) {
+    const closingTab = toolTabs.find((tab) => tab.id === tabId);
+    if (
+      closingTab?.previewSession?.dirty &&
+      !window.confirm("关闭标签会丢弃尚未保存的 Markdown 更改，是否继续？")
+    ) {
+      return;
+    }
     setToolTabs((current) => {
       const next = closeToolTabState(current, activeToolTabId, tabId);
       if (next.activeTabId !== activeToolTabId) {
@@ -2956,6 +2984,17 @@ export function App() {
       return next.tabs;
     });
   }
+
+  const updatePreviewSession = useCallback(
+    (tabId: string, session: PreviewDocumentSession) => {
+      setToolTabs((current) =>
+        current.map((tab) =>
+          tab.id === tabId ? { ...tab, previewSession: session } : tab,
+        ),
+      );
+    },
+    [],
+  );
 
   async function chooseWorkspace(
     bindDraftProject = false,
@@ -5146,6 +5185,7 @@ export function App() {
             onOpenSettings={openModelSettings}
             onActivateToolTab={setActiveToolTabId}
             onCloseToolTab={closeToolTab}
+            onPreviewSessionChange={updatePreviewSession}
             onToggleConversation={() =>
               setConversationCollapsed((current) => !current)
             }
@@ -12057,6 +12097,7 @@ function RightPanel({
   onOpenSettings,
   onActivateToolTab,
   onCloseToolTab,
+  onPreviewSessionChange,
   onToggleConversation,
   onHideToolStage,
   onAddContextSources,
@@ -12163,6 +12204,10 @@ function RightPanel({
   onOpenSettings(): void;
   onActivateToolTab(tabId: string): void;
   onCloseToolTab(tabId: string): void;
+  onPreviewSessionChange(
+    tabId: string,
+    session: PreviewDocumentSession,
+  ): void;
   onToggleConversation(): void;
   onHideToolStage(): void;
   onAddContextSources(): void;
@@ -12328,10 +12373,13 @@ function RightPanel({
             activeToolTab.previewTarget ? (
             <PreviewHost
               client={client}
+              sessionId={activeToolTab.id}
+              sessionState={activeToolTab.previewSession}
               threadId={thread?.id ?? null}
               workspaceRoot={workspaceRoot}
               target={activeToolTab.previewTarget}
               onOpenMarkdownLink={onOpenMarkdownLink}
+              onSessionChange={onPreviewSessionChange}
             />
           ) : (
             activeToolTab.kind !== "image" &&
