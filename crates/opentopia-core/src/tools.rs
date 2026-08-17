@@ -31,8 +31,9 @@ use crate::execution_authorization::{
     ToolExecutionIntent,
 };
 use crate::file_mutation::{
-    lock_mutation_paths, read_optional, FileMutationBatch, FileMutationBatchResult,
-    FileMutationObserver, FileMutationScope, FileMutationTarget, PreparedFileMutation,
+    lock_mutation_paths, normalize_text_encoding, read_optional, FileMutationBatch,
+    FileMutationBatchResult, FileMutationObserver, FileMutationScope, FileMutationTarget,
+    PreparedFileMutation,
 };
 use crate::flow_runtime::FlowNodeHarness;
 use crate::mcp::{McpCallResult, McpToolDescriptor};
@@ -607,7 +608,7 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SpreadsheetToolAction {
     Inspect,
@@ -642,18 +643,21 @@ enum SpreadsheetCopyContentMode {
     deny_unknown_fields
 )]
 enum SpreadsheetBatchOperation {
+    #[schemars(rename_all = "camelCase")]
     WriteRows {
         sheet: String,
         start: CellAddress,
         #[schemars(length(max = 10000))]
         rows: Vec<Vec<SpreadsheetCellInput>>,
     },
+    #[schemars(rename_all = "camelCase")]
     WriteColumns {
         sheet: String,
         start: CellAddress,
         #[schemars(length(max = 256))]
         columns: Vec<Vec<SpreadsheetCellInput>>,
     },
+    #[schemars(rename_all = "camelCase")]
     CopyRows {
         source_path: String,
         source_sheet: String,
@@ -665,6 +669,7 @@ enum SpreadsheetBatchOperation {
         #[serde(default)]
         content_mode: SpreadsheetCopyContentMode,
     },
+    #[schemars(rename_all = "camelCase")]
     CopyColumns {
         source_path: String,
         source_sheet: String,
@@ -679,108 +684,466 @@ enum SpreadsheetBatchOperation {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SpreadsheetToolInput {
-    action: SpreadsheetToolAction,
-    /// Workspace-relative XLSX path. For mutations this is the destination and,
-    /// when it exists, the workbook updated in place.
-    #[serde(default)]
-    path: Option<String>,
-    /// Opaque user attachment ID for inspect/list/read. Provide either this or path.
-    #[serde(default)]
-    attachment_id: Option<String>,
-    /// Worksheet name for single-range or row/column reads.
-    #[serde(default)]
-    sheet: Option<String>,
-    /// Inclusive zero-based range for read_range.
-    #[serde(default)]
-    range: Option<CellRange>,
-    /// Multiple sheet/range pairs for read_ranges.
-    #[serde(default)]
-    #[schemars(length(max = 64))]
-    ranges: Vec<SheetRangeRequest>,
-    /// Zero-based starting row for read_rows/read_columns.
-    #[serde(default)]
-    start_row: Option<u32>,
-    /// Zero-based starting column for read_rows/read_columns.
-    #[serde(default)]
-    start_column: Option<u32>,
-    /// Number of rows for read_rows/read_columns.
-    #[serde(default)]
-    row_count: Option<u32>,
-    /// Number of columns for read_rows/read_columns.
-    #[serde(default)]
-    column_count: Option<u32>,
-    /// Text query for find.
-    #[serde(default)]
-    query: Option<String>,
-    /// Text matching behavior for find.
-    #[serde(default)]
-    match_mode: Option<SpreadsheetTextMatchMode>,
-    /// Whether find comparisons are case-sensitive. Filter conditions carry their own setting.
-    #[serde(default)]
-    case_sensitive: bool,
-    /// Include formula expressions while finding cells.
-    #[serde(default)]
-    include_formulas: bool,
-    /// Row predicates for filter_rows. Condition columns are absolute and zero-based.
-    #[serde(default)]
-    #[schemars(length(max = 32))]
-    conditions: Vec<SpreadsheetFilterCondition>,
-    /// Whether every or any filter condition must match.
-    #[serde(default)]
-    filter_match_mode: Option<SpreadsheetFilterMatchMode>,
-    /// Maximum matches returned by find or filter_rows.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 1000))]
-    max_results: Option<usize>,
-    /// Start cell for compact write_rows/write_columns calls.
-    #[serde(default)]
-    start: Option<CellAddress>,
-    /// Matrix for compact write_rows calls.
-    #[serde(default)]
-    #[schemars(length(max = 10000))]
-    rows: Vec<Vec<SpreadsheetCellInput>>,
-    /// Matrix for compact write_columns calls.
-    #[serde(default)]
-    #[schemars(length(max = 256))]
-    columns: Vec<Vec<SpreadsheetCellInput>>,
-    /// Source workbook for compact copy_rows/copy_columns calls.
-    #[serde(default)]
-    from: Option<String>,
-    #[serde(default)]
-    source_sheet: Option<String>,
-    #[serde(default)]
-    source_start: Option<CellAddress>,
-    #[serde(default)]
-    destination_sheet: Option<String>,
-    #[serde(default)]
-    destination_start: Option<CellAddress>,
-    #[serde(default)]
-    content_mode: SpreadsheetCopyContentMode,
-    /// Optional existing XLSX to update. Compatible cell-only changes preserve
-    /// untouched template parts; structural workbook changes rebuild it.
-    #[serde(default)]
-    source_path: Option<String>,
-    /// Workspace-relative XLSX output path for writes and mutations.
-    #[serde(default)]
-    output_path: Option<String>,
-    #[serde(default)]
-    #[schemars(length(max = 256))]
-    sheets: Vec<SheetWriteRequest>,
-    /// One row/column write or copy operation for a direct mutation action.
-    #[serde(default)]
-    operation: Option<SpreadsheetBatchOperation>,
-    /// Ordered operations for batch. All are validated before the output is written.
-    #[serde(default)]
-    #[schemars(length(max = 64))]
-    operations: Vec<SpreadsheetBatchOperation>,
-    /// Batch mutations are validate-then-write and atomic. Omit or set true.
-    #[serde(default)]
-    atomic: Option<bool>,
+#[serde(
+    tag = "action",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum SpreadsheetToolInput {
+    #[schemars(rename_all = "camelCase")]
+    Inspect {
+        /// Workspace-relative XLSX path. Provide exactly one of path or attachmentId.
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    ListSheets {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    ReadRange {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        sheet: String,
+        /// Inclusive zero-based range.
+        range: CellRange,
+    },
+    #[schemars(rename_all = "camelCase")]
+    ReadRanges {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        #[schemars(length(min = 1, max = 64))]
+        ranges: Vec<SheetRangeRequest>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    ReadRows {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        sheet: String,
+        start_row: u32,
+        start_column: u32,
+        #[schemars(range(min = 1))]
+        row_count: u32,
+        #[schemars(range(min = 1))]
+        column_count: u32,
+    },
+    #[schemars(rename_all = "camelCase")]
+    ReadColumns {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        sheet: String,
+        start_row: u32,
+        start_column: u32,
+        #[schemars(range(min = 1))]
+        row_count: u32,
+        #[schemars(range(min = 1))]
+        column_count: u32,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Find {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        #[serde(default)]
+        sheet: Option<String>,
+        #[serde(default)]
+        range: Option<CellRange>,
+        query: String,
+        #[serde(default)]
+        match_mode: Option<SpreadsheetTextMatchMode>,
+        #[serde(default)]
+        case_sensitive: bool,
+        #[serde(default)]
+        include_formulas: bool,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 1000))]
+        max_results: Option<usize>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    FilterRows {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        sheet: String,
+        range: CellRange,
+        #[schemars(length(min = 1, max = 32))]
+        conditions: Vec<SpreadsheetFilterCondition>,
+        #[serde(default)]
+        filter_match_mode: Option<SpreadsheetFilterMatchMode>,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 1000))]
+        max_results: Option<usize>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Write {
+        /// Destination path. Existing files are updated in place when possible.
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        source_path: Option<String>,
+        #[serde(default)]
+        output_path: Option<String>,
+        #[schemars(length(max = 256))]
+        sheets: Vec<SheetWriteRequest>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    WriteRows {
+        #[serde(default)]
+        path: Option<String>,
+        sheet: String,
+        start: CellAddress,
+        #[schemars(length(min = 1, max = 10000))]
+        rows: Vec<Vec<SpreadsheetCellInput>>,
+        #[serde(default)]
+        source_path: Option<String>,
+        #[serde(default)]
+        output_path: Option<String>,
+        #[serde(default)]
+        atomic: Option<bool>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    WriteColumns {
+        #[serde(default)]
+        path: Option<String>,
+        sheet: String,
+        start: CellAddress,
+        #[schemars(length(min = 1, max = 256))]
+        columns: Vec<Vec<SpreadsheetCellInput>>,
+        #[serde(default)]
+        source_path: Option<String>,
+        #[serde(default)]
+        output_path: Option<String>,
+        #[serde(default)]
+        atomic: Option<bool>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    CopyRows {
+        #[serde(default)]
+        path: Option<String>,
+        from: String,
+        source_sheet: String,
+        source_start: CellAddress,
+        #[schemars(range(min = 1))]
+        row_count: u32,
+        #[schemars(range(min = 1))]
+        column_count: u32,
+        destination_sheet: String,
+        destination_start: CellAddress,
+        #[serde(default)]
+        content_mode: SpreadsheetCopyContentMode,
+        #[serde(default)]
+        source_path: Option<String>,
+        #[serde(default)]
+        output_path: Option<String>,
+        #[serde(default)]
+        atomic: Option<bool>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    CopyColumns {
+        #[serde(default)]
+        path: Option<String>,
+        from: String,
+        source_sheet: String,
+        source_start: CellAddress,
+        #[schemars(range(min = 1))]
+        row_count: u32,
+        #[schemars(range(min = 1))]
+        column_count: u32,
+        destination_sheet: String,
+        destination_start: CellAddress,
+        #[serde(default)]
+        content_mode: SpreadsheetCopyContentMode,
+        #[serde(default)]
+        source_path: Option<String>,
+        #[serde(default)]
+        output_path: Option<String>,
+        #[serde(default)]
+        atomic: Option<bool>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Batch {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        source_path: Option<String>,
+        #[serde(default)]
+        output_path: Option<String>,
+        /// Ordered operations validated before the output is written.
+        #[schemars(length(min = 1, max = 64))]
+        operations: Vec<SpreadsheetBatchOperation>,
+        /// Mutations are validate-then-write and atomic. Omit or set true.
+        #[serde(default)]
+        atomic: Option<bool>,
+    },
 }
 
 impl SpreadsheetToolInput {
+    fn action(&self) -> SpreadsheetToolAction {
+        match self {
+            Self::Inspect { .. } => SpreadsheetToolAction::Inspect,
+            Self::ListSheets { .. } => SpreadsheetToolAction::ListSheets,
+            Self::ReadRange { .. } => SpreadsheetToolAction::ReadRange,
+            Self::ReadRanges { .. } => SpreadsheetToolAction::ReadRanges,
+            Self::ReadRows { .. } => SpreadsheetToolAction::ReadRows,
+            Self::ReadColumns { .. } => SpreadsheetToolAction::ReadColumns,
+            Self::Find { .. } => SpreadsheetToolAction::Find,
+            Self::FilterRows { .. } => SpreadsheetToolAction::FilterRows,
+            Self::Write { .. } => SpreadsheetToolAction::Write,
+            Self::WriteRows { .. } => SpreadsheetToolAction::WriteRows,
+            Self::WriteColumns { .. } => SpreadsheetToolAction::WriteColumns,
+            Self::CopyRows { .. } => SpreadsheetToolAction::CopyRows,
+            Self::CopyColumns { .. } => SpreadsheetToolAction::CopyColumns,
+            Self::Batch { .. } => SpreadsheetToolAction::Batch,
+        }
+    }
+
+    fn path(&self) -> Option<&str> {
+        match self {
+            Self::Inspect { path, .. }
+            | Self::ListSheets { path, .. }
+            | Self::ReadRange { path, .. }
+            | Self::ReadRanges { path, .. }
+            | Self::ReadRows { path, .. }
+            | Self::ReadColumns { path, .. }
+            | Self::Find { path, .. }
+            | Self::FilterRows { path, .. }
+            | Self::Write { path, .. }
+            | Self::WriteRows { path, .. }
+            | Self::WriteColumns { path, .. }
+            | Self::CopyRows { path, .. }
+            | Self::CopyColumns { path, .. }
+            | Self::Batch { path, .. } => path.as_deref(),
+        }
+    }
+
+    fn attachment_id(&self) -> Option<&str> {
+        match self {
+            Self::Inspect { attachment_id, .. }
+            | Self::ListSheets { attachment_id, .. }
+            | Self::ReadRange { attachment_id, .. }
+            | Self::ReadRanges { attachment_id, .. }
+            | Self::ReadRows { attachment_id, .. }
+            | Self::ReadColumns { attachment_id, .. }
+            | Self::Find { attachment_id, .. }
+            | Self::FilterRows { attachment_id, .. } => attachment_id.as_deref(),
+            Self::Write { .. }
+            | Self::WriteRows { .. }
+            | Self::WriteColumns { .. }
+            | Self::CopyRows { .. }
+            | Self::CopyColumns { .. }
+            | Self::Batch { .. } => None,
+        }
+    }
+
+    fn mutation_paths(&self) -> Vec<&str> {
+        let mut paths = Vec::new();
+        match self {
+            Self::Write {
+                path,
+                source_path,
+                output_path,
+                ..
+            }
+            | Self::WriteRows {
+                path,
+                source_path,
+                output_path,
+                ..
+            }
+            | Self::WriteColumns {
+                path,
+                source_path,
+                output_path,
+                ..
+            }
+            | Self::Batch {
+                path,
+                source_path,
+                output_path,
+                ..
+            } => paths.extend(
+                path.iter()
+                    .chain(source_path.iter())
+                    .chain(output_path.iter())
+                    .map(String::as_str),
+            ),
+            Self::CopyRows {
+                path,
+                from,
+                source_path,
+                output_path,
+                ..
+            }
+            | Self::CopyColumns {
+                path,
+                from,
+                source_path,
+                output_path,
+                ..
+            } => {
+                paths.extend(
+                    path.iter()
+                        .chain(source_path.iter())
+                        .chain(output_path.iter())
+                        .map(String::as_str),
+                );
+                paths.push(from);
+            }
+            Self::Inspect { .. }
+            | Self::ListSheets { .. }
+            | Self::ReadRange { .. }
+            | Self::ReadRanges { .. }
+            | Self::ReadRows { .. }
+            | Self::ReadColumns { .. }
+            | Self::Find { .. }
+            | Self::FilterRows { .. } => {}
+        }
+        if let Self::Batch { operations, .. } = self {
+            paths.extend(
+                operations
+                    .iter()
+                    .filter_map(spreadsheet_operation_source_path),
+            );
+        }
+        paths
+    }
+
+    fn mutation_output_path(&self) -> Option<&str> {
+        match self {
+            Self::Write {
+                path, output_path, ..
+            }
+            | Self::WriteRows {
+                path, output_path, ..
+            }
+            | Self::WriteColumns {
+                path, output_path, ..
+            }
+            | Self::CopyRows {
+                path, output_path, ..
+            }
+            | Self::CopyColumns {
+                path, output_path, ..
+            }
+            | Self::Batch {
+                path, output_path, ..
+            } => output_path.as_deref().or(path.as_deref()),
+            Self::Inspect { .. }
+            | Self::ListSheets { .. }
+            | Self::ReadRange { .. }
+            | Self::ReadRanges { .. }
+            | Self::ReadRows { .. }
+            | Self::ReadColumns { .. }
+            | Self::Find { .. }
+            | Self::FilterRows { .. } => None,
+        }
+    }
+
+    fn mutation_read_paths(&self) -> Vec<&str> {
+        let mut paths = Vec::new();
+        match self {
+            Self::Write {
+                path, source_path, ..
+            }
+            | Self::WriteRows {
+                path, source_path, ..
+            }
+            | Self::WriteColumns {
+                path, source_path, ..
+            }
+            | Self::Batch {
+                path, source_path, ..
+            } => paths.extend(source_path.iter().chain(path.iter()).map(String::as_str)),
+            Self::CopyRows {
+                path,
+                from,
+                source_path,
+                ..
+            }
+            | Self::CopyColumns {
+                path,
+                from,
+                source_path,
+                ..
+            } => {
+                paths.extend(source_path.iter().chain(path.iter()).map(String::as_str));
+                paths.push(from);
+            }
+            Self::Inspect { .. }
+            | Self::ListSheets { .. }
+            | Self::ReadRange { .. }
+            | Self::ReadRanges { .. }
+            | Self::ReadRows { .. }
+            | Self::ReadColumns { .. }
+            | Self::Find { .. }
+            | Self::FilterRows { .. } => {}
+        }
+        if let Self::Batch { operations, .. } = self {
+            paths.extend(
+                operations
+                    .iter()
+                    .filter_map(spreadsheet_operation_source_path),
+            );
+        }
+        paths
+    }
+
+    fn into_execution_input(self) -> SpreadsheetExecutionInput {
+        SpreadsheetExecutionInput::from(self)
+    }
+}
+
+struct SpreadsheetExecutionInput {
+    action: SpreadsheetToolAction,
+    path: Option<String>,
+    attachment_id: Option<String>,
+    sheet: Option<String>,
+    range: Option<CellRange>,
+    ranges: Vec<SheetRangeRequest>,
+    start_row: Option<u32>,
+    start_column: Option<u32>,
+    row_count: Option<u32>,
+    column_count: Option<u32>,
+    query: Option<String>,
+    match_mode: Option<SpreadsheetTextMatchMode>,
+    case_sensitive: bool,
+    include_formulas: bool,
+    conditions: Vec<SpreadsheetFilterCondition>,
+    filter_match_mode: Option<SpreadsheetFilterMatchMode>,
+    max_results: Option<usize>,
+    start: Option<CellAddress>,
+    rows: Vec<Vec<SpreadsheetCellInput>>,
+    columns: Vec<Vec<SpreadsheetCellInput>>,
+    from: Option<String>,
+    source_sheet: Option<String>,
+    source_start: Option<CellAddress>,
+    destination_sheet: Option<String>,
+    destination_start: Option<CellAddress>,
+    content_mode: SpreadsheetCopyContentMode,
+    source_path: Option<String>,
+    output_path: Option<String>,
+    sheets: Vec<SheetWriteRequest>,
+    operations: Vec<SpreadsheetBatchOperation>,
+    atomic: Option<bool>,
+}
+
+impl SpreadsheetExecutionInput {
     fn mutation_output_path(&self) -> Option<&str> {
         self.output_path.as_deref().or(self.path.as_deref())
     }
@@ -858,6 +1221,241 @@ impl SpreadsheetToolInput {
     }
 }
 
+impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
+    fn from(input: SpreadsheetToolInput) -> Self {
+        let mut execution = Self {
+            action: input.action(),
+            path: None,
+            attachment_id: None,
+            sheet: None,
+            range: None,
+            ranges: Vec::new(),
+            start_row: None,
+            start_column: None,
+            row_count: None,
+            column_count: None,
+            query: None,
+            match_mode: None,
+            case_sensitive: false,
+            include_formulas: false,
+            conditions: Vec::new(),
+            filter_match_mode: None,
+            max_results: None,
+            start: None,
+            rows: Vec::new(),
+            columns: Vec::new(),
+            from: None,
+            source_sheet: None,
+            source_start: None,
+            destination_sheet: None,
+            destination_start: None,
+            content_mode: SpreadsheetCopyContentMode::Values,
+            source_path: None,
+            output_path: None,
+            sheets: Vec::new(),
+            operations: Vec::new(),
+            atomic: None,
+        };
+        match input {
+            SpreadsheetToolInput::Inspect {
+                path,
+                attachment_id,
+            }
+            | SpreadsheetToolInput::ListSheets {
+                path,
+                attachment_id,
+            } => {
+                execution.path = path;
+                execution.attachment_id = attachment_id;
+            }
+            SpreadsheetToolInput::ReadRange {
+                path,
+                attachment_id,
+                sheet,
+                range,
+            } => {
+                execution.path = path;
+                execution.attachment_id = attachment_id;
+                execution.sheet = Some(sheet);
+                execution.range = Some(range);
+            }
+            SpreadsheetToolInput::ReadRanges {
+                path,
+                attachment_id,
+                ranges,
+            } => {
+                execution.path = path;
+                execution.attachment_id = attachment_id;
+                execution.ranges = ranges;
+            }
+            SpreadsheetToolInput::ReadRows {
+                path,
+                attachment_id,
+                sheet,
+                start_row,
+                start_column,
+                row_count,
+                column_count,
+            }
+            | SpreadsheetToolInput::ReadColumns {
+                path,
+                attachment_id,
+                sheet,
+                start_row,
+                start_column,
+                row_count,
+                column_count,
+            } => {
+                execution.path = path;
+                execution.attachment_id = attachment_id;
+                execution.sheet = Some(sheet);
+                execution.start_row = Some(start_row);
+                execution.start_column = Some(start_column);
+                execution.row_count = Some(row_count);
+                execution.column_count = Some(column_count);
+            }
+            SpreadsheetToolInput::Find {
+                path,
+                attachment_id,
+                sheet,
+                range,
+                query,
+                match_mode,
+                case_sensitive,
+                include_formulas,
+                max_results,
+            } => {
+                execution.path = path;
+                execution.attachment_id = attachment_id;
+                execution.sheet = sheet;
+                execution.range = range;
+                execution.query = Some(query);
+                execution.match_mode = match_mode;
+                execution.case_sensitive = case_sensitive;
+                execution.include_formulas = include_formulas;
+                execution.max_results = max_results;
+            }
+            SpreadsheetToolInput::FilterRows {
+                path,
+                attachment_id,
+                sheet,
+                range,
+                conditions,
+                filter_match_mode,
+                max_results,
+            } => {
+                execution.path = path;
+                execution.attachment_id = attachment_id;
+                execution.sheet = Some(sheet);
+                execution.range = Some(range);
+                execution.conditions = conditions;
+                execution.filter_match_mode = filter_match_mode;
+                execution.max_results = max_results;
+            }
+            SpreadsheetToolInput::Write {
+                path,
+                source_path,
+                output_path,
+                sheets,
+            } => {
+                execution.path = path;
+                execution.source_path = source_path;
+                execution.output_path = output_path;
+                execution.sheets = sheets;
+            }
+            SpreadsheetToolInput::WriteRows {
+                path,
+                sheet,
+                start,
+                rows,
+                source_path,
+                output_path,
+                atomic,
+            } => {
+                execution.path = path;
+                execution.sheet = Some(sheet);
+                execution.start = Some(start);
+                execution.rows = rows;
+                execution.source_path = source_path;
+                execution.output_path = output_path;
+                execution.atomic = atomic;
+            }
+            SpreadsheetToolInput::WriteColumns {
+                path,
+                sheet,
+                start,
+                columns,
+                source_path,
+                output_path,
+                atomic,
+            } => {
+                execution.path = path;
+                execution.sheet = Some(sheet);
+                execution.start = Some(start);
+                execution.columns = columns;
+                execution.source_path = source_path;
+                execution.output_path = output_path;
+                execution.atomic = atomic;
+            }
+            SpreadsheetToolInput::CopyRows {
+                path,
+                from,
+                source_sheet,
+                source_start,
+                row_count,
+                column_count,
+                destination_sheet,
+                destination_start,
+                content_mode,
+                source_path,
+                output_path,
+                atomic,
+            }
+            | SpreadsheetToolInput::CopyColumns {
+                path,
+                from,
+                source_sheet,
+                source_start,
+                row_count,
+                column_count,
+                destination_sheet,
+                destination_start,
+                content_mode,
+                source_path,
+                output_path,
+                atomic,
+            } => {
+                execution.path = path;
+                execution.from = Some(from);
+                execution.source_sheet = Some(source_sheet);
+                execution.source_start = Some(source_start);
+                execution.row_count = Some(row_count);
+                execution.column_count = Some(column_count);
+                execution.destination_sheet = Some(destination_sheet);
+                execution.destination_start = Some(destination_start);
+                execution.content_mode = content_mode;
+                execution.source_path = source_path;
+                execution.output_path = output_path;
+                execution.atomic = atomic;
+            }
+            SpreadsheetToolInput::Batch {
+                path,
+                source_path,
+                output_path,
+                operations,
+                atomic,
+            } => {
+                execution.path = path;
+                execution.source_path = source_path;
+                execution.output_path = output_path;
+                execution.operations = operations;
+                execution.atomic = atomic;
+            }
+        }
+        execution
+    }
+}
+
 pub struct SpreadsheetTool;
 
 #[async_trait]
@@ -873,7 +1471,7 @@ impl TypedTool for SpreadsheetTool {
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        match input.action {
+        match input.action() {
             SpreadsheetToolAction::Inspect
             | SpreadsheetToolAction::ListSheets
             | SpreadsheetToolAction::ReadRange
@@ -883,16 +1481,12 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::Find
             | SpreadsheetToolAction::FilterRows => {
                 ToolExecutionPolicy::read_only(vec![tool_resource_key(
-                    if input.attachment_id.is_some() {
+                    if input.attachment_id().is_some() {
                         "attachment"
                     } else {
                         "file"
                     },
-                    input
-                        .attachment_id
-                        .as_deref()
-                        .or(input.path.as_deref())
-                        .unwrap_or("*"),
+                    input.attachment_id().or(input.path()).unwrap_or("*"),
                 )])
             }
             SpreadsheetToolAction::Write
@@ -902,21 +1496,10 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::CopyColumns
             | SpreadsheetToolAction::Batch => {
                 let mut resource_keys = input
-                    .source_path
-                    .iter()
-                    .chain(input.output_path.iter())
-                    .chain(input.path.iter())
-                    .chain(input.from.iter())
+                    .mutation_paths()
+                    .into_iter()
                     .map(|path| tool_resource_key("file", path))
                     .collect::<Vec<_>>();
-                resource_keys.extend(
-                    input
-                        .operation
-                        .iter()
-                        .chain(input.operations.iter())
-                        .filter_map(spreadsheet_operation_source_path)
-                        .map(|path| tool_resource_key("file", path)),
-                );
                 resource_keys.sort();
                 resource_keys.dedup();
                 if resource_keys.is_empty() {
@@ -934,7 +1517,7 @@ impl TypedTool for SpreadsheetTool {
     }
 
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        match input.action {
+        match input.action() {
             SpreadsheetToolAction::Inspect
             | SpreadsheetToolAction::ListSheets
             | SpreadsheetToolAction::ReadRange
@@ -943,7 +1526,7 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::ReadColumns
             | SpreadsheetToolAction::Find
             | SpreadsheetToolAction::FilterRows => {
-                ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from))
+                ToolExecutionIntent::observation(input.path().map(PathBuf::from))
             }
             SpreadsheetToolAction::Write
             | SpreadsheetToolAction::WriteRows
@@ -951,20 +1534,7 @@ impl TypedTool for SpreadsheetTool {
             | SpreadsheetToolAction::CopyRows
             | SpreadsheetToolAction::CopyColumns
             | SpreadsheetToolAction::Batch => {
-                let read_paths = input
-                    .source_path
-                    .iter()
-                    .chain(input.path.iter())
-                    .chain(input.from.iter())
-                    .map(PathBuf::from)
-                    .chain(
-                        input
-                            .operation
-                            .iter()
-                            .chain(input.operations.iter())
-                            .filter_map(spreadsheet_operation_source_path)
-                            .map(PathBuf::from),
-                    );
+                let read_paths = input.mutation_read_paths().into_iter().map(PathBuf::from);
                 ToolExecutionIntent::workspace_mutation(
                     input.mutation_output_path().map(PathBuf::from),
                 )
@@ -979,7 +1549,9 @@ impl TypedTool for SpreadsheetTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        match input.action {
+        let action = input.action();
+        let input = input.into_execution_input();
+        match action {
             SpreadsheetToolAction::Inspect
             | SpreadsheetToolAction::ListSheets
             | SpreadsheetToolAction::ReadRange
@@ -1015,7 +1587,7 @@ fn spreadsheet_operation_source_path(operation: &SpreadsheetBatchOperation) -> O
 
 async fn execute_spreadsheet_read(
     call_id: Uuid,
-    input: SpreadsheetToolInput,
+    input: SpreadsheetExecutionInput,
     ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     let path = input
@@ -1208,7 +1780,7 @@ fn counted_spreadsheet_range(
 
 async fn execute_spreadsheet_write(
     call_id: Uuid,
-    input: SpreadsheetToolInput,
+    input: SpreadsheetExecutionInput,
     ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     let output_relative = input
@@ -1289,7 +1861,7 @@ async fn execute_spreadsheet_write(
 
 async fn execute_spreadsheet_mutations(
     call_id: Uuid,
-    input: SpreadsheetToolInput,
+    input: SpreadsheetExecutionInput,
     ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
     anyhow::ensure!(
@@ -1305,16 +1877,9 @@ async fn execute_spreadsheet_mutations(
     ensure_xlsx_path(&output_path)?;
     enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
 
-    let compact_operation = if input.operation.is_none() {
-        input.compact_direct_operation()?
-    } else {
-        None
-    };
-    let operations = spreadsheet_operations_for_action(
-        input.action,
-        input.operation.or(compact_operation),
-        input.operations,
-    )?;
+    let compact_operation = input.compact_direct_operation()?;
+    let operations =
+        spreadsheet_operations_for_action(input.action, compact_operation, input.operations)?;
     let base_source = if let Some(relative) = input
         .source_path
         .as_deref()
@@ -2257,8 +2822,7 @@ fn skill_display_name(name: &str) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 enum BrowserActionInput {
     Navigate,
     Observe,
@@ -2307,61 +2871,224 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BrowserInput {
-    /// Browser action to perform.
+#[serde(
+    tag = "action",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum BrowserInput {
+    #[schemars(rename_all = "camelCase")]
+    Navigate {
+        url: String,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 120000))]
+        timeout_ms: Option<u64>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Observe {
+        #[serde(default)]
+        include_screenshot: bool,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Screenshot {},
+    #[schemars(rename_all = "camelCase")]
+    Click {
+        observation_id: String,
+        node_ref: String,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Type {
+        observation_id: String,
+        node_ref: String,
+        text: String,
+        #[serde(default = "default_true")]
+        clear_first: bool,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Select {
+        observation_id: String,
+        node_ref: String,
+        value: String,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Hover {
+        observation_id: String,
+        node_ref: String,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Scroll {
+        observation_id: String,
+        node_ref: String,
+        #[serde(default)]
+        #[schemars(range(min = -10000.0, max = 10000.0))]
+        delta_x: f64,
+        #[serde(default)]
+        #[schemars(range(min = -10000.0, max = 10000.0))]
+        delta_y: f64,
+    },
+    #[schemars(rename_all = "camelCase")]
+    SwitchTarget { target_ref: String },
+    #[schemars(rename_all = "camelCase")]
+    Wait {
+        #[serde(default)]
+        condition: BrowserWaitConditionInput,
+        #[serde(default)]
+        selector: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 120000))]
+        timeout_ms: Option<u64>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Download {
+        url: String,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 21600000))]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 60000))]
+        yield_time_ms: Option<u64>,
+        #[serde(default)]
+        expected_filename: Option<String>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Close {},
+}
+
+struct BrowserExecutionInput {
     action: BrowserActionInput,
-    /// URL for navigate or download.
-    #[serde(default)]
     url: Option<String>,
-    /// CSS selector for a non-mutating wait condition only.
-    #[serde(default)]
     selector: Option<String>,
-    /// Required for click, type, select, hover, and scroll; returned by observe.
-    #[serde(default)]
     observation_id: Option<String>,
-    /// Required for click, type, select, hover, and scroll; returned by observe.
-    #[serde(default)]
     node_ref: Option<String>,
-    /// Include a screenshot in observe; defaults to false.
-    #[serde(default)]
     include_screenshot: bool,
-    /// Text for type or a wait text condition.
-    #[serde(default)]
     text: Option<String>,
-    /// Option value or visible label for select.
-    #[serde(default)]
     value: Option<String>,
-    /// Clear an input before typing; defaults to true.
-    #[serde(default = "default_true")]
     clear_first: bool,
-    /// Horizontal scroll delta, bounded to one practical interaction.
-    #[serde(default)]
-    #[schemars(range(min = -10000.0, max = 10000.0))]
     delta_x: f64,
-    /// Vertical scroll delta, bounded to one practical interaction.
-    #[serde(default)]
-    #[schemars(range(min = -10000.0, max = 10000.0))]
     delta_y: f64,
-    /// Target reference returned by observe; required for switch_target.
-    #[serde(default)]
     target_ref: Option<String>,
-    /// Wait condition; defaults to document_complete.
-    #[serde(default)]
     condition: BrowserWaitConditionInput,
-    /// Operation timeout. Downloads default to one hour and allow up to six;
-    /// other browser actions remain capped at two minutes.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 21600000))]
     timeout_ms: Option<u64>,
-    /// How long a download may stay inline before it automatically returns a
-    /// background job id. Other browser actions ignore this field.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 60000))]
     yield_time_ms: Option<u64>,
-    /// Optional expected filename for a download.
-    #[serde(default)]
     expected_filename: Option<String>,
+}
+
+impl From<BrowserInput> for BrowserExecutionInput {
+    fn from(input: BrowserInput) -> Self {
+        let mut execution = Self {
+            action: BrowserActionInput::Close,
+            url: None,
+            selector: None,
+            observation_id: None,
+            node_ref: None,
+            include_screenshot: false,
+            text: None,
+            value: None,
+            clear_first: true,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            target_ref: None,
+            condition: BrowserWaitConditionInput::DocumentComplete,
+            timeout_ms: None,
+            yield_time_ms: None,
+            expected_filename: None,
+        };
+        match input {
+            BrowserInput::Navigate { url, timeout_ms } => {
+                execution.action = BrowserActionInput::Navigate;
+                execution.url = Some(url);
+                execution.timeout_ms = timeout_ms;
+            }
+            BrowserInput::Observe { include_screenshot } => {
+                execution.action = BrowserActionInput::Observe;
+                execution.include_screenshot = include_screenshot;
+            }
+            BrowserInput::Screenshot {} => execution.action = BrowserActionInput::Screenshot,
+            BrowserInput::Click {
+                observation_id,
+                node_ref,
+            } => {
+                execution.action = BrowserActionInput::Click;
+                execution.observation_id = Some(observation_id);
+                execution.node_ref = Some(node_ref);
+            }
+            BrowserInput::Type {
+                observation_id,
+                node_ref,
+                text,
+                clear_first,
+            } => {
+                execution.action = BrowserActionInput::Type;
+                execution.observation_id = Some(observation_id);
+                execution.node_ref = Some(node_ref);
+                execution.text = Some(text);
+                execution.clear_first = clear_first;
+            }
+            BrowserInput::Select {
+                observation_id,
+                node_ref,
+                value,
+            } => {
+                execution.action = BrowserActionInput::Select;
+                execution.observation_id = Some(observation_id);
+                execution.node_ref = Some(node_ref);
+                execution.value = Some(value);
+            }
+            BrowserInput::Hover {
+                observation_id,
+                node_ref,
+            } => {
+                execution.action = BrowserActionInput::Hover;
+                execution.observation_id = Some(observation_id);
+                execution.node_ref = Some(node_ref);
+            }
+            BrowserInput::Scroll {
+                observation_id,
+                node_ref,
+                delta_x,
+                delta_y,
+            } => {
+                execution.action = BrowserActionInput::Scroll;
+                execution.observation_id = Some(observation_id);
+                execution.node_ref = Some(node_ref);
+                execution.delta_x = delta_x;
+                execution.delta_y = delta_y;
+            }
+            BrowserInput::SwitchTarget { target_ref } => {
+                execution.action = BrowserActionInput::SwitchTarget;
+                execution.target_ref = Some(target_ref);
+            }
+            BrowserInput::Wait {
+                condition,
+                selector,
+                text,
+                timeout_ms,
+            } => {
+                execution.action = BrowserActionInput::Wait;
+                execution.condition = condition;
+                execution.selector = selector;
+                execution.text = text;
+                execution.timeout_ms = timeout_ms;
+            }
+            BrowserInput::Download {
+                url,
+                timeout_ms,
+                yield_time_ms,
+                expected_filename,
+            } => {
+                execution.action = BrowserActionInput::Download;
+                execution.url = Some(url);
+                execution.timeout_ms = timeout_ms;
+                execution.yield_time_ms = yield_time_ms;
+                execution.expected_filename = expected_filename;
+            }
+            BrowserInput::Close {} => {}
+        }
+        execution
+    }
 }
 
 pub struct BrowserTool;
@@ -2416,6 +3143,7 @@ impl TypedTool for BrowserTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
+        let input = BrowserExecutionInput::from(input);
         let runtime = ctx
             .browser
             .as_ref()
@@ -2723,8 +3451,7 @@ impl TypedTool for BrowserTool {
 
 impl_typed_tool!(BrowserTool);
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 enum ComputerActionInput {
     ListWindows,
     Observe,
@@ -2806,40 +3533,166 @@ impl ComputerKeyInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ComputerInput {
+#[serde(
+    tag = "action",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum ComputerInput {
+    #[schemars(rename_all = "camelCase")]
+    ListWindows {},
+    #[schemars(rename_all = "camelCase")]
+    Observe { window_id: String },
+    #[schemars(rename_all = "camelCase")]
+    Click {
+        observation_id: String,
+        x: u32,
+        y: u32,
+        #[serde(default)]
+        button: ComputerMouseButtonInput,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Type {
+        observation_id: String,
+        #[schemars(length(max = 4096))]
+        text: String,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Keypress {
+        observation_id: String,
+        key: ComputerKeyInput,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Scroll {
+        observation_id: String,
+        #[schemars(range(min = -12000, max = 12000))]
+        delta_y: i64,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Drag {
+        observation_id: String,
+        x: u32,
+        y: u32,
+        end_x: u32,
+        end_y: u32,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Wait {
+        observation_id: String,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 30000))]
+        duration_ms: Option<u64>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Close {},
+}
+
+impl ComputerInput {
+    fn action(&self) -> ComputerActionInput {
+        match self {
+            Self::ListWindows {} => ComputerActionInput::ListWindows,
+            Self::Observe { .. } => ComputerActionInput::Observe,
+            Self::Click { .. } => ComputerActionInput::Click,
+            Self::Type { .. } => ComputerActionInput::Type,
+            Self::Keypress { .. } => ComputerActionInput::Keypress,
+            Self::Scroll { .. } => ComputerActionInput::Scroll,
+            Self::Drag { .. } => ComputerActionInput::Drag,
+            Self::Wait { .. } => ComputerActionInput::Wait,
+            Self::Close {} => ComputerActionInput::Close,
+        }
+    }
+}
+
+struct ComputerExecutionInput {
     action: ComputerActionInput,
-    /// Opaque windowId returned by list_windows; required by observe.
-    #[serde(default)]
     window_id: Option<String>,
-    /// Required for every action after observe.
-    #[serde(default)]
     observation_id: Option<String>,
-    #[serde(default)]
     x: Option<u64>,
-    #[serde(default)]
     y: Option<u64>,
-    #[serde(default)]
     end_x: Option<u64>,
-    #[serde(default)]
     end_y: Option<u64>,
-    /// Mouse button for click; defaults to left.
-    #[serde(default)]
     button: ComputerMouseButtonInput,
-    /// Ordinary text to type. Secrets are rejected.
-    #[serde(default)]
-    #[schemars(length(max = 4096))]
     text: Option<String>,
-    #[serde(default)]
     key: Option<ComputerKeyInput>,
-    /// Vertical wheel delta for scroll.
-    #[serde(default)]
-    #[schemars(range(min = -12000, max = 12000))]
     delta_y: Option<i64>,
-    /// Wait duration; defaults to 1000ms.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 30000))]
     duration_ms: Option<u64>,
+}
+
+impl From<ComputerInput> for ComputerExecutionInput {
+    fn from(input: ComputerInput) -> Self {
+        let mut execution = Self {
+            action: input.action(),
+            window_id: None,
+            observation_id: None,
+            x: None,
+            y: None,
+            end_x: None,
+            end_y: None,
+            button: ComputerMouseButtonInput::Left,
+            text: None,
+            key: None,
+            delta_y: None,
+            duration_ms: None,
+        };
+        match input {
+            ComputerInput::ListWindows {} | ComputerInput::Close {} => {}
+            ComputerInput::Observe { window_id } => execution.window_id = Some(window_id),
+            ComputerInput::Click {
+                observation_id,
+                x,
+                y,
+                button,
+            } => {
+                execution.observation_id = Some(observation_id);
+                execution.x = Some(u64::from(x));
+                execution.y = Some(u64::from(y));
+                execution.button = button;
+            }
+            ComputerInput::Type {
+                observation_id,
+                text,
+            } => {
+                execution.observation_id = Some(observation_id);
+                execution.text = Some(text);
+            }
+            ComputerInput::Keypress {
+                observation_id,
+                key,
+            } => {
+                execution.observation_id = Some(observation_id);
+                execution.key = Some(key);
+            }
+            ComputerInput::Scroll {
+                observation_id,
+                delta_y,
+            } => {
+                execution.observation_id = Some(observation_id);
+                execution.delta_y = Some(delta_y);
+            }
+            ComputerInput::Drag {
+                observation_id,
+                x,
+                y,
+                end_x,
+                end_y,
+            } => {
+                execution.observation_id = Some(observation_id);
+                execution.x = Some(u64::from(x));
+                execution.y = Some(u64::from(y));
+                execution.end_x = Some(u64::from(end_x));
+                execution.end_y = Some(u64::from(end_y));
+            }
+            ComputerInput::Wait {
+                observation_id,
+                duration_ms,
+            } => {
+                execution.observation_id = Some(observation_id);
+                execution.duration_ms = duration_ms;
+            }
+        }
+        execution
+    }
 }
 
 pub struct ComputerTool;
@@ -2857,7 +3710,7 @@ impl TypedTool for ComputerTool {
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        match input.action {
+        match input.action() {
             ComputerActionInput::ListWindows | ComputerActionInput::Observe => {
                 ToolExecutionPolicy::read_only(vec!["computer:windows".to_string()])
             }
@@ -2871,6 +3724,7 @@ impl TypedTool for ComputerTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
+        let input = ComputerExecutionInput::from(input);
         let runtime = ctx
             .computer
             .as_ref()
@@ -3004,7 +3858,7 @@ fn ensure_computer_target_allowed(
     }
 }
 
-fn parse_computer_action(input: ComputerInput) -> anyhow::Result<ComputerAction> {
+fn parse_computer_action(input: ComputerExecutionInput) -> anyhow::Result<ComputerAction> {
     let observation_id = || required_typed_string(input.observation_id.as_deref(), "observationId");
     match input.action {
         ComputerActionInput::Click => Ok(ComputerAction::Click {
@@ -5586,10 +6440,8 @@ fn background_scope(ctx: &ToolInvocationContext) -> anyhow::Result<BackgroundSco
 
 pub struct BackgroundOutputTool;
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 enum BackgroundOutputActionInput {
-    #[default]
     Read,
     List,
     Write,
@@ -5597,25 +6449,99 @@ enum BackgroundOutputActionInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BackgroundOutputInput {
-    /// Operation to perform. Defaults to read.
-    #[serde(default)]
+#[serde(
+    tag = "action",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum BackgroundOutputInput {
+    #[schemars(rename_all = "camelCase")]
+    Read {
+        job_id: String,
+        /// Maximum time to wait. Defaults to one hour; zero is an immediate snapshot.
+        #[serde(default)]
+        #[schemars(range(min = 0, max = 3600000))]
+        timeout_ms: Option<u64>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    List {},
+    #[schemars(rename_all = "camelCase")]
+    Write {
+        job_id: String,
+        data: String,
+        #[serde(default)]
+        append_newline: bool,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Stop { job_id: String },
+}
+
+impl BackgroundOutputInput {
+    fn action(&self) -> BackgroundOutputActionInput {
+        match self {
+            Self::Read { .. } => BackgroundOutputActionInput::Read,
+            Self::List {} => BackgroundOutputActionInput::List,
+            Self::Write { .. } => BackgroundOutputActionInput::Write,
+            Self::Stop { .. } => BackgroundOutputActionInput::Stop,
+        }
+    }
+
+    fn job_id(&self) -> Option<&str> {
+        match self {
+            Self::Read { job_id, .. } | Self::Write { job_id, .. } | Self::Stop { job_id } => {
+                Some(job_id)
+            }
+            Self::List {} => None,
+        }
+    }
+}
+
+struct BackgroundOutputExecutionInput {
     action: BackgroundOutputActionInput,
-    /// Job UUID returned by shell. Required except for list.
-    #[serde(default)]
     job_id: Option<String>,
-    /// Input to send for write.
-    #[serde(default)]
     data: Option<String>,
-    /// Append a newline to data. Defaults to false.
-    #[serde(default)]
     append_newline: bool,
-    /// Maximum time a read waits for useful output or completion. Defaults to
-    /// one hour. Zero requests an immediate snapshot.
-    #[serde(default, alias = "timeoutMs")]
-    #[schemars(range(min = 0, max = 3600000))]
     timeout_ms: Option<u64>,
+}
+
+impl From<BackgroundOutputInput> for BackgroundOutputExecutionInput {
+    fn from(input: BackgroundOutputInput) -> Self {
+        match input {
+            BackgroundOutputInput::Read { job_id, timeout_ms } => Self {
+                action: BackgroundOutputActionInput::Read,
+                job_id: Some(job_id),
+                data: None,
+                append_newline: false,
+                timeout_ms,
+            },
+            BackgroundOutputInput::List {} => Self {
+                action: BackgroundOutputActionInput::List,
+                job_id: None,
+                data: None,
+                append_newline: false,
+                timeout_ms: None,
+            },
+            BackgroundOutputInput::Write {
+                job_id,
+                data,
+                append_newline,
+            } => Self {
+                action: BackgroundOutputActionInput::Write,
+                job_id: Some(job_id),
+                data: Some(data),
+                append_newline,
+                timeout_ms: None,
+            },
+            BackgroundOutputInput::Stop { job_id } => Self {
+                action: BackgroundOutputActionInput::Stop,
+                job_id: Some(job_id),
+                data: None,
+                append_newline: false,
+                timeout_ms: None,
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -5632,11 +6558,10 @@ impl TypedTool for BackgroundOutputTool {
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
         let key = input
-            .job_id
-            .as_deref()
+            .job_id()
             .map(|job_id| tool_resource_key("session", job_id))
             .unwrap_or_else(|| "*".to_string());
-        match input.action {
+        match input.action() {
             BackgroundOutputActionInput::List => {
                 ToolExecutionPolicy::read_only(vec!["sessions:self".to_string()])
             }
@@ -5665,6 +6590,7 @@ impl TypedTool for BackgroundOutputTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
+        let input = BackgroundOutputExecutionInput::from(input);
         let registry = ctx
             .background
             .as_ref()
@@ -5802,7 +6728,7 @@ impl TypedTool for ShellTool {
 
     fn description(&self) -> &str {
         if cfg!(windows) {
-            "Run a Windows PowerShell 5.1 command in a workspace directory with timeout and output caps. This is not Bash or PowerShell 7: use `;` or explicit `$LASTEXITCODE` checks instead of `&&`/`||`, `Select-Object -First/-Last` instead of `head`/`tail`, and `$null` for discarded output. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
+            "Run a command with the configured Windows PowerShell runtime (PowerShell 7 preferred, Windows PowerShell 5.1 fallback) in a workspace directory with timeout and output caps. The runtime prompt and result metadata identify the active dialect. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
         } else {
             "Run a POSIX `sh` command in a workspace directory with timeout and output caps; do not use PowerShell cmdlets or `$env:` syntax. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
         }
@@ -6533,13 +7459,40 @@ async fn execute_portable_patch(
             continue;
         }
         mutations.push(match current {
-            Some(contents) => PreparedFileMutation::write(path, original, contents),
+            Some(contents) => PreparedFileMutation {
+                path,
+                original,
+                target: FileMutationTarget::Write(contents),
+            },
             None => PreparedFileMutation {
                 path,
                 original,
                 target: FileMutationTarget::Delete,
             },
         });
+    }
+    for index in 0..mutations.len() {
+        let mutation = &mutations[index];
+        let FileMutationTarget::Write(contents) = &mutation.target else {
+            continue;
+        };
+        let path = mutation.path.clone();
+        let normalized = normalize_text_encoding(&path, contents.clone());
+        if normalized == *contents {
+            continue;
+        }
+        if let Err(error) = ctx
+            .environment
+            .write_file(FileWriteRequest::new(&path, normalized.clone()))
+            .await
+        {
+            rollback_external_mutations(ctx.environment.as_ref(), &mutations).await?;
+            return Err(error.context(format!(
+                "failed to normalize text encoding for {}",
+                path.display()
+            )));
+        }
+        mutations[index].target = FileMutationTarget::Write(normalized);
     }
     if let (Some(observer), Some(scope)) = (
         ctx.file_mutation_observer.as_deref(),
@@ -6686,7 +7639,10 @@ async fn execute_native_patch_batch(
                     original.is_none(),
                     "create_file target already exists: {logical_path}"
                 );
-                let contents = create_file_contents_from_diff(&diff)?.into_bytes();
+                let contents = normalize_text_encoding(
+                    &target,
+                    create_file_contents_from_diff(&diff)?.into_bytes(),
+                );
                 let bytes = contents.len();
                 mutations.push(PreparedFileMutation::write(&target, None, contents));
                 outputs.push(format!("Created {}", target.display()));
@@ -6699,10 +7655,15 @@ async fn execute_native_patch_batch(
                 let original_bytes = original.with_context(|| {
                     format!("update_file target does not exist: {logical_path}")
                 })?;
-                let original_text =
-                    String::from_utf8(original_bytes.clone()).with_context(|| {
-                        format!("update_file target is not UTF-8 text: {logical_path}")
-                    })?;
+                let had_utf8_bom = original_bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+                let text_bytes = if had_utf8_bom {
+                    &original_bytes[3..]
+                } else {
+                    &original_bytes
+                };
+                let original_text = String::from_utf8(text_bytes.to_vec()).with_context(|| {
+                    format!("update_file target is not UTF-8 text: {logical_path}")
+                })?;
                 let updated = apply_text_patch(&original_text, &diff).with_context(|| {
                     format!("failed to apply update_file patch to {logical_path}")
                 })?;
@@ -6710,7 +7671,14 @@ async fn execute_native_patch_batch(
                     updated != original_text,
                     "update_file patch made no changes: {logical_path}"
                 );
-                let contents = updated.into_bytes();
+                let mut contents = updated.into_bytes();
+                if had_utf8_bom {
+                    let mut encoded = Vec::with_capacity(contents.len() + 3);
+                    encoded.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+                    encoded.append(&mut contents);
+                    contents = encoded;
+                }
+                let contents = normalize_text_encoding(&target, contents);
                 let bytes = contents.len();
                 mutations.push(PreparedFileMutation::write(
                     &target,
@@ -7982,6 +8950,7 @@ mod tests {
     use crate::model::{ContextSourceRef, Message, MessageRole};
     use crate::policy::{BasicPolicyEngine, PermissionMode};
     use crate::store::{SessionStore, SqliteSessionStore};
+    use crate::SandboxMode;
 
     #[derive(Clone)]
     struct ComputerRuntimeFixture {
@@ -8106,20 +9075,7 @@ mod tests {
         let empty = ComputerTool
             .execute_typed(
                 Uuid::new_v4(),
-                ComputerInput {
-                    action: ComputerActionInput::ListWindows,
-                    window_id: None,
-                    observation_id: None,
-                    x: None,
-                    y: None,
-                    end_x: None,
-                    end_y: None,
-                    button: ComputerMouseButtonInput::Left,
-                    text: None,
-                    key: None,
-                    delta_y: None,
-                    duration_ms: None,
-                },
+                ComputerInput::ListWindows {},
                 computer_tool_context(runtime.clone(), &[]),
             )
             .await
@@ -8130,20 +9086,7 @@ mod tests {
         let filtered = ComputerTool
             .execute_typed(
                 Uuid::new_v4(),
-                ComputerInput {
-                    action: ComputerActionInput::ListWindows,
-                    window_id: None,
-                    observation_id: None,
-                    x: None,
-                    y: None,
-                    end_x: None,
-                    end_y: None,
-                    button: ComputerMouseButtonInput::Left,
-                    text: None,
-                    key: None,
-                    delta_y: None,
-                    duration_ms: None,
-                },
+                ComputerInput::ListWindows {},
                 computer_tool_context(runtime, &["opentopia.exe"]),
             )
             .await
@@ -8160,19 +9103,8 @@ mod tests {
         let result = ComputerTool
             .execute_typed(
                 Uuid::new_v4(),
-                ComputerInput {
-                    action: ComputerActionInput::Observe,
-                    window_id: Some("allowed".to_string()),
-                    observation_id: None,
-                    x: None,
-                    y: None,
-                    end_x: None,
-                    end_y: None,
-                    button: ComputerMouseButtonInput::Left,
-                    text: None,
-                    key: None,
-                    delta_y: None,
-                    duration_ms: None,
+                ComputerInput::Observe {
+                    window_id: "allowed".to_string(),
                 },
                 computer_tool_context(
                     ComputerRuntimeFixture {
@@ -8661,6 +9593,39 @@ mod tests {
         }
     }
 
+    fn action_schema_branches(schema: &Value) -> &[Value] {
+        schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .expect("action tool must expose object branches")
+    }
+
+    fn action_schema_branch<'a>(schema: &'a Value, action: &str) -> &'a Value {
+        action_schema_branches(schema)
+            .iter()
+            .find(|branch| {
+                branch["properties"]["action"]["enum"]
+                    .as_array()
+                    .is_some_and(|values| values.as_slice() == [json!(action)])
+            })
+            .unwrap_or_else(|| panic!("missing schema branch for action {action}"))
+    }
+
+    fn assert_discriminated_action_schema(tool: &dyn Tool, actions: &[&str]) {
+        let schema = tool.schema();
+        let branches = action_schema_branches(&schema);
+        assert_eq!(branches.len(), actions.len(), "{}", tool.name());
+        for action in actions {
+            let branch = action_schema_branch(&schema, action);
+            assert_eq!(branch["additionalProperties"], false, "{action}");
+            assert!(branch["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("action"))));
+        }
+    }
+
     #[test]
     fn spawn_agent_fork_turns_schema_only_allows_labels_or_positive_counts() {
         let schema = Tool::schema(&SpawnAgentTool);
@@ -8767,10 +9732,246 @@ mod tests {
     #[test]
     fn background_read_schema_exposes_a_bounded_wait() {
         let schema = BackgroundOutputTool.schema();
-        let timeout = &schema["properties"]["timeoutMs"];
-        assert_eq!(timeout["minimum"].as_f64(), Some(0.0));
-        assert_eq!(timeout["maximum"].as_f64(), Some(3_600_000.0));
+        let read = action_schema_branch(&schema, "read");
+        let timeout = &read["properties"]["timeoutMs"];
+        assert!(
+            schema_contains_object_matching(timeout, &|object| {
+                object.get("minimum").and_then(Value::as_f64) == Some(0.0)
+                    && object.get("maximum").and_then(Value::as_f64) == Some(3_600_000.0)
+            }),
+            "timeout schema: {timeout}"
+        );
+        assert!(read["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("jobId"))));
         assert!(Tool::description(&BackgroundOutputTool).contains("cancellable wait"));
+    }
+
+    #[test]
+    fn action_driven_tools_expose_only_action_specific_fields() {
+        assert_discriminated_action_schema(
+            &SpreadsheetTool,
+            &[
+                "inspect",
+                "list_sheets",
+                "read_range",
+                "read_ranges",
+                "read_rows",
+                "read_columns",
+                "find",
+                "filter_rows",
+                "write",
+                "write_rows",
+                "write_columns",
+                "copy_rows",
+                "copy_columns",
+                "batch",
+            ],
+        );
+        assert_discriminated_action_schema(
+            &BrowserTool,
+            &[
+                "navigate",
+                "observe",
+                "screenshot",
+                "click",
+                "type",
+                "select",
+                "hover",
+                "scroll",
+                "switch_target",
+                "wait",
+                "download",
+                "close",
+            ],
+        );
+        assert_discriminated_action_schema(
+            &ComputerTool,
+            &[
+                "list_windows",
+                "observe",
+                "click",
+                "type",
+                "keypress",
+                "scroll",
+                "drag",
+                "wait",
+                "close",
+            ],
+        );
+        assert_discriminated_action_schema(&PdfTool, &["inspect", "extract", "render", "validate"]);
+        assert_discriminated_action_schema(&DocumentTool, &["inspect", "extract", "validate"]);
+        assert_discriminated_action_schema(
+            &BackgroundOutputTool,
+            &["read", "list", "write", "stop"],
+        );
+
+        let spreadsheet = SpreadsheetTool.schema();
+        let read_range = &action_schema_branch(&spreadsheet, "read_range")["properties"];
+        assert!(read_range.get("range").is_some());
+        assert!(read_range.get("rows").is_none());
+        let write_rows = &action_schema_branch(&spreadsheet, "write_rows")["properties"];
+        assert!(write_rows.get("rows").is_some());
+        assert!(write_rows.get("query").is_none());
+        assert!(write_rows.get("operations").is_none());
+        let batch = &action_schema_branch(&spreadsheet, "batch")["properties"];
+        assert!(batch.get("operations").is_some());
+        assert!(batch.get("rows").is_none());
+
+        let browser = BrowserTool.schema();
+        let navigate = &action_schema_branch(&browser, "navigate")["properties"];
+        assert!(navigate.get("url").is_some());
+        assert!(navigate.get("nodeRef").is_none());
+        let click = &action_schema_branch(&browser, "click")["properties"];
+        assert!(click.get("observationId").is_some());
+        assert!(click.get("nodeRef").is_some());
+        assert!(click.get("url").is_none());
+
+        let computer = ComputerTool.schema();
+        let drag = &action_schema_branch(&computer, "drag")["properties"];
+        assert!(drag.get("endX").is_some());
+        assert!(drag.get("text").is_none());
+
+        let pdf = PdfTool.schema();
+        let extract = &action_schema_branch(&pdf, "extract")["properties"];
+        assert!(extract.get("maxCharacters").is_some());
+        assert!(extract.get("dpi").is_none());
+        let render = &action_schema_branch(&pdf, "render")["properties"];
+        assert!(render.get("dpi").is_some());
+        assert!(render.get("maxCharacters").is_none());
+
+        let document = DocumentTool.schema();
+        let inspect = &action_schema_branch(&document, "inspect")["properties"];
+        assert!(inspect.get("includeRelatedParts").is_none());
+        let extract = &action_schema_branch(&document, "extract")["properties"];
+        assert!(extract.get("includeRelatedParts").is_some());
+
+        let background = BackgroundOutputTool.schema();
+        let list = &action_schema_branch(&background, "list")["properties"];
+        assert_eq!(list.as_object().map(serde_json::Map::len), Some(1));
+        let write = &action_schema_branch(&background, "write")["properties"];
+        assert!(write.get("data").is_some());
+        assert!(write.get("timeoutMs").is_none());
+    }
+
+    #[test]
+    fn builtin_action_discriminators_never_use_a_flat_optional_field_bag() {
+        let registry = ToolRegistry::with_builtins();
+        for name in registry.list() {
+            let schema = registry.get(&name).expect("registered tool").schema();
+            let flat_actions = schema["properties"]["action"]["enum"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default();
+            assert!(
+                flat_actions <= 1,
+                "tool {name} exposes {flat_actions} actions through one flat property bag"
+            );
+        }
+    }
+
+    #[test]
+    fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
+        assert!(SpreadsheetTool
+            .input_error(&json!({
+                "action": "read_range",
+                "path": "book.xlsx",
+                "sheet": "Sheet1"
+            }))
+            .is_some());
+        assert!(BrowserTool
+            .input_error(&json!({ "action": "navigate" }))
+            .is_some());
+        assert!(BrowserTool
+            .input_error(&json!({
+                "action": "click",
+                "observationId": "obs",
+                "nodeRef": "n1",
+                "url": "https://example.com"
+            }))
+            .is_some());
+        assert!(ComputerTool
+            .input_error(&json!({
+                "action": "drag",
+                "observationId": "obs",
+                "x": 1,
+                "y": 2
+            }))
+            .is_some());
+        assert!(PdfTool
+            .input_error(&json!({
+                "action": "inspect",
+                "path": "report.pdf",
+                "dpi": 96
+            }))
+            .is_some());
+        assert!(DocumentTool
+            .input_error(&json!({
+                "action": "validate",
+                "path": "report.docx",
+                "maxCharacters": 100
+            }))
+            .is_some());
+        assert!(BackgroundOutputTool.input_error(&json!({})).is_some());
+        assert!(BackgroundOutputTool
+            .input_error(&json!({ "action": "read" }))
+            .is_some());
+
+        assert!(SpreadsheetTool
+            .input_error(&json!({
+                "action": "read_range",
+                "path": "book.xlsx",
+                "sheet": "Sheet1",
+                "range": {
+                    "start": { "row": 0, "column": 0 },
+                    "end": { "row": 1, "column": 1 }
+                }
+            }))
+            .is_none());
+        assert!(BackgroundOutputTool
+            .input_error(&json!({ "action": "list" }))
+            .is_none());
+        assert!(BrowserTool
+            .input_error(&json!({
+                "action": "click",
+                "observationId": "obs",
+                "nodeRef": "n1"
+            }))
+            .is_none());
+        assert!(ComputerTool
+            .input_error(&json!({
+                "action": "drag",
+                "observationId": "obs",
+                "x": 1,
+                "y": 2,
+                "endX": 3,
+                "endY": 4
+            }))
+            .is_none());
+        assert!(PdfTool
+            .input_error(&json!({
+                "action": "render",
+                "path": "report.pdf",
+                "pages": [1],
+                "dpi": 96
+            }))
+            .is_none());
+        assert!(DocumentTool
+            .input_error(&json!({
+                "action": "extract",
+                "path": "report.docx",
+                "includeRelatedParts": true,
+                "maxCharacters": 100
+            }))
+            .is_none());
+        assert!(BackgroundOutputTool
+            .input_error(&json!({
+                "action": "write",
+                "jobId": Uuid::new_v4(),
+                "data": "hello",
+                "appendNewline": true
+            }))
+            .is_none());
     }
 
     #[test]
@@ -9728,14 +10929,15 @@ mod tests {
         assert!(read.output.contains("compact"));
 
         let schema = SpreadsheetTool.schema();
-        let properties = schema["properties"]
-            .as_object()
-            .expect("spreadsheet properties");
-        assert!(properties.contains_key("path"));
-        assert!(properties.contains_key("rows"));
-        assert!(properties.contains_key("outputPath"));
-        assert!(properties.contains_key("operation"));
-        assert!(properties.contains_key("atomic"));
+        let write_rows = &action_schema_branch(&schema, "write_rows")["properties"];
+        assert!(write_rows.get("path").is_some());
+        assert!(write_rows.get("rows").is_some());
+        assert!(
+            write_rows.get("outputPath").is_some(),
+            "write_rows schema: {write_rows}"
+        );
+        assert!(write_rows.get("atomic").is_some());
+        assert!(write_rows.get("operation").is_none());
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
@@ -10107,6 +11309,35 @@ mod tests {
         fs::remove_dir_all(workspace_root).unwrap();
     }
 
+    #[test]
+    fn shell_intent_projects_known_external_reads_through_unknown_pipeline_segments() {
+        let requested = PathBuf::from("C:\\Users\\me\\Downloads\\orders.csv");
+        let sibling = PathBuf::from("C:\\Users\\me\\Downloads\\other.csv");
+        let analysis = analyze_shell_command(
+            "Import-Csv -LiteralPath 'C:\\Users\\me\\Downloads\\orders.csv' | Where-Object Status -eq open",
+        );
+        let intent = shell_execution_intent(&analysis);
+
+        assert_eq!(intent.filesystem, FilesystemAccess::ReadWorkspace);
+        assert_eq!(
+            intent.approval_escalation,
+            ApprovalEscalation::CommandScopedHostAccess
+        );
+        assert_eq!(intent.requested_read_paths, vec![requested.clone()]);
+
+        let grant = ExecutionGrant::resolve(
+            &LocalSandboxConfig::enforce(),
+            Path::new("C:\\workspace"),
+            &intent,
+            false,
+        )
+        .unwrap();
+        assert_eq!(grant.sandbox.sandbox_mode, SandboxMode::ReadOnly);
+        assert!(grant.sandbox.is_within_approved_read_scope(&requested));
+        assert!(!grant.sandbox.is_within_approved_read_scope(&sibling));
+        assert!(grant.sandbox.approved_write_paths.is_empty());
+    }
+
     #[tokio::test]
     async fn shell_honors_workspace_relative_workdir() {
         let workspace_root =
@@ -10263,7 +11494,10 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn shell_rejects_posix_connectors_before_execution() {
+    async fn windows_powershell_51_rejects_unsupported_connectors_before_execution() {
+        if ShellDialect::current() != ShellDialect::WindowsPowerShell51 {
+            return;
+        }
         let workspace_root =
             std::env::temp_dir().join(format!("opentopia-shell-dialect-{}", Uuid::new_v4()));
         fs::create_dir_all(&workspace_root).unwrap();
@@ -10348,39 +11582,9 @@ mod tests {
     fn structured_observation_and_control_tools_declare_scoped_parallelism() {
         let spreadsheet_read = <SpreadsheetTool as TypedTool>::execution_policy(
             &SpreadsheetTool,
-            &SpreadsheetToolInput {
-                action: SpreadsheetToolAction::Inspect,
+            &SpreadsheetToolInput::Inspect {
                 path: Some("reports/a.xlsx".to_string()),
                 attachment_id: None,
-                sheet: None,
-                range: None,
-                ranges: Vec::new(),
-                start_row: None,
-                start_column: None,
-                row_count: None,
-                column_count: None,
-                query: None,
-                match_mode: None,
-                case_sensitive: false,
-                include_formulas: false,
-                conditions: Vec::new(),
-                filter_match_mode: None,
-                max_results: None,
-                start: None,
-                rows: Vec::new(),
-                columns: Vec::new(),
-                from: None,
-                source_sheet: None,
-                source_start: None,
-                destination_sheet: None,
-                destination_start: None,
-                content_mode: SpreadsheetCopyContentMode::Values,
-                source_path: None,
-                output_path: None,
-                sheets: Vec::new(),
-                operation: None,
-                operations: Vec::new(),
-                atomic: None,
             },
         );
         assert!(spreadsheet_read.read_only);
@@ -10390,39 +11594,9 @@ mod tests {
         let attachment_id = Uuid::new_v4().to_string();
         let spreadsheet_attachment = <SpreadsheetTool as TypedTool>::execution_policy(
             &SpreadsheetTool,
-            &SpreadsheetToolInput {
-                action: SpreadsheetToolAction::Inspect,
+            &SpreadsheetToolInput::Inspect {
                 path: None,
                 attachment_id: Some(attachment_id.clone()),
-                sheet: None,
-                range: None,
-                ranges: Vec::new(),
-                start_row: None,
-                start_column: None,
-                row_count: None,
-                column_count: None,
-                query: None,
-                match_mode: None,
-                case_sensitive: false,
-                include_formulas: false,
-                conditions: Vec::new(),
-                filter_match_mode: None,
-                max_results: None,
-                start: None,
-                rows: Vec::new(),
-                columns: Vec::new(),
-                from: None,
-                source_sheet: None,
-                source_start: None,
-                destination_sheet: None,
-                destination_start: None,
-                content_mode: SpreadsheetCopyContentMode::Values,
-                source_path: None,
-                output_path: None,
-                sheets: Vec::new(),
-                operation: None,
-                operations: Vec::new(),
-                atomic: None,
             },
         );
         assert_eq!(
@@ -10432,39 +11606,11 @@ mod tests {
 
         let spreadsheet_write = <SpreadsheetTool as TypedTool>::execution_policy(
             &SpreadsheetTool,
-            &SpreadsheetToolInput {
-                action: SpreadsheetToolAction::Write,
+            &SpreadsheetToolInput::Write {
                 path: None,
-                attachment_id: None,
-                sheet: None,
-                range: None,
-                ranges: Vec::new(),
-                start_row: None,
-                start_column: None,
-                row_count: None,
-                column_count: None,
-                query: None,
-                match_mode: None,
-                case_sensitive: false,
-                include_formulas: false,
-                conditions: Vec::new(),
-                filter_match_mode: None,
-                max_results: None,
-                start: None,
-                rows: Vec::new(),
-                columns: Vec::new(),
-                from: None,
-                source_sheet: None,
-                source_start: None,
-                destination_sheet: None,
-                destination_start: None,
-                content_mode: SpreadsheetCopyContentMode::Values,
                 source_path: Some("reports/source.xlsx".to_string()),
                 output_path: Some("reports/output.xlsx".to_string()),
                 sheets: Vec::new(),
-                operation: None,
-                operations: Vec::new(),
-                atomic: None,
             },
         );
         assert!(!spreadsheet_write.read_only);
@@ -10510,11 +11656,8 @@ mod tests {
         let job_id = Uuid::new_v4().to_string();
         let background_read = <BackgroundOutputTool as TypedTool>::execution_policy(
             &BackgroundOutputTool,
-            &BackgroundOutputInput {
-                action: BackgroundOutputActionInput::Read,
-                job_id: Some(job_id.clone()),
-                data: None,
-                append_newline: false,
+            &BackgroundOutputInput::Read {
+                job_id: job_id.clone(),
                 timeout_ms: None,
             },
         );
@@ -10878,6 +12021,59 @@ mod tests {
         assert!(fs::read_to_string(workspace_root.join("styles.css"))
             .unwrap()
             .contains("border: none"));
+        fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn apply_patch_created_unicode_powershell_script_runs_in_windows_powershell_51() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("opentopia-powershell-encoding-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace_root).unwrap();
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+        ));
+        let context = ToolInvocationContext::local_with_sandbox_config(
+            workspace_root.clone(),
+            policy,
+            LocalSandboxConfig::danger_full_access(),
+        );
+        let envelope = "*** Begin Patch\n*** Add File: unicode.ps1\n+$utf8 = New-Object System.Text.UTF8Encoding($false)\n+[Console]::OutputEncoding = $utf8\n+Write-Output \"中文（全角括号）\"\n*** End Patch";
+
+        execute_portable_patch(Uuid::new_v4(), envelope, context.clone())
+            .await
+            .unwrap();
+        let script_path = workspace_root.join("unicode.ps1");
+        let bytes = fs::read(&script_path).unwrap();
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
+
+        let script = script_path.to_string_lossy().into_owned();
+        let output = context
+            .environment
+            .exec(
+                ExecRequest::new("powershell.exe").args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    script.as_str(),
+                ]),
+                ExecutionContext::with_timeout(Duration::from_secs(20)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            output.success,
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "中文（全角括号）"
+        );
         fs::remove_dir_all(workspace_root).unwrap();
     }
 

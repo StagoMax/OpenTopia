@@ -495,7 +495,22 @@ pub struct PreparedProviderRequest {
     pub body: Value,
     pub observation_body: Value,
     pub logical_request: ModelRequest,
+    /// Exact function-tool contracts compiled for this provider request. The
+    /// response decoder uses the same artifacts that produced the advertised
+    /// schemas to restore provider wire arguments to the canonical tool shape.
+    pub tool_contracts: Vec<CompiledToolContract>,
     pub response_commit: ProviderResponseCommitMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledToolContract {
+    pub name: String,
+    /// Schema before provider-specific strict lowering. This is normally the
+    /// tool's canonical schema; representation adapters such as portable
+    /// apply_patch may intentionally expose a canonical subset.
+    pub logical_input_schema: Value,
+    /// The exact schema serialized into this request.
+    pub wire_input_schema: Value,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -700,6 +715,8 @@ pub enum ProviderToolDefinition {
 pub struct ProviderToolCall {
     pub id: String,
     pub name: String,
+    /// Canonical tool arguments. Provider adapters must decode any
+    /// provider-specific strict-schema representation before returning a call.
     pub arguments: Value,
 }
 
@@ -750,6 +767,7 @@ pub trait ModelProvider: Send + Sync {
             observation_body: redact_transport_value(&body),
             body,
             logical_request: request,
+            tool_contracts: Vec::new(),
             response_commit,
         })
     }
@@ -2105,6 +2123,7 @@ impl OpenAiCompatibleProvider {
             .is_none_or(|effort| effort != "none");
         let messages = self.chat_codec.encode_messages(&request, thinking_enabled);
         let tool_capable = !request.tool_candidates.is_empty();
+        let compiled_tools = compile_openai_tools(&request.tool_candidates, self.tool_protocol);
         let stream = !tool_capable
             || self.tool_protocol.streaming_tools == ProviderFeatureSupport::Supported;
         let mut payload = json!({
@@ -2160,7 +2179,7 @@ impl OpenAiCompatibleProvider {
             }
         }
         if !request.tool_candidates.is_empty() {
-            payload["tools"] = json!(openai_tools(&request.tool_candidates, self.tool_protocol));
+            payload["tools"] = json!(compiled_tools.tools);
             // DeepSeek V4 thinking mode rejects tool_choice and treats an
             // omitted value as auto. Non-thinking mode accepts the field.
             if !deepseek_thinking_enabled {
@@ -2200,6 +2219,7 @@ impl OpenAiCompatibleProvider {
             observation_body: redact_transport_value(&payload),
             body: payload,
             logical_request: request,
+            tool_contracts: compiled_tools.contracts,
             response_commit: if tool_capable {
                 ProviderResponseCommitMode::Atomic
             } else {
@@ -2270,7 +2290,7 @@ impl OpenAiCompatibleProvider {
             true,
         )
         .await;
-        let response = match decoded {
+        let mut response = match decoded {
             Ok(response) => response,
             Err(error)
                 if streamed
@@ -2302,6 +2322,7 @@ impl OpenAiCompatibleProvider {
                 return Err(error);
             }
         };
+        normalize_provider_tool_calls(&mut response.tool_calls, &prepared.tool_contracts);
         on_transport(ProviderTransportEvent::Response {
             attempt,
             status: Some(200),
@@ -2604,10 +2625,11 @@ impl OpenAiResponsesProvider {
         request: ModelRequest,
     ) -> anyhow::Result<PreparedProviderRequest> {
         ensure_visual_input_supported(&request, self.supports_vision)?;
-        let requires_function_tools =
-            responses_tool_definitions(&request.tool_candidates, self.tool_protocol)
-                .iter()
-                .any(|definition| matches!(definition, ProviderToolDefinition::Function { .. }));
+        let compiled_tools = compile_responses_tools(&request.tool_candidates, self.tool_protocol);
+        let requires_function_tools = compiled_tools
+            .tools
+            .iter()
+            .any(|tool| tool.get("type").and_then(Value::as_str) == Some("function"));
         if requires_function_tools {
             require_function_tools("OpenAI Responses", self.tool_protocol)?;
         }
@@ -2664,10 +2686,7 @@ impl OpenAiResponsesProvider {
         if self.native_web_search {
             tools.push(json!({ "type": "web_search" }));
         }
-        tools.extend(responses_tools(
-            &request.tool_candidates,
-            self.tool_protocol,
-        ));
+        tools.extend(compiled_tools.tools.iter().cloned());
         if !tools.is_empty() {
             payload["tools"] = json!(tools);
             payload["tool_choice"] = json!("auto");
@@ -2732,6 +2751,7 @@ impl OpenAiResponsesProvider {
             observation_body: redact_transport_value(&payload),
             body: payload,
             logical_request: request,
+            tool_contracts: compiled_tools.contracts,
             response_commit: if tool_capable {
                 ProviderResponseCommitMode::Atomic
             } else {
@@ -2788,7 +2808,7 @@ impl OpenAiResponsesProvider {
             true,
         )
         .await;
-        let response = match decoded {
+        let mut response = match decoded {
             Ok(response) => response,
             Err(error)
                 if streamed
@@ -2820,6 +2840,7 @@ impl OpenAiResponsesProvider {
                 return Err(error);
             }
         };
+        normalize_provider_tool_calls(&mut response.tool_calls, &prepared.tool_contracts);
         on_transport(ProviderTransportEvent::Response {
             attempt,
             status: Some(status.as_u16()),
@@ -3105,6 +3126,7 @@ impl AnthropicMessagesProvider {
             observation_body: redact_transport_value(&payload),
             body: payload,
             logical_request: request,
+            tool_contracts: Vec::new(),
             response_commit: if tool_capable {
                 ProviderResponseCommitMode::Atomic
             } else {
@@ -5386,35 +5408,54 @@ fn portable_function_tool_candidate(candidate: &ProviderToolCandidate) -> Provid
     }
 }
 
+#[cfg(test)]
 fn openai_tools(
     candidates: &[ProviderToolCandidate],
     capabilities: ProviderToolProtocolCapabilities,
 ) -> Vec<Value> {
-    candidates
-        .iter()
-        .map(|candidate| {
-            let candidate = portable_function_tool_candidate(candidate);
-            let strict_capable =
-                capabilities.strict_function_tools == ProviderFeatureSupport::Supported;
-            let strict_schema = strict_capable
-                .then(|| openai_strict_function_schema(&candidate.input_schema))
-                .flatten();
-            let strict = strict_schema.is_some();
-            let input_schema = strict_schema.unwrap_or(candidate.input_schema);
-            let mut function = json!({
-                "name": candidate.name,
-                "description": candidate.description,
-                "parameters": input_schema,
-            });
-            if strict_capable {
-                function["strict"] = json!(strict);
-            }
-            json!({
-                "type": "function",
-                "function": function,
-            })
-        })
-        .collect()
+    compile_openai_tools(candidates, capabilities).tools
+}
+
+#[derive(Debug)]
+struct CompiledProviderTools {
+    tools: Vec<Value>,
+    contracts: Vec<CompiledToolContract>,
+}
+
+fn compile_openai_tools(
+    candidates: &[ProviderToolCandidate],
+    capabilities: ProviderToolProtocolCapabilities,
+) -> CompiledProviderTools {
+    let mut tools = Vec::with_capacity(candidates.len());
+    let mut contracts = Vec::with_capacity(candidates.len());
+    candidates.iter().for_each(|candidate| {
+        let candidate = portable_function_tool_candidate(candidate);
+        let strict_capable =
+            capabilities.strict_function_tools == ProviderFeatureSupport::Supported;
+        let strict_schema = strict_capable
+            .then(|| openai_strict_function_schema(&candidate.input_schema))
+            .flatten();
+        let strict = strict_schema.is_some();
+        let input_schema = strict_schema.unwrap_or_else(|| candidate.input_schema.clone());
+        contracts.push(CompiledToolContract {
+            name: candidate.name.clone(),
+            logical_input_schema: candidate.input_schema.clone(),
+            wire_input_schema: input_schema.clone(),
+        });
+        let mut function = json!({
+            "name": candidate.name,
+            "description": candidate.description,
+            "parameters": input_schema,
+        });
+        if strict_capable {
+            function["strict"] = json!(strict);
+        }
+        tools.push(json!({
+            "type": "function",
+            "function": function,
+        }));
+    });
+    CompiledProviderTools { tools, contracts }
 }
 
 /// Lowers the provider-neutral Draft 7 schema into the conservative subset
@@ -5477,6 +5518,14 @@ fn lower_openai_strict_schema_node(schema: &mut Value) -> Option<()> {
     }
     if let Some(items) = object.get_mut("items") {
         lower_openai_strict_schema_node(items)?;
+    }
+
+    // A root or nested object union owns its properties inside mutually
+    // exclusive branches. Adding an empty `properties` map plus
+    // `additionalProperties: false` to the union container would reject every
+    // field accepted by those branches.
+    if object.contains_key("anyOf") && !object.contains_key("properties") {
+        return Some(());
     }
 
     let is_object = object.get("type").is_some_and(schema_type_includes_object)
@@ -5614,67 +5663,196 @@ fn make_openai_schema_nullable(schema: &mut Value) -> Option<()> {
     Some(())
 }
 
-fn responses_tool_definitions(
-    candidates: &[ProviderToolCandidate],
-    capabilities: ProviderToolProtocolCapabilities,
-) -> Vec<ProviderToolDefinition> {
-    candidates
-        .iter()
-        .map(|candidate| {
-            let is_apply_patch = candidate.name == "apply_patch";
-            // The local executor advertises native operation support through
-            // its schema. This second gate prevents an endpoint capability
-            // from selecting a wire format the Harness cannot yet execute.
-            let accepts_native_operation = candidate
-                .input_schema
-                .pointer("/properties/operation")
-                .is_some();
-            let accepts_freeform_patch = candidate
-                .input_schema
-                .pointer("/properties/patch/type")
-                .and_then(Value::as_str)
-                == Some("string");
-
-            if is_apply_patch
-                && accepts_native_operation
-                && capabilities.hosted_apply_patch == ProviderFeatureSupport::Supported
-            {
-                ProviderToolDefinition::Hosted {
-                    kind: "apply_patch".to_string(),
-                }
-            } else if is_apply_patch
-                && accepts_freeform_patch
-                && capabilities.freeform_tools == ProviderFeatureSupport::Supported
-            {
-                ProviderToolDefinition::Freeform {
-                    name: candidate.name.clone(),
-                    description: format!(
-                        "{} Return only the raw unified diff accepted by this tool; do not wrap it in JSON or Markdown.",
-                        candidate.description
-                    ),
-                }
-            } else {
-                let candidate = portable_function_tool_candidate(candidate);
-                let strict_schema = (capabilities.strict_function_tools
-                    == ProviderFeatureSupport::Supported)
-                    .then(|| openai_strict_function_schema(&candidate.input_schema))
-                    .flatten();
-                let strict = strict_schema.is_some();
-                ProviderToolDefinition::Function {
-                    name: candidate.name,
-                    description: candidate.description,
-                    input_schema: strict_schema.unwrap_or(candidate.input_schema),
-                    strict,
-                }
-            }
-        })
-        .collect()
+fn normalize_provider_tool_calls(
+    tool_calls: &mut [ProviderToolCall],
+    contracts: &[CompiledToolContract],
+) {
+    for call in tool_calls {
+        let Some(contract) = contracts.iter().find(|contract| contract.name == call.name) else {
+            continue;
+        };
+        normalize_provider_arguments(
+            &contract.logical_input_schema,
+            &contract.wire_input_schema,
+            &mut call.arguments,
+        );
+    }
 }
 
+/// Restores a provider wire value to the schema shape that existed before
+/// strict lowering. Only nullability introduced for an originally optional
+/// property is removed; canonical nullable values and invalid values are left
+/// untouched for the ordinary runtime validator.
+fn normalize_provider_arguments(logical_schema: &Value, wire_schema: &Value, value: &mut Value) {
+    let logical_branch = matching_schema_branch(logical_schema, value);
+    let wire_branch = matching_schema_branch(wire_schema, value);
+    if logical_branch.is_some() || wire_branch.is_some() {
+        normalize_provider_arguments(
+            logical_branch.unwrap_or(logical_schema),
+            wire_branch.unwrap_or(wire_schema),
+            value,
+        );
+        return;
+    }
+
+    if let Some(object) = value.as_object_mut() {
+        let logical_required = logical_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let logical_properties = logical_schema.get("properties").and_then(Value::as_object);
+        let wire_properties = wire_schema.get("properties").and_then(Value::as_object);
+        let keys = object.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let Some(logical_property) = logical_properties.and_then(|items| items.get(&key))
+            else {
+                continue;
+            };
+            let Some(wire_property) = wire_properties.and_then(|items| items.get(&key)) else {
+                continue;
+            };
+            let remove_provider_null = object.get(&key).is_some_and(Value::is_null)
+                && !logical_required.contains(key.as_str())
+                && !schema_accepts_null(logical_property)
+                && schema_accepts_null(wire_property);
+            if remove_provider_null {
+                object.remove(&key);
+            } else if let Some(item) = object.get_mut(&key) {
+                normalize_provider_arguments(logical_property, wire_property, item);
+            }
+        }
+    } else if let Some(items) = value.as_array_mut() {
+        if let (Some(logical_items), Some(wire_items)) =
+            (logical_schema.get("items"), wire_schema.get("items"))
+        {
+            for item in items {
+                normalize_provider_arguments(logical_items, wire_items, item);
+            }
+        }
+    }
+}
+
+fn schema_accepts_null(schema: &Value) -> bool {
+    tool_input_schema_error(schema, &Value::Null, "arguments").is_none()
+}
+
+fn matching_schema_branch<'a>(schema: &'a Value, value: &Value) -> Option<&'a Value> {
+    let branches = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))?
+        .as_array()?;
+
+    if let Some(object) = value.as_object() {
+        if let Some(discriminator) = discriminated_union_key(branches) {
+            if let Some(actual) = object.get(&discriminator) {
+                if let Some(branch) = branches.iter().find(|branch| {
+                    branch
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .and_then(|properties| properties.get(&discriminator))
+                        .and_then(schema_singleton_value)
+                        == Some(actual)
+                }) {
+                    return Some(branch);
+                }
+            }
+        }
+    }
+
+    branches
+        .iter()
+        .find(|branch| tool_input_schema_error(branch, value, "arguments").is_none())
+}
+
+struct CompiledResponseToolDefinitions {
+    definitions: Vec<ProviderToolDefinition>,
+    contracts: Vec<CompiledToolContract>,
+}
+
+fn compile_responses_tool_definitions(
+    candidates: &[ProviderToolCandidate],
+    capabilities: ProviderToolProtocolCapabilities,
+) -> CompiledResponseToolDefinitions {
+    let mut definitions = Vec::with_capacity(candidates.len());
+    let mut contracts = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let is_apply_patch = candidate.name == "apply_patch";
+        // The local executor advertises native operation support through
+        // its schema. This second gate prevents an endpoint capability
+        // from selecting a wire format the Harness cannot yet execute.
+        let accepts_native_operation = candidate
+            .input_schema
+            .pointer("/properties/operation")
+            .is_some();
+        let accepts_freeform_patch = candidate
+            .input_schema
+            .pointer("/properties/patch/type")
+            .and_then(Value::as_str)
+            == Some("string");
+
+        if is_apply_patch
+            && accepts_native_operation
+            && capabilities.hosted_apply_patch == ProviderFeatureSupport::Supported
+        {
+            definitions.push(ProviderToolDefinition::Hosted {
+                kind: "apply_patch".to_string(),
+            });
+        } else if is_apply_patch
+            && accepts_freeform_patch
+            && capabilities.freeform_tools == ProviderFeatureSupport::Supported
+        {
+            definitions.push(ProviderToolDefinition::Freeform {
+                name: candidate.name.clone(),
+                description: format!(
+                    "{} Return only the raw unified diff accepted by this tool; do not wrap it in JSON or Markdown.",
+                    candidate.description
+                ),
+            });
+        } else {
+            let candidate = portable_function_tool_candidate(candidate);
+            let strict_schema = (capabilities.strict_function_tools
+                == ProviderFeatureSupport::Supported)
+                .then(|| openai_strict_function_schema(&candidate.input_schema))
+                .flatten();
+            let strict = strict_schema.is_some();
+            let input_schema = strict_schema.unwrap_or_else(|| candidate.input_schema.clone());
+            contracts.push(CompiledToolContract {
+                name: candidate.name.clone(),
+                logical_input_schema: candidate.input_schema.clone(),
+                wire_input_schema: input_schema.clone(),
+            });
+            definitions.push(ProviderToolDefinition::Function {
+                name: candidate.name,
+                description: candidate.description,
+                input_schema,
+                strict,
+            });
+        }
+    }
+    CompiledResponseToolDefinitions {
+        definitions,
+        contracts,
+    }
+}
+
+#[cfg(test)]
 fn responses_tools(
     candidates: &[ProviderToolCandidate],
     capabilities: ProviderToolProtocolCapabilities,
 ) -> Vec<Value> {
+    compile_responses_tools(candidates, capabilities).tools
+}
+
+fn compile_responses_tools(
+    candidates: &[ProviderToolCandidate],
+    capabilities: ProviderToolProtocolCapabilities,
+) -> CompiledProviderTools {
     fn lower_definition(definition: ProviderToolDefinition) -> Value {
         match definition {
             ProviderToolDefinition::Function {
@@ -5698,13 +5876,13 @@ fn responses_tools(
         }
     }
 
-    let definitions = responses_tool_definitions(candidates, capabilities);
+    let compiled = compile_responses_tool_definitions(candidates, capabilities);
     let mut tools = Vec::new();
     let mut namespaces: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
     let native_deferred = capabilities.deferred_tool_loading == ProviderFeatureSupport::Supported
         && capabilities.hosted_tool_search == ProviderFeatureSupport::Supported;
 
-    for (candidate, definition) in candidates.iter().zip(definitions) {
+    for (candidate, definition) in candidates.iter().zip(compiled.definitions) {
         let mut tool = lower_definition(definition);
         match candidate.disclosure {
             ProviderToolDisclosure::Direct if native_deferred => tools.push(tool),
@@ -5744,7 +5922,10 @@ fn responses_tools(
     if native_deferred && has_deferred {
         tools.push(json!({ "type": "tool_search" }));
     }
-    tools
+    CompiledProviderTools {
+        tools,
+        contracts: compiled.contracts,
+    }
 }
 
 fn responses_input(request: &ModelRequest) -> Vec<Value> {
@@ -8562,6 +8743,7 @@ impl ModelProvider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{SpreadsheetTool, Tool};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -11455,6 +11637,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_provider_decodes_arguments_with_the_exact_advertised_strict_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            assert!(request.contains(r#""strict":true"#));
+            assert!(request.contains(r#""type":["array","null"]"#));
+            socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_records\",\"function\":{\"name\":\"records\",\"arguments\":\"{\\\"columns\\\":null}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let mut provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1"),
+            "test-key",
+            "strict-contract-model",
+        );
+        provider.tool_protocol.streaming_tools = ProviderFeatureSupport::Supported;
+        provider.tool_protocol.strict_function_tools = ProviderFeatureSupport::Supported;
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate::direct(
+            "records",
+            "Update records",
+            json!({
+                "type": "object",
+                "properties": {
+                    "columns": { "type": "array", "items": { "type": "string" } }
+                },
+                "additionalProperties": false
+            }),
+        )];
+
+        let response = provider
+            .stream_prepared(
+                provider.prepare(Uuid::new_v4(), request).unwrap(),
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.tool_calls[0].arguments, json!({}));
+    }
+
+    #[tokio::test]
     async fn chat_provider_fails_fast_when_upstream_rejects_image_input() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -12364,6 +12604,240 @@ mod tests {
             lowered["properties"]["window"]["anyOf"][0]["additionalProperties"],
             false
         );
+    }
+
+    #[test]
+    fn strict_function_schema_preserves_root_discriminated_unions() {
+        let schema = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["read"] },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["action", "path"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list"] }
+                    },
+                    "required": ["action"]
+                }
+            ]
+        });
+
+        let lowered = openai_strict_function_schema(&schema).expect("lower root tagged union");
+        assert!(lowered["anyOf"].is_array());
+        assert!(lowered.get("properties").is_none());
+        assert!(lowered.get("additionalProperties").is_none());
+        assert_eq!(lowered["anyOf"][0]["additionalProperties"], false);
+        assert_eq!(lowered["anyOf"][1]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn compiled_contract_restores_only_provider_introduced_nulls() {
+        let candidate = ProviderToolCandidate::direct(
+            "records",
+            "Update records.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "columns": { "type": "array", "items": { "type": "string" } },
+                    "note": { "type": "string" },
+                    "explicitNullable": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false
+            }),
+        );
+        let capabilities = ProviderToolProtocolCapabilities {
+            function_tools: ProviderFeatureSupport::Supported,
+            strict_function_tools: ProviderFeatureSupport::Supported,
+            ..ProviderToolProtocolCapabilities::default()
+        };
+
+        let compiled = compile_openai_tools(&[candidate], capabilities);
+        let contract = &compiled.contracts[0];
+        assert_eq!(
+            compiled.tools[0]["function"]["parameters"],
+            contract.wire_input_schema
+        );
+        let mut arguments = json!({
+            "columns": null,
+            "note": null,
+            "explicitNullable": null
+        });
+        assert_eq!(
+            tool_input_schema_error(&contract.wire_input_schema, &arguments, "arguments"),
+            None
+        );
+
+        normalize_provider_arguments(
+            &contract.logical_input_schema,
+            &contract.wire_input_schema,
+            &mut arguments,
+        );
+
+        assert_eq!(arguments, json!({ "explicitNullable": null }));
+        assert_eq!(
+            tool_input_schema_error(&contract.logical_input_schema, &arguments, "arguments"),
+            None
+        );
+    }
+
+    #[test]
+    fn prepared_openai_requests_retain_the_exact_advertised_contract() {
+        let mut request = model_request();
+        request.tool_candidates = vec![ProviderToolCandidate::direct(
+            "records",
+            "Update records.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "columns": { "type": "array", "items": { "type": "string" } }
+                },
+                "additionalProperties": false
+            }),
+        )];
+
+        let mut chat =
+            OpenAiCompatibleProvider::new("https://example.test/v1", "test-key", "strict-model");
+        chat.tool_protocol.strict_function_tools = ProviderFeatureSupport::Supported;
+        let chat = chat.prepare(Uuid::nil(), request.clone()).unwrap();
+        assert_eq!(chat.tool_contracts.len(), 1);
+        assert_eq!(
+            chat.body["tools"][0]["function"]["parameters"],
+            chat.tool_contracts[0].wire_input_schema
+        );
+
+        let mut responses =
+            OpenAiResponsesProvider::new("https://example.test/v1", "test-key", "strict-model");
+        responses.native_web_search = false;
+        responses.tool_protocol.strict_function_tools = ProviderFeatureSupport::Supported;
+        let responses = responses.prepare(Uuid::nil(), request).unwrap();
+        assert_eq!(responses.tool_contracts.len(), 1);
+        assert_eq!(
+            responses.body["tools"][0]["parameters"],
+            responses.tool_contracts[0].wire_input_schema
+        );
+    }
+
+    #[test]
+    fn compiled_contract_normalizes_the_selected_root_union_branch() {
+        let candidate = ProviderToolCandidate::direct(
+            "spreadsheet",
+            "Spreadsheet operations.",
+            json!({
+                "type": "object",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "enum": ["write_columns"] },
+                            "path": { "type": "string" },
+                            "columns": {
+                                "type": "array",
+                                "items": { "type": "array", "items": { "type": "string" } },
+                                "minItems": 1
+                            }
+                        },
+                        "required": ["action", "columns"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "enum": ["filter_rows"] },
+                            "path": { "type": "string" },
+                            "conditions": {
+                                "type": "array",
+                                "items": { "type": "object" },
+                                "minItems": 1
+                            }
+                        },
+                        "required": ["action", "conditions"],
+                        "additionalProperties": false
+                    }
+                ]
+            }),
+        );
+        let capabilities = ProviderToolProtocolCapabilities {
+            function_tools: ProviderFeatureSupport::Supported,
+            strict_function_tools: ProviderFeatureSupport::Supported,
+            ..ProviderToolProtocolCapabilities::default()
+        };
+        let compiled = compile_openai_tools(&[candidate], capabilities);
+        let contract = &compiled.contracts[0];
+        let mut arguments = json!({
+            "action": "write_columns",
+            "path": null,
+            "columns": [["sku", "quantity"]]
+        });
+        assert_eq!(
+            tool_input_schema_error(&contract.wire_input_schema, &arguments, "arguments"),
+            None
+        );
+
+        normalize_provider_arguments(
+            &contract.logical_input_schema,
+            &contract.wire_input_schema,
+            &mut arguments,
+        );
+
+        assert_eq!(
+            arguments,
+            json!({
+                "action": "write_columns",
+                "columns": [["sku", "quantity"]]
+            })
+        );
+        assert_eq!(
+            tool_input_schema_error(&contract.logical_input_schema, &arguments, "arguments"),
+            None
+        );
+    }
+
+    #[test]
+    fn spreadsheet_wire_contract_is_accepted_by_the_typed_runtime_contract() {
+        let tool = SpreadsheetTool;
+        let candidate = ProviderToolCandidate::direct(
+            Tool::name(&tool),
+            Tool::description(&tool),
+            Tool::schema(&tool),
+        );
+        let capabilities = ProviderToolProtocolCapabilities {
+            function_tools: ProviderFeatureSupport::Supported,
+            strict_function_tools: ProviderFeatureSupport::Supported,
+            ..ProviderToolProtocolCapabilities::default()
+        };
+        let compiled = compile_openai_tools(&[candidate], capabilities);
+        let contract = &compiled.contracts[0];
+        let mut arguments = json!({
+            "action": "write_columns",
+            "path": null,
+            "sheet": "Orders",
+            "start": { "row": 0, "column": 0 },
+            "columns": [[{ "type": "string", "value": "sku" }]],
+            "sourcePath": null,
+            "outputPath": null,
+            "atomic": null
+        });
+        assert_eq!(
+            tool_input_schema_error(&contract.wire_input_schema, &arguments, "arguments"),
+            None
+        );
+
+        normalize_provider_arguments(
+            &contract.logical_input_schema,
+            &contract.wire_input_schema,
+            &mut arguments,
+        );
+
+        assert_eq!(Tool::input_error(&tool, &arguments), None);
+        assert!(arguments["columns"].is_array());
+        assert!(arguments["path"].is_null());
     }
 
     #[test]

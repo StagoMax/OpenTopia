@@ -10,8 +10,7 @@ use crate::pdf::{
 
 const DEFAULT_RENDER_DPI: u16 = 144;
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 enum PdfToolAction {
     Inspect,
     Extract,
@@ -20,27 +19,147 @@ enum PdfToolAction {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PdfToolInput {
+#[serde(
+    tag = "action",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum PdfToolInput {
+    #[schemars(rename_all = "camelCase")]
+    Inspect {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Extract {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        /// One-based page numbers. Defaults to all pages.
+        #[serde(default)]
+        #[schemars(length(max = 8), inner(range(min = 1)))]
+        pages: Vec<u32>,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 200000))]
+        max_characters: Option<usize>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Render {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        /// One-based page numbers. Defaults to page 1.
+        #[serde(default)]
+        #[schemars(length(max = 8), inner(range(min = 1)))]
+        pages: Vec<u32>,
+        #[serde(default)]
+        #[schemars(range(min = 36, max = 288))]
+        dpi: Option<u16>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Validate {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+    },
+}
+
+impl PdfToolInput {
+    fn action(&self) -> PdfToolAction {
+        match self {
+            Self::Inspect { .. } => PdfToolAction::Inspect,
+            Self::Extract { .. } => PdfToolAction::Extract,
+            Self::Render { .. } => PdfToolAction::Render,
+            Self::Validate { .. } => PdfToolAction::Validate,
+        }
+    }
+
+    fn source(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Self::Inspect {
+                path,
+                attachment_id,
+            }
+            | Self::Extract {
+                path,
+                attachment_id,
+                ..
+            }
+            | Self::Render {
+                path,
+                attachment_id,
+                ..
+            }
+            | Self::Validate {
+                path,
+                attachment_id,
+            } => (path.as_deref(), attachment_id.as_deref()),
+        }
+    }
+}
+
+struct PdfExecutionInput {
     action: PdfToolAction,
-    /// Workspace-relative PDF path. Provide either this or attachmentId.
-    #[serde(default)]
     path: Option<String>,
-    /// Opaque user attachment ID shown in the attachment manifest.
-    #[serde(default)]
     attachment_id: Option<String>,
-    /// One-based page numbers. Extract defaults to all pages; render defaults to page 1.
-    #[serde(default)]
-    #[schemars(length(max = 8), inner(range(min = 1)))]
     pages: Vec<u32>,
-    /// Maximum extracted characters.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 200000))]
     max_characters: Option<usize>,
-    /// Render resolution in dots per inch.
-    #[serde(default)]
-    #[schemars(range(min = 36, max = 288))]
     dpi: Option<u16>,
+}
+
+impl From<PdfToolInput> for PdfExecutionInput {
+    fn from(input: PdfToolInput) -> Self {
+        let action = input.action();
+        match input {
+            PdfToolInput::Inspect {
+                path,
+                attachment_id,
+            }
+            | PdfToolInput::Validate {
+                path,
+                attachment_id,
+            } => Self {
+                action,
+                path,
+                attachment_id,
+                pages: Vec::new(),
+                max_characters: None,
+                dpi: None,
+            },
+            PdfToolInput::Extract {
+                path,
+                attachment_id,
+                pages,
+                max_characters,
+            } => Self {
+                action,
+                path,
+                attachment_id,
+                pages,
+                max_characters,
+                dpi: None,
+            },
+            PdfToolInput::Render {
+                path,
+                attachment_id,
+                pages,
+                dpi,
+            } => Self {
+                action,
+                path,
+                attachment_id,
+                pages,
+                max_characters: None,
+                dpi,
+            },
+        }
+    }
 }
 
 pub struct PdfTool;
@@ -58,9 +177,9 @@ impl TypedTool for PdfTool {
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        let file =
-            artifact_input_resource_key(input.path.as_deref(), input.attachment_id.as_deref());
-        if matches!(input.action, PdfToolAction::Render) {
+        let (path, attachment_id) = input.source();
+        let file = artifact_input_resource_key(path, attachment_id);
+        if matches!(input.action(), PdfToolAction::Render) {
             ToolExecutionPolicy::read_only(vec!["artifact-runtime:pdf".to_string(), file])
         } else {
             ToolExecutionPolicy::read_only(vec![file])
@@ -68,7 +187,7 @@ impl TypedTool for PdfTool {
     }
 
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from))
+        ToolExecutionIntent::observation(input.source().0.map(PathBuf::from))
     }
 
     async fn execute_typed(
@@ -77,6 +196,7 @@ impl TypedTool for PdfTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
+        let input = PdfExecutionInput::from(input);
         let artifact_input = read_artifact_input(
             &ctx,
             input.path.as_deref(),
@@ -169,8 +289,7 @@ impl TypedTool for PdfTool {
 
 impl_typed_tool!(PdfTool);
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 enum DocumentToolAction {
     Inspect,
     Extract,
@@ -178,22 +297,110 @@ enum DocumentToolAction {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DocumentToolInput {
+#[serde(
+    tag = "action",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DocumentToolInput {
+    #[schemars(rename_all = "camelCase")]
+    Inspect {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Extract {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+        /// Include headers, footers, comments, footnotes, and endnotes.
+        #[serde(default)]
+        include_related_parts: bool,
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 200000))]
+        max_characters: Option<usize>,
+    },
+    #[schemars(rename_all = "camelCase")]
+    Validate {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<String>,
+    },
+}
+
+impl DocumentToolInput {
+    fn action(&self) -> DocumentToolAction {
+        match self {
+            Self::Inspect { .. } => DocumentToolAction::Inspect,
+            Self::Extract { .. } => DocumentToolAction::Extract,
+            Self::Validate { .. } => DocumentToolAction::Validate,
+        }
+    }
+
+    fn source(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Self::Inspect {
+                path,
+                attachment_id,
+            }
+            | Self::Extract {
+                path,
+                attachment_id,
+                ..
+            }
+            | Self::Validate {
+                path,
+                attachment_id,
+            } => (path.as_deref(), attachment_id.as_deref()),
+        }
+    }
+}
+
+struct DocumentExecutionInput {
     action: DocumentToolAction,
-    /// Workspace-relative DOCX path. Provide either this or attachmentId.
-    #[serde(default)]
     path: Option<String>,
-    /// Opaque user attachment ID shown in the attachment manifest.
-    #[serde(default)]
     attachment_id: Option<String>,
-    /// Include headers, footers, comments, footnotes, and endnotes during extraction.
-    #[serde(default)]
     include_related_parts: bool,
-    /// Maximum extracted characters.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 200000))]
     max_characters: Option<usize>,
+}
+
+impl From<DocumentToolInput> for DocumentExecutionInput {
+    fn from(input: DocumentToolInput) -> Self {
+        let action = input.action();
+        match input {
+            DocumentToolInput::Inspect {
+                path,
+                attachment_id,
+            }
+            | DocumentToolInput::Validate {
+                path,
+                attachment_id,
+            } => Self {
+                action,
+                path,
+                attachment_id,
+                include_related_parts: false,
+                max_characters: None,
+            },
+            DocumentToolInput::Extract {
+                path,
+                attachment_id,
+                include_related_parts,
+                max_characters,
+            } => Self {
+                action,
+                path,
+                attachment_id,
+                include_related_parts,
+                max_characters,
+            },
+        }
+    }
 }
 
 pub struct DocumentTool;
@@ -211,13 +418,13 @@ impl TypedTool for DocumentTool {
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        let file =
-            artifact_input_resource_key(input.path.as_deref(), input.attachment_id.as_deref());
+        let (path, attachment_id) = input.source();
+        let file = artifact_input_resource_key(path, attachment_id);
         ToolExecutionPolicy::read_only(vec![file])
     }
 
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        ToolExecutionIntent::observation(input.path.iter().map(PathBuf::from))
+        ToolExecutionIntent::observation(input.source().0.map(PathBuf::from))
     }
 
     async fn execute_typed(
@@ -226,6 +433,7 @@ impl TypedTool for DocumentTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
+        let input = DocumentExecutionInput::from(input);
         let artifact_input = read_artifact_input(
             &ctx,
             input.path.as_deref(),

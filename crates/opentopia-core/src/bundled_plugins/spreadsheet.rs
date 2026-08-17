@@ -33,6 +33,20 @@ mod tests {
     use crate::tools::{SpreadsheetTool, Tool};
     use serde_json::Value;
 
+    fn action_names(schema: &Value) -> Vec<String> {
+        schema["oneOf"]
+            .as_array()
+            .expect("action branches")
+            .iter()
+            .map(|branch| {
+                branch["properties"]["action"]["enum"][0]
+                    .as_str()
+                    .expect("action name")
+                    .to_string()
+            })
+            .collect()
+    }
+
     #[test]
     fn package_and_manifest_keep_host_owned_trust_out_of_plugin_data() {
         let manifest: Value = serde_json::from_slice(MANIFEST).expect("valid plugin manifest");
@@ -60,8 +74,8 @@ mod tests {
             tool.name()
         );
         assert_eq!(
-            tool.schema()["properties"]["action"]["enum"],
-            serde_json::json!([
+            action_names(&tool.schema()),
+            vec![
                 "inspect",
                 "list_sheets",
                 "read_range",
@@ -75,8 +89,8 @@ mod tests {
                 "write_columns",
                 "copy_rows",
                 "copy_columns",
-                "batch"
-            ])
+                "batch",
+            ]
         );
         assert!(opentopia["contributes"].get("previewers").is_none());
         assert_eq!(

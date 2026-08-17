@@ -24,6 +24,20 @@ mod tests {
     use crate::tools::{PdfTool, Tool};
     use serde_json::Value;
 
+    fn action_names(schema: &Value) -> Vec<String> {
+        schema["oneOf"]
+            .as_array()
+            .expect("action branches")
+            .iter()
+            .map(|branch| {
+                branch["properties"]["action"]["enum"][0]
+                    .as_str()
+                    .expect("action name")
+                    .to_string()
+            })
+            .collect()
+    }
+
     #[test]
     fn manifest_registers_the_host_owned_pdf_tool() {
         let manifest: Value = serde_json::from_slice(MANIFEST).expect("valid PDF manifest");
@@ -53,14 +67,17 @@ mod tests {
             manifest["opentopia"]["permissions"]["filesystem"],
             serde_json::json!(["workspace:read"])
         );
+        let tool_schema = tool.schema();
         assert_eq!(
-            tool.schema()["properties"]["action"]["enum"],
-            serde_json::json!(["inspect", "extract", "render", "validate"])
+            action_names(&tool_schema),
+            vec!["inspect", "extract", "render", "validate"]
         );
-        assert_eq!(
-            tool.schema()["properties"]["pages"]["items"]["minimum"],
-            serde_json::json!(1.0)
-        );
+        assert!(tool_schema["oneOf"].as_array().is_some_and(|branches| {
+            branches
+                .iter()
+                .filter_map(|branch| branch["properties"].get("pages"))
+                .all(|pages| pages["items"]["minimum"] == serde_json::json!(1.0))
+        }));
         assert!(manifest.get("trust").is_none());
         assert!(manifest.get("official").is_none());
         assert!(manifest["opentopia"].get("trust").is_none());

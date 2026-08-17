@@ -24,6 +24,20 @@ mod tests {
     use crate::tools::{DocumentTool, Tool};
     use serde_json::Value;
 
+    fn action_names(schema: &Value) -> Vec<String> {
+        schema["oneOf"]
+            .as_array()
+            .expect("action branches")
+            .iter()
+            .map(|branch| {
+                branch["properties"]["action"]["enum"][0]
+                    .as_str()
+                    .expect("action name")
+                    .to_string()
+            })
+            .collect()
+    }
+
     #[test]
     fn manifest_registers_the_host_owned_document_tool() {
         let manifest: Value = serde_json::from_slice(MANIFEST).expect("valid Documents manifest");
@@ -52,12 +66,21 @@ mod tests {
             manifest["opentopia"]["permissions"]["filesystem"],
             serde_json::json!(["workspace:read"])
         );
+        let tool_schema = tool.schema();
         assert_eq!(
-            tool.schema()["properties"]["action"]["enum"],
-            serde_json::json!(["inspect", "extract", "validate"])
+            action_names(&tool_schema),
+            vec!["inspect", "extract", "validate"]
         );
-        assert!(tool.schema()["properties"].get("pages").is_none());
-        assert!(tool.schema()["properties"].get("dpi").is_none());
+        assert!(tool_schema["oneOf"].as_array().is_some_and(|branches| {
+            branches
+                .iter()
+                .all(|branch| branch["properties"].get("pages").is_none())
+        }));
+        assert!(tool_schema["oneOf"].as_array().is_some_and(|branches| {
+            branches
+                .iter()
+                .all(|branch| branch["properties"].get("dpi").is_none())
+        }));
         assert!(manifest.get("trust").is_none());
         assert!(manifest.get("official").is_none());
         assert!(manifest["opentopia"].get("trust").is_none());

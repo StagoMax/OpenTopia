@@ -225,6 +225,7 @@ mod tests {
                 body: serde_json::json!({"encoded": request.input.current_user.message}),
                 observation_body: serde_json::json!({"encoded": true}),
                 logical_request: request,
+                tool_contracts: Vec::new(),
                 response_commit: ProviderResponseCommitMode::Streaming,
             })
         }
@@ -320,6 +321,7 @@ mod tests {
                 body: serde_json::json!({}),
                 observation_body: serde_json::json!({}),
                 logical_request: request,
+                tool_contracts: Vec::new(),
                 response_commit: ProviderResponseCommitMode::Atomic,
             })
         }
