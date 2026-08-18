@@ -4,6 +4,7 @@ use crate::store::{normalize_workspace_key, SqliteSessionStore};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -13,7 +14,7 @@ use uuid::Uuid;
 
 const MAX_PLUGIN_CONTROL_FILE_BYTES: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginControlScopeType {
     Global,
@@ -40,7 +41,7 @@ impl PluginControlScopeType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginControlScope {
     pub scope_type: PluginControlScopeType,
@@ -124,7 +125,7 @@ impl PluginControlScope {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginActivationRecord {
     pub plugin_id: String,
@@ -133,7 +134,7 @@ pub struct PluginActivationRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSettingsRecord {
     pub plugin_id: String,
@@ -142,7 +143,7 @@ pub struct PluginSettingsRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSecretBindingRecord {
     pub plugin_id: String,
@@ -154,7 +155,7 @@ pub struct PluginSecretBindingRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPermissionGrantStatus {
     Granted,
@@ -178,7 +179,7 @@ impl PluginPermissionGrantStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginPermissionGrantRecord {
     pub plugin_id: String,
@@ -192,7 +193,7 @@ pub struct PluginPermissionGrantRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginContributionRecord {
     pub plugin_id: String,
@@ -204,7 +205,7 @@ pub struct PluginContributionRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginRuntimeHealthStatus {
     Unknown,
@@ -237,7 +238,7 @@ impl PluginRuntimeHealthStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginRuntimeHealthRecord {
     pub plugin_id: String,
@@ -249,7 +250,7 @@ pub struct PluginRuntimeHealthRecord {
     pub restart_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginPermissionRequest {
     pub category: String,
@@ -257,7 +258,7 @@ pub struct PluginPermissionRequest {
     pub permission: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginControlManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]

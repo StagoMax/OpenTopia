@@ -13,6 +13,7 @@ use opentopia_core::{
     PluginRuntimeHealthRecord, PluginSecretBindingRecord, PluginSettingsRecord, PluginSource,
     SessionStore, SqliteSessionStore, Thread,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -688,16 +689,16 @@ struct PluginActivationRequest {
     enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct PluginActivationResponse {
+pub(super) struct PluginActivationResponse {
     activation: PluginActivationRecord,
     effective_enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct PluginDetailResponse {
+pub(super) struct PluginDetailResponse {
     plugin: PluginDescriptor,
     manifest: PluginControlManifest,
     activations: Vec<PluginActivationRecord>,
@@ -716,17 +717,17 @@ struct PluginSettingsPatchRequest {
     secret_bindings: BTreeMap<String, Option<String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct PluginSettingsResponse {
+pub(super) struct PluginSettingsResponse {
     schema: Option<Value>,
     settings: PluginSettingsRecord,
     secret_bindings: Vec<PluginSecretBindingRecord>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct PluginPermissionsResponse {
+pub(super) struct PluginPermissionsResponse {
     requests: Vec<opentopia_core::PluginPermissionRequest>,
     grants: Vec<PluginPermissionGrantRecord>,
 }
@@ -745,9 +746,9 @@ fn empty_json_object() -> Value {
     Value::Object(Map::new())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct ThreadCapabilitiesResponse {
+pub(super) struct ThreadCapabilitiesResponse {
     thread_id: Uuid,
     experience_mode: ExperienceMode,
     prompt_profile_id: String,
@@ -758,7 +759,7 @@ struct ThreadCapabilitiesResponse {
     plugins: Vec<ThreadPluginCapabilities>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ThreadPluginCapabilities {
     plugin_id: String,

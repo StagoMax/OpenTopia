@@ -3,6 +3,7 @@ use crate::local_git::{LocalGitRemote, NormalizedGitRemoteUrl, LOCAL_GIT_V1_API_
 use crate::store::SqliteSessionStore;
 use anyhow::bail;
 use rusqlite::{params, Connection, OptionalExtension};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,7 +11,7 @@ use std::path::PathBuf;
 
 pub const SCM_CONNECTOR_HOST_API_VERSION: &str = "scmConnectorHost.v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScmConnectorDescriptor {
     pub plugin_id: String,
@@ -51,7 +52,9 @@ impl ScmConnectorDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ScmConnectorCapability {
     ChangeRequests,
@@ -62,7 +65,7 @@ pub enum ScmConnectorCapability {
     RepositoryIdentity,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScmRemoteUrlMatcher {
     pub matcher_id: String,
@@ -100,7 +103,7 @@ impl ScmRemoteUrlMatcher {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ScmHostMatcher {
     Exact(String),
@@ -119,7 +122,7 @@ impl ScmHostMatcher {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ScmPathMatcher {
     Exact(String),
@@ -141,7 +144,9 @@ impl ScmPathMatcher {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ScmMatcherSpecificity {
     pub host: u8,
@@ -149,7 +154,7 @@ pub struct ScmMatcherSpecificity {
     pub scheme: u8,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScmRemoteBinding {
     pub workspace_key: String,
@@ -292,7 +297,7 @@ fn validate_binding(binding: &ScmRemoteBinding) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScmConnectorCandidate {
     pub plugin_id: String,
@@ -301,14 +306,14 @@ pub struct ScmConnectorCandidate {
     pub specificity: ScmMatcherSpecificity,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScmSelectionSource {
     BestMatch,
     RemoteBinding,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ScmConnectorSelection {
     Unmatched,
@@ -323,7 +328,7 @@ pub enum ScmConnectorSelection {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScmBindingIssue {
     WrongWorkspaceOrRemote,

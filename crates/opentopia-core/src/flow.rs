@@ -3,6 +3,7 @@ use crate::enterprise::{
 };
 use crate::model_context::content_fingerprint;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -12,7 +13,7 @@ pub const MAX_FLOW_NODES: usize = 128;
 pub const MAX_FLOW_LOOP_ITERATIONS: u32 = 50;
 pub const MAX_FLOW_DURATION_SECONDS: u64 = 86_400;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
@@ -23,7 +24,7 @@ pub enum FlowSourceV1 {
     RunTrace { run_id: Uuid, trace_hash: String },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowDraftStatusV1 {
     Drafting,
@@ -45,7 +46,9 @@ impl FlowDraftStatusV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphNodeKindV1 {
     Agent,
@@ -59,7 +62,7 @@ pub enum GraphNodeKindV1 {
     Output,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphNodeV1 {
     pub id: String,
@@ -73,7 +76,7 @@ pub struct GraphNodeV1 {
     pub output_schema: Value,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopExhaustionActionV1 {
     RequireHuman,
@@ -81,7 +84,7 @@ pub enum LoopExhaustionActionV1 {
     Fail,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphLoopPolicyV1 {
     pub max_iterations: u32,
@@ -89,7 +92,7 @@ pub struct GraphLoopPolicyV1 {
     pub on_exhausted: LoopExhaustionActionV1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphEdgeV1 {
     pub from: String,
@@ -106,7 +109,7 @@ pub struct GraphEdgeV1 {
     pub loop_policy: Option<GraphLoopPolicyV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphDefinitionV1 {
     pub schema_version: u16,
@@ -115,7 +118,7 @@ pub struct GraphDefinitionV1 {
     pub edges: Vec<GraphEdgeV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowBudgetV1 {
     pub max_node_executions: u32,
@@ -135,7 +138,7 @@ impl Default for FlowBudgetV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowSpecV1 {
     pub flow_id: String,
@@ -159,14 +162,14 @@ pub struct FlowSpecV1 {
     pub pending_decisions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowValidationSeverityV1 {
     Error,
     Warning,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowValidationIssueV1 {
     pub severity: FlowValidationSeverityV1,
@@ -179,7 +182,7 @@ pub struct FlowValidationIssueV1 {
     pub remediation: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowValidationReportV1 {
     pub valid: bool,
@@ -196,7 +199,7 @@ impl FlowValidationReportV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowDraftV1 {
     pub schema_version: u16,
@@ -257,7 +260,7 @@ impl FlowDraftV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowDefinitionV1 {
     pub schema_version: u16,
@@ -280,7 +283,7 @@ pub struct FlowDefinitionV1 {
     pub published_by: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowTrialStatusV1 {
     Passed,
@@ -296,7 +299,7 @@ impl FlowTrialStatusV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowSimulationStepV1 {
     pub order: u32,
@@ -305,7 +308,7 @@ pub struct FlowSimulationStepV1 {
     pub bounded_by: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowTrialV1 {
     pub schema_version: u16,
@@ -319,7 +322,7 @@ pub struct FlowTrialV1 {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessNodeTargetV1 {
     AgentCore,
@@ -351,7 +354,7 @@ impl HarnessNodeTargetV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CompiledFlowNodeV1 {
     pub node_id: String,
@@ -359,7 +362,7 @@ pub struct CompiledFlowNodeV1 {
     pub reference: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CompiledFlowPlanV1 {
     pub schema_version: u16,

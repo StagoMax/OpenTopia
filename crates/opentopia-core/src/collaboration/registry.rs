@@ -590,7 +590,7 @@ impl CollaborationRegistry for InMemoryCollaborationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::collaboration::{test_runtime_snapshot, RuntimeWorkspaceModeV1};
 
     async fn session_with_depth(
         depth: u16,
@@ -609,7 +609,7 @@ mod tests {
                 root_agent_type: "default".to_string(),
                 root_runtime_snapshot: RuntimeSnapshotSeed::new(
                     None,
-                    json!({ "agentType": "default" }),
+                    test_runtime_snapshot("default", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 session_policy: CollaborationSessionPolicy {
                     max_agents: 8,
@@ -635,7 +635,7 @@ mod tests {
                 task_message: "inspect the runtime".to_string(),
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(root.runtime_snapshot_id),
-                    json!({ "agentType": "explorer" }),
+                    test_runtime_snapshot("explorer", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 spawn_policy: AgentSpawnPolicy::allows_children(2, 2),
             })
@@ -662,7 +662,7 @@ mod tests {
                 task_message: "inspect".to_string(),
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(root.runtime_snapshot_id),
-                    json!({ "agentType": "explorer" }),
+                    test_runtime_snapshot("explorer", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 spawn_policy: AgentSpawnPolicy::allows_children(2, 2),
             })
@@ -677,7 +677,7 @@ mod tests {
                 task_message: "review".to_string(),
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(child.runtime_snapshot_id),
-                    json!({ "agentType": "explorer" }),
+                    test_runtime_snapshot("explorer", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 spawn_policy: AgentSpawnPolicy::disabled(2),
             })
@@ -700,7 +700,7 @@ mod tests {
                 task_message: "first".to_string(),
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(root.runtime_snapshot_id),
-                    json!({ "agentType": "worker" }),
+                    test_runtime_snapshot("worker", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 spawn_policy: AgentSpawnPolicy::disabled(1),
             })
@@ -745,7 +745,7 @@ mod tests {
                 task_message: "first".to_string(),
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(root.runtime_snapshot_id),
-                    json!({ "agentType": "worker" }),
+                    test_runtime_snapshot("worker", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 spawn_policy: AgentSpawnPolicy::disabled(1),
             })

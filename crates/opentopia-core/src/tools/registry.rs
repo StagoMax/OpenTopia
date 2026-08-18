@@ -3,9 +3,9 @@ use super::{
     FilesystemTool, FollowupAgentTaskTool, InterruptAgentTool, ListAgentsTool, ListSkillsTool,
     PdfTool, ReadArtifactTool, ReadAttachmentTool, ReadSkillTool, RegisteredTool,
     RequestUserInputTool, SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool,
-    SpreadsheetTool, Tool, ToolApprovalMode, ToolCapabilityDescriptor, ToolClass,
-    ToolExecutionPolicy, ToolGovernance, ToolRiskLevel, ToolSideEffect, ToolSource, UpdatePlanTool,
-    ViewAttachmentTool, WaitAgentTool,
+    SpreadsheetDescribeTool, SpreadsheetExecuteTool, SpreadsheetInspectTool, SpreadsheetTool, Tool,
+    ToolApprovalMode, ToolCapabilityDescriptor, ToolClass, ToolExecutionPolicy, ToolGovernance,
+    ToolRiskLevel, ToolSideEffect, ToolSource, UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
 };
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::enterprise::DataClassification;
@@ -235,6 +235,33 @@ impl ToolRegistry {
                     ),
                     "spreadsheet" => (
                         Arc::new(SpreadsheetTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_inspect" => (
+                        Arc::new(SpreadsheetInspectTool),
+                        governed(
+                            ToolRiskLevel::Low,
+                            ToolSideEffect::None,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_describe" => (
+                        Arc::new(SpreadsheetDescribeTool),
+                        governed(
+                            ToolRiskLevel::Low,
+                            ToolSideEffect::None,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_execute" => (
+                        Arc::new(SpreadsheetExecuteTool),
                         governed(
                             ToolRiskLevel::High,
                             ToolSideEffect::WorkspaceWrite,

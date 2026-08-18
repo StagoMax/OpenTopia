@@ -1,6 +1,7 @@
 use crate::execution_spec::ShellDialect;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use schemars::JsonSchema;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -23,7 +24,7 @@ const MAX_ARCHIVE_BYTES: u64 = 250 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 750 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 2_000;
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellRuntimeSource {
     Configured,
@@ -33,7 +34,7 @@ pub enum ShellRuntimeSource {
     System,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellRuntime {
     pub program: PathBuf,
@@ -52,7 +53,7 @@ impl ShellRuntime {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedPowerShellStatus {
     NotRequired,
@@ -63,7 +64,7 @@ pub enum ManagedPowerShellStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellRuntimeStatus {
     pub runtime: ShellRuntime,

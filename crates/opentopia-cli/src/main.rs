@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use opentopia_core::{
-    discover_plugins, AgentCore, AgentEvent, AgentTurnInput, Message, MessageRole, PermissionMode,
-    SessionStore, SqliteSessionStore,
+    discover_plugins, AgentCore, AgentEvent, AgentRunConfig, AgentRunIdentity, AgentTurnDriver,
+    AgentTurnInput, CapabilityProjection, ExecutionAuthority, LocalSandboxConfig, Message,
+    MessageRole, PermissionMode, SessionStore, SqliteSessionStore,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -64,11 +65,22 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|plugin| !plugin.native_capabilities.is_empty())
                 .map(|plugin| (plugin.name, plugin.default_enabled))
                 .collect::<HashMap<_, _>>();
-            let mut agent = AgentCore::from_env();
-            agent.set_bundled_plugin_activations(&bundled_plugin_activations);
             let turn_id = Uuid::new_v4();
-            let payloads = agent
-                .run_turn(AgentTurnInput {
+            let authority = ExecutionAuthority::new(
+                thread.workspace_root.clone(),
+                args.permission,
+                LocalSandboxConfig::from_env(),
+                CapabilityProjection::unrestricted(),
+            )?;
+            let mut agent =
+                AgentCore::from_env().begin_run(AgentRunConfig::using_current_provider(
+                    authority,
+                    AgentRunIdentity::root(turn_id, 1),
+                ))?;
+            agent.set_bundled_plugin_activations(&bundled_plugin_activations);
+            let agent = agent.finalize()?;
+            let context = agent.prepare_turn(
+                AgentTurnInput {
                     thread_id,
                     user_message_id: user_message.id,
                     workspace_root: thread.workspace_root,
@@ -81,8 +93,12 @@ async fn main() -> anyhow::Result<()> {
                     provider_cursor: None,
                     store: Some(store.clone() as Arc<dyn SessionStore>),
                     cancellation: None,
-                })
-                .await?;
+                },
+                None,
+            )?;
+            let payloads = AgentTurnDriver::run_turn(&agent, context, None)
+                .await?
+                .events;
 
             let mut events = Vec::new();
             for payload in payloads {

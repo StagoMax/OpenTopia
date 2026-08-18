@@ -1,3 +1,4 @@
+use super::resource_api::{preview_api_error, resolve_preview_id_for_thread};
 use super::{
     current_settings, ensure_thread, load_agent_profiles_for_thread, plugins_api, publish_payload,
     sync_plugin_mcp_configs, ApiError, AppState,
@@ -18,6 +19,7 @@ use opentopia_core::{
     PluginRuntimeHealthStatus, PolicyDecision, PolicyEngine, ToolCall, ToolPermissionDescriptor,
     ToolResult, MAX_MEDIA_HANDLER_INPUT_BYTES, MAX_MEDIA_HANDLER_OUTPUT_BYTES,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -667,11 +669,11 @@ fn resolve_registered_media_source(
     thread_id: Uuid,
     resource_id: &str,
 ) -> Result<MediaSource, ApiError> {
-    let preview = super::resolve_preview_id_for_thread(state, thread_id, resource_id)?;
+    let preview = resolve_preview_id_for_thread(state, thread_id, resource_id)?;
     let descriptor = preview.descriptor.clone();
     let content =
         opentopia_core::read_preview_content(&preview, MAX_MEDIA_HANDLER_INPUT_BYTES as u64)
-            .map_err(super::preview_api_error)?;
+            .map_err(preview_api_error)?;
     let protocol_name = FsPath::new(&descriptor.name)
         .file_name()
         .filter(|name| !name.is_empty())
@@ -920,9 +922,9 @@ fn empty_json_object() -> Value {
     json!({})
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct MediaHandlerInvocationResponse {
+pub(super) struct MediaHandlerInvocationResponse {
     contribution_id: String,
     plugin_id: String,
     runtime: MediaHandlerRuntime,
@@ -930,9 +932,9 @@ struct MediaHandlerInvocationResponse {
     output: MediaHandlerResultEnvelopeV1,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct ContributionHostSnapshot {
+pub(super) struct ContributionHostSnapshot {
     previewers: Vec<MediaHandlerDescriptor>,
     context_loaders: Vec<MediaHandlerDescriptor>,
     apps: Vec<AppViewDescriptor>,
@@ -953,9 +955,9 @@ struct StartAppSessionRequest {
     contribution_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct AppViewSessionResponse {
+pub(super) struct AppViewSessionResponse {
     #[serde(flatten)]
     session: AppViewSession,
     content_path: String,

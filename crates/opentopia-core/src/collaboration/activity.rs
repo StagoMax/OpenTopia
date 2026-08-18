@@ -3,6 +3,7 @@ use crate::model::{AgentEvent, AgentEventPayload, ModelContentPart, ToolResult};
 use crate::provider::redact_model_observation;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -46,7 +47,7 @@ impl ActivityQuery {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentActivityWindow {
     pub agent_thread_id: AgentThreadId,
@@ -59,7 +60,7 @@ pub struct AgentActivityWindow {
     pub recent_tool_results: Vec<ToolResultProjection>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityEvent {
     pub seq: i64,
@@ -69,7 +70,7 @@ pub struct ActivityEvent {
     pub details: Option<ActivityEventDetails>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActivityEventDetails {
     ModelRound {
@@ -93,7 +94,7 @@ pub enum ActivityEventDetails {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultKind {
     Text,
@@ -103,7 +104,7 @@ pub enum ToolResultKind {
     Mixed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultProjection {
     pub invocation_id: Uuid,

@@ -1,4 +1,5 @@
 use crate::execution::{ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -72,7 +73,7 @@ impl GitWorkflowAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GitWorkflowActionKind {
     Status,
@@ -369,7 +370,7 @@ impl GitWorkflowError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitBranchInfo {
     pub full_ref: String,
@@ -388,7 +389,7 @@ pub struct GitRemoteInfo {
     pub push_urls: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AheadBehind {
     pub ahead: u64,

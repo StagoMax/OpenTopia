@@ -11,6 +11,7 @@ mod pdf;
 mod spreadsheet;
 
 use crate::plugins::PluginError;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,7 +20,7 @@ use uuid::Uuid;
 
 const RECEIPT_FILE: &str = ".opentopia-bundled.json";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BundledPluginTrust {
     Standard,

@@ -7,6 +7,7 @@ use crate::git_workflow::{
     GitWorkflowResult, ListBranchesRequest, PullRequest, PushRequest, RemoveWorktreeRequest,
     SwitchBranchRequest,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -165,7 +166,7 @@ impl LocalGitRemoveWorktreeRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalGitV1Response {
     pub api_version: String,
@@ -174,7 +175,7 @@ pub struct LocalGitV1Response {
     pub output: LocalGitV1Output,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalGitCommandSummary {
     pub exit_code: Option<i32>,
@@ -194,7 +195,7 @@ impl LocalGitCommandSummary {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum LocalGitV1Output {
     Status(LocalGitStatus),
@@ -205,7 +206,7 @@ pub enum LocalGitV1Output {
     Mutation(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalGitStatus {
     pub branch: Option<String>,
@@ -213,7 +214,7 @@ pub struct LocalGitStatus {
     pub porcelain_v2: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalGitRemote {
     pub name: String,
@@ -221,7 +222,7 @@ pub struct LocalGitRemote {
     pub push_urls: Vec<NormalizedGitRemoteUrl>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalGitWorktree {
     pub path: PathBuf,
@@ -241,7 +242,7 @@ impl LocalGitRemote {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedGitRemoteUrl {
     pub normalized: String,

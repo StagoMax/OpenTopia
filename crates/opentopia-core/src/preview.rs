@@ -6,6 +6,7 @@ use crate::spreadsheet::{
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{Cursor, Read, Write};
@@ -24,7 +25,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 pub const MAX_PREVIEW_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
 const DELIMITED_PREVIEW_SHEET: &str = "Data";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewKind {
     Text,
@@ -35,7 +36,7 @@ pub enum PreviewKind {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewSource {
     Workspace,
@@ -46,7 +47,7 @@ pub enum PreviewSource {
 
 /// Operations granted to a resolved resource. Renderers consume these
 /// capabilities instead of inferring authority from where a file came from.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewCapabilities {
     pub read: bool,
@@ -56,7 +57,7 @@ pub struct PreviewCapabilities {
     pub open_external: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(
     tag = "source",
     rename_all = "snake_case",
@@ -69,7 +70,7 @@ pub enum PreviewTarget {
     Attachment { attachment_id: Uuid },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewDescriptor {
     pub id: String,
@@ -99,7 +100,7 @@ pub struct ResolvedPreview {
     pub content: PreviewContentSource,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewWorkbook {
     pub preview_id: String,
@@ -107,7 +108,7 @@ pub struct PreviewWorkbook {
     pub sheets: Vec<PreviewSheet>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewSheet {
     pub name: String,
@@ -127,7 +128,7 @@ pub struct PreviewRangeRequest {
     pub column_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewRange {
     pub preview_id: String,
@@ -733,23 +734,15 @@ fn delimited_reader<'a>(
         )?),
         PreviewContentSource::Inline(bytes) => Box::new(Cursor::new(bytes.as_slice())),
     };
-    Ok(csv::ReaderBuilder::new()
-        .has_headers(false)
-        .flexible(true)
-        .delimiter(delimiter)
-        .from_reader(source))
+    Ok(crate::delimited::byte_reader(source, delimiter))
 }
 
 fn delimited_cell_value(field: &[u8], row: u32, column: u32) -> SpreadsheetCellValue {
-    let field = if row == 0 && column == 0 {
-        field.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(field)
-    } else {
-        field
-    };
-    if field.is_empty() {
+    let value = crate::delimited::decode_field(field, row == 0 && column == 0, false);
+    if value.is_empty() {
         SpreadsheetCellValue::Empty
     } else {
-        SpreadsheetCellValue::String(String::from_utf8_lossy(field).into_owned())
+        SpreadsheetCellValue::String(value)
     }
 }
 

@@ -13,6 +13,7 @@ use crate::computer::{
 };
 use crate::effect_journal::{EffectIntent, EffectKind, EffectSideEffectClass, EffectStatus};
 use crate::enterprise::CapabilityProjection;
+use crate::execution_authority::ExecutionAuthority;
 use crate::guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext, GuardianReviewResult,
     GuardianReviewSessionManager,
@@ -24,11 +25,11 @@ use crate::model::{
     ToolResult,
 };
 use crate::model_context::content_fingerprint;
-use crate::policy::{
-    approval_required, ApprovalRequired, BasicPolicyEngine, PermissionMode, PolicyDecision,
-};
+#[cfg(test)]
+use crate::policy::BasicPolicyEngine;
+use crate::policy::{approval_required, ApprovalRequired, PermissionMode, PolicyDecision};
 use crate::provider::{
-    invalid_tool_arguments_json_details, ModelConversationMessage, ModelProvider, ProviderToolCall,
+    invalid_tool_arguments_json_details, ModelConversationMessage, ProviderToolCall,
     ProviderToolCandidate, ProviderToolResult,
 };
 use crate::sandbox::LocalSandboxConfig;
@@ -52,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -68,7 +69,6 @@ const TOOL_EXECUTION_DURATION_MS_KEY: &str = "durationMs";
 /// cone and can later be replaced without changing the model loop.
 #[derive(Clone)]
 pub struct ToolRuntimeHost {
-    pub(crate) runtime: Arc<dyn ToolRuntime>,
     pub(crate) catalog: ToolRegistry,
     pub(crate) mcp_host: Option<McpExtensionHost>,
     pub(crate) active_mcp_tools: Vec<McpToolDescriptor>,
@@ -82,13 +82,11 @@ pub struct ToolRuntimeHost {
 
 impl ToolRuntimeHost {
     pub fn new(
-        guardian_provider: Arc<dyn ModelProvider>,
         catalog: ToolRegistry,
         model_supports_vision: bool,
         sandbox_config: LocalSandboxConfig,
     ) -> Self {
         Self {
-            runtime: Arc::new(LocalToolRuntime::new(guardian_provider)),
             catalog,
             mcp_host: None,
             active_mcp_tools: Vec::new(),
@@ -472,6 +470,7 @@ pub struct ToolApprovalCandidate {
 }
 
 pub struct ToolReviewInput<'a> {
+    pub guardian: &'a GuardianReviewSessionManager,
     pub request: &'a GuardianApprovalRequest,
     pub conversation: &'a [ModelConversationMessage],
     pub current_user_message: &'a str,
@@ -562,9 +561,6 @@ pub struct ProviderToolExecutionReport {
 
 #[async_trait]
 pub trait ToolRuntime: Send + Sync {
-    /// Replace the approval-review transport without rebuilding the turn kernel.
-    fn set_guardian_provider(&self, provider: Arc<dyn ModelProvider>);
-
     /// Reject malformed provider calls before authorization or execution.
     fn validate_provider_call(
         &self,
@@ -621,10 +617,8 @@ pub trait ToolRuntime: Send + Sync {
 }
 
 /// Local implementation of the provider-neutral tool runtime port.
-#[derive(Clone)]
-pub struct LocalToolRuntime {
-    guardian: Arc<RwLock<GuardianReviewSessionManager>>,
-}
+#[derive(Clone, Default)]
+pub struct LocalToolRuntime;
 
 /// Constructor-injected executor for the local Tool trait. The wide
 /// ToolInvocationContext is captured once at the runtime edge; individual tools
@@ -645,25 +639,13 @@ impl ToolExecutor {
 }
 
 impl LocalToolRuntime {
-    pub fn new(guardian_provider: Arc<dyn ModelProvider>) -> Self {
-        Self {
-            guardian: Arc::new(RwLock::new(GuardianReviewSessionManager::new(
-                guardian_provider,
-            ))),
-        }
+    pub fn new() -> Self {
+        Self
     }
 }
 
 #[async_trait]
 impl ToolRuntime for LocalToolRuntime {
-    fn set_guardian_provider(&self, provider: Arc<dyn ModelProvider>) {
-        *self
-            .guardian
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            GuardianReviewSessionManager::new(provider);
-    }
-
     fn validate_provider_call(
         &self,
         catalog: &ToolRuntimeCatalog,
@@ -757,17 +739,15 @@ impl ToolRuntime for LocalToolRuntime {
             permission_mode,
             sandbox_config,
         } = input;
-        let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+        let Ok(authority) = ExecutionAuthority::new(
             workspace_root.to_path_buf(),
             permission_mode,
-            sandbox_config,
-        ));
-        let mut authorization_context = ToolInvocationContext::local_with_sandbox_config(
-            workspace_root.to_path_buf(),
-            policy,
             sandbox_config.clone(),
-        );
-        authorization_context.permission_mode = permission_mode;
+            catalog.capability_projection.clone(),
+        ) else {
+            return Vec::new();
+        };
+        let authorization_context = authority.local_tool_context();
         let mut resource_keys = HashMap::<String, bool>::new();
         let mut selected = Vec::new();
 
@@ -840,17 +820,15 @@ impl ToolRuntime for LocalToolRuntime {
             permission_mode,
             sandbox_config,
         } = input;
-        let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
+        let Ok(authority) = ExecutionAuthority::new(
             workspace_root.to_path_buf(),
             permission_mode,
-            sandbox_config,
-        ));
-        let mut context = ToolInvocationContext::local_with_sandbox_config(
-            workspace_root.to_path_buf(),
-            policy,
             sandbox_config.clone(),
-        );
-        context.permission_mode = permission_mode;
+            catalog.capability_projection.clone(),
+        ) else {
+            return Vec::new();
+        };
+        let context = authority.local_tool_context();
         let mut candidates = Vec::new();
         for provider_call in calls.iter().take(MAX_PARALLEL_TOOL_CALLS) {
             if !catalog.allows(&provider_call.name) || catalog.input_error(provider_call).is_some()
@@ -926,12 +904,8 @@ impl ToolRuntime for LocalToolRuntime {
         input: ToolReviewInput<'_>,
         cancellation: Option<&CancellationToken>,
     ) -> GuardianReviewResult {
-        let manager = self
+        input
             .guardian
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        manager
             .review(
                 input.request,
                 GuardianReviewContext {
@@ -1583,9 +1557,7 @@ mod tests {
 
     #[test]
     fn default_runtime_implements_the_object_safe_tool_port() {
-        accepts_object_safe_runtime(&LocalToolRuntime::new(Arc::new(
-            crate::provider::MockProvider,
-        )));
+        accepts_object_safe_runtime(&LocalToolRuntime::new());
     }
 
     #[test]
@@ -1719,7 +1691,7 @@ mod tests {
         ));
         let context =
             ToolInvocationContext::local_with_sandbox_config(std::env::temp_dir(), policy, sandbox);
-        let runtime = LocalToolRuntime::new(Arc::new(crate::provider::MockProvider));
+        let runtime = LocalToolRuntime::new();
         let turn_id = Uuid::new_v4();
         let provider_call = ProviderToolCall {
             id: "provider-approval-1".to_string(),
@@ -1817,7 +1789,7 @@ mod tests {
             background: background.clone(),
             turn_inbox: Arc::clone(&inbox),
         };
-        let runtime = LocalToolRuntime::new(Arc::new(crate::provider::MockProvider));
+        let runtime = LocalToolRuntime::new();
 
         let reports = runtime
             .execute_provider_batch(vec![

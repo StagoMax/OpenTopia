@@ -1,48 +1,27 @@
+mod turn_execution;
+
+pub(crate) use turn_execution::{drive_agent_turn, resume_agent_turn};
+
 use crate::agent_runs::AgentRunExecutor;
 use async_trait::async_trait;
 use opentopia_core::collaboration::{
-    AgentCollaborationInvocation, AgentCollaborationRuntime, AgentInvocationIdentity,
-    AgentMailboxNotifier, AgentRunCommand, AgentRunResumeSignal, AgentThreadId, AgentTurnId,
-    AgentTurnStatus, CollaborationRegistry, RuntimeSnapshotDeriver, SqliteAgentActivitySource,
-    SqliteCollaborationRepository,
+    AgentCollaborationRuntime, AgentMailboxNotifier, AgentRunCommand, AgentThreadId, AgentTurnId,
+    AgentTurnStatus, CollaborationRegistry, RuntimeForkTurnsLabelV1, RuntimeForkTurnsV1,
+    RuntimeSnapshotDeriver, RuntimeSnapshotV1, RuntimeWorkspaceAssignmentV1,
+    RuntimeWorkspaceModeV1, SqliteAgentActivitySource, SqliteCollaborationRepository,
 };
 use opentopia_core::{
-    execute_git_workflow, isolated_agent_worktree_request, AgentContinuation, AgentCore,
-    AgentEventPayload, AgentEventSender, AgentProfile, AgentResumeSignal, AgentTurnDriver,
-    AgentTurnInput, AgentTurnOutcome, AgentTurnResult, AppSettings, CapabilityProjection,
-    CompiledModelContext, ExecutionContext, LocalExecutionEnvironment, McpExtensionHost,
-    ModelConversationMessage, ModelConversationRole, ProviderConversationCursor, ProviderSettings,
-    ResourceLimit, SandboxMode, SessionStore, SqliteSessionStore, TurnInbox, TurnInboxItem,
+    execute_git_workflow, isolated_agent_worktree_request, AgentCore, AgentEventPayload,
+    AppSettings, ExecutionContext, LocalExecutionEnvironment, McpExtensionHost,
+    ModelConversationMessage, ModelConversationRole, ResourceLimit, SessionStore,
+    SqliteSessionStore, TurnInbox,
 };
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-/// The sole server-side entry point into the reusable AgentCore turn kernel.
-/// Root and descendant orchestration may differ, but neither owns a second
-/// model/tool control loop.
-pub(crate) async fn drive_agent_turn(
-    agent: &AgentCore,
-    input: AgentTurnInput,
-    model_context: Option<CompiledModelContext>,
-    sender: Option<AgentEventSender>,
-) -> anyhow::Result<AgentTurnResult> {
-    AgentTurnDriver::run_turn(agent, input, model_context, sender).await
-}
-
-/// Resume the exact continuation through the same reusable turn kernel.
-pub(crate) async fn resume_agent_turn(
-    agent: &AgentCore,
-    continuation: AgentContinuation,
-    signal: AgentResumeSignal,
-    store: Option<Arc<dyn SessionStore>>,
-    cancellation: Option<CancellationToken>,
-    sender: Option<AgentEventSender>,
-) -> anyhow::Result<AgentTurnResult> {
-    AgentTurnDriver::resume_turn(agent, continuation, signal, store, cancellation, sender).await
-}
 
 #[derive(Clone)]
 pub struct AgentTurnCoordinator {
@@ -86,468 +65,10 @@ impl AgentTurnCoordinator {
         }
     }
 
-    async fn execute_start(
-        &self,
-        agent_thread_id: AgentThreadId,
-        agent_turn_id: AgentTurnId,
-        cancellation: CancellationToken,
-    ) -> anyhow::Result<()> {
-        let thread = self.repository.get_thread(agent_thread_id).await?;
-        let turn = self.repository.get_turn(agent_turn_id).await?;
-        anyhow::ensure!(
-            turn.agent_thread_id == thread.id && turn.session_id == thread.session_id,
-            "Agent Run command identity is inconsistent"
-        );
-        if cancellation.is_cancelled() {
-            self.finish(
-                thread.id,
-                turn.id,
-                AgentTurnStatus::Cancelled,
-                json!({
-                    "status": "cancelled",
-                    "reason": "cancelled before admission",
-                    "agentPath": thread.path,
-                }),
-            )?;
-            return Ok(());
-        }
-        self.repository
-            .transition_turn(turn.id, AgentTurnStatus::Running)
-            .await?;
-        self.activity.notify(thread.id);
-
-        let session = self.repository.get_session(thread.session_id).await?;
-        let user_thread = self
-            .store
-            .get_thread(session.user_task_id)?
-            .ok_or_else(|| anyhow::anyhow!("user task thread no longer exists"))?;
-        let snapshot = self
-            .repository
-            .get_runtime_snapshot(thread.runtime_snapshot_id)
-            .await?;
-        let mut settings = self
-            .settings
-            .read()
-            .expect("settings lock poisoned")
-            .clone();
-        if let Some(provider) = snapshot.snapshot.get("provider") {
-            let provider: ProviderSettings = serde_json::from_value(provider.clone())?;
-            settings.active_provider_id = provider.id.clone();
-            settings.providers = vec![provider];
-        }
-        if let Some(permission) = snapshot.snapshot.get("permissionMode") {
-            settings.permission_mode = serde_json::from_value(permission.clone())?;
-        }
-
-        let mut agent = self.base_agent.read().expect("agent lock poisoned").clone();
-        agent.set_provider_from_settings(&settings);
-        let profile = frozen_agent_profile(&snapshot.snapshot, &thread.agent_type)?;
-        agent.apply_agent_profile(&profile);
-        agent.set_mcp_host(self.mcp_host.clone());
-        crate::sync_thread_bundled_plugin_activations(
-            &self.store,
-            session.user_task_id,
-            &mut agent,
-        );
-        crate::sync_thread_attachment_tool_preloads(&self.store, session.user_task_id, &mut agent);
-        crate::sync_thread_mcp_tools(
-            &self.store,
-            &self.mcp_host,
-            session.user_task_id,
-            &mut agent,
-        )
-        .await;
-        if let Some(projection) = snapshot.snapshot.get("capabilityProjection") {
-            let projection: CapabilityProjection = serde_json::from_value(projection.clone())?;
-            agent.restrict_capabilities(&projection);
-        }
-        if let Some(tools) = snapshot.snapshot.get("tools").and_then(Value::as_array) {
-            agent.restrict_to_tools(tools.iter().filter_map(Value::as_str));
-        }
-        if snapshot
-            .snapshot
-            .get("workspaceMode")
-            .and_then(Value::as_str)
-            == Some("shared_read_only")
-        {
-            agent.set_sandbox_config(
-                settings
-                    .sandbox
-                    .to_local_sandbox_config()
-                    .with_sandbox_mode(SandboxMode::ReadOnly),
-            );
-        }
-        let workspace_root = self
-            .prepare_workspace(&snapshot.snapshot, &user_thread.workspace_root, &settings)
-            .await?;
-
-        let identity = AgentInvocationIdentity {
-            session_id: thread.session_id,
-            agent_thread_id: thread.id,
-            agent_turn_id: turn.id,
-            runtime_snapshot_id: thread.runtime_snapshot_id,
-        };
-        let invocation = AgentCollaborationInvocation::new(
-            self.collaboration.clone(),
-            self.activity.clone(),
-            self.snapshot_deriver.clone(),
-            identity,
-        );
-        agent.set_agent_execution_identity(turn.id, turn.invocation_id, &thread.path);
-        agent.set_agent_collaboration(invocation.clone());
-        for message in invocation.pending_messages(256).await? {
-            self.turn_inbox
-                .push(turn.id.as_uuid(), TurnInboxItem::AgentMessage { message });
-        }
-
-        let mut conversation = self.load_conversation(&thread, &snapshot.snapshot).await?;
-        let user_entry = ModelConversationMessage {
-            role: ModelConversationRole::User,
-            content: turn.task_message.clone(),
-            content_parts: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-        };
-        self.repository.append_ledger_item(
-            turn.session_id,
-            thread.id,
-            turn.id,
-            "conversation",
-            &serde_json::to_value(&user_entry)?,
-        )?;
-
-        let provider = settings.active_provider().clone();
-        let provider_cursor = self
-            .repository
-            .load_provider_state(thread.id, &provider.id)?
-            .and_then(|(model, _, value)| {
-                (model == provider.model)
-                    .then(|| serde_json::from_value::<ProviderConversationCursor>(value).ok())
-                    .flatten()
-            });
-        let input = AgentTurnInput {
-            thread_id: session.user_task_id,
-            user_message_id: turn.id.as_uuid(),
-            workspace_root,
-            content: turn.task_message.clone(),
-            user_content: Vec::new(),
-            context_summary: None,
-            conversation: conversation.clone(),
-            permission_mode: settings.permission_mode,
-            context_budget: None,
-            provider_cursor,
-            store: Some(self.store.clone()),
-            cancellation: Some(cancellation),
-        };
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let sink = self.clone();
-        let sink_thread = thread.clone();
-        let sink_turn = turn.clone();
-        let user_task_id = session.user_task_id;
-        let event_task = tokio::spawn(async move {
-            while let Some(payload) = receiver.recv().await {
-                if let Err(error) =
-                    sink.record_event(user_task_id, &sink_thread, &sink_turn, payload)
-                {
-                    tracing::error!(?error, "failed to persist Agent activity event");
-                }
-            }
-        });
-        let result = drive_agent_turn(&agent, input, None, Some(sender)).await;
-        let _ = event_task.await;
-
-        match result {
-            Ok(result) => {
-                match &result.outcome {
-                    AgentTurnOutcome::Suspended {
-                        approval_id,
-                        continuation,
-                    } => {
-                        let value =
-                            crate::encode_turn_checkpoint(&self.store, "approval", continuation)?;
-                        self.store.put_approval_continuation(
-                            *approval_id,
-                            session.user_task_id,
-                            value,
-                        )?;
-                    }
-                    AgentTurnOutcome::AwaitingInput {
-                        request,
-                        continuation,
-                    } => {
-                        let value =
-                            crate::encode_turn_checkpoint(&self.store, "user_input", continuation)?;
-                        self.store
-                            .put_user_input_request(session.user_task_id, request, value)?;
-                    }
-                    AgentTurnOutcome::WaitingUserAction { .. }
-                    | AgentTurnOutcome::Completed
-                    | AgentTurnOutcome::Cancelled { .. }
-                    | AgentTurnOutcome::Partial { .. }
-                    | AgentTurnOutcome::Blocked { .. }
-                    | AgentTurnOutcome::Stopped { .. } => {}
-                }
-                if let Some(cursor) = result.provider_cursor.as_ref() {
-                    self.repository.save_provider_state(
-                        thread.id,
-                        &provider.id,
-                        &provider.model,
-                        &cursor.response_id,
-                        &cursor.compatibility_hash,
-                        &serde_json::to_value(cursor)?,
-                    )?;
-                }
-                let result_text = crate::agent_result_text(&result.events);
-                let assistant_entry = ModelConversationMessage {
-                    role: ModelConversationRole::Assistant,
-                    content: result_text.clone(),
-                    content_parts: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_results: Vec::new(),
-                };
-                self.repository.append_ledger_item(
-                    turn.session_id,
-                    thread.id,
-                    turn.id,
-                    "conversation",
-                    &serde_json::to_value(&assistant_entry)?,
-                )?;
-                conversation.push(user_entry);
-                conversation.push(assistant_entry);
-                let (status, mut payload, checkpoint) =
-                    outcome_payload(&thread.path.to_string(), result.outcome, result_text)?;
-                attach_workspace_delivery(&mut payload, &snapshot.snapshot);
-                if let Some((kind, continuation)) = checkpoint {
-                    self.repository
-                        .put_turn_checkpoint(turn.id, kind, &continuation)?;
-                } else {
-                    self.repository.delete_turn_checkpoint(turn.id)?;
-                }
-                self.finish(thread.id, turn.id, status, payload)?;
-            }
-            Err(error) => {
-                self.record_event(
-                    session.user_task_id,
-                    &thread,
-                    &turn,
-                    AgentEventPayload::Error {
-                        message: error.to_string(),
-                    },
-                )?;
-                let mut payload = json!({
-                    "status": "failed",
-                    "agentPath": thread.path,
-                    "error": error.to_string(),
-                });
-                attach_workspace_delivery(&mut payload, &snapshot.snapshot);
-                self.finish(thread.id, turn.id, AgentTurnStatus::Failed, payload)?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn execute_resume(
-        &self,
-        agent_thread_id: AgentThreadId,
-        agent_turn_id: AgentTurnId,
-        signal: AgentRunResumeSignal,
-        cancellation: CancellationToken,
-    ) -> anyhow::Result<()> {
-        let thread = self.repository.get_thread(agent_thread_id).await?;
-        let turn = self.repository.resume_turn(agent_turn_id)?;
-        anyhow::ensure!(turn.agent_thread_id == thread.id, "resume target mismatch");
-        let (_, checkpoint) = self
-            .repository
-            .get_turn_checkpoint(turn.id)?
-            .ok_or_else(|| anyhow::anyhow!("Agent Turn checkpoint is missing"))?;
-        let continuation: opentopia_core::AgentContinuation = serde_json::from_value(checkpoint)?;
-        let session = self.repository.get_session(thread.session_id).await?;
-        let snapshot = self
-            .repository
-            .get_runtime_snapshot(thread.runtime_snapshot_id)
-            .await?;
-        let mut settings = self
-            .settings
-            .read()
-            .expect("settings lock poisoned")
-            .clone();
-        if let Some(provider) = snapshot.snapshot.get("provider") {
-            let provider: ProviderSettings = serde_json::from_value(provider.clone())?;
-            settings.active_provider_id = provider.id.clone();
-            settings.providers = vec![provider];
-        }
-        if let Some(permission) = snapshot.snapshot.get("permissionMode") {
-            settings.permission_mode = serde_json::from_value(permission.clone())?;
-        }
-        let provider = settings.active_provider().clone();
-        let mut agent = self.base_agent.read().expect("agent lock poisoned").clone();
-        agent.set_provider_from_settings(&settings);
-        let profile = frozen_agent_profile(&snapshot.snapshot, &thread.agent_type)?;
-        agent.apply_agent_profile(&profile);
-        agent.set_mcp_host(self.mcp_host.clone());
-        crate::sync_thread_bundled_plugin_activations(
-            &self.store,
-            session.user_task_id,
-            &mut agent,
-        );
-        crate::sync_thread_attachment_tool_preloads(&self.store, session.user_task_id, &mut agent);
-        crate::sync_thread_mcp_tools(
-            &self.store,
-            &self.mcp_host,
-            session.user_task_id,
-            &mut agent,
-        )
-        .await;
-        if let Some(projection) = snapshot.snapshot.get("capabilityProjection") {
-            agent.restrict_capabilities(&serde_json::from_value::<CapabilityProjection>(
-                projection.clone(),
-            )?);
-        }
-        if let Some(tools) = snapshot.snapshot.get("tools").and_then(Value::as_array) {
-            agent.restrict_to_tools(tools.iter().filter_map(Value::as_str));
-        }
-        if snapshot
-            .snapshot
-            .get("workspaceMode")
-            .and_then(Value::as_str)
-            == Some("shared_read_only")
-        {
-            agent.set_sandbox_config(
-                settings
-                    .sandbox
-                    .to_local_sandbox_config()
-                    .with_sandbox_mode(SandboxMode::ReadOnly),
-            );
-        }
-        let invocation = AgentCollaborationInvocation::new(
-            self.collaboration.clone(),
-            self.activity.clone(),
-            self.snapshot_deriver.clone(),
-            AgentInvocationIdentity {
-                session_id: thread.session_id,
-                agent_thread_id: thread.id,
-                agent_turn_id: turn.id,
-                runtime_snapshot_id: thread.runtime_snapshot_id,
-            },
-        );
-        agent.set_agent_execution_identity(turn.id, turn.invocation_id, &thread.path);
-        agent.set_agent_collaboration(invocation.clone());
-        for message in invocation.pending_messages(256).await? {
-            self.turn_inbox
-                .push(turn.id.as_uuid(), TurnInboxItem::AgentMessage { message });
-        }
-
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let sink = self.clone();
-        let sink_thread = thread.clone();
-        let sink_turn = turn.clone();
-        let user_task_id = session.user_task_id;
-        let event_task = tokio::spawn(async move {
-            while let Some(payload) = receiver.recv().await {
-                if let Err(error) =
-                    sink.record_event(user_task_id, &sink_thread, &sink_turn, payload)
-                {
-                    tracing::error!(?error, "failed to persist resumed Agent activity event");
-                }
-            }
-        });
-        let result = resume_agent_turn(
-            &agent,
-            continuation,
-            signal.into(),
-            Some(self.store.clone()),
-            Some(cancellation),
-            Some(sender),
-        )
-        .await;
-        let _ = event_task.await;
-        match result {
-            Ok(result) => {
-                if let Some(cursor) = result.provider_cursor.as_ref() {
-                    self.repository.save_provider_state(
-                        thread.id,
-                        &provider.id,
-                        &provider.model,
-                        &cursor.response_id,
-                        &cursor.compatibility_hash,
-                        &serde_json::to_value(cursor)?,
-                    )?;
-                }
-                match &result.outcome {
-                    AgentTurnOutcome::Suspended {
-                        approval_id,
-                        continuation,
-                    } => {
-                        let value =
-                            crate::encode_turn_checkpoint(&self.store, "approval", continuation)?;
-                        self.store.put_approval_continuation(
-                            *approval_id,
-                            session.user_task_id,
-                            value,
-                        )?;
-                    }
-                    AgentTurnOutcome::AwaitingInput {
-                        request,
-                        continuation,
-                    } => {
-                        let value =
-                            crate::encode_turn_checkpoint(&self.store, "user_input", continuation)?;
-                        self.store
-                            .put_user_input_request(session.user_task_id, request, value)?;
-                    }
-                    _ => {}
-                }
-                let result_text = crate::agent_result_text(&result.events);
-                let assistant_entry = ModelConversationMessage {
-                    role: ModelConversationRole::Assistant,
-                    content: result_text.clone(),
-                    content_parts: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_results: Vec::new(),
-                };
-                self.repository.append_ledger_item(
-                    turn.session_id,
-                    thread.id,
-                    turn.id,
-                    "conversation",
-                    &serde_json::to_value(&assistant_entry)?,
-                )?;
-                let (status, mut payload, checkpoint) =
-                    outcome_payload(&thread.path.to_string(), result.outcome, result_text)?;
-                attach_workspace_delivery(&mut payload, &snapshot.snapshot);
-                if let Some((kind, continuation)) = checkpoint {
-                    self.repository
-                        .put_turn_checkpoint(turn.id, kind, &continuation)?;
-                } else {
-                    self.repository.delete_turn_checkpoint(turn.id)?;
-                }
-                self.finish(thread.id, turn.id, status, payload)?;
-            }
-            Err(error) => {
-                self.record_event(
-                    session.user_task_id,
-                    &thread,
-                    &turn,
-                    AgentEventPayload::Error {
-                        message: error.to_string(),
-                    },
-                )?;
-                let mut payload = json!({
-                    "status": "failed",
-                    "agentPath": thread.path,
-                    "error": error.to_string(),
-                });
-                attach_workspace_delivery(&mut payload, &snapshot.snapshot);
-                self.finish(thread.id, turn.id, AgentTurnStatus::Failed, payload)?;
-            }
-        }
-        Ok(())
-    }
-
     async fn load_conversation(
         &self,
         thread: &opentopia_core::collaboration::AgentThreadRecord,
-        snapshot: &Value,
+        snapshot: &RuntimeSnapshotV1,
     ) -> anyhow::Result<Vec<ModelConversationMessage>> {
         let stored = self
             .repository
@@ -558,8 +79,7 @@ impl AgentTurnCoordinator {
                 .map(|value| serde_json::from_value(value).map_err(Into::into))
                 .collect();
         }
-        let fork = snapshot.get("forkTurns").unwrap_or(&Value::Null);
-        if fork == "none" {
+        if snapshot.fork_turns == RuntimeForkTurnsV1::Label(RuntimeForkTurnsLabelV1::None) {
             return Ok(Vec::new());
         }
         let Some(parent_id) = thread.parent_agent_thread_id else {
@@ -571,7 +91,7 @@ impl AgentTurnCoordinator {
             let messages = self.store.list_messages(session.user_task_id)?;
             return Ok(apply_fork_window(
                 crate::project_model_conversation(&messages, &[]),
-                fork,
+                &snapshot.fork_turns,
             ));
         }
         let conversation = self
@@ -580,42 +100,28 @@ impl AgentTurnCoordinator {
             .into_iter()
             .map(|value| serde_json::from_value(value).map_err(Into::into))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(apply_fork_window(conversation, fork))
+        Ok(apply_fork_window(conversation, &snapshot.fork_turns))
     }
 
     async fn prepare_workspace(
         &self,
-        snapshot: &Value,
-        fallback: &Path,
+        snapshot: &RuntimeSnapshotV1,
         settings: &AppSettings,
     ) -> anyhow::Result<PathBuf> {
-        let root = snapshot
-            .get("workspaceRoot")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| fallback.to_path_buf());
-        if snapshot.get("workspaceMode").and_then(Value::as_str) != Some("isolated_worktree")
-            || root.exists()
-        {
+        let root = snapshot.workspace_root.clone();
+        if snapshot.workspace_mode != RuntimeWorkspaceModeV1::IsolatedWorktree || root.exists() {
             return Ok(root);
         }
-        let assignment = snapshot
-            .get("workspaceAssignment")
-            .and_then(Value::as_object)
-            .ok_or_else(|| anyhow::anyhow!("isolated workspace assignment is missing"))?;
-        let repository = assignment
-            .get("repositoryRoot")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("isolated workspace repository root is missing"))?;
-        let branch = assignment
-            .get("branch")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("isolated workspace branch is missing"))?;
-        let base_commit = assignment
-            .get("baseCommit")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("isolated workspace base commit is missing"))?;
+        let RuntimeWorkspaceAssignmentV1::IsolatedWorktree {
+            repository_root: repository,
+            branch,
+            base_commit,
+            ..
+        } = &snapshot.workspace_assignment
+        else {
+            anyhow::bail!("isolated workspace assignment is missing");
+        };
+        let repository = repository.clone();
         if let Some(parent) = root.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -629,8 +135,8 @@ impl AgentTurnCoordinator {
         let request = isolated_agent_worktree_request(
             repository,
             root.clone(),
-            branch.to_string(),
-            base_commit.to_string(),
+            branch.clone(),
+            base_commit.clone(),
         )?;
         let result = execute_git_workflow(
             &environment,
@@ -703,16 +209,12 @@ impl AgentTurnCoordinator {
 
 fn apply_fork_window(
     conversation: Vec<ModelConversationMessage>,
-    fork: &Value,
+    fork: &RuntimeForkTurnsV1,
 ) -> Vec<ModelConversationMessage> {
-    let count = fork
-        .get("count")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok());
-    let Some(count) = count else {
+    let RuntimeForkTurnsV1::Count { count } = fork else {
         return conversation;
     };
-    if count == 0 {
+    if *count == 0 {
         return Vec::new();
     }
     let user_starts = conversation
@@ -724,7 +226,7 @@ fn apply_fork_window(
         .collect::<Vec<_>>();
     let start = user_starts
         .len()
-        .checked_sub(count)
+        .checked_sub(*count)
         .and_then(|index| user_starts.get(index).copied())
         .unwrap_or(0);
     conversation.into_iter().skip(start).collect()
@@ -735,15 +237,17 @@ mod tests {
     use super::*;
     use crate::agent_runs::ServerAgentRunScheduler;
     use opentopia_core::collaboration::{
-        AgentMailbox, AgentMailboxMessage, AgentMailboxMessageKind, AgentRunScheduler,
-        AgentSpawnPolicy, AgentThreadRecord, AgentTurnRecord, CollaborationSessionId,
-        CollaborationSessionPolicy, CreateCollaborationSession, RuntimeSnapshotSeed,
+        AgentCollaborationInvocation, AgentInvocationIdentity, AgentMailbox, AgentMailboxMessage,
+        AgentMailboxMessageKind, AgentRunResumeSignal, AgentRunScheduler, AgentSpawnPolicy,
+        AgentThreadRecord, AgentTurnRecord, CollaborationSessionId, CollaborationSessionPolicy,
+        CreateCollaborationSession, RuntimeSnapshotSeed,
     };
     use opentopia_core::{
-        AgentProfileRegistry, ApprovalStatus, BasicPolicyEngine, BufferedTurnInbox,
-        ModelConversationMessage, ModelConversationRole, OpenAiCompatibilityReport, PermissionMode,
-        ProviderAdapterKind, ProviderAuthKind, ProviderKind, ProviderTransportKind, ToolCall,
-        ToolInvocationContext, ToolRegistry,
+        AgentProfileRegistry, ApprovalStatus, BufferedTurnInbox, CapabilityProjection,
+        ExecutionAuthority, LocalSandboxConfig, ModelConversationMessage, ModelConversationRole,
+        OpenAiCompatibilityReport, PermissionMode, ProviderAdapterKind, ProviderAuthKind,
+        ProviderKind, ProviderSettings, ProviderTransportKind, ToolCall, ToolInvocationContext,
+        ToolRegistry,
     };
     use serde_json::json;
     use std::process::Command;
@@ -1253,13 +757,14 @@ mod tests {
                     runtime_snapshot_id: agent.runtime_snapshot_id,
                 },
             );
-            let mut context = ToolInvocationContext::local(
+            let authority = ExecutionAuthority::new(
                 self.workspace.clone(),
-                Arc::new(BasicPolicyEngine::new(
-                    self.workspace.clone(),
-                    PermissionMode::FullAccess,
-                )),
-            );
+                PermissionMode::FullAccess,
+                LocalSandboxConfig::from_env(),
+                CapabilityProjection::unrestricted(),
+            )
+            .unwrap();
+            let mut context = authority.local_tool_context();
             context.thread_id = Some(self.user_task_id);
             context.collaboration = Some(invocation);
             context.agent_turn_id = Some(turn.id.as_uuid());
@@ -1386,7 +891,7 @@ mod tests {
             message(ModelConversationRole::Tool, "tool two"),
             message(ModelConversationRole::Assistant, "answer two"),
         ];
-        let forked = apply_fork_window(conversation, &json!({ "count": 1 }));
+        let forked = apply_fork_window(conversation, &RuntimeForkTurnsV1::Count { count: 1 });
         assert_eq!(forked.len(), 3);
         assert_eq!(forked[0].content, "two");
         assert_eq!(forked[2].content, "answer two");
@@ -2438,23 +1943,42 @@ mod tests {
             .join("isolated-child");
         let branch = format!("codex/test-worktree-{}", Uuid::new_v4());
         let settings = AppSettings::from_env(PermissionMode::FullAccess);
+        let snapshot = RuntimeSnapshotV1::decode(&json!({
+            "schemaVersion": 1,
+            "agentType": "default",
+            "allowedAgentTypes": ["default"],
+            "agentProfiles": [],
+            "workspaceMode": "isolated_worktree",
+            "workspaceRoot": worktree,
+            "workspaceAssignment": {
+                "mode": "isolated_worktree",
+                "repositoryRoot": repository,
+                "root": worktree,
+                "branch": branch,
+                "baseCommit": base_commit,
+                "deliveryState": "pending"
+            },
+            "gitBaseCommit": base_commit,
+            "forkTurns": "all",
+            "provider": settings.active_provider(),
+            "permissionMode": settings.permission_mode,
+            "sandbox": settings.sandbox,
+            "agentRuntime": settings.agent_runtime,
+            "capabilityProjection": CapabilityProjection::unrestricted(),
+            "tools": [],
+            "toolCatalog": [],
+            "pluginContributions": [],
+            "attachmentReferences": [],
+            "spawnPolicy": {
+                "allowChildSpawns": false,
+                "maxDepth": 1,
+                "maxDirectChildren": 0
+            }
+        }))
+        .expect("valid isolated worktree snapshot");
         let prepared = fixture
             .coordinator
-            .prepare_workspace(
-                &json!({
-                    "workspaceMode": "isolated_worktree",
-                    "workspaceRoot": worktree,
-                    "workspaceAssignment": {
-                        "mode": "isolated_worktree",
-                        "repositoryRoot": repository,
-                        "root": worktree,
-                        "branch": branch,
-                        "baseCommit": base_commit,
-                    }
-                }),
-                &repository,
-                &settings,
-            )
+            .prepare_workspace(&snapshot, &settings)
             .await
             .expect("prepare isolated worktree");
 
@@ -2544,90 +2068,4 @@ impl AgentRunExecutor for AgentTurnCoordinator {
             }
         }
     }
-}
-
-fn frozen_agent_profile(snapshot: &Value, agent_type: &str) -> anyhow::Result<AgentProfile> {
-    snapshot
-        .get("agentProfiles")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|value| serde_json::from_value::<AgentProfile>(value.clone()).ok())
-        .find(|profile| profile.name == agent_type)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "agent profile `{agent_type}` is absent from the frozen runtime snapshot"
-            )
-        })
-}
-
-fn attach_workspace_delivery(payload: &mut Value, snapshot: &Value) {
-    let Some(assignment) = snapshot.get("workspaceAssignment") else {
-        return;
-    };
-    let mut assignment = assignment.clone();
-    if let Some(object) = assignment.as_object_mut() {
-        object.insert(
-            "deliveryState".to_string(),
-            Value::String("ready".to_string()),
-        );
-    }
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("workspaceAssignment".to_string(), assignment);
-    }
-}
-
-fn outcome_payload(
-    path: &str,
-    outcome: AgentTurnOutcome,
-    result: String,
-) -> anyhow::Result<(AgentTurnStatus, Value, Option<(&'static str, Value)>)> {
-    let (status, kind, reason, checkpoint) = match outcome {
-        AgentTurnOutcome::Completed => (AgentTurnStatus::Completed, "completed", None, None),
-        AgentTurnOutcome::Cancelled { reason } => {
-            (AgentTurnStatus::Cancelled, "cancelled", Some(reason), None)
-        }
-        AgentTurnOutcome::Partial { reason } => {
-            (AgentTurnStatus::Completed, "partial", Some(reason), None)
-        }
-        AgentTurnOutcome::Blocked { reason } => {
-            (AgentTurnStatus::Completed, "blocked", Some(reason), None)
-        }
-        AgentTurnOutcome::Stopped { reason } => {
-            (AgentTurnStatus::Failed, "stopped", Some(reason), None)
-        }
-        AgentTurnOutcome::Suspended { continuation, .. } => (
-            AgentTurnStatus::WaitingApproval,
-            "waiting_approval",
-            None,
-            Some(("approval", serde_json::to_value(continuation)?)),
-        ),
-        AgentTurnOutcome::AwaitingInput { continuation, .. } => (
-            AgentTurnStatus::WaitingInput,
-            "waiting_input",
-            None,
-            Some(("user_input", serde_json::to_value(continuation)?)),
-        ),
-        AgentTurnOutcome::WaitingUserAction {
-            reason,
-            continuation,
-            ..
-        } => (
-            AgentTurnStatus::WaitingAction,
-            "waiting_action",
-            Some(reason),
-            Some(("external_action", serde_json::to_value(continuation)?)),
-        ),
-    };
-    Ok((
-        status,
-        json!({
-            "status": kind,
-            "agentPath": path,
-            "result": result,
-            "reason": reason,
-            "checkpoint": checkpoint,
-        }),
-        checkpoint,
-    ))
 }

@@ -1,10 +1,10 @@
 use lopdf::{content, dictionary, Document, Object, Stream};
 use opentopia_core::{
     extract_document_text, extract_pdf_text, inspect_document, inspect_pdf, inspect_plugin,
-    validate_document, validate_pdf, ArtifactRuntime, ArtifactRuntimeError, BasicPolicyEngine,
-    ContextSourceKind, ContextSourceRef, Message, MessagePart, MessageRole, ModelContentPart,
-    PermissionMode, SessionStore, SqliteSessionStore, ToolCall, ToolInvocationContext,
-    ToolRegistry, ToolStateStore,
+    validate_document, validate_pdf, ArtifactRuntime, ArtifactRuntimeError, CapabilityProjection,
+    ContextSourceKind, ContextSourceRef, ExecutionAuthority, LocalSandboxConfig, Message,
+    MessagePart, MessageRole, ModelContentPart, PermissionMode, SessionStore, SqliteSessionStore,
+    ToolCall, ToolInvocationContext, ToolRegistry, ToolStateStore,
 };
 use rust_xlsxwriter::Workbook;
 use serde_json::json;
@@ -14,6 +14,17 @@ use std::sync::Arc;
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
+
+fn tool_context(workspace: &Path, permission_mode: PermissionMode) -> ToolInvocationContext {
+    ExecutionAuthority::new(
+        workspace.to_path_buf(),
+        permission_mode,
+        LocalSandboxConfig::from_env(),
+        CapabilityProjection::unrestricted(),
+    )
+    .expect("valid test execution authority")
+    .local_tool_context()
+}
 
 #[test]
 fn bundled_office_plugins_register_independent_native_tools() {
@@ -80,12 +91,8 @@ async fn native_tools_read_through_the_workspace_environment_and_return_typed_pn
     std::fs::write(workspace.join("sample.pdf"), sample_pdf("Native PDF"))
         .expect("write PDF fixture");
     std::fs::write(workspace.join("sample.docx"), sample_docx()).expect("write DOCX fixture");
-    let policy = Arc::new(BasicPolicyEngine::new(
-        workspace.clone(),
-        PermissionMode::FullAccess,
-    ));
-    let context = ToolInvocationContext::local(workspace.clone(), policy.clone());
-    let second_context = ToolInvocationContext::local(workspace.clone(), policy);
+    let context = tool_context(&workspace, PermissionMode::FullAccess);
+    let second_context = tool_context(&workspace, PermissionMode::FullAccess);
     assert!(Arc::ptr_eq(
         &context.artifact_runtime,
         &second_context.artifact_runtime
@@ -175,11 +182,7 @@ async fn native_office_tools_read_real_thread_attachments_by_id() {
     }
     store.append_message(message).expect("persist attachments");
 
-    let policy = Arc::new(BasicPolicyEngine::new(
-        workspace.clone(),
-        PermissionMode::ReadOnly,
-    ));
-    let mut context = ToolInvocationContext::local(workspace.clone(), policy);
+    let mut context = tool_context(&workspace, PermissionMode::ReadOnly);
     context.state = Some(ToolStateStore::new(store.clone()));
     context.thread_id = Some(thread.id);
     context.artifact_runtime =

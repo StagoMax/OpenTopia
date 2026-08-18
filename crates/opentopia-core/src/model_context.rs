@@ -1,10 +1,11 @@
 use crate::model::ModelContentPart;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextItemKind {
     BaseInstructions,
@@ -46,7 +47,7 @@ impl ContextItemKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ContextRole {
     System,
@@ -74,7 +75,7 @@ impl ContextRole {
 /// This is harness metadata. Providers never receive this enum as a prompt tag.
 /// `Data` means the item is asserted as context or state, but does not mint new
 /// instructions merely because its transport role may be `developer`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextAuthority {
     System,
@@ -110,7 +111,7 @@ impl ContextAuthority {
 /// for one Turn may still be placed in a reusable provider prefix, while a
 /// durable checkpoint belongs to an Epoch even when transported in that same
 /// prefix. Providers never receive this enum as a prompt tag.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextLifecycle {
     Build,
@@ -138,7 +139,7 @@ impl ContextLifecycle {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextCacheScope {
     Stable,
@@ -172,7 +173,7 @@ impl ContextCacheScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextSensitivity {
     Public,
@@ -180,7 +181,7 @@ pub enum ContextSensitivity {
     Sensitive,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelContextItem {
     pub id: String,
@@ -253,7 +254,7 @@ impl<'de> Deserialize<'de> for ModelContextItem {
 /// These values are intentionally kept separate from provider-reported usage:
 /// they explain which harness modules built the request, while provider usage is
 /// the billing/accounting authority after the request completes.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenEstimateBreakdown {
     pub base_instructions: usize,
@@ -503,7 +504,7 @@ fn inferred_semantics(
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CompiledModelContext {
     #[serde(default)]
@@ -618,7 +619,7 @@ impl CompiledModelContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct InstructionSnapshotRef {
     pub scope: String,
@@ -628,7 +629,7 @@ pub struct InstructionSnapshotRef {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorldStateSnapshot {
     pub cwd: PathBuf,
@@ -790,7 +791,7 @@ fn compact_skill_description(description: &str) -> String {
     compact
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorldStateSkill {
     pub id: String,
@@ -800,7 +801,7 @@ pub struct WorldStateSkill {
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadContextSnapshot {
     pub captured_at: DateTime<Utc>,
@@ -824,7 +825,7 @@ pub struct ThreadContextSnapshot {
     pub context_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnContextSnapshot {
     pub captured_at: DateTime<Utc>,

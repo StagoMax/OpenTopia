@@ -14,6 +14,7 @@ use crate::provider::{
 use crate::sandbox::LocalSandboxConfig;
 use crate::shell_analysis::analyze_shell_command;
 use futures_util::future::join_all;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -43,7 +44,7 @@ const GUARDIAN_MAX_TOOL_ROUNDS: usize = 4;
 const BUNDLED_GUARDIAN_POLICY_TEMPLATE: &str = include_str!("guardian_policy_template.md");
 const BUNDLED_GUARDIAN_POLICY: &str = include_str!("guardian_policy.md");
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianRiskLevel {
     Low,
@@ -52,7 +53,7 @@ pub enum GuardianRiskLevel {
     Critical,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianUserAuthorization {
     Unknown,
@@ -79,7 +80,7 @@ pub struct GuardianAssessment {
     pub rationale: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianReviewStatus {
     InProgress,
@@ -93,14 +94,14 @@ pub enum GuardianReviewStatus {
     Aborted,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianReviewFailureKind {
     ReviewerUnavailable,
     InvalidReviewerResponse,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianDecisionSource {
     Guardian,
@@ -206,7 +207,7 @@ impl GuardianApprovalAction {
                         .map(str::to_string),
                 }
             }
-            "filesystem" | "spreadsheet" => {
+            "filesystem" | "spreadsheet" | "spreadsheet_execute" => {
                 let path = call
                     .arguments
                     .get("path")
@@ -418,6 +419,18 @@ impl GuardianReviewSessionManager {
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             timeout: GUARDIAN_REVIEW_TIMEOUT,
             max_attempts: GUARDIAN_REVIEW_MAX_ATTEMPTS,
+        }
+    }
+
+    /// Bind a provider for one prepared run while preserving the stable,
+    /// thread-keyed reviewer session store. Provider rebinding never mutates
+    /// another Agent clone.
+    pub(crate) fn with_provider(&self, provider: Arc<dyn ModelProvider>) -> Self {
+        Self {
+            provider,
+            sessions: self.sessions.clone(),
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
         }
     }
 
@@ -1180,6 +1193,14 @@ mod tests {
     }
 
     struct SlowReviewer;
+
+    #[test]
+    fn provider_rebinding_preserves_sessions_without_mutating_the_manager() {
+        let manager = GuardianReviewSessionManager::new(Arc::new(SlowReviewer));
+        let rebound = manager.with_provider(Arc::new(SlowReviewer));
+        assert!(Arc::ptr_eq(&manager.sessions, &rebound.sessions));
+        assert!(!Arc::ptr_eq(&manager.provider, &rebound.provider));
+    }
 
     #[async_trait]
     impl ModelProvider for SlowReviewer {

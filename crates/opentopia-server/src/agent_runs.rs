@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use opentopia_core::collaboration::{
     AgentMailboxMessage, AgentMailboxNotifier, AgentRunCommand, AgentRunScheduler,
     AgentRunSchedulerError, AgentThreadId, AgentTurnId, CollaborationRegistry,
-    CollaborationSessionId, SqliteCollaborationRepository,
+    CollaborationSessionId, RuntimeWorkspaceModeV1, SqliteCollaborationRepository,
 };
 use opentopia_core::{TurnInbox, TurnInboxItem};
 use std::collections::{HashMap, HashSet};
@@ -111,18 +111,9 @@ impl ServerAgentRunScheduler {
                     Err(_) => None,
                 }
                 .and_then(|snapshot| {
-                    (snapshot
-                        .snapshot
-                        .get("workspaceMode")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("shared_coordinated"))
-                    .then(|| {
-                        snapshot
-                            .snapshot
-                            .get("workspaceRoot")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("<unknown-workspace>")
-                            .to_string()
+                    snapshot.decode().ok().and_then(|snapshot| {
+                        (snapshot.workspace_mode == RuntimeWorkspaceModeV1::SharedCoordinated)
+                            .then(|| snapshot.workspace_root.to_string_lossy().into_owned())
                     })
                 });
                 let workspace_permit = if let Some(workspace) = shared_workspace {
@@ -322,6 +313,10 @@ mod tests {
                         json!({
                             "workspaceMode": "shared_read_only",
                             "workspaceRoot": workspace,
+                            "provider": {},
+                            "permissionMode": "read_only",
+                            "sandbox": {},
+                            "capabilityProjection": {},
                         }),
                     ),
                     session_policy: CollaborationSessionPolicy {
@@ -360,6 +355,10 @@ mod tests {
                         json!({
                             "workspaceMode": workspace_mode,
                             "workspaceRoot": "C:/scheduler-fixture",
+                            "provider": {},
+                            "permissionMode": "read_only",
+                            "sandbox": {},
+                            "capabilityProjection": {},
                         }),
                     ),
                     spawn_policy: AgentSpawnPolicy::disabled(1),

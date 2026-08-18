@@ -2,12 +2,13 @@ use crate::computer::{ComputerAction, ComputerPolicyContext, WindowTarget};
 use crate::execution_authorization::{FilesystemAccess, NetworkAccess, ToolExecutionIntent};
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::shell_analysis::{analyze_shell_command, ShellCapability};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     Chat,

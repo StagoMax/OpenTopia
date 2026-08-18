@@ -1,6 +1,7 @@
 use crate::model::ExperienceMode;
 use crate::model_context::content_fingerprint;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +15,7 @@ pub const MAX_AGENT_DELEGATION_DEPTH: u16 = 16;
 /// A deterministic, fail-closed view of the capabilities available to one
 /// Agent execution. `allow_all_*` is explicit so a missing field never means
 /// unrestricted access when an ExecutionContext is deserialized.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CapabilityProjection {
     pub allow_all_tools: bool,
@@ -212,7 +213,9 @@ impl ExperienceSurfaceProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DataClassification {
     Public,
@@ -221,7 +224,7 @@ pub enum DataClassification {
     Restricted,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     File,
@@ -229,7 +232,7 @@ pub enum ResourceKind {
     Database,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionResourceGrantV1 {
     pub binding_id: String,
@@ -351,7 +354,7 @@ pub struct AgentDefinitionV1 {
     pub state_schema: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnterpriseExecutionContextV1 {
     pub schema_version: u16,
@@ -367,14 +370,14 @@ pub struct EnterpriseExecutionContextV1 {
     pub model_policy: AgentModelPolicyV1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentModelBindingV1 {
     pub provider_id: String,
     pub model_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentModelPolicyV1 {
     pub allow_all_models: bool,
@@ -431,7 +434,7 @@ impl AgentModelPolicyV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRiskClassV1 {
     Low,
@@ -440,7 +443,7 @@ pub enum AgentRiskClassV1 {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentBudgetV1 {
     pub max_turns: u32,
@@ -458,7 +461,7 @@ impl Default for AgentBudgetV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTemplateSpecV1 {
     pub description: String,
@@ -474,7 +477,7 @@ pub struct AgentTemplateSpecV1 {
     pub risk_class: AgentRiskClassV1,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTemplateStatusV1 {
     Draft,
@@ -490,7 +493,7 @@ impl AgentTemplateStatusV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTemplateVersionV1 {
     pub schema_version: u16,
@@ -655,7 +658,7 @@ impl AgentTemplateVersionV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityChangeKindV1 {
     Added,
@@ -664,7 +667,7 @@ pub enum CapabilityChangeKindV1 {
     Reduced,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityChangeV1 {
     pub scope: String,
@@ -672,7 +675,7 @@ pub struct CapabilityChangeV1 {
     pub kind: CapabilityChangeKindV1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTemplateDiffV1 {
     pub from_version: Option<u32>,
@@ -748,7 +751,7 @@ impl AgentTemplateDiffV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentInstanceStatusV1 {
     Active,
@@ -768,7 +771,7 @@ impl AgentInstanceStatusV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInstanceV1 {
     pub schema_version: u16,

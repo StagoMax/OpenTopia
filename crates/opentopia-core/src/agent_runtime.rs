@@ -1,16 +1,15 @@
 //! Stable execution boundary between product lifecycle code and the concrete agent kernel.
 //!
-//! The server may still configure an [`AgentCore`] before a turn starts, but it
-//! drives and resumes turns through [`AgentTurnDriver`]. This keeps HTTP,
+//! Product code prepares an [`AgentCore`] into a [`PreparedAgentRun`] before a
+//! turn starts, then drives and resumes it through [`AgentTurnDriver`]. This keeps HTTP,
 //! persistence, and SSE ownership outside the loop while allowing another
 //! trusted driver implementation to be introduced without changing those
 //! product-layer call sites.
 
 use crate::agent::{
-    AgentContinuation, AgentCore, AgentEventSender, AgentTurnInput, AgentTurnResult,
+    AgentContinuation, AgentEventSender, AgentTurnResult, PreparedAgentRun, TurnExecutionContext,
 };
 use crate::model::UserInputResponse;
-use crate::model_context::CompiledModelContext;
 use crate::store::SessionStore;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -47,8 +46,7 @@ pub trait AgentTurnDriver: Send + Sync {
     /// Start a new turn with an optional precompiled model context.
     async fn run_turn(
         &self,
-        input: AgentTurnInput,
-        model_context: Option<CompiledModelContext>,
+        context: TurnExecutionContext,
         sender: Option<AgentEventSender>,
     ) -> anyhow::Result<AgentTurnResult>;
 
@@ -64,14 +62,13 @@ pub trait AgentTurnDriver: Send + Sync {
 }
 
 #[async_trait]
-impl AgentTurnDriver for AgentCore {
+impl AgentTurnDriver for PreparedAgentRun {
     async fn run_turn(
         &self,
-        input: AgentTurnInput,
-        model_context: Option<CompiledModelContext>,
+        context: TurnExecutionContext,
         sender: Option<AgentEventSender>,
     ) -> anyhow::Result<AgentTurnResult> {
-        self.run_turn_detailed_streaming_with_context(input, model_context, sender)
+        self.run_turn_detailed_streaming_with_context(context.input, context.model_context, sender)
             .await
     }
 
@@ -83,6 +80,7 @@ impl AgentTurnDriver for AgentCore {
         cancellation: Option<CancellationToken>,
         sender: Option<AgentEventSender>,
     ) -> anyhow::Result<AgentTurnResult> {
+        self.validate_continuation(&continuation)?;
         self.resume_from_signal_streaming(continuation, signal, store, cancellation, sender)
             .await
     }
@@ -98,9 +96,24 @@ mod tests {
     fn accepts_object_safe_driver(_driver: &dyn AgentTurnDriver) {}
 
     #[test]
-    fn agent_core_implements_object_safe_turn_driver() {
-        let agent = AgentCore::default();
-        accepts_object_safe_driver(&agent);
+    fn prepared_agent_run_implements_object_safe_turn_driver() {
+        let workspace = std::env::temp_dir();
+        let authority = crate::ExecutionAuthority::new(
+            workspace,
+            PermissionMode::FullAccess,
+            crate::LocalSandboxConfig::default(),
+            crate::CapabilityProjection::unrestricted(),
+        )
+        .unwrap();
+        let driver = crate::AgentCore::default()
+            .begin_run(crate::AgentRunConfig::using_current_provider(
+                authority,
+                crate::AgentRunIdentity::root(Uuid::new_v4(), 1),
+            ))
+            .unwrap()
+            .finalize()
+            .unwrap();
+        accepts_object_safe_driver(&driver);
     }
 
     #[test]
@@ -129,6 +142,7 @@ mod tests {
     #[test]
     fn driver_delegates_tool_batch_and_model_request_materialization() {
         let source = include_str!("agent.rs");
+        let context_assembly_source = include_str!("agent/tool_disclosure.rs");
         let production_source = source
             .split("#[cfg(test)]\nmod tests")
             .next()
@@ -146,7 +160,7 @@ mod tests {
             );
         }
         assert!(production_source.contains("execute_provider_batch(inputs)"));
-        assert!(production_source.contains("context_assembler.compile(ContextAssemblyInput"));
+        assert!(context_assembly_source.contains("context_assembler.compile(ContextAssemblyInput"));
     }
 
     #[test]
@@ -172,28 +186,44 @@ mod tests {
 
     #[tokio::test]
     async fn driver_event_sequence_is_preserved_behind_the_port() {
-        let driver = AgentCore::default();
-        let result = AgentTurnDriver::run_turn(
-            &driver,
-            AgentTurnInput {
-                thread_id: Uuid::from_u128(1),
-                user_message_id: Uuid::from_u128(2),
-                workspace_root: std::env::temp_dir(),
-                content: "event-sequence-golden".to_string(),
-                user_content: Vec::new(),
-                context_summary: None,
-                conversation: Vec::new(),
-                permission_mode: PermissionMode::FullAccess,
-                context_budget: None,
-                provider_cursor: None,
-                store: None,
-                cancellation: None,
-            },
-            None,
-            None,
+        let workspace = std::env::temp_dir();
+        let authority = crate::ExecutionAuthority::new(
+            workspace.clone(),
+            PermissionMode::FullAccess,
+            crate::LocalSandboxConfig::default(),
+            crate::CapabilityProjection::unrestricted(),
         )
-        .await
-        .expect("turn driver completes behind the port");
+        .unwrap();
+        let driver = crate::AgentCore::default()
+            .begin_run(crate::AgentRunConfig::using_current_provider(
+                authority,
+                crate::AgentRunIdentity::root(Uuid::new_v4(), 1),
+            ))
+            .unwrap()
+            .finalize()
+            .unwrap();
+        let context = driver
+            .prepare_turn(
+                crate::AgentTurnInput {
+                    thread_id: Uuid::from_u128(1),
+                    user_message_id: Uuid::from_u128(2),
+                    workspace_root: workspace,
+                    content: "event-sequence-golden".to_string(),
+                    user_content: Vec::new(),
+                    context_summary: None,
+                    conversation: Vec::new(),
+                    permission_mode: PermissionMode::FullAccess,
+                    context_budget: None,
+                    provider_cursor: None,
+                    store: None,
+                    cancellation: None,
+                },
+                None,
+            )
+            .unwrap();
+        let result = AgentTurnDriver::run_turn(&driver, context, None)
+            .await
+            .expect("turn driver completes behind the port");
 
         assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
         let sequence = result

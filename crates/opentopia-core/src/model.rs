@@ -10,12 +10,13 @@ use crate::provider::ModelUsage;
 use crate::skills::LoadedSkill;
 use crate::work_form::{WorkForm, WorkFormStatus};
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
     pub id: Uuid,
@@ -42,7 +43,7 @@ impl Project {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: Uuid,
@@ -63,7 +64,7 @@ pub struct Thread {
 
 /// A concrete model to run a thread with. The connection supplies the endpoint
 /// and credentials; this only narrows which model and how hard it thinks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadModelSelection {
     pub connection_id: String,
@@ -72,7 +73,7 @@ pub struct ThreadModelSelection {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperienceMode {
     Work,
@@ -100,7 +101,7 @@ impl ExperienceMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CollaborationMode {
     #[default]
@@ -172,7 +173,7 @@ impl Thread {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     System,
@@ -202,7 +203,7 @@ impl MessageRole {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: Uuid,
@@ -224,7 +225,7 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagePart {
     Text {
@@ -272,7 +273,7 @@ pub enum MessagePart {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextSourceRef {
     pub id: Uuid,
@@ -298,7 +299,7 @@ impl From<&LoadedContextSource> for ContextSourceRef {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillRef {
     pub id: String,
@@ -320,7 +321,7 @@ impl From<&LoadedSkill> for SkillRef {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: Uuid,
@@ -344,7 +345,7 @@ impl ToolCall {
 /// variants retain information that would otherwise be flattened into a prompt
 /// string. `Image` stores the original bytes so provider adapters can choose
 /// their native multimodal representation at the last possible point.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelContentPart {
     Text {
@@ -395,7 +396,7 @@ impl ModelContentPart {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResult {
     pub call_id: Uuid,
@@ -432,7 +433,7 @@ impl ToolResult {
 
 pub type GoalStatus = WorkFormStatus;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalRecord {
     pub id: Uuid,
@@ -463,7 +464,7 @@ impl GoalRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalSnapshot {
     pub goal: GoalRecord,
@@ -488,7 +489,7 @@ impl GoalSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Artifact {
     pub id: Uuid,
@@ -556,7 +557,7 @@ impl Artifact {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ArtifactStorage {
     Inline { content: String },
@@ -579,7 +580,7 @@ impl ArtifactStorage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactMetadata {
     pub id: Uuid,
@@ -592,7 +593,7 @@ pub struct ArtifactMetadata {
     pub metadata: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ArtifactStorageMetadata {
     Inline,
@@ -601,7 +602,7 @@ pub enum ArtifactStorageMetadata {
 
 pub const CONTEXT_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextCheckpointMode {
     #[default]
@@ -611,7 +612,7 @@ pub enum ContextCheckpointMode {
     NativeProvider,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextFactStatus {
     #[default]
@@ -620,14 +621,14 @@ pub enum ContextFactStatus {
     Superseded,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpointCoverage {
     pub through_seq: i64,
     pub through_message_count: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpointFact {
     pub id: String,
@@ -640,7 +641,7 @@ pub struct ContextCheckpointFact {
     pub confidence: Option<u8>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpointFile {
     pub path: PathBuf,
@@ -650,7 +651,7 @@ pub struct ContextCheckpointFile {
     pub source_seqs: Vec<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpointWorkspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -661,7 +662,7 @@ pub struct ContextCheckpointWorkspace {
     pub files_changed: Vec<ContextCheckpointFile>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpointCommand {
     pub command: String,
@@ -671,7 +672,7 @@ pub struct ContextCheckpointCommand {
     pub source_seqs: Vec<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpointStep {
     pub id: String,
@@ -681,7 +682,7 @@ pub struct ContextCheckpointStep {
     pub source_seqs: Vec<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpointInteraction {
     pub kind: String,
@@ -690,7 +691,7 @@ pub struct ContextCheckpointInteraction {
     pub source_seqs: Vec<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpointArtifact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,7 +704,7 @@ pub struct ContextCheckpointArtifact {
     pub source_seqs: Vec<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpoint {
     pub id: Uuid,
@@ -763,7 +764,7 @@ impl ContextCheckpoint {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -784,7 +785,7 @@ pub struct ContextProjection {
     pub native_compaction_item_count: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCompactionMetrics {
     pub source: String,
@@ -796,7 +797,7 @@ pub struct ContextCompactionMetrics {
     pub active_constraint_retention_percent: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCompactionDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -809,7 +810,7 @@ pub struct ContextCompactionDetails {
     pub metrics: Option<ContextCompactionMetrics>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextSummary {
     pub id: Uuid,
@@ -845,7 +846,7 @@ impl ContextSummary {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalStatus {
     Pending,
@@ -872,7 +873,7 @@ impl ApprovalStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Approval {
     pub approval_id: Uuid,
@@ -884,7 +885,7 @@ pub struct Approval {
     pub decided_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputOption {
     pub id: String,
@@ -894,7 +895,7 @@ pub struct UserInputOption {
     pub recommended: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputQuestion {
     pub id: String,
@@ -909,14 +910,14 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputRequest {
     pub request_id: Uuid,
     pub questions: Vec<UserInputQuestion>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputAnswer {
     pub question_id: String,
@@ -926,7 +927,7 @@ pub struct UserInputAnswer {
     pub custom_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputResponse {
     pub answers: Vec<UserInputAnswer>,
@@ -940,7 +941,7 @@ pub struct UserInputResponse {
     pub cancelled: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UserInputStatus {
     Pending,
@@ -964,7 +965,7 @@ impl UserInputStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputRecord {
     pub thread_id: Uuid,
@@ -994,7 +995,7 @@ impl Approval {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
     Running,
@@ -1050,7 +1051,7 @@ impl TurnStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnRecord {
     pub turn_id: Uuid,
@@ -1088,7 +1089,7 @@ fn default_turn_invocation_id() -> u64 {
     1
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnChangeSetStatus {
     Capturing,
@@ -1118,7 +1119,7 @@ impl TurnChangeSetStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnFileChangeKind {
     Added,
@@ -1127,7 +1128,7 @@ pub enum TurnFileChangeKind {
     Renamed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnFileChange {
     pub kind: TurnFileChangeKind,
@@ -1148,7 +1149,7 @@ impl TurnFileChange {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnChangeSet {
     pub turn_id: Uuid,
@@ -1247,7 +1248,7 @@ pub struct TerminalCommandHistory {
     pub completed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEvent {
     pub id: Uuid,
@@ -1280,7 +1281,7 @@ impl AgentEvent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEventPayload {
     ThreadContextSnapshot {
@@ -1490,7 +1491,7 @@ pub enum AgentEventPayload {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelCallPurpose {
     #[default]
@@ -1501,7 +1502,7 @@ pub enum ModelCallPurpose {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderRetryKind {
     #[default]

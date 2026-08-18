@@ -1,8 +1,7 @@
 use crate::agent::AgentCore;
-use crate::completion_runtime::{
-    CompletionGate, CompletionRegistry, DefaultCompletionGate, DefaultCompletionRegistry,
-};
-use crate::context_runtime::{ContextAssembler, DefaultContextAssembler};
+use crate::agent_kernel::AgentKernel;
+use crate::completion_runtime::{DefaultCompletionGate, DefaultCompletionRegistry};
+use crate::context_runtime::DefaultContextAssembler;
 use crate::model::ThreadModelSelection;
 use crate::model_gateway::{ModelGateway, ProviderModelGateway};
 use crate::prompt_runtime::AgentRuntimeSettings;
@@ -14,9 +13,9 @@ use crate::sandbox::LocalSandboxConfig;
 use crate::settings::{
     AppSettings, ProviderSettings, ProviderToolProtocolCapabilities, RolloutBudgetSettings,
 };
-use crate::tool_runtime::ToolRuntimeHost;
+use crate::tool_runtime::{LocalToolRuntime, ToolRuntimeHost};
 use crate::tools::ToolRegistry;
-use crate::turn_inbox::{BufferedTurnInbox, TurnInbox};
+use crate::turn_inbox::BufferedTurnInbox;
 use std::sync::Arc;
 
 /// Dependency bundle used only at the Agent Core composition boundary.
@@ -25,17 +24,15 @@ use std::sync::Arc;
 /// selection, default implementations, and environment/settings lookup stay in
 /// this module instead of leaking into the turn coordinator.
 pub(crate) struct AgentCoreComposition {
-    pub context_assembler: Arc<dyn ContextAssembler>,
-    pub model_gateway: Arc<dyn ModelGateway>,
+    pub kernel: AgentKernel,
+    pub guardian_provider: Arc<dyn ModelProvider>,
     pub tool_host: ToolRuntimeHost,
-    pub completion_gate: Arc<dyn CompletionGate>,
-    pub completion_registry: Arc<dyn CompletionRegistry>,
-    pub turn_inbox: Arc<dyn TurnInbox>,
     pub rollout_budget_settings: Option<RolloutBudgetSettings>,
     pub agent_runtime_settings: AgentRuntimeSettings,
     pub provider_tool_protocol: ProviderToolProtocolCapabilities,
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentProviderBinding {
     pub model_gateway: Arc<dyn ModelGateway>,
     pub guardian_provider: Arc<dyn ModelProvider>,
@@ -46,7 +43,10 @@ pub(crate) struct AgentProviderBinding {
 }
 
 impl AgentProviderBinding {
-    fn from_settings(settings: &AppSettings, selection: Option<&ThreadModelSelection>) -> Self {
+    pub(crate) fn from_settings(
+        settings: &AppSettings,
+        selection: Option<&ThreadModelSelection>,
+    ) -> Self {
         let connection =
             settings.provider_by_id_or_active(selection.map(|value| value.connection_id.as_str()));
         let resolved = match selection {
@@ -79,12 +79,16 @@ impl AgentCoreComposition {
         sandbox: LocalSandboxConfig,
     ) -> Self {
         Self {
-            context_assembler: Arc::new(DefaultContextAssembler),
-            model_gateway: Arc::new(ProviderModelGateway::from_provider(provider)),
-            tool_host: ToolRuntimeHost::new(guardian_provider, tools, supports_vision, sandbox),
-            completion_gate: Arc::new(DefaultCompletionGate),
-            completion_registry: Arc::new(DefaultCompletionRegistry),
-            turn_inbox: Arc::new(BufferedTurnInbox::default()),
+            kernel: AgentKernel::new(
+                Arc::new(DefaultContextAssembler),
+                Arc::new(ProviderModelGateway::from_provider(provider)),
+                Arc::new(LocalToolRuntime::new()),
+                Arc::new(DefaultCompletionGate),
+                Arc::new(DefaultCompletionRegistry),
+                Arc::new(BufferedTurnInbox::default()),
+            ),
+            guardian_provider,
+            tool_host: ToolRuntimeHost::new(tools, supports_vision, sandbox),
             rollout_budget_settings: None,
             agent_runtime_settings: AgentRuntimeSettings::default(),
             provider_tool_protocol: ProviderToolProtocolCapabilities::default(),

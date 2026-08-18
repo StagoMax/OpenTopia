@@ -1,5 +1,6 @@
 use crate::bundled_plugins::BundledPluginTrust;
 use crate::plugins::PluginSource;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,7 +9,7 @@ use thiserror::Error;
 
 pub const OPENTOPIA_MANIFEST_API_VERSION: &str = "1";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenTopiaManifest {
     pub api_version: String,
@@ -22,14 +23,14 @@ pub struct OpenTopiaManifest {
     pub configuration: Option<ManifestConfiguration>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManifestRequirements {
     #[serde(default)]
     pub host_capabilities: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginPermissions {
     #[serde(default)]
@@ -72,7 +73,9 @@ impl PluginPermissions {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPermissionKind {
     Filesystem,
@@ -81,7 +84,9 @@ pub enum PluginPermissionKind {
     Desktop,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginPermission {
     pub kind: PluginPermissionKind,
@@ -97,7 +102,7 @@ impl PluginPermission {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManifestContributions {
     #[serde(default)]
@@ -116,7 +121,7 @@ pub struct ManifestContributions {
     pub unsupported: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManifestConfiguration {
     pub schema: String,
@@ -129,7 +134,7 @@ pub struct CodexCompatibleContributions<'a> {
     pub apps: Option<&'a Value>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginCapabilityManifest {
     pub api_version: Option<String>,
@@ -269,7 +274,9 @@ impl PluginCapabilityManifest {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ContributionKind {
     Skill,
@@ -282,7 +289,9 @@ pub enum ContributionKind {
     App,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ContributionOrigin {
     CodexCompatible,
@@ -311,7 +320,7 @@ impl ContributionKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginContribution {
     pub id: String,
@@ -371,7 +380,7 @@ pub enum CapabilityManifestError {
     DuplicateContributionId(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisteredPluginCapabilities {
     pub plugin_id: String,
@@ -586,14 +595,14 @@ pub enum CapabilityRegistryError {
     UnstableContributionId(String),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityActivationScope {
     pub workspace_id: Option<String>,
     pub thread_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginActivation {
     pub plugin_id: String,
@@ -612,7 +621,7 @@ impl PluginActivation {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityActivationRequest {
     pub scope: CapabilityActivationScope,
@@ -622,7 +631,7 @@ pub struct CapabilityActivationRequest {
     pub plugins: Vec<PluginActivation>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivatedContribution {
     pub plugin_name: String,
@@ -631,14 +640,14 @@ pub struct ActivatedContribution {
     pub contribution: PluginContribution,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UnavailableContribution {
     pub contribution: ActivatedContribution,
     pub reason: CapabilityUnavailableReason,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityUnavailableReason {
     Disabled,
@@ -648,14 +657,14 @@ pub enum CapabilityUnavailableReason {
     Conflict,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityConflict {
     pub key: String,
     pub contribution_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityActivationSnapshot {
     pub scope: CapabilityActivationScope,

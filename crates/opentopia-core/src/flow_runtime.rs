@@ -3,17 +3,19 @@ use crate::flow::{
     compile_flow, FlowBudgetV1, FlowDefinitionV1, GraphDefinitionV1, GraphEdgeV1,
     GraphLoopPolicyV1, GraphNodeKindV1, GraphNodeV1, LoopExhaustionActionV1,
 };
+use crate::human_task::HumanTaskV1;
 use crate::tools::ToolInvocationContext;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowRunStatusV1 {
     Queued,
@@ -47,7 +49,7 @@ impl FlowRunStatusV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowNodeRunStatusV1 {
     Running,
@@ -57,7 +59,7 @@ pub enum FlowNodeRunStatusV1 {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowTranscriptEntryKindV1 {
     Input,
@@ -68,7 +70,7 @@ pub enum FlowTranscriptEntryKindV1 {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowTranscriptEntryV1 {
     pub id: Uuid,
@@ -119,7 +121,7 @@ impl FlowTranscriptEntryV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowNodeRunV1 {
     pub id: Uuid,
@@ -139,7 +141,7 @@ pub struct FlowNodeRunV1 {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowRunV1 {
     pub schema_version: u16,
@@ -169,6 +171,8 @@ pub struct FlowRunV1 {
     pub tool_calls: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_human_task_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -221,6 +225,7 @@ impl FlowRunV1 {
             node_executions: 0,
             tool_calls: 0,
             waiting_node_id: None,
+            active_human_task_id: None,
             error: None,
             created_at: now,
             started_at: None,
@@ -292,7 +297,7 @@ pub struct FlowNodeExecutionRequestV1 {
     pub context: ToolInvocationContext,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowNodeExecutionResultV1 {
     pub output: Value,
@@ -374,6 +379,7 @@ pub fn resolve_flow_approval(
     ));
     node_run.completed_at = Some(Utc::now());
     run.waiting_node_id = None;
+    run.active_human_task_id = None;
     if approved {
         run.node_outputs.insert(node_id.clone(), output.clone());
         run.status = FlowRunStatusV1::Running;
@@ -413,6 +419,7 @@ pub fn prepare_flow_resume(
     run.node_runs[index].completed_at = Some(Utc::now());
     remove_first(&mut run.ready_nodes, &node_id);
     run.ready_nodes.insert(0, node_id);
+    run.active_human_task_id = None;
     Ok(())
 }
 
@@ -484,8 +491,10 @@ async fn drive_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow:
         remove_first(&mut run.ready_nodes, &node_id);
         if node.kind == GraphNodeKindV1::Approval {
             let transcript_input = input.clone();
+            let task_input = input.clone();
+            let node_run_id = Uuid::new_v4();
             let node_run = FlowNodeRunV1 {
-                id: Uuid::new_v4(),
+                id: node_run_id,
                 node_id: node_id.clone(),
                 attempt: run.next_attempt(&node_id),
                 status: FlowNodeRunStatusV1::WaitingApproval,
@@ -511,10 +520,25 @@ async fn drive_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow:
             run.node_runs.push(node_run);
             run.node_executions = run.node_executions.saturating_add(1);
             run.started_at.get_or_insert_with(Utc::now);
-            run.waiting_node_id = Some(node_id);
+            run.waiting_node_id = Some(node_id.clone());
             run.status = FlowRunStatusV1::WaitingApproval;
+            let task = HumanTaskV1::flow_approval(
+                run.thread_id,
+                run.id,
+                node_run_id,
+                node_id.clone(),
+                &node.label,
+                json!({
+                    "flowId": run.flow_id,
+                    "flowVersion": run.flow_version,
+                    "nodeId": node_id,
+                    "nodeLabel": node.label,
+                    "input": task_input,
+                }),
+            );
+            run.active_human_task_id = Some(task.id);
             run.touch();
-            store.update_flow_run(&run, expected)?;
+            store.update_flow_run_and_human_task(&run, expected, &task, None)?;
             return Ok(());
         }
 
@@ -1140,10 +1164,22 @@ mod tests {
         let context = runtime_context(store.clone(), thread.id);
         spawn_flow_run(run.id, context.clone()).expect("spawn run");
         let mut waiting = wait_for_status(&store, run.id, FlowRunStatusV1::WaitingApproval).await;
+        let mut task = store
+            .get_pending_human_task_for_flow_run(run.id)
+            .expect("load Human task")
+            .expect("approval task");
+        assert_eq!(waiting.active_human_task_id, Some(task.id));
         let expected = waiting.revision;
+        let task_expected = task.revision;
         resolve_flow_approval(&mut waiting, true, Some("reviewed")).expect("approve");
+        task.resolve(
+            crate::human_task::HumanTaskActionV1::Approve,
+            Some("reviewed"),
+            "test_operator",
+        )
+        .expect("resolve Human task");
         store
-            .update_flow_run(&waiting, expected)
+            .update_flow_run_and_human_task(&waiting, expected, &task, Some(task_expected))
             .expect("persist approval");
         spawn_flow_run(run.id, context).expect("resume run");
 
@@ -1152,6 +1188,86 @@ mod tests {
             completed.output,
             Some(json!({"approved": true, "note": "reviewed"}))
         );
+    }
+
+    #[test]
+    fn restart_creates_a_recovery_human_task_for_an_interrupted_node() {
+        let database_path = std::env::temp_dir().join(format!(
+            "opentopia-flow-recovery-{}-{}.db",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let run_id;
+        {
+            let store = SqliteSessionStore::open(&database_path).expect("open store");
+            let thread = store
+                .create_thread_with_mode(
+                    Some("Interrupted Flow".to_string()),
+                    PathBuf::from("."),
+                    ExperienceMode::Flow,
+                )
+                .expect("create Flow thread");
+            let definition = definition(
+                vec![
+                    runtime_node("external-write", GraphNodeKindV1::Condition, json!({})),
+                    runtime_node("output", GraphNodeKindV1::Output, json!({})),
+                ],
+                vec![GraphEdgeV1 {
+                    from: "external-write".to_string(),
+                    to: "output".to_string(),
+                    condition: None,
+                    allowed_fields: BTreeSet::new(),
+                    data_classification: DataClassification::Internal,
+                    on_error: None,
+                    loop_policy: None,
+                }],
+            );
+            let mut run = FlowRunV1::new(
+                thread.id,
+                &definition,
+                json!({"request": "sync"}),
+                &CapabilityProjection::unrestricted(),
+            )
+            .expect("create run");
+            run_id = run.id;
+            run.status = FlowRunStatusV1::Running;
+            run.ready_nodes.clear();
+            run.started_at = Some(Utc::now());
+            run.node_runs.push(FlowNodeRunV1 {
+                id: Uuid::new_v4(),
+                node_id: "external-write".to_string(),
+                attempt: 1,
+                status: FlowNodeRunStatusV1::Running,
+                input: json!({"request": "sync"}),
+                output: None,
+                error: None,
+                tool_calls: 1,
+                transcript: vec![],
+                started_at: Utc::now(),
+                completed_at: None,
+            });
+            store.insert_flow_run(&run).expect("persist running Flow");
+        }
+
+        {
+            let reopened = SqliteSessionStore::open(&database_path).expect("reopen store");
+            let run = reopened
+                .get_flow_run(run_id)
+                .expect("load recovered Flow")
+                .expect("recovered Flow");
+            let task = reopened
+                .get_pending_human_task_for_flow_run(run_id)
+                .expect("load recovery task")
+                .expect("recovery task");
+            assert_eq!(run.status, FlowRunStatusV1::Paused);
+            assert_eq!(run.active_human_task_id, Some(task.id));
+            assert_eq!(task.task_type, crate::human_task::HumanTaskTypeV1::Recovery);
+            assert_eq!(task.payload["sideEffectState"], "unknown");
+        }
+
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("db-shm"));
     }
 
     #[tokio::test]

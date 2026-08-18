@@ -11,6 +11,7 @@ mod invocation;
 mod mailbox;
 mod registry;
 mod run_scheduler;
+mod runtime_snapshot;
 mod service;
 mod snapshot_deriver;
 mod sqlite_activity_source;
@@ -42,6 +43,12 @@ pub use registry::{
 };
 pub use run_scheduler::{
     AgentRunCommand, AgentRunResumeSignal, AgentRunScheduler, AgentRunSchedulerError,
+};
+#[cfg(test)]
+pub(crate) use runtime_snapshot::test_runtime_snapshot;
+pub use runtime_snapshot::{
+    RuntimeForkTurnsLabelV1, RuntimeForkTurnsV1, RuntimeSnapshotV1, RuntimeWorkspaceAssignmentV1,
+    RuntimeWorkspaceDeliveryStateV1, RuntimeWorkspaceModeV1, RUNTIME_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use service::{AgentCollaborationRuntime, AgentCollaborationRuntimeError, SpawnAgentOutcome};
 pub use snapshot_deriver::AttenuatingRuntimeSnapshotDeriver;

@@ -42,8 +42,8 @@ impl AgentCore {
         sandbox_config: &LocalSandboxConfig,
     ) -> Vec<usize> {
         let catalog = self.tool_runtime_catalog();
-        self.tool_host
-            .runtime
+        self.kernel
+            .tool_runtime
             .parallel_call_indices(ToolSchedulingInput {
                 catalog: &catalog,
                 calls,
@@ -58,8 +58,8 @@ impl AgentCore {
         calls: &[ProviderToolCall],
     ) -> Vec<usize> {
         let catalog = self.tool_runtime_catalog();
-        self.tool_host
-            .runtime
+        self.kernel
+            .tool_runtime
             .approved_parallel_call_indices(&catalog, calls)
     }
 
@@ -71,8 +71,8 @@ impl AgentCore {
         sandbox_config: &LocalSandboxConfig,
     ) -> Vec<crate::tool_runtime::ToolApprovalCandidate> {
         let catalog = self.tool_runtime_catalog();
-        self.tool_host
-            .runtime
+        self.kernel
+            .tool_runtime
             .approval_candidates(ToolSchedulingInput {
                 catalog: &catalog,
                 calls,

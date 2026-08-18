@@ -2,9 +2,7 @@ use crate::enterprise::DataClassification;
 use crate::flow::{
     simulate_flow, validate_flow_spec, FlowDraftStatusV1, FlowDraftV1, FlowSourceV1, FlowSpecV1,
 };
-use crate::flow_runtime::{
-    prepare_flow_resume, resolve_flow_approval, spawn_flow_run, FlowRunStatusV1, FlowRunV1,
-};
+use crate::flow_runtime::{prepare_flow_resume, spawn_flow_run, FlowRunStatusV1, FlowRunV1};
 use crate::model::{ExperienceMode, ToolCall, ToolResult, TurnStatus};
 use crate::tools::{
     RegisteredTool, Tool, ToolApprovalMode, ToolClass, ToolExecutionPolicy, ToolGovernance,
@@ -215,10 +213,6 @@ struct StatusInput {
 struct ResumeInput {
     run_id: Uuid,
     #[serde(default)]
-    approved: Option<bool>,
-    #[serde(default)]
-    note: Option<String>,
-    #[serde(default)]
     retry_interrupted_node: bool,
 }
 
@@ -285,7 +279,7 @@ impl Tool for FlowTool {
             FlowToolAction::Run => "Start an immutable published Flow in the durable Flow Runtime. The runtime schedules graph dependencies and control nodes, while Agent, Skill, and Tool nodes execute through the currently restricted Agent Harness.",
             FlowToolAction::Status => "Inspect one durable Flow run or list recent runs for the current Flow session, including node attempts, outputs, budgets, and pending control state.",
             FlowToolAction::Pause => "Request a Flow run pause. The request takes effect at the next node boundary so an in-flight side effect is not interrupted into an unknown state.",
-            FlowToolAction::Resume => "Resume a paused Flow run, or resolve its explicit approval node with approved=true/false. Execution continues from the persisted node boundary.",
+            FlowToolAction::Resume => "Resume an operator-paused Flow run from its persisted node boundary. Approval and recovery Human tasks must be resolved by a person through the Inbox.",
             FlowToolAction::Cancel => "Request cancellation of a Flow run at the next node boundary.",
         }
     }
@@ -353,8 +347,6 @@ impl Tool for FlowTool {
                 "required": ["runId"],
                 "properties": {
                     "runId": {"type": "string", "format": "uuid"},
-                    "approved": {"type": "boolean"},
-                    "note": {"type": "string"},
                     "retryInterruptedNode": {
                         "type": "boolean",
                         "description": "After a process restart, explicitly retry a node that may have stopped mid-side-effect. Inspect external state first."
@@ -626,8 +618,8 @@ impl Tool for FlowTool {
                 match run.status {
                     FlowRunStatusV1::Paused => {
                         anyhow::ensure!(
-                            input.approved.is_none(),
-                            "approved is only valid while a Flow is waiting for approval"
+                            store.get_pending_human_task_for_flow_run(run.id)?.is_none(),
+                            "Flow recovery requires a person to resolve the Human task"
                         );
                         prepare_flow_resume(&mut run, input.retry_interrupted_node)?;
                         run.status = FlowRunStatusV1::Running;
@@ -635,13 +627,7 @@ impl Tool for FlowTool {
                         run.touch();
                     }
                     FlowRunStatusV1::WaitingApproval => {
-                        resolve_flow_approval(
-                            &mut run,
-                            input.approved.ok_or_else(|| {
-                                anyhow::anyhow!("approved is required for an approval node")
-                            })?,
-                            input.note.as_deref(),
-                        )?;
+                        anyhow::bail!("Flow approval requires a person to resolve the Human task")
                     }
                     _ => anyhow::bail!("Flow run is not paused or waiting for approval"),
                 }
@@ -672,8 +658,19 @@ impl Tool for FlowTool {
                 } else {
                     run.status = FlowRunStatusV1::CancelRequested;
                 }
+                run.active_human_task_id = None;
                 run.touch();
-                let run = store.update_flow_run(&run, expected)?;
+                let run = if let Some(mut task) =
+                    store.get_pending_human_task_for_flow_run(run.id)?
+                {
+                    let task_revision = task.revision;
+                    task.cancel(Some("Flow run cancelled"), "flow_control")?;
+                    store
+                        .update_flow_run_and_human_task(&run, expected, &task, Some(task_revision))?
+                        .0
+                } else {
+                    store.update_flow_run(&run, expected)?
+                };
                 Self::result(call.id, json!({"run": run}))
             }
         }

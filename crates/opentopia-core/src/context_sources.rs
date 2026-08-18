@@ -1,4 +1,5 @@
 use crate::model::ModelContentPart;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
@@ -11,7 +12,7 @@ pub const DEFAULT_MAX_SOURCE_BYTES: u64 = 25 * 1024 * 1024;
 pub const DEFAULT_MAX_TEXT_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_TOTAL_TEXT_BYTES: usize = 512 * 1024;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextSourceKind {
     Text,

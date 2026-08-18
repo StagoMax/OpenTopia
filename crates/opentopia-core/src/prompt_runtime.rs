@@ -3,10 +3,11 @@ use crate::model_context::{
     content_fingerprint, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
     ModelContextItem,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPersonality {
     Focused,
@@ -30,7 +31,7 @@ impl AgentPersonality {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAutonomy {
     Guided,
@@ -54,7 +55,7 @@ impl AgentAutonomy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MultiAgentMode {
     Off,
@@ -78,7 +79,7 @@ impl MultiAgentMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressUpdateMode {
     Milestones,
@@ -102,7 +103,7 @@ impl ProgressUpdateMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AgentRuntimeSettings {
     pub personality: AgentPersonality,

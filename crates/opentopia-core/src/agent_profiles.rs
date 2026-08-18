@@ -1,11 +1,12 @@
 use crate::sandbox::SandboxMode;
 use crate::{ContributionKind, PluginDescriptor};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AgentProfile {
     pub name: String,
     pub description: String,
@@ -64,6 +65,7 @@ impl AgentProfile {
                 "apply_patch".to_string(),
                 "create_skill".to_string(),
                 "spreadsheet".to_string(),
+                "spreadsheet_execute".to_string(),
             ],
             ..Self::default_profile()
         }

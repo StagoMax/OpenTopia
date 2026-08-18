@@ -7,6 +7,7 @@ use super::{
     RuntimeSnapshotSeed, SpawnAgentOutcome, SpawnAgentThread,
 };
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -89,7 +90,7 @@ pub struct SpawnChildAgentRequest {
     pub allow_child_spawns: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentListItem {
     pub agent: AgentThreadRecord,
@@ -514,9 +515,10 @@ impl AgentCollaborationInvocation {
 mod tests {
     use super::*;
     use crate::collaboration::{
-        AgentActivitySource, AgentRunCommand, AgentRunScheduler, AgentRunSchedulerError,
-        AgentTurnStatus, CollaborationRegistry, CollaborationSessionPolicy,
+        test_runtime_snapshot, AgentActivitySource, AgentRunCommand, AgentRunScheduler,
+        AgentRunSchedulerError, AgentTurnStatus, CollaborationRegistry, CollaborationSessionPolicy,
         CreateCollaborationSession, InMemoryAgentMailbox, InMemoryCollaborationRegistry,
+        RuntimeWorkspaceModeV1,
     };
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -582,11 +584,10 @@ mod tests {
             Ok(DerivedChildRuntime {
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(parent.id),
-                    json!({
-                        "agentType": request.agent_type,
-                        "forkTurns": request.fork_turns,
-                        "workspaceMode": request.workspace_mode,
-                    }),
+                    test_runtime_snapshot(
+                        &request.agent_type,
+                        RuntimeWorkspaceModeV1::SharedReadOnly,
+                    ),
                 ),
                 spawn_policy: if request.allow_child_spawns {
                     AgentSpawnPolicy::allows_children(2, 2)
@@ -622,7 +623,7 @@ mod tests {
                     root_agent_type: "default".to_string(),
                     root_runtime_snapshot: RuntimeSnapshotSeed::new(
                         None,
-                        json!({ "agentType": "default" }),
+                        test_runtime_snapshot("default", RuntimeWorkspaceModeV1::SharedCoordinated),
                     ),
                     session_policy: CollaborationSessionPolicy {
                         max_agents: 8,
@@ -789,7 +790,10 @@ mod tests {
                 root_turn_id: AgentTurnId::new(),
                 root_task_message: "other".to_string(),
                 root_agent_type: "default".to_string(),
-                root_runtime_snapshot: RuntimeSnapshotSeed::new(None, json!({})),
+                root_runtime_snapshot: RuntimeSnapshotSeed::new(
+                    None,
+                    test_runtime_snapshot("default", RuntimeWorkspaceModeV1::SharedCoordinated),
+                ),
                 session_policy: CollaborationSessionPolicy::default(),
                 root_spawn_policy: AgentSpawnPolicy::allows_children(1, 1),
             })

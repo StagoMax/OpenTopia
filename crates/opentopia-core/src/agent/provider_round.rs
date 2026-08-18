@@ -1,0 +1,347 @@
+use super::{
+    compact_completed_tool_history, finalization_outcome, finalize_inbox_cancelled_turn,
+    finalize_provider_turn, finalize_rollout_hard_limit_turn, incomplete_model_response,
+    latest_work_form, provider_context_window_exceeded, record_rollout_usage,
+    repeated_invalid_tool_call_error, rollout_checkpoint_due, synchronize_context_budget,
+    truncate_for_summary, AgentCompletionGuardDelivery, AgentCore, AgentEventPayload,
+    AgentTurnResult, Arc, CancellationToken, CompiledModelContext, ContextBudget, ModelContentPart,
+    ModelConversationMessage, ModelDecision, ProviderToolCall, ProviderToolCandidate,
+    ProviderToolResult, RolloutBudget, RolloutCheckpointObservation, SessionStore, TurnEvents,
+    TurnRuntimeState, Uuid, BACKGROUND_COMMAND_REMINDER_STAGE, MAX_ROLLOUT_MODEL_ROUNDS,
+};
+
+pub(super) enum ProviderRoundOutcome {
+    Continue {
+        model_rounds: usize,
+        rollout_reviews: usize,
+    },
+    Finished(AgentTurnResult),
+}
+
+impl AgentCore {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn complete_provider_round(
+        &self,
+        thread_id: Uuid,
+        user_message_id: Uuid,
+        context_summary: Option<&str>,
+        conversation: &mut Vec<ModelConversationMessage>,
+        budget: &mut Option<ContextBudget>,
+        rollout_budget: &mut Option<RolloutBudget>,
+        mut model_rounds: usize,
+        mut rollout_reviews: usize,
+        runtime_state: &mut TurnRuntimeState,
+        model_context: &CompiledModelContext,
+        store: Option<&Arc<dyn SessionStore>>,
+        cancellation: Option<&CancellationToken>,
+        model_user_message: &str,
+        model_user_content: &[ModelContentPart],
+        tool_candidates: &[ProviderToolCandidate],
+        provider_tool_calls: &mut Vec<ProviderToolCall>,
+        provider_tool_results: &mut Vec<ProviderToolResult>,
+        pending_tool_calls: &mut Vec<ProviderToolCall>,
+        compacted_tool_history: &mut String,
+        provider_response_items: &mut Vec<serde_json::Value>,
+        branch_developer_instructions: Option<&str>,
+        compatibility_hash: &str,
+        completion_guard_delivery: &mut Option<AgentCompletionGuardDelivery>,
+        events: &mut TurnEvents,
+    ) -> anyhow::Result<ProviderRoundOutcome> {
+        if model_rounds >= MAX_ROLLOUT_MODEL_ROUNDS {
+            return Ok(ProviderRoundOutcome::Finished(
+                finalize_rollout_hard_limit_turn(
+                    thread_id,
+                    model_rounds,
+                    std::mem::replace(events, TurnEvents::new(None)),
+                ),
+            ));
+        }
+
+        if rollout_checkpoint_due(model_rounds, rollout_reviews) {
+            rollout_reviews = rollout_reviews.saturating_add(1);
+            let latest_form = latest_work_form(events, &provider_tool_results);
+            events.push(AgentEventPayload::ContextWarning {
+                stage: "rollout_self_review_checkpoint".to_string(),
+                message: format!(
+                    "Main-model self-review checkpoint after {model_rounds} completed rounds; the runtime supplied counters without making a progress decision."
+                ),
+            });
+            self.apply_rollout_checkpoint_observation(
+                RolloutCheckpointObservation {
+                    model_rounds,
+                    remaining_budget_tokens: rollout_budget
+                        .as_ref()
+                        .map(RolloutBudget::remaining_tokens),
+                    work_form: latest_form.as_ref(),
+                },
+                provider_tool_calls,
+                provider_tool_results,
+                provider_response_items,
+                events,
+            )?;
+        }
+
+        if rollout_budget
+            .as_ref()
+            .is_some_and(RolloutBudget::is_exhausted)
+        {
+            anyhow::bail!("shared rollout token budget exhausted");
+        }
+        // Everything the runtime noticed since the previous round reaches the
+        // model here as evidence rather than as control flow.
+        let step_reminders = self.collect_step_reminders(
+            thread_id,
+            user_message_id,
+            model_rounds,
+            rollout_budget.as_ref(),
+            runtime_state,
+        );
+        if step_reminders.cancelled {
+            return Ok(ProviderRoundOutcome::Finished(
+                finalize_inbox_cancelled_turn(
+                    thread_id,
+                    std::mem::replace(events, TurnEvents::new(None)),
+                ),
+            ));
+        }
+        let round_model_context = model_context.clone();
+        for reminder in &step_reminders.reminders {
+            events.push(AgentEventPayload::ContextWarning {
+                stage: format!("step_reminder.{}", reminder.stage),
+                message: truncate_for_summary(&reminder.content, 400),
+            });
+            if reminder.stage != BACKGROUND_COMMAND_REMINDER_STAGE {
+                self.append_step_reminder_observation(
+                    &reminder.stage,
+                    &reminder.content,
+                    reminder.observation_id.as_deref(),
+                    provider_tool_calls,
+                    provider_tool_results,
+                    provider_response_items,
+                    events,
+                );
+            }
+        }
+        for async_result in &step_reminders.async_tool_results {
+            self.append_background_completion_observation(
+                async_result,
+                provider_tool_calls,
+                provider_tool_results,
+                provider_response_items,
+                events,
+            );
+        }
+        let pressure_request = self.assemble_model_request(
+            &round_model_context,
+            context_summary,
+            conversation.clone(),
+            model_user_message.to_string(),
+            model_user_content.to_vec(),
+            tool_candidates.to_vec(),
+            provider_tool_calls.clone(),
+            provider_tool_results.clone(),
+            provider_response_items.clone(),
+            None,
+            branch_developer_instructions.map(str::to_string),
+        )?;
+        synchronize_context_budget(budget, pressure_request.logical());
+        compact_completed_tool_history(
+            conversation,
+            provider_tool_calls,
+            provider_tool_results,
+            provider_response_items,
+            compacted_tool_history,
+            budget,
+        );
+        let request = self.assemble_model_request(
+            &round_model_context,
+            context_summary,
+            conversation.clone(),
+            model_user_message.to_string(),
+            model_user_content.to_vec(),
+            tool_candidates.to_vec(),
+            provider_tool_calls.clone(),
+            provider_tool_results.clone(),
+            provider_response_items.clone(),
+            None,
+            branch_developer_instructions.map(str::to_string),
+        )?;
+        let response = match self
+            .complete_model(
+                request,
+                model_rounds.saturating_add(1),
+                events,
+                cancellation,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(_) if cancellation.is_some_and(CancellationToken::is_cancelled) => {
+                return Ok(ProviderRoundOutcome::Finished(
+                    finalize_inbox_cancelled_turn(
+                        thread_id,
+                        std::mem::replace(events, TurnEvents::new(None)),
+                    ),
+                ));
+            }
+            Err(error) if provider_context_window_exceeded(&error) => {
+                let previous_result_count = provider_tool_results.len();
+                if let Some(context_budget) = budget.as_mut() {
+                    context_budget.used_tokens = context_budget.max_tokens;
+                }
+                compact_completed_tool_history(
+                    conversation,
+                    provider_tool_calls,
+                    provider_tool_results,
+                    provider_response_items,
+                    compacted_tool_history,
+                    budget,
+                );
+                if provider_tool_results.len() == previous_result_count {
+                    return Err(error);
+                }
+                events.push(AgentEventPayload::ContextWarning {
+                    stage: "provider_context_overflow_recovery".to_string(),
+                    message: "The provider rejected the input as larger than its context window. Older completed tool results were compacted and the model request is being retried once."
+                        .to_string(),
+                });
+                let retry_request = self.assemble_model_request(
+                    &round_model_context,
+                    context_summary,
+                    conversation.clone(),
+                    model_user_message.to_string(),
+                    model_user_content.to_vec(),
+                    tool_candidates.to_vec(),
+                    provider_tool_calls.clone(),
+                    provider_tool_results.clone(),
+                    provider_response_items.clone(),
+                    None,
+                    branch_developer_instructions.map(str::to_string),
+                )?;
+                synchronize_context_budget(budget, retry_request.logical());
+                let retry = self
+                    .complete_model(
+                        retry_request,
+                        model_rounds.saturating_add(1),
+                        events,
+                        cancellation,
+                    )
+                    .await;
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Ok(ProviderRoundOutcome::Finished(
+                        finalize_inbox_cancelled_turn(
+                            thread_id,
+                            std::mem::replace(events, TurnEvents::new(None)),
+                        ),
+                    ));
+                }
+                retry?
+            }
+            Err(error) => return Err(error),
+        };
+        model_rounds = model_rounds.saturating_add(1);
+        // The round carrying these observations reached the model, so the
+        // matching state may now be advanced. A round that failed or was
+        // cancelled above leaves them pending and redelivers them next time.
+        self.commit_step_reminders(step_reminders, rollout_budget, runtime_state)
+            .await?;
+        if let Some(delivery) = completion_guard_delivery.take() {
+            self.acknowledge_completion_delivery(&delivery).await?;
+        }
+        if let Some(budget) = budget.as_mut() {
+            budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
+        }
+        record_rollout_usage(rollout_budget, response.usage.as_ref())?;
+
+        let post_parse_control = self.drain_post_parse_control(user_message_id);
+        if post_parse_control.cancelled {
+            return Ok(ProviderRoundOutcome::Finished(
+                finalize_inbox_cancelled_turn(
+                    thread_id,
+                    std::mem::replace(events, TurnEvents::new(None)),
+                ),
+            ));
+        }
+        if !post_parse_control.steers.is_empty() {
+            self.append_steer_observations(
+                &post_parse_control.steers,
+                provider_tool_calls,
+                provider_tool_results,
+                provider_response_items,
+                events,
+            );
+            // The parsed response is deliberately not committed. Any tool
+            // calls it proposed remain unstarted and therefore cannot
+            // become orphan calls or duplicate side effects.
+            return Ok(ProviderRoundOutcome::Continue {
+                model_rounds,
+                rollout_reviews,
+            });
+        }
+
+        match response.decision() {
+            ModelDecision::Incomplete(reason) => {
+                return Err(incomplete_model_response(reason, &response));
+            }
+            ModelDecision::Final(_) => {
+                if let Some(intervention) = self
+                    .apply_finalization_guard(
+                        thread_id,
+                        user_message_id,
+                        store,
+                        pending_tool_calls,
+                        provider_tool_calls,
+                        provider_tool_results,
+                        provider_response_items,
+                        events,
+                    )
+                    .await?
+                {
+                    *completion_guard_delivery = intervention.agent_delivery;
+                    return Ok(ProviderRoundOutcome::Continue {
+                        model_rounds,
+                        rollout_reviews,
+                    });
+                }
+                let outcome = finalization_outcome(
+                    store,
+                    self.turn_id(user_message_id),
+                    self.goal.as_ref().map(|goal| goal.id),
+                    provider_tool_results,
+                )?;
+                return Ok(ProviderRoundOutcome::Finished(finalize_provider_turn(
+                    thread_id,
+                    response,
+                    std::mem::take(provider_response_items),
+                    std::mem::take(provider_tool_results),
+                    budget.take(),
+                    std::mem::replace(events, TurnEvents::new(None)),
+                    compatibility_hash.to_string(),
+                    outcome,
+                )));
+            }
+            ModelDecision::Act(tool_calls) => {
+                if let Some(message) =
+                    repeated_invalid_tool_call_error(runtime_state, &tool_calls, tool_candidates)
+                {
+                    events.push(AgentEventPayload::ContextWarning {
+                        stage: "invalid_tool_call_circuit_breaker".to_string(),
+                        message: message.clone(),
+                    });
+                    anyhow::bail!(message);
+                }
+                *pending_tool_calls = tool_calls;
+                runtime_state.record_tool_calls(pending_tool_calls);
+            }
+        }
+        provider_response_items.extend(response.provider_items);
+        provider_tool_calls.extend(pending_tool_calls.clone());
+        if let Some(budget) = budget.as_mut() {
+            budget.record_tokens(0);
+        }
+        Ok(ProviderRoundOutcome::Continue {
+            model_rounds,
+            rollout_reviews,
+        })
+    }
+}

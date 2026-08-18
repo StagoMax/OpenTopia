@@ -1,0 +1,613 @@
+#[test]
+fn sqlite_store_round_trips_reasoning_delta_events() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/reasoning-events"))
+        .expect("create thread");
+    let turn_id = Uuid::new_v4();
+    let event = AgentEvent::new(
+        thread.id,
+        Some(turn_id),
+        0,
+        AgentEventPayload::ReasoningDelta {
+            text: "正在核对依赖".to_string(),
+        },
+    );
+
+    let stored = store.append_event(event).expect("append reasoning event");
+    assert_eq!(stored.kind(), "reasoning_delta");
+
+    let events = store.list_events(thread.id, None).expect("list events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].turn_id, Some(turn_id));
+    match &events[0].payload {
+        AgentEventPayload::ReasoningDelta { text } => {
+            assert_eq!(text, "正在核对依赖");
+        }
+        payload => panic!("unexpected payload: {payload:?}"),
+    }
+}
+
+#[test]
+fn sqlite_store_appends_event_batches_with_contiguous_sequences() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/event-batches"))
+        .expect("create thread");
+    let turn_id = Uuid::new_v4();
+    let stored = store
+        .append_events(vec![
+            AgentEvent::new(
+                thread.id,
+                Some(turn_id),
+                0,
+                AgentEventPayload::ReasoningDelta {
+                    text: "first".to_string(),
+                },
+            ),
+            AgentEvent::new(
+                thread.id,
+                Some(turn_id),
+                0,
+                AgentEventPayload::ModelDelta {
+                    text: "second".to_string(),
+                },
+            ),
+        ])
+        .expect("append event batch");
+
+    assert_eq!(
+        stored.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    let listed = store
+        .list_events(thread.id, None)
+        .expect("list event batch");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, stored[0].id);
+    assert_eq!(listed[1].id, stored[1].id);
+}
+
+#[test]
+fn completed_assistant_message_replaces_historical_stream_in_conversation_view() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/conversation-snapshot"))
+        .expect("create thread");
+    let turn_id = Uuid::new_v4();
+    let message = Message::text(thread.id, MessageRole::Assistant, "complete answer");
+    store
+        .append_events(vec![
+            AgentEvent::new(
+                thread.id,
+                Some(turn_id),
+                0,
+                AgentEventPayload::ModelDelta {
+                    text: "partial ".to_string(),
+                },
+            ),
+            AgentEvent::new(
+                thread.id,
+                Some(turn_id),
+                0,
+                AgentEventPayload::AssistantMessage { message },
+            ),
+        ])
+        .expect("append completed stream");
+
+    let diagnostic_events = store
+        .list_events(thread.id, None)
+        .expect("list full events");
+    assert_eq!(diagnostic_events.len(), 2);
+    let conversation_events = store
+        .list_conversation_events(thread.id, None)
+        .expect("list conversation projection");
+    assert_eq!(conversation_events.len(), 1);
+    assert!(matches!(
+        conversation_events[0].payload,
+        AgentEventPayload::AssistantMessage { .. }
+    ));
+}
+
+#[test]
+fn conversation_retry_event_preserves_reconnect_progress() {
+    let request_id = Uuid::new_v4();
+    let payload = AgentEventPayload::ProviderRequestRetried {
+        request_id,
+        round: 2,
+        attempt: 4,
+        retry_kind: crate::model::ProviderRetryKind::Network,
+        retry_index: Some(3),
+        retry_limit: Some(5),
+        reason: "connection reset".to_string(),
+        body: serde_json::json!({"secret": "removed"}),
+    };
+    let full = serde_json::to_string(&payload).expect("serialize full payload");
+    let compact = conversation_payload_json(&payload, &full)
+        .expect("project conversation payload")
+        .expect("retry event remains visible");
+    let projected: AgentEventPayload =
+        serde_json::from_str(&compact).expect("deserialize projected retry payload");
+
+    assert!(matches!(
+        projected,
+        AgentEventPayload::ProviderRequestRetried {
+            request_id: projected_request_id,
+            retry_kind: crate::model::ProviderRetryKind::Network,
+            retry_index: Some(3),
+            retry_limit: Some(5),
+            body,
+            ..
+        } if projected_request_id == request_id && body.is_null()
+    ));
+}
+
+#[test]
+fn conversation_event_view_removes_diagnostic_bodies_and_hidden_reasoning() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/conversation-events"))
+        .expect("create thread");
+    let turn_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+
+    for payload in [
+        AgentEventPayload::ModelRequest {
+            request_id,
+            round: 1,
+            request: serde_json::json!({"prompt": "x".repeat(32_000)}),
+        },
+        AgentEventPayload::ProviderRequestSent {
+            request_id,
+            round: 1,
+            attempt: 1,
+            adapter: "test".to_string(),
+            method: "POST".to_string(),
+            endpoint: "http://localhost/model".to_string(),
+            body: serde_json::json!({"input": "y".repeat(32_000)}),
+        },
+        AgentEventPayload::ReasoningDelta {
+            text: "hidden historical reasoning".to_string(),
+        },
+        AgentEventPayload::ToolCallFinished {
+            result: ToolResult::text(
+                Uuid::new_v4(),
+                "tool output".repeat(1_000),
+                serde_json::json!({}),
+            ),
+        },
+        AgentEventPayload::TokenUsage {
+            request_id: None,
+            round: None,
+            purpose: crate::model::ModelCallPurpose::AgentRound,
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            local_input_estimate: None,
+            input_breakdown: None,
+        },
+        AgentEventPayload::TurnFinished {
+            summary: "done".to_string(),
+        },
+    ] {
+        store
+            .append_event(AgentEvent::new(thread.id, Some(turn_id), 0, payload))
+            .expect("append event");
+    }
+
+    let raw = store.list_events(thread.id, None).expect("list raw events");
+    assert_eq!(raw.len(), 6);
+    assert!(matches!(
+        &raw[0].payload,
+        AgentEventPayload::ModelRequest { request, .. }
+            if request.get("prompt").is_some()
+    ));
+
+    let conversation = store
+        .list_conversation_events(thread.id, None)
+        .expect("list conversation events");
+    assert_eq!(conversation.len(), 5);
+    assert!(matches!(
+        &conversation[0].payload,
+        AgentEventPayload::ModelRequest { request, .. } if request.is_null()
+    ));
+    assert!(matches!(
+        &conversation[1].payload,
+        AgentEventPayload::ProviderRequestSent { body, .. } if body.is_null()
+    ));
+    assert!(matches!(
+        &conversation[2].payload,
+        AgentEventPayload::ToolCallFinished { result }
+            if result.content.is_empty() && result.output.len() == 11_000
+    ));
+    assert!(conversation
+        .iter()
+        .all(|event| !matches!(event.payload, AgentEventPayload::ReasoningDelta { .. })));
+
+    let turn_tool_results = store
+        .list_turn_tool_result_events(thread.id, turn_id)
+        .expect("list one turn's tool results");
+    assert_eq!(turn_tool_results.len(), 1);
+    assert!(matches!(
+        &turn_tool_results[0].payload,
+        AgentEventPayload::ToolCallFinished { result }
+            if result.content.is_empty() && result.output.len() == 11_000
+    ));
+
+    let context = store
+        .list_context_events(thread.id)
+        .expect("list context events");
+    assert_eq!(context.len(), 1);
+    assert!(matches!(
+        context[0].payload,
+        AgentEventPayload::TokenUsage { .. }
+    ));
+    assert_eq!(
+        store
+            .count_events_after(thread.id, 2)
+            .expect("count later events"),
+        4
+    );
+}
+
+#[test]
+fn migration_backfills_conversation_events_for_existing_databases() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/event-backfill"))
+        .expect("create thread");
+    store
+        .append_event(AgentEvent::new(
+            thread.id,
+            None,
+            0,
+            AgentEventPayload::TurnFinished {
+                summary: "existing event".to_string(),
+            },
+        ))
+        .expect("append event");
+    {
+        let conn = store.conn.lock().expect("lock store");
+        remove_post_legacy_agent_runtime_tables(&conn);
+        conn.execute("DELETE FROM conversation_events", [])
+            .expect("remove projected rows");
+        conn.execute_batch(
+            r#"
+            DROP TABLE agent_mailbox_messages;
+            DROP TABLE agent_ledger_items;
+            DROP TABLE agent_turns;
+            DROP TABLE agent_threads;
+            DROP TABLE agent_runtime_snapshots;
+            DROP TABLE agent_sessions;
+            DROP TABLE schema_migrations;
+            PRAGMA user_version = 8;
+            "#,
+        )
+        .expect("restore previous schema version");
+    }
+
+    store.migrate().expect("rerun migration");
+
+    let events = store
+        .list_conversation_events(thread.id, None)
+        .expect("list backfilled events");
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].payload,
+        AgentEventPayload::TurnFinished { .. }
+    ));
+}
+
+#[test]
+fn workspace_keys_normalize_windows_drive_and_unc_paths() {
+    let drive = normalize_workspace_key(Path::new(r"J:\Project\OpenTopia\"));
+    assert_eq!(drive, "j:/project/opentopia");
+    assert_eq!(
+        drive,
+        normalize_workspace_key(Path::new(r"\\?\j:\PROJECT\OpenTopia"))
+    );
+    assert_eq!(
+        drive,
+        normalize_workspace_key(Path::new("J:/Project/./Scratch/../OpenTopia/"))
+    );
+
+    let unc = normalize_workspace_key(Path::new(r"\\Server\Share\Repo\"));
+    assert_eq!(unc, "//server/share/repo");
+    assert_eq!(
+        unc,
+        normalize_workspace_key(Path::new(r"\\?\UNC\server\SHARE\repo"))
+    );
+    assert_ne!(
+        normalize_workspace_key(Path::new("/srv/Repo")),
+        normalize_workspace_key(Path::new("/srv/repo"))
+    );
+}
+
+#[test]
+fn queued_turn_messages_are_persisted_and_removed() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/turn-queue"))
+        .expect("create thread");
+    let first = store
+        .append_message(Message::text(thread.id, MessageRole::User, "first"))
+        .expect("append first message");
+    let second = store
+        .append_message(Message::text(thread.id, MessageRole::User, "second"))
+        .expect("append second message");
+
+    store
+        .enqueue_turn_message(thread.id, first.id)
+        .expect("enqueue first message");
+    store
+        .enqueue_turn_message(thread.id, second.id)
+        .expect("enqueue second message");
+
+    assert_eq!(
+        store
+            .list_queued_turn_messages(thread.id)
+            .expect("list queued messages"),
+        vec![first.id, second.id]
+    );
+    assert!(store
+        .remove_queued_turn_message(thread.id, first.id)
+        .expect("remove first message"));
+    assert_eq!(
+        store
+            .list_queued_turn_messages(thread.id)
+            .expect("list remaining messages"),
+        vec![second.id]
+    );
+}
+
+#[test]
+fn context_budget_uses_unicode_aware_token_estimates() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/context-budget"))
+        .expect("create thread");
+    store
+        .append_message(Message::text(
+            thread.id,
+            MessageRole::User,
+            "\u{4f60}\u{597d}\u{4e16}\u{754c}",
+        ))
+        .expect("append non-ASCII message");
+
+    let budget = store
+        .get_context_budget(thread.id)
+        .expect("calculate context budget");
+    assert_eq!(budget.message_count, 1);
+    assert_eq!(budget.used_tokens, 54);
+}
+
+#[test]
+fn turn_lifecycle_round_trips_and_returns_latest_record() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/turn-lifecycle"))
+        .expect("create thread");
+    let first = store
+        .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+        .expect("insert running turn");
+
+    assert_eq!(
+        store
+            .get_active_turn(thread.id)
+            .expect("get active turn")
+            .expect("active turn")
+            .turn_id,
+        first.turn_id
+    );
+    let waiting = store
+        .update_turn_status(first.turn_id, TurnStatus::WaitingApproval, None)
+        .expect("pause turn")
+        .expect("updated turn");
+    assert_eq!(waiting.status, TurnStatus::WaitingApproval);
+    assert!(waiting.completed_at.is_none());
+    assert!(store
+        .get_active_turn(thread.id)
+        .expect("get active turn")
+        .is_none());
+
+    let second = store
+        .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+        .expect("insert resumed turn");
+    let succeeded = store
+        .update_turn_status(second.turn_id, TurnStatus::Succeeded, None)
+        .expect("finish turn")
+        .expect("updated turn");
+    assert!(succeeded.completed_at.is_some());
+    assert_eq!(
+        store
+            .get_latest_turn(thread.id)
+            .expect("get latest turn")
+            .expect("latest turn")
+            .turn_id,
+        second.turn_id
+    );
+}
+
+#[test]
+fn effect_journal_deduplicates_intent_and_recovers_running_effects() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/effect-journal"))
+        .expect("create thread");
+    let turn = store
+        .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+        .expect("insert turn");
+    let intent = EffectIntent {
+        thread_id: thread.id,
+        turn_id: turn.turn_id,
+        agent_path: "/root".to_string(),
+        idempotency_key: format!("{}/tool/call-1", turn.turn_id),
+        kind: EffectKind::ToolCall,
+        operation: "send_message".to_string(),
+        input_hash: "input-v1".to_string(),
+        input: serde_json::json!({ "message": "hello" }),
+        side_effect_class: EffectSideEffectClass::External,
+        idempotent: false,
+    };
+
+    let prepared = store.prepare_effect(&intent).expect("prepare effect");
+    let duplicate = store
+        .prepare_effect(&intent)
+        .expect("deduplicate prepared effect");
+    assert_eq!(prepared.effect_id, duplicate.effect_id);
+    let running = store
+        .start_effect(prepared.effect_id)
+        .expect("start effect");
+    assert_eq!(running.status, EffectStatus::Running);
+    assert_eq!(running.attempt, 1);
+
+    assert_eq!(
+        store
+            .mark_running_effects_indeterminate()
+            .expect("recover running effects"),
+        1
+    );
+    let uncertain = store
+        .get_effect(prepared.effect_id)
+        .expect("load effect")
+        .expect("effect exists");
+    assert_eq!(uncertain.status, EffectStatus::Indeterminate);
+    assert!(uncertain.requires_reconciliation());
+    assert_eq!(store.list_turn_effects(turn.turn_id).unwrap().len(), 1);
+}
+
+#[test]
+fn effect_journal_rejects_idempotency_key_reuse_with_new_input() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/effect-conflict"))
+        .expect("create thread");
+    let turn = store
+        .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+        .expect("insert turn");
+    let mut intent = EffectIntent {
+        thread_id: thread.id,
+        turn_id: turn.turn_id,
+        agent_path: "/root".to_string(),
+        idempotency_key: "stable-call".to_string(),
+        kind: EffectKind::ToolCall,
+        operation: "write_file".to_string(),
+        input_hash: "first".to_string(),
+        input: serde_json::json!({ "path": "a.txt" }),
+        side_effect_class: EffectSideEffectClass::Workspace,
+        idempotent: false,
+    };
+    store.prepare_effect(&intent).expect("prepare first intent");
+    intent.input_hash = "second".to_string();
+    let error = store
+        .prepare_effect(&intent)
+        .expect_err("reject changed input under the same key");
+    assert!(error.to_string().contains("reused with a different"));
+}
+
+#[test]
+fn turn_change_sets_round_trip_and_can_be_marked_reverted() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/turn-changes"))
+        .expect("create thread");
+    let turn = store
+        .insert_turn(TurnRecord::running(thread.id, Uuid::new_v4()))
+        .expect("insert turn");
+    let mut change_set =
+        TurnChangeSet::capturing(turn.turn_id, thread.id, thread.workspace_root.clone());
+    change_set.repo_root = Some(PathBuf::from("C:/workspace/turn-changes"));
+    change_set.workspace_prefix = Some(PathBuf::from("."));
+    change_set.before_tree = Some("before-tree".to_string());
+    change_set.after_tree = Some("after-tree".to_string());
+    change_set.status = TurnChangeSetStatus::Ready;
+    change_set.files = vec![TurnFileChange {
+        kind: TurnFileChangeKind::Modified,
+        old_path: Some(PathBuf::from("src/main.rs")),
+        new_path: Some(PathBuf::from("src/main.rs")),
+        before_oid: Some("before-oid".to_string()),
+        after_oid: Some("after-oid".to_string()),
+        before_mode: Some("100644".to_string()),
+        after_mode: Some("100644".to_string()),
+        additions: Some(3),
+        deletions: Some(1),
+        binary: false,
+    }];
+    change_set.additions = 3;
+    change_set.deletions = 1;
+    change_set.finalized_at = Some(Utc::now());
+
+    store
+        .upsert_turn_change_set(&change_set)
+        .expect("store turn changes");
+    let loaded = store
+        .get_turn_change_set(turn.turn_id)
+        .expect("load turn changes")
+        .expect("turn changes exist");
+    assert_eq!(loaded.status, TurnChangeSetStatus::Ready);
+    assert_eq!(loaded.files, change_set.files);
+    assert_eq!(
+        store
+            .list_turn_change_sets(thread.id)
+            .expect("list turn changes"),
+        vec![loaded.clone()]
+    );
+
+    let reverted_at = Utc::now();
+    let reverted = store
+        .mark_turn_change_set_reverted(turn.turn_id, reverted_at)
+        .expect("mark reverted")
+        .expect("turn changes exist");
+    assert_eq!(reverted.reverted_at, Some(reverted_at));
+}
+
+#[test]
+fn startup_recovery_interrupts_only_active_turns() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let first_thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/interrupted-running"))
+        .expect("create first thread");
+    let second_thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/interrupted-cancelling"))
+        .expect("create second thread");
+    let third_thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/waiting-approval"))
+        .expect("create third thread");
+    let running = store
+        .insert_turn(TurnRecord::running(first_thread.id, Uuid::new_v4()))
+        .expect("insert running turn");
+    let cancelling = store
+        .insert_turn(TurnRecord::running(second_thread.id, Uuid::new_v4()))
+        .expect("insert cancelling turn");
+    store
+        .update_turn_status(cancelling.turn_id, TurnStatus::Cancelling, None)
+        .expect("mark cancelling");
+    let waiting = store
+        .insert_turn(TurnRecord::running(third_thread.id, Uuid::new_v4()))
+        .expect("insert waiting turn");
+    store
+        .update_turn_status(waiting.turn_id, TurnStatus::WaitingApproval, None)
+        .expect("mark waiting");
+
+    assert_eq!(store.interrupt_active_turns().expect("recover turns"), 2);
+    for turn_id in [running.turn_id, cancelling.turn_id] {
+        let recovered = store
+            .get_turn(turn_id)
+            .expect("get recovered turn")
+            .expect("recovered turn");
+        assert_eq!(recovered.status, TurnStatus::Interrupted);
+        assert!(recovered.completed_at.is_some());
+        assert!(recovered.error.is_some());
+    }
+    assert_eq!(
+        store
+            .get_turn(waiting.turn_id)
+            .expect("get waiting turn")
+            .expect("waiting turn")
+            .status,
+        TurnStatus::WaitingApproval
+    );
+}

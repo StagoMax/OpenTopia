@@ -14,7 +14,7 @@ const MAX_SKILL_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_DISCOVERY_BYTES: usize = 64 * 1024;
 const MAX_DISCOVERY_DEPTH: usize = 4;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillDescriptor {
     pub id: String,

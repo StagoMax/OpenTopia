@@ -2,6 +2,7 @@ use crate::capabilities::{ContributionKind, PluginContribution};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +17,7 @@ pub const MAX_MEDIA_HANDLER_INPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_MEDIA_HANDLER_OPTIONS_BYTES: usize = 64 * 1024;
 pub const MAX_MEDIA_HANDLER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MediaHandlerRuntime {
     McpV1 { server: String, tool: String },
@@ -56,14 +57,14 @@ impl MediaHandlerRuntime {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaHandlerOperation {
     Preview,
     LoadContext,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaHandlerSourceV1 {
     pub path: String,
@@ -72,7 +73,7 @@ pub struct MediaHandlerSourceV1 {
     pub content_base64: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaHandlerInvocationV1 {
     pub api_version: String,
@@ -139,7 +140,7 @@ impl MediaHandlerInvocationV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaHandlerResultEnvelopeV1 {
     pub api_version: String,
@@ -182,7 +183,7 @@ impl MediaHandlerResultEnvelopeV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaHandlerDescriptor {
     pub contribution_id: String,
@@ -281,7 +282,7 @@ impl MediaHandlerDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MediaHandlerSelection {
     None,
@@ -342,7 +343,7 @@ impl ContributionHandlerRegistry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppViewSandbox {
     pub node_integration: bool,
@@ -362,7 +363,7 @@ impl Default for AppViewSandbox {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppViewDescriptor {
     pub contribution_id: String,
@@ -431,14 +432,14 @@ impl AppViewDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AppViewSessionStatus {
     Ready,
     Stopped,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppViewSession {
     pub session_id: Uuid,
@@ -449,7 +450,7 @@ pub struct AppViewSession {
     pub stopped_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppViewMessage {
     pub session_id: Uuid,

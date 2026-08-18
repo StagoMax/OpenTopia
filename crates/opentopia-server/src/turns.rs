@@ -4,6 +4,7 @@ use opentopia_core::collaboration::{
     SqliteCollaborationRepository,
 };
 use opentopia_core::{SessionStore, SqliteSessionStore, TurnRecord, TurnStatus};
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -45,7 +46,7 @@ pub struct TurnHandle {
     pub cancel: CancellationToken,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnCancelResult {
     pub turn_id: Option<Uuid>,
@@ -568,7 +569,17 @@ mod tests {
                 root_turn_id: AgentTurnId::from_uuid(handle.turn_id),
                 root_task_message: "root lifecycle test".to_string(),
                 root_agent_type: "default".to_string(),
-                root_runtime_snapshot: RuntimeSnapshotSeed::new(None, json!({})),
+                root_runtime_snapshot: RuntimeSnapshotSeed::new(
+                    None,
+                    json!({
+                        "workspaceRoot": "C:/workspace/project",
+                        "workspaceMode": "shared_read_only",
+                        "provider": {},
+                        "permissionMode": "read_only",
+                        "sandbox": {},
+                        "capabilityProjection": {}
+                    }),
+                ),
                 session_policy: CollaborationSessionPolicy::default(),
                 root_spawn_policy: AgentSpawnPolicy::default(),
             })

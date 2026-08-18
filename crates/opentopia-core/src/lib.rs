@@ -1,7 +1,9 @@
 pub mod agent;
 mod agent_composition;
+mod agent_kernel;
 pub mod agent_profiles;
 pub mod agent_runtime;
+pub mod api_contract;
 pub mod artifact_runtime;
 pub mod background;
 mod base_prompt;
@@ -17,11 +19,13 @@ pub mod context_runtime;
 pub mod context_sources;
 pub mod contribution_hosts;
 pub mod database_maintenance;
+mod delimited;
 pub mod desktop_browser;
 pub mod document;
 pub mod effect_journal;
 pub mod enterprise;
 pub mod execution;
+pub mod execution_authority;
 pub mod execution_authorization;
 mod execution_runtime;
 pub mod execution_spec;
@@ -31,6 +35,7 @@ pub mod flow_runtime;
 mod flow_tools;
 pub mod git_workflow;
 pub mod guardian;
+pub mod human_task;
 pub mod instructions;
 pub mod local_git;
 pub mod mcp;
@@ -38,6 +43,7 @@ pub mod mcp_host;
 pub mod model;
 pub mod model_context;
 pub mod model_gateway;
+pub mod office_runtime;
 pub mod pdf;
 pub mod plugin_control;
 pub mod plugins;
@@ -70,12 +76,19 @@ pub mod workspace;
 
 pub use agent::{
     agent_model_context_with_runtime, default_agent_model_context, AgentContinuation,
-    AgentContinuationState, AgentCore, AgentEventSender, AgentTurnInput, AgentTurnOutcome,
-    AgentTurnResult, ContextBudget as AgentContextBudget, ProviderConversationCursor,
-    ToolExposurePolicy,
+    AgentContinuationState, AgentCore, AgentEventSender, AgentRunConfig, AgentRunDraft,
+    AgentRunIdentity, AgentTurnInput, AgentTurnOutcome, AgentTurnResult,
+    ContextBudget as AgentContextBudget, PreparedAgentRun, ProviderConversationCursor,
+    ToolExposurePolicy, TurnExecutionContext,
 };
+pub use agent_kernel::AgentKernel;
 pub use agent_profiles::{AgentProfile, AgentProfileRegistry};
 pub use agent_runtime::{AgentResumeSignal, AgentTurnDriver};
+pub use api_contract::{
+    AgentActivityEnvelopeV1, AgentActivityNotification, AgentEventEnvelopeV1,
+    DesktopStreamEnvelope, DesktopStreamKind, TerminalEvent, TerminalEventEnvelopeV1,
+    TerminalEventKind, DESKTOP_STREAM_API_VERSION,
+};
 pub use artifact_runtime::{
     ArtifactRuntime, ArtifactRuntimeError, HayroPdfBackend, PdfBackend, RenderedPage,
     ValidationIssue, ValidationReport, ValidationSeverity, MAX_ARTIFACT_INPUT_BYTES,
@@ -166,6 +179,7 @@ pub use execution::{
     FileReadResult, FileWriteRequest, LocalExecutionEnvironment, PatchResult, ResourceLimit,
     ShellDialect, StdioSession, WriteResult,
 };
+pub use execution_authority::ExecutionAuthority;
 pub use execution_authorization::{
     ApprovalEscalation, ExecutionGrant, FilesystemAccess, NetworkAccess, ProcessLifetime,
     ToolExecutionIntent,
@@ -203,6 +217,10 @@ pub use guardian::{
     GuardianReviewSessionManager, GuardianReviewStatus, GuardianRiskLevel,
     GuardianUserAuthorization,
 };
+pub use human_task::{
+    HumanTaskActionV1, HumanTaskResolutionV1, HumanTaskSourceKindV1, HumanTaskStatusV1,
+    HumanTaskTypeV1, HumanTaskV1, HUMAN_TASK_SCHEMA_VERSION_V1,
+};
 pub use instructions::{
     resolve_instruction_documents, InstructionDocument, InstructionResolution, InstructionScope,
 };
@@ -239,6 +257,10 @@ pub use model_context::{
     TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
 };
 pub use model_gateway::{ModelGateway, ProviderCodec, ProviderModelGateway, ProviderTransport};
+pub use office_runtime::{
+    OfficePythonRuntime, OfficeRuntime, OfficeRuntimeError, OfficeRuntimeSource,
+    OfficeRuntimeStatus, OFFICE_RUNTIME_ID, OFFICE_RUNTIME_MANIFEST,
+};
 pub use pdf::{
     extract_pdf_text, inspect_pdf, validate_pdf, PdfError, PdfExtraction, PdfInspection,
     PdfPageText, PdfValidation, MAX_PDF_EXTRACT_CHARACTERS,
@@ -338,8 +360,8 @@ pub use spreadsheet::{
 };
 pub use store::{
     normalize_workspace_key, AgentTemplateStoreError, ContextBudget, FlowStoreError,
-    ProviderContextStateKind, ProviderConversationState, SessionStore, SqliteSessionStore,
-    StoreError,
+    HumanTaskStoreError, ProviderContextStateKind, ProviderConversationState, SessionStore,
+    SqliteSessionStore, StoreError,
 };
 pub use tool_result_ingress::tool_result_is_error;
 pub use tool_runtime::{

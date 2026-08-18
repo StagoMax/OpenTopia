@@ -19,10 +19,15 @@ const FILES: &[BundledPluginFile] = &[
 pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
     metadata: BundledPluginMetadata {
         name: "spreadsheet",
-        version: "1.2.0",
+        version: "2.0.0",
         trust: BundledPluginTrust::Official,
         default_enabled: true,
-        native_capabilities: &["spreadsheet"],
+        native_capabilities: &[
+            "spreadsheet",
+            "spreadsheet_inspect",
+            "spreadsheet_describe",
+            "spreadsheet_execute",
+        ],
     },
     files: FILES,
 };
@@ -30,7 +35,10 @@ pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{SpreadsheetTool, Tool};
+    use crate::tools::{
+        SpreadsheetDescribeTool, SpreadsheetExecuteTool, SpreadsheetInspectTool, SpreadsheetTool,
+        Tool,
+    };
     use serde_json::Value;
 
     fn action_names(schema: &Value) -> Vec<String> {
@@ -55,7 +63,15 @@ mod tests {
         assert_eq!(PACKAGE.metadata.version, manifest["version"]);
         assert_eq!(PACKAGE.metadata.trust, BundledPluginTrust::Official);
         assert!(PACKAGE.metadata.default_enabled);
-        assert_eq!(PACKAGE.metadata.native_capabilities, &["spreadsheet"]);
+        assert_eq!(
+            PACKAGE.metadata.native_capabilities,
+            &[
+                "spreadsheet",
+                "spreadsheet_inspect",
+                "spreadsheet_describe",
+                "spreadsheet_execute",
+            ]
+        );
         assert!(manifest.get("trust").is_none());
         assert!(manifest.get("official").is_none());
         assert!(manifest["opentopia"].get("trust").is_none());
@@ -74,8 +90,23 @@ mod tests {
             tool.name()
         );
         assert_eq!(
+            opentopia["contributes"]["nativeTools"]
+                .as_array()
+                .expect("native tools")
+                .iter()
+                .skip(1)
+                .map(|entry| entry["id"].as_str().expect("tool id"))
+                .collect::<Vec<_>>(),
+            vec![
+                SpreadsheetInspectTool.name(),
+                SpreadsheetDescribeTool.name(),
+                SpreadsheetExecuteTool.name(),
+            ]
+        );
+        assert_eq!(
             action_names(&tool.schema()),
             vec![
+                "inspect_delimited",
                 "inspect",
                 "list_sheets",
                 "read_range",
@@ -84,6 +115,9 @@ mod tests {
                 "read_columns",
                 "find",
                 "filter_rows",
+                "validate",
+                "fill_template",
+                "export_delimited",
                 "write",
                 "write_rows",
                 "write_columns",

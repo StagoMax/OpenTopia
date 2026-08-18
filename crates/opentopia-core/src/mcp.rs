@@ -1,11 +1,12 @@
 use crate::policy::ToolPermissionDescriptor;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerConfig {
     pub server_id: Uuid,
@@ -48,7 +49,7 @@ impl McpServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpLifecycleStatus {
     NotStarted,
@@ -58,7 +59,7 @@ pub enum McpLifecycleStatus {
     Disabled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerStatus {
     pub server_id: Uuid,
@@ -92,7 +93,7 @@ impl McpServerStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolDescriptor {
     pub public_name: String,
@@ -119,7 +120,7 @@ impl From<&McpToolDescriptor> for ToolPermissionDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpCallResult {
     pub server_id: Uuid,
@@ -132,7 +133,7 @@ pub struct McpCallResult {
     pub raw: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadMcpServer {
     pub thread_id: Uuid,

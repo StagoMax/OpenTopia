@@ -1,8 +1,9 @@
 use anyhow::Context;
 use opentopia_core::{
-    AgentCore, AgentEventPayload, AgentProfile, AgentTurnInput, BrowserObserveOptions,
-    BrowserRuntime, BrowserRuntimeConfig, BrowserSessionId, CodexAppServerProvider,
-    LocalBrowserRuntime, MessagePart, PermissionMode, ProviderKind, ProviderModelSettings,
+    AgentCore, AgentEventPayload, AgentProfile, AgentRunConfig, AgentRunIdentity, AgentTurnDriver,
+    AgentTurnInput, BrowserObserveOptions, BrowserRuntime, BrowserRuntimeConfig, BrowserSessionId,
+    CapabilityProjection, CodexAppServerProvider, ExecutionAuthority, LocalBrowserRuntime,
+    LocalSandboxConfig, MessagePart, PermissionMode, ProviderKind, ProviderModelSettings,
     ProviderSettings, SessionStore, SqliteSessionStore, ToolRegistry,
 };
 use std::sync::Arc;
@@ -68,9 +69,8 @@ async fn main() -> anyhow::Result<()> {
             CodexAppServerProvider::from_settings(&settings)
                 .context("Codex App Server provider is not configured")?,
         );
-        let mut agent = AgentCore::new(provider, ToolRegistry::with_builtins());
-        agent.set_browser_runtime(browser.clone());
-        agent.apply_agent_profile(&AgentProfile {
+        let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
+        let profile = AgentProfile {
             name: "browser-smoke".to_string(),
             description: "Runs a constrained browser-control smoke test.".to_string(),
             developer_instructions: "Use only the browser tool. Follow the browser observation contract exactly: navigate, observe, click using the returned observationId and nodeRef, then observe again. Do not close the browser session; the harness will clean it up.".to_string(),
@@ -82,10 +82,25 @@ async fn main() -> anyhow::Result<()> {
             denied_tools: Vec::new(),
             source_plugin_id: None,
             source_contribution_id: None,
-        });
+        };
+        let authority = ExecutionAuthority::new(
+            workspace_root.clone(),
+            PermissionMode::FullAccess,
+            LocalSandboxConfig::default(),
+            CapabilityProjection::unrestricted(),
+        )?;
+        let mut draft = agent.begin_run(
+            AgentRunConfig::using_current_provider(
+                authority,
+                AgentRunIdentity::root(Uuid::new_v4(), 1),
+            )
+            .with_profile(profile),
+        )?;
+        draft.set_browser_runtime(browser.clone());
+        let agent = draft.finalize()?;
 
-        let events = agent
-            .run_turn(AgentTurnInput {
+        let turn = agent.prepare_turn(
+            AgentTurnInput {
                 thread_id: thread.id,
                 user_message_id: Uuid::new_v4(),
                 workspace_root,
@@ -100,8 +115,10 @@ async fn main() -> anyhow::Result<()> {
                 provider_cursor: None,
                 store: Some(store.clone()),
                 cancellation: None,
-            })
-            .await?;
+            },
+            None,
+        )?;
+        let events = AgentTurnDriver::run_turn(&agent, turn, None).await?.events;
 
         let actions = browser_actions(&events);
         for expected in ["navigate", "observe", "click"] {

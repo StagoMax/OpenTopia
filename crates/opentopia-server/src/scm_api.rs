@@ -13,6 +13,7 @@ use opentopia_core::{
     ScmConnectorDescriptor, ScmConnectorSelection, ScmRemoteBinding, ToolCall, ToolResult,
     LOCAL_GIT_V1_API_VERSION,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path as FsPath, PathBuf};
@@ -347,9 +348,9 @@ fn publish_local_git_failure(
     );
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct ScmRemoteConnectorResponse {
+pub(super) struct ScmRemoteConnectorResponse {
     remote: LocalGitRemote,
     connectors: Vec<ScmConnectorDescriptor>,
     binding: Option<ScmRemoteBinding>,

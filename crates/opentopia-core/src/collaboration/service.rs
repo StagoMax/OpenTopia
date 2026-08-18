@@ -181,6 +181,7 @@ impl AgentCollaborationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collaboration::{test_runtime_snapshot, RuntimeWorkspaceModeV1};
     use crate::collaboration::{
         AgentSpawnPolicy, AgentTurnStatus, CollaborationRegistry, CollaborationSessionPolicy,
         CreateCollaborationSession, InMemoryAgentMailbox, InMemoryCollaborationRegistry,
@@ -224,7 +225,7 @@ mod tests {
                 root_agent_type: "default".to_string(),
                 root_runtime_snapshot: RuntimeSnapshotSeed::new(
                     None,
-                    serde_json::json!({ "agentType": "default" }),
+                    test_runtime_snapshot("default", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 session_policy: CollaborationSessionPolicy {
                     max_agents: 8,
@@ -260,7 +261,7 @@ mod tests {
                 task_message: "inspect".to_string(),
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(root.runtime_snapshot_id),
-                    serde_json::json!({ "agentType": "explorer" }),
+                    test_runtime_snapshot("explorer", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 spawn_policy: AgentSpawnPolicy::disabled(1),
             })
@@ -294,7 +295,7 @@ mod tests {
                 task_message: "inspect".to_string(),
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(root.runtime_snapshot_id),
-                    serde_json::json!({ "agentType": "explorer" }),
+                    test_runtime_snapshot("explorer", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 spawn_policy: AgentSpawnPolicy::disabled(1),
             })
@@ -334,7 +335,7 @@ mod tests {
                 task_message: "inspect".to_string(),
                 runtime_snapshot: RuntimeSnapshotSeed::new(
                     Some(root.runtime_snapshot_id),
-                    serde_json::json!({ "agentType": "explorer" }),
+                    test_runtime_snapshot("explorer", RuntimeWorkspaceModeV1::SharedCoordinated),
                 ),
                 spawn_policy: AgentSpawnPolicy::disabled(1),
             })

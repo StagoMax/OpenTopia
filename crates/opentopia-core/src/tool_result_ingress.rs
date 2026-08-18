@@ -219,7 +219,12 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
         "list_skills" | "list_agents" => {
             object.remove("count");
         }
-        "document" | "pdf" | "spreadsheet" => {
+        "document"
+        | "pdf"
+        | "spreadsheet"
+        | "spreadsheet_inspect"
+        | "spreadsheet_describe"
+        | "spreadsheet_execute" => {
             object.remove("action");
         }
         _ => {}
@@ -312,7 +317,7 @@ fn bound_structured_content(
         if !exceeds_limit {
             continue;
         }
-        *value = if tool_name == "spreadsheet" {
+        *value = if matches!(tool_name, "spreadsheet" | "spreadsheet_execute") {
             compact_spreadsheet_json(value, max_bytes, artifact_id)
         } else {
             compact_generic_json(value, artifact_id)

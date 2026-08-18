@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 const WORK_FORM_NAMESPACE: Uuid = Uuid::from_u128(0x6f70656e_746f_7069_615f_776f726b66);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum WorkScope {
     Turn(Uuid),
@@ -122,7 +122,7 @@ pub struct WorkItem {
     pub evidence_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkForm {
     pub id: Uuid,

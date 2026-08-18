@@ -5,6 +5,7 @@
 //! optimizations.
 
 use super::{ContextBudget, RolloutBudget, TurnRuntimeState};
+use crate::execution_authority::ExecutionAuthority;
 use crate::model::{CollaborationMode, GoalRecord, ModelContentPart};
 use crate::model_context::CompiledModelContext;
 use crate::policy::PermissionMode;
@@ -33,6 +34,11 @@ pub struct AgentContinuation {
     pub context_summary: Option<String>,
     pub conversation: Vec<ModelConversationMessage>,
     pub permission_mode: PermissionMode,
+    /// Frozen authority used to start this turn. Product resume paths reject
+    /// legacy checkpoints that do not carry it instead of reconstructing wider
+    /// authority from live settings.
+    #[serde(default)]
+    pub execution_authority: Option<ExecutionAuthority>,
     pub context_budget: Option<ContextBudget>,
     #[serde(default)]
     pub rollout_budget: Option<RolloutBudget>,

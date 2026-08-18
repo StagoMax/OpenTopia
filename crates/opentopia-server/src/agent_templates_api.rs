@@ -8,6 +8,7 @@ use opentopia_core::{
     AgentTemplateVersionV1, CapabilityProjection, ExecutionResourceGrantV1, ExperienceMode,
     ExperienceSurfaceProfile,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -463,9 +464,9 @@ struct PublishAgentTemplateVersionRequest {
     approve_capability_expansion: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct AgentTemplateVersionView {
+pub(super) struct AgentTemplateVersionView {
     template: AgentTemplateVersionV1,
     diff: AgentTemplateDiffV1,
 }
@@ -491,9 +492,9 @@ struct CreateAgentInstanceRequest {
     bind_to_thread: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct CreateAgentInstanceResponse {
+pub(super) struct CreateAgentInstanceResponse {
     instance: AgentInstanceV1,
     bound: bool,
 }

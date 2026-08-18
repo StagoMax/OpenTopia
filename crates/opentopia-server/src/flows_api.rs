@@ -8,12 +8,14 @@ use axum::{Json, Router};
 use chrono::Utc;
 use opentopia_core::{
     agent_model_context_with_runtime, experience_mode_module, prepare_flow_resume,
-    resolve_flow_approval, simulate_flow, spawn_flow_run, validate_flow_spec, BasicPolicyEngine,
-    CapabilityProjection, ExperienceMode, ExperienceSurfaceProfile, FlowDefinitionV1,
-    FlowDraftStatusV1, FlowDraftV1, FlowRunStatusV1, FlowRunV1, FlowSourceV1, FlowSpecV1,
-    FlowStoreError, FlowTrialV1, RuntimeSurface, SessionStore, ToolInvocationContext,
-    ToolStateStore, TurnStatus,
+    resolve_flow_approval, simulate_flow, spawn_flow_run, validate_flow_spec, AgentRunConfig,
+    AgentRunIdentity, CapabilityProjection, ExecutionAuthority, ExperienceMode,
+    ExperienceSurfaceProfile, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1, FlowRunStatusV1,
+    FlowRunV1, FlowSourceV1, FlowSpecV1, FlowStoreError, FlowTrialV1, HumanTaskActionV1,
+    HumanTaskStoreError, RuntimeSurface, SessionStore, ToolInvocationContext, ToolStateStore,
+    TurnStatus,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -333,6 +335,12 @@ async fn resume_flow_run(
     let mut run = flow_run_for_request(&state, run_id)?;
     let thread = ensure_flow_thread(&state, run.thread_id)?;
     let expected = run.revision;
+    let mut human_task = state
+        .store
+        .get_pending_human_task_for_flow_run(run.id)
+        .map_err(flow_error)?;
+    let human_task_expected_revision = human_task.as_ref().map(|task| task.revision);
+    let mut human_task_action = None;
     match run.status {
         FlowRunStatusV1::Paused => {
             if request.approved.is_some() {
@@ -345,25 +353,46 @@ async fn resume_flow_run(
             run.status = FlowRunStatusV1::Running;
             run.error = None;
             run.touch();
+            if human_task.is_some() {
+                human_task_action = Some(HumanTaskActionV1::Retry);
+            }
         }
-        FlowRunStatusV1::WaitingApproval => resolve_flow_approval(
-            &mut run,
-            request
+        FlowRunStatusV1::WaitingApproval => {
+            let approved = request
                 .approved
-                .ok_or_else(|| ApiError::bad_request("approved is required"))?,
-            request.note.as_deref(),
-        )
-        .map_err(ApiError::from)?,
+                .ok_or_else(|| ApiError::bad_request("approved is required"))?;
+            resolve_flow_approval(&mut run, approved, request.note.as_deref())
+                .map_err(ApiError::from)?;
+            human_task_action = Some(if approved {
+                HumanTaskActionV1::Approve
+            } else {
+                HumanTaskActionV1::Reject
+            });
+        }
         _ => {
             return Err(ApiError::conflict(
                 "Flow run is not paused or waiting for approval",
             ))
         }
     }
-    let run = state
-        .store
-        .update_flow_run(&run, expected)
-        .map_err(flow_error)?;
+    let run = if let (Some(mut task), Some(action), Some(task_revision)) = (
+        human_task.take(),
+        human_task_action,
+        human_task_expected_revision,
+    ) {
+        task.resolve(action, request.note.as_deref(), "local_operator")
+            .map_err(ApiError::from)?;
+        state
+            .store
+            .update_flow_run_and_human_task(&run, expected, &task, Some(task_revision))
+            .map_err(flow_error)?
+            .0
+    } else {
+        state
+            .store
+            .update_flow_run(&run, expected)
+            .map_err(flow_error)?
+    };
     if !run.status.is_terminal() {
         let capabilities = flow_capabilities(&state, run.thread_id)?;
         let context = flow_runtime_context(&state, &thread, run.id, capabilities).await?;
@@ -390,13 +419,28 @@ async fn cancel_flow_run(
     } else {
         run.status = FlowRunStatusV1::CancelRequested;
     }
+    run.active_human_task_id = None;
     run.touch();
-    Ok(Json(
+    let pending_task = state
+        .store
+        .get_pending_human_task_for_flow_run(run.id)
+        .map_err(flow_error)?;
+    let run = if let Some(mut task) = pending_task {
+        let task_revision = task.revision;
+        task.cancel(Some("Flow run cancelled by operator"), "local_operator")
+            .map_err(ApiError::from)?;
+        state
+            .store
+            .update_flow_run_and_human_task(&run, expected, &task, Some(task_revision))
+            .map_err(flow_error)?
+            .0
+    } else {
         state
             .store
             .update_flow_run(&run, expected)
-            .map_err(flow_error)?,
-    ))
+            .map_err(flow_error)?
+    };
+    Ok(Json(run))
 }
 
 fn flow_run_for_request(state: &AppState, run_id: Uuid) -> Result<FlowRunV1, ApiError> {
@@ -409,21 +453,34 @@ fn flow_run_for_request(state: &AppState, run_id: Uuid) -> Result<FlowRunV1, Api
     Ok(run)
 }
 
-async fn flow_runtime_context(
+pub(crate) async fn flow_runtime_context(
     state: &AppState,
     thread: &opentopia_core::Thread,
     parent_run_id: Uuid,
     capabilities: CapabilityProjection,
 ) -> Result<ToolInvocationContext, ApiError> {
     let settings = current_settings(state);
-    let mut agent = state.agent.read().expect("agent lock poisoned").clone();
-    agent.apply_experience_mode(thread.experience_mode);
-    if thread.model_selection.is_some() {
-        agent.set_provider_from_settings_with_model(&settings, thread.model_selection.as_ref());
-    }
-    agent.restrict_capabilities(&capabilities);
+    let authority = ExecutionAuthority::new(
+        thread.workspace_root.clone(),
+        settings.permission_mode,
+        settings.sandbox.to_local_sandbox_config(),
+        capabilities.clone(),
+    )
+    .map_err(ApiError::from)?;
+    let config = AgentRunConfig::from_settings(
+        &settings,
+        thread.model_selection.as_ref(),
+        authority.clone(),
+        AgentRunIdentity::root(parent_run_id, 1),
+    )
+    .with_experience_mode(thread.experience_mode);
+    let mut agent = state
+        .agent
+        .read()
+        .expect("agent lock poisoned")
+        .begin_run(config)
+        .map_err(ApiError::from)?;
     agent.set_mcp_host(state.mcp_host.clone());
-    agent.set_agent_context(parent_run_id, 0);
     if capabilities.allow_all_plugins || !capabilities.plugins.is_empty() {
         sync_thread_bundled_plugin_activations(&state.store, thread.id, &mut agent);
     } else {
@@ -432,26 +489,15 @@ async fn flow_runtime_context(
     if capabilities.allow_all_mcp_servers || !capabilities.mcp_servers.is_empty() {
         sync_thread_mcp_tools(&state.store, &state.mcp_host, thread.id, &mut agent).await;
     }
-    let sandbox = settings.sandbox.to_local_sandbox_config();
-    let policy = Arc::new(BasicPolicyEngine::new_with_sandbox_config(
-        thread.workspace_root.clone(),
-        settings.permission_mode,
-        &sandbox,
-    ));
-    let mut context = ToolInvocationContext::local_with_sandbox_config(
-        thread.workspace_root.clone(),
-        policy,
-        sandbox.clone(),
-    );
-    context.permission_mode = settings.permission_mode;
+    let agent = agent.finalize().map_err(ApiError::from)?;
+    let sandbox = authority.sandbox_config().clone();
+    let mut context = authority.local_tool_context();
     context.state = Some(ToolStateStore::new(state.store.clone()));
     context.thread_id = Some(thread.id);
     context.agent_turn_id = Some(parent_run_id);
     context.background = Some(state.background.clone());
     context.browser = Some(state.browser.clone());
     context.computer = Some(state.computer.clone());
-    context.capability_projection = capabilities;
-    context.flow_harness = Some(Arc::new(agent.clone()));
     let mut model_context = agent_model_context_with_runtime(
         &thread.workspace_root,
         &sandbox,
@@ -462,6 +508,7 @@ async fn flow_runtime_context(
         .items
         .push(experience_mode_module(ExperienceMode::Flow));
     context.fork_model_context = Some(model_context);
+    context.flow_harness = Some(Arc::new(agent));
     Ok(context)
 }
 
@@ -470,11 +517,11 @@ fn draft_view(state: &AppState, draft: FlowDraftV1) -> Result<FlowDraftView, Api
     Ok(FlowDraftView { draft, trials })
 }
 
-fn ensure_enterprise(state: &AppState) -> Result<(), ApiError> {
+pub(crate) fn ensure_enterprise(state: &AppState) -> Result<(), ApiError> {
     ensure_experience_mode_enabled(&current_settings(state), ExperienceMode::Flow)
 }
 
-fn ensure_flow_thread(
+pub(crate) fn ensure_flow_thread(
     state: &AppState,
     thread_id: Uuid,
 ) -> Result<opentopia_core::Thread, ApiError> {
@@ -504,7 +551,13 @@ fn flow_capabilities(state: &AppState, thread_id: Uuid) -> Result<CapabilityProj
     Ok(surface)
 }
 
-fn flow_error(error: anyhow::Error) -> ApiError {
+pub(crate) fn flow_error(error: anyhow::Error) -> ApiError {
+    if let Some(error) = error.downcast_ref::<HumanTaskStoreError>() {
+        return match error {
+            HumanTaskStoreError::NotFound(_) => ApiError::not_found(error.to_string()),
+            HumanTaskStoreError::RevisionConflict(_) => ApiError::conflict(error.to_string()),
+        };
+    }
     if let Some(error) = error.downcast_ref::<FlowStoreError>() {
         return match error {
             FlowStoreError::DraftNotFound(_) | FlowStoreError::RunNotFound(_) => {
@@ -575,9 +628,9 @@ struct ResumeFlowRunRequest {
     retry_interrupted_node: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct FlowDraftView {
+pub(super) struct FlowDraftView {
     draft: FlowDraftV1,
     trials: Vec<FlowTrialV1>,
 }

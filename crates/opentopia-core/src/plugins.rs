@@ -5,6 +5,7 @@ use crate::capabilities::{
     CodexCompatibleContributions, ContributionOrigin, OpenTopiaManifest, PluginCapabilityManifest,
     RegisteredPluginCapabilities,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -20,7 +21,7 @@ const MAX_MCP_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PLUGIN_FILES: usize = 10_000;
 const MAX_PLUGIN_BYTES: u64 = 100 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginScope {
     Workspace,
@@ -28,7 +29,7 @@ pub enum PluginScope {
     Codex,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginSource {
     Workspace,
@@ -37,7 +38,7 @@ pub enum PluginSource {
     Bundled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginDescriptor {
     pub id: String,

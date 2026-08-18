@@ -2,12 +2,13 @@ use anyhow::Context;
 use async_trait::async_trait;
 use lopdf::{content, dictionary, Document, Object, Stream};
 use opentopia_core::{
-    tool_result_is_error, AgentCore, AgentEventPayload, AgentResumeSignal, AgentTurnInput,
-    AgentTurnOutcome, Artifact, BackgroundProcessRegistry, CollaborationMode, ContextSourceKind,
-    ContextSourceRef, LocalSandboxConfig, Message, MessagePart, MessageRole, ModelContentPart,
-    ModelFinishReason, ModelProvider, ModelRequest, ModelResponse, PermissionMode,
-    ProviderHealthCheck, ProviderToolCall, SessionStore, SqliteSessionStore, Tool, ToolCall,
-    ToolExposurePolicy, ToolInvocationContext, ToolRegistry, ToolResult, UserInputAnswer,
+    tool_result_is_error, AgentCore, AgentEventPayload, AgentResumeSignal, AgentRunConfig,
+    AgentRunIdentity, AgentTurnDriver, AgentTurnInput, AgentTurnOutcome, Artifact,
+    BackgroundProcessRegistry, CapabilityProjection, CollaborationMode, ContextSourceKind,
+    ContextSourceRef, ExecutionAuthority, LocalSandboxConfig, Message, MessagePart, MessageRole,
+    ModelContentPart, ModelFinishReason, ModelProvider, ModelRequest, ModelResponse,
+    PermissionMode, ProviderHealthCheck, ProviderToolCall, SessionStore, SqliteSessionStore, Tool,
+    ToolCall, ToolExposurePolicy, ToolInvocationContext, ToolRegistry, ToolResult, UserInputAnswer,
     UserInputResponse,
 };
 use serde_json::{json, Value};
@@ -20,7 +21,7 @@ use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-const EXPECTED_TOOLS: [&str; 16] = [
+const EXPECTED_TOOLS: [&str; 18] = [
     "apply_patch",
     "background_output",
     "create_skill",
@@ -34,7 +35,9 @@ const EXPECTED_TOOLS: [&str; 16] = [
     "request_user_input",
     "set_plan",
     "shell",
-    "spreadsheet",
+    "spreadsheet_describe",
+    "spreadsheet_execute",
+    "spreadsheet_inspect",
     "update_plan",
     "view_attachment",
 ];
@@ -279,49 +282,66 @@ impl ModelProvider for SmokeProvider {
             ),
             11 => Self::one_call(
                 11,
-                "spreadsheet",
+                "spreadsheet_describe",
                 json!({
-                    "action": "write",
-                    "outputPath": "smoke.xlsx",
-                    "sheets": [{
-                        "name": "Smoke",
-                        "cells": [{
-                            "address": { "row": 0, "column": 0 },
-                            "value": { "type": "string", "value": "TOPIA_SPREADSHEET_OK" }
-                        }]
-                    }]
+                    "resource": { "kind": "workspaceFile", "path": "smoke.xlsx" },
+                    "operations": ["write"]
                 }),
             ),
             12 => Self::one_call(
                 12,
-                "document",
-                json!({ "action": "inspect", "path": "sample.docx" }),
+                "spreadsheet_execute",
+                json!({
+                    "operation": "write",
+                    "arguments": {
+                        "outputPath": "smoke.xlsx",
+                        "sheets": [{
+                            "name": "Smoke",
+                            "cells": [{
+                                "address": { "row": 0, "column": 0 },
+                                "value": { "type": "string", "value": "TOPIA_SPREADSHEET_OK" }
+                            }]
+                        }]
+                    }
+                }),
             ),
             13 => Self::one_call(
                 13,
-                "pdf",
-                json!({ "action": "inspect", "path": "sample.pdf" }),
+                "spreadsheet_inspect",
+                json!({
+                    "resource": { "kind": "workspaceFile", "path": "smoke.xlsx" }
+                }),
             ),
             14 => Self::one_call(
                 14,
-                "read_artifact",
-                json!({ "artifactId": self.artifact_id }),
+                "document",
+                json!({ "action": "inspect", "path": "sample.docx" }),
             ),
             15 => Self::one_call(
                 15,
-                "read_attachment",
-                json!({ "attachmentId": self.text_attachment_id }),
+                "pdf",
+                json!({ "action": "inspect", "path": "sample.pdf" }),
             ),
             16 => Self::one_call(
                 16,
+                "read_artifact",
+                json!({ "artifactId": self.artifact_id }),
+            ),
+            17 => Self::one_call(
+                17,
+                "read_attachment",
+                json!({ "attachmentId": self.text_attachment_id }),
+            ),
+            18 => Self::one_call(
+                18,
                 "view_attachment",
                 json!({
                     "attachmentId": self.image_attachment_id,
                     "focus": "Verify the smoke image is available."
                 }),
             ),
-            17 => Self::one_call(
-                17,
+            19 => Self::one_call(
+                19,
                 "request_user_input",
                 json!({
                     "questions": [{
@@ -345,7 +365,7 @@ impl ModelProvider for SmokeProvider {
                     }]
                 }),
             ),
-            18 => ModelResponse::text("TOPIA_DEFAULT_TOOL_SURFACE_OK"),
+            20 => ModelResponse::text("TOPIA_DEFAULT_TOOL_SURFACE_OK"),
             stage => anyhow::bail!("unexpected smoke-provider stage {stage}"),
         };
         Ok(response)
@@ -447,28 +467,38 @@ async fn run_tool_search_smoke(workspace: &Path) -> anyhow::Result<()> {
     let mut registry = ToolRegistry::with_core_tools();
     registry.insert_mcp("mcp_smoke_echo".to_string(), Arc::new(DeferredSmokeTool));
     let mut agent = AgentCore::new(Arc::new(DeferredSearchProvider::default()), registry);
-    agent.set_sandbox_config(LocalSandboxConfig::danger_full_access());
     agent.set_tool_exposure_policy(ToolExposurePolicy::Progressive);
+    let authority = ExecutionAuthority::new(
+        workspace.to_path_buf(),
+        PermissionMode::FullAccess,
+        LocalSandboxConfig::danger_full_access(),
+        CapabilityProjection::unrestricted(),
+    )?;
+    let agent = agent
+        .begin_run(AgentRunConfig::using_current_provider(
+            authority,
+            AgentRunIdentity::root(Uuid::new_v4(), 1),
+        ))?
+        .finalize()?;
 
-    let result = agent
-        .run_turn_detailed_streaming(
-            AgentTurnInput {
-                thread_id: Uuid::new_v4(),
-                user_message_id: Uuid::new_v4(),
-                workspace_root: workspace.to_path_buf(),
-                content: "Discover and invoke the deferred smoke capability.".to_string(),
-                user_content: Vec::new(),
-                context_summary: None,
-                conversation: Vec::new(),
-                permission_mode: PermissionMode::FullAccess,
-                context_budget: None,
-                provider_cursor: None,
-                store: None,
-                cancellation: None,
-            },
-            None,
-        )
-        .await?;
+    let turn = agent.prepare_turn(
+        AgentTurnInput {
+            thread_id: Uuid::new_v4(),
+            user_message_id: Uuid::new_v4(),
+            workspace_root: workspace.to_path_buf(),
+            content: "Discover and invoke the deferred smoke capability.".to_string(),
+            user_content: Vec::new(),
+            context_summary: None,
+            conversation: Vec::new(),
+            permission_mode: PermissionMode::FullAccess,
+            context_budget: None,
+            provider_cursor: None,
+            store: None,
+            cancellation: None,
+        },
+        None,
+    )?;
+    let result = AgentTurnDriver::run_turn(&agent, turn, None).await?;
     anyhow::ensure!(matches!(result.outcome, AgentTurnOutcome::Completed));
     let names = result
         .events
@@ -559,7 +589,6 @@ async fn run_smoke(workspace: &Path) -> anyhow::Result<()> {
         );
     }
     let mut agent = AgentCore::new(provider, registry);
-    agent.set_sandbox_config(LocalSandboxConfig::danger_full_access());
     agent.set_background_processes(BackgroundProcessRegistry::default());
 
     let default_catalog = agent
@@ -577,8 +606,20 @@ async fn run_smoke(workspace: &Path) -> anyhow::Result<()> {
         "default Code tool surface changed; expected {expected_default_catalog:?}, found {default_catalog:?}"
     );
 
-    agent.apply_collaboration_mode(CollaborationMode::Plan, None)?;
-    let plan_catalog = agent
+    let authority = ExecutionAuthority::new(
+        workspace.to_path_buf(),
+        PermissionMode::FullAccess,
+        LocalSandboxConfig::danger_full_access(),
+        CapabilityProjection::unrestricted(),
+    )?;
+    let draft = agent.begin_run(
+        AgentRunConfig::using_current_provider(
+            authority,
+            AgentRunIdentity::root(Uuid::new_v4(), 1),
+        )
+        .with_collaboration_mode(CollaborationMode::Plan, None),
+    )?;
+    let plan_catalog = draft
         .provider_tool_catalog()
         .into_iter()
         .map(|tool| tool.name)
@@ -591,27 +632,27 @@ async fn run_smoke(workspace: &Path) -> anyhow::Result<()> {
         plan_catalog == expected_catalog,
         "Plan-mode Code tool surface changed; expected {expected_catalog:?}, found {plan_catalog:?}"
     );
+    let agent = draft.finalize()?;
 
     let user_message_id = Uuid::new_v4();
-    let initial = agent
-        .run_turn_detailed_streaming(
-            AgentTurnInput {
-                thread_id: thread.id,
-                user_message_id,
-                workspace_root: workspace.to_path_buf(),
-                content: "Run the complete default tool-surface smoke scenario.".to_string(),
-                user_content: Vec::new(),
-                context_summary: None,
-                conversation: Vec::new(),
-                permission_mode: PermissionMode::FullAccess,
-                context_budget: None,
-                provider_cursor: None,
-                store: Some(store.clone()),
-                cancellation: None,
-            },
-            None,
-        )
-        .await?;
+    let turn = agent.prepare_turn(
+        AgentTurnInput {
+            thread_id: thread.id,
+            user_message_id,
+            workspace_root: workspace.to_path_buf(),
+            content: "Run the complete default tool-surface smoke scenario.".to_string(),
+            user_content: Vec::new(),
+            context_summary: None,
+            conversation: Vec::new(),
+            permission_mode: PermissionMode::FullAccess,
+            context_budget: None,
+            provider_cursor: None,
+            store: Some(store.clone()),
+            cancellation: None,
+        },
+        None,
+    )?;
+    let initial = AgentTurnDriver::run_turn(&agent, turn, None).await?;
     let (request, continuation) = match initial.outcome {
         AgentTurnOutcome::AwaitingInput {
             request,
@@ -621,26 +662,26 @@ async fn run_smoke(workspace: &Path) -> anyhow::Result<()> {
     };
     anyhow::ensure!(request.questions[0].id == "finish_smoke");
 
-    let resumed = agent
-        .resume_from_signal_streaming(
-            continuation,
-            AgentResumeSignal::UserInput {
-                request_id: request.request_id,
-                response: UserInputResponse {
-                    answers: vec![UserInputAnswer {
-                        question_id: "finish_smoke".to_string(),
-                        option_id: Some("finish".to_string()),
-                        custom_text: None,
-                    }],
-                    skipped: false,
-                    cancelled: false,
-                },
+    let resumed = AgentTurnDriver::resume_turn(
+        &agent,
+        continuation,
+        AgentResumeSignal::UserInput {
+            request_id: request.request_id,
+            response: UserInputResponse {
+                answers: vec![UserInputAnswer {
+                    question_id: "finish_smoke".to_string(),
+                    option_id: Some("finish".to_string()),
+                    custom_text: None,
+                }],
+                skipped: false,
+                cancelled: false,
             },
-            Some(store.clone()),
-            None,
-            None,
-        )
-        .await?;
+        },
+        Some(store.clone()),
+        None,
+        None,
+    )
+    .await?;
     anyhow::ensure!(matches!(resumed.outcome, AgentTurnOutcome::Completed));
 
     let events = initial
@@ -659,7 +700,7 @@ async fn run_smoke(workspace: &Path) -> anyhow::Result<()> {
         .is_file());
 
     println!(
-        "OpenTopia tool-surface smoke passed (15 default Code tools + Plan-only request_user_input)."
+        "OpenTopia tool-surface smoke passed (17 default Code tools + Plan-only request_user_input)."
     );
     for name in EXPECTED_TOOLS {
         println!("PASS {name}");

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -9,7 +10,17 @@ use uuid::Uuid;
 macro_rules! uuid_id {
     ($name:ident) => {
         #[derive(
-            Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+            Debug,
+            Clone,
+            Copy,
+            Serialize,
+            Deserialize,
+            JsonSchema,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
         )]
         #[serde(transparent)]
         pub struct $name(Uuid);
@@ -63,7 +74,9 @@ uuid_id!(AgentMailboxMessageId);
 pub const ROOT_AGENT_PATH: &str = "/root";
 pub const MAX_AGENT_TASK_NAME_CHARS: usize = 64;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 #[serde(transparent)]
 pub struct AgentPath(String);
 
@@ -187,7 +200,7 @@ impl CollaborationSessionPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSpawnPolicy {
     pub allow_child_spawns: bool,
@@ -222,6 +235,7 @@ impl RuntimeSnapshotSeed {
                 "content hash does not match snapshot payload".to_string(),
             ));
         }
+        super::RuntimeSnapshotV1::decode(&self.snapshot)?;
         Ok(())
     }
 }
@@ -246,6 +260,12 @@ pub struct AgentRuntimeSnapshotRecord {
     pub content_hash: String,
     pub snapshot: Value,
     pub created_at: DateTime<Utc>,
+}
+
+impl AgentRuntimeSnapshotRecord {
+    pub fn decode(&self) -> Result<super::RuntimeSnapshotV1, CollaborationDomainError> {
+        super::RuntimeSnapshotV1::decode(&self.snapshot)
+    }
 }
 
 impl AgentSpawnPolicy {
@@ -288,7 +308,7 @@ pub struct CollaborationSessionRecord {
     pub closed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentThreadRecord {
     pub id: AgentThreadId,
@@ -309,7 +329,7 @@ impl AgentThreadRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTurnStatus {
     Queued,
@@ -384,7 +404,7 @@ impl AgentTurnStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTurnRecord {
     pub id: AgentTurnId,
@@ -428,7 +448,7 @@ impl AgentTurnRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAvailability {
     Idle,

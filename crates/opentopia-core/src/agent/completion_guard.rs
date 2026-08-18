@@ -99,7 +99,7 @@ impl AgentCore {
                 CompletionSignal::blocking(source_id, message, details)
             })
             .collect::<Vec<_>>();
-        completion_signals.extend(self.completion_registry.signals(&registered_forms));
+        completion_signals.extend(self.kernel.completion_registry.signals(&registered_forms));
         let background_scope = BackgroundScope {
             thread_id,
             agent_path: self.agent_path.clone(),
@@ -126,7 +126,7 @@ impl AgentCore {
                     )
                 }),
         );
-        let completion_report = self.completion_gate.check(completion_signals);
+        let completion_report = self.kernel.completion_gate.check(completion_signals);
         for reminder in completion_report.reminders {
             events.push(AgentEventPayload::ContextWarning {
                 stage: "completion_advisory".to_string(),

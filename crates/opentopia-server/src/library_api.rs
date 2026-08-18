@@ -9,6 +9,7 @@ use opentopia_core::{
     ModelContentPart, Tool, ToolCall, ToolExecutionPolicy, ToolInvocationContext, ToolResult,
 };
 use reqwest::Url;
+use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -480,7 +481,7 @@ async fn list_library_providers() -> Json<Vec<LibraryProviderDescriptor>> {
 async fn get_library_status(
     Path(provider): Path<String>,
     State(state): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LibraryProviderStatus>, ApiError> {
     let value = match LibraryProviderId::parse(&provider)? {
         LibraryProviderId::Sag => {
             let status = state
@@ -489,7 +490,7 @@ async fn get_library_status(
                 .transport
                 .get::<SagStatus>("SAG", "api/status", None)
                 .await?;
-            serde_json::to_value(SagConnectionView {
+            LibraryProviderStatus::Sag(SagConnectionView {
                 provider: "SAG",
                 endpoint: state.library_providers.sag.transport.display_url(),
                 status,
@@ -502,14 +503,13 @@ async fn get_library_status(
                 .transport
                 .get::<GraphRagStatus>("Graph RAG", "health", None)
                 .await?;
-            serde_json::to_value(GraphRagConnectionView {
+            LibraryProviderStatus::GraphRag(GraphRagConnectionView {
                 provider: "Graph RAG",
                 endpoint: state.library_providers.graph_rag.transport.display_url(),
                 status,
             })
         }
-    }
-    .map_err(|error| ApiError::internal(format!("序列化资料库状态失败：{error}")))?;
+    };
     Ok(Json(value))
 }
 
@@ -517,7 +517,7 @@ async fn list_library_sources(
     Path(provider): Path<String>,
     Query(query): Query<LibrarySourcesQuery>,
     State(state): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LibrarySourcePageView>, ApiError> {
     query.validate()?;
     let value = match LibraryProviderId::parse(&provider)? {
         LibraryProviderId::Sag => {
@@ -541,20 +541,24 @@ async fn list_library_sources(
         }
     }
     .map_err(|error| ApiError::internal(format!("序列化资料来源失败：{error}")))?;
-    Ok(Json(camelize_value(value)))
+    let response = serde_json::from_value(camelize_value(value))
+        .map_err(|error| ApiError::bad_gateway(format!("资料来源响应格式无效：{error}")))?;
+    Ok(Json(response))
 }
 
 async fn search_library(
     Path(provider): Path<String>,
     State(state): State<AppState>,
     Json(request): Json<LibrarySearchRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LibrarySearchResponseView>, ApiError> {
     let provider = LibraryProviderId::parse(&provider)?;
     let value = state
         .library_providers
         .search_context_pack(provider, request)
         .await?;
-    Ok(Json(value))
+    let response = serde_json::from_value(value)
+        .map_err(|error| ApiError::bad_gateway(format!("资料检索响应格式无效：{error}")))?;
+    Ok(Json(response))
 }
 
 async fn upload_library_source(
@@ -562,7 +566,7 @@ async fn upload_library_source(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<LibraryIngestionResponseView>), ApiError> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -593,14 +597,16 @@ async fn upload_library_source(
                 .await?
         }
     };
-    Ok((StatusCode::CREATED, Json(camelize_value(value))))
+    let response = serde_json::from_value(camelize_value(value))
+        .map_err(|error| ApiError::bad_gateway(format!("资料导入响应格式无效：{error}")))?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn ingest_library_text(
     Path(provider): Path<String>,
     State(state): State<AppState>,
     Json(request): Json<SagTextIngestionRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<LibraryIngestionResponseView>), ApiError> {
     if !matches!(LibraryProviderId::parse(&provider)?, LibraryProviderId::Sag) {
         return Err(ApiError::bad_request(
             "Graph RAG 的文本导入请使用结构化文档接口或文件上传。",
@@ -628,7 +634,9 @@ async fn ingest_library_text(
             Duration::from_secs(300),
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(camelize_value(result))))
+    let response = serde_json::from_value(camelize_value(result))
+        .map_err(|error| ApiError::bad_gateway(format!("资料导入响应格式无效：{error}")))?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 fn configured_url(name: &str, fallback: &str) -> String {
@@ -713,9 +721,9 @@ async fn parse_provider_response<T: DeserializeOwned>(
         .map_err(|error| ApiError::bad_gateway(format!("{provider} 响应格式无效：{error}")))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct LibraryProviderDescriptor {
+pub(super) struct LibraryProviderDescriptor {
     id: &'static str,
     name: &'static str,
     title: &'static str,
@@ -755,7 +763,7 @@ impl LibraryProviderDescriptor {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct LibraryProviderCapabilities {
     graph_paths: bool,
@@ -764,15 +772,15 @@ struct LibraryProviderCapabilities {
     llm_planning: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct SagConnectionView {
+pub(super) struct SagConnectionView {
     provider: &'static str,
     endpoint: String,
     status: SagStatus,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 struct SagStatus {
     status: String,
@@ -798,15 +806,15 @@ struct SagStatus {
     prompt_injection: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct GraphRagConnectionView {
+pub(super) struct GraphRagConnectionView {
     provider: &'static str,
     endpoint: String,
     status: GraphRagStatus,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 struct GraphRagStatus {
     status: String,
@@ -834,6 +842,13 @@ struct GraphRagStatus {
     agent_loop_integration: bool,
     #[serde(default)]
     prompt_injection: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub(super) enum LibraryProviderStatus {
+    Sag(SagConnectionView),
+    GraphRag(GraphRagConnectionView),
 }
 
 #[derive(Debug, Deserialize)]
@@ -877,6 +892,33 @@ struct LibrarySourcePage<T> {
     offset: usize,
     limit: usize,
     has_more: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LibrarySourcePageView {
+    items: Vec<Value>,
+    total: usize,
+    authorized_total: usize,
+    index_total: usize,
+    offset: usize,
+    limit: usize,
+    has_more: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LibrarySearchResponseView {
+    pack: Value,
+    diagnostics: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LibraryIngestionResponseView {
+    status: String,
+    #[serde(flatten)]
+    fields: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]

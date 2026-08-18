@@ -1,12 +1,13 @@
 use crate::powershell_runtime::current_shell_runtime;
 use crate::sandbox::NetworkPolicy;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellDialect {
     PowerShell7,

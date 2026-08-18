@@ -1,19 +1,23 @@
 {
   "name": "spreadsheet",
-  "version": "1.2.0",
-  "description": "Inspect, search, filter, create, and update bounded XLSX workbooks through the model tool.",
+  "version": "2.0.0",
+  "description": "Inspect spreadsheets, progressively obtain operation contracts, and execute XLSX/CSV/TSV work through a bounded host runtime.",
   "author": {
     "name": "OpenTopia Contributors"
   },
   "interface": {
     "displayName": "Spreadsheet",
-    "shortDescription": "Work with XLSX files in the current workspace.",
-    "longDescription": "Give the model bounded XLSX inspection, range reading, creation, and update capabilities. Desktop workbook preview is an independent application capability.",
+    "shortDescription": "Work with XLSX, CSV, and TSV files through a progressive protocol.",
+    "longDescription": "Give the model bounded XLSX inspection, validation, creation, and update capabilities plus server-side CSV/TSV inspection, template filling, and export. The model first inspects a resource, then requests only the selected operation's contract, then executes it. Desktop workbook preview is an independent application capability.",
     "developerName": "OpenTopia",
     "category": "Productivity",
-    "defaultPrompt": "Use the spreadsheet capability when the task requires inspecting, reading, creating, or updating an XLSX workbook.",
+    "defaultPrompt": "For spreadsheet work use spreadsheet_inspect, spreadsheet_describe, then spreadsheet_execute. Describe returns the exact operation schema so do not guess optional fields. For CSV/TSV-to-XLSX template tasks, choose fill_template; the tool handles quoted commas, quoted newlines, duplicate headers, writing, and reopen validation server-side. Use validate for XLSX verification; do not use PDF or manually unpack OOXML unless the spreadsheet protocol reports an unsupported workbook feature. The legacy spreadsheet tool remains only for compatibility.",
     "capabilities": [
       "XLSX inspection",
+      "XLSX structural validation",
+      "Complex CSV and TSV inspection",
+      "Delimited data template filling",
+      "CSV and TSV export",
       "Bounded range reading",
       "Cell finding and conditional row filtering",
       "Workbook creation and update"
@@ -41,6 +45,18 @@
         {
           "id": "spreadsheet",
           "runtime": "builtin:spreadsheet"
+        },
+        {
+          "id": "spreadsheet_inspect",
+          "runtime": "builtin:spreadsheet_inspect"
+        },
+        {
+          "id": "spreadsheet_describe",
+          "runtime": "builtin:spreadsheet_describe"
+        },
+        {
+          "id": "spreadsheet_execute",
+          "runtime": "builtin:spreadsheet_execute"
         }
       ]
     },

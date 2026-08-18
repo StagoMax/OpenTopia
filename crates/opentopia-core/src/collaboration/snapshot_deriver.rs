@@ -1,11 +1,10 @@
 use super::{
     AgentRuntimeSnapshotRecord, AgentSpawnPolicy, AgentWorkspaceMode, ChildRuntimeSnapshotRequest,
-    DerivedChildRuntime, ForkTurns, RuntimeSnapshotDerivationError, RuntimeSnapshotDeriver,
-    RuntimeSnapshotSeed,
+    DerivedChildRuntime, ForkTurns, RuntimeForkTurnsLabelV1, RuntimeForkTurnsV1,
+    RuntimeSnapshotDerivationError, RuntimeSnapshotDeriver, RuntimeSnapshotSeed,
+    RuntimeWorkspaceAssignmentV1, RuntimeWorkspaceDeliveryStateV1, RuntimeWorkspaceModeV1,
 };
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
-use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Production snapshot derivation policy. It starts from the already frozen
@@ -21,98 +20,63 @@ impl RuntimeSnapshotDeriver for AttenuatingRuntimeSnapshotDeriver {
         parent: &AgentRuntimeSnapshotRecord,
         request: ChildRuntimeSnapshotRequest,
     ) -> Result<DerivedChildRuntime, RuntimeSnapshotDerivationError> {
-        let mut snapshot = parent.snapshot.as_object().cloned().ok_or_else(|| {
-            RuntimeSnapshotDerivationError::Rejected(
-                "parent runtime snapshot must be a JSON object".to_string(),
-            )
+        let mut snapshot = parent.decode().map_err(|error| {
+            RuntimeSnapshotDerivationError::Rejected(format!(
+                "parent runtime snapshot is invalid: {error}"
+            ))
         })?;
-        if let Some(allowed) = snapshot.get("allowedAgentTypes").and_then(Value::as_array) {
-            let permitted = allowed
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|agent_type| agent_type == request.agent_type);
-            if !permitted {
-                return Err(RuntimeSnapshotDerivationError::Rejected(format!(
-                    "agent type `{}` is outside the frozen parent snapshot",
-                    request.agent_type
-                )));
-            }
+        if !snapshot
+            .allowed_agent_types
+            .iter()
+            .any(|agent_type| agent_type == &request.agent_type)
+        {
+            return Err(RuntimeSnapshotDerivationError::Rejected(format!(
+                "agent type `{}` is outside the frozen parent snapshot",
+                request.agent_type
+            )));
         }
 
-        let parent_spawn = snapshot
-            .get("spawnPolicy")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let parent_allows_children = parent_spawn
-            .get("allowChildSpawns")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let max_depth = parent_spawn
-            .get("maxDepth")
-            .and_then(Value::as_u64)
-            .and_then(|value| u16::try_from(value).ok())
-            .unwrap_or(1);
-        let max_direct_children = parent_spawn
-            .get("maxDirectChildren")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0);
-        if request.allow_child_spawns && !parent_allows_children {
+        if request.allow_child_spawns && !snapshot.spawn_policy.allow_child_spawns {
             return Err(RuntimeSnapshotDerivationError::Rejected(
                 "the parent snapshot does not allow recursive spawn".to_string(),
             ));
         }
         let spawn_policy = if request.allow_child_spawns {
-            AgentSpawnPolicy::allows_children(max_depth, max_direct_children)
+            AgentSpawnPolicy::allows_children(
+                snapshot.spawn_policy.max_depth,
+                snapshot.spawn_policy.max_direct_children,
+            )
         } else {
-            AgentSpawnPolicy::disabled(max_depth)
+            AgentSpawnPolicy::disabled(snapshot.spawn_policy.max_depth)
         };
 
-        let inherited_workspace = snapshot
-            .get("workspaceMode")
-            .and_then(Value::as_str)
-            .unwrap_or("shared_read_only")
-            .to_string();
         let workspace_mode = match request.workspace_mode {
-            AgentWorkspaceMode::Auto => inherited_workspace.clone(),
-            AgentWorkspaceMode::SharedReadOnly => "shared_read_only".to_string(),
+            AgentWorkspaceMode::Auto => snapshot.workspace_mode,
+            AgentWorkspaceMode::SharedReadOnly => RuntimeWorkspaceModeV1::SharedReadOnly,
             AgentWorkspaceMode::SharedCoordinated => {
-                if inherited_workspace == "shared_read_only" {
+                if snapshot.workspace_mode == RuntimeWorkspaceModeV1::SharedReadOnly {
                     return Err(RuntimeSnapshotDerivationError::Rejected(
                         "shared coordinated access would expand a read-only parent snapshot"
                             .to_string(),
                     ));
                 }
-                "shared_coordinated".to_string()
+                RuntimeWorkspaceModeV1::SharedCoordinated
             }
-            AgentWorkspaceMode::IsolatedWorktree => "isolated_worktree".to_string(),
+            AgentWorkspaceMode::IsolatedWorktree => RuntimeWorkspaceModeV1::IsolatedWorktree,
         };
 
-        snapshot.insert("agentType".to_string(), Value::String(request.agent_type));
-        snapshot.insert(
-            "forkTurns".to_string(),
-            match request.fork_turns {
-                ForkTurns::None => Value::String("none".to_string()),
-                ForkTurns::All => Value::String("all".to_string()),
-                ForkTurns::Count(count) => json!({ "count": count }),
-            },
-        );
-        let inherited_root = snapshot
-            .get("workspaceRoot")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                RuntimeSnapshotDerivationError::Rejected(
-                    "parent runtime snapshot does not contain a workspace root".to_string(),
-                )
-            })?;
-        let workspace_assignment = if workspace_mode == "isolated_worktree" {
+        snapshot.agent_type = request.agent_type;
+        snapshot.fork_turns = match request.fork_turns {
+            ForkTurns::None => RuntimeForkTurnsV1::Label(RuntimeForkTurnsLabelV1::None),
+            ForkTurns::All => RuntimeForkTurnsV1::Label(RuntimeForkTurnsLabelV1::All),
+            ForkTurns::Count(count) => RuntimeForkTurnsV1::Count { count },
+        };
+        let inherited_root = snapshot.workspace_root.clone();
+        let workspace_assignment = if workspace_mode == RuntimeWorkspaceModeV1::IsolatedWorktree {
             let base_commit = snapshot
-                .get("gitBaseCommit")
-                .and_then(Value::as_str)
+                .git_base_commit
+                .clone()
                 .filter(|value| !value.is_empty())
-                .map(str::to_string)
                 .ok_or_else(|| {
                     RuntimeSnapshotDerivationError::Rejected(
                         "isolated worktree requires a frozen Git base commit".to_string(),
@@ -123,61 +87,57 @@ impl RuntimeSnapshotDeriver for AttenuatingRuntimeSnapshotDeriver {
                 .join(".opentopia")
                 .join("worktrees")
                 .join(format!("agent-{token}"));
-            snapshot.insert(
-                "workspaceRoot".to_string(),
-                Value::String(root.to_string_lossy().into_owned()),
-            );
-            json!({
-                "mode": "isolated_worktree",
-                "repositoryRoot": inherited_root,
-                "root": root,
-                "branch": format!("codex/agent/{token}"),
-                "baseCommit": base_commit,
-                "deliveryState": "pending"
-            })
+            snapshot.workspace_root = root.clone();
+            RuntimeWorkspaceAssignmentV1::IsolatedWorktree {
+                repository_root: inherited_root,
+                root,
+                branch: format!("codex/agent/{token}"),
+                base_commit: base_commit.clone(),
+                delivery_state: RuntimeWorkspaceDeliveryStateV1::Pending,
+            }
         } else {
-            json!({
-                "mode": workspace_mode,
-                "root": inherited_root,
-            })
+            RuntimeWorkspaceAssignmentV1::shared(workspace_mode, inherited_root)
         };
-        snapshot.insert("workspaceMode".to_string(), Value::String(workspace_mode));
-        snapshot.insert("workspaceAssignment".to_string(), workspace_assignment);
-        snapshot.insert("spawnPolicy".to_string(), spawn_policy_json(&spawn_policy));
+        snapshot.workspace_mode = workspace_mode;
+        snapshot.workspace_assignment = workspace_assignment;
+        snapshot.spawn_policy = spawn_policy.clone();
+        let snapshot = snapshot.encode().map_err(|error| {
+            RuntimeSnapshotDerivationError::Unavailable(format!(
+                "child runtime snapshot could not be encoded: {error}"
+            ))
+        })?;
         Ok(DerivedChildRuntime {
-            runtime_snapshot: RuntimeSnapshotSeed::new(Some(parent.id), Value::Object(snapshot)),
+            runtime_snapshot: RuntimeSnapshotSeed::new(Some(parent.id), snapshot),
             spawn_policy,
         })
     }
 }
 
-fn spawn_policy_json(policy: &AgentSpawnPolicy) -> Value {
-    let mut value = Map::new();
-    value.insert(
-        "allowChildSpawns".to_string(),
-        Value::Bool(policy.allow_child_spawns),
-    );
-    value.insert("maxDepth".to_string(), json!(policy.max_depth));
-    value.insert(
-        "maxDirectChildren".to_string(),
-        json!(policy.max_direct_children),
-    );
-    Value::Object(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collaboration::{CollaborationSessionId, RuntimeSnapshotId};
+    use crate::collaboration::{
+        test_runtime_snapshot, CollaborationSessionId, RuntimeSnapshotId, RuntimeWorkspaceModeV1,
+    };
     use chrono::Utc;
+    use serde_json::{json, Value};
 
     fn parent(snapshot: Value) -> AgentRuntimeSnapshotRecord {
+        let workspace_mode = match snapshot.get("workspaceMode").and_then(Value::as_str) {
+            Some("shared_read_only") => RuntimeWorkspaceModeV1::SharedReadOnly,
+            _ => RuntimeWorkspaceModeV1::SharedCoordinated,
+        };
+        let mut complete = test_runtime_snapshot("default", workspace_mode);
+        complete
+            .as_object_mut()
+            .unwrap()
+            .extend(snapshot.as_object().unwrap().clone());
         AgentRuntimeSnapshotRecord {
             id: RuntimeSnapshotId::new(),
             session_id: CollaborationSessionId::new(),
             parent_snapshot_id: None,
             content_hash: "fixture".to_string(),
-            snapshot,
+            snapshot: complete,
             created_at: Utc::now(),
         }
     }
