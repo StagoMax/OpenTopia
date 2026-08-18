@@ -1,5 +1,7 @@
 param(
-  [switch]$StageOnly
+  [switch]$StageOnly,
+  [string]$OfficeRuntimeSource,
+  [string]$OfficePython
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +43,7 @@ $releaseSandboxBinary = Join-Path $repoRoot "target\release\$sandboxBinaryName"
 $sandboxStageDir = Join-Path $runtimeTempDir "opentopia-sandbox"
 $stagedSandboxBinary = Join-Path $sandboxStageDir $sandboxBinaryName
 $runtimeManifestPath = Join-Path $runtimeTempDir "opentopia-runtime-manifest.json"
+$officeRuntimeStageDir = Join-Path $runtimeTempDir "office-runtime"
 
 function Assert-RuntimeStagePath {
   param([Parameter(Mandatory = $true)][string]$Path)
@@ -51,6 +54,58 @@ function Assert-RuntimeStagePath {
   }
   if (-not ([System.IO.Path]::GetFileName($fullPath)).StartsWith(".runtime-stage")) {
     throw "Refusing to modify an unexpected runtime stage path: $fullPath"
+  }
+}
+
+function Resolve-OfficeRuntimeSource {
+  if ($OfficeRuntimeSource) {
+    return (Resolve-Path -LiteralPath $OfficeRuntimeSource).Path
+  }
+  if ($env:OPENTOPIA_OFFICE_RUNTIME_SOURCE) {
+    return (Resolve-Path -LiteralPath $env:OPENTOPIA_OFFICE_RUNTIME_SOURCE).Path
+  }
+  if ($OfficePython) {
+    $prepared = Join-Path $repoRoot "runtime\office\.prepared-$PID"
+    & (Join-Path $PSScriptRoot "prepare-office-runtime.ps1") -Python $OfficePython -Output $prepared
+    return $prepared
+  }
+  if ($env:OPENTOPIA_OFFICE_RUNTIME_PYTHON) {
+    $prepared = Join-Path $repoRoot "runtime\office\.prepared-$PID"
+    & (Join-Path $PSScriptRoot "prepare-office-runtime.ps1") -Python $env:OPENTOPIA_OFFICE_RUNTIME_PYTHON -Output $prepared
+    return $prepared
+  }
+  $default = Join-Path $repoRoot "runtime\office\dist"
+  if (Test-Path -LiteralPath $default) {
+    return (Resolve-Path -LiteralPath $default).Path
+  }
+  throw "A managed Office runtime is required. Set OPENTOPIA_OFFICE_RUNTIME_SOURCE or pass -OfficePython to create one."
+}
+
+function Assert-OfficeRuntimeSource {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $manifestPath = Join-Path $Path "office-runtime.json"
+  if (-not (Test-Path -LiteralPath $manifestPath)) {
+    throw "Office runtime manifest not found: $manifestPath"
+  }
+  $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+  if ($manifest.schemaVersion -ne 1 -or $manifest.id -ne "ai.opentopia.office-runtime") {
+    throw "Office runtime manifest has an unsupported identity: $manifestPath"
+  }
+  if (-not $manifest.python.path -or -not $manifest.python.sha256) {
+    throw "Office runtime manifest has no Python artifact: $manifestPath"
+  }
+  $pythonPath = Join-Path $Path $manifest.python.path
+  $runtimePrefix = [System.IO.Path]::GetFullPath($Path) + [System.IO.Path]::DirectorySeparatorChar
+  $resolvedPython = [System.IO.Path]::GetFullPath($pythonPath)
+  if (-not $resolvedPython.StartsWith($runtimePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Office runtime Python path escapes its runtime root"
+  }
+  if (-not (Test-Path -LiteralPath $resolvedPython)) {
+    throw "Office runtime Python executable not found: $resolvedPython"
+  }
+  $actual = (Get-FileHash -LiteralPath $resolvedPython -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -ne $manifest.python.sha256.ToLowerInvariant()) {
+    throw "Office runtime Python hash does not match its manifest"
   }
 }
 
@@ -85,6 +140,11 @@ try {
 
   Write-Host "Staged server binary for the runtime bundle: $stagedServerBinary"
 
+  $resolvedOfficeRuntime = Resolve-OfficeRuntimeSource
+  Assert-OfficeRuntimeSource -Path $resolvedOfficeRuntime
+  Copy-Item -LiteralPath $resolvedOfficeRuntime -Destination $officeRuntimeStageDir -Recurse -Force
+  Write-Host "Staged managed Office runtime: $officeRuntimeStageDir"
+
   $sandboxProtocol = $null
   if ($isWindowsHost) {
     if (-not (Test-Path -LiteralPath $releaseSandboxBinary)) {
@@ -104,6 +164,10 @@ try {
       throw "Failed to stage OpenTopia Windows sandbox at $stagedSandboxBinary"
     }
     Write-Host "Staged first-party Windows sandbox for the runtime bundle: $stagedSandboxBinary"
+  }
+  $artifacts.officeRuntime = [ordered]@{
+    path = "office-runtime/office-runtime.json"
+    sha256 = (Get-FileHash -LiteralPath (Join-Path $officeRuntimeStageDir "office-runtime.json") -Algorithm SHA256).Hash.ToLowerInvariant()
   }
 
   $artifacts = [ordered]@{
